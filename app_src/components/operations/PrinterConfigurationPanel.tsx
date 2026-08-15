@@ -113,6 +113,33 @@ type PrintAgentDistributionManifest = {
   deliveryBackend: string
 }
 
+type CustomerPrintAgentReleaseArtifact = {
+  platform: 'macos' | 'windows'
+  architecture: 'universal' | 'x64'
+  filename: string
+  byteLength: number
+  sha256: string
+  signed: true
+  notarized: boolean
+  stapled: boolean
+  customerReleaseReady: true
+  href: string
+}
+
+type CustomerPrintAgentRelease = {
+  schemaVersion: 1
+  product: 'ClawPilot Print Agent'
+  version: string
+  customerReleaseReady: true
+  artifacts: CustomerPrintAgentReleaseArtifact[]
+}
+
+type CustomerPrintAgentReleasePayload = {
+  ok?: boolean
+  error?: string
+  release?: CustomerPrintAgentRelease
+}
+
 type PrintJobPayload = {
   ok?: boolean
   error?: string
@@ -268,6 +295,56 @@ function DeveloperPrintAgentDownloadButton() {
       startIcon={<DownloadRounded />}
     >
       Download developer preview
+    </Button>
+  )
+}
+
+function customerReleaseArtifactIsValid(
+  artifact: CustomerPrintAgentReleaseArtifact,
+): boolean {
+  const expectedArchitecture = artifact.platform === 'macos' ? 'universal' : 'x64'
+  const expectedSuffix = artifact.platform === 'macos' ? '.dmg' : '.exe'
+  const expectedHref = '/api/operations/print-agent/releases/download'
+    + `?platform=${artifact.platform}&architecture=${artifact.architecture}`
+  return artifact.architecture === expectedArchitecture
+    && artifact.filename.endsWith(expectedSuffix)
+    && Number.isSafeInteger(artifact.byteLength)
+    && artifact.byteLength > 0
+    && /^[a-f0-9]{64}$/.test(artifact.sha256)
+    && artifact.signed === true
+    && artifact.customerReleaseReady === true
+    && artifact.href === expectedHref
+    && (artifact.platform !== 'macos' || (
+      artifact.notarized === true && artifact.stapled === true
+    ))
+    && (artifact.platform !== 'windows' || (
+      artifact.notarized === false && artifact.stapled === false
+    ))
+}
+
+function customerReleaseIsValid(release: CustomerPrintAgentRelease): boolean {
+  return release.schemaVersion === 1
+    && release.product === 'ClawPilot Print Agent'
+    && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(release.version)
+    && release.customerReleaseReady === true
+    && release.artifacts.length === 2
+    && new Set(release.artifacts.map((artifact) => artifact.platform)).size === 2
+    && release.artifacts.every(customerReleaseArtifactIsValid)
+}
+
+function CustomerPrintAgentDownloadButton({
+  artifact,
+}: {
+  artifact: CustomerPrintAgentReleaseArtifact
+}) {
+  return (
+    <Button
+      component="a"
+      href={artifact.href}
+      variant="outlined"
+      startIcon={<DownloadRounded />}
+    >
+      {artifact.platform === 'macos' ? 'Download for macOS' : 'Download for Windows'}
     </Button>
   )
 }
@@ -515,11 +592,56 @@ export default function PrinterConfigurationPanel() {
   const [pairingBaseUrl, setPairingBaseUrl] = useState('https://dev.aiapp.eigenracing.com')
   const [printAgentDistribution, setPrintAgentDistribution] =
     useState<PrintAgentDistributionManifest | null>(null)
+  const [customerPrintAgentRelease, setCustomerPrintAgentRelease] =
+    useState<CustomerPrintAgentRelease | null>(null)
+  const [customerPrintAgentReleaseLoading, setCustomerPrintAgentReleaseLoading] = useState(true)
   const pairingCommand = `npm run print-agent:pair:macos -- --base-url '${pairingBaseUrl}'`
 
   useEffect(() => {
     setPairingBaseUrl(window.location.origin)
   }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        const response = await fetch('/api/operations/print-agent/releases', {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        if (!response.ok) {
+          setCustomerPrintAgentRelease(null)
+          return
+        }
+        const payload = await responsePayload<CustomerPrintAgentReleasePayload>(response)
+        if (
+          payload.ok
+          && payload.release
+          && customerReleaseIsValid(payload.release)
+        ) {
+          setCustomerPrintAgentRelease(payload.release)
+        } else {
+          setCustomerPrintAgentRelease(null)
+        }
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          setCustomerPrintAgentRelease(null)
+        }
+      } finally {
+        if (!controller.signal.aborted) setCustomerPrintAgentReleaseLoading(false)
+      }
+    })()
+    return () => controller.abort()
+  }, [])
+
+  const printAgentSetupReady = Boolean(customerPrintAgentRelease)
+    || ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+  const customerMacPrintAgent = customerPrintAgentRelease?.artifacts.find(
+    (artifact) => artifact.platform === 'macos',
+  ) || null
+  const customerWindowsPrintAgent = customerPrintAgentRelease?.artifacts.find(
+    (artifact) => artifact.platform === 'windows',
+  ) || null
 
   useEffect(() => {
     if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return undefined
@@ -994,7 +1116,7 @@ export default function PrinterConfigurationPanel() {
             startIcon={<TokenRounded />}
             onClick={() => setView('agents')}
           >
-            {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? 'Print Agent setup' : 'Local print service'}
+            {printAgentSetupReady ? 'Print Agent setup' : 'Local print service'}
           </Button>
           {printers?.capabilities.canView && (
             <Button
@@ -1177,7 +1299,15 @@ export default function PrinterConfigurationPanel() {
               </Button>
             )}
           </Stack>
-          {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
+          {customerPrintAgentRelease ? (
+            <Alert severity="info" sx={{ mt: 2 }}>
+              Install the signed ClawPilot Print Agent for macOS or Windows, then enter the
+              Zebra&apos;s private network IP and raw port 9100 in that local app. ClawPilot stores
+              only the logical printer-to-agent assignment; the IP stays on the computer. The
+              computer must remain on, connected to the printer network, and signed in for
+              background printing.
+            </Alert>
+          ) : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
             <Alert severity="warning" sx={{ mt: 2 }}>
               Developer preview only: enter the printer hostname/IP and raw port (normally 9100)
               in the local helper on the controlled development Mac. ClawPilot stores the logical
@@ -1185,10 +1315,9 @@ export default function PrinterConfigurationPanel() {
             </Alert>
           ) : (
             <Alert severity="warning" sx={{ mt: 2 }}>
-              The signed and notarized native macOS Print Agent is not released yet. The Zebra
-              hostname/IP and raw port 9100 will be entered only in that local application, never
-              in this hosted form. Existing paired headless background agents remain available;
-              do not distribute the unsigned developer helper to operators.
+              {customerPrintAgentReleaseLoading
+                ? 'Checking for a verified ClawPilot Print Agent release...'
+                : 'A verified signed Print Agent release is not currently available. Existing paired background agents remain available; do not distribute the unsigned developer helper to operators.'}
             </Alert>
           )}
           {!printers?.warehouses.length ? (
@@ -1308,7 +1437,22 @@ export default function PrinterConfigurationPanel() {
               gap={2}
             >
               <Box sx={{ minWidth: 0 }}>
-                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
+                {customerPrintAgentRelease ? (
+                  <>
+                    <Typography fontWeight={700}>
+                      ClawPilot Print Agent v{customerPrintAgentRelease.version}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Download the verified signed installer for this computer, then create a
+                      one-time workspace pairing code. The app collects and tests the Zebra&apos;s
+                      private network IP and port 9100 locally without printing, keeps that
+                      endpoint out of ClawPilot, and runs in the signed-in user&apos;s background tray.
+                      The computer must stay on, signed in, and connected to the printer network
+                      whenever ClawPilot should print. Web app download/manual print remains a
+                      separate delivery choice.
+                    </Typography>
+                  </>
+                ) : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
                   <>
                     <Typography fontWeight={700}>Developer-only local printing preview</Typography>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
@@ -1322,25 +1466,24 @@ export default function PrinterConfigurationPanel() {
                   </>
                 ) : (
                   <>
-                    <Typography fontWeight={700}>Native macOS Print Agent is not released</Typography>
+                    <Typography fontWeight={700}>Verified Print Agent release unavailable</Typography>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                      Customer setup will be enabled after the native application is Developer ID
-                      signed and Apple notarized. Configure network printer will pass only
-                      organization, warehouse, and one-time pairing context to that local app. The
-                      app will collect the Zebra hostname/IP and port 9100, test reachability
-                      without printing, and keep the endpoint out of hosted state, URLs, and
-                      browser history, then install the headless background LAN agent. Existing
-                      paired background agents remain visible below. Web app download/manual print
-                      remains a separate best-effort delivery choice. Existing connected entries
-                      are headless macOS LaunchAgents used for web-managed LAN printing; no app
-                      window or Dock icon is expected from that runtime.
+                      {customerPrintAgentReleaseLoading
+                        ? 'ClawPilot is checking the verified signed macOS and Windows release.'
+                        : 'New operator pairing stays disabled until the exact signed macOS and Windows release passes verification. Existing paired background agents remain visible below, and web app download/manual print remains available.'}
                     </Typography>
                   </>
                 )}
               </Box>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexShrink={0}>
-                <DeveloperPrintAgentDownloadButton />
-                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && agents?.capabilities.canManage && (
+                {customerMacPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+                )}
+                {customerWindowsPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+                )}
+                {!customerPrintAgentRelease && <DeveloperPrintAgentDownloadButton />}
+                {printAgentSetupReady && agents?.capabilities.canManage && (
                   <Button
                     variant="contained"
                     startIcon={<TokenRounded />}
@@ -1372,15 +1515,17 @@ export default function PrinterConfigurationPanel() {
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+                {customerPrintAgentRelease
+                  ? 'Download and open the signed Print Agent, then create a one-time code for this workspace. The app prompts locally for the private Zebra IP and port 9100.'
+                  : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
                   ? 'Open the developer helper first, then create a one-time code for this workspace. The helper prompts locally for the Zebra IP and port 9100.'
-                  : 'A signed and notarized native macOS Print Agent is required before a new operator can pair this workspace.'}
+                  : 'A verified signed macOS or Windows Print Agent is required before a new operator can pair this workspace.'}
               </Typography>
             </Box>
           ) : (
             <Stack sx={{ mt: 1 }}>
               <Stack direction="row" justifyContent="flex-end" sx={{ mb: 0.5 }}>
-                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && agents?.capabilities.canManage && (
+                {printAgentSetupReady && agents?.capabilities.canManage && (
                   <Button
                     size="small"
                     variant="text"
@@ -2148,7 +2293,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(enrollForm)}
+        open={printAgentSetupReady && Boolean(enrollForm)}
         onClose={() => !saving && setEnrollForm(null)}
         fullWidth
         maxWidth="sm"
@@ -2363,7 +2508,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(pairingGrant?.pairingCode)}
+        open={printAgentSetupReady && Boolean(pairingGrant?.pairingCode)}
         onClose={() => setPairingGrant(null)}
         fullWidth
         maxWidth="sm"
@@ -2372,27 +2517,48 @@ export default function PrinterConfigurationPanel() {
         <DialogContent dividers>
           <Stack spacing={2}>
             <Box>
-              <Typography fontWeight={700}>1. Open the developer-only macOS helper</Typography>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                This unsigned preview is for a controlled development Mac only and is not a
-                customer installer. It is credential-free and never contains this workspace&apos;s
-                pairing code, printer IP, or ClawPilot session. Do not bypass or disable
-                Gatekeeper on an operator Mac.
+              <Typography fontWeight={700}>
+                {customerPrintAgentRelease
+                  ? '1. Download and open the signed Print Agent'
+                  : '1. Open the developer-only macOS helper'}
               </Typography>
-              <Box sx={{ mt: 1 }}><DeveloperPrintAgentDownloadButton /></Box>
-              <Box sx={{ mt: 0.75 }}>
-                <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-              </Box>
+              {customerPrintAgentRelease ? (
+                <>
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                    Choose the installer for this computer. Only use the verified installer linked
+                    here. The app is credential-free and never contains this workspace&apos;s pairing
+                    code, printer IP, or ClawPilot session.
+                  </Typography>
+                  <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}>
+                    {customerMacPrintAgent && (
+                      <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+                    )}
+                    {customerWindowsPrintAgent && (
+                      <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+                    )}
+                  </Stack>
+                </>
+              ) : (
+                <>
+                  <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                    This unsigned preview is for a controlled development Mac only and is not a
+                    customer installer. Do not bypass or disable Gatekeeper on an operator Mac.
+                  </Typography>
+                  <Box sx={{ mt: 1 }}><DeveloperPrintAgentDownloadButton /></Box>
+                  <Box sx={{ mt: 0.75 }}>
+                    <PrintAgentDistributionFacts manifest={printAgentDistribution} />
+                  </Box>
+                </>
+              )}
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>2. Enter the local Zebra connection on this Mac</Typography>
+              <Typography fontWeight={700}>2. Enter the local Zebra connection</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                In the Print Agent menu choose <strong>1. Pair a workspace and printer</strong>.
-                Confirm this ClawPilot URL, use a unique workspace instance name, then enter the
-                printer hostname/IP and raw port 9100. The Print Agent probes reachability without
-                printing a label or claiming a job. The endpoint remains only in the Mac
-                LaunchAgent.
+                In the Print Agent choose Pair workspace. Confirm the trusted ClawPilot site, then
+                enter the printer&apos;s private network IPv4 address and raw port 9100. The app probes
+                reachability without sending printer bytes or claiming a job. The endpoint remains
+                encrypted on this computer and is never sent to ClawPilot.
               </Typography>
             </Box>
             <Divider />
@@ -2433,20 +2599,21 @@ export default function PrinterConfigurationPanel() {
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>4. Finish pairing on this Mac</Typography>
+              <Typography fontWeight={700}>4. Finish pairing in the Print Agent</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Paste the one-time cppair code only when macOS Keychain prompts. The helper
-                redeems it, installs the background agent, and stores the long-lived credential
-                in Keychain rather than the downloaded ZIP or LaunchAgent file.
+                Paste the one-time cppair code only into the signed app. It redeems the code and
+                stores the long-lived credential using macOS Keychain or Windows protected storage,
+                never in the installer or a command line.
               </Typography>
             </Box>
             <Box>
               <Typography fontWeight={700}>5. Verify and finish setup in ClawPilot</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 Return to Agents to confirm Connected, then use Printers to create the logical
-                printer profile, assign this agent, and choose its document routing. Reopen the
-                downloaded Print Agent and choose <strong>2. Test an installed printer
-                connection</strong> any time to probe the same IP/9100 endpoint without printing.
+                printer profile, assign this agent, and choose its document routing. Use Test
+                connection in the local app any time to probe the same IP/9100 endpoint without
+                printing or claiming a job. Leave the computer on and signed in for background
+                printing.
               </Typography>
               <Button
                 size="small"
@@ -2462,7 +2629,8 @@ export default function PrinterConfigurationPanel() {
               </Button>
             </Box>
             <Divider />
-            <Box component="details">
+            {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && (
+              <Box component="details">
               <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
                 Advanced terminal pairing
               </Box>
@@ -2493,13 +2661,14 @@ export default function PrinterConfigurationPanel() {
               >
                 Copy Mac pairing command
               </Button>
-            </Box>
+              </Box>
+            )}
             <Box>
               <Typography fontWeight={700}>Pair another workspace</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Keep the downloaded helper. Switch workspaces in ClawPilot, create a new pairing
-                code, then run the .command file again with a unique instance name. The same physical
-                printer may be used, while each workspace retains its own agent identity, Keychain
+                Keep the installed app. Switch workspaces in ClawPilot, create a new pairing code,
+                then add another workspace in the Print Agent. The same physical printer may be
+                used while each workspace retains its own authoritative agent identity, protected
                 credential, delivery ledger, and logical printer profile.
               </Typography>
             </Box>
