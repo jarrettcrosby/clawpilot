@@ -85,6 +85,16 @@ function isPublicAppleAppLink(pathname: string) {
     || pathname === '/ios'
 }
 
+const PUBLIC_PRINT_AGENT_DOWNLOADS = new Set([
+  '/downloads/ClawPilot-Print-Agent-macOS.zip',
+  '/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  '/downloads/ClawPilot-Print-Agent-macOS.json',
+])
+
+function isPublicCredentialFreePrintAgentDownload(pathname: string) {
+  return PUBLIC_PRINT_AGENT_DOWNLOADS.has(pathname)
+}
+
 function sensitiveMutationDuringImpersonation(req: NextRequest, session: BrowserSession): boolean {
   if (!session.impersonating || ['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return false
   const path = req.nextUrl.pathname
@@ -141,6 +151,7 @@ export async function proxy(req: NextRequest) {
   if (!AUTH_REQUIRED) return NextResponse.next()
   if (pathname.startsWith('/api/') && isPublicApi(pathname)) return NextResponse.next()
   if (isPublicAppleAppLink(pathname)) return NextResponse.next()
+  if (isPublicCredentialFreePrintAgentDownload(pathname)) return NextResponse.next()
   if (pathname.startsWith('/s/')) return NextResponse.next()
 
   if (pathname === '/welcome') {

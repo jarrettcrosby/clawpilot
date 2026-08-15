@@ -13,7 +13,7 @@ const outputPath = outputArgumentIndex === -1
 if (!outputPath) throw new Error('--output requires a path')
 
 const archiveRoot = 'ClawPilot Print Agent'
-const version = '0.1.0-preview.1'
+const version = '0.1.0-preview.2'
 const runtimeFiles = [
   'install-macos-print-agent.mjs',
   'manage-macos-print-agent.mjs',
@@ -73,23 +73,27 @@ Download first, then finish web setup
 -------------------------------------
 
 1. Download and extract this credential-free ZIP.
-2. In the ClawPilot web app, open Operations > Printing.
-3. Create a short-lived pairing code for the exact workspace and warehouse.
-4. Keep the code dialog open while pairing this Mac.
+2. Open "ClawPilot Print Agent.command" and choose "Pair a workspace and
+   printer" so the local endpoint prompts are ready.
+3. In the ClawPilot web app, open Operations > Printing > Agents.
+4. Create a short-lived pairing code for the exact workspace and warehouse.
+5. Keep the code dialog open while pairing this Mac.
 
 Install or pair
 ---------------
 
 1. This preview requires Node.js 20 or newer from https://nodejs.org.
 2. Extract the ZIP.
-3. Double-click "ClawPilot Print Agent.command".
+3. Double-click "ClawPilot Print Agent.command" (or Control-click and choose
+   Open once if macOS blocks the unsigned preview).
 4. Choose "Pair a workspace and printer".
 5. Enter a unique workspace/printer instance name, the printer hostname or IP,
    and its raw port (normally 9100).
-6. Paste the short-lived cppair code only at the macOS Keychain prompt.
+6. The helper tests raw endpoint reachability without printing or claiming a
+   ClawPilot job.
+7. Paste the short-lived cppair code only at the macOS Keychain prompt.
 
-Because this preview is unsigned, macOS may require Control-clicking the
-.command file, choosing Open, and confirming once. Do not disable Gatekeeper.
+Do not disable Gatekeeper.
 
 The helper redeems the short-lived pairing code over HTTPS and atomically
 replaces it in macOS Keychain with the long-lived runtime credential. Neither

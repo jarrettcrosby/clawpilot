@@ -208,6 +208,7 @@ if (flags.has('--dry-run')) {
     runtimeDeliveryHelperPath,
     ledgerPath,
     credentialEmbedded: plist.includes('cpprint.v1.'),
+    printerEndpointStorage: 'local_launch_agent_only',
     plist,
   })}\n`)
   process.exit(0)
@@ -258,4 +259,5 @@ process.stdout.write(`${JSON.stringify({
   ledgerPath,
   stdoutPath,
   stderrPath,
+  printerEndpointStorage: 'local_launch_agent_only',
 })}\n`)

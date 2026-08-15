@@ -942,7 +942,14 @@ export default function PrinterConfigurationPanel() {
             Route durable documents, supervise local agents, and audit every delivery attempt.
           </Typography>
         </Box>
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+          <Button
+            variant="outlined"
+            startIcon={<DownloadRounded />}
+            onClick={() => setView('agents')}
+          >
+            Print Agent setup
+          </Button>
           {printers?.capabilities.canView && (
             <Button
               variant="outlined"
@@ -1084,7 +1091,27 @@ export default function PrinterConfigurationPanel() {
         </Box>
       ) : view === 'printers' ? (
         <Box sx={{ pt: 2 }}>
-          <Stack direction="row" justifyContent="flex-end">
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            justifyContent="flex-end"
+            spacing={1}
+          >
+            <Button
+              component="a"
+              href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
+              download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
+              variant="outlined"
+              startIcon={<DownloadRounded />}
+            >
+              Download Print Agent for macOS
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={<TokenRounded />}
+              onClick={() => setView('agents')}
+            >
+              Set up Zebra connection
+            </Button>
             {printers?.capabilities.canManage && (
               <Button
                 variant="contained"
@@ -1096,6 +1123,12 @@ export default function PrinterConfigurationPanel() {
               </Button>
             )}
           </Stack>
+          <Alert severity="info" sx={{ mt: 2 }}>
+            For a local-agent Zebra, enter the printer hostname/IP and raw port (normally 9100)
+            in the downloaded Print Agent on the Mac that can reach it. ClawPilot stores the
+            logical printer and agent assignment, but never receives or displays that local
+            network endpoint.
+          </Alert>
           {!printers?.warehouses.length ? (
             <Alert severity="warning" sx={{ mt: 2 }}>Create an active warehouse before configuring printers.</Alert>
           ) : !printers.printers.length ? (
@@ -1215,9 +1248,11 @@ export default function PrinterConfigurationPanel() {
               <Box sx={{ minWidth: 0 }}>
                 <Typography fontWeight={700}>Set up local printing</Typography>
                 <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  Configure agents, printers, and routing in ClawPilot. The downloaded Mac pairing
-                  helper asks for the printer&apos;s local hostname/IP and port without sending that
-                  endpoint to ClawPilot.
+                  Download and open the Mac Print Agent, choose <strong>Pair a workspace and
+                  printer</strong>, then enter the Zebra&apos;s local hostname/IP and raw port
+                  (normally 9100) on that Mac. Create the one-time workspace code here only when
+                  the local helper is open. The endpoint stays on the Mac and is never sent to
+                  ClawPilot.
                 </Typography>
                 <Box sx={{ mt: 0.75 }}>
                   <PrintAgentDistributionFacts manifest={printAgentDistribution} />
@@ -1231,7 +1266,7 @@ export default function PrinterConfigurationPanel() {
                   variant="outlined"
                   startIcon={<DownloadRounded />}
                 >
-                  Download macOS pairing helper
+                  Download Print Agent for macOS
                 </Button>
                 {agents?.capabilities.canManage && (
                   <Button
@@ -1265,7 +1300,8 @@ export default function PrinterConfigurationPanel() {
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Download the Mac pairing helper, then create a one-time code for this workspace.
+                Download and open the Mac Print Agent first, then create a one-time code for this
+                workspace. The Print Agent will prompt locally for the Zebra IP and port 9100.
               </Typography>
             </Box>
           ) : (
@@ -1826,10 +1862,25 @@ export default function PrinterConfigurationPanel() {
               {printerForm.printerType === 'thermal'
                 && printerForm.connectionMode === 'local_agent' && (
                 <Alert severity="info">
-                  New Zebra profiles retain the 4 x 6 carrier-label preset. For barcode
-                  printing, select only the label sizes this physical device is ready to use,
-                  then add Product barcode label and Location barcode label. The bundled agent
-                  supports all five listed Zebra label sizes without a custom runtime.
+                  <Stack spacing={1} alignItems="flex-start">
+                    <Typography variant="body2">
+                      Enter the Zebra hostname/IP and raw port (normally 9100) in the downloaded
+                      Print Agent on the Mac, not in this hosted form. This form defines routing
+                      and capabilities only. New Zebra profiles retain the 4 x 6 carrier-label
+                      preset; select only the label sizes physically loaded and calibrated.
+                    </Typography>
+                    <Button
+                      size="small"
+                      variant="text"
+                      startIcon={<DownloadRounded />}
+                      onClick={() => {
+                        setPrinterForm(null)
+                        setView('agents')
+                      }}
+                    >
+                      Open Print Agent setup
+                    </Button>
+                  </Stack>
                 </Alert>
               )}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -2204,10 +2255,13 @@ export default function PrinterConfigurationPanel() {
         <DialogContent dividers>
           <Stack spacing={2}>
             <Box>
-              <Typography fontWeight={700}>1. Download the macOS pairing helper</Typography>
+              <Typography fontWeight={700}>1. Download and open the macOS Print Agent</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 The download is credential-free. It never contains this workspace&apos;s pairing
-                code, printer IP, or ClawPilot session.
+                code, printer IP, or ClawPilot session. Unzip it, then double-click
+                <strong> ClawPilot Print Agent.command</strong>. If macOS blocks this unsigned
+                preview, Control-click the file, choose Open, and confirm once; do not disable
+                Gatekeeper.
               </Typography>
               <Button
                 component="a"
@@ -2217,7 +2271,7 @@ export default function PrinterConfigurationPanel() {
                 startIcon={<DownloadRounded />}
                 sx={{ mt: 1 }}
               >
-                Download macOS pairing helper
+                Download Print Agent for macOS
               </Button>
               <Box sx={{ mt: 0.75 }}>
                 <PrintAgentDistributionFacts manifest={printAgentDistribution} />
@@ -2225,7 +2279,18 @@ export default function PrinterConfigurationPanel() {
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>2. Copy the one-time pairing code</Typography>
+              <Typography fontWeight={700}>2. Enter the local Zebra connection on this Mac</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                In the Print Agent menu choose <strong>1. Pair a workspace and printer</strong>.
+                Confirm this ClawPilot URL, use a unique workspace instance name, then enter the
+                printer hostname/IP and raw port 9100. The Print Agent probes reachability without
+                printing a label or claiming a job. The endpoint remains only in the Mac
+                LaunchAgent.
+              </Typography>
+            </Box>
+            <Divider />
+            <Box>
+              <Typography fontWeight={700}>3. Copy the one-time pairing code</Typography>
               <Alert severity="warning" sx={{ mt: 1 }}>
                 One-time pairing code: this short-lived code is shown once and expires{' '}
                 {timestamp(pairingGrant?.expiresAt || null)}. If it is lost or expires, create a
@@ -2261,20 +2326,20 @@ export default function PrinterConfigurationPanel() {
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>3. Connect on this Mac</Typography>
+              <Typography fontWeight={700}>4. Finish pairing on this Mac</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Unzip the download and double-click ClawPilot Print Agent.command. Its Terminal
-                menu prompts for a unique workspace instance, this pairing code, and the printer
-                hostname/IP with its raw port, normally 9100.
-                The printer IP stays on this Mac and is never submitted to the hosted
-                printer-configuration API.
+                Paste the one-time cppair code only when macOS Keychain prompts. The helper
+                redeems it, installs the background agent, and stores the long-lived credential
+                in Keychain rather than the downloaded ZIP or LaunchAgent file.
               </Typography>
             </Box>
             <Box>
-              <Typography fontWeight={700}>4. Finish setup in ClawPilot</Typography>
+              <Typography fontWeight={700}>5. Verify and finish setup in ClawPilot</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 Return to Agents to confirm Connected, then use Printers to create the logical
-                printer profile, assign this agent, and choose its document routing.
+                printer profile, assign this agent, and choose its document routing. Reopen the
+                downloaded Print Agent and choose <strong>2. Test an installed printer
+                connection</strong> any time to probe the same IP/9100 endpoint without printing.
               </Typography>
               <Button
                 size="small"

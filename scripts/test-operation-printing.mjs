@@ -419,7 +419,10 @@ for (const fragment of [
   'Enable bundled barcode printing',
   'Legacy bundled shipping only',
   'All five Zebra barcode-label sizes are included in the bundled runtime.',
-  'New Zebra profiles retain the 4 x 6 carrier-label preset.',
+  'New Zebra profiles retain the 4 x 6 carrier-label',
+  'preset; select only the label sizes physically loaded and calibrated.',
+  'Enter the Zebra hostname/IP and raw port (normally 9100)',
+  'This form defines routing',
 ]) assert.ok(panel.includes(fragment), `Printer UI missing ${fragment}`)
 assert.ok(
   !panel.includes("supportedFormats: ['ZPL', 'PDF']"),

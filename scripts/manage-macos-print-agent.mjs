@@ -74,6 +74,16 @@ will remain on this Mac.
   execFileSync(process.execPath, [
     path.join(scriptDirectory, 'pair-macos-print-agent.mjs'),
   ], { stdio: 'inherit' })
+  process.stdout.write(`
+Pairing complete. The Zebra hostname/IP and raw port were reachable from this
+Mac; no label was printed and no ClawPilot print job was claimed. Return to
+Operations > Printing > Agents to confirm Connected, then assign the agent to
+the workspace's logical printer profile.
+
+To use this same physical Zebra in another workspace, switch workspaces in
+ClawPilot, create a new pairing code, and choose option 4 with a unique local
+instance name. You may enter the same local hostname/IP and port.
+`)
 }
 
 function serviceIsRunning(instance) {

@@ -80,6 +80,16 @@ new uniquely named pairing. A native signed/notarized application remains a
 separate distribution milestone; the download does not imply those release
 controls.
 
+The ZIP, exact checksum, and manifest are public only at their three fixed
+download paths because the artifact is credential-free. A workspace pairing
+code is created and displayed separately in the authenticated web application;
+it is never placed in a download URL or archive. In the web UI, operators can
+reach the download from both **Printers** and **Agents**. The hosted printer
+form intentionally does not accept an IP address: the downloaded agent prompts
+on the Mac for the Zebra hostname/IP and raw port, normally `9100`, probes that
+endpoint without printing or claiming a job, and stores it only in the local
+LaunchAgent.
+
 Do not vendor an indiscriminate collection of GitHub printer drivers into the
 agent. Prefer carrier-native output, driverless IPP/CUPS where the device
 supports it, signed vendor software, or a maintained printing bridge with a

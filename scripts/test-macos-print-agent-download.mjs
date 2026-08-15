@@ -37,7 +37,7 @@ try {
     outputPath,
   ], { encoding: 'utf8' }))
   assert.equal(build.ok, true)
-  assert.equal(build.version, '0.1.0-preview.1')
+  assert.equal(build.version, '0.1.0-preview.2')
   assert.equal(build.filename, 'ClawPilot-Print-Agent-macOS.zip')
   assert.equal(build.credentialEmbedded, false)
   assert.equal(build.signed, false)
@@ -53,7 +53,7 @@ try {
   const manifest = JSON.parse(readFileSync(build.manifestPath, 'utf8'))
   assert.deepEqual(manifest, {
     schemaVersion: 1,
-    version: '0.1.0-preview.1',
+    version: '0.1.0-preview.2',
     platform: 'macos',
     architecture: 'node-runtime-portable',
     artifactHref: '/downloads/ClawPilot-Print-Agent-macOS.zip',
@@ -105,7 +105,7 @@ try {
     'delivery ledger',
     'not code-signed or notarized',
   ]) assert.ok(readme.includes(requirement), `README is missing ${requirement}`)
-  assert.equal(entries.get(`${prefix}VERSION.txt`).toString('utf8'), '0.1.0-preview.1\n')
+  assert.equal(entries.get(`${prefix}VERSION.txt`).toString('utf8'), '0.1.0-preview.2\n')
 
   assert.deepEqual(
     entries.get(`${prefix}runtime/run-local-print-agent.mjs`),
@@ -166,6 +166,14 @@ try {
   assert.ok(!manager.includes('delete-generic-password'))
   assert.ok(!manager.includes('rmSync('))
   assert.ok(!manager.includes('CLAWPILOT_PRINT_AGENT_CREDENTIAL'))
+
+  const proxy = readFileSync('app_src/proxy.ts', 'utf8')
+  for (const publicArtifact of [
+    '/downloads/ClawPilot-Print-Agent-macOS.zip',
+    '/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+    '/downloads/ClawPilot-Print-Agent-macOS.json',
+  ]) assert.ok(proxy.includes(`'${publicArtifact}'`), `Proxy is missing ${publicArtifact}`)
+  assert.ok(proxy.includes('isPublicCredentialFreePrintAgentDownload(pathname)'))
 } finally {
   rmSync(sandbox, { recursive: true, force: true })
 }
