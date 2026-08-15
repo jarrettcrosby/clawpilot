@@ -1,6 +1,15 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import {
+  createDecipheriv,
+  createHash,
+  createPublicKey,
+  diffieHellman,
+  generateKeyPairSync,
+  hkdfSync,
+  randomBytes,
+  randomUUID,
+} from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
@@ -234,6 +243,106 @@ function requestErrorAdapter() {
     }
   }
   return { OperationsRequestError: RequestError }
+}
+
+function pairingRecoveryClient() {
+  const keyPair = generateKeyPairSync('x25519')
+  const publicKey = Buffer.from(keyPair.publicKey.export({
+    format: 'der',
+    type: 'spki',
+  }))
+  return {
+    privateKey: keyPair.privateKey,
+    request: {
+      schemaVersion: 2,
+      installationId: randomUUID(),
+      clientPublicKey: publicKey.toString('base64url'),
+      clientKeyFingerprint: createHash('sha256')
+        .update(publicKey)
+        .digest('base64url'),
+    },
+  }
+}
+
+function decryptPairingEnrollment({
+  result,
+  client,
+  pairingCode,
+  idempotencyKey,
+}) {
+  assert.equal(result.installationId, client.request.installationId)
+  assert.equal(
+    result.clientKeyFingerprint,
+    client.request.clientKeyFingerprint,
+  )
+  const sealed = result.sealedEnrollment
+  assert.deepEqual({
+    schemaVersion: sealed.schemaVersion,
+    keyAgreement: sealed.keyAgreement,
+    keyDerivation: sealed.keyDerivation,
+    contentEncryption: sealed.contentEncryption,
+  }, {
+    schemaVersion: 1,
+    keyAgreement: 'X25519',
+    keyDerivation: 'HKDF-SHA256',
+    contentEncryption: 'A256GCM',
+  })
+  const context = Buffer.from(sealed.authenticatedContext, 'base64url')
+  const sharedSecret = diffieHellman({
+    privateKey: client.privateKey,
+    publicKey: createPublicKey({
+      key: Buffer.from(sealed.serverPublicKey, 'base64url'),
+      format: 'der',
+      type: 'spki',
+    }),
+  })
+  const key = Buffer.from(hkdfSync(
+    'sha256',
+    sharedSecret,
+    Buffer.from(sealed.salt, 'base64url'),
+    context,
+    32,
+  ))
+  try {
+    const decipher = createDecipheriv(
+      'aes-256-gcm',
+      key,
+      Buffer.from(sealed.iv, 'base64url'),
+    )
+    decipher.setAAD(context)
+    decipher.setAuthTag(Buffer.from(sealed.authTag, 'base64url'))
+    const plaintext = Buffer.concat([
+      decipher.update(Buffer.from(sealed.ciphertext, 'base64url')),
+      decipher.final(),
+    ])
+    const enrollment = JSON.parse(plaintext.toString('utf8'))
+    plaintext.fill(0)
+    assert.equal(enrollment.schemaVersion, 1)
+    assert.equal(
+      enrollment.binding.pairingGrantId,
+      pairingCode.split('.')[2].toLowerCase(),
+    )
+    assert.equal(
+      enrollment.binding.installationId,
+      client.request.installationId,
+    )
+    assert.equal(
+      enrollment.binding.clientKeyFingerprint,
+      client.request.clientKeyFingerprint,
+    )
+    assert.equal(enrollment.binding.idempotencyKey, idempotencyKey)
+    assert.equal(enrollment.agent.id, result.agent.id)
+    assert.equal(enrollment.agent.globalId, result.agent.globalId)
+    assert.equal(enrollment.agent.name, result.agent.name)
+    assert.equal(
+      enrollment.agent.warehouseGlobalId,
+      result.agent.warehouseGlobalId,
+    )
+    return enrollment
+  } finally {
+    sharedSecret.fill(0)
+    key.fill(0)
+  }
 }
 
 const managedSandboxFulfillmentConfiguration = {
@@ -998,44 +1107,154 @@ async function verifyRuntime(connectionString) {
       /different print-agent pairing request/,
     )
 
+    const pairingClient = pairingRecoveryClient()
+    const pairingRedemptionKey = `redeem-pairing-${fixture.suffix}`
     const pairingRedemption = await persistence
       .redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: pairingIssue.pairingGrant.pairingCode,
-        idempotencyKey: `redeem-pairing-${fixture.suffix}`,
+        idempotencyKey: pairingRedemptionKey,
+        client: pairingClient.request,
       })
     assert.equal(pairingRedemption.replayed, false)
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(pairingRedemption, 'credential'),
+      false,
+      'The API-facing persistence result must never expose plaintext cpprint',
+    )
+    const decryptedPairing = decryptPairingEnrollment({
+      result: pairingRedemption,
+      client: pairingClient,
+      pairingCode: pairingIssue.pairingGrant.pairingCode,
+      idempotencyKey: pairingRedemptionKey,
+    })
     assert.match(
-      pairingRedemption.credential,
+      decryptedPairing.credential,
       /^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
     )
     assert.equal(
+      decryptedPairing.binding.organizationId,
+      fixture.organizationId,
+      'The sealed enrollment must be bound to the grant organization',
+    )
+    assert.equal(
       pairingRedemption.agent.id,
-      pairingRedemption.credential.split('.')[2],
+      decryptedPairing.credential.split('.')[2],
       'Redeemed credential must use the grant-reserved agent identity',
     )
     assert.ok(
       await persistence.authenticateOperationsPrintAgentInPostgres(
-        pairingRedemption.credential,
+        decryptedPairing.credential,
       ),
       'A redeemed credential must authenticate immediately',
     )
+    assert.equal(
+      JSON.stringify(auditCalls).includes(decryptedPairing.credential),
+      false,
+      'Audit events must never log a plaintext cpprint credential',
+    )
     const redeemedGrant = await pool.query(
-      `SELECT status, print_agent_id::text, redemption_idempotency_key
+      `SELECT
+         status,
+         print_agent_id::text,
+         redemption_idempotency_key,
+         redemption_protocol,
+         client_installation_id::text,
+         client_public_key_spki,
+         client_key_fingerprint,
+         credential_envelope,
+         credential_envelope_sha256,
+         recovery_expires_at > redeemed_at AS bounded_recovery,
+         recovery_expires_at <= redeemed_at + interval '10 minutes'
+           AS recovery_within_ten_minutes
        FROM operations_print_agent_pairing_grants
        WHERE id = $1::uuid`,
       [pairingIssue.pairingGrant.id],
     )
-    assert.deepEqual(redeemedGrant.rows[0], {
+    assert.deepEqual({
+      status: redeemedGrant.rows[0].status,
+      print_agent_id: redeemedGrant.rows[0].print_agent_id,
+      redemption_idempotency_key:
+        redeemedGrant.rows[0].redemption_idempotency_key,
+      redemption_protocol: redeemedGrant.rows[0].redemption_protocol,
+      client_installation_id: redeemedGrant.rows[0].client_installation_id,
+      client_public_key_spki: redeemedGrant.rows[0].client_public_key_spki,
+      client_key_fingerprint: redeemedGrant.rows[0].client_key_fingerprint,
+      bounded_recovery: redeemedGrant.rows[0].bounded_recovery,
+      recovery_within_ten_minutes:
+        redeemedGrant.rows[0].recovery_within_ten_minutes,
+    }, {
       status: 'redeemed',
       print_agent_id: pairingRedemption.agent.id,
-      redemption_idempotency_key: `redeem-pairing-${fixture.suffix}`,
+      redemption_idempotency_key: pairingRedemptionKey,
+      redemption_protocol: 'x25519-hkdf-sha256-aes-256-gcm-v1',
+      client_installation_id: pairingClient.request.installationId,
+      client_public_key_spki: pairingClient.request.clientPublicKey,
+      client_key_fingerprint: pairingClient.request.clientKeyFingerprint,
+      bounded_recovery: true,
+      recovery_within_ten_minutes: true,
     })
+    assert.match(
+      redeemedGrant.rows[0].credential_envelope_sha256,
+      /^[a-f0-9]{64}$/,
+    )
+    assert.doesNotMatch(
+      JSON.stringify(redeemedGrant.rows[0]),
+      /cpprint[.]v1[.]/,
+      'The grant row must contain only a sealed credential envelope',
+    )
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_print_agent_pairing_grants
+         SET credential_envelope = credential_envelope
+           || '{"ciphertext":"tampered"}'::jsonb
+         WHERE id = $1::uuid`,
+        [pairingIssue.pairingGrant.id],
+      ),
+      /Terminal print-agent pairing grants are immutable/,
+    )
+
+    // Simulate a committed database transaction whose HTTPS response was lost.
+    // The exact same installation key and Idempotency-Key recover the same
+    // envelope and authoritative agent without creating another agent.
+    const recoveredPairing = await persistence
+      .redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: pairingRedemptionKey,
+        client: pairingClient.request,
+      })
+    assert.equal(recoveredPairing.replayed, true)
+    assert.deepEqual(
+      structuredClone(recoveredPairing.sealedEnrollment),
+      structuredClone(pairingRedemption.sealedEnrollment),
+    )
+    assert.equal(recoveredPairing.agent.id, pairingRedemption.agent.id)
+    assert.equal(recoveredPairing.agent.globalId, pairingRedemption.agent.globalId)
+    assert.equal(
+      (await pool.query(
+        `SELECT count(*)::int AS count
+         FROM operations_print_agents
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [fixture.organizationId, pairingRedemption.agent.id],
+      )).rows[0].count,
+      1,
+    )
     await expectRejected(
       () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: pairingIssue.pairingGrant.pairingCode,
         idempotencyKey: `redeem-replay-${fixture.suffix}`,
+        client: pairingClient.request,
       }),
-      /already used/,
+      /original installation and Idempotency-Key/,
+    )
+    const differentPairingClient = pairingRecoveryClient()
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: pairingRedemptionKey,
+        client: differentPairingClient.request,
+      }),
+      /different print-agent installation key/,
     )
 
     const concurrentIssue = await persistence
@@ -1044,31 +1263,34 @@ async function verifyRuntime(connectionString) {
         name: 'Concurrent pairing agent',
         idempotencyKey: `pairing-concurrent-${fixture.suffix}`,
       })
+    const concurrentPairingClient = pairingRecoveryClient()
+    const concurrentRedemptionKey = `pairing-concurrent-${fixture.suffix}`
     const concurrentRedemptions = await Promise.allSettled([
       persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: concurrentIssue.pairingGrant.pairingCode,
-        idempotencyKey: `pairing-concurrent-a-${fixture.suffix}`,
+        idempotencyKey: concurrentRedemptionKey,
+        client: concurrentPairingClient.request,
       }),
       persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: concurrentIssue.pairingGrant.pairingCode,
-        idempotencyKey: `pairing-concurrent-b-${fixture.suffix}`,
+        idempotencyKey: concurrentRedemptionKey,
+        client: concurrentPairingClient.request,
       }),
     ])
     assert.equal(
       concurrentRedemptions.filter((result) => result.status === 'fulfilled').length,
-      1,
-      'Exactly one concurrent redemption may receive a cpprint credential',
+      2,
+      'Exact concurrent retries must recover one sealed enrollment',
     )
     assert.equal(
       concurrentRedemptions.filter((result) => result.status === 'rejected').length,
-      1,
+      0,
     )
-    assert.match(
-      String(
-        concurrentRedemptions.find((result) => result.status === 'rejected')
-          ?.reason?.message || '',
-      ),
-      /already used/,
+    const concurrentValues = concurrentRedemptions.map((result) => result.value)
+    assert.equal(new Set(concurrentValues.map((result) => result.agent.id)).size, 1)
+    assert.deepEqual(
+      structuredClone(concurrentValues[0].sealedEnrollment),
+      structuredClone(concurrentValues[1].sealedEnrollment),
     )
 
     const invalidSecretIssue = await persistence
@@ -1082,10 +1304,12 @@ async function verifyRuntime(connectionString) {
     const wrongPairingCode = `${correctPairingCode.slice(0, -1)}${
       finalCharacter === 'A' ? 'B' : 'A'
     }`
+    const invalidSecretClient = pairingRecoveryClient()
     await expectRejected(
       () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: wrongPairingCode,
         idempotencyKey: `pairing-wrong-${fixture.suffix}`,
+        client: invalidSecretClient.request,
       }),
       /pairing code is invalid/i,
     )
@@ -1103,8 +1327,9 @@ async function verifyRuntime(connectionString) {
       .redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: correctPairingCode,
         idempotencyKey: `pairing-valid-after-wrong-${fixture.suffix}`,
+        client: invalidSecretClient.request,
       })
-    assert.ok(validAfterWrongSecret.credential)
+    assert.ok(validAfterWrongSecret.sealedEnrollment)
 
     const expiredMaterial = persistence.createOperationsPrintAgentPairingCode()
     const expiredReservedAgentId = randomUUID()
@@ -1139,6 +1364,7 @@ async function verifyRuntime(connectionString) {
       () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
         pairingCode: expiredMaterial.pairingCode,
         idempotencyKey: `redeem-expired-${fixture.suffix}`,
+        client: pairingRecoveryClient().request,
       }),
       /expired/,
     )
@@ -1152,6 +1378,156 @@ async function verifyRuntime(connectionString) {
       status: 'expired',
       expired: true,
     })
+
+    const legacyConsumedAgent = await persistence.enrollOperationsPrintAgentInPostgres({
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Pre-recovery pairing agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `pre-recovery-agent-${fixture.suffix}`,
+      ...printing.DEFAULT_PRINT_AGENT_CAPABILITIES,
+    })
+    const legacyConsumedMaterial = persistence
+      .createOperationsPrintAgentPairingCode()
+    await pool.query(
+      `INSERT INTO operations_print_agent_pairing_grants (
+         id, organization_id, warehouse_id, reserved_agent_id, name,
+         secret_hash, supported_formats, supported_media,
+         supported_document_types, status, request_fingerprint,
+         idempotency_key, created_by, created_at, expires_at,
+         redeemed_at, print_agent_id, redemption_idempotency_key,
+         redemption_request_fingerprint
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+         $6, $7::text[], $8::text[],
+         $9::text[], 'redeemed', $10,
+         $11, $12, clock_timestamp() - interval '2 minutes',
+         clock_timestamp() + interval '8 minutes',
+         clock_timestamp() - interval '1 minute', $4::uuid, $13, $14
+       )`,
+      [
+        legacyConsumedMaterial.pairingGrantId,
+        fixture.organizationId,
+        fixture.warehouseId,
+        legacyConsumedAgent.agent.id,
+        'Pre-recovery pairing agent',
+        legacyConsumedMaterial.secretHash,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        persistence.operationsPrintDeliveryFingerprint({ legacy: true }),
+        `pre-recovery-grant-${fixture.suffix}`,
+        fixture.actorEmail,
+        `pre-recovery-redeem-${fixture.suffix}`,
+        persistence.operationsPrintDeliveryFingerprint({
+          legacyRedemption: true,
+        }),
+      ],
+    )
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: legacyConsumedMaterial.pairingCode,
+        idempotencyKey: `pre-recovery-redeem-${fixture.suffix}`,
+        client: pairingRecoveryClient().request,
+      }),
+      /redeemed by an older client/,
+    )
+
+    const recoveryExpiredAgent = await persistence.enrollOperationsPrintAgentInPostgres({
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Expired recovery-window agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `expired-recovery-agent-${fixture.suffix}`,
+      ...printing.DEFAULT_PRINT_AGENT_CAPABILITIES,
+    })
+    const recoveryExpiredMaterial = persistence
+      .createOperationsPrintAgentPairingCode()
+    const recoveryExpiredClient = pairingRecoveryClient()
+    const recoveryExpiredKey = `expired-recovery-redeem-${fixture.suffix}`
+    const recoveryExpiredFingerprint = persistence
+      .operationsPrintDeliveryFingerprint({
+        action: 'redeem-print-agent-pairing-grant-v2',
+        protocol: 'x25519-hkdf-sha256-aes-256-gcm-v1',
+        pairingGrantId: recoveryExpiredMaterial.pairingGrantId,
+        organizationId: fixture.organizationId,
+        reservedAgentId: recoveryExpiredAgent.agent.id,
+        warehouseId: fixture.warehouseId,
+        name: 'Expired recovery-window agent',
+        supportedFormats: printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+        supportedMedia: printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+        supportedDocumentTypes:
+          printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        installationId: recoveryExpiredClient.request.installationId,
+        clientKeyFingerprint:
+          recoveryExpiredClient.request.clientKeyFingerprint,
+        idempotencyKey: recoveryExpiredKey,
+      })
+    await pool.query(
+      `INSERT INTO operations_print_agent_pairing_grants (
+         id, organization_id, warehouse_id, reserved_agent_id, name,
+         secret_hash, supported_formats, supported_media,
+         supported_document_types, status, request_fingerprint,
+         idempotency_key, created_by, created_at, expires_at,
+         redeemed_at, print_agent_id, redemption_idempotency_key,
+         redemption_request_fingerprint, redemption_protocol,
+         client_installation_id, client_public_key_spki,
+         client_key_fingerprint, credential_envelope,
+         credential_envelope_sha256, recovery_expires_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+         $6, $7::text[], $8::text[],
+         $9::text[], 'redeemed', $10,
+         $11, $12, clock_timestamp() - interval '4 minutes',
+         clock_timestamp() + interval '5 minutes',
+         clock_timestamp() - interval '2 minutes', $4::uuid, $13,
+         $14, 'x25519-hkdf-sha256-aes-256-gcm-v1',
+         $15::uuid, $16, $17, $18::jsonb, $19,
+         clock_timestamp() - interval '1 minute'
+       )`,
+      [
+        recoveryExpiredMaterial.pairingGrantId,
+        fixture.organizationId,
+        fixture.warehouseId,
+        recoveryExpiredAgent.agent.id,
+        'Expired recovery-window agent',
+        recoveryExpiredMaterial.secretHash,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        persistence.operationsPrintDeliveryFingerprint({
+          expiredRecoveryGrant: true,
+        }),
+        `expired-recovery-grant-${fixture.suffix}`,
+        fixture.actorEmail,
+        recoveryExpiredKey,
+        recoveryExpiredFingerprint,
+        recoveryExpiredClient.request.installationId,
+        recoveryExpiredClient.request.clientPublicKey,
+        recoveryExpiredClient.request.clientKeyFingerprint,
+        JSON.stringify({
+          schemaVersion: 1,
+          keyAgreement: 'X25519',
+          keyDerivation: 'HKDF-SHA256',
+          contentEncryption: 'A256GCM',
+          serverPublicKey: 'A'.repeat(59),
+          salt: 'B'.repeat(43),
+          iv: 'C'.repeat(16),
+          ciphertext: 'D',
+          authTag: 'E'.repeat(22),
+          authenticatedContext: 'F',
+        }),
+        'd'.repeat(64),
+      ],
+    )
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: recoveryExpiredMaterial.pairingCode,
+        idempotencyKey: recoveryExpiredKey,
+        client: recoveryExpiredClient.request,
+      }),
+      /pairing recovery window expired/i,
+    )
 
     const legacyBundledEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,

@@ -83,6 +83,16 @@ type PrintAgentPairingGrantRow = {
   created_at: TimestampValue
   expires_at: TimestampValue
   print_agent_id: string | null
+  redemption_idempotency_key?: string | null
+  redemption_request_fingerprint?: string | null
+  redemption_protocol?: string | null
+  client_installation_id?: string | null
+  client_public_key_spki?: string | null
+  client_key_fingerprint?: string | null
+  credential_envelope?: OperationsPrintAgentSealedEnrollment | null
+  credential_envelope_sha256?: string | null
+  recovery_expires_at?: TimestampValue | null
+  redemption_clock?: TimestampValue
   is_expired?: boolean
 }
 
@@ -95,6 +105,30 @@ export type OperationsPrintAgentPairingGrant = {
   supportedFormats: OperationsPrintAgentProfile['supportedFormats']
   supportedMedia: OperationsPrintAgentProfile['supportedMedia']
   supportedDocumentTypes: OperationsPrintAgentProfile['supportedDocumentTypes']
+}
+
+export const OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION = 2 as const
+export const OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_PROTOCOL =
+  'x25519-hkdf-sha256-aes-256-gcm-v1' as const
+
+export type OperationsPrintAgentPairingClient = {
+  schemaVersion: typeof OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION
+  installationId: string
+  clientPublicKey: string
+  clientKeyFingerprint: string
+}
+
+export type OperationsPrintAgentSealedEnrollment = {
+  schemaVersion: 1
+  keyAgreement: 'X25519'
+  keyDerivation: 'HKDF-SHA256'
+  contentEncryption: 'A256GCM'
+  serverPublicKey: string
+  salt: string
+  iv: string
+  ciphertext: string
+  authTag: string
+  authenticatedContext: string
 }
 
 type PrintJobRow = {
@@ -314,6 +348,9 @@ const PRINT_AGENT_CREDENTIAL =
   /^cpprint\.v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/i
 const PRINT_AGENT_PAIRING_CODE =
   /^cppair\.v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/i
+const X25519_SPKI_BASE64URL = /^[A-Za-z0-9_-]{59}$/
+const SHA256_BASE64URL = /^[A-Za-z0-9_-]{43}$/
+const PAIRING_RECOVERY_WINDOW_MS = 10 * 60 * 1000
 const STORAGE_PROTOCOLS = new Set([
   'https:',
   's3:',
@@ -718,6 +755,175 @@ function parsePrintAgentPairingCode(value: string) {
     : null
 }
 
+function strictBase64UrlBytes(value: string) {
+  const encoded = String(value || '').trim()
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) return null
+  const bytes = Buffer.from(encoded, 'base64url')
+  return bytes.length > 0 && bytes.toString('base64url') === encoded
+    ? bytes
+    : null
+}
+
+function pairingClientKeyFingerprint(spki: Buffer) {
+  return crypto.createHash('sha256').update(spki).digest('base64url')
+}
+
+function requiredPairingClient(
+  input: OperationsPrintAgentPairingClient,
+): OperationsPrintAgentPairingClient & { publicKey: crypto.KeyObject } {
+  if (
+    input.schemaVersion
+      !== OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_PROTOCOL_REQUIRED',
+      'This print-agent build does not support recovery-safe pairing',
+      426,
+    )
+  }
+  const installationId = String(input.installationId || '').trim().toLowerCase()
+  const clientPublicKey = String(input.clientPublicKey || '').trim()
+  const clientKeyFingerprint = String(input.clientKeyFingerprint || '').trim()
+  if (
+    !UUID.test(installationId)
+    || !X25519_SPKI_BASE64URL.test(clientPublicKey)
+    || !SHA256_BASE64URL.test(clientKeyFingerprint)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_INVALID',
+      'Print-agent installation identity or recovery key is invalid',
+    )
+  }
+  const spki = strictBase64UrlBytes(clientPublicKey)
+  if (!spki || spki.length !== 44) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_INVALID',
+      'Print-agent recovery public key is invalid',
+    )
+  }
+  let publicKey: crypto.KeyObject
+  try {
+    publicKey = crypto.createPublicKey({
+      key: spki,
+      format: 'der',
+      type: 'spki',
+    })
+  } catch {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_INVALID',
+      'Print-agent recovery public key is invalid',
+    )
+  }
+  const canonical = Buffer.from(publicKey.export({ format: 'der', type: 'spki' }))
+  const derivedFingerprint = pairingClientKeyFingerprint(canonical)
+  if (
+    publicKey.asymmetricKeyType !== 'x25519'
+    || !canonical.equals(spki)
+    || !crypto.timingSafeEqual(
+      Buffer.from(derivedFingerprint, 'base64url'),
+      Buffer.from(clientKeyFingerprint, 'base64url'),
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_INVALID',
+      'Print-agent recovery key fingerprint is invalid',
+    )
+  }
+  return {
+    schemaVersion: input.schemaVersion,
+    installationId,
+    clientPublicKey,
+    clientKeyFingerprint,
+    publicKey,
+  }
+}
+
+function createPairingCredentialEnvelope(input: {
+  pairingGrantId: string
+  organizationId: string
+  installationId: string
+  clientKeyFingerprint: string
+  idempotencyKey: string
+  redemptionRequestFingerprint: string
+  recoveryExpiresAt: string
+  clientPublicKey: crypto.KeyObject
+  credential: string
+  agent: OperationsPrintAgentProfile
+}) {
+  const binding = {
+    endpoint: '/api/operations/print-agent/pair',
+    pairingGrantId: input.pairingGrantId,
+    organizationId: input.organizationId,
+    printAgentId: input.agent.id,
+    printAgentGlobalId: input.agent.globalId,
+    installationId: input.installationId,
+    clientKeyFingerprint: input.clientKeyFingerprint,
+    idempotencyKey: input.idempotencyKey,
+    redemptionRequestFingerprint: input.redemptionRequestFingerprint,
+    recoveryExpiresAt: input.recoveryExpiresAt,
+  }
+  const authenticatedContext = Buffer.from(stableJson(binding), 'utf8')
+  const plaintext = Buffer.from(stableJson({
+    schemaVersion: 1,
+    credential: input.credential,
+    agent: {
+      id: input.agent.id,
+      globalId: input.agent.globalId,
+      name: input.agent.name,
+      warehouseId: input.agent.warehouseId,
+      warehouseGlobalId: input.agent.warehouseGlobalId,
+      warehouseName: input.agent.warehouseName,
+    },
+    binding,
+  }), 'utf8')
+  const ephemeral = crypto.generateKeyPairSync('x25519')
+  const serverPublicKey = Buffer.from(ephemeral.publicKey.export({
+    format: 'der',
+    type: 'spki',
+  }))
+  const salt = crypto.randomBytes(32)
+  const iv = crypto.randomBytes(12)
+  const sharedSecret = crypto.diffieHellman({
+    privateKey: ephemeral.privateKey,
+    publicKey: input.clientPublicKey,
+  })
+  const key = Buffer.from(crypto.hkdfSync(
+    'sha256',
+    sharedSecret,
+    salt,
+    authenticatedContext,
+    32,
+  ))
+  try {
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+    cipher.setAAD(authenticatedContext)
+    const ciphertext = Buffer.concat([
+      cipher.update(plaintext),
+      cipher.final(),
+    ])
+    const envelope: OperationsPrintAgentSealedEnrollment = {
+      schemaVersion: 1,
+      keyAgreement: 'X25519',
+      keyDerivation: 'HKDF-SHA256',
+      contentEncryption: 'A256GCM',
+      serverPublicKey: serverPublicKey.toString('base64url'),
+      salt: salt.toString('base64url'),
+      iv: iv.toString('base64url'),
+      ciphertext: ciphertext.toString('base64url'),
+      authTag: cipher.getAuthTag().toString('base64url'),
+      authenticatedContext: authenticatedContext.toString('base64url'),
+    }
+    return {
+      envelope,
+      envelopeSha256: contentHash(stableJson(envelope)),
+    }
+  } finally {
+    plaintext.fill(0)
+    sharedSecret.fill(0)
+    key.fill(0)
+  }
+}
+
 function stableStorageReference(value: string) {
   const storageReference = String(value || '').trim()
   if (
@@ -1054,6 +1260,22 @@ async function oneAgent(
     )
   }
   return agentProfile(result.rows[0])
+}
+
+async function maybeAgentById(
+  organizationId: string,
+  id: string,
+  client: PoolClient,
+) {
+  const result = await client.query<PrintAgentRow>(
+    `${PRINT_AGENT_SELECT}
+     WHERE agent.organization_id = $1::uuid
+       AND agent.id = $2::uuid
+     GROUP BY agent.id, warehouse.global_id, warehouse.name
+     LIMIT 1`,
+    [organizationId, id],
+  )
+  return result.rows[0] ? agentProfile(result.rows[0]) : null
 }
 
 async function oneJob(
@@ -1539,19 +1761,33 @@ type PairingRedemptionOutcome =
   | {
       kind: 'redeemed'
       agent: OperationsPrintAgentProfile
-      credential: string
+      sealedEnrollment: OperationsPrintAgentSealedEnrollment
+      recoveryExpiresAt: string
+      replayed: boolean
     }
   | {
-      kind: 'invalid' | 'expired' | 'consumed' | 'revoked'
+      kind:
+        | 'invalid'
+        | 'expired'
+        | 'legacy_consumed'
+        | 'client_mismatch'
+        | 'replay_mismatch'
+        | 'recovery_expired'
+        | 'revoked'
+        | 'corrupt'
     }
 
 export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
   pairingCode: string
   idempotencyKey: string
+  client: OperationsPrintAgentPairingClient
 }): Promise<{
   agent: OperationsPrintAgentProfile
-  credential: string
-  replayed: false
+  sealedEnrollment: OperationsPrintAgentSealedEnrollment
+  installationId: string
+  clientKeyFingerprint: string
+  recoveryExpiresAt: string
+  replayed: boolean
 }> {
   const parsed = parsePrintAgentPairingCode(input.pairingCode)
   if (!parsed) {
@@ -1562,6 +1798,7 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
     )
   }
   const idempotencyKey = requiredIdempotencyKey(input.idempotencyKey)
+  const pairingClient = requiredPairingClient(input.client)
   const suppliedSecretHash = hashOperationsPrintAgentPairingSecret(
     parsed.pairingGrantId,
     parsed.secret,
@@ -1590,7 +1827,16 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
          created_at,
          expires_at,
          print_agent_id::text,
-         expires_at <= clock_timestamp() AS is_expired
+         redemption_idempotency_key,
+         redemption_request_fingerprint,
+         redemption_protocol,
+         client_installation_id::text,
+         client_public_key_spki,
+         client_key_fingerprint,
+         credential_envelope,
+         credential_envelope_sha256,
+         recovery_expires_at,
+         clock_timestamp() AS redemption_clock
        FROM operations_print_agent_pairing_grants
        WHERE id = $1::uuid
        FOR UPDATE`,
@@ -1602,16 +1848,122 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
     if (!secureHashEqual(grant.secret_hash, suppliedSecretHash)) {
       return { kind: 'invalid' }
     }
+    const redemptionClock = grant.redemption_clock
+      ? new Date(grant.redemption_clock)
+      : null
+    if (!redemptionClock || !Number.isFinite(redemptionClock.getTime())) {
+      return { kind: 'corrupt' }
+    }
 
-    if (grant.status === 'redeemed') return { kind: 'consumed' }
+    const redemptionRequestFingerprint = fingerprint({
+      action: 'redeem-print-agent-pairing-grant-v2',
+      protocol: OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_PROTOCOL,
+      pairingGrantId: grant.id,
+      organizationId: grant.organization_id,
+      reservedAgentId: grant.reserved_agent_id,
+      warehouseId: grant.warehouse_id,
+      name: grant.name,
+      supportedFormats: grant.supported_formats,
+      supportedMedia: grant.supported_media,
+      supportedDocumentTypes: grant.supported_document_types,
+      installationId: pairingClient.installationId,
+      clientKeyFingerprint: pairingClient.clientKeyFingerprint,
+      idempotencyKey,
+    })
+
+    if (grant.status === 'redeemed') {
+      if (
+        !grant.redemption_protocol
+        || !grant.client_installation_id
+        || !grant.client_public_key_spki
+        || !grant.client_key_fingerprint
+        || !grant.credential_envelope
+        || !grant.credential_envelope_sha256
+        || !grant.recovery_expires_at
+        || !grant.print_agent_id
+        || !UUID.test(grant.print_agent_id)
+      ) {
+        return { kind: 'legacy_consumed' }
+      }
+      if (
+        grant.redemption_protocol
+          !== OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_PROTOCOL
+        || grant.client_installation_id !== pairingClient.installationId
+        || grant.client_public_key_spki !== pairingClient.clientPublicKey
+        || grant.client_key_fingerprint !== pairingClient.clientKeyFingerprint
+      ) {
+        return { kind: 'client_mismatch' }
+      }
+      if (
+        grant.redemption_idempotency_key !== idempotencyKey
+        || grant.redemption_request_fingerprint
+          !== redemptionRequestFingerprint
+      ) {
+        return { kind: 'replay_mismatch' }
+      }
+      const recoveryExpiresAt = iso(grant.recovery_expires_at) as string
+      const recoveryExpiresAtMs = new Date(recoveryExpiresAt).getTime()
+      if (
+        !Number.isFinite(recoveryExpiresAtMs)
+        || recoveryExpiresAtMs <= redemptionClock.getTime()
+      ) {
+        return { kind: 'recovery_expired' }
+      }
+      if (!secureHashEqual(
+        grant.credential_envelope_sha256,
+        contentHash(stableJson(grant.credential_envelope)),
+      )) {
+        return { kind: 'corrupt' }
+      }
+      const agent = await maybeAgentById(
+        grant.organization_id,
+        grant.print_agent_id,
+        client,
+      )
+      if (
+        !agent
+        || agent.id !== grant.reserved_agent_id
+        || agent.status === 'revoked'
+      ) {
+        return agent?.status === 'revoked'
+          ? { kind: 'revoked' }
+          : { kind: 'corrupt' }
+      }
+      const expectedContext = Buffer.from(stableJson({
+        endpoint: '/api/operations/print-agent/pair',
+        pairingGrantId: grant.id,
+        organizationId: grant.organization_id,
+        printAgentId: agent.id,
+        printAgentGlobalId: agent.globalId,
+        installationId: pairingClient.installationId,
+        clientKeyFingerprint: pairingClient.clientKeyFingerprint,
+        idempotencyKey,
+        redemptionRequestFingerprint,
+        recoveryExpiresAt,
+      }), 'utf8').toString('base64url')
+      if (
+        grant.credential_envelope.authenticatedContext !== expectedContext
+      ) {
+        return { kind: 'corrupt' }
+      }
+      return {
+        kind: 'redeemed',
+        agent,
+        sealedEnrollment: grant.credential_envelope,
+        recoveryExpiresAt,
+        replayed: true,
+      }
+    }
     if (grant.status === 'expired') return { kind: 'expired' }
     if (grant.status === 'revoked') return { kind: 'revoked' }
-    if (grant.is_expired) {
+    const grantExpiresAt = new Date(grant.expires_at).getTime()
+    if (!Number.isFinite(grantExpiresAt)) return { kind: 'corrupt' }
+    if (grantExpiresAt <= redemptionClock.getTime()) {
       await client.query(
         `UPDATE operations_print_agent_pairing_grants
-         SET status = 'expired', expired_at = clock_timestamp()
+         SET status = 'expired', expired_at = $2::timestamptz
          WHERE id = $1::uuid`,
-        [grant.id],
+        [grant.id, redemptionClock.toISOString()],
       )
       return { kind: 'expired' }
     }
@@ -1619,16 +1971,6 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
     const generated = createOperationsPrintAgentCredential(
       grant.reserved_agent_id,
     )
-    const redemptionRequestFingerprint = fingerprint({
-      action: 'redeem-print-agent-pairing-grant',
-      pairingGrantId: grant.id,
-      reservedAgentId: grant.reserved_agent_id,
-      warehouseId: grant.warehouse_id,
-      name: grant.name,
-      supportedFormats: grant.supported_formats,
-      supportedMedia: grant.supported_media,
-      supportedDocumentTypes: grant.supported_document_types,
-    })
     const inserted = await client.query<{ global_id: string }>(
       `INSERT INTO operations_print_agents (
          id,
@@ -1670,21 +2012,56 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
         grant.supported_document_types,
       ],
     )
-    await client.query(
-      `UPDATE operations_print_agent_pairing_grants
-       SET
-         status = 'redeemed',
-         redeemed_at = clock_timestamp(),
-         print_agent_id = reserved_agent_id,
-         redemption_idempotency_key = $2,
-         redemption_request_fingerprint = $3
-       WHERE id = $1::uuid`,
-      [grant.id, idempotencyKey, redemptionRequestFingerprint],
-    )
     const agent = await oneAgent(
       grant.organization_id,
       inserted.rows[0].global_id,
       client,
+    )
+    const redeemedAt = redemptionClock.toISOString()
+    const recoveryExpiresAt = new Date(
+      redemptionClock.getTime() + PAIRING_RECOVERY_WINDOW_MS,
+    ).toISOString()
+    const sealed = createPairingCredentialEnvelope({
+      pairingGrantId: grant.id,
+      organizationId: grant.organization_id,
+      installationId: pairingClient.installationId,
+      clientKeyFingerprint: pairingClient.clientKeyFingerprint,
+      idempotencyKey,
+      redemptionRequestFingerprint,
+      recoveryExpiresAt,
+      clientPublicKey: pairingClient.publicKey,
+      credential: generated.credential,
+      agent,
+    })
+    await client.query(
+      `UPDATE operations_print_agent_pairing_grants
+       SET
+         status = 'redeemed',
+         redeemed_at = $2::timestamptz,
+         print_agent_id = reserved_agent_id,
+         redemption_idempotency_key = $3,
+         redemption_request_fingerprint = $4,
+         redemption_protocol = $5,
+         client_installation_id = $6::uuid,
+         client_public_key_spki = $7,
+         client_key_fingerprint = $8,
+         credential_envelope = $9::jsonb,
+         credential_envelope_sha256 = $10,
+         recovery_expires_at = $11::timestamptz
+       WHERE id = $1::uuid`,
+      [
+        grant.id,
+        redeemedAt,
+        idempotencyKey,
+        redemptionRequestFingerprint,
+        OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_PROTOCOL,
+        pairingClient.installationId,
+        pairingClient.clientPublicKey,
+        pairingClient.clientKeyFingerprint,
+        JSON.stringify(sealed.envelope),
+        sealed.envelopeSha256,
+        recoveryExpiresAt,
+      ],
     )
     await recordAuditEvent({
       eventType: 'operations.print_agent.enrolled',
@@ -1698,6 +2075,9 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
         pairingGrantId: grant.id,
         printAgentGlobalId: agent.globalId,
         warehouseGlobalId: agent.warehouseGlobalId,
+        pairingProtocol: OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_PROTOCOL,
+        clientKeyFingerprint: pairingClient.clientKeyFingerprint,
+        recoveryExpiresAt,
         credentialVersion: agent.credentialVersion,
         supportedFormats: agent.supportedFormats,
         supportedMedia: agent.supportedMedia,
@@ -1707,15 +2087,20 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
     return {
       kind: 'redeemed',
       agent,
-      credential: generated.credential,
+      sealedEnrollment: sealed.envelope,
+      recoveryExpiresAt,
+      replayed: false,
     }
   })
 
   if (outcome.kind === 'redeemed') {
     return {
       agent: outcome.agent,
-      credential: outcome.credential,
-      replayed: false,
+      sealedEnrollment: outcome.sealedEnrollment,
+      installationId: pairingClient.installationId,
+      clientKeyFingerprint: pairingClient.clientKeyFingerprint,
+      recoveryExpiresAt: outcome.recoveryExpiresAt,
+      replayed: outcome.replayed,
     }
   }
   const failures = {
@@ -1729,15 +2114,35 @@ export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
       message: 'Print-agent pairing code expired; create a new code',
       status: 410,
     },
-    consumed: {
-      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_CONSUMED',
-      message: 'Print-agent pairing code was already used; create a new code',
+    legacy_consumed: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_RECOVERY_UNAVAILABLE',
+      message: 'This pairing code was redeemed by an older client; revoke the orphaned print agent and create a new code',
+      status: 410,
+    },
+    client_mismatch: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_MISMATCH',
+      message: 'This pairing code is bound to a different print-agent installation key',
+      status: 409,
+    },
+    replay_mismatch: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_REPLAY_MISMATCH',
+      message: 'Pairing recovery requires the original installation and Idempotency-Key',
+      status: 409,
+    },
+    recovery_expired: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_RECOVERY_EXPIRED',
+      message: 'The pairing recovery window expired; revoke the orphaned print agent and create a new code',
       status: 410,
     },
     revoked: {
       code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_REVOKED',
       message: 'Print-agent pairing code was revoked; create a new code',
       status: 410,
+    },
+    corrupt: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_RECOVERY_CORRUPT',
+      message: 'Stored print-agent pairing recovery evidence failed integrity validation',
+      status: 500,
     },
   } as const
   const failure = failures[outcome.kind]

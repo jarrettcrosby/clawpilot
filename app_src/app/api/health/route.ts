@@ -1941,6 +1941,7 @@ export async function GET() {
           operations_print_delivery_migration_applied: boolean
           operations_print_device_reference_privacy_applied: boolean
           operations_print_agent_pairing_grants_applied: boolean
+          operations_print_agent_pairing_recovery_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
           shopify_checkout_audience_policy_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
@@ -4365,6 +4366,40 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0295_operations_print_agent_pairing_recovery_envelopes.sql'
+              )
+              AND (
+                SELECT count(*) = 7
+                FROM pg_attribute pairing_recovery_column
+                WHERE pairing_recovery_column.attrelid = to_regclass(
+                  'operations_print_agent_pairing_grants'
+                )
+                  AND pairing_recovery_column.attname = ANY (ARRAY[
+                    'redemption_protocol',
+                    'client_installation_id',
+                    'client_public_key_spki',
+                    'client_key_fingerprint',
+                    'credential_envelope',
+                    'credential_envelope_sha256',
+                    'recovery_expires_at'
+                  ])
+                  AND NOT pairing_recovery_column.attisdropped
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint pairing_recovery_constraint
+                WHERE pairing_recovery_constraint.conrelid = to_regclass(
+                  'operations_print_agent_pairing_grants'
+                )
+                  AND pairing_recovery_constraint.conname =
+                    'operations_print_agent_pairing_grants_envelope_shape_valid'
+                  AND pairing_recovery_constraint.contype = 'c'
+                  AND pairing_recovery_constraint.convalidated
+              ) AS operations_print_agent_pairing_recovery_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
               AND EXISTS (
@@ -5346,6 +5381,7 @@ export async function GET() {
             && row?.operations_print_delivery_migration_applied
             && row?.operations_print_device_reference_privacy_applied
             && row?.operations_print_agent_pairing_grants_applied
+            && row?.operations_print_agent_pairing_recovery_applied
             && row?.shopify_carrier_configured_carriers_applied
             && row?.shopify_checkout_audience_policy_applied
             && row?.carrier_shipping_diagnostics_applied
@@ -5463,8 +5499,12 @@ export async function GET() {
           },
           printAgentPairing: {
             status: row?.operations_print_agent_pairing_grants_applied
+              && row?.operations_print_agent_pairing_recovery_applied
               ? 'ready'
               : 'migration-pending',
+            recoverySafe: Boolean(
+              row?.operations_print_agent_pairing_recovery_applied,
+            ),
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
@@ -5781,6 +5821,7 @@ export async function GET() {
           || !row?.operations_print_delivery_migration_applied
           || !row?.operations_print_device_reference_privacy_applied
           || !row?.operations_print_agent_pairing_grants_applied
+          || !row?.operations_print_agent_pairing_recovery_applied
           || !row?.shopify_carrier_configured_carriers_applied
           || !row?.shopify_checkout_audience_policy_applied
           || !row?.carrier_shipping_diagnostics_applied

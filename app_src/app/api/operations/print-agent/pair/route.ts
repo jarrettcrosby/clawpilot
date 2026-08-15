@@ -4,6 +4,7 @@ import {
   isPostgresStorageEnabled,
 } from '@/lib/persistence/config'
 import {
+  OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION,
   redeemOperationsPrintAgentPairingGrantInPostgres,
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
@@ -15,6 +16,10 @@ export const runtime = 'nodejs'
 const MAX_REQUEST_BYTES = 2 * 1024
 const PAIRING_CODE =
   /^cppair\.v1\.[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/i
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const X25519_SPKI_BASE64URL = /^[A-Za-z0-9_-]{59}$/
+const SHA256_BASE64URL = /^[A-Za-z0-9_-]{43}$/
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -119,8 +124,25 @@ async function body(req: NextRequest) {
   }
   const value = parsed as Record<string, unknown>
   if (
-    Object.keys(value).length !== 1
-    || !Object.prototype.hasOwnProperty.call(value, 'pairingCode')
+    Object.keys(value).length === 1
+    && Object.prototype.hasOwnProperty.call(value, 'pairingCode')
+  ) {
+    fail(
+      'OPERATIONS_PRINT_AGENT_PAIRING_PROTOCOL_REQUIRED',
+      'Install the current ClawPilot Print Agent to use recovery-safe pairing',
+      426,
+    )
+  }
+  const supportedFields = new Set([
+    'schemaVersion',
+    'pairingCode',
+    'installationId',
+    'clientPublicKey',
+    'clientKeyFingerprint',
+  ])
+  if (
+    Object.keys(value).length !== supportedFields.size
+    || Object.keys(value).some((field) => !supportedFields.has(field))
   ) {
     fail(
       'OPERATIONS_PRINT_AGENT_REQUEST_INVALID',
@@ -135,7 +157,30 @@ async function body(req: NextRequest) {
       401,
     )
   }
-  return pairingCode
+  const schemaVersion = value.schemaVersion
+  const installationId = String(value.installationId || '').trim().toLowerCase()
+  const clientPublicKey = String(value.clientPublicKey || '').trim()
+  const clientKeyFingerprint = String(value.clientKeyFingerprint || '').trim()
+  if (
+    schemaVersion !== OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION
+    || !UUID.test(installationId)
+    || !X25519_SPKI_BASE64URL.test(clientPublicKey)
+    || !SHA256_BASE64URL.test(clientKeyFingerprint)
+  ) {
+    fail(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CLIENT_INVALID',
+      'Print-agent recovery identity is invalid',
+    )
+  }
+  return {
+    pairingCode,
+    client: {
+      schemaVersion: OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION,
+      installationId,
+      clientPublicKey,
+      clientKeyFingerprint,
+    },
+  }
 }
 
 function errorResponse(error: unknown) {
@@ -160,12 +205,17 @@ export async function POST(req: NextRequest) {
     }
     secureTransport(req)
     installerRequest(req)
-    const pairingCode = await body(req)
+    const pairingRequest = await body(req)
     const result = await redeemOperationsPrintAgentPairingGrantInPostgres({
-      pairingCode,
+      pairingCode: pairingRequest.pairingCode,
       idempotencyKey: idempotencyKey(req),
+      client: pairingRequest.client,
     })
-    return json({ ok: true, ...result })
+    return json({
+      ok: true,
+      schemaVersion: OPERATIONS_PRINT_AGENT_PAIRING_REDEMPTION_SCHEMA_VERSION,
+      ...result,
+    })
   } catch (error) {
     return errorResponse(error)
   }
