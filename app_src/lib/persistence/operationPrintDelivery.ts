@@ -3428,7 +3428,7 @@ function isUncertainLocalAgentOutcome(
   outcome: LatestPrintAttemptOutcome | null,
 ): boolean {
   return outcome?.state === 'failed'
-    && outcome.actor_type === 'local_print_agent'
+    && ['local_print_agent', 'system'].includes(outcome.actor_type)
     && outcome.error_code === 'PRINT_OUTCOME_UNCERTAIN'
     && outcome.physical_output_verified === false
 }
@@ -3791,7 +3791,7 @@ async function recoverExpiredClaims(
   for (const job of expired.rows) {
     const requestFingerprint = fingerprint({
       state: 'failed',
-      reason: 'lease_expired',
+      reason: 'lease_expired_outcome_uncertain',
       jobGlobalId: job.global_id,
       claimToken: job.current_claim_attempt_id,
     })
@@ -3803,7 +3803,8 @@ async function recoverExpiredClaims(
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid,
          'failed', 'system', $4::uuid, $5,
-         $6, 'LEASE_EXPIRED', 'Local print-agent lease expired before acknowledgement'
+         $6, 'PRINT_OUTCOME_UNCERTAIN',
+         'Local print-agent lease expired without proving whether printer bytes were accepted; automatic retry is blocked'
        )`,
       [
         agent.organizationId,
@@ -3814,18 +3815,26 @@ async function recoverExpiredClaims(
         requestFingerprint,
       ],
     )
-    await scheduleRetry({
-      client,
-      job,
-      idempotencyKey: `print-job:${job.global_id}:lease-retry:${job.attempts + 1}`,
-      detail: job.fallback_printer_id && job.printer_id === job.requested_printer_id
-        ? 'Claim lease expired; queued on the approved fallback printer'
-        : 'Claim lease expired; queued for another bounded attempt',
-      delaySeconds: 0,
-      preferFallback: true,
-      actorEmail: null,
-      actorType: 'system',
-    })
+    await recordAuditEvent({
+      eventType: 'operations.print_job.failed',
+      aggregateType: 'operations.print_job',
+      aggregateId: job.global_id,
+      eventKey: `operations:print-job:lease-outcome-uncertain:${job.current_claim_attempt_id}`,
+      subject: agent.globalId,
+      organizationId: agent.organizationId,
+      isSystem: true,
+      payload: {
+        printJobGlobalId: job.global_id,
+        printAgentGlobalId: agent.globalId,
+        printerGlobalId: job.printer_global_id,
+        attempt: job.attempts,
+        errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+        retryQueued: false,
+        sourceOrderGlobalId: job.source_order_global_id,
+        sourceShipmentGlobalId: job.source_shipment_global_id,
+        trackingNumber: job.tracking_number,
+      },
+    }, client)
   }
 }
 
@@ -5041,7 +5050,7 @@ export async function reprintOperationsPrintJobInPostgres(input: {
     if (original.status !== 'delivered' && !uncertainOutcomeRecovery) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_REPRINT_INVALID',
-        'Only acknowledged print jobs or exact local-agent uncertain outcomes can authorize a new print',
+        'Only acknowledged print jobs or exact local-agent delivery-uncertain outcomes can authorize a new print',
         409,
       )
     }

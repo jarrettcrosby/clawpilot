@@ -558,7 +558,7 @@ function hasUncertainPrintOutcome(job: OperationsPrintJobListItem): boolean {
   const latest = job.attemptHistory[job.attemptHistory.length - 1]
   return job.status === 'failed'
     && latest?.state === 'failed'
-    && latest.actorType === 'local_print_agent'
+    && ['local_print_agent', 'system'].includes(latest.actorType)
     && latest.errorCode === 'PRINT_OUTCOME_UNCERTAIN'
     && latest.physicalOutputVerified === false
 }

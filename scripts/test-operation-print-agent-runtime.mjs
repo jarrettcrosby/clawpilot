@@ -1542,6 +1542,98 @@ async function verifyRuntime(connectionString) {
     })
     assert.equal(cancelledUncertainRecovery.status, 'cancelled')
 
+    const expiredLeaseSource = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: queued.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `expired-lease-source-${fixture.suffix}`,
+      reason: 'Create an isolated expired-lease uncertainty fixture',
+    })
+    const expiredLeaseClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: fallbackAgent,
+      idempotencyKey: `expired-lease-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(expiredLeaseClaim.length, 1)
+    assert.equal(expiredLeaseClaim[0].globalId, expiredLeaseSource.globalId)
+    await pool.query(
+      `ALTER TABLE operations_print_delivery_attempts
+       DISABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+    )
+    try {
+      await pool.query(
+        `UPDATE operations_print_delivery_attempts
+         SET occurred_at = clock_timestamp() - interval '2 seconds',
+             claim_expires_at = clock_timestamp() - interval '1 second'
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND state = 'claimed'`,
+        [fixture.organizationId, expiredLeaseClaim[0].claimToken],
+      )
+    } finally {
+      await pool.query(
+        `ALTER TABLE operations_print_delivery_attempts
+         ENABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+      )
+    }
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET claim_expires_at = clock_timestamp() - interval '1 second'
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [fixture.organizationId, expiredLeaseSource.globalId],
+    )
+    const expiredLeaseRecoveryClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: fallbackAgent,
+      idempotencyKey: `expired-lease-recovery-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(expiredLeaseRecoveryClaim.length, 0)
+    const expiredLeaseWorkspace = await persistence.readOperationsPrintJobWorkspaceFromPostgres({
+      organizationId: fixture.organizationId,
+      canView: true,
+      canManage: true,
+      canExecute: true,
+    })
+    const expiredLeaseJob = expiredLeaseWorkspace.jobs.find(
+      (job) => job.globalId === expiredLeaseSource.globalId,
+    )
+    assert.equal(expiredLeaseJob?.status, 'failed')
+    assert.equal(expiredLeaseJob?.attemptHistory.at(-1).actorType, 'system')
+    assert.equal(expiredLeaseJob?.attemptHistory.at(-1).errorCode, 'PRINT_OUTCOME_UNCERTAIN')
+    await expectRejected(
+      () => persistence.retryOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: expiredLeaseSource.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `expired-lease-retry-denied-${fixture.suffix}`,
+        reason: 'An expired claim must never be automatically or manually resent as the same job',
+      }),
+      /may already have occurred/,
+    )
+    const expiredLeaseAuthorizedPrint = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: expiredLeaseSource.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `expired-lease-new-print-${fixture.suffix}`,
+      reason: 'Operator inspected the printer after lease expiry and authorized a distinct job',
+    })
+    assert.equal(expiredLeaseAuthorizedPrint.status, 'queued')
+    assert.notEqual(expiredLeaseAuthorizedPrint.globalId, expiredLeaseSource.globalId)
+    assert.equal(expiredLeaseAuthorizedPrint.reprintOfJobGlobalId, expiredLeaseSource.globalId)
+    const cancelledExpiredLeasePrint = await persistence.cancelOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: expiredLeaseAuthorizedPrint.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `cancel-expired-lease-new-print-${fixture.suffix}`,
+      reason: 'Expired-lease recovery contract was proven without physical output',
+    })
+    assert.equal(cancelledExpiredLeasePrint.status, 'cancelled')
+
     const labelPrinter = await createPrinter(pool, fixture, {
       code: `LABEL-${fixture.suffix}`,
       name: 'Primary carrier-label printer',
