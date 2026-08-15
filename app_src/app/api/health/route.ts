@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
 import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
+import { getPrintAgentReleaseConfiguration } from '@/lib/operations/printAgentReleaseConfig'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
@@ -1765,6 +1766,7 @@ export async function GET() {
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
+    const printAgentRelease = getPrintAgentReleaseConfiguration()
     const commerceRevisionEvidence =
       commerceRevisionEvidenceConfiguration()
 
@@ -1809,6 +1811,9 @@ export async function GET() {
     }
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
+    }
+    if (printAgentRelease.enabled && !printAgentRelease.ready) {
+      errors.push(printAgentRelease.reason)
     }
     if (!String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
       errors.push('Hosted runtime ClawPilot mail sender is not configured.')
@@ -7236,6 +7241,13 @@ export async function GET() {
           repository: repositoryRunner.repositoryFullName,
           baseBranch: repositoryRunner.baseBranch,
           patchOnly: true,
+        },
+        printAgentRelease: {
+          enabled: printAgentRelease.enabled,
+          ready: printAgentRelease.ready,
+          reason: printAgentRelease.reason,
+          version: printAgentRelease.version || null,
+          customerAssetsOnly: true,
         },
       },
       checkedAt,

@@ -774,6 +774,7 @@ for (const requiredPath of [
   'scripts/verify-mail-sender.mjs',
   'scripts/test-operation-printing.mjs',
   'scripts/test-operation-print-agent-runtime.mjs',
+  'scripts/test-print-agent-release-download.mjs',
   'scripts/pair-macos-print-agent.mjs',
   'scripts/lib/macos-print-agent-pairing.mjs',
   'scripts/test-macos-print-agent-pairing.mjs',
@@ -836,6 +837,11 @@ for (const requiredPath of [
   'app_src/lib/quickBooksSyncWorker.ts',
   'app_src/lib/agents/repositoryRunnerConfig.ts',
   'app_src/lib/githubApp.ts',
+  'app_src/lib/operations/printAgentReleaseConfig.ts',
+  'app_src/lib/operations/printAgentRelease.mjs',
+  'app_src/lib/operations/printAgentReleaseService.ts',
+  'app_src/app/api/operations/print-agent/releases/route.ts',
+  'app_src/app/api/operations/print-agent/releases/download/route.ts',
   'app_src/lib/persistence/repositoryRuns.ts',
   'app_src/lib/repositoryRunWorker.ts',
   'scripts/test-repository-runner.mjs',
@@ -870,6 +876,7 @@ for (const requiredPath of [
   }
 }
 
+run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
 run('npm', ['run', 'build'])
 
 if (!existsSync(resolve(root, 'app_src/.next/BUILD_ID'))) {

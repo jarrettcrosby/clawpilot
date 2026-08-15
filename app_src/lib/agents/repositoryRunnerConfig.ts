@@ -21,6 +21,16 @@ export type RepositoryRunnerConfiguration = {
   callbackUrl: string
 }
 
+export type GitHubRepositoryInstallationConfiguration = {
+  ready: boolean
+  reason: string
+  repositoryFullName: string
+  repositoryId: string
+  installationId: string
+  appId: string
+  privateKey: string
+}
+
 function positiveInteger(value: unknown): string {
   const text = String(value || '').trim()
   return /^[1-9][0-9]*$/.test(text) ? text : ''
@@ -34,6 +44,31 @@ function privateKeyFromEnvironment(): string {
     return decoded.includes('BEGIN PRIVATE KEY') || decoded.includes('BEGIN RSA PRIVATE KEY') ? decoded : ''
   } catch {
     return ''
+  }
+}
+
+export function getGitHubRepositoryInstallationConfiguration(): GitHubRepositoryInstallationConfiguration {
+  const repositoryFullName = String(process.env.CLAWPILOT_GITHUB_REPOSITORY || 'jarrettcrosby/clawpilot').trim()
+  const repositoryId = positiveInteger(process.env.CLAWPILOT_GITHUB_REPOSITORY_ID)
+  const installationId = positiveInteger(process.env.CLAWPILOT_GITHUB_INSTALLATION_ID)
+  const appId = positiveInteger(process.env.CLAWPILOT_GITHUB_APP_ID)
+  const privateKey = privateKeyFromEnvironment()
+  const ready = REPOSITORY_PATTERN.test(repositoryFullName)
+    && Boolean(repositoryId)
+    && Boolean(installationId)
+    && Boolean(appId)
+    && Boolean(privateKey)
+
+  return {
+    ready,
+    reason: ready
+      ? 'GitHub repository installation is ready'
+      : 'GitHub repository installation configuration is incomplete',
+    repositoryFullName,
+    repositoryId,
+    installationId,
+    appId,
+    privateKey,
   }
 }
 
@@ -52,21 +87,15 @@ function callbackUrl(): string {
 
 export function getRepositoryRunnerConfiguration(): RepositoryRunnerConfiguration {
   const enabled = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_ENABLED || '0') === '1'
-  const repositoryFullName = String(process.env.CLAWPILOT_GITHUB_REPOSITORY || 'jarrettcrosby/clawpilot').trim()
-  const repositoryId = positiveInteger(process.env.CLAWPILOT_GITHUB_REPOSITORY_ID)
-  const installationId = positiveInteger(process.env.CLAWPILOT_GITHUB_INSTALLATION_ID)
-  const appId = positiveInteger(process.env.CLAWPILOT_GITHUB_APP_ID)
+  const installation = getGitHubRepositoryInstallationConfiguration()
+  const { repositoryFullName, repositoryId, installationId, appId, privateKey } = installation
   const appBotUser = String(process.env.CLAWPILOT_GITHUB_APP_BOT_USER || '').trim()
-  const privateKey = privateKeyFromEnvironment()
   const baseBranch = String(process.env.CLAWPILOT_GITHUB_BASE_BRANCH || 'dev').trim()
   const workflowFile = String(process.env.CLAWPILOT_GITHUB_WORKFLOW_FILE || 'clawpilot-repository-runner.yml').trim()
   const reportSecret = String(process.env.CLAWPILOT_REPOSITORY_RUNNER_REPORT_SECRET || '')
   const callback = callbackUrl()
 
-  const invalid = !REPOSITORY_PATTERN.test(repositoryFullName)
-    || !repositoryId
-    || !installationId
-    || !appId
+  const invalid = !installation.ready
     || !BOT_USER_PATTERN.test(appBotUser)
     || !privateKey
     || !BRANCH_PATTERN.test(baseBranch)

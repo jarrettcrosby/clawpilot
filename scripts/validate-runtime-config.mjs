@@ -144,6 +144,44 @@ function validateRepositoryRunnerConfiguration() {
   return 'enabled'
 }
 
+function validatePrintAgentReleaseConfiguration() {
+  const enabled = String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_ENABLED || '0')
+  if (enabled !== '0' && enabled !== '1') fail('CLAWPILOT_PRINT_AGENT_RELEASE_ENABLED must be 0 or 1')
+  if (enabled === '0') return 'disabled'
+
+  const positiveInteger = (value) => /^[1-9][0-9]*$/.test(String(value || '').trim())
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_APP_ID)) fail('CLAWPILOT_GITHUB_APP_ID must be a positive integer')
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_INSTALLATION_ID)) fail('CLAWPILOT_GITHUB_INSTALLATION_ID must be a positive integer')
+  if (!positiveInteger(process.env.CLAWPILOT_GITHUB_REPOSITORY_ID)) fail('CLAWPILOT_GITHUB_REPOSITORY_ID must be a positive integer')
+  if (String(process.env.CLAWPILOT_GITHUB_REPOSITORY || '') !== 'jarrettcrosby/clawpilot') {
+    fail('CLAWPILOT_GITHUB_REPOSITORY must be jarrettcrosby/clawpilot for Print Agent releases')
+  }
+  const privateKey = String(process.env.CLAWPILOT_GITHUB_APP_PRIVATE_KEY_BASE64 || '')
+  try {
+    const decoded = Buffer.from(privateKey, 'base64').toString('utf8')
+    if (!decoded.includes('BEGIN PRIVATE KEY') && !decoded.includes('BEGIN RSA PRIVATE KEY')) throw new Error('invalid')
+  } catch {
+    fail('CLAWPILOT_GITHUB_APP_PRIVATE_KEY_BASE64 must contain a base64-encoded PEM private key')
+  }
+  const version = String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_VERSION || '').trim()
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    fail('CLAWPILOT_PRINT_AGENT_RELEASE_VERSION must be an exact semantic version')
+  }
+  if (String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_TAG || '') !== `print-gateway-v${version}`) {
+    fail('CLAWPILOT_PRINT_AGENT_RELEASE_TAG must exactly match print-gateway-v<version>')
+  }
+  if (!/^[0-9a-f]{40}$/.test(String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_SOURCE_COMMIT || ''))) {
+    fail('CLAWPILOT_PRINT_AGENT_RELEASE_SOURCE_COMMIT must be an exact lowercase 40-character commit')
+  }
+  if (!/^[0-9a-f]{64}$/.test(String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_INDEX_SHA256 || ''))) {
+    fail('CLAWPILOT_PRINT_AGENT_RELEASE_INDEX_SHA256 must be an exact lowercase SHA-256')
+  }
+  if (!['0', '1'].includes(String(process.env.CLAWPILOT_PRINT_AGENT_RELEASE_PRERELEASE || ''))) {
+    fail('CLAWPILOT_PRINT_AGENT_RELEASE_PRERELEASE must be explicitly set to 0 or 1')
+  }
+  return `enabled:${version}`
+}
+
 function validateRevisionEvidenceConfiguration() {
   try {
     const configuration = resolveCommerceOrderRevisionEvidenceKeyConfig({
@@ -167,5 +205,6 @@ const clients = validateServiceClients()
 const embeddingProvider = validateEmbeddingConfiguration()
 const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
+const printAgentRelease = validatePrintAgentReleaseConfiguration()
 const revisionEvidence = validateRevisionEvidenceConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
