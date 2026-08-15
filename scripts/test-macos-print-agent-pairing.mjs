@@ -180,21 +180,25 @@ const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx'
 for (const text of [
   'Download developer preview',
   'Developer-only local printing preview',
-  'Native macOS Print Agent is not released',
+  'Verified Print Agent release unavailable',
+  'ClawPilot Print Agent v',
+  'Download for macOS',
+  'Download for Windows',
   'Configure network printer',
   'Local print service',
   'View local agent status',
   'Background LAN print agent',
   'Web app download / manual print',
   'Create pairing code',
-  'Finish pairing on this Mac',
+  'Finish pairing in the Print Agent',
   'Waiting for connection',
   'Refresh connection status',
   'Configure printers',
   'Pair another workspace',
-  'run the .command file again with a unique instance name',
-  'It is credential-free',
-  'The endpoint remains only in the Mac',
+  'Keep the installed app',
+  'credential-free',
+  'private network IPv4 address and raw port 9100',
+  'never sent to ClawPilot',
   'raw-network ZPL preview',
   'unsigned and not notarized',
   'never distribute to operators',
@@ -202,18 +206,16 @@ for (const text of [
   'Copy Mac pairing command',
   'Local device reference:',
   'View Print Agent status',
-  'enter the printer hostname/IP and raw port (normally 9100)',
-  'probes reachability without',
-  'printing a label or claiming a job',
-  '2. Test an installed printer',
+  'The app probes',
+  'reachability without sending printer bytes or claiming a job',
+  'Use Test',
+  'Leave the computer on and signed in',
   'Browser download/manual print opens or downloads the document for an operator',
   'cannot send',
   'raw TCP to a Zebra hostname/IP',
   'System service (not implemented)',
   'reserved schema value only',
-  'headless macOS LaunchAgents used for web-managed LAN printing',
-  'no app',
-  'Dock icon is expected',
+  'runs in the signed-in user&apos;s background tray',
 ]) assert.ok(panel.includes(text), `Printer pairing UI is missing: ${text}`)
 for (const fragment of [
   "const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'",
@@ -242,22 +244,26 @@ assert.ok(
   panel.indexOf('Download developer preview') < panel.indexOf('One-time pairing code'),
   'The developer helper must be obtained before the one-time pairing code',
 )
+assert.ok(
+  panel.indexOf('Download for macOS') < panel.indexOf('One-time pairing code'),
+  'The verified customer installer must be offered before the one-time pairing code',
+)
 assert.equal(
   panel.match(/href=\{MACOS_PRINT_AGENT_DOWNLOAD_PATH\}/g)?.length,
   1,
   'All preview downloads must flow through the default-off developer-only button',
 )
-assert.ok(panel.includes('open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(enrollForm)}'))
-assert.ok(panel.includes('open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(pairingGrant?.pairingCode)}'))
+assert.ok(panel.includes('open={printAgentSetupReady && Boolean(enrollForm)}'))
+assert.ok(panel.includes('open={printAgentSetupReady && Boolean(pairingGrant?.pairingCode)}'))
 assert.ok(!panel.includes('Control-click'), 'Customer UI must never present Gatekeeper bypass as setup')
 assert.ok(!panel.includes('choose Open'), 'Customer UI must never present Gatekeeper bypass as setup')
 const exampleEnv = read('.env.example')
 assert.ok(exampleEnv.includes('# NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW=false'))
 assert.ok(exampleEnv.includes('Leave disabled for every'))
 const webSetupOrder = [
-  '2. Enter the local Zebra connection on this Mac',
+  '2. Enter the local Zebra connection',
   '3. Copy the one-time pairing code',
-  '4. Finish pairing on this Mac',
+  '4. Finish pairing in the Print Agent',
 ]
 for (let index = 1; index < webSetupOrder.length; index += 1) {
   assert.ok(
