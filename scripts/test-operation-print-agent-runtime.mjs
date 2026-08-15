@@ -1118,7 +1118,7 @@ async function verifyRuntime(connectionString) {
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
          $6, $7::text[], $8::text[], $9::text[], $10, $11, $12,
          clock_timestamp() - interval '11 minutes',
-         clock_timestamp() - interval '1 minute'
+         clock_timestamp() - interval '1 minute 1 second'
        )`,
       [
         expiredMaterial.pairingGrantId,

@@ -37,9 +37,12 @@ try {
     outputPath,
   ], { encoding: 'utf8' }))
   assert.equal(build.ok, true)
-  assert.equal(build.version, '0.1.0-preview.2')
+  assert.equal(build.version, '0.1.0-preview.3')
   assert.equal(build.filename, 'ClawPilot-Print-Agent-macOS.zip')
   assert.equal(build.credentialEmbedded, false)
+  assert.equal(build.releaseChannel, 'developer-preview')
+  assert.equal(build.distributionAudience, 'developers-only')
+  assert.equal(build.customerReleaseReady, false)
   assert.equal(build.signed, false)
   assert.equal(build.notarized, false)
   assert.equal(build.nodeRuntimeBundled, false)
@@ -53,7 +56,7 @@ try {
   const manifest = JSON.parse(readFileSync(build.manifestPath, 'utf8'))
   assert.deepEqual(manifest, {
     schemaVersion: 1,
-    version: '0.1.0-preview.2',
+    version: '0.1.0-preview.3',
     platform: 'macos',
     architecture: 'node-runtime-portable',
     artifactHref: '/downloads/ClawPilot-Print-Agent-macOS.zip',
@@ -62,8 +65,13 @@ try {
     sha256: build.sha256,
     checksumHref: '/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
     credentialEmbedded: false,
+    releaseChannel: 'developer-preview',
+    distributionAudience: 'developers-only',
+    customerReleaseReady: false,
     signed: false,
     notarized: false,
+    requiresDeveloperIdSigning: true,
+    requiresAppleNotarization: true,
     nodeMinimumMajor: 20,
     nodeRuntimeBundled: false,
     deliveryBackend: 'raw-network-zpl',
@@ -94,10 +102,13 @@ try {
 
   const readme = entries.get(`${prefix}README.txt`).toString('utf8')
   for (const requirement of [
+    'DEVELOPER-ONLY PREVIEW',
+    'NOT FOR OPERATOR OR CUSTOMER DISTRIBUTION',
     'Download and extract this credential-free ZIP',
     'Operations > Printing',
     'short-lived cppair code',
-    'Do not disable Gatekeeper',
+    'Do not bypass or disable Gatekeeper',
+    'Developer ID signed and Apple notarized',
     'unique workspace/printer instance name',
     'macOS Keychain',
     'printer hostname or IP',
@@ -105,7 +116,7 @@ try {
     'delivery ledger',
     'not code-signed or notarized',
   ]) assert.ok(readme.includes(requirement), `README is missing ${requirement}`)
-  assert.equal(entries.get(`${prefix}VERSION.txt`).toString('utf8'), '0.1.0-preview.2\n')
+  assert.equal(entries.get(`${prefix}VERSION.txt`).toString('utf8'), '0.1.0-preview.3\n')
 
   assert.deepEqual(
     entries.get(`${prefix}runtime/run-local-print-agent.mjs`),
@@ -168,12 +179,40 @@ try {
   assert.ok(!manager.includes('CLAWPILOT_PRINT_AGENT_CREDENTIAL'))
 
   const proxy = readFileSync('app_src/proxy.ts', 'utf8')
-  for (const publicArtifact of [
+  const expectedDeveloperArtifacts = [
     '/downloads/ClawPilot-Print-Agent-macOS.zip',
     '/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
     '/downloads/ClawPilot-Print-Agent-macOS.json',
-  ]) assert.ok(proxy.includes(`'${publicArtifact}'`), `Proxy is missing ${publicArtifact}`)
-  assert.ok(proxy.includes('isPublicCredentialFreePrintAgentDownload(pathname)'))
+  ]
+  for (const developerArtifact of expectedDeveloperArtifacts) {
+    assert.ok(proxy.includes(`'${developerArtifact}'`), `Proxy is missing ${developerArtifact}`)
+  }
+  const developerSet = proxy.match(
+    /const DEVELOPER_PRINT_AGENT_PREVIEW_ARTIFACTS = new Set\(\[([\s\S]*?)\]\)/,
+  )
+  assert.ok(developerSet, 'Proxy is missing the exact developer print-agent artifact set')
+  assert.deepEqual(
+    [...developerSet[1].matchAll(/'([^']+)'/g)].map((match) => match[1]),
+    expectedDeveloperArtifacts,
+    'Only the exact developer ZIP, checksum, and manifest may be preview-enabled',
+  )
+  assert.ok(proxy.includes("process.env.NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW === 'true'"))
+  assert.ok(proxy.includes('isDeveloperPrintAgentPreviewArtifact(pathname)'))
+  assert.ok(proxy.includes('&& !DEVELOPER_PRINT_AGENT_PREVIEW_ENABLED)'))
+  assert.ok(proxy.includes("return new NextResponse('Not found'"))
+  assert.ok(
+    proxy.indexOf('isDeveloperPrintAgentPreviewArtifact(pathname)')
+      < proxy.indexOf('if (!AUTH_REQUIRED) return NextResponse.next()'),
+    'Disabled developer artifacts must return 404 even when browser auth is disabled',
+  )
+  assert.ok(
+    !proxy.includes('isPublicCredentialFreePrintAgentDownload'),
+    'Unsigned developer artifacts must never bypass browser authentication',
+  )
+  assert.ok(
+    !proxy.includes("pathname.startsWith('/downloads/')"),
+    'Arbitrary /downloads paths must remain behind browser authentication',
+  )
 } finally {
   rmSync(sandbox, { recursive: true, force: true })
 }

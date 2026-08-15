@@ -102,8 +102,13 @@ type PrintAgentDistributionManifest = {
   byteLength: number
   sha256: string
   checksumHref: string
+  releaseChannel: 'developer-preview'
+  distributionAudience: 'developers-only'
+  customerReleaseReady: false
   signed: boolean
   notarized: boolean
+  requiresDeveloperIdSigning: true
+  requiresAppleNotarization: true
   nodeMinimumMajor: number
   deliveryBackend: string
 }
@@ -140,6 +145,8 @@ const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'
 const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`
 const MACOS_PRINT_AGENT_CHECKSUM_NAME = `${MACOS_PRINT_AGENT_DOWNLOAD_NAME}.sha256`
 const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'
+const ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW =
+  process.env.NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW === 'true'
 const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000
 
 const fieldSx = {
@@ -153,9 +160,9 @@ const fieldSx = {
 const LABELS: Record<string, string> = {
   thermal: 'Thermal',
   nonthermal: 'Nonthermal',
-  local_agent: 'Local print agent',
-  browser: 'Browser download',
-  system_service: 'System service',
+  local_agent: 'Background LAN print agent',
+  browser: 'Web app download / manual print',
+  system_service: 'System service (not implemented)',
   pack: 'Pack station',
   shipping: 'Shipping station',
   receiving: 'Receiving station',
@@ -228,12 +235,13 @@ function PrintAgentDistributionFacts({
 }: {
   manifest: PrintAgentDistributionManifest | null
 }) {
+  if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return null
   return (
     <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap" useFlexGap>
       <Typography variant="caption" color="text.secondary">
         {manifest
-          ? `v${manifest.version} · ${formatBytes(manifest.byteLength)} · raw-network ZPL · unsigned/unnotarized · Node.js ${manifest.nodeMinimumMajor}+ · SHA-256 ${manifest.sha256.slice(0, 12)}…`
-          : 'macOS raw-network ZPL preview · unsigned and not notarized · Node.js 20 or newer required'}
+          ? `Developer-only v${manifest.version} · ${formatBytes(manifest.byteLength)} · raw-network ZPL · unsigned/unnotarized · Node.js ${manifest.nodeMinimumMajor}+ · SHA-256 ${manifest.sha256.slice(0, 12)}…`
+          : 'Developer-only macOS raw-network ZPL preview · unsigned and not notarized · never distribute to operators'}
       </Typography>
       <Button
         component="a"
@@ -246,6 +254,21 @@ function PrintAgentDistributionFacts({
         SHA-256
       </Button>
     </Stack>
+  )
+}
+
+function DeveloperPrintAgentDownloadButton() {
+  if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return null
+  return (
+    <Button
+      component="a"
+      href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
+      download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
+      variant="outlined"
+      startIcon={<DownloadRounded />}
+    >
+      Download developer preview
+    </Button>
   )
 }
 
@@ -490,6 +513,7 @@ export default function PrinterConfigurationPanel() {
   }, [])
 
   useEffect(() => {
+    if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return undefined
     const controller = new AbortController()
     void (async () => {
       try {
@@ -509,8 +533,13 @@ export default function PrinterConfigurationPanel() {
           && manifest.byteLength > 0
           && typeof manifest.sha256 === 'string'
           && /^[a-f0-9]{64}$/.test(manifest.sha256)
+          && manifest.releaseChannel === 'developer-preview'
+          && manifest.distributionAudience === 'developers-only'
+          && manifest.customerReleaseReady === false
           && manifest.signed === false
           && manifest.notarized === false
+          && manifest.requiresDeveloperIdSigning === true
+          && manifest.requiresAppleNotarization === true
           && manifest.nodeMinimumMajor === 20
           && manifest.deliveryBackend === 'raw-network-zpl'
         ) {
@@ -746,6 +775,10 @@ export default function PrinterConfigurationPanel() {
 
   async function savePrinter() {
     if (!printerForm) return
+    if (printerForm.connectionMode === 'system_service') {
+      setError('System service printing is not implemented. Choose Web app download/manual print or Background LAN print agent.')
+      return
+    }
     if (!printerForm.code.trim() || !printerForm.name.trim()) {
       setError('Printer code and name are required')
       return
@@ -945,10 +978,10 @@ export default function PrinterConfigurationPanel() {
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
           <Button
             variant="outlined"
-            startIcon={<DownloadRounded />}
+            startIcon={<TokenRounded />}
             onClick={() => setView('agents')}
           >
-            Print Agent setup
+            {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? 'Print Agent setup' : 'Local print service'}
           </Button>
           {printers?.capabilities.canView && (
             <Button
@@ -1096,21 +1129,15 @@ export default function PrinterConfigurationPanel() {
             justifyContent="flex-end"
             spacing={1}
           >
-            <Button
-              component="a"
-              href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-              download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-              variant="outlined"
-              startIcon={<DownloadRounded />}
-            >
-              Download Print Agent for macOS
-            </Button>
+            <DeveloperPrintAgentDownloadButton />
             <Button
               variant="outlined"
               startIcon={<TokenRounded />}
               onClick={() => setView('agents')}
             >
-              Set up Zebra connection
+              {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+                ? 'Configure network printer'
+                : 'View local agent status'}
             </Button>
             {printers?.capabilities.canManage && (
               <Button
@@ -1123,12 +1150,20 @@ export default function PrinterConfigurationPanel() {
               </Button>
             )}
           </Stack>
-          <Alert severity="info" sx={{ mt: 2 }}>
-            For a local-agent Zebra, enter the printer hostname/IP and raw port (normally 9100)
-            in the downloaded Print Agent on the Mac that can reach it. ClawPilot stores the
-            logical printer and agent assignment, but never receives or displays that local
-            network endpoint.
-          </Alert>
+          {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
+            <Alert severity="warning" sx={{ mt: 2 }}>
+              Developer preview only: enter the printer hostname/IP and raw port (normally 9100)
+              in the local helper on the controlled development Mac. ClawPilot stores the logical
+              printer and agent assignment, but never receives or displays that endpoint.
+            </Alert>
+          ) : (
+            <Alert severity="warning" sx={{ mt: 2 }}>
+              The signed and notarized native macOS Print Agent is not released yet. The Zebra
+              hostname/IP and raw port 9100 will be entered only in that local application, never
+              in this hosted form. Existing paired headless background agents remain available;
+              do not distribute the unsigned developer helper to operators.
+            </Alert>
+          )}
           {!printers?.warehouses.length ? (
             <Alert severity="warning" sx={{ mt: 2 }}>Create an active warehouse before configuring printers.</Alert>
           ) : !printers.printers.length ? (
@@ -1246,29 +1281,39 @@ export default function PrinterConfigurationPanel() {
               gap={2}
             >
               <Box sx={{ minWidth: 0 }}>
-                <Typography fontWeight={700}>Set up local printing</Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  Download and open the Mac Print Agent, choose <strong>Pair a workspace and
-                  printer</strong>, then enter the Zebra&apos;s local hostname/IP and raw port
-                  (normally 9100) on that Mac. Create the one-time workspace code here only when
-                  the local helper is open. The endpoint stays on the Mac and is never sent to
-                  ClawPilot.
-                </Typography>
-                <Box sx={{ mt: 0.75 }}>
-                  <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-                </Box>
+                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW ? (
+                  <>
+                    <Typography fontWeight={700}>Developer-only local printing preview</Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Use only on a controlled development Mac. Enter the Zebra&apos;s local
+                      hostname/IP and raw port 9100 in the helper before creating the one-time
+                      workspace code. The endpoint stays on the Mac and is never sent to ClawPilot.
+                    </Typography>
+                    <Box sx={{ mt: 0.75 }}>
+                      <PrintAgentDistributionFacts manifest={printAgentDistribution} />
+                    </Box>
+                  </>
+                ) : (
+                  <>
+                    <Typography fontWeight={700}>Native macOS Print Agent is not released</Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Customer setup will be enabled after the native application is Developer ID
+                      signed and Apple notarized. Configure network printer will pass only
+                      organization, warehouse, and one-time pairing context to that local app. The
+                      app will collect the Zebra hostname/IP and port 9100, test reachability
+                      without printing, and keep the endpoint out of hosted state, URLs, and
+                      browser history, then install the headless background LAN agent. Existing
+                      paired background agents remain visible below. Web app download/manual print
+                      remains a separate best-effort delivery choice. Existing connected entries
+                      are headless macOS LaunchAgents used for web-managed LAN printing; no app
+                      window or Dock icon is expected from that runtime.
+                    </Typography>
+                  </>
+                )}
               </Box>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexShrink={0}>
-                <Button
-                  component="a"
-                  href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-                  download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-                  variant="outlined"
-                  startIcon={<DownloadRounded />}
-                >
-                  Download Print Agent for macOS
-                </Button>
-                {agents?.capabilities.canManage && (
+                <DeveloperPrintAgentDownloadButton />
+                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && agents?.capabilities.canManage && (
                   <Button
                     variant="contained"
                     startIcon={<TokenRounded />}
@@ -1300,14 +1345,15 @@ export default function PrinterConfigurationPanel() {
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Download and open the Mac Print Agent first, then create a one-time code for this
-                workspace. The Print Agent will prompt locally for the Zebra IP and port 9100.
+                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+                  ? 'Open the developer helper first, then create a one-time code for this workspace. The helper prompts locally for the Zebra IP and port 9100.'
+                  : 'A signed and notarized native macOS Print Agent is required before a new operator can pair this workspace.'}
               </Typography>
             </Box>
           ) : (
             <Stack sx={{ mt: 1 }}>
               <Stack direction="row" justifyContent="flex-end" sx={{ mb: 0.5 }}>
-                {agents?.capabilities.canManage && (
+                {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && agents?.capabilities.canManage && (
                   <Button
                     size="small"
                     variant="text"
@@ -1851,34 +1897,55 @@ export default function PrinterConfigurationPanel() {
                   select
                   fullWidth
                   size="small"
-                  label="Connection"
+                  label="Print delivery method"
                   value={printerForm.connectionMode}
                   onChange={(event) => chooseConnection(event.target.value as PrinterConnectionMode)}
+                  helperText="Choose one: web app download/manual print or a durable background LAN agent."
                   sx={fieldSx}
                 >
-                  {PRINTER_CONNECTION_MODES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
+                  {PRINTER_CONNECTION_MODES.map((item) => (
+                    <MenuItem key={item} value={item} disabled={item === 'system_service'}>
+                      {item === 'system_service' ? 'System service (not implemented)' : label(item)}
+                    </MenuItem>
+                  ))}
                 </TextField>
               </Stack>
+              {printerForm.connectionMode === 'browser' && (
+                <Alert severity="info">
+                  Browser download/manual print opens or downloads the document for an operator.
+                  It is best-effort, creates no durable device acknowledgement, and cannot send
+                  raw TCP to a Zebra hostname/IP.
+                </Alert>
+              )}
+              {printerForm.connectionMode === 'system_service' && (
+                <Alert severity="warning">
+                  System service is a reserved schema value only; ClawPilot has no certified
+                  delivery backend for it. Choose Web app download/manual print or Background LAN
+                  print agent.
+                </Alert>
+              )}
               {printerForm.printerType === 'thermal'
                 && printerForm.connectionMode === 'local_agent' && (
                 <Alert severity="info">
                   <Stack spacing={1} alignItems="flex-start">
                     <Typography variant="body2">
-                      Enter the Zebra hostname/IP and raw port (normally 9100) in the downloaded
-                      Print Agent on the Mac, not in this hosted form. This form defines routing
-                      and capabilities only. New Zebra profiles retain the 4 x 6 carrier-label
-                      preset; select only the label sizes physically loaded and calibrated.
+                      {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+                        ? 'Enter the Zebra hostname/IP and raw port 9100 in the developer helper on the controlled development Mac, not in this hosted form.'
+                        : 'The Zebra hostname/IP and raw port 9100 will be entered only in the signed and notarized native Mac Print Agent after it is released, not in this hosted form.'}
+                      {' '}This form defines routing and capabilities only. New Zebra profiles
+                      retain the 4 x 6 carrier-label preset; select only the label sizes physically
+                      loaded and calibrated.
                     </Typography>
                     <Button
                       size="small"
                       variant="text"
-                      startIcon={<DownloadRounded />}
+                      startIcon={<TokenRounded />}
                       onClick={() => {
                         setPrinterForm(null)
                         setView('agents')
                       }}
                     >
-                      Open Print Agent setup
+                      View Print Agent status
                     </Button>
                   </Stack>
                 </Alert>
@@ -2039,7 +2106,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={Boolean(enrollForm)}
+        open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(enrollForm)}
         onClose={() => !saving && setEnrollForm(null)}
         fullWidth
         maxWidth="sm"
@@ -2246,7 +2313,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={Boolean(pairingGrant?.pairingCode)}
+        open={ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW && Boolean(pairingGrant?.pairingCode)}
         onClose={() => setPairingGrant(null)}
         fullWidth
         maxWidth="sm"
@@ -2255,24 +2322,14 @@ export default function PrinterConfigurationPanel() {
         <DialogContent dividers>
           <Stack spacing={2}>
             <Box>
-              <Typography fontWeight={700}>1. Download and open the macOS Print Agent</Typography>
+              <Typography fontWeight={700}>1. Open the developer-only macOS helper</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                The download is credential-free. It never contains this workspace&apos;s pairing
-                code, printer IP, or ClawPilot session. Unzip it, then double-click
-                <strong> ClawPilot Print Agent.command</strong>. If macOS blocks this unsigned
-                preview, Control-click the file, choose Open, and confirm once; do not disable
-                Gatekeeper.
+                This unsigned preview is for a controlled development Mac only and is not a
+                customer installer. It is credential-free and never contains this workspace&apos;s
+                pairing code, printer IP, or ClawPilot session. Do not bypass or disable
+                Gatekeeper on an operator Mac.
               </Typography>
-              <Button
-                component="a"
-                href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-                download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-                variant="outlined"
-                startIcon={<DownloadRounded />}
-                sx={{ mt: 1 }}
-              >
-                Download Print Agent for macOS
-              </Button>
+              <Box sx={{ mt: 1 }}><DeveloperPrintAgentDownloadButton /></Box>
               <Box sx={{ mt: 0.75 }}>
                 <PrintAgentDistributionFacts manifest={printAgentDistribution} />
               </Box>

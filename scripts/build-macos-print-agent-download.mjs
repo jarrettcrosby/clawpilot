@@ -13,7 +13,7 @@ const outputPath = outputArgumentIndex === -1
 if (!outputPath) throw new Error('--output requires a path')
 
 const archiveRoot = 'ClawPilot Print Agent'
-const version = '0.1.0-preview.2'
+const version = '0.1.0-preview.3'
 const runtimeFiles = [
   'install-macos-print-agent.mjs',
   'manage-macos-print-agent.mjs',
@@ -64,10 +64,13 @@ const readme = `ClawPilot Print Agent for macOS
 
 Version ${version}
 
-This download is the operator setup for ClawPilot's first-party raw-ZPL local
-print service. It supports a network Zebra-compatible printer reachable by
-hostname or IP on raw TCP port 9100. It does not support USB-only printers,
-PDF/PNG, office documents, Windows, or arbitrary printer drivers.
+DEVELOPER-ONLY PREVIEW — NOT FOR OPERATOR OR CUSTOMER DISTRIBUTION
+
+This unsigned preview exercises ClawPilot's first-party raw-ZPL local print
+service on controlled development Macs. It supports a network Zebra-compatible
+printer reachable by hostname or IP on raw TCP port 9100. It does not support
+USB-only printers, PDF/PNG, office documents, Windows, or arbitrary printer
+drivers.
 
 Download first, then finish web setup
 -------------------------------------
@@ -84,8 +87,7 @@ Install or pair
 
 1. This preview requires Node.js 20 or newer from https://nodejs.org.
 2. Extract the ZIP.
-3. Double-click "ClawPilot Print Agent.command" (or Control-click and choose
-   Open once if macOS blocks the unsigned preview).
+3. Open "ClawPilot Print Agent.command" only on a controlled development Mac.
 4. Choose "Pair a workspace and printer".
 5. Enter a unique workspace/printer instance name, the printer hostname or IP,
    and its raw port (normally 9100).
@@ -93,7 +95,9 @@ Install or pair
    ClawPilot job.
 7. Paste the short-lived cppair code only at the macOS Keychain prompt.
 
-Do not disable Gatekeeper.
+Gatekeeper may block this unsigned preview. Do not bypass or disable Gatekeeper
+on an operator/customer Mac. Customer setup remains unavailable until the
+native application is Developer ID signed and Apple notarized.
 
 The helper redeems the short-lived pairing code over HTTPS and atomically
 replaces it in macOS Keychain with the long-lived runtime credential. Neither
@@ -124,10 +128,11 @@ instance. Retained state is not silently deleted or reused.
 Distribution status
 -------------------
 
-This macOS preview ZIP is not code-signed or notarized. It is not a .pkg or a
-native .app and does not claim those release controls. A signed/notarized app
-can replace this preview without changing ClawPilot's web enrollment,
-credential, ledger, claim fencing, or device-privacy contracts.
+This developer-only macOS preview ZIP is not code-signed or notarized. It is
+not a .pkg or a native .app and is intentionally hidden from normal ClawPilot
+operator setup. A Developer ID signed and Apple-notarized native app can
+replace this preview without changing ClawPilot's web enrollment, credential,
+ledger, claim fencing, or device-privacy contracts.
 `
 
 const entries = [
@@ -171,8 +176,13 @@ const manifest = {
   sha256,
   checksumHref,
   credentialEmbedded: false,
+  releaseChannel: 'developer-preview',
+  distributionAudience: 'developers-only',
+  customerReleaseReady: false,
   signed: false,
   notarized: false,
+  requiresDeveloperIdSigning: true,
+  requiresAppleNotarization: true,
   nodeMinimumMajor: 20,
   nodeRuntimeBundled: false,
   deliveryBackend: 'raw-network-zpl',
@@ -193,6 +203,9 @@ process.stdout.write(`${JSON.stringify({
   byteLength: archive.byteLength,
   sha256,
   credentialEmbedded: /cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}/i.test(archiveText),
+  releaseChannel: 'developer-preview',
+  distributionAudience: 'developers-only',
+  customerReleaseReady: false,
   signed: false,
   notarized: false,
   nodeRuntimeBundled: false,
