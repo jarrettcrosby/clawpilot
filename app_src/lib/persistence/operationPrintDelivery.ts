@@ -66,6 +66,37 @@ type PrintAgentRow = {
   last_seen_at: TimestampValue | null
 }
 
+type PrintAgentPairingGrantRow = {
+  id: string
+  organization_id: string
+  warehouse_id: string
+  reserved_agent_id: string
+  name: string
+  secret_hash: string
+  status: 'pending' | 'redeemed' | 'expired' | 'revoked'
+  request_fingerprint: string
+  idempotency_key: string
+  supported_formats: OperationsPrintAgentProfile['supportedFormats']
+  supported_media: OperationsPrintAgentProfile['supportedMedia']
+  supported_document_types: OperationsPrintAgentProfile['supportedDocumentTypes']
+  created_by: string | null
+  created_at: TimestampValue
+  expires_at: TimestampValue
+  print_agent_id: string | null
+  is_expired?: boolean
+}
+
+export type OperationsPrintAgentPairingGrant = {
+  id: string
+  pairingCode: string | null
+  expiresAt: string
+  warehouseId: string
+  name: string
+  supportedFormats: OperationsPrintAgentProfile['supportedFormats']
+  supportedMedia: OperationsPrintAgentProfile['supportedMedia']
+  supportedDocumentTypes: OperationsPrintAgentProfile['supportedDocumentTypes']
+}
+
 type PrintJobRow = {
   id: string
   global_id: string
@@ -274,6 +305,8 @@ const SHIPMENT_GLOBAL_ID = /^gsh(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
 const PRINT_AGENT_CREDENTIAL =
   /^cpprint\.v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/i
+const PRINT_AGENT_PAIRING_CODE =
+  /^cppair\.v1\.([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/i
 const STORAGE_PROTOCOLS = new Set([
   'https:',
   's3:',
@@ -616,6 +649,46 @@ export function createOperationsPrintAgentCredential(
   }
 }
 
+export function hashOperationsPrintAgentPairingSecret(
+  pairingGrantId: string,
+  secret: string,
+) {
+  if (!UUID.test(pairingGrantId) || !/^[A-Za-z0-9_-]{43}$/.test(secret)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CODE_INVALID',
+      'Print-agent pairing code is invalid',
+      401,
+    )
+  }
+  return crypto
+    .createHash('sha256')
+    .update(
+      `clawpilot:operations-print-agent-pairing:v1\n${pairingGrantId.toLowerCase()}\n${secret}`,
+    )
+    .digest('hex')
+}
+
+export function createOperationsPrintAgentPairingCode(
+  pairingGrantId: string = crypto.randomUUID(),
+) {
+  if (!UUID.test(pairingGrantId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CODE_INVALID',
+      'Print-agent pairing identity is invalid',
+    )
+  }
+  const normalizedPairingGrantId = pairingGrantId.toLowerCase()
+  const secret = crypto.randomBytes(32).toString('base64url')
+  return {
+    pairingGrantId: normalizedPairingGrantId,
+    pairingCode: `cppair.v1.${normalizedPairingGrantId}.${secret}`,
+    secretHash: hashOperationsPrintAgentPairingSecret(
+      normalizedPairingGrantId,
+      secret,
+    ),
+  }
+}
+
 function secureHashEqual(left: string, right: string) {
   if (!SHA256.test(left) || !SHA256.test(right)) return false
   return crypto.timingSafeEqual(
@@ -628,6 +701,13 @@ function parseAgentCredential(value: string) {
   const match = String(value || '').trim().match(PRINT_AGENT_CREDENTIAL)
   return match
     ? { agentId: match[1].toLowerCase(), secret: match[2] }
+    : null
+}
+
+function parsePrintAgentPairingCode(value: string) {
+  const match = String(value || '').trim().match(PRINT_AGENT_PAIRING_CODE)
+  return match
+    ? { pairingGrantId: match[1].toLowerCase(), secret: match[2] }
     : null
 }
 
@@ -1241,6 +1321,424 @@ export async function readOperationsPrintJobWorkspaceFromPostgres(input: {
     jobs: result.rows.map(jobItem),
     generatedAt: new Date().toISOString(),
   }
+}
+
+function pairingGrantProjection(
+  row: PrintAgentPairingGrantRow,
+  pairingCode: string | null,
+): OperationsPrintAgentPairingGrant {
+  return {
+    id: row.id,
+    pairingCode,
+    expiresAt: iso(row.expires_at) as string,
+    warehouseId: row.warehouse_id,
+    name: row.name,
+    supportedFormats: row.supported_formats,
+    supportedMedia: row.supported_media,
+    supportedDocumentTypes: row.supported_document_types,
+  }
+}
+
+export async function createOperationsPrintAgentPairingGrantInPostgres(input: {
+  organizationId: string
+  warehouseId: string
+  name: string
+  actorEmail: string
+  idempotencyKey: string
+  supportedFormats?: OperationsPrintAgentProfile['supportedFormats']
+  supportedMedia?: OperationsPrintAgentProfile['supportedMedia']
+  supportedDocumentTypes?: OperationsPrintAgentProfile['supportedDocumentTypes']
+}): Promise<{ pairingGrant: OperationsPrintAgentPairingGrant }> {
+  const organizationId = requiredOrganizationId(input.organizationId)
+  const actorEmail = requiredActor(input.actorEmail)
+  const idempotencyKey = requiredIdempotencyKey(input.idempotencyKey)
+  const name = String(input.name || '').trim()
+  if (!name || name.length > 120 || /[\u0000-\u001f\u007f]/.test(name)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_NAME_INVALID',
+      'Print agent name is invalid',
+    )
+  }
+  if (!UUID.test(input.warehouseId)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_WAREHOUSE_INVALID',
+      'Print agent warehouse is invalid',
+    )
+  }
+  const capabilities = requiredPrintAgentCapabilities({
+    supportedFormats: input.supportedFormats
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+    supportedMedia: input.supportedMedia
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+    supportedDocumentTypes: input.supportedDocumentTypes
+      || DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+  })
+  const requestFingerprint = fingerprint({
+    action: 'create-print-agent-pairing-grant',
+    warehouseId: input.warehouseId,
+    name,
+    ...capabilities,
+  })
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-agent-pairing-grant:${organizationId}:${idempotencyKey}`,
+    )
+    const replay = await client.query<PrintAgentPairingGrantRow>(
+      `SELECT
+         id::text,
+         organization_id::text,
+         warehouse_id::text,
+         reserved_agent_id::text,
+         name,
+         secret_hash,
+         status,
+         request_fingerprint,
+         idempotency_key,
+         supported_formats,
+         supported_media,
+         supported_document_types,
+         created_by,
+         created_at,
+         expires_at,
+         print_agent_id::text
+       FROM operations_print_agent_pairing_grants
+       WHERE organization_id = $1::uuid
+         AND idempotency_key = $2
+       FOR SHARE`,
+      [organizationId, idempotencyKey],
+    )
+    if (replay.rows[0]) {
+      if (replay.rows[0].request_fingerprint !== requestFingerprint) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
+          'Idempotency-Key was already used for a different print-agent pairing request',
+          409,
+        )
+      }
+      return {
+        pairingGrant: pairingGrantProjection(replay.rows[0], null),
+      }
+    }
+
+    const warehouse = await client.query(
+      `SELECT id
+       FROM operations_warehouses
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND status = 'active'
+         AND upper(code) <> 'MOCK-01'
+       FOR SHARE`,
+      [organizationId, input.warehouseId],
+    )
+    if (!warehouse.rows[0]) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_WAREHOUSE_INVALID',
+        'Select an active non-test warehouse',
+      )
+    }
+
+    const generated = createOperationsPrintAgentPairingCode()
+    const reservedAgentId = crypto.randomUUID()
+    const inserted = await client.query<PrintAgentPairingGrantRow>(
+      `INSERT INTO operations_print_agent_pairing_grants (
+         id,
+         organization_id,
+         warehouse_id,
+         reserved_agent_id,
+         name,
+         secret_hash,
+         supported_formats,
+         supported_media,
+         supported_document_types,
+         request_fingerprint,
+         idempotency_key,
+         created_by,
+         expires_at
+       ) VALUES (
+         $1::uuid,
+         $2::uuid,
+         $3::uuid,
+         $4::uuid,
+         $5,
+         $6,
+         $7::text[],
+         $8::text[],
+         $9::text[],
+         $10,
+         $11,
+         $12,
+         now() + interval '10 minutes'
+       )
+       RETURNING
+         id::text,
+         organization_id::text,
+         warehouse_id::text,
+         reserved_agent_id::text,
+         name,
+         secret_hash,
+         status,
+         request_fingerprint,
+         idempotency_key,
+         supported_formats,
+         supported_media,
+         supported_document_types,
+         created_by,
+         created_at,
+         expires_at,
+         print_agent_id::text`,
+      [
+        generated.pairingGrantId,
+        organizationId,
+        input.warehouseId,
+        reservedAgentId,
+        name,
+        generated.secretHash,
+        capabilities.supportedFormats,
+        capabilities.supportedMedia,
+        capabilities.supportedDocumentTypes,
+        requestFingerprint,
+        idempotencyKey,
+        actorEmail,
+      ],
+    )
+    const pairingGrant = pairingGrantProjection(
+      inserted.rows[0],
+      generated.pairingCode,
+    )
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.print_agent.pairing_grant_created',
+      aggregateType: 'operations.print_agent_pairing_grant',
+      aggregateId: pairingGrant.id,
+      eventKey: `operations:print-agent-pairing-grant:created:${pairingGrant.id}`,
+      subject: name,
+      organizationId,
+      payload: {
+        pairingGrantId: pairingGrant.id,
+        warehouseId: pairingGrant.warehouseId,
+        expiresAt: pairingGrant.expiresAt,
+        supportedFormats: pairingGrant.supportedFormats,
+        supportedMedia: pairingGrant.supportedMedia,
+        supportedDocumentTypes: pairingGrant.supportedDocumentTypes,
+      },
+    }, client)
+    return { pairingGrant }
+  })
+}
+
+type PairingRedemptionOutcome =
+  | {
+      kind: 'redeemed'
+      agent: OperationsPrintAgentProfile
+      credential: string
+    }
+  | {
+      kind: 'invalid' | 'expired' | 'consumed' | 'revoked'
+    }
+
+export async function redeemOperationsPrintAgentPairingGrantInPostgres(input: {
+  pairingCode: string
+  idempotencyKey: string
+}): Promise<{
+  agent: OperationsPrintAgentProfile
+  credential: string
+  replayed: false
+}> {
+  const parsed = parsePrintAgentPairingCode(input.pairingCode)
+  if (!parsed) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_PAIRING_CODE_INVALID',
+      'Print-agent pairing code is invalid',
+      401,
+    )
+  }
+  const idempotencyKey = requiredIdempotencyKey(input.idempotencyKey)
+  const suppliedSecretHash = hashOperationsPrintAgentPairingSecret(
+    parsed.pairingGrantId,
+    parsed.secret,
+  )
+
+  const outcome = await withTransaction<PairingRedemptionOutcome>(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-agent-pairing-grant:redeem:${parsed.pairingGrantId}`,
+    )
+    const current = await client.query<PrintAgentPairingGrantRow>(
+      `SELECT
+         id::text,
+         organization_id::text,
+         warehouse_id::text,
+         reserved_agent_id::text,
+         name,
+         secret_hash,
+         status,
+         request_fingerprint,
+         idempotency_key,
+         supported_formats,
+         supported_media,
+         supported_document_types,
+         created_by,
+         created_at,
+         expires_at,
+         print_agent_id::text,
+         expires_at <= clock_timestamp() AS is_expired
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid
+       FOR UPDATE`,
+      [parsed.pairingGrantId],
+    )
+    const grant = current.rows[0]
+    if (!grant) return { kind: 'invalid' }
+
+    if (!secureHashEqual(grant.secret_hash, suppliedSecretHash)) {
+      return { kind: 'invalid' }
+    }
+
+    if (grant.status === 'redeemed') return { kind: 'consumed' }
+    if (grant.status === 'expired') return { kind: 'expired' }
+    if (grant.status === 'revoked') return { kind: 'revoked' }
+    if (grant.is_expired) {
+      await client.query(
+        `UPDATE operations_print_agent_pairing_grants
+         SET status = 'expired', expired_at = clock_timestamp()
+         WHERE id = $1::uuid`,
+        [grant.id],
+      )
+      return { kind: 'expired' }
+    }
+
+    const generated = createOperationsPrintAgentCredential(
+      grant.reserved_agent_id,
+    )
+    const redemptionRequestFingerprint = fingerprint({
+      action: 'redeem-print-agent-pairing-grant',
+      pairingGrantId: grant.id,
+      reservedAgentId: grant.reserved_agent_id,
+      warehouseId: grant.warehouse_id,
+      name: grant.name,
+      supportedFormats: grant.supported_formats,
+      supportedMedia: grant.supported_media,
+      supportedDocumentTypes: grant.supported_document_types,
+    })
+    const inserted = await client.query<{ global_id: string }>(
+      `INSERT INTO operations_print_agents (
+         id,
+         organization_id,
+         warehouse_id,
+         name,
+         secret_hash,
+         request_fingerprint,
+         idempotency_key,
+         enrolled_by,
+         supported_formats,
+         supported_media,
+         supported_document_types
+       ) VALUES (
+         $1::uuid,
+         $2::uuid,
+         $3::uuid,
+         $4,
+         $5,
+         $6,
+         $7,
+         $8,
+         $9::text[],
+         $10::text[],
+         $11::text[]
+       )
+       RETURNING global_id`,
+      [
+        generated.agentId,
+        grant.organization_id,
+        grant.warehouse_id,
+        grant.name,
+        generated.secretHash,
+        redemptionRequestFingerprint,
+        `pairing-grant:${grant.id}`,
+        grant.created_by,
+        grant.supported_formats,
+        grant.supported_media,
+        grant.supported_document_types,
+      ],
+    )
+    await client.query(
+      `UPDATE operations_print_agent_pairing_grants
+       SET
+         status = 'redeemed',
+         redeemed_at = clock_timestamp(),
+         print_agent_id = reserved_agent_id,
+         redemption_idempotency_key = $2,
+         redemption_request_fingerprint = $3
+       WHERE id = $1::uuid`,
+      [grant.id, idempotencyKey, redemptionRequestFingerprint],
+    )
+    const agent = await oneAgent(
+      grant.organization_id,
+      inserted.rows[0].global_id,
+      client,
+    )
+    await recordAuditEvent({
+      eventType: 'operations.print_agent.enrolled',
+      aggregateType: 'operations.print_agent',
+      aggregateId: agent.globalId,
+      eventKey: `operations:print-agent:paired:${grant.id}`,
+      subject: grant.name,
+      organizationId: grant.organization_id,
+      isSystem: true,
+      payload: {
+        pairingGrantId: grant.id,
+        printAgentGlobalId: agent.globalId,
+        warehouseGlobalId: agent.warehouseGlobalId,
+        credentialVersion: agent.credentialVersion,
+        supportedFormats: agent.supportedFormats,
+        supportedMedia: agent.supportedMedia,
+        supportedDocumentTypes: agent.supportedDocumentTypes,
+      },
+    }, client)
+    return {
+      kind: 'redeemed',
+      agent,
+      credential: generated.credential,
+    }
+  })
+
+  if (outcome.kind === 'redeemed') {
+    return {
+      agent: outcome.agent,
+      credential: outcome.credential,
+      replayed: false,
+    }
+  }
+  const failures = {
+    invalid: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_INVALID',
+      message: 'Print-agent pairing code is invalid',
+      status: 401,
+    },
+    expired: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_EXPIRED',
+      message: 'Print-agent pairing code expired; create a new code',
+      status: 410,
+    },
+    consumed: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_CONSUMED',
+      message: 'Print-agent pairing code was already used; create a new code',
+      status: 410,
+    },
+    revoked: {
+      code: 'OPERATIONS_PRINT_AGENT_PAIRING_CODE_REVOKED',
+      message: 'Print-agent pairing code was revoked; create a new code',
+      status: 410,
+    },
+  } as const
+  const failure = failures[outcome.kind]
+  throw new OperationsRequestError(
+    failure.code,
+    failure.message,
+    failure.status,
+  )
 }
 
 export async function enrollOperationsPrintAgentInPostgres(input: {

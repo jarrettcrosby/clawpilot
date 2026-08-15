@@ -122,7 +122,7 @@ type CarrierPayload = {
   productionLabelAuthorizationAllowed?: boolean
   productionLabelRuntimeLane?: 'production' | 'railway_development' | null
   integrations?: CarrierIntegrationsState
-  rateTest?: CarrierSandboxRateTest
+  rateTest?: CarrierShippingDiagnosticRateTest
   rateTestLabel?: CarrierRateTestLabel
   rateTestLabels?: CarrierRateTestLabel[]
   rateTestLabelOutputs?: Record<
@@ -146,21 +146,23 @@ type RevealedCarrierCredential = {
   expiresAt: string
 }
 
-type CarrierSandboxRateTest = {
+type DiagnosticRateParcel = {
+  description: string
+  length: number
+  width: number
+  height: number
+  dimensionUnit: 'IN'
+  weight: number
+  weightUnit: 'LB'
+}
+
+type CarrierShippingDiagnosticRateTest = {
   provider: 'ups_rest' | 'fedex_rest'
-  environment: 'sandbox'
+  environment: 'sandbox' | 'production'
   fixture: {
     origin: SandboxRateDestinationForm
-    destination: SandboxRateDestinationForm
-    parcel: {
-      description: string
-      length: number
-      width: number
-      height: number
-      dimensionUnit: 'IN'
-      weight: number
-      weightUnit: 'LB'
-    }
+    destination: SandboxRateDestinationForm & { residential?: boolean }
+    parcel: DiagnosticRateParcel
   }
   destinationFingerprint: string
   rates: Array<{
@@ -188,13 +190,14 @@ type SandboxRateDestinationForm = {
   countryCode: string
 }
 
-type CarrierSandboxRate = CarrierSandboxRateTest['rates'][number]
+type CarrierSandboxRate = CarrierShippingDiagnosticRateTest['rates'][number]
 
 type CarrierRateTestLabel = {
   globalId: string
   rateEvidenceGlobalId: string
+  carrierAccountGlobalId: string
   provider: 'ups_rest' | 'fedex_rest'
-  environment: 'sandbox'
+  environment: 'sandbox' | 'production'
   serviceCode: string
   serviceName: string
   rateType: string | null
@@ -301,6 +304,7 @@ type CarrierRateTestLabelAttempt = {
   action: 'create' | 'void'
   state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
   provider: 'ups_rest' | 'fedex_rest'
+  environment: 'sandbox' | 'production'
   serviceCode: string
   selectedRate: {
     serviceCode: string
@@ -412,6 +416,28 @@ function defaultSandboxRateDestination(): SandboxRateDestinationForm {
   }
 }
 
+function defaultDiagnosticParcel(): DiagnosticRateParcel {
+  return {
+    description: 'Test Product',
+    length: 12,
+    width: 10,
+    height: 6,
+    dimensionUnit: 'IN',
+    weight: 5,
+    weightUnit: 'LB',
+  }
+}
+
+function productionPostageConfirmation(input: {
+  provider: 'ups_rest' | 'fedex_rest'
+  carrierAccountGlobalId: string
+  serviceCode: string
+  currency: string
+  amount: string
+}) {
+  return `BUY REAL POSTAGE | ${input.provider === 'ups_rest' ? 'UPS' : 'FEDEX'} | ${input.carrierAccountGlobalId} | ${input.serviceCode} | ${input.currency} ${input.amount}`
+}
+
 function sandboxRateKey(rate: CarrierSandboxRate) {
   return JSON.stringify([
     rate.serviceCode,
@@ -459,8 +485,13 @@ export default function CarrierIntegrationPanel({
   const [confirmDisconnect, setConfirmDisconnect] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
-  const [rateTest, setRateTest] = useState<CarrierSandboxRateTest | null>(null)
+  const [rateTest, setRateTest] = useState<CarrierShippingDiagnosticRateTest | null>(null)
   const [rateDestinations, setRateDestinations] = useState<Record<string, SandboxRateDestinationForm>>({})
+  const [rateParcels, setRateParcels] = useState<Record<string, DiagnosticRateParcel>>({})
+  const [rateDestinationResidential, setRateDestinationResidential] = useState<Record<string, boolean>>({})
+  const [diagnosticSenderPhones, setDiagnosticSenderPhones] = useState<Record<string, string>>({})
+  const [diagnosticRecipientPhones, setDiagnosticRecipientPhones] = useState<Record<string, string>>({})
+  const [productionPostageTypedConfirmation, setProductionPostageTypedConfirmation] = useState('')
   const [rateTestLabels, setRateTestLabels] = useState<CarrierRateTestLabel[]>([])
   const [rateTestLabelOutputs, setRateTestLabelOutputs] = useState(
     FALLBACK_RATE_TEST_LABEL_OUTPUTS,
@@ -511,6 +542,12 @@ export default function CarrierIntegrationPanel({
     () => (account?.carrierAccounts || []).filter((entry) => entry.status === 'active'),
     [account?.carrierAccounts],
   )
+  const productionSenderAccounts = activeCarrierAccounts.filter(
+    (entry) => entry.allowSenderBilling,
+  )
+  const diagnosticCarrierAccounts = environment === 'production'
+    ? productionSenderAccounts
+    : activeCarrierAccounts
   const carrierConfiguration = account ? {
     managedBy: account.managedBy,
     authorizationScope: account.authorizationScope,
@@ -531,12 +568,14 @@ export default function CarrierIntegrationPanel({
   const labelWorkflowAuthorized =
     !sourceManagedDelegation || managedSandboxFulfillmentDelegation
   const explicitCarrierAccountGlobalId = selectedCarrierAccounts[key] || ''
-  const selectedCarrierAccountGlobalId = activeCarrierAccounts.some(
+  const selectedCarrierAccountGlobalId = diagnosticCarrierAccounts.some(
     (entry) => entry.globalId === explicitCarrierAccountGlobalId,
   )
     ? explicitCarrierAccountGlobalId
-    : activeCarrierAccounts.length === 1 ? activeCarrierAccounts[0].globalId : ''
-  const selectedCarrierAccount = activeCarrierAccounts.find(
+    : diagnosticCarrierAccounts.length === 1
+      ? diagnosticCarrierAccounts[0].globalId
+      : ''
+  const selectedCarrierAccount = diagnosticCarrierAccounts.find(
     (entry) => entry.globalId === selectedCarrierAccountGlobalId,
   ) || null
   const rateDestination = rateDestinations[key] || defaultSandboxRateDestination()
@@ -548,15 +587,20 @@ export default function CarrierIntegrationPanel({
     && /^\d{5}(?:-\d{4})?$/.test(rateDestination.postalCode.trim())
     && rateDestination.countryCode === 'US',
   )
-  const providerRateParcel = rateTest?.fixture.parcel || {
-    description: 'Test Product',
-    length: 12,
-    width: 10,
-    height: 6,
-    dimensionUnit: 'IN' as const,
-    weight: 5,
-    weightUnit: 'LB' as const,
-  }
+  const providerRateParcel = rateParcels[key] || defaultDiagnosticParcel()
+  const destinationResidential = rateDestinationResidential[key] === true
+  const diagnosticSenderPhone = diagnosticSenderPhones[key] || ''
+  const diagnosticRecipientPhone = diagnosticRecipientPhones[key] || ''
+  const diagnosticPhonesComplete = Boolean(
+    diagnosticSenderPhone.trim().length >= 7 && diagnosticRecipientPhone.trim().length >= 7,
+  )
+  const diagnosticParcelComplete = Boolean(
+    providerRateParcel.description.trim()
+    && providerRateParcel.length > 0
+    && providerRateParcel.width > 0
+    && providerRateParcel.height > 0
+    && providerRateParcel.weight > 0,
+  )
   const selectedUnitRateParcelDimensions = formatDimensionsMm({
     lengthMm: providerRateParcel.length * MILLIMETERS_PER_INCH,
     widthMm: providerRateParcel.width * MILLIMETERS_PER_INCH,
@@ -608,9 +652,11 @@ export default function CarrierIntegrationPanel({
   )
   const visibleReconciliationAttempts = useMemo(
     () => rateTestAttempts.filter((entry) => (
-      entry.provider === provider && entry.reconciliationEligible
+      entry.provider === provider
+      && entry.environment === environment
+      && entry.reconciliationEligible
     )),
-    [provider, rateTestAttempts],
+    [environment, provider, rateTestAttempts],
   )
   const selectedReconciliationAttempt = visibleReconciliationAttempts.find(
     (entry) => entry.globalId === reconciliationAttemptGlobalId,
@@ -683,9 +729,6 @@ export default function CarrierIntegrationPanel({
           : !selectedCarrierAccountGlobalId
             ? 'Select the sandbox billing account to use for the test.'
             : ''
-  const productionSenderAccounts = activeCarrierAccounts.filter(
-    (entry) => entry.allowSenderBilling,
-  )
   const productionRateBlocker = !account?.configured
     ? 'Save and verify the production credential first.'
     : account.verificationStatus !== 'verified'
@@ -696,8 +739,34 @@ export default function CarrierIntegrationPanel({
           ? 'This connection is not authorized for production rating.'
           : !productionSenderAccounts.length
             ? 'Add and enable a production sender-billing account.'
-            : ''
+            : !selectedCarrierAccountGlobalId
+              ? 'Select the exact production sender-billing account to rate.'
+              : !selectedCarrierAccount?.allowSenderBilling
+                ? 'Select a production account authorized for sender billing.'
+                : ''
   const productionRateReady = !productionRateBlocker
+  const selectedProductionConfirmation = rateTest?.environment === 'production' && selectedRate
+    ? productionPostageConfirmation({
+        provider: rateTest.provider,
+        carrierAccountGlobalId: rateTest.carrierAccountGlobalId,
+        serviceCode: selectedRate.serviceCode,
+        currency: selectedRate.currency,
+        amount: selectedRate.amount,
+      })
+    : ''
+  const productionCreateBlocker = environment !== 'production'
+    ? ''
+    : !productionLabelAuthorizationAllowed
+      ? 'LIVE label buying is available only in the trusted ClawPilot Railway development or production runtime.'
+      : !livePostageAuthorized
+        ? 'Authorize the production_label capability above before buying REAL POSTAGE.'
+        : !canRevealCredentials
+          ? 'Organization owner or administrator access is required to buy REAL POSTAGE.'
+          : !canExecute
+            ? 'Warehouse execution permission is required to buy REAL POSTAGE.'
+            : !diagnosticPhonesComplete
+              ? 'Enter sender and recipient phone numbers for the provider label request.'
+              : ''
 
   useEffect(() => {
     let active = true
@@ -776,6 +845,23 @@ export default function CarrierIntegrationPanel({
     setReconciliationReason('')
     setReconciliationConfirmed(false)
     setReconciliationIdempotencyKey('')
+    setProductionPostageTypedConfirmation('')
+  }
+
+  function updateRateParcel<K extends keyof DiagnosticRateParcel>(
+    field: K,
+    value: DiagnosticRateParcel[K],
+  ) {
+    setRateParcels((current) => ({
+      ...current,
+      [key]: { ...(current[key] || defaultDiagnosticParcel()), [field]: value },
+    }))
+    resetLoadedRate()
+  }
+
+  function updateDestinationResidential(value: boolean) {
+    setRateDestinationResidential((current) => ({ ...current, [key]: value }))
+    resetLoadedRate()
   }
 
   function resetLoadedRate() {
@@ -790,6 +876,7 @@ export default function CarrierIntegrationPanel({
     setReconciliationReason('')
     setReconciliationConfirmed(false)
     setReconciliationIdempotencyKey('')
+    setProductionPostageTypedConfirmation('')
   }
 
   function resetCarrierAccountForm() {
@@ -950,7 +1037,11 @@ export default function CarrierIntegrationPanel({
       !rateTest
       || !selectedRate
       || !selectedLabelOutput
-      || !createLabelConfirmed
+      || (environment === 'sandbox' && !createLabelConfirmed)
+      || (
+        environment === 'production'
+        && productionPostageTypedConfirmation !== selectedProductionConfirmation
+      )
       || !createLabelReason.trim()
     ) return
     const idempotencyKey = createLabelIdempotencyKey || newIdempotencyKey('create')
@@ -967,12 +1058,31 @@ export default function CarrierIntegrationPanel({
           amount: selectedRate.amount,
           currency: selectedRate.currency,
         },
-        destination: rateTest.fixture.destination,
+        destination: {
+          name: rateTest.fixture.destination.name,
+          line1: rateTest.fixture.destination.line1,
+          line2: rateTest.fixture.destination.line2,
+          city: rateTest.fixture.destination.city,
+          region: rateTest.fixture.destination.region,
+          postalCode: rateTest.fixture.destination.postalCode,
+          countryCode: rateTest.fixture.destination.countryCode,
+        },
+        destinationResidential: rateTest.fixture.destination.residential === true,
+        parcel: rateTest.fixture.parcel,
+        ...(environment === 'production'
+          ? {
+              shipFromPhone: diagnosticSenderPhone.trim(),
+              shipToPhone: diagnosticRecipientPhone.trim(),
+              operatorConfirmation: productionPostageTypedConfirmation,
+            }
+          : {}),
         outputFormat: selectedLabelOutput.format,
         reason: createLabelReason.trim(),
         idempotencyKey,
       },
-      'Sandbox label created and stored. It is now available for test printing.',
+      environment === 'production'
+        ? 'LIVE production postage was created and stored. Print the stored provider bytes, then void it immediately.'
+        : 'Sandbox label created and stored. It is now available for test printing.',
     )
     if (!result) return
     const createdLabel = result.rateTestLabel || result.rateTestLabels?.find((entry) => (
@@ -986,6 +1096,7 @@ export default function CarrierIntegrationPanel({
     setRateTestPrintJob(null)
     setCreateLabelReason('')
     setCreateLabelConfirmed(false)
+    setProductionPostageTypedConfirmation('')
     setCreateLabelIdempotencyKey('')
     setPrintLabelIdempotencyKey('')
     setVoidLabelReason('')
@@ -1035,7 +1146,7 @@ export default function CarrierIntegrationPanel({
       },
       closeSample
         ? `UPS CIE sample ${selectedRateTestLabel.globalId} was closed locally; no carrier void call was made.`
-        : `Sandbox label ${selectedRateTestLabel.globalId} was voided.`,
+        : `${selectedRateTestLabel.environment === 'production' ? 'LIVE production' : 'Sandbox'} label ${selectedRateTestLabel.globalId} was voided.`,
     )
     if (!result) return
     setVoidLabelReason('')
@@ -1612,12 +1723,18 @@ export default function CarrierIntegrationPanel({
             sx={fieldSx}
           />
         </Box>
-        {environment === 'sandbox' && provider !== 'usps_rest' && activeCarrierAccounts.length ? (
+        {provider !== 'usps_rest' && diagnosticCarrierAccounts.length ? (
           <FormControl fullWidth size="small" sx={{ mt: 1.5 }}>
-            <InputLabel id="sandbox-carrier-account-label">Sandbox billing account</InputLabel>
+            <InputLabel id="carrier-account-label">
+              {environment === 'production'
+                ? 'LIVE production billing account'
+                : 'Sandbox billing account'}
+            </InputLabel>
             <Select
-              labelId="sandbox-carrier-account-label"
-              label="Sandbox billing account"
+              labelId="carrier-account-label"
+              label={environment === 'production'
+                ? 'LIVE production billing account'
+                : 'Sandbox billing account'}
               value={selectedCarrierAccountGlobalId}
               onChange={(event) => {
                 setSelectedCarrierAccounts((current) => ({
@@ -1628,9 +1745,9 @@ export default function CarrierIntegrationPanel({
                 setSelectedRateTestLabelGlobalId('')
                 setSelectedRateTestPrinterGlobalId('')
               }}
-              disabled={busy || activeCarrierAccounts.length === 1}
+              disabled={busy || diagnosticCarrierAccounts.length === 1}
             >
-              {activeCarrierAccounts.map((entry) => (
+              {diagnosticCarrierAccounts.map((entry) => (
                 <MenuItem key={entry.globalId} value={entry.globalId}>
                   {entry.displayName} ending {entry.accountNumberLastFour}
                 </MenuItem>
@@ -2028,10 +2145,12 @@ export default function CarrierIntegrationPanel({
         </Box>
       )}
 
-      {environment === 'sandbox' && provider !== 'usps_rest' ? (
+      {provider !== 'usps_rest' ? (
         <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
           <Typography variant="subtitle2" fontWeight={700}>
-            {sourceManagedDelegation
+            {environment === 'production'
+              ? 'LIVE production shipping account diagnostic'
+              : sourceManagedDelegation
               ? ratingOnlyDelegation
                 ? 'Sandbox rate test'
                 : managedSandboxFulfillmentDelegation
@@ -2040,7 +2159,9 @@ export default function CarrierIntegrationPanel({
               : 'Sandbox label test workflow'}
           </Typography>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            {sourceManagedDelegation
+            {environment === 'production'
+              ? 'Choose one exact production account, rate an editable parcel, buy the exact selected rate as REAL POSTAGE, print the stored provider bytes, then void it immediately.'
+              : sourceManagedDelegation
               ? ratingOnlyDelegation
                 ? 'Rate an editable US destination from the AG Alchemy warehouse. No carrier mutation follows the quote.'
                 : managedSandboxFulfillmentDelegation
@@ -2054,15 +2175,15 @@ export default function CarrierIntegrationPanel({
               alternativeLabel
               sx={{ mt: 2, mb: 2, '& .MuiStepLabel-label': { fontSize: '0.75rem' } }}
             >
-              {['Rate', 'Create label', 'Print stored label', 'Void / close'].map((label) => (
+              {['Rate', environment === 'production' ? 'Buy LIVE label' : 'Create label', 'Print stored label', environment === 'production' ? 'Void' : 'Void / close'].map((label) => (
                 <Step key={label}><StepLabel>{label}</StepLabel></Step>
               ))}
             </Stepper>
           ) : null}
           {labelWorkflowAuthorized && !canExecute ? (
             <Alert severity="info" sx={{ mb: 2, borderRadius: '8px' }}>
-              You can review and run rating diagnostics, but creating, downloading, printing, or voiding a
-              label also requires warehouse-execution permission.
+              You can run rating diagnostics, but creating, printing, or voiding a label requires
+              warehouse-execution permission.
             </Alert>
           ) : null}
           <Typography variant="overline" color="text.disabled">Step 1 · Rate</Typography>
@@ -2092,7 +2213,7 @@ export default function CarrierIntegrationPanel({
               </>
             ) : (
               <Typography variant="body2" color="text.secondary">
-                Select an active sandbox billing account.
+                Select an active {environment === 'production' ? 'LIVE production' : 'sandbox'} billing account.
               </Typography>
             )}
           </Box>
@@ -2158,19 +2279,52 @@ export default function CarrierIntegrationPanel({
               label="Destination country"
               value={rateDestination.countryCode}
               inputProps={{ readOnly: true }}
-              helperText="Sandbox rating is currently US-only"
+              helperText="Shipping account diagnostics are currently US-only"
               sx={fieldSx}
             />
           </Box>
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-            Fixed parcel: {providerRateParcel.description} ·{' '}
-            {selectedUnitRateParcelDimensions} · {selectedUnitRateParcelWeight}.
+          <FormControlLabel
+            control={(
+              <Checkbox
+                checked={destinationResidential}
+                onChange={(_, checked) => updateDestinationResidential(checked)}
+                disabled={busy}
+              />
+            )}
+            label="Residential destination"
+            sx={{ mt: 0.5, ml: 0 }}
+          />
+          <Typography variant="subtitle2" fontWeight={700} sx={{ mt: 1.5, mb: 1 }}>
+            Test parcel
           </Typography>
-          <Typography variant="caption" color="text.disabled" display="block">
-            Provider-native fixture (sent unchanged): {providerRateParcel.length} ×{' '}
-            {providerRateParcel.width} × {providerRateParcel.height}{' '}
-            {providerRateParcel.dimensionUnit} · {providerRateParcel.weight}{' '}
-            {providerRateParcel.weightUnit}.
+          <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', sm: '2fr repeat(4, 1fr)' }, gap: 1.5 }}>
+            <TextField
+              required
+              label="Description"
+              value={providerRateParcel.description}
+              onChange={(event) => updateRateParcel('description', event.target.value)}
+              disabled={busy}
+              inputProps={{ maxLength: 120 }}
+              sx={fieldSx}
+            />
+            {(['length', 'width', 'height', 'weight'] as const).map((field) => (
+              <TextField
+                key={field}
+                required
+                type="number"
+                label={field === 'weight' ? 'Weight (lb)' : `${field[0].toUpperCase()}${field.slice(1)} (in)`}
+                value={providerRateParcel[field]}
+                onChange={(event) => updateRateParcel(field, Number(event.target.value))}
+                disabled={busy}
+                inputProps={{ min: 0.01, max: field === 'weight' ? 150 : 108, step: 0.01 }}
+                sx={fieldSx}
+              />
+            ))}
+          </Box>
+          <Typography variant="caption" color="text.disabled" display="block" sx={{ mt: 0.75 }}>
+            Sent unchanged: {providerRateParcel.length} × {providerRateParcel.width} ×{' '}
+            {providerRateParcel.height} {providerRateParcel.dimensionUnit} · {providerRateParcel.weight}{' '}
+            {providerRateParcel.weightUnit} ({selectedUnitRateParcelDimensions} · {selectedUnitRateParcelWeight}).
           </Typography>
           <Typography variant="caption" color="text.disabled" display="block">
             Rating returns prices only. No label media, shipment, pickup, manifest, tracking record, print
@@ -2179,10 +2333,12 @@ export default function CarrierIntegrationPanel({
           </Typography>
           <Box sx={{ mt: 1.5 }}>
             <Tooltip title={
-              sandboxRateBlocker
+              (environment === 'production' ? productionRateBlocker : sandboxRateBlocker)
               || (!rateDestinationComplete
                 ? 'Complete the US test destination first.'
-                : 'Returns sandbox prices for the entered destination and fixed test parcel.')
+                : !diagnosticParcelComplete
+                  ? 'Complete the test parcel first.'
+                  : `Returns ${environment === 'production' ? 'LIVE production' : 'sandbox'} prices from the exact selected account.`)
             }>
               <span>
                 <Button
@@ -2190,20 +2346,26 @@ export default function CarrierIntegrationPanel({
                   startIcon={pendingAction === 'rate'
                     ? <CircularProgress size={16} color="inherit" />
                     : <PriceCheckRounded />}
-                  disabled={busy || Boolean(sandboxRateBlocker) || !rateDestinationComplete}
+                  disabled={
+                    busy
+                    || Boolean(environment === 'production' ? productionRateBlocker : sandboxRateBlocker)
+                    || !rateDestinationComplete
+                    || !diagnosticParcelComplete
+                  }
                   onClick={() => {
                     void patch(
                       'rate',
                       {
-                        action: 'test-sandbox-rate',
+                        action: 'test-shipping-diagnostic-rate',
                         provider,
                         environment,
+                        integrationAccountGlobalId: account?.globalId,
+                        carrierAccountGlobalId: selectedCarrierAccountGlobalId,
                         destination: rateDestination,
-                        ...(activeCarrierAccounts.length > 1
-                          ? { carrierAccountGlobalId: selectedCarrierAccountGlobalId }
-                          : {}),
+                        destinationResidential,
+                        parcel: providerRateParcel,
                       },
-                      `${providerLabel(provider)} sandbox rates returned. Select one exact rate to continue.`,
+                      `${providerLabel(provider)} ${environment === 'production' ? 'LIVE production' : 'sandbox'} rates returned from the exact selected account.`,
                     ).then((result) => {
                       if (!result?.rateTest) return
                       setRateTest(result.rateTest)
@@ -2212,16 +2374,25 @@ export default function CarrierIntegrationPanel({
                       setRateTestPrintJob(null)
                       setCreateLabelReason('')
                       setCreateLabelConfirmed(false)
+                      setProductionPostageTypedConfirmation('')
                       setCreateLabelIdempotencyKey('')
                       setRateDestinations((current) => ({
                         ...current,
                         [key]: result.rateTest!.fixture.destination,
                       }))
+                      setRateParcels((current) => ({
+                        ...current,
+                        [key]: result.rateTest!.fixture.parcel,
+                      }))
+                      setRateDestinationResidential((current) => ({
+                        ...current,
+                        [key]: result.rateTest!.fixture.destination.residential === true,
+                      }))
                     })
                   }}
                   sx={buttonSx}
                 >
-                  Test sandbox rates
+                  Get {environment === 'production' ? 'LIVE production' : 'sandbox'} rates
                 </Button>
               </span>
             </Tooltip>
@@ -2252,6 +2423,7 @@ export default function CarrierIntegrationPanel({
                     onChange={() => {
                       setSelectedRateKey(sandboxRateKey(rate))
                       setCreateLabelConfirmed(false)
+                      setProductionPostageTypedConfirmation('')
                       setCreateLabelIdempotencyKey('')
                     }}
                     disabled={busy}
@@ -2274,8 +2446,11 @@ export default function CarrierIntegrationPanel({
                 </Box>
               ))}
               <Typography variant="caption" color="text.disabled" sx={{ mt: 1 }}>
-                {rateTest.carrierAccountGlobalId} | {rateTest.billingRelationship.replace('_', ' ')} | Evidence{' '}
-                {rateTest.evidenceGlobalId}
+                {rateTest.environment === 'production' ? 'LIVE production account' : 'Sandbox account'}:{' '}
+                {rateTest.carrierAccountGlobalId} · {rateTest.billingRelationship.replace('_', ' ')} · Evidence{' '}
+                {rateTest.evidenceGlobalId} · {formatUserDateTime(rateTest.testedAt, dateTimeSettings, {
+                  year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+                })}
               </Typography>
             </Stack>
           ) : null}
@@ -2283,12 +2458,14 @@ export default function CarrierIntegrationPanel({
           {labelWorkflowAuthorized ? (
             <>
           <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-            <Typography variant="overline" color="text.disabled">Step 2 · Create label</Typography>
+            <Typography variant="overline" color="text.disabled">
+              Step 2 · {environment === 'production' ? 'Buy LIVE label' : 'Create label'}
+            </Typography>
             <Typography variant="subtitle2" fontWeight={700}>Confirm one exact returned rate</Typography>
             {!rateTest ? (
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Run a sandbox rate first. Label creation is not available from an advisory service name or a
-                manually entered price.
+                Run an exact {environment === 'production' ? 'LIVE production' : 'sandbox'} rate first.
+                Label creation is never available from a manually entered service or price.
               </Typography>
             ) : !selectedRate ? (
               <Alert severity="info" sx={{ mt: 1.5, borderRadius: '8px' }}>
@@ -2329,6 +2506,7 @@ export default function CarrierIntegrationPanel({
                         [labelOutputProvider]: event.target.value as 'ZPL' | 'PDF' | 'PNG',
                       }))
                       setCreateLabelConfirmed(false)
+                      setProductionPostageTypedConfirmation('')
                       setCreateLabelIdempotencyKey('')
                     }}
                     disabled={busy || availableLabelOutputs.length < 2}
@@ -2358,7 +2536,7 @@ export default function CarrierIntegrationPanel({
                   required
                   multiline
                   minRows={2}
-                  label="Test-label reason"
+                  label={environment === 'production' ? 'LIVE postage test reason' : 'Test-label reason'}
                   value={createLabelReason}
                   onChange={(event) => {
                     setCreateLabelReason(event.target.value)
@@ -2369,20 +2547,73 @@ export default function CarrierIntegrationPanel({
                   helperText={`${createLabelReason.length}/500 · recorded with the carrier action`}
                   sx={fieldSx}
                 />
-                <FormControlLabel
-                  control={(
-                    <Checkbox
-                      checked={createLabelConfirmed}
-                      onChange={(_, checked) => {
-                        setCreateLabelConfirmed(checked)
+                {environment === 'production' ? (
+                  <>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 1.5 }}>
+                      <TextField
+                        required
+                        label="Sender phone"
+                        value={diagnosticSenderPhone}
+                        onChange={(event) => {
+                          setDiagnosticSenderPhones((current) => ({ ...current, [key]: event.target.value }))
+                          setCreateLabelIdempotencyKey('')
+                        }}
+                        disabled={busy}
+                        inputProps={{ maxLength: 24 }}
+                        sx={fieldSx}
+                      />
+                      <TextField
+                        required
+                        label="Recipient phone"
+                        value={diagnosticRecipientPhone}
+                        onChange={(event) => {
+                          setDiagnosticRecipientPhones((current) => ({ ...current, [key]: event.target.value }))
+                          setCreateLabelIdempotencyKey('')
+                        }}
+                        disabled={busy}
+                        inputProps={{ maxLength: 24 }}
+                        sx={fieldSx}
+                      />
+                    </Box>
+                    <Alert severity="warning" sx={{ borderRadius: '8px' }}>
+                      REAL POSTAGE: buying this exact {providerLabel(provider)} rate can incur a production
+                      charge. Print the stored provider bytes, then use the true carrier void below immediately.
+                    </Alert>
+                    <TextField
+                      required
+                      label="Type the exact REAL POSTAGE confirmation"
+                      value={productionPostageTypedConfirmation}
+                      onChange={(event) => {
+                        setProductionPostageTypedConfirmation(event.target.value)
                         setCreateLabelIdempotencyKey('')
                       }}
                       disabled={busy}
+                      helperText={selectedProductionConfirmation}
+                      inputProps={{ maxLength: 300 }}
+                      sx={fieldSx}
                     />
-                  )}
-                  label={`I confirm this will call ${providerLabel(provider)} sandbox to create and durably store a real test label for the exact selected rate.`}
-                  sx={{ alignItems: 'flex-start', m: 0 }}
-                />
+                    {productionCreateBlocker ? (
+                      <Typography variant="caption" color="warning.main">
+                        {productionCreateBlocker}
+                      </Typography>
+                    ) : null}
+                  </>
+                ) : (
+                  <FormControlLabel
+                    control={(
+                      <Checkbox
+                        checked={createLabelConfirmed}
+                        onChange={(_, checked) => {
+                          setCreateLabelConfirmed(checked)
+                          setCreateLabelIdempotencyKey('')
+                        }}
+                        disabled={busy}
+                      />
+                    )}
+                    label={`I confirm this will call ${providerLabel(provider)} sandbox to create and durably store a real test label for the exact selected rate.`}
+                    sx={{ alignItems: 'flex-start', m: 0 }}
+                  />
+                )}
                 <Box>
                   <Button
                     variant="contained"
@@ -2393,13 +2624,20 @@ export default function CarrierIntegrationPanel({
                       busy
                       || !canExecute
                       || !selectedLabelOutput
-                      || !createLabelConfirmed
+                      || (environment === 'sandbox' && !createLabelConfirmed)
+                      || (environment === 'production' && Boolean(productionCreateBlocker))
+                      || (
+                        environment === 'production'
+                        && productionPostageTypedConfirmation !== selectedProductionConfirmation
+                      )
                       || !createLabelReason.trim()
                     }
                     onClick={() => void createRateTestLabel()}
                     sx={buttonSx}
                   >
-                    Create and store sandbox label
+                    {environment === 'production'
+                      ? 'Buy and store LIVE production label'
+                      : 'Create and store sandbox label'}
                   </Button>
                 </Box>
               </Stack>
@@ -2407,7 +2645,9 @@ export default function CarrierIntegrationPanel({
           </Box>
 
           <Box sx={{ mt: 3, pt: 2, borderTop: '1px solid', borderColor: 'divider' }}>
-            <Typography variant="overline" color="text.disabled">Stored test labels</Typography>
+            <Typography variant="overline" color="text.disabled">
+              Stored {environment === 'production' ? 'LIVE production' : 'sandbox test'} labels
+            </Typography>
             <Typography variant="subtitle2" fontWeight={700}>Reloadable label history</Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
               Label metadata is durable and safe to review. Label bytes and internal database identifiers
@@ -2466,6 +2706,10 @@ export default function CarrierIntegrationPanel({
                           {label.format} {label.mediaSize.replace('label_', '').replace('x', ' × ')}
                         </Typography>
                         <Typography variant="caption" color="text.disabled" display="block">
+                          {label.environment === 'production' ? 'LIVE production' : 'Sandbox'} account{' '}
+                          {label.carrierAccountGlobalId}
+                        </Typography>
+                        <Typography variant="caption" color="text.disabled" display="block">
                           Provider-native {label.providerImageType} · source bytes immutable
                         </Typography>
                         <Typography variant="caption" color="text.disabled" display="block">
@@ -2480,7 +2724,7 @@ export default function CarrierIntegrationPanel({
               </Stack>
             ) : (
               <Alert severity="info" sx={{ mt: 1.5, borderRadius: '8px' }}>
-                No {providerLabel(provider)} sandbox test labels have been stored for this organization.
+                No {providerLabel(provider)} {environment === 'production' ? 'LIVE production' : 'sandbox test'} labels have been stored for this organization.
               </Alert>
             )}
           </Box>
@@ -2688,7 +2932,7 @@ export default function CarrierIntegrationPanel({
                 severity="info"
                 sx={{ mt: 1.5, borderRadius: '8px' }}
               >
-                Create a sandbox label or select one from Stored test labels before printing.
+                Create or select a stored {environment === 'production' ? 'LIVE production' : 'sandbox'} label before printing.
               </Alert>
             ) : printReadinessBlocker === 'execution_permission_required' ? (
               <Alert
@@ -2724,7 +2968,7 @@ export default function CarrierIntegrationPanel({
                 Printer profiles are configured, but none supports shipping labels in{' '}
                 {selectedRateTestLabel.format} on {selectedRateTestLabel.mediaSize}.{' '}
                 {selectedRateTestLabel.format === 'PDF'
-                  ? 'This existing provider PDF remains immutable. Void it below, run a new sandbox rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.'
+                  ? `This provider PDF remains immutable. Void it below, run a new ${environment === 'production' ? 'LIVE production' : 'sandbox'} rate, and create a new provider-native thermal ZPL label for a ZPL printer; or configure a PDF-capable local print service.`
                   : 'Configure a printer that explicitly supports this exact format and media before printing.'}
               </Alert>
             ) : printReadinessBlocker === 'compatible_printer_offline' ? (
@@ -2790,7 +3034,7 @@ export default function CarrierIntegrationPanel({
                 onClick={() => void printRateTestLabel()}
                 sx={buttonSx}
               >
-                Test print stored label
+                Print stored {environment === 'production' ? 'LIVE label' : 'test label'}
               </Button>
             </Box>
             {selectedRateTestLabel
@@ -2816,7 +3060,9 @@ export default function CarrierIntegrationPanel({
                 <Typography variant="subtitle2" fontWeight={700}>
                   {selectedRateTestLabel.lifecycleMode === 'close_sample'
                     ? 'Close the UPS CIE sample evidence'
-                    : 'Close the carrier-side test'}
+                    : selectedRateTestLabel.environment === 'production'
+                      ? 'Void the LIVE production label'
+                      : 'Void the carrier-side test'}
                 </Typography>
                 {selectedRateTestLabel.status === 'voided' ? (
                   <Alert severity="success" sx={{ mt: 1.5, borderRadius: '8px' }}>
@@ -2839,8 +3085,9 @@ export default function CarrierIntegrationPanel({
                       </Alert>
                     ) : (
                       <Alert severity="warning" sx={{ borderRadius: '8px' }}>
-                        Voiding calls the carrier for tracking {selectedRateTestLabel.trackingNumber}. It does
-                        not delete the stored audit record.
+                        {selectedRateTestLabel.environment === 'production' ? 'TRUE PROVIDER VOID' : 'Voiding'}{' '}
+                        calls the carrier for tracking {selectedRateTestLabel.trackingNumber}. It does not
+                        delete the stored label or audit record.
                       </Alert>
                     )}
                     {selectedRateTestLabelVoidAttempt?.state === 'failed' ? (
@@ -2921,7 +3168,9 @@ export default function CarrierIntegrationPanel({
                       >
                         {selectedRateTestLabel.lifecycleMode === 'close_sample'
                           ? 'Close UPS sample without carrier call'
-                          : 'Void exact sandbox label'}
+                          : selectedRateTestLabel.environment === 'production'
+                            ? 'Void exact LIVE production label now'
+                            : 'Void exact sandbox label'}
                       </Button>
                     </Box>
                   </Stack>

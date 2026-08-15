@@ -375,8 +375,7 @@ function verifySourceContracts() {
   }
   const managementRoute = read('app_src/app/api/operations/print-agents/route.ts')
   for (const fragment of [
-    "command.action === 'enroll-agent'",
-    "command.action === 'rotate-credential'",
+    "command.action === 'create-pairing-grant'",
     "command.action === 'revoke-agent'",
     'requireRequestUser',
     'supportedFormats',
@@ -385,6 +384,17 @@ function verifySourceContracts() {
     'DEFAULT_PRINT_AGENT_CAPABILITIES',
   ]) {
     assert.ok(managementRoute.includes(fragment), `Missing print-agent management contract: ${fragment}`)
+  }
+  for (const forbidden of [
+    "command.action === 'enroll-agent'",
+    "command.action === 'rotate-credential'",
+    'enrollOperationsPrintAgentInPostgres',
+    'rotateOperationsPrintAgentCredentialInPostgres',
+  ]) {
+    assert.ok(
+      !managementRoute.includes(forbidden),
+      `Browser print-agent management must not expose cpprint issuance: ${forbidden}`,
+    )
   }
 
   const helpers = loadPersistenceHelpers()

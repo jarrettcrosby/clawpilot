@@ -34,6 +34,24 @@ export type ShopifyOrderPlanningAuthorityTarget = {
   }>
 }
 
+export type ShopifyOrderPlanningAssignmentTarget = {
+  organizationId: string
+  accountGlobalId: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  externalOrderId: string
+  mappings: Array<{
+    globalId: string
+    rowVersion: number
+    externalLocationId: string
+    externalLocationName: string
+    warehouseGlobalId: string
+    warehouseName: string
+    locationGlobalId: string
+    locationCode: string
+  }>
+}
+
 export class ShopifyOrderPlanningAuthorityPersistenceError extends Error {
   constructor(
     message: string,
@@ -405,6 +423,177 @@ export async function readShopifyOrderPlanningAuthorityTargetFromPostgres(
     const target = await readTarget(client, input)
     await client.query('COMMIT')
     return target
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // Preserve the exact context failure.
+    }
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+export async function readShopifyOrderPlanningAssignmentTargetFromPostgres(
+  rawInput: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    candidateGlobalId: unknown
+    expectedCandidateRowVersion: unknown
+  },
+): Promise<ShopifyOrderPlanningAssignmentTarget> {
+  const organizationId = normalizeCommerceOrganizationId(
+    rawInput.organizationId,
+  )
+  const accountGlobalId = normalizeCommerceAccountGlobalId(
+    rawInput.accountGlobalId,
+  )
+  const candidateGlobalId = exactReference(
+    rawInput.candidateGlobalId,
+    CANDIDATE_GLOBAL_ID,
+    'Commerce order candidate',
+  )
+  const expectedCandidateRowVersion = Number(
+    rawInput.expectedCandidateRowVersion,
+  )
+  if (
+    !Number.isSafeInteger(expectedCandidateRowVersion)
+    || expectedCandidateRowVersion < 0
+  ) {
+    fail(
+      'Expected candidate row version is invalid',
+      400,
+      'SHOPIFY_ORDER_PLANNING_INPUT_INVALID',
+    )
+  }
+  const client = await getPostgresPool().connect()
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const candidateResult = await client.query<{
+      row_version: string
+      external_order_id: string
+      workflow_state: string
+      canonical_order_id: string | null
+    }>(
+      `SELECT candidate.row_version::text, candidate.external_order_id,
+              candidate.workflow_state, candidate.canonical_order_id::text
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = account.organization_id
+        AND candidate.integration_account_id = account.id
+       WHERE account.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+         AND account.status = 'active'
+         AND candidate.global_id = $3
+       LIMIT 2`,
+      [organizationId, accountGlobalId, candidateGlobalId],
+    )
+    if (candidateResult.rows.length !== 1) {
+      fail(
+        'The exact active Shopify order context is unavailable',
+        409,
+        'SHOPIFY_ORDER_PLANNING_CONTEXT_UNAVAILABLE',
+      )
+    }
+    const candidate = candidateResult.rows[0]
+    const candidateRowVersion = exactInteger(
+      candidate.row_version,
+      'Candidate row version',
+    )
+    if (candidateRowVersion !== expectedCandidateRowVersion) {
+      fail(
+        'The Shopify order candidate changed; refresh before rating',
+        409,
+        'SHOPIFY_ORDER_PLANNING_CANDIDATE_STALE',
+      )
+    }
+    if (
+      candidate.workflow_state !== 'promoted'
+      || !candidate.canonical_order_id
+    ) {
+      fail(
+        'Only an exact promoted Shopify order can be prepared',
+        422,
+        'SHOPIFY_ORDER_PLANNING_CANDIDATE_NOT_PROMOTED',
+      )
+    }
+    if (!SHOPIFY_ORDER_GID.test(candidate.external_order_id)) {
+      fail(
+        'The promoted order has an invalid Shopify order identity',
+        500,
+        'SHOPIFY_ORDER_PLANNING_CONTEXT_CORRUPT',
+      )
+    }
+    const mappingResult = await client.query<{
+      global_id: string
+      row_version: string
+      external_location_id: string
+      external_location_name: string
+      warehouse_global_id: string
+      warehouse_name: string
+      location_global_id: string
+      location_code: string
+    }>(
+      `SELECT mapping.global_id, mapping.row_version::text,
+              mapping.external_location_id,
+              mapping.external_location_name,
+              warehouse.global_id AS warehouse_global_id,
+              warehouse.name AS warehouse_name,
+              location.global_id AS location_global_id,
+              location.code AS location_code
+       FROM operations_commerce_inventory_location_mappings mapping
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = mapping.organization_id
+        AND warehouse.id = mapping.warehouse_id
+        AND warehouse.status = 'active'
+       JOIN operations_locations location
+         ON location.organization_id = mapping.organization_id
+        AND location.id = mapping.location_id
+        AND location.warehouse_id = warehouse.id
+        AND location.active = true
+       JOIN operations_integration_accounts account
+         ON account.organization_id = mapping.organization_id
+        AND account.id = mapping.integration_account_id
+       WHERE mapping.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND mapping.active = true
+       ORDER BY mapping.external_location_id, mapping.id`,
+      [organizationId, accountGlobalId],
+    )
+    const mappings = mappingResult.rows.map((mapping) => {
+      if (!SHOPIFY_LOCATION_GID.test(mapping.external_location_id)) {
+        fail(
+          'A saved Shopify location mapping has an invalid provider identity',
+          500,
+          'SHOPIFY_ORDER_PLANNING_CONTEXT_CORRUPT',
+        )
+      }
+      return {
+        globalId: mapping.global_id,
+        rowVersion: exactInteger(
+          mapping.row_version,
+          'Shopify location mapping row version',
+        ),
+        externalLocationId: mapping.external_location_id,
+        externalLocationName: mapping.external_location_name,
+        warehouseGlobalId: mapping.warehouse_global_id,
+        warehouseName: mapping.warehouse_name,
+        locationGlobalId: mapping.location_global_id,
+        locationCode: mapping.location_code,
+      }
+    })
+    await client.query('COMMIT')
+    return {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      candidateRowVersion,
+      externalOrderId: candidate.external_order_id,
+      mappings,
+    }
   } catch (error) {
     try {
       await client.query('ROLLBACK')

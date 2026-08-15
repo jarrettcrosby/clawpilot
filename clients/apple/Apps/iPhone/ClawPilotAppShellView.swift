@@ -977,6 +977,7 @@ private struct ManagerOrderAssignmentView: View {
     let order: ManagerOrderDetail
     @State private var pickerEmail = ""
     @State private var reason = "Release and assign warehouse picks from ClawPilot Mobile"
+    @State private var showReplanningConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -985,6 +986,9 @@ private struct ManagerOrderAssignmentView: View {
                     orderSummary
                     pickerSection
                     consequenceNotice
+                    if let correction = order.replanningCorrectionAvailability {
+                        replanningCorrectionSection(correction)
+                    }
 
                     Button {
                         Task {
@@ -1040,6 +1044,15 @@ private struct ManagerOrderAssignmentView: View {
                 }
             }
             .interactiveDismissDisabled(model.isManagerBusy)
+            .sheet(isPresented: $showReplanningConfirmation) {
+                if let correction = order.replanningCorrectionAction {
+                    ManagerOrderReplanningConfirmationView(
+                        model: model,
+                        order: order,
+                        correction: correction
+                    )
+                }
+            }
             .onAppear {
                 if pickerEmail.isEmpty { pickerEmail = model.managerPickers.first?.email ?? "" }
             }
@@ -1119,6 +1132,49 @@ private struct ManagerOrderAssignmentView: View {
         .background(AppShellTheme.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 15))
     }
 
+    private func replanningCorrectionSection(
+        _ correction: ManagerOrderActionAvailability
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Order correction")
+                .font(.headline)
+                .foregroundStyle(AppShellTheme.text)
+            Text(
+                correction.isExactReplanningCorrectionProjection
+                    ? (correction.consequenceSummary ?? "")
+                    : (correction.blockedReason
+                        ?? "Refresh this order before reviewing a correction.")
+            )
+                .font(.footnote)
+                .foregroundStyle(AppShellTheme.muted)
+            if !correction.isExactReplanningCorrectionProjection,
+               let blockedCode = correction.blockedCode {
+                Text(blockedCode)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(Color.orange)
+            }
+            Button {
+                showReplanningConfirmation = true
+            } label: {
+                Label(correction.label, systemImage: "arrow.uturn.backward.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(ShellSecondaryButtonStyle())
+            .disabled(
+                model.isManagerBusy
+                    || model.isReplayingManagerOrderReplanning
+                    || model.hasPendingManagerOrderReplanning
+                    || !correction.isExactReplanningCorrectionProjection
+            )
+        }
+        .padding(16)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 15))
+        .overlay {
+            RoundedRectangle(cornerRadius: 15)
+                .stroke(Color.orange.opacity(0.28), lineWidth: 1)
+        }
+    }
+
     private func metric(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased())
@@ -1130,6 +1186,147 @@ private struct ManagerOrderAssignmentView: View {
                 .foregroundStyle(AppShellTheme.text)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ManagerOrderReplanningConfirmationView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: PickingPhoneModel
+    let order: ManagerOrderDetail
+    let correction: ManagerOrderActionAvailability
+    @State private var reason = ""
+
+    private var normalizedReason: String {
+        reason.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var reasonIsValid: Bool {
+        normalizedReason.utf16.count >= 8
+            && normalizedReason.utf16.count <= 500
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Label("This changes local warehouse state", systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                        .foregroundStyle(Color.orange)
+
+                    Text(correction.consequenceSummary ?? "")
+                        .font(.body)
+                        .foregroundStyle(AppShellTheme.text)
+
+                    Label(
+                        "The provider order remains unchanged. This request makes zero carrier and storefront calls.",
+                        systemImage: "network.slash"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(AppShellTheme.muted)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Required audit reason")
+                            .font(.headline)
+                            .foregroundStyle(AppShellTheme.text)
+                        TextField(
+                            "Explain why this order must be replanned",
+                            text: $reason,
+                            axis: .vertical
+                        )
+                        .lineLimit(3...6)
+                        .shellInputSurface()
+                        .disabled(model.hasPendingManagerOrderReplanning)
+                        Text("At least 8 characters · \(normalizedReason.utf16.count)/500")
+                            .font(.caption)
+                            .foregroundStyle(AppShellTheme.muted)
+                    }
+
+                    if let detail = model.managerOrderReplanningDetail {
+                        Label(
+                            detail,
+                            systemImage: model.managerOrderReplanningRefreshRequired
+                                ? "arrow.clockwise.circle"
+                                : "externaldrive.badge.timemachine"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(
+                            model.managerOrderReplanningRefreshRequired
+                                ? Color.orange
+                                : AppShellTheme.muted
+                        )
+                        .padding(14)
+                        .background(AppShellTheme.raised, in: RoundedRectangle(cornerRadius: 13))
+                    }
+
+                    if model.managerOrderReplanningRefreshRequired {
+                        Button {
+                            Task {
+                                await model.refreshManagerAfterReplanningConflict()
+                                dismiss()
+                            }
+                        } label: {
+                            Label("Refresh order before another correction", systemImage: "arrow.clockwise")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(ShellPrimaryButtonStyle())
+                        .disabled(model.isManagerBusy)
+                    } else {
+                        Button {
+                            Task {
+                                let completed = model.hasPendingManagerOrderReplanning
+                                    ? await model.retryPendingManagerOrderReplanning()
+                                    : await model.reopenManagerOrderForReplanning(
+                                        reason: normalizedReason
+                                    )
+                                if completed { dismiss() }
+                            }
+                        } label: {
+                            HStack {
+                                if model.isReplayingManagerOrderReplanning {
+                                    ProgressView().tint(AppShellTheme.primaryText)
+                                }
+                                Text(
+                                    model.hasPendingManagerOrderReplanning
+                                        ? "Retry saved correction"
+                                        : "Confirm reopen for replanning"
+                                )
+                                Image(systemName: "arrow.uturn.backward")
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(ShellPrimaryButtonStyle())
+                        .disabled(
+                            model.isManagerBusy
+                                || model.isReplayingManagerOrderReplanning
+                                || (!model.hasPendingManagerOrderReplanning && !reasonIsValid)
+                        )
+                    }
+
+                    Button("Keep current warehouse work") { dismiss() }
+                        .buttonStyle(ShellSecondaryButtonStyle())
+                        .disabled(
+                            model.isManagerBusy
+                                || model.isReplayingManagerOrderReplanning
+                        )
+                }
+                .padding(20)
+            }
+            .background(AppShellTheme.canvas)
+            .navigationTitle("Reopen order \(order.orderNumber)?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(
+                            model.isManagerBusy
+                                || model.isReplayingManagerOrderReplanning
+                        )
+                }
+            }
+            .interactiveDismissDisabled(
+                model.isManagerBusy || model.isReplayingManagerOrderReplanning
+            )
+        }
     }
 }
 

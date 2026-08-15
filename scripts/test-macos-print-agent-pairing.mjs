@@ -38,7 +38,9 @@ assert.equal(result.ok, true)
 assert.equal(result.action, 'validated')
 assert.equal(result.label, 'com.clawpilot.print-agent.test-pro-bakery-bites-zebra')
 assert.equal(result.printerEndpointStorage, 'local_launch_agent_only')
-assert.equal(result.credentialInput, 'secure_macos_keychain_prompt')
+assert.equal(result.credentialInput, 'secure_macos_keychain_pairing_grant_prompt')
+assert.equal(result.primaryPairingSecret, 'cppair.v1')
+assert.equal(result.legacyManualCompatibility, 'cpprint.v1')
 assert.equal(result.printerPort, 9100)
 assert.ok(!output.includes(host), 'Dry-run output must not disclose the local printer endpoint')
 assert.ok(!output.includes('cpprint.v1.'), 'Pairing output must never contain a credential')
@@ -157,12 +159,63 @@ try {
 
 const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
 for (const text of [
+  'Download macOS pairing helper',
+  'Create pairing code',
   'Connect on this Mac',
+  'Waiting for connection',
+  'Refresh connection status',
+  'Configure printers',
   'Pair another workspace',
+  'double-click ClawPilot Print Agent.command',
+  'run the .command file again with a unique instance name',
+  'The download is credential-free',
   'The printer IP stays on this Mac',
+  'raw-network ZPL preview',
+  'unsigned and not notarized',
+  'Node.js 20 or newer required',
+  'One-time pairing code',
   'Copy Mac pairing command',
   'Local device reference:',
 ]) assert.ok(panel.includes(text), `Printer pairing UI is missing: ${text}`)
+for (const fragment of [
+  "const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'",
+  "const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'",
+  'const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`',
+  "const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'",
+  'href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}',
+  'download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}',
+  'href={MACOS_PRINT_AGENT_CHECKSUM_PATH}',
+  'manifest.sha256.slice(0, 12)',
+  "manifest.deliveryBackend === 'raw-network-zpl'",
+  'const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000',
+  'printers.generatedAt',
+  'agents.generatedAt',
+  "? 'Agent connected'",
+  "? 'Connected'",
+  "'Agent offline'",
+  "'Seen before'",
+]) assert.ok(panel.includes(fragment), `Print-agent download UI is missing: ${fragment}`)
+assert.ok(
+  panel.indexOf('Download macOS pairing helper') < panel.indexOf('One-time pairing code'),
+  'The credential-free app download must appear before the one-time pairing code',
+)
+for (const fragment of [
+  "action: 'create-pairing-grant'",
+  'result.pairingGrant.pairingCode',
+  'pairingGrant?.pairingCode',
+  'pairingGrant?.expiresAt',
+  'the prior code cannot be recovered',
+]) assert.ok(panel.includes(fragment), `Short-lived pairing-grant UI is missing: ${fragment}`)
+for (const forbidden of [
+  'result.credential',
+  'setCredential(',
+  "'rotate-credential'",
+  'cpprint.v1',
+]) assert.ok(!panel.includes(forbidden), `Web pairing UI exposes a legacy credential path: ${forbidden}`)
+assert.ok(
+  !/href=\{?[^\n}]*(?:credential|token)/i.test(panel),
+  'A credential or token must never be placed in a print-agent download link',
+)
 assert.ok(!panel.includes('label="Printer IP"'), 'Hosted printer setup must not collect an IP')
 
 const printerRoute = read('app_src/app/api/operations/printers/route.ts')

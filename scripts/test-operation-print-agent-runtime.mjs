@@ -943,6 +943,216 @@ async function verifyRuntime(connectionString) {
       },
     )
     const fixture = await seedBase(pool)
+    const pairingInput = {
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Pairing-grant Zebra agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `pairing-grant-${fixture.suffix}`,
+      ...printing.DEFAULT_PRINT_AGENT_CAPABILITIES,
+    }
+    const pairingIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres(pairingInput)
+    assert.match(
+      pairingIssue.pairingGrant.pairingCode,
+      /^cppair\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
+    )
+    assert.ok(
+      Date.parse(pairingIssue.pairingGrant.expiresAt) > Date.now(),
+      'Pairing grants must expire in the future',
+    )
+    const persistedPairingSecret = await pool.query(
+      `SELECT secret_hash, status, print_agent_id
+       FROM operations_print_agent_pairing_grants
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, pairingIssue.pairingGrant.id],
+    )
+    assert.match(persistedPairingSecret.rows[0].secret_hash, /^[a-f0-9]{64}$/)
+    assert.equal(
+      JSON.stringify(persistedPairingSecret.rows[0]).includes(
+        pairingIssue.pairingGrant.pairingCode,
+      ),
+      false,
+      'Plaintext cppair grants must never be persisted',
+    )
+    assert.equal(persistedPairingSecret.rows[0].status, 'pending')
+    assert.equal(persistedPairingSecret.rows[0].print_agent_id, null)
+
+    const pairingIssueReplay = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres(pairingInput)
+    assert.equal(
+      pairingIssueReplay.pairingGrant.id,
+      pairingIssue.pairingGrant.id,
+    )
+    assert.equal(
+      pairingIssueReplay.pairingGrant.pairingCode,
+      null,
+      'Idempotent browser replays must not recover plaintext cppair grants',
+    )
+    await expectRejected(
+      () => persistence.createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Different pairing plan',
+      }),
+      /different print-agent pairing request/,
+    )
+
+    const pairingRedemption = await persistence
+      .redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: `redeem-pairing-${fixture.suffix}`,
+      })
+    assert.equal(pairingRedemption.replayed, false)
+    assert.match(
+      pairingRedemption.credential,
+      /^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
+    )
+    assert.equal(
+      pairingRedemption.agent.id,
+      pairingRedemption.credential.split('.')[2],
+      'Redeemed credential must use the grant-reserved agent identity',
+    )
+    assert.ok(
+      await persistence.authenticateOperationsPrintAgentInPostgres(
+        pairingRedemption.credential,
+      ),
+      'A redeemed credential must authenticate immediately',
+    )
+    const redeemedGrant = await pool.query(
+      `SELECT status, print_agent_id::text, redemption_idempotency_key
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [pairingIssue.pairingGrant.id],
+    )
+    assert.deepEqual(redeemedGrant.rows[0], {
+      status: 'redeemed',
+      print_agent_id: pairingRedemption.agent.id,
+      redemption_idempotency_key: `redeem-pairing-${fixture.suffix}`,
+    })
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: `redeem-replay-${fixture.suffix}`,
+      }),
+      /already used/,
+    )
+
+    const concurrentIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Concurrent pairing agent',
+        idempotencyKey: `pairing-concurrent-${fixture.suffix}`,
+      })
+    const concurrentRedemptions = await Promise.allSettled([
+      persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: concurrentIssue.pairingGrant.pairingCode,
+        idempotencyKey: `pairing-concurrent-a-${fixture.suffix}`,
+      }),
+      persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: concurrentIssue.pairingGrant.pairingCode,
+        idempotencyKey: `pairing-concurrent-b-${fixture.suffix}`,
+      }),
+    ])
+    assert.equal(
+      concurrentRedemptions.filter((result) => result.status === 'fulfilled').length,
+      1,
+      'Exactly one concurrent redemption may receive a cpprint credential',
+    )
+    assert.equal(
+      concurrentRedemptions.filter((result) => result.status === 'rejected').length,
+      1,
+    )
+    assert.match(
+      String(
+        concurrentRedemptions.find((result) => result.status === 'rejected')
+          ?.reason?.message || '',
+      ),
+      /already used/,
+    )
+
+    const invalidSecretIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Wrong-secret pairing agent',
+        idempotencyKey: `pairing-wrong-secret-${fixture.suffix}`,
+      })
+    const correctPairingCode = invalidSecretIssue.pairingGrant.pairingCode
+    const finalCharacter = correctPairingCode.at(-1)
+    const wrongPairingCode = `${correctPairingCode.slice(0, -1)}${
+      finalCharacter === 'A' ? 'B' : 'A'
+    }`
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: wrongPairingCode,
+        idempotencyKey: `pairing-wrong-${fixture.suffix}`,
+      }),
+      /pairing code is invalid/i,
+    )
+    const stillPendingGrant = await pool.query(
+      `SELECT status, print_agent_id
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [invalidSecretIssue.pairingGrant.id],
+    )
+    assert.deepEqual(stillPendingGrant.rows[0], {
+      status: 'pending',
+      print_agent_id: null,
+    })
+    const validAfterWrongSecret = await persistence
+      .redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: correctPairingCode,
+        idempotencyKey: `pairing-valid-after-wrong-${fixture.suffix}`,
+      })
+    assert.ok(validAfterWrongSecret.credential)
+
+    const expiredMaterial = persistence.createOperationsPrintAgentPairingCode()
+    const expiredReservedAgentId = randomUUID()
+    await pool.query(
+      `INSERT INTO operations_print_agent_pairing_grants (
+         id, organization_id, warehouse_id, reserved_agent_id, name,
+         secret_hash, supported_formats, supported_media,
+         supported_document_types, request_fingerprint, idempotency_key,
+         created_by, created_at, expires_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+         $6, $7::text[], $8::text[], $9::text[], $10, $11, $12,
+         clock_timestamp() - interval '11 minutes',
+         clock_timestamp() - interval '1 minute'
+       )`,
+      [
+        expiredMaterial.pairingGrantId,
+        fixture.organizationId,
+        fixture.warehouseId,
+        expiredReservedAgentId,
+        'Expired pairing agent',
+        expiredMaterial.secretHash,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        persistence.operationsPrintDeliveryFingerprint({ expired: true }),
+        `pairing-expired-${fixture.suffix}`,
+        fixture.actorEmail,
+      ],
+    )
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: expiredMaterial.pairingCode,
+        idempotencyKey: `redeem-expired-${fixture.suffix}`,
+      }),
+      /expired/,
+    )
+    const expiredGrant = await pool.query(
+      `SELECT status, expired_at IS NOT NULL AS expired
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [expiredMaterial.pairingGrantId],
+    )
+    assert.deepEqual(expiredGrant.rows[0], {
+      status: 'expired',
+      expired: true,
+    })
+
     const legacyBundledEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,
       warehouseId: fixture.warehouseId,

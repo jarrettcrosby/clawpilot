@@ -9,6 +9,9 @@ import {
   normalizeShopifyCheckoutRateWarmPolicy,
   type ShopifyCheckoutRateWarmPolicy,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
+import type {
+  CarrierAccountAddress,
+} from '@/lib/integrations/carrierCredentialCrypto'
 import {
   acquireTransactionAdvisoryLock,
   getPostgresPool,
@@ -20,7 +23,9 @@ export const MAX_SHOPIFY_CHECKOUT_MATERIALS = 8
 export const MAX_SHOPIFY_CHECKOUT_LINES = 500
 export const MAX_SHOPIFY_CHECKOUT_PACKAGES = 50
 export const MAX_SHOPIFY_CHECKOUT_OFFERS = 100
-export const MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS = 2
+export const MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS = 8
+export const MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS =
+  MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS * 2
 export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION =
   'shopify-checkout-line-pack-evidence-v1' as const
 export const SHOPIFY_CHECKOUT_RECEIPT_PACKAGE_LEVELS = [
@@ -87,6 +92,17 @@ export type ShopifyCarrierServiceConfigWriteInput = {
   quoteTtlSeconds: number
   orderReconciliationWindowSeconds: number
   algorithmVersion: string
+  actorEmail: string
+}
+
+export type ShopifyCarrierServiceCarrierBindingsWriteInput = {
+  organizationId: string
+  accountGlobalId: string
+  expectedRowVersion: number
+  carriers: Array<{
+    provider: ShopifyCheckoutCarrierProvider
+    carrierAccountGlobalId: string
+  }>
   actorEmail: string
 }
 
@@ -179,10 +195,13 @@ export type ShopifyCheckoutRatingMaterial = {
 
 export type ShopifyCheckoutRatingCarrierBinding = {
   provider: ShopifyCheckoutCarrierProvider
+  carrierIntegrationAccountGlobalId: string
   carrierAccountId: string
   carrierAccountGlobalId: string
   credentialVersion: number
   displayName: string
+  registeredAddress: CarrierAccountAddress
+  registeredAddressFingerprint: string
   accountStatus: 'needs_configuration' | 'active' | 'disabled'
   integrationStatus: 'active' | 'disabled' | 'error'
   environment: 'mock' | 'sandbox' | 'production'
@@ -643,10 +662,13 @@ type MaterialRow = QueryResultRow & {
 
 type CarrierBindingRow = QueryResultRow & {
   carrier_provider: ShopifyCheckoutCarrierProvider
+  carrier_integration_account_global_id: string
   carrier_account_id: string
   carrier_account_global_id: string
   credential_version: number
   display_name: string
+  registered_address: CarrierAccountAddress
+  registered_address_fingerprint: string
   account_status: 'needs_configuration' | 'active' | 'disabled'
   integration_status: 'active' | 'disabled' | 'error'
   environment: 'mock' | 'sandbox' | 'production'
@@ -1513,6 +1535,56 @@ function assertPolicyHash(
   }
 }
 
+function normalizeShopifyCarrierServiceCarrierBindings(
+  carriers: ShopifyCarrierServiceCarrierBindingsWriteInput['carriers'],
+) {
+  if (
+    !Array.isArray(carriers)
+    || carriers.length < 1
+    || carriers.length > MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
+      'Select between 1 and '
+        + `${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} TEST and `
+        + `${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} LIVE configured UPS or FedEx carrier accounts`,
+    )
+  }
+  const carrierAccountIds = new Set<string>()
+  return carriers.map((binding) => {
+    if (
+      binding?.provider !== 'ups_rest'
+      && binding?.provider !== 'fedex_rest'
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
+        'Checkout carriers must be configured UPS or FedEx accounts',
+      )
+    }
+    const carrierAccountGlobalId = matchValue(
+      binding.carrierAccountGlobalId,
+      CARRIER_ACCOUNT_GLOBAL_ID,
+      'Carrier account Global ID',
+    )
+    if (carrierAccountIds.has(carrierAccountGlobalId)) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
+        'Checkout carrier accounts must be unique',
+      )
+    }
+    carrierAccountIds.add(carrierAccountGlobalId)
+    return {
+      provider: binding.provider,
+      carrierAccountGlobalId,
+    }
+  }).sort((left, right) => (
+    left.provider.localeCompare(right.provider)
+    || left.carrierAccountGlobalId.localeCompare(
+      right.carrierAccountGlobalId,
+    )
+  ))
+}
+
 export function normalizeShopifyCarrierServiceConfigInput(
   input: ShopifyCarrierServiceConfigWriteInput,
 ): NormalizedShopifyCarrierServiceConfigInput {
@@ -1581,49 +1653,9 @@ export function normalizeShopifyCarrierServiceConfigInput(
       ),
     }
   })
-  if (
-    !Array.isArray(input.carriers)
-    || input.carriers.length < 1
-    || input.carriers.length > 2
-  ) {
-    fail(
-      'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
-      'Select one or two configured UPS or FedEx carrier accounts',
-    )
-  }
-  const providerIds = new Set<ShopifyCheckoutCarrierProvider>()
-  const carrierAccountIds = new Set<string>()
-  const carriers = input.carriers.map((binding) => {
-    if (
-      binding?.provider !== 'ups_rest'
-      && binding?.provider !== 'fedex_rest'
-    ) {
-      fail(
-        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
-        'Checkout carriers must be configured UPS or FedEx accounts',
-      )
-    }
-    const carrierAccountGlobalId = matchValue(
-      binding.carrierAccountGlobalId,
-      CARRIER_ACCOUNT_GLOBAL_ID,
-      'Carrier account Global ID',
-    )
-    if (
-      providerIds.has(binding.provider)
-      || carrierAccountIds.has(carrierAccountGlobalId)
-    ) {
-      fail(
-        'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID',
-        'Checkout carrier providers and accounts must be unique',
-      )
-    }
-    providerIds.add(binding.provider)
-    carrierAccountIds.add(carrierAccountGlobalId)
-    return {
-      provider: binding.provider,
-      carrierAccountGlobalId,
-    }
-  }).sort((left, right) => left.provider.localeCompare(right.provider))
+  const carriers = normalizeShopifyCarrierServiceCarrierBindings(
+    input.carriers,
+  )
   const inventoryMaxAgeSeconds = integer(
     input.inventoryMaxAgeSeconds,
     'Inventory maximum age',
@@ -1991,10 +2023,14 @@ function carrierBinding(
 ): ShopifyCheckoutRatingCarrierBinding {
   return {
     provider: row.carrier_provider,
+    carrierIntegrationAccountGlobalId:
+      row.carrier_integration_account_global_id,
     carrierAccountId: row.carrier_account_id,
     carrierAccountGlobalId: row.carrier_account_global_id,
     credentialVersion: row.credential_version,
     displayName: row.display_name,
+    registeredAddress: row.registered_address,
+    registeredAddressFingerprint: row.registered_address_fingerprint,
     accountStatus: row.account_status,
     integrationStatus: row.integration_status,
     environment: row.environment,
@@ -2132,10 +2168,13 @@ async function readConfigChildren(
     () => run<CarrierBindingRow>(
       `SELECT
          selected.carrier_provider,
+         integration.global_id AS carrier_integration_account_global_id,
          carrier_account.id::text AS carrier_account_id,
          carrier_account.global_id AS carrier_account_global_id,
          credential.credential_version,
          carrier_account.display_name,
+         carrier_account.registered_address,
+         carrier_account.registered_address_fingerprint,
          carrier_account.status AS account_status,
          integration.status AS integration_status,
          integration.environment
@@ -2151,7 +2190,9 @@ async function readConfigChildren(
         AND credential.integration_account_id = integration.id
        WHERE selected.organization_id = $1::uuid
          AND selected.config_id = $2::uuid
-       ORDER BY selected.carrier_provider`,
+       ORDER BY
+         selected.carrier_provider,
+         carrier_account.global_id`,
       [input.organizationId, input.configId],
     ),
   ] as const)
@@ -3372,7 +3413,7 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
       id: string
       global_id: string
       provider: ShopifyCheckoutCarrierProvider
-      environment: 'mock' | 'sandbox' | 'production'
+      environment: 'sandbox' | 'production'
     }>(
       `SELECT
          carrier_account.id::text,
@@ -3387,7 +3428,7 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
          AND carrier_account.global_id = ANY($2::text[])
          AND integration.integration_type = 'carrier'
          AND integration.provider IN ('ups_rest', 'fedex_rest')
-         AND integration.environment = 'sandbox'`,
+         AND integration.environment IN ('sandbox', 'production')`,
       [
         input.organizationId,
         input.carriers.map((item) => item.carrierAccountGlobalId),
@@ -3401,7 +3442,6 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
       if (
         !row
         || row.provider !== selected.provider
-        || row.environment !== 'sandbox'
       ) {
         fail(
           'SHOPIFY_CHECKOUT_CARRIER_ACCOUNT_INVALID',
@@ -3409,6 +3449,28 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
           409,
         )
       }
+    }
+    const carrierEnvironmentCounts = selectedCarriers.rows.reduce(
+      (counts, row) => {
+        counts[row.environment] += 1
+        return counts
+      },
+      { sandbox: 0, production: 0 } as Record<
+        'sandbox' | 'production',
+        number
+      >,
+    )
+    if (
+      carrierEnvironmentCounts.sandbox
+        > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
+      || carrierEnvironmentCounts.production
+        > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_INVALID',
+        `Select no more than ${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} TEST and ${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} LIVE carrier rating accounts`,
+        409,
+      )
     }
     await client.query(
       `INSERT INTO operations_shopify_carrier_service_config_carriers (
@@ -3460,6 +3522,394 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
           (item) => item.carrierAccountGlobalId,
         ),
         rowVersion: Number(config.row_version),
+      },
+    }, client)
+    return readConfigWithClient(client, input)
+  })
+}
+
+/**
+ * Replace only the exact TEST/LIVE carrier-account bindings behind an already
+ * registered Shopify CarrierService. Shopify registration and callback-token
+ * identity are retained. The row-version advance invalidates cached callback
+ * context, while the shared advisory lock and live-receipt check prevent an
+ * account rotation from crossing an in-flight checkout claim.
+ */
+export async function updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres(
+  rawInput: ShopifyCarrierServiceCarrierBindingsWriteInput,
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    carriers: normalizeShopifyCarrierServiceCarrierBindings(
+      rawInput.carriers,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-active-transition:${input.organizationId}`,
+    )
+    const identity = await client.query<{ id: string }>(
+      `SELECT config.id::text
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    if (!identity.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_NOT_FOUND',
+        'CarrierService configuration was not found',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-authorization:'
+        + input.organizationId + ':' + identity.rows[0].id,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-config-mutation:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-bindings:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
+    const currentResult = await client.query<{
+      id: string
+      global_id: string
+      row_version: string
+      registration_state: ShopifyCarrierServiceRegistrationState
+      service_gid: string | null
+      activation_revision: number
+      current_activation_revision: number
+      activation_state: 'shadow' | 'active'
+    }>(
+      `SELECT
+         config.id::text,
+         config.global_id,
+         config.row_version::text,
+         config.registration_state,
+         config.service_gid,
+         config.activation_revision,
+         activation.revision AS current_activation_revision,
+         activation.state AS activation_state
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = config.organization_id
+       WHERE config.organization_id = $1::uuid
+         AND config.id = $2::uuid
+         AND account.global_id = $3
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       FOR UPDATE OF config, account, activation`,
+      [input.organizationId, identity.rows[0].id, input.accountGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_NOT_FOUND',
+        'CarrierService configuration was not found',
+        404,
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.registration_state !== 'registered'
+      || !current.service_gid
+      || !SHOPIFY_SERVICE_GID.test(current.service_gid)
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_REGISTERED_BINDING_UPDATE_REQUIRED',
+        'Only an exactly registered Shopify CarrierService can rotate carrier accounts without a provider mutation',
+        409,
+      )
+    }
+    if (
+      current.activation_revision !== current.current_activation_revision
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_FENCE_STALE',
+        'Operations activation changed before the carrier-account rotation',
+        409,
+      )
+    }
+    const unsafeAuthorization = await client.query<{ global_id: string }>(
+      `SELECT authorized_mutation.global_id
+       FROM operations_shopify_carrier_service_mutation_authorizations
+         authorized_mutation
+       LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
+         ON attempt.organization_id = authorized_mutation.organization_id
+        AND attempt.authorization_id = authorized_mutation.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
+         ON outcome.organization_id = attempt.organization_id
+        AND outcome.attempt_id = attempt.id
+       LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
+         resolution
+         ON resolution.organization_id = attempt.organization_id
+        AND resolution.attempt_id = attempt.id
+       WHERE authorized_mutation.organization_id = $1::uuid
+         AND authorized_mutation.config_id = $2::uuid
+         AND authorized_mutation.config_row_version = $3::bigint
+         AND (
+           (
+             outcome.outcome = 'failed'
+             AND outcome.provider_write_count = 0
+           )
+           OR resolution.disposition = 'confirmed_not_applied'
+           OR (
+             attempt.id IS NULL
+             AND authorized_mutation.expires_at <= now()
+           )
+         ) IS NOT TRUE
+       LIMIT 1`,
+      [input.organizationId, current.id, input.expectedRowVersion],
+    )
+    if (unsafeAuthorization.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_BINDING_UPDATE_MUTATION_UNRESOLVED',
+        'Resolve the current Shopify CarrierService provider mutation before rotating carrier accounts',
+        409,
+      )
+    }
+    const liveReceipt = await client.query<{ global_id: string }>(
+      `SELECT receipt.global_id
+       FROM operations_shopify_checkout_rate_receipts receipt
+       WHERE receipt.organization_id = $1::uuid
+         AND receipt.config_id = $2::uuid
+         AND receipt.config_row_version = $3::bigint
+         AND receipt.status = 'processing'
+         AND receipt.lease_expires_at > now()
+       LIMIT 1
+       FOR UPDATE OF receipt`,
+      [input.organizationId, current.id, input.expectedRowVersion],
+    )
+    if (liveReceipt.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_BINDING_UPDATE_RECEIPT_IN_FLIGHT',
+        'Wait for the active checkout-rate request to finish before rotating carrier accounts',
+        409,
+      )
+    }
+    const selectedCarriers = await client.query<{
+      id: string
+      global_id: string
+      provider: ShopifyCheckoutCarrierProvider
+      environment: 'sandbox' | 'production'
+    }>(
+      `SELECT
+         carrier_account.id::text,
+         carrier_account.global_id,
+         integration.provider,
+         integration.environment
+       FROM operations_carrier_accounts carrier_account
+       JOIN operations_integration_accounts integration
+         ON integration.organization_id = carrier_account.organization_id
+        AND integration.id = carrier_account.integration_account_id
+       WHERE carrier_account.organization_id = $1::uuid
+         AND carrier_account.global_id = ANY($2::text[])
+         AND integration.integration_type = 'carrier'
+         AND integration.provider IN ('ups_rest', 'fedex_rest')
+         AND integration.environment IN ('sandbox', 'production')`,
+      [
+        input.organizationId,
+        input.carriers.map((item) => item.carrierAccountGlobalId),
+      ],
+    )
+    const carrierByGlobalId = new Map(
+      selectedCarriers.rows.map((row) => [row.global_id, row]),
+    )
+    for (const selected of input.carriers) {
+      const row = carrierByGlobalId.get(selected.carrierAccountGlobalId)
+      if (!row || row.provider !== selected.provider) {
+        fail(
+          'SHOPIFY_CHECKOUT_CARRIER_ACCOUNT_INVALID',
+          `Carrier account ${selected.carrierAccountGlobalId} is unavailable`,
+          409,
+        )
+      }
+    }
+    const carrierEnvironmentCounts = selectedCarriers.rows.reduce(
+      (counts, row) => {
+        counts[row.environment] += 1
+        return counts
+      },
+      { sandbox: 0, production: 0 } as Record<
+        'sandbox' | 'production',
+        number
+      >,
+    )
+    if (
+      carrierEnvironmentCounts.sandbox
+        > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
+      || carrierEnvironmentCounts.production
+        > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_INVALID',
+        `Select no more than ${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} TEST and ${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} LIVE carrier rating accounts`,
+        409,
+      )
+    }
+    await client.query(
+      `SELECT set_config(
+         'clawpilot.shopify_carrier_binding_write_token',
+         $1,
+         true
+       )`,
+      [`${current.id}:${input.expectedRowVersion}`],
+    )
+    await client.query(
+      `DELETE FROM operations_shopify_carrier_service_config_carriers
+       WHERE organization_id = $1::uuid
+         AND config_id = $2::uuid`,
+      [input.organizationId, current.id],
+    )
+    await client.query(
+      `INSERT INTO operations_shopify_carrier_service_config_carriers (
+         organization_id, config_id, carrier_provider, carrier_account_id
+       )
+       SELECT
+         $1::uuid,
+         $2::uuid,
+         selected.provider,
+         carrier_account.id
+       FROM jsonb_to_recordset($3::jsonb) AS selected(
+         provider text,
+         carrier_account_global_id text
+       )
+       JOIN operations_carrier_accounts carrier_account
+         ON carrier_account.organization_id = $1::uuid
+        AND carrier_account.global_id
+          = selected.carrier_account_global_id`,
+      [
+        input.organizationId,
+        current.id,
+        JSON.stringify(input.carriers.map((item) => ({
+          provider: item.provider,
+          carrier_account_global_id: item.carrierAccountGlobalId,
+        }))),
+      ],
+    )
+    const applicableEnvironment = current.activation_state === 'active'
+      ? 'production'
+      : 'sandbox'
+    const applicableReadiness = await client.query<{ ready: boolean }>(
+      `SELECT
+         operations_shopify_carrier_service_config_environment_is_ready(
+           $1::uuid, $2::uuid, $3
+         ) AS ready`,
+      [input.organizationId, current.id, applicableEnvironment],
+    )
+    if (applicableReadiness.rows[0]?.ready !== true) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_NOT_READY',
+        current.activation_state === 'active'
+          ? 'Keep one through eight verified LIVE rating accounts ready for the current Active callback before saving carrier bindings'
+          : 'Keep one through eight verified TEST rating accounts ready for the current Shadow callback before saving carrier bindings',
+        409,
+      )
+    }
+    const updated = await client.query<{
+      row_version: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET row_version = row_version + 1,
+           updated_by = $4,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $3::bigint
+         AND registration_state = 'registered'
+         AND service_gid = $5
+       RETURNING row_version::text`,
+      [
+        input.organizationId,
+        current.id,
+        input.expectedRowVersion,
+        input.actorEmail,
+        current.service_gid,
+      ],
+    )
+    if (
+      Number(updated.rows[0]?.row_version)
+        !== input.expectedRowVersion + 1
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed during carrier-account rotation',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.carrier_bindings_updated',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: current.global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${current.global_id}:version:${updated.rows[0].row_version}:carrier-bindings`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        carrierAccounts: selectedCarriers.rows.map((carrier) => ({
+          provider: carrier.provider,
+          environment: carrier.environment,
+          carrierAccountGlobalId: carrier.global_id,
+        })).sort((left, right) => (
+          left.environment.localeCompare(right.environment)
+          || left.provider.localeCompare(right.provider)
+          || left.carrierAccountGlobalId.localeCompare(
+            right.carrierAccountGlobalId,
+          )
+        )),
+        sandboxAccountCount: carrierEnvironmentCounts.sandbox,
+        productionAccountCount: carrierEnvironmentCounts.production,
+        fromRowVersion: input.expectedRowVersion,
+        rowVersion: Number(updated.rows[0].row_version),
+        registrationState: current.registration_state,
+        serviceGidRetained: current.service_gid,
+        callbackTokenRetained: true,
+        providerWrites: 0,
       },
     }, client)
     return readConfigWithClient(client, input)
@@ -3944,22 +4394,30 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
       && (
         current.accountEnvironment !== 'sandbox'
         || current.carriers.length < 1
-        || current.carriers.length > 2
-        || new Set(
-          current.carriers.map((carrier) => carrier.provider),
-        ).size !== current.carriers.length
+        || current.carriers.length
+          > MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS
+        || new Set(current.carriers.map(
+          (carrier) => carrier.carrierAccountGlobalId,
+        )).size !== current.carriers.length
         || current.carriers.some((carrier) => (
           carrier.provider !== 'ups_rest'
           && carrier.provider !== 'fedex_rest'
         ))
-        || current.carriers.some(
-          (carrier) => carrier.environment !== 'sandbox',
-        )
+        || current.carriers.some((carrier) => (
+          carrier.environment !== 'sandbox'
+          && carrier.environment !== 'production'
+        ))
+        || current.carriers.filter(
+          (carrier) => carrier.environment === 'sandbox',
+        ).length > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
+        || current.carriers.filter(
+          (carrier) => carrier.environment === 'production',
+        ).length > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
       )
     ) {
       fail(
-        'SHOPIFY_CHECKOUT_SANDBOX_REQUIRED',
-        'This development CarrierService callback can register sandbox accounts only',
+        'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_INVALID',
+        'CarrierService rating requires bounded, unique TEST and LIVE direct carrier account sets',
         409,
       )
     }
@@ -3988,6 +4446,21 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
       fail(
         'SHOPIFY_CHECKOUT_CONFIG_FENCE_STALE',
         'Operations activation changed before registration finalization',
+        409,
+      )
+    }
+    const expectedCarrierEnvironment = currentActivation.state === 'active'
+      ? 'production'
+      : 'sandbox'
+    if (
+      ['shadow_simulated', 'registered'].includes(input.registrationState)
+      && current.carriers.filter(
+        (carrier) => carrier.environment === expectedCarrierEnvironment,
+      ).length < 1
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_INVALID',
+        `Operations ${currentActivation.state} requires at least one explicitly selected ${expectedCarrierEnvironment} carrier rating account`,
         409,
       )
     }
@@ -4747,6 +5220,11 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
       client,
       `shopify-checkout-receipt:${input.organizationId}:${input.accountGlobalId}:${input.requestFingerprint}`,
     )
+    await acquireTransactionAdvisoryLock(
+      client,
+      'shopify-carrier-service-bindings:'
+        + input.organizationId + ':' + input.accountGlobalId,
+    )
     const configRow = await readConfigRowWithClient(client, input)
     const config = configRow
       ? checkoutReceiptClaimConfig(configRow)
@@ -5484,15 +5962,15 @@ function normalizeCompletion(
   ))
   if (
     !Array.isArray(input.providerAttempts)
+    || input.providerAttempts.length < 1
     || input.providerAttempts.length
-      !== MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS
+      > MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS
   ) {
     fail(
       'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_COUNT_INVALID',
-      `Checkout result requires exactly ${MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS} carrier attempts`,
+      `Checkout result requires between 1 and ${MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS} carrier account attempts`,
     )
   }
-  const attemptProviders = new Set<string>()
   const attemptAccounts = new Set<string>()
   const providerAttempts = input.providerAttempts.map((attempt) => {
     const provider = attempt.provider
@@ -5508,15 +5986,13 @@ function normalizeCompletion(
       'Carrier account Global ID',
     )
     if (
-      attemptProviders.has(provider)
-      || attemptAccounts.has(carrierAccountGlobalId)
+      attemptAccounts.has(carrierAccountGlobalId)
     ) {
       fail(
         'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_DUPLICATE',
-        'Checkout provider attempts must use unique carriers and accounts',
+        'Checkout provider attempts must use unique carrier accounts',
       )
     }
-    attemptProviders.add(provider)
     attemptAccounts.add(carrierAccountGlobalId)
     const rateEvidenceGlobalId = matchValue(
       attempt.rateEvidenceGlobalId,
@@ -5573,7 +6049,12 @@ function normalizeCompletion(
       ...normalized,
       attemptHash: shopifyCheckoutRatingHash(normalized),
     }
-  }).sort((left, right) => left.provider.localeCompare(right.provider))
+  }).sort((left, right) => (
+    left.provider.localeCompare(right.provider)
+    || left.carrierAccountGlobalId.localeCompare(
+      right.carrierAccountGlobalId,
+    )
+  ))
   if (!providerAttempts.some((attempt) => attempt.status === 'succeeded')) {
     fail(
       'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_SUCCESS_REQUIRED',
@@ -5587,10 +6068,7 @@ function normalizeCompletion(
         === attempt.carrierAccountGlobalId
       && offer.rateEvidenceGlobalId === attempt.rateEvidenceGlobalId
     ))
-    if (
-      (attempt.status === 'succeeded' && matchingOffers.length < 1)
-      || (attempt.status === 'degraded' && matchingOffers.length > 0)
-    ) {
+    if (attempt.status === 'degraded' && matchingOffers.length > 0) {
       fail(
         'SHOPIFY_CHECKOUT_PROVIDER_ATTEMPT_OFFER_MISMATCH',
         'Checkout offers must map exactly to successful carrier attempts',

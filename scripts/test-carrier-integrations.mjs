@@ -424,7 +424,6 @@ const safeRateTestLabelMapper = route.slice(
 for (const forbidden of [
   'createAttemptGlobalId',
   'voidAttemptGlobalId',
-  'carrierAccountGlobalId',
   'credentialVersion',
   'labelPayload',
 ]) {
@@ -435,8 +434,11 @@ for (const forbidden of [
 }
 assert.ok(
   safeRateTestLabelMapper.includes('contentSha256: label.contentSha256')
-    && safeRateTestLabelMapper.includes('byteLength: label.byteLength'),
-  'Carrier GET label history must expose safe integrity metadata without stored bytes',
+    && safeRateTestLabelMapper.includes('byteLength: label.byteLength')
+    && safeRateTestLabelMapper.includes(
+      'carrierAccountGlobalId: label.carrierAccountGlobalId',
+    ),
+  'Carrier GET label history must expose safe integrity and exact-account metadata without stored bytes',
 )
 
 const panel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
@@ -455,16 +457,16 @@ for (const fragment of [
   'Copy client ID',
   'Copy client secret',
   'setRevealedCredential(null)',
-  'Test sandbox rate',
+  "Get {environment === 'production' ? 'LIVE production' : 'sandbox'} rates",
   'Read-only sender',
   'Test destination',
   'Destination address line 1',
   'Destination address line 2',
   'Destination ZIP code',
-  'Fixed parcel: {providerRateParcel.description}',
+  'Test parcel',
   'selectedUnitRateParcelDimensions',
   'selectedUnitRateParcelWeight',
-  'Provider-native fixture (sent unchanged)',
+  'Sent unchanged:',
   'Rating returns prices only',
   'No label media',
   'Disconnect',
@@ -480,7 +482,7 @@ for (const fragment of [
   'destination: rateDestination',
   'destinationFingerprint',
   'Sandbox label test workflow',
-  "['Rate', 'Create label', 'Print stored label', 'Void / close']",
+  "environment === 'production' ? 'Buy LIVE label' : 'Create label'",
   "action: 'create-rate-test-label'",
   "action: 'print-rate-test-label'",
   "'void-rate-test-label'",
@@ -488,14 +490,14 @@ for (const fragment of [
   'rateEvidenceGlobalId: rateTest.evidenceGlobalId',
   'selectedRate.serviceCode',
   'Create and store sandbox label',
-  'Test print stored label',
+  "Print stored {environment === 'production' ? 'LIVE label' : 'test label'}",
   'Void exact sandbox label',
   'Close UPS sample without carrier call',
   'Label metadata is durable and safe to review.',
   'Label bytes and internal database identifiers',
   'Printing queues the label bytes already stored in ClawPilot.',
   'It does not call the carrier,',
-  'creating, downloading, printing, or voiding a',
+  'creating, printing, or voiding a label requires',
   'canExecute && (selectedRateTestLabel.printArtifactGlobalId',
   "entry.connectionMode === 'local_agent'",
   "entry.localPrintAgentStatus === 'active'",

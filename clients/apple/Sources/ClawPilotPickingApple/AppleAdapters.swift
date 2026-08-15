@@ -218,6 +218,135 @@ public actor DurablePickCache: PickCache {
         }
     }
 
+    public func saveManagerOrderReplanningOutbox(
+        _ command: ManagerOrderReplanningCommand
+    ) async throws {
+        if let existing = try await loadManagerOrderReplanningOutbox(),
+           existing != command {
+            throw ManagerOrderReplanningClientError.differentCorrectionPending
+        }
+        try await requireNoPickerCommand(for: command.orderGlobalId)
+        try write(command, name: "manager-order-replanning-outbox.json")
+    }
+
+    public func loadManagerOrderReplanningOutbox() async throws
+        -> ManagerOrderReplanningCommand? {
+        try read(
+            ManagerOrderReplanningCommand.self,
+            name: "manager-order-replanning-outbox.json"
+        )
+    }
+
+    public func requireManagerOrderReplanningReplayIsUnblocked(
+        _ command: ManagerOrderReplanningCommand
+    ) async throws {
+        guard try await loadManagerOrderReplanningOutbox() == command else {
+            throw PickingContractError.contextMismatch
+        }
+        try await requireNoPickerCommand(for: command.orderGlobalId)
+    }
+
+    public func clearManagerOrderReplanningOutbox(
+        _ command: ManagerOrderReplanningCommand
+    ) async throws {
+        guard try await loadManagerOrderReplanningOutbox() == command else {
+            throw PickingContractError.contextMismatch
+        }
+        let url = directory.appendingPathComponent(
+            "manager-order-replanning-outbox.json"
+        )
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw PickingContractError.contextMismatch
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    @discardableResult
+    public func quarantineManagerOrderReplanningOutbox(
+        _ command: ManagerOrderReplanningCommand,
+        code: String,
+        message: String,
+        quarantinedAt: Date = Date()
+    ) async throws -> ManagerOrderReplanningQuarantine {
+        guard try await loadManagerOrderReplanningOutbox() == command else {
+            throw PickingContractError.contextMismatch
+        }
+        let quarantine = try ManagerOrderReplanningQuarantine(
+            command: command,
+            code: code,
+            message: message,
+            quarantinedAt: quarantinedAt
+        )
+        let token = UUID().uuidString.lowercased()
+        let detailName = "manager-order-replanning-quarantine-\(token).json"
+        let retainedCommandName =
+            "manager-order-replanning-quarantined-command-\(token).json"
+        var detailWasWritten = false
+        do {
+            try write(quarantine, name: detailName)
+            detailWasWritten = true
+        } catch {
+            // Continue to the rename. Moving the active file out of the replay
+            // path is the fail-safe operation when storage cannot accept a new
+            // detail file; the exact command is still retained for support.
+        }
+        let activeURL = directory.appendingPathComponent(
+            "manager-order-replanning-outbox.json"
+        )
+        let retainedURL = directory.appendingPathComponent(retainedCommandName)
+        do {
+            try FileManager.default.moveItem(at: activeURL, to: retainedURL)
+        } catch {
+            if detailWasWritten {
+                // The detailed quarantine contains the complete command, so an
+                // exact active duplicate must not survive and replay silently.
+                try FileManager.default.removeItem(at: activeURL)
+            } else {
+                throw error
+            }
+        }
+        return quarantine
+    }
+
+    public func loadManagerOrderReplanningQuarantines() async throws
+        -> [ManagerOrderReplanningQuarantine] {
+        try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        .filter {
+            $0.lastPathComponent.hasPrefix("manager-order-replanning-quarantine-")
+                && $0.pathExtension == "json"
+        }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        .map {
+            try decoder.decode(
+                ManagerOrderReplanningQuarantine.self,
+                from: Data(contentsOf: $0)
+            )
+        }
+    }
+
+    private func requireNoPickerCommand(for orderGlobalId: String) async throws {
+        let confirmation = try await loadOutbox()
+        let handoff = try await loadHandoffOutbox()
+        if confirmation?.orderGlobalId == orderGlobalId
+            || handoff?.orderGlobalId == orderGlobalId {
+            throw ManagerOrderReplanningClientError.pickerCommandPending
+        }
+        if let progress = try await loadProgress(),
+           progress.order.orderGlobalId == orderGlobalId,
+           !progress.scannedTaskIDs.isEmpty
+            || !progress.locationVerifiedTaskIDs.isEmpty
+            || !progress.productStartPendingTaskIDs.isEmpty
+            || !progress.locationObservations.isEmpty
+            || !progress.productObservations.isEmpty
+            || !progress.countEvidence.isEmpty
+            || !progress.stageContextTokens.isEmpty {
+            throw ManagerOrderReplanningClientError.pickerCommandPending
+        }
+    }
+
     public func loadProgress() async throws -> PickSessionProgress? {
         try read(PickSessionProgress.self, name: "pick-progress.json")
     }
@@ -242,34 +371,50 @@ public actor DurablePickCache: PickCache {
         }
         let confirmation = try await loadOutbox()
         let handoff = try await loadHandoffOutbox()
+        let managerReplanning = try await loadManagerOrderReplanningOutbox()
         switch transition.pickerCachePolicy {
         case .clearScopedData:
-            guard confirmation == nil, handoff == nil else {
+            guard confirmation == nil,
+                  handoff == nil,
+                  managerReplanning == nil else {
                 throw PickingContractError.contextMismatch
             }
         case .preserveProtectedCommand:
-            guard confirmation != nil || handoff != nil,
-                  let queue = try await loadQueue(),
-                  queue.organizationId == transition.targetOrganizationId,
-                  queue.workerEmail == transition.workerEmail,
-                  confirmation.map({ command in
-                      queue.orders.contains(where: {
-                          $0.orderGlobalId == command.orderGlobalId
-                              && $0.rowVersion == command.expectedRowVersion
-                      })
-                  }) != false,
-                  handoff.map({ command in
-                      command.organizationId == transition.targetOrganizationId
-                          && command.workerEmail == transition.workerEmail
-                          && queue.orders.contains(where: { order in
-                              order.orderGlobalId == command.orderGlobalId
-                                  && order.rowVersion == command.expectedRowVersion
-                                  && order.tasks.count == command.expectedAssignedTaskCount
-                          })
-                          && command.blockedConfirmationIdempotencyKey
-                              == confirmation?.idempotencyKey
-                  }) != false else {
+            guard confirmation != nil
+                    || handoff != nil
+                    || managerReplanning != nil else {
                 throw PickingContractError.contextMismatch
+            }
+            if confirmation != nil || handoff != nil {
+                guard let queue = try await loadQueue(),
+                      queue.organizationId == transition.targetOrganizationId,
+                      queue.workerEmail == transition.workerEmail,
+                      confirmation.map({ command in
+                          queue.orders.contains(where: {
+                              $0.orderGlobalId == command.orderGlobalId
+                                  && $0.rowVersion == command.expectedRowVersion
+                          })
+                      }) != false,
+                      handoff.map({ command in
+                          command.organizationId == transition.targetOrganizationId
+                              && command.workerEmail == transition.workerEmail
+                              && queue.orders.contains(where: { order in
+                                  order.orderGlobalId == command.orderGlobalId
+                                      && order.rowVersion == command.expectedRowVersion
+                                      && order.tasks.count == command.expectedAssignedTaskCount
+                              })
+                              && command.blockedConfirmationIdempotencyKey
+                                  == confirmation?.idempotencyKey
+                      }) != false else {
+                    throw PickingContractError.contextMismatch
+                }
+            }
+            if let managerReplanning {
+                guard managerReplanning.organizationId
+                        == transition.targetOrganizationId,
+                      managerReplanning.workerEmail == transition.workerEmail else {
+                    throw PickingContractError.contextMismatch
+                }
             }
         }
         try write(transition, name: "workspace-transition.json")
@@ -318,6 +463,7 @@ public enum PickingAPIError: Error, Equatable, Sendable {
     case unauthorized
     case sessionSuperseded
     case rateLimited(retryAfterSeconds: Int)
+    case conflict(code: String, message: String)
     case rejected(code: String, message: String)
     case invalidResponse
 }
@@ -329,6 +475,7 @@ extension PickingAPIError: LocalizedError {
         case .unauthorized: "Sign in to continue."
         case .sessionSuperseded: "This signed-in operation was cancelled because the session changed."
         case .rateLimited(let seconds): "Too many code requests. Try again in \(seconds) seconds."
+        case .conflict(_, let message): message
         case .rejected(_, let message): message
         case .invalidResponse: "ClawPilot returned an unexpected response."
         }
@@ -539,6 +686,57 @@ public struct ManagerOrderSummary: Decodable, Equatable, Identifiable, Sendable 
     }
 }
 
+public struct ManagerOrderActionAvailability: Decodable, Equatable, Sendable {
+    public let action: String
+    public let label: String
+    public let enabled: Bool
+    public let blockedReason: String?
+    public let blockedCode: String?
+    public let consequenceSummary: String?
+    public let expectedPlanGlobalId: String?
+    public let expectedPlanVersion: Int?
+    public let expectedCorrectionFingerprint: String?
+
+    public init(
+        action: String,
+        label: String,
+        enabled: Bool,
+        blockedReason: String?,
+        blockedCode: String? = nil,
+        consequenceSummary: String? = nil,
+        expectedPlanGlobalId: String? = nil,
+        expectedPlanVersion: Int? = nil,
+        expectedCorrectionFingerprint: String? = nil
+    ) {
+        self.action = action
+        self.label = label
+        self.enabled = enabled
+        self.blockedReason = blockedReason
+        self.blockedCode = blockedCode
+        self.consequenceSummary = consequenceSummary
+        self.expectedPlanGlobalId = expectedPlanGlobalId
+        self.expectedPlanVersion = expectedPlanVersion
+        self.expectedCorrectionFingerprint = expectedCorrectionFingerprint
+    }
+
+    public var isExactReplanningCorrectionProjection: Bool {
+        action == "reopen_for_replanning"
+            && enabled
+            && blockedReason == nil
+            && !(consequenceSummary ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && expectedPlanGlobalId?.range(
+                of: #"^gfp(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                options: .regularExpression
+            ) != nil
+            && (expectedPlanVersion ?? 0) >= 1
+            && expectedCorrectionFingerprint?.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+            ) != nil
+    }
+}
+
 public struct ManagerOrderDetail: Decodable, Equatable, Identifiable, Sendable {
     public var id: String { globalId }
     public let globalId: String
@@ -552,6 +750,17 @@ public struct ManagerOrderDetail: Decodable, Equatable, Identifiable, Sendable {
     public let pickTaskCount: Int
     public let readyPickTaskCount: Int
     public let pickedPickTaskCount: Int
+    public let availableActions: [ManagerOrderActionAvailability]
+
+    public var replanningCorrectionAvailability: ManagerOrderActionAvailability? {
+        availableActions.first { $0.action == "reopen_for_replanning" }
+    }
+
+    public var replanningCorrectionAction: ManagerOrderActionAvailability? {
+        replanningCorrectionAvailability.flatMap {
+            $0.isExactReplanningCorrectionProjection ? $0 : nil
+        }
+    }
 
     public init(
         globalId: String,
@@ -564,7 +773,8 @@ public struct ManagerOrderDetail: Decodable, Equatable, Identifiable, Sendable {
         waveStatus: String?,
         pickTaskCount: Int,
         readyPickTaskCount: Int,
-        pickedPickTaskCount: Int
+        pickedPickTaskCount: Int,
+        availableActions: [ManagerOrderActionAvailability] = []
     ) {
         self.globalId = globalId
         self.orderNumber = orderNumber
@@ -577,6 +787,307 @@ public struct ManagerOrderDetail: Decodable, Equatable, Identifiable, Sendable {
         self.pickTaskCount = pickTaskCount
         self.readyPickTaskCount = readyPickTaskCount
         self.pickedPickTaskCount = pickedPickTaskCount
+        self.availableActions = availableActions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case globalId, orderNumber, customerName, status, warehouseName
+        case rowVersion, planStatus, waveStatus, pickTaskCount
+        case readyPickTaskCount, pickedPickTaskCount, availableActions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        globalId = try values.decode(String.self, forKey: .globalId)
+        orderNumber = try values.decode(String.self, forKey: .orderNumber)
+        customerName = try values.decode(String.self, forKey: .customerName)
+        status = try values.decode(String.self, forKey: .status)
+        warehouseName = try values.decodeIfPresent(String.self, forKey: .warehouseName)
+        rowVersion = try values.decode(Int.self, forKey: .rowVersion)
+        planStatus = try values.decodeIfPresent(String.self, forKey: .planStatus)
+        waveStatus = try values.decodeIfPresent(String.self, forKey: .waveStatus)
+        pickTaskCount = try values.decode(Int.self, forKey: .pickTaskCount)
+        readyPickTaskCount = try values.decode(Int.self, forKey: .readyPickTaskCount)
+        pickedPickTaskCount = try values.decode(Int.self, forKey: .pickedPickTaskCount)
+        availableActions = try values.decodeIfPresent(
+            [ManagerOrderActionAvailability].self,
+            forKey: .availableActions
+        ) ?? []
+    }
+}
+
+public enum ManagerOrderReplanningClientError: Error, Equatable, Sendable {
+    case invalidServerProjection
+    case invalidCommand
+    case pickerCommandPending
+    case differentCorrectionPending
+    case identityMismatch
+}
+
+public enum ManagerOrderReplanningConflictDisposition: Equatable, Sendable {
+    case retrySameCommand
+    case quarantineStaleProjection
+
+    public static func forServerCode(_ code: String) -> Self {
+        terminalProjectionCodes.contains(code)
+            ? .quarantineStaleProjection : .retrySameCommand
+    }
+
+    private static let terminalProjectionCodes: Set<String> = [
+        "OPERATIONS_ORDER_VERSION_CONFLICT",
+        "OPERATIONS_REPLANNING_STATE_INVALID",
+        "OPERATIONS_REPLANNING_PROVIDER_INVALID",
+        "OPERATIONS_REPLANNING_ORDER_TYPE_INVALID",
+        "OPERATIONS_REPLANNING_STATUS_INVALID",
+        "OPERATIONS_REPLANNING_RELEASED_RECALL_REQUIRED",
+        "OPERATIONS_REPLANNING_PLAN_STATE_INVALID",
+        "OPERATIONS_REPLANNING_REVISION_STALE",
+        "OPERATIONS_REPLANNING_PHYSICAL_WORK_EXISTS",
+        "OPERATIONS_REPLANNING_COMMITMENTS_CHANGED",
+        "OPERATIONS_REPLANNING_DOWNSTREAM_EVIDENCE_EXISTS",
+        "OPERATIONS_REPLANNING_PLAN_CHANGED",
+        "OPERATIONS_REPLANNING_FINGERPRINT_CONFLICT",
+        "OPERATIONS_REPLANNING_FINGERPRINT_UNAVAILABLE",
+        "OPERATIONS_REPLANNING_INVENTORY_CHANGED",
+        "OPERATIONS_REPLANNING_RESERVATION_CHANGED",
+        "OPERATIONS_REPLANNING_PROVIDER_COMMITMENT_CHANGED",
+        "OPERATIONS_REPLANNING_PACKAGING_CHANGED",
+    ]
+}
+
+extension ManagerOrderReplanningClientError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidServerProjection:
+            "Refresh the order. ClawPilot did not project an exact replanning correction."
+        case .invalidCommand:
+            "The correction reason or exact server fences are invalid."
+        case .pickerCommandPending:
+            "Finish the saved pick confirmation or picker handoff for this order before reopening it."
+        case .differentCorrectionPending:
+            "Resolve the previously saved order correction before starting another one."
+        case .identityMismatch:
+            "Return to the manager and organization that created this saved correction."
+        }
+    }
+}
+
+public struct ManagerOrderReplanningCommand: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let action: String
+    public let organizationId: String
+    public let workerEmail: String
+    public let orderGlobalId: String
+    public let expectedRowVersion: Int
+    public let expectedPlanGlobalId: String
+    public let expectedPlanVersion: Int
+    public let expectedCorrectionFingerprint: String
+    public let reason: String
+    public let idempotencyKey: String
+
+    public init(
+        order: ManagerOrderDetail,
+        organizationId: String,
+        workerEmail: String,
+        reason: String,
+        idempotencyKey: String = UUID().uuidString.lowercased()
+    ) throws {
+        guard let projection = order.replanningCorrectionAction else {
+            throw ManagerOrderReplanningClientError.invalidServerProjection
+        }
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedOrganizationId = organizationId.lowercased()
+        let normalizedWorkerEmail = workerEmail.lowercased()
+        let normalizedIdempotencyKey = idempotencyKey.lowercased()
+        let fullIdempotencyKey = "manager-replanning:\(normalizedIdempotencyKey)"
+        guard let planGlobalId = projection.expectedPlanGlobalId,
+              let planVersion = projection.expectedPlanVersion,
+              let fingerprint = projection.expectedCorrectionFingerprint,
+              Self.isValid(
+                organizationId: normalizedOrganizationId,
+                workerEmail: normalizedWorkerEmail,
+                orderGlobalId: order.globalId,
+                expectedRowVersion: order.rowVersion,
+                expectedPlanGlobalId: planGlobalId,
+                expectedPlanVersion: planVersion,
+                expectedCorrectionFingerprint: fingerprint,
+                reason: normalizedReason,
+                idempotencyKey: fullIdempotencyKey
+              ) else {
+            throw ManagerOrderReplanningClientError.invalidCommand
+        }
+        schemaVersion = 1
+        action = "reopen-order-for-replanning"
+        self.organizationId = normalizedOrganizationId
+        self.workerEmail = normalizedWorkerEmail
+        orderGlobalId = order.globalId
+        expectedRowVersion = order.rowVersion
+        expectedPlanGlobalId = planGlobalId
+        expectedPlanVersion = planVersion
+        expectedCorrectionFingerprint = fingerprint
+        self.reason = normalizedReason
+        self.idempotencyKey = fullIdempotencyKey
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, action, organizationId, workerEmail
+        case orderGlobalId, expectedRowVersion, expectedPlanGlobalId
+        case expectedPlanVersion, expectedCorrectionFingerprint
+        case reason, idempotencyKey
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        let action = try values.decode(String.self, forKey: .action)
+        let organizationId = try values.decode(String.self, forKey: .organizationId)
+        let workerEmail = try values.decode(String.self, forKey: .workerEmail)
+        let orderGlobalId = try values.decode(String.self, forKey: .orderGlobalId)
+        let expectedRowVersion = try values.decode(Int.self, forKey: .expectedRowVersion)
+        let expectedPlanGlobalId = try values.decode(
+            String.self,
+            forKey: .expectedPlanGlobalId
+        )
+        let expectedPlanVersion = try values.decode(
+            Int.self,
+            forKey: .expectedPlanVersion
+        )
+        let fingerprint = try values.decode(
+            String.self,
+            forKey: .expectedCorrectionFingerprint
+        )
+        let reason = try values.decode(String.self, forKey: .reason)
+        let idempotencyKey = try values.decode(String.self, forKey: .idempotencyKey)
+        guard schemaVersion == 1,
+              action == "reopen-order-for-replanning",
+              Self.isValid(
+                organizationId: organizationId,
+                workerEmail: workerEmail,
+                orderGlobalId: orderGlobalId,
+                expectedRowVersion: expectedRowVersion,
+                expectedPlanGlobalId: expectedPlanGlobalId,
+                expectedPlanVersion: expectedPlanVersion,
+                expectedCorrectionFingerprint: fingerprint,
+                reason: reason,
+                idempotencyKey: idempotencyKey
+              ) else {
+            throw ManagerOrderReplanningClientError.invalidCommand
+        }
+        self.schemaVersion = schemaVersion
+        self.action = action
+        self.organizationId = organizationId
+        self.workerEmail = workerEmail
+        self.orderGlobalId = orderGlobalId
+        self.expectedRowVersion = expectedRowVersion
+        self.expectedPlanGlobalId = expectedPlanGlobalId
+        self.expectedPlanVersion = expectedPlanVersion
+        expectedCorrectionFingerprint = fingerprint
+        self.reason = reason
+        self.idempotencyKey = idempotencyKey
+    }
+
+    private static func isValid(
+        organizationId: String,
+        workerEmail: String,
+        orderGlobalId: String,
+        expectedRowVersion: Int,
+        expectedPlanGlobalId: String,
+        expectedPlanVersion: Int,
+        expectedCorrectionFingerprint: String,
+        reason: String,
+        idempotencyKey: String
+    ) -> Bool {
+        UUID(uuidString: organizationId) != nil
+            && workerEmail.contains("@")
+            && workerEmail.utf8.count <= 254
+            && orderGlobalId.range(
+                of: #"^gor(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                options: .regularExpression
+            ) != nil
+            && expectedRowVersion >= 0
+            && expectedPlanGlobalId.range(
+                of: #"^gfp(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                options: .regularExpression
+            ) != nil
+            && expectedPlanVersion >= 1
+            && expectedCorrectionFingerprint.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+            ) != nil
+            && reason.utf16.count >= 8
+            && reason.utf16.count <= 500
+            && reason.unicodeScalars.allSatisfy {
+                $0.value >= 0x20 && $0.value != 0x7f
+            }
+            && idempotencyKey.range(
+                of: #"^[A-Za-z0-9._:-]{8,200}$"#,
+                options: .regularExpression
+            ) != nil
+    }
+}
+
+public struct ManagerOrderReplanningQuarantine: Codable, Equatable, Sendable {
+    public let command: ManagerOrderReplanningCommand
+    public let code: String
+    public let message: String
+    public let quarantinedAt: Date
+
+    public init(
+        command: ManagerOrderReplanningCommand,
+        code: String,
+        message: String,
+        quarantinedAt: Date
+    ) throws {
+        let normalizedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedCode.isEmpty,
+              normalizedCode.utf8.count <= 160,
+              !normalizedMessage.isEmpty,
+              normalizedMessage.utf8.count <= 1_000,
+              quarantinedAt.timeIntervalSince1970.isFinite else {
+            throw ManagerOrderReplanningClientError.invalidCommand
+        }
+        self.command = command
+        self.code = normalizedCode
+        self.message = normalizedMessage
+        self.quarantinedAt = quarantinedAt
+    }
+}
+
+public struct ManagerOrderReplanningResult: Decodable, Equatable, Sendable {
+    public let orderGlobalId: String
+    public let orderStatus: String
+    public let previousRowVersion: Int
+    public let rowVersion: Int
+    public let correctionGlobalId: String
+    public let cancelledPlanGlobalId: String
+    public let releasedLocalReservationCount: Int
+    public let releasedProviderCommitmentCount: Int
+    public let releasedPackagingClaimCount: Int
+    public let providerReads: Int
+    public let providerWrites: Int
+    public let replayed: Bool
+
+    public func validated(
+        for command: ManagerOrderReplanningCommand
+    ) throws -> ManagerOrderReplanningResult {
+        guard orderGlobalId == command.orderGlobalId,
+              orderStatus == "imported",
+              previousRowVersion == command.expectedRowVersion,
+              rowVersion == previousRowVersion + 1,
+              correctionGlobalId.range(
+                of: #"^gorc(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                options: .regularExpression
+              ) != nil,
+              cancelledPlanGlobalId == command.expectedPlanGlobalId,
+              releasedLocalReservationCount >= 0,
+              releasedProviderCommitmentCount >= 0,
+              releasedPackagingClaimCount >= 0,
+              providerReads == 0,
+              providerWrites == 0 else {
+            throw PickingContractError.contextMismatch
+        }
+        return self
     }
 }
 
@@ -1002,6 +1513,13 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct ManagerOrderReplanningEnvelope: Decodable {
+        let ok: Bool
+        let result: ManagerOrderReplanningResult?
+        let code: String?
+        let error: String?
+    }
+
     private struct ManagerOrderCommandBody: Encodable {
         let action: String
         let orderGlobalId: String
@@ -1017,6 +1535,16 @@ public actor PickingAPIClient {
         let expectedTaskCount: Int
         let expectedAssignmentFingerprint: String
         let assignedTo: String?
+        let reason: String
+    }
+
+    private struct ManagerOrderReplanningBody: Encodable {
+        let action: String
+        let orderGlobalId: String
+        let expectedRowVersion: Int
+        let expectedPlanGlobalId: String
+        let expectedPlanVersion: Int
+        let expectedCorrectionFingerprint: String
         let reason: String
     }
 
@@ -1568,6 +2096,62 @@ public actor PickingAPIClient {
             assignedTo: assignedTo,
             reason: reason
         )
+    }
+
+    public func reopenManagerOrderForReplanning(
+        _ command: ManagerOrderReplanningCommand
+    ) async throws -> ManagerOrderReplanningResult {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ManagerOrderReplanningBody(
+            action: command.action,
+            orderGlobalId: command.orderGlobalId,
+            expectedRowVersion: command.expectedRowVersion,
+            expectedPlanGlobalId: command.expectedPlanGlobalId,
+            expectedPlanVersion: command.expectedPlanVersion,
+            expectedCorrectionFingerprint: command.expectedCorrectionFingerprint,
+            reason: command.reason
+        ))
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(
+            ManagerOrderReplanningEnvelope.self,
+            from: data
+        )
+        if http.statusCode == 409 {
+            throw PickingAPIError.conflict(
+                code: envelope?.code ?? "OPERATIONS_UNCLASSIFIED_CONFLICT",
+                message: envelope?.error
+                    ?? "The order changed after this correction was reviewed."
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            if let envelope {
+                throw PickingAPIError.rejected(
+                    code: envelope.code ?? "OPERATIONS_REPLANNING_FAILED",
+                    message: envelope.error ?? "The order could not be reopened."
+                )
+            }
+            if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            if http.statusCode == 429 {
+                let seconds = Int(
+                    http.value(forHTTPHeaderField: "Retry-After") ?? ""
+                ) ?? 60
+                throw PickingAPIError.rateLimited(
+                    retryAfterSeconds: max(1, seconds)
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return try result.validated(for: command)
     }
 
     public func confirm(_ command: ConfirmPicksCommand) async throws {

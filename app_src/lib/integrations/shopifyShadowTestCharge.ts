@@ -93,10 +93,10 @@ export function applyShopifyShadowTestCharge(input: {
       offer.serviceLevelCode,
     ) === selectedServiceCode
   ))
-  if (selectedOffers.length !== 1) {
+  if (selectedOffers.length < 1) {
     throw new ShopifyShadowTestChargeError(
       'SHOPIFY_SHADOW_TEST_SERVICE_UNAVAILABLE',
-      'Configured Shadow test service is not uniquely available',
+      'Configured Shadow test service is unavailable',
     )
   }
 

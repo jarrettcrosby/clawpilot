@@ -22,6 +22,7 @@ type InventoryProductEvidence = {
   availabilityAuthority:
     | 'operational_available'
     | 'shopify_provider_commitment'
+    | 'shadow_training_simulated'
   providerCommittedQuantity: number
   activeReservedQuantity: number
   effectiveAvailableQuantity: number
@@ -169,6 +170,7 @@ export async function planOperationalGeometryRatePackages(input: {
   recipePackages: HybridRecipePackage[]
   materials: HybridCartonizationMaterial[]
   inventoryProducts: InventoryProductEvidence[]
+  availabilityMode?: 'operational' | 'shadow_training_simulated'
   startingSequence: number
   maximumPackages: number
   optimizer: FulfillmentOptimizerV1 | null
@@ -177,7 +179,9 @@ export async function planOperationalGeometryRatePackages(input: {
     maxCandidates?: number
   }
 }): Promise<OperationalGeometryRatePlan> {
-  if (input.provider !== 'shopify') {
+  const shadowTraining =
+    input.availabilityMode === 'shadow_training_simulated'
+  if (input.provider !== 'shopify' && !shadowTraining) {
     return blocked(
       'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_GEOMETRY_PROVIDER_UNSUPPORTED',
       'Operational geometry cartonization currently requires exact Shopify inventory authority.',
@@ -256,11 +260,16 @@ export async function planOperationalGeometryRatePackages(input: {
       || material.maximumGrossWeightGrams <= material.tareWeightGrams
       || !positiveInteger(material.unitCostMinor)
       || material.currency !== input.currency
-      || !nonnegativeInteger(material.stockRowVersion)
-      || !nonnegativeInteger(material.stockOnHandQuantity)
-      || !nonnegativeInteger(material.activeClaimedQuantity)
-      || material.stockOnHandQuantity - material.activeClaimedQuantity
-        !== material.availableQuantity
+      || (
+        !shadowTraining
+        && (
+          !nonnegativeInteger(material.stockRowVersion)
+          || !nonnegativeInteger(material.stockOnHandQuantity)
+          || !nonnegativeInteger(material.activeClaimedQuantity)
+          || material.stockOnHandQuantity - material.activeClaimedQuantity
+            !== material.availableQuantity
+        )
+      )
     )
   })
   if (invalidMaterial) {
@@ -285,8 +294,10 @@ export async function planOperationalGeometryRatePackages(input: {
         || !positiveInteger(emptyWeightGrams)
         || !positiveInteger(materialCostMinor)
       ) return []
-      const available = Number(material.availableQuantity)
-        - (usedMaterialQuantity.get(material.materialGlobalId) || 0)
+      const available = shadowTraining
+        ? fallbackUnitCount
+        : Number(material.availableQuantity)
+          - (usedMaterialQuantity.get(material.materialGlobalId) || 0)
       if (!positiveInteger(available)) return []
       return [{
         cartonGlobalId: material.materialGlobalId,
@@ -324,6 +335,19 @@ export async function planOperationalGeometryRatePackages(input: {
       const positionIds = product?.sourcePositionGlobalIds || []
       const available = Number(product?.effectiveAvailableQuantity)
         - (usedProductQuantity.get(productGlobalId) || 0)
+      if (
+        shadowTraining
+        && product?.availabilityAuthority === 'shadow_training_simulated'
+        && positiveInteger(available)
+      ) {
+        return [{
+          positionGlobalId: `training-${productGlobalId}`,
+          warehouseGlobalId: input.warehouseGlobalId,
+          productGlobalId,
+          availableQuantity: available,
+          unitHandlingCostMinor: 0,
+        }]
+      }
       if (
         !product
         || product.availabilityAuthority
@@ -365,6 +389,7 @@ export async function planOperationalGeometryRatePackages(input: {
     candidateRowVersion: input.candidateRowVersion,
     warehouseGlobalId: input.warehouseGlobalId,
     readAt: input.readAt,
+    availabilityMode: input.availabilityMode || 'operational',
     fallbackLines: input.fallbackLines,
     recipePackageKeys: input.recipePackages.map((item) => item.packageKey),
     materialFacts: input.materials,

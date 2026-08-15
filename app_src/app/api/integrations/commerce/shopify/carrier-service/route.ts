@@ -56,6 +56,7 @@ import {
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
+  updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres,
   updateShopifyCarrierServicePlanRatePolicyInPostgres,
   updateShopifyCarrierServiceRateWarmPolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
@@ -1259,10 +1260,27 @@ export async function POST(req: NextRequest) {
       ) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_SHADOW_REQUIRED',
-          'Set Operations to Shadow before configuring checkout rating',
+          'Set Operations to Shadow or Active before configuring checkout rating',
           409,
         )
       }
+      const carriers = array(body.carriers, 'Carrier accounts')
+        .map((item) => {
+          const selected = record(item, 'Carrier account')
+          return {
+            provider: selected.provider as ShopifyCheckoutCarrierProvider,
+            carrierAccountGlobalId: selected.carrierAccountGlobalId as string,
+          }
+        })
+      if (current.config?.registrationState === 'registered') {
+        await updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres({
+          organizationId: context.organizationId,
+          accountGlobalId: accountId,
+          expectedRowVersion: current.config.rowVersion,
+          carriers,
+          actorEmail: context.actor.email,
+        })
+      } else {
       const materials = array(body.materials, 'Packaging materials')
         .map((item) => {
           const selected = record(item, 'Packaging material')
@@ -1271,14 +1289,6 @@ export async function POST(req: NextRequest) {
               selected.materialGlobalId || '',
             ),
             expectedRowVersion: Number(selected.expectedRowVersion),
-          }
-        })
-      const carriers = array(body.carriers, 'Carrier accounts')
-        .map((item) => {
-          const selected = record(item, 'Carrier account')
-          return {
-            provider: selected.provider as ShopifyCheckoutCarrierProvider,
-            carrierAccountGlobalId: selected.carrierAccountGlobalId as string,
           }
         })
       const callbackTokenVersion = current.config
@@ -1324,7 +1334,7 @@ export async function POST(req: NextRequest) {
         ratingMode: 'whole_shipment',
         inventoryPolicy: 'fresh_atp_fail_closed',
         materialPolicy: 'revision_fenced_rated_outer_dimensions',
-        carrierPolicy: 'all_configured_providers_once',
+        carrierPolicy: 'all_configured_accounts_once',
         pricingPolicy:
           'carton_selection_uses_landed_cost_customer_charge_is_carrier_cost',
         servicePolicy: 'one_service_for_every_package',
@@ -1373,6 +1383,7 @@ export async function POST(req: NextRequest) {
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
         actorEmail: context.actor.email,
       })
+      }
     } else if (action === 'save-plan-rate-policy') {
       requireActivator(context.capabilities.canActivate)
       if (!current.config) {

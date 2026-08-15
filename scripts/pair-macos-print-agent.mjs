@@ -12,6 +12,11 @@ import {
   completeMacPrintPairingTransaction,
   rollbackMacPrintPairingTransaction,
 } from './lib/macos-print-agent-pairing.mjs'
+import {
+  macPrintPairingIdempotencyKey,
+  macPrintPairingSecretKind,
+  redeemMacPrintPairingGrant,
+} from './lib/macos-print-agent-credential.mjs'
 
 const args = process.argv.slice(2)
 const values = new Map()
@@ -24,7 +29,7 @@ for (let index = 0; index < args.length; index += 1) {
     continue
   }
   if (value.toLowerCase().includes('credential') || value.toLowerCase().includes('password')) {
-    throw new Error('The one-time credential cannot be supplied through command arguments')
+    throw new Error('Pairing secrets cannot be supplied through command arguments')
   }
   const next = args[index + 1]
   if (!next || next.startsWith('--')) throw new Error(`${value} requires a value`)
@@ -36,7 +41,7 @@ if (flags.has('--help') || flags.has('-h')) {
   process.stdout.write(`Pair a Mac with a ClawPilot local print agent
 
 The command prompts locally for a unique workspace/instance name, printer
-hostname or IP address, raw printer port, and the one-time agent credential.
+hostname or IP address, raw printer port, and a short-lived pairing grant.
 The hostname/IP remains in the local LaunchAgent configuration and is never
 sent to the hosted printer-configuration API.
 
@@ -47,9 +52,10 @@ Optional:
   --printer-port        Raw printer port (default 9100)
   --dry-run             Validate a plan without probing, Keychain, or install
 
-The credential cannot be supplied through command arguments or environment
+The pairing grant cannot be supplied through command arguments or environment
 options. macOS Keychain prompts for it without placing it in argv, logs, or
-shell history.
+shell history. A directly supplied cpprint runtime credential remains accepted
+only for explicit legacy/manual compatibility.
 `)
   process.exit(0)
 }
@@ -125,24 +131,65 @@ function deleteKeychainItem(service, account) {
   )
 }
 
-function addCredentialToKeychain(service, account) {
+function keychainValue(service, account) {
+  return execFileSync(
+    '/usr/bin/security',
+    ['find-generic-password', '-s', service, '-a', account, '-w'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+  ).trim()
+}
+
+function replaceKeychainValueFromStdin(service, account, value) {
+  const result = spawnSync(
+    '/usr/bin/security',
+    ['add-generic-password', '-U', '-s', service, '-a', account, '-w'],
+    {
+      encoding: 'utf8',
+      input: `${value}\n`,
+      stdio: ['pipe', 'ignore', 'ignore'],
+    },
+  )
+  if (result.status !== 0 || keychainValue(service, account) !== value) {
+    throw new Error('The runtime credential could not be secured in macOS Keychain')
+  }
+}
+
+async function storeRuntimeCredential({
+  service,
+  account,
+  configuredBaseUrl,
+}) {
   process.stdout.write(
-    'Paste the one-time ClawPilot agent credential at the secure macOS Keychain prompt.\n',
+    'Paste the short-lived ClawPilot pairing code at the secure macOS Keychain prompt.\n',
   )
   const result = spawnSync(
     '/usr/bin/security',
     ['add-generic-password', '-s', service, '-a', account, '-w'],
     { stdio: 'inherit' },
   )
-  if (result.status !== 0) throw new Error('The credential was not stored in macOS Keychain')
-  const credential = execFileSync(
-    '/usr/bin/security',
-    ['find-generic-password', '-s', service, '-a', account, '-w'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
-  ).trim()
-  if (!/^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i.test(credential)) {
+  if (result.status !== 0) throw new Error('The pairing code was not stored in macOS Keychain')
+  const suppliedSecret = keychainValue(service, account)
+  const kind = macPrintPairingSecretKind(suppliedSecret)
+  if (!kind) {
     deleteKeychainItem(service, account)
-    throw new Error('The stored value is not a valid one-time ClawPilot agent credential')
+    throw new Error('The stored value is not a valid ClawPilot pairing code')
+  }
+  if (kind === 'legacy_runtime_credential') {
+    process.stderr.write(
+      'Legacy/manual cpprint credential accepted. New web setup should use a short-lived cppair grant.\n',
+    )
+    return
+  }
+  try {
+    const runtimeCredential = await redeemMacPrintPairingGrant({
+      baseUrl: configuredBaseUrl,
+      pairingCode: suppliedSecret,
+      idempotencyKey: macPrintPairingIdempotencyKey(suppliedSecret),
+    })
+    replaceKeychainValueFromStdin(service, account, runtimeCredential)
+  } catch (error) {
+    deleteKeychainItem(service, account)
+    throw error
   }
 }
 
@@ -225,7 +272,9 @@ if (flags.has('--dry-run')) {
     baseUrl: plan.configuredBaseUrl,
     printerPort: plan.printerPort,
     printerEndpointStorage: 'local_launch_agent_only',
-    credentialInput: 'secure_macos_keychain_prompt',
+    credentialInput: 'secure_macos_keychain_pairing_grant_prompt',
+    primaryPairingSecret: 'cppair.v1',
+    legacyManualCompatibility: 'cpprint.v1',
     keychainService: plan.keychainService,
     keychainAccount: plan.keychainAccount,
   })}\n`)
@@ -256,7 +305,11 @@ const pairingTransaction = beginMacPrintPairingTransaction({
 let credentialStored = false
 try {
   await probePrinter(plan.printerHost, plan.printerPort)
-  addCredentialToKeychain(plan.keychainService, plan.keychainAccount)
+  await storeRuntimeCredential({
+    service: plan.keychainService,
+    account: plan.keychainAccount,
+    configuredBaseUrl: plan.configuredBaseUrl,
+  })
   credentialStored = true
   const installer = path.join(
     path.dirname(fileURLToPath(import.meta.url)),

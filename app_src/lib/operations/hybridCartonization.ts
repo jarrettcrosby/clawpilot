@@ -115,7 +115,7 @@ export type HybridCartonizationMaterial = {
 }
 
 export type HybridCartonizationInput = {
-  mode: 'production' | 'sandbox_demo'
+  mode: 'production' | 'sandbox_demo' | 'shadow_training_simulated'
   lines: HybridCartonizationLine[]
   recipes: HybridCartonizationRecipe[]
   materials: HybridCartonizationMaterial[]

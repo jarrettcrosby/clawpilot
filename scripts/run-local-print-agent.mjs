@@ -11,6 +11,7 @@ import {
   readOrCreateLocalDeviceKey,
   runWithLocalPrinterKernelLock,
 } from './lib/local-print-device.mjs'
+import { rawPrintFailureDisposition } from './lib/submit-raw-print.mjs'
 
 const args = new Set(process.argv.slice(2))
 const once = args.has('--once')
@@ -60,7 +61,7 @@ if (help) {
 
 Required environment:
   CLAWPILOT_PRINT_AGENT_URL          ClawPilot deployment base URL
-  CLAWPILOT_PRINT_AGENT_CREDENTIAL   One-time enrolled cpprint credential
+  CLAWPILOT_PRINT_AGENT_CREDENTIAL   Runtime cpprint credential (valid until revoked)
   CLAWPILOT_PRINTER_HOST             Printer hostname or IP address
 
 Optional environment:
@@ -257,6 +258,7 @@ async function submitRaw(payload, timeoutMs = 10_000) {
     const error = new Error('The configured local printer is busy')
     error.code = 'LOCAL_PRINTER_BUSY'
     error.acceptedBytes = 0
+    error.deliveryStarted = false
     throw error
   }
   let result = null
@@ -273,10 +275,15 @@ async function submitRaw(payload, timeoutMs = 10_000) {
     return { acceptedBytes: payload.byteLength }
   }
   const error = new Error('The configured local printer did not complete delivery')
-  error.code = String(result?.code || 'PRINT_OUTCOME_UNCERTAIN')
-  error.acceptedBytes = Number.isSafeInteger(Number(result?.acceptedBytes))
-    ? Number(result.acceptedBytes)
-    : payload.byteLength
+  const disposition = rawPrintFailureDisposition({
+    acceptedBytes: Number.isSafeInteger(Number(result?.acceptedBytes))
+      ? Number(result.acceptedBytes)
+      : payload.byteLength,
+    deliveryStarted: result?.deliveryStarted,
+  })
+  error.code = String(result?.code || disposition.code)
+  error.acceptedBytes = disposition.acceptedBytes
+  error.deliveryStarted = disposition.deliveryStarted
   throw error
 }
 
@@ -482,8 +489,8 @@ async function handleJob(config, ledger, job, deviceReference) {
   try {
     result = await submitRaw(payload)
   } catch (error) {
-    const acceptedBytes = Number(error?.acceptedBytes || 0)
-    const retryable = acceptedBytes === 0
+    const disposition = rawPrintFailureDisposition(error)
+    const { acceptedBytes, deliveryStarted, retryable } = disposition
     const state = retryable ? 'delivery_failed' : 'outcome_uncertain'
     const failedAt = new Date().toISOString()
     ledger.claims[key] = {
@@ -491,12 +498,14 @@ async function handleJob(config, ledger, job, deviceReference) {
       state,
       failedAt,
       acceptedBytes,
+      deliveryStarted,
     }
     ledger.deliveries[immutableKey] = {
       ...ledger.deliveries[immutableKey],
       state,
       failedAt,
       acceptedBytes,
+      deliveryStarted,
     }
     await writeLedger(ledger)
     await failClaim(config, job, {
@@ -512,6 +521,7 @@ async function handleJob(config, ledger, job, deviceReference) {
       jobGlobalId: job.globalId,
       retryable,
       acceptedBytes,
+      deliveryStarted,
     })
     return
   }

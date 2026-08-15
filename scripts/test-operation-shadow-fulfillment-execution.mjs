@@ -16,6 +16,13 @@ const types = readFileSync(
   resolve(root, 'app_src/lib/operations/types.ts'),
   'utf8',
 )
+const preparationReader = readFileSync(
+  resolve(
+    root,
+    'app_src/lib/persistence/operationShadowFulfillmentPreparation.ts',
+  ),
+  'utf8',
+)
 const destinationRepair = readFileSync(
   resolve(
     root,
@@ -150,6 +157,7 @@ for (const fragment of [
   "plan.status !== 'released'",
   "reconciliation.outcome !== 'matched'",
   'AND config.id = $4::uuid',
+  "AND carrier_connection.environment = 'sandbox'",
   'selectCanonicalFulfillmentRate',
   'completedShadowFulfillmentExecutionResult',
   'OPERATIONS_FULFILLMENT_EXECUTION_ALREADY_PREPARED',
@@ -184,11 +192,15 @@ for (const fragment of [
   'const normalizedResponse = {',
   'packagePlanHash: current.packagePlanHash',
   'packageCount: current.packages.length',
+  'carrierAccountGlobalId: offer.carrierAccountGlobalId',
   'JSON.stringify(normalizedResponse)',
   "'cartonization_shipment_rate'",
   "'sandbox'",
   'shipment.destinationFingerprint\n            !== current.fulfillmentCarrierDestinationFingerprint',
   'checkoutCarrierDestinationFingerprint:',
+  'checkoutCarrierAccountGlobalId',
+  'selected_carrier_account_id',
+  'carrier_account_id',
   'carrierDestinationFingerprint:\n          current.fulfillmentCarrierDestinationFingerprint',
   "authority_mode, state",
   "'shadow', 'shadow_prepared'",
@@ -199,6 +211,18 @@ for (const fragment of [
   'completeCommandReceipt',
 ]) {
   assert.ok(command.includes(fragment), `Command is missing ${fragment}`)
+}
+
+for (const fragment of [
+  'attempt.carrierAccountGlobalId\n              === selected.carrierAccountGlobalId',
+  'offer.carrierAccountGlobalId\n              === selected.carrierAccountGlobalId',
+  'current.checkoutCarrierAccountGlobalId\n          !== selected.carrierAccountGlobalId',
+  'selectedCarrierAccountGlobalId:',
+]) {
+  assert.ok(
+    command.includes(fragment),
+    `Exact selected carrier-account lineage is missing ${fragment}`,
+  )
 }
 
 assert.equal(
@@ -352,12 +376,26 @@ const resultType = types.slice(resultTypeStart, resultTypeEnd)
 for (const fragment of [
   "orderStatus: 'packed'",
   "status: 'succeeded' | 'degraded'",
+  'carrierAccountGlobalId: string',
   'providerWriteCount: 0',
   'postagePurchaseCount: 0',
   'labelWriteCount: 0',
   'commerceWriteCount: 0',
 ]) {
   assert.ok(resultType.includes(fragment), `Result type is missing ${fragment}`)
+}
+
+for (const fragment of [
+  'checkout_run.selected_carrier_account_id',
+  'fulfillment_run.selected_carrier_account_id',
+  'checkout_carrier_account_global_id',
+  'fulfillment_carrier_account_global_id',
+  'carrierAccountGlobalId:',
+]) {
+  assert.ok(
+    preparationReader.includes(fragment),
+    `Shadow preparation readback is missing ${fragment}`,
+  )
 }
 
 console.log('Shadow fulfillment-preparation command contract passed.')

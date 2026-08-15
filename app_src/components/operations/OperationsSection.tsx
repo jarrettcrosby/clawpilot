@@ -74,6 +74,7 @@ import type {
   OperationsOrderCommandResult,
   OperationsOrderDetail,
   OperationsOrderListItem,
+  OperationsOrderReplanningCorrectionResult,
   OperationsOrderStatus,
   OperationsPackingSlipCommandResult,
   OperationsSandboxLabelCommandResult,
@@ -102,6 +103,9 @@ import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
 import OneOffShippingExecutionPanel from '@/components/operations/OneOffShippingExecutionPanel'
+import ShadowOrderTrainingPanel, {
+  type ShadowTrainingPlanTarget,
+} from '@/components/operations/ShadowOrderTrainingPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
@@ -167,6 +171,7 @@ type OperationsPayload = {
     | OperationsCommerceActivePreparationResult
     | OperationsCommerceActiveTransitionResult
     | OperationsExternalFulfillmentReconciliationResult
+    | OperationsOrderReplanningCorrectionResult
     | OperationsOrderCommandResult
     | OperationsPackingSlipCommandResult
     | OperationsSandboxLabelCommandResult
@@ -191,6 +196,50 @@ type PlanningEvidencePayload = {
     globalId: string
     status: 'succeeded' | 'partial' | 'failed'
   }
+}
+
+type ShopifyPlanningAssignment = {
+  version: 'shopify-order-planning-assignment-v1'
+  status: 'ready' | 'unmapped' | 'provider_managed' | 'split' | 'not_open'
+  accountGlobalId: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  assignments: Array<{
+    shopifyLocationId: string
+    shopifyLocationName: string
+    ownerType: 'merchant_managed' | 'fulfillment_service'
+    fulfillmentService: null | {
+      id: string
+      serviceName: string
+      type: string | null
+    }
+    fulfillmentOrderIds: string[]
+    mapping: null | {
+      globalId: string
+      rowVersion: number
+      warehouseGlobalId: string
+      warehouseName: string
+      locationGlobalId: string
+      locationCode: string
+    }
+  }>
+  selectedWarehouse: null | {
+    globalId: string
+    name: string
+    mappingGlobalId: string
+    mappingRowVersion: number
+    shopifyLocationId: string
+    shopifyLocationName: string
+  }
+  providerReads: 1
+  providerWrites: 0
+}
+
+type ShopifyPlanningAssignmentPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  assignment?: ShopifyPlanningAssignment
 }
 
 type OneOffExecutionPayload = {
@@ -670,6 +719,7 @@ function money(minor: string | null | undefined, currency = 'USD') {
 function operationalPlanningMaterialBlockers(
   material: PackagingMaterial,
   warehouseGlobalId: string,
+  requireStock = true,
 ) {
   const blockers: string[] = []
   const ratedOuter = material.ratedOuterDimensionsMm
@@ -693,11 +743,14 @@ function operationalPlanningMaterialBlockers(
     item.warehouseGlobalId === warehouseGlobalId
   ))
   if (
+    requireStock
+    && (
     !stock
     || stock.warehouseStatus !== 'active'
     || !stock.isAvailable
     || !stock.onHandQuantity
     || stock.onHandQuantity <= 0
+    )
   ) {
     blockers.push('available warehouse stock missing')
   }
@@ -981,7 +1034,7 @@ function ShadowFulfillmentPreparationPanel({
         <Stack spacing={0.75} sx={{ mt: 0.75 }}>
           {preparation.providerAttempts.map((attempt) => (
             <Box
-              key={attempt.provider}
+              key={`${attempt.provider}:${attempt.carrierAccountGlobalId}`}
               sx={{
                 minWidth: 0,
                 p: 1.25,
@@ -1060,7 +1113,9 @@ function OrderDetailDrawer({
   busy,
   onClose,
   onPlan,
+  trainingRefreshToken,
   onRelease,
+  onReopenForReplanning,
   onConfirmPicks,
   onReconcileExternalFulfillment,
   onVerifyPack,
@@ -1095,8 +1150,10 @@ function OrderDetailDrawer({
   open: boolean
   busy: boolean
   onClose: () => void
-  onPlan: () => void
+  onPlan: (trainingTarget?: ShadowTrainingPlanTarget) => void
+  trainingRefreshToken: number
   onRelease: () => void
+  onReopenForReplanning: () => void
   onConfirmPicks: () => void
   onReconcileExternalFulfillment: () => void
   onVerifyPack: () => void
@@ -1125,6 +1182,9 @@ function OrderDetailDrawer({
   const dateTime = useUserDateTime()
   const { measurementSystem } = useMeasurementSystem()
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
+  const replanningAction = order?.availableActions?.find(
+    (item) => item.action === 'reopen_for_replanning',
+  )
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const reconcileExternalFulfillmentAction = order?.availableActions?.find(
     (item) => item.action === 'reconcile_external_fulfillment',
@@ -1133,12 +1193,22 @@ function OrderDetailDrawer({
   const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const canPlanImportedOrder = Boolean(
-    order?.status === 'imported'
+    activationState !== 'shadow'
+    && order?.status === 'imported'
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce',
   )
+  const shadowProviderOrder = Boolean(
+    activationState === 'shadow'
+    && order?.sourceProvider
+    && ['shopify', 'faire'].includes(order.sourceProvider),
+  )
   const primaryAction = canPlanImportedOrder
     ? undefined
+    : shadowProviderOrder
+      ? order?.shopifyExternalFulfillmentReconciliationRequired
+        ? reconcileExternalFulfillmentAction
+        : undefined
     : order?.status === 'released'
       ? order.shopifyExternalFulfillmentReconciliationRequired
         ? reconcileExternalFulfillmentAction
@@ -1178,7 +1248,7 @@ function OrderDetailDrawer({
   const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
     && Boolean(order.oneOffShippingMode)
   const activeExecutionRequiredReason = activationState !== 'active'
-    ? 'Carrier label create and void actions require Operations Active mode.'
+    ? 'Order label create and void actions require Operations Active mode. To test a sandbox carrier account and printer while this workspace is in Shadow, use Shipping Settings → Sandbox / Developer; that diagnostic does not ship or update this order.'
     : null
   const createBlockedReason = activeExecutionRequiredReason
     || (!canExecute
@@ -1271,6 +1341,17 @@ function OrderDetailDrawer({
           overflowY: 'auto',
         }}>
           <Stack spacing={3}>
+            {shadowProviderOrder && order && (
+              <DetailSection title="Shadow training">
+                <ShadowOrderTrainingPanel
+                  orderGlobalId={order.globalId}
+                  canExecute={canExecute}
+                  disabled={busy}
+                  refreshToken={trainingRefreshToken}
+                  onPlan={onPlan}
+                />
+              </DetailSection>
+            )}
             <DetailSection title="Overview">
               <Box sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 1.5 }}>
                 <Box><Typography variant="caption" color="text.secondary">Customer</Typography><Typography>{order.customerName}</Typography><Typography variant="caption" color="#A8C7FA">{order.customerGlobalId}</Typography></Box>
@@ -1283,7 +1364,7 @@ function OrderDetailDrawer({
               </Typography>
             </DetailSection>
 
-            {order.sourceProvider === 'shopify' && (
+            {order.sourceProvider === 'shopify' && activationState !== 'shadow' && (
               <DetailSection title="Provider writes">
                 <ShopifyOrderManagementPanel
                   orderGlobalId={order.globalId}
@@ -1345,7 +1426,7 @@ function OrderDetailDrawer({
                           ? <CircularProgress size={16} />
                           : <Inventory2Rounded />}
                         disabled={!canExecute || busy}
-                        onClick={onPlan}
+                        onClick={() => onPlan()}
                       >
                         {busy ? 'Preparing' : 'Prepare order'}
                       </Button>
@@ -1416,6 +1497,31 @@ function OrderDetailDrawer({
                     </Button>
                   </span>
                 </Tooltip>
+              )}
+              {replanningAction && (
+                <Stack spacing={0.75} sx={{ mt: primaryAction ? 1.25 : 0 }}>
+                  <Tooltip title={replanningAction.blockedReason
+                    || replanningAction.consequenceSummary
+                    || 'Cancel an unreleased local plan and return the order to Imported'}>
+                    <span>
+                      <Button
+                        fullWidth
+                        variant="outlined"
+                        color="warning"
+                        startIcon={<ReplayRounded />}
+                        disabled={!replanningAction.enabled || busy}
+                        onClick={onReopenForReplanning}
+                      >
+                        {replanningAction.label}
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  {replanningAction.blockedReason && (
+                    <Typography variant="caption" color="text.secondary">
+                      {replanningAction.blockedReason}
+                    </Typography>
+                  )}
+                </Stack>
               )}
             </DetailSection>
 
@@ -2467,9 +2573,15 @@ export default function OperationsSection({
   const [commerceActivePrepareKey, setCommerceActivePrepareKey] = useState('')
   const [commerceActiveActivateKey, setCommerceActiveActivateKey] = useState('')
   const [planOpen, setPlanOpen] = useState(false)
+  const [shadowTrainingPlanTarget, setShadowTrainingPlanTarget] =
+    useState<ShadowTrainingPlanTarget | null>(null)
+  const [shadowTrainingRefreshToken, setShadowTrainingRefreshToken] =
+    useState(0)
   const [planPreparationLoading, setPlanPreparationLoading] = useState(false)
   const [planPackagingWorkspace, setPlanPackagingWorkspace] =
     useState<PackagingMaterialsWorkspace | null>(null)
+  const [planShopifyAssignment, setPlanShopifyAssignment] =
+    useState<ShopifyPlanningAssignment | null>(null)
   const [planWarehouseGlobalId, setPlanWarehouseGlobalId] = useState('')
   const [planMaterialGlobalIds, setPlanMaterialGlobalIds] = useState<string[]>([])
   const [creatingPlanEvidence, setCreatingPlanEvidence] = useState(false)
@@ -2488,6 +2600,13 @@ export default function OperationsSection({
   const [releaseReason, setReleaseReason] = useState('Release the reviewed plan to warehouse execution')
   const [releaseIdempotencyKey, setReleaseIdempotencyKey] = useState('')
   const [releasingOrder, setReleasingOrder] = useState(false)
+  const [replanningCorrectionOpen, setReplanningCorrectionOpen] = useState(false)
+  const [replanningCorrectionReason, setReplanningCorrectionReason] = useState('')
+  const [replanningCorrectionConfirmed, setReplanningCorrectionConfirmed] =
+    useState(false)
+  const [replanningCorrectionIdempotencyKey, setReplanningCorrectionIdempotencyKey] =
+    useState('')
+  const [reopeningForReplanning, setReopeningForReplanning] = useState(false)
   const [confirmPicksOpen, setConfirmPicksOpen] = useState(false)
   const [confirmPicksReason, setConfirmPicksReason] = useState('Confirm all ready pick tasks for the released wave')
   const [confirmPicksIdempotencyKey, setConfirmPicksIdempotencyKey] = useState('')
@@ -2761,7 +2880,10 @@ export default function OperationsSection({
     window.location.hash = 'operations'
   }
 
-  const loadPlanPreparation = async (order: OperationsOrderDetail) => {
+  const loadPlanPreparation = async (
+    order: OperationsOrderDetail,
+    localTraining = false,
+  ) => {
     if (!order.planningPreparation) {
       setPlanError(
         'This imported order is missing its promoted sales-channel candidate. Refresh the order or reopen Commerce imports.',
@@ -2770,36 +2892,103 @@ export default function OperationsSection({
     }
     setPlanPreparationLoading(true)
     try {
-      const response = await fetch('/api/operations/packaging-materials', {
+      const packagingRequest = fetch('/api/operations/packaging-materials', {
         cache: 'no-store',
       })
+      const assignmentRequest = order.sourceProvider === 'shopify'
+        && !localTraining
+        ? fetch(
+            '/api/integrations/commerce/intake/planning-assignment',
+            {
+              method: 'POST',
+              cache: 'no-store',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: 'inspect',
+                accountGlobalId: order.planningPreparation.accountGlobalId,
+                candidateGlobalId: order.planningPreparation.candidateGlobalId,
+                expectedCandidateRowVersion:
+                  order.planningPreparation.candidateRowVersion,
+              }),
+            },
+          )
+        : null
+      const [response, assignmentResponse] = await Promise.all([
+        packagingRequest,
+        assignmentRequest,
+      ])
       const payload = await response.json().catch(() => ({})) as
         PackagingMaterialsPayload
       if (!response.ok || !payload.ok || !payload.packagingMaterials) {
-        throw new Error(payload.error || 'Packaging materials could not be loaded')
+        throw new Error(
+          payload.error || 'Packaging materials could not be loaded',
+        )
       }
       const packaging = payload.packagingMaterials
-      const warehouseGlobalId = packaging.warehouses.find(
-        (warehouse) => warehouse.status === 'active',
-      )?.globalId || ''
+      let assignment: ShopifyPlanningAssignment | null = null
+      if (assignmentResponse) {
+        const assignmentPayload = await assignmentResponse.json()
+          .catch(() => ({})) as ShopifyPlanningAssignmentPayload
+        if (!assignmentResponse.ok || !assignmentPayload.assignment) {
+          throw new Error(
+            `${assignmentPayload.error
+              || 'Shopify fulfillment routing could not be inspected'}${
+              assignmentPayload.code ? ` [${assignmentPayload.code}]` : ''
+            }`,
+          )
+        }
+        assignment = assignmentPayload.assignment
+      }
+      const warehouseGlobalId = assignment?.status === 'ready'
+        ? assignment.selectedWarehouse?.globalId || ''
+        : packaging.warehouses.find(
+            (warehouse) => warehouse.status === 'active',
+          )?.globalId || ''
       const operationalMaterials = warehouseGlobalId
         ? packaging.materials.filter((material) => (
             operationalPlanningMaterialBlockers(
               material,
               warehouseGlobalId,
+              !localTraining,
             ).length === 0
           ))
         : []
       setPlanPackagingWorkspace(packaging)
+      setPlanShopifyAssignment(assignment)
       setPlanWarehouseGlobalId(warehouseGlobalId)
       setPlanMaterialGlobalIds(
         operationalMaterials[0] ? [operationalMaterials[0].globalId] : [],
       )
-      if (!warehouseGlobalId) {
+      if (!localTraining && assignment?.status === 'provider_managed') {
+        const providerLocation = assignment.assignments[0]
+        setPlanError(
+          `Shopify assigned this order to ${
+            providerLocation?.shopifyLocationName || 'an app-managed location'
+          }${providerLocation?.fulfillmentService?.serviceName
+            ? ` (${providerLocation.fulfillmentService.serviceName})`
+            : ''}. This provider-managed fulfillment order cannot be planned as ClawPilot warehouse work.`,
+        )
+      } else if (!localTraining && assignment?.status === 'unmapped') {
+        setPlanError(
+          `Shopify assigned this order to ${
+            assignment.assignments[0]?.shopifyLocationName || 'an unmapped location'
+          }. Map that Shopify location to a ClawPilot warehouse before cartonization.`,
+        )
+      } else if (!localTraining && assignment?.status === 'split') {
+        setPlanError(
+          'Shopify split this order across more than one fulfillment location. Split-warehouse planning is not available yet.',
+        )
+      } else if (!localTraining && assignment?.status === 'not_open') {
+        setPlanError(
+          'Shopify has no untouched open fulfillment assignment that ClawPilot can plan.',
+        )
+      } else if (!warehouseGlobalId) {
         setPlanError('Configure an active warehouse before preparing this order.')
       } else if (!operationalMaterials.length) {
         setPlanError(
-          'No active stocked packaging has factual exterior dimensions and tare for this warehouse.',
+          localTraining
+            ? 'No active packaging has factual exterior dimensions and tare for training.'
+            : 'No active stocked packaging has factual exterior dimensions and tare for this warehouse.',
         )
       }
     } catch (caught) {
@@ -2813,32 +3002,42 @@ export default function OperationsSection({
     }
   }
 
-  const openPlan = () => {
-    setPlanCartonizationEvidenceGlobalId('')
+  const openPlan = (trainingTarget?: ShadowTrainingPlanTarget) => {
+    const sealedTrainingEvidence = (
+      trainingTarget?.cartonizationEvidenceGlobalId || ''
+    ).trim().toLowerCase()
+    setShadowTrainingPlanTarget(trainingTarget || null)
+    setPlanCartonizationEvidenceGlobalId(sealedTrainingEvidence)
     setPlanPackagingWorkspace(null)
+    setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
+    setPlanPreparationLoading(false)
     setPlanEvidenceIdempotencyKey(
       `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
     )
-    setPlanReason(
-      'Rate, cartonize, and accept the reviewed warehouse plan',
-    )
+    setPlanReason(trainingTarget
+      ? 'Rate, cartonize, and accept the local-only training plan'
+      : 'Rate, cartonize, and accept the reviewed warehouse plan')
     setPlanIdempotencyKey(
-      `operations-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+      `${trainingTarget ? 'shadow-training-plan' : 'operations-plan'}:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
     )
     setPlanError('')
     setPlanOpen(true)
-    if (detail) void loadPlanPreparation(detail)
+    if (detail && !sealedTrainingEvidence) {
+      void loadPlanPreparation(detail, Boolean(trainingTarget))
+    }
   }
 
   const closePlan = () => {
     if (planningOrder || creatingPlanEvidence) return
     setPlanOpen(false)
     setPlanPackagingWorkspace(null)
+    setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
     setPlanCartonizationEvidenceGlobalId('')
+    setShadowTrainingPlanTarget(null)
     setPlanEvidenceIdempotencyKey('')
     setPlanIdempotencyKey('')
     setPlanError('')
@@ -2858,7 +3057,11 @@ export default function OperationsSection({
       || !planEvidenceIdempotencyKey
     ) return
     const blocker = selectedMaterials.flatMap((material) => (
-      operationalPlanningMaterialBlockers(material, planWarehouseGlobalId)
+      operationalPlanningMaterialBlockers(
+        material,
+        planWarehouseGlobalId,
+        !shadowTrainingPlanTarget,
+      )
         .map((reason) => `${material.code}: ${reason}`)
     ))[0]
     if (blocker) {
@@ -2880,6 +3083,13 @@ export default function OperationsSection({
             candidateGlobalId: preparation.candidateGlobalId,
             expectedCandidateRowVersion: preparation.candidateRowVersion,
             warehouseGlobalId: planWarehouseGlobalId,
+            shadowTraining: shadowTrainingPlanTarget
+              ? {
+                  runGlobalId: shadowTrainingPlanTarget.runGlobalId,
+                  expectedRowVersion:
+                    shadowTrainingPlanTarget.expectedRowVersion,
+                }
+              : undefined,
             selectedMaterials: selectedMaterials.map((material) => ({
               materialGlobalId: material.globalId,
               expectedRowVersion: material.rowVersion,
@@ -2931,6 +3141,56 @@ export default function OperationsSection({
     setError('')
     setNotice('')
     try {
+      if (shadowTrainingPlanTarget) {
+        const response = await fetch('/api/operations/training', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': planIdempotencyKey,
+          },
+          body: JSON.stringify({
+            action: 'plan',
+            runGlobalId: shadowTrainingPlanTarget.runGlobalId,
+            cartonizationEvidenceGlobalId: evidenceGlobalId,
+            expectedRowVersion: shadowTrainingPlanTarget.expectedRowVersion,
+            reason: planReason.trim(),
+          }),
+        })
+        const payload = await response.json().catch(() => ({})) as {
+          ok?: boolean
+          error?: string
+          code?: string
+          run?: {
+            globalId: string
+            state: string
+            packages: unknown[]
+          }
+        }
+        if (!response.ok || !payload.ok || payload.run?.state !== 'planned') {
+          throw new Error(
+            `${payload.error || 'Training order could not be prepared'}${
+              payload.code ? ` [${payload.code}]` : ''
+            }`,
+          )
+        }
+        setPlanOpen(false)
+        setPlanPackagingWorkspace(null)
+        setPlanShopifyAssignment(null)
+        setPlanWarehouseGlobalId('')
+        setPlanMaterialGlobalIds([])
+        setPlanCartonizationEvidenceGlobalId('')
+        setShadowTrainingPlanTarget(null)
+        setPlanEvidenceIdempotencyKey('')
+        setPlanIdempotencyKey('')
+        setPlanError('')
+        setNotice(
+          `Training run ${payload.run.globalId} prepared ${payload.run.packages.length} local-only ${
+            payload.run.packages.length === 1 ? 'package' : 'packages'
+          } from ${evidenceGlobalId}. No store write, inventory mutation, postage, label, or shipment was created.`,
+        )
+        setShadowTrainingRefreshToken((current) => current + 1)
+        return
+      }
       const response = await fetch('/api/operations', {
         method: 'POST',
         headers: {
@@ -3009,9 +3269,11 @@ export default function OperationsSection({
 
       setPlanOpen(false)
       setPlanPackagingWorkspace(null)
+      setPlanShopifyAssignment(null)
       setPlanWarehouseGlobalId('')
       setPlanMaterialGlobalIds([])
       setPlanCartonizationEvidenceGlobalId('')
+      setShadowTrainingPlanTarget(null)
       setPlanEvidenceIdempotencyKey('')
       setPlanIdempotencyKey('')
       setPlanError('')
@@ -3076,6 +3338,97 @@ export default function OperationsSection({
       setError(caught instanceof Error ? caught.message : 'Order could not be released')
     } finally {
       setReleasingOrder(false)
+    }
+  }
+
+  const openReplanningCorrection = () => {
+    const action = detail?.availableActions.find(
+      (item) => item.action === 'reopen_for_replanning',
+    )
+    if (!detail || !action?.enabled) return
+    setReplanningCorrectionReason('')
+    setReplanningCorrectionConfirmed(false)
+    setReplanningCorrectionIdempotencyKey(
+      `operations-replanning:${detail.globalId}:${crypto.randomUUID()}`,
+    )
+    setReplanningCorrectionOpen(true)
+  }
+
+  const closeReplanningCorrection = () => {
+    if (reopeningForReplanning) return
+    setReplanningCorrectionOpen(false)
+    setReplanningCorrectionReason('')
+    setReplanningCorrectionConfirmed(false)
+    setReplanningCorrectionIdempotencyKey('')
+  }
+
+  const reopenForReplanning = async (event: FormEvent) => {
+    event.preventDefault()
+    const action = detail?.availableActions.find(
+      (item) => item.action === 'reopen_for_replanning',
+    )
+    const reason = replanningCorrectionReason.trim()
+    if (
+      !detail
+      || !action?.enabled
+      || !action.expectedPlanGlobalId
+      || !Number.isSafeInteger(action.expectedPlanVersion)
+      || !action.expectedCorrectionFingerprint
+      || reason.length < 8
+      || !replanningCorrectionConfirmed
+      || !replanningCorrectionIdempotencyKey
+    ) return
+    setReopeningForReplanning(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': replanningCorrectionIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'reopen-order-for-replanning',
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          expectedPlanGlobalId: action.expectedPlanGlobalId,
+          expectedPlanVersion: action.expectedPlanVersion,
+          expectedCorrectionFingerprint:
+            action.expectedCorrectionFingerprint,
+          reason,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('correctionGlobalId' in payload.result)
+        || payload.result.orderStatus !== 'imported'
+      ) {
+        throw new Error(
+          `${payload.error || 'Order could not be reopened for replanning'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      const result = payload.result as OperationsOrderReplanningCorrectionResult
+      setReplanningCorrectionOpen(false)
+      setReplanningCorrectionReason('')
+      setReplanningCorrectionConfirmed(false)
+      setReplanningCorrectionIdempotencyKey('')
+      setNotice(
+        `Order ${result.orderGlobalId} returned to Imported under correction ${
+          result.correctionGlobalId
+        }. Plan ${result.cancelledPlanGlobalId} was retained as cancelled; no carrier or storefront call was made.`,
+      )
+      await loadWorkspace(result.orderGlobalId)
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Order could not be reopened for replanning')
+    } finally {
+      setReopeningForReplanning(false)
     }
   }
 
@@ -4907,6 +5260,7 @@ export default function OperationsSection({
           || planPreparationLoading
           || creatingPlanEvidence
           || releasingOrder
+          || reopeningForReplanning
           || confirmingPicks
           || reconcilingExternalFulfillment
           || verifyingPack
@@ -4922,8 +5276,10 @@ export default function OperationsSection({
           || Boolean(printingPackingSlipArtifactId)
         }
         onClose={closeDrawer}
+        trainingRefreshToken={shadowTrainingRefreshToken}
         onPlan={openPlan}
         onRelease={openRelease}
+        onReopenForReplanning={openReplanningCorrection}
         onConfirmPicks={openConfirmPicks}
         onReconcileExternalFulfillment={
           openExternalFulfillmentReconciliation
@@ -5337,29 +5693,121 @@ export default function OperationsSection({
 
       <Dialog open={planOpen} onClose={closePlan} fullWidth maxWidth="md">
         <Box component="form" onSubmit={planOrder}>
-          <DialogTitle>Prepare and plan imported order</DialogTitle>
+          <DialogTitle>
+            {shadowTrainingPlanTarget
+              ? 'Prepare local training simulation'
+              : 'Prepare and plan imported order'}
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="info">
-                Select the fulfillment warehouse and factual packaging for{' '}
-                {detail?.orderNumber || 'this imported order'}. ClawPilot will
-                cartonize the order, compare read-only UPS and FedEx rates, and
-                retain immutable evidence before creating the warehouse plan.
-                Nothing here purchases postage, creates a label, releases a wave,
-                or assigns a picker.
+                {shadowTrainingPlanTarget?.cartonizationEvidenceGlobalId ? (
+                  <>
+                    This run already owns exact sealed cartonization and sandbox-rate
+                    evidence. Review and reuse that frozen evidence to create only the
+                    local training overlay. No new carrier request, commerce-provider
+                    request, reservation, inventory change, warehouse wave, operational
+                    package, shipment, label, postage, or store write is made.
+                  </>
+                ) : shadowTrainingPlanTarget ? (
+                  <>
+                    Select factual warehouse and packaging inputs for the local
+                    simulation of {detail?.orderNumber || 'this imported order'}.
+                    ClawPilot will cartonize and compare read-only rates, then copy
+                    the sealed facts into the training overlay only. This creates
+                    zero canonical reservations, inventory changes, warehouse
+                    waves, operational packages, shipments, labels, postage, or
+                    store writes.
+                  </>
+                ) : (
+                  <>
+                    Select the fulfillment warehouse and factual packaging for{' '}
+                    {detail?.orderNumber || 'this imported order'}. ClawPilot will
+                    cartonize the order, compare read-only UPS and FedEx rates, and
+                    retain immutable evidence before creating the warehouse plan.
+                    Nothing here purchases postage, creates a label, releases a wave,
+                    or assigns a picker.
+                  </>
+                )}
               </Alert>
               {planError && (
                 <Alert severity="error" onClose={() => setPlanError('')}>
                   {planError}
                 </Alert>
               )}
-              {planPreparationLoading ? (
+              {shadowTrainingPlanTarget?.cartonizationEvidenceGlobalId ? (
+                <>
+                  <Typography variant="overline" color="text.secondary">
+                    Step 1 · Review the exact sealed training evidence
+                  </Typography>
+                  <CartonizationRateEvidencePanel
+                    evidenceGlobalId={planCartonizationEvidenceGlobalId}
+                  />
+                  <Alert severity="info" variant="outlined">
+                    This evidence is reused exactly as sealed. Continuing does not
+                    rerun cartonization or contact a carrier or commerce provider.
+                  </Alert>
+                </>
+              ) : planPreparationLoading ? (
                 <Stack direction="row" spacing={1.5} alignItems="center" sx={{ py: 2 }}>
                   <CircularProgress size={22} />
                   <Typography>Loading warehouses and factual packaging…</Typography>
                 </Stack>
               ) : planPackagingWorkspace ? (
                 <>
+                  {planShopifyAssignment ? (
+                    <Alert
+                      severity={planShopifyAssignment.status === 'ready'
+                        ? 'success'
+                        : planShopifyAssignment.status === 'provider_managed'
+                          ? 'info'
+                          : 'warning'}
+                      variant="outlined"
+                      action={planShopifyAssignment.status === 'unmapped' ? (
+                        <Button
+                          size="small"
+                          onClick={() => {
+                            closePlan()
+                            setView('imports')
+                          }}
+                        >
+                          Map location
+                        </Button>
+                      ) : undefined}
+                    >
+                      {shadowTrainingPlanTarget
+                        ? `Shopify currently assigns this order to ${
+                          planShopifyAssignment.assignments[0]
+                            ?.shopifyLocationName || 'an external location'
+                        }. Training remains local-only, so you may select factual ClawPilot warehouse inputs without changing that assignment.`
+                        : planShopifyAssignment.status === 'ready'
+                        ? `Shopify assigned this order to ${
+                          planShopifyAssignment.selectedWarehouse
+                            ?.shopifyLocationName
+                        }, mapped to ${
+                          planShopifyAssignment.selectedWarehouse?.name
+                        }. The exact mapped warehouse is selected.`
+                        : planShopifyAssignment.status === 'provider_managed'
+                          ? `Shopify assigned this order to ${
+                            planShopifyAssignment.assignments[0]
+                              ?.shopifyLocationName
+                          }, managed by ${
+                            planShopifyAssignment.assignments[0]
+                              ?.fulfillmentService?.serviceName
+                              || 'another fulfillment app'
+                          }. ClawPilot will not create local warehouse work for it.`
+                          : planShopifyAssignment.status === 'unmapped'
+                            ? `Shopify assigned this order to ${
+                              planShopifyAssignment.assignments[0]
+                                ?.shopifyLocationName
+                            }, which has no ClawPilot warehouse mapping.`
+                            : planShopifyAssignment.status === 'split'
+                              ? `Shopify assigned this order across ${
+                                planShopifyAssignment.assignments.length
+                              } locations; split-location planning is not available yet.`
+                              : 'Shopify has no untouched open fulfillment assignment for this order.'}
+                    </Alert>
+                  ) : null}
                   <Typography variant="overline" color="text.secondary">
                     Step 1 · Choose fulfillment facts
                   </Typography>
@@ -5370,13 +5818,20 @@ export default function OperationsSection({
                       labelId="order-planning-warehouse-label"
                       label="Warehouse"
                       value={planWarehouseGlobalId}
-                      disabled={creatingPlanEvidence || planEvidenceValid}
+                      disabled={
+                        creatingPlanEvidence
+                        || planEvidenceValid
+                        || Boolean(
+                          planShopifyAssignment && !shadowTrainingPlanTarget
+                        )
+                      }
                       onChange={(event) => {
                         const warehouseGlobalId = event.target.value
                         const eligible = planPackagingWorkspace.materials.filter(
                           (material) => operationalPlanningMaterialBlockers(
                             material,
                             warehouseGlobalId,
+                            !shadowTrainingPlanTarget,
                           ).length === 0,
                         )
                         setPlanWarehouseGlobalId(warehouseGlobalId)
@@ -5401,7 +5856,11 @@ export default function OperationsSection({
                         ))}
                     </Select>
                     <FormHelperText>
-                      Inventory and carrier sender accounts must resolve to this warehouse.
+                      {shadowTrainingPlanTarget
+                        ? 'Training selection is local-only and does not change the provider fulfillment location.'
+                        : planShopifyAssignment?.status === 'ready'
+                        ? 'Locked to Shopify’s current exact fulfillment assignment and active location mapping.'
+                        : 'Inventory and carrier sender accounts must resolve to this warehouse.'}
                     </FormHelperText>
                   </FormControl>
                   <FormControl fullWidth>
@@ -5438,6 +5897,7 @@ export default function OperationsSection({
                         const blockers = operationalPlanningMaterialBlockers(
                           material,
                           planWarehouseGlobalId,
+                          !shadowTrainingPlanTarget,
                         )
                         const selected = planMaterialGlobalIds.includes(material.globalId)
                         return (
@@ -5460,7 +5920,9 @@ export default function OperationsSection({
                       })}
                     </Select>
                     <FormHelperText>
-                      Only active, stocked materials with factual exterior dimensions and tare can be rated.
+                      {shadowTrainingPlanTarget
+                        ? 'Training requires active materials with factual exterior dimensions and tare; stock is shown for context but is not consumed.'
+                        : 'Only active, stocked materials with factual exterior dimensions and tare can be rated.'}
                     </FormHelperText>
                   </FormControl>
                   {!planEvidenceValid ? (
@@ -5475,6 +5937,12 @@ export default function OperationsSection({
                         || !planWarehouseGlobalId
                         || planMaterialGlobalIds.length < 1
                         || planMaterialGlobalIds.length > 8
+                        || Boolean(
+                          !shadowTrainingPlanTarget
+                          &&
+                          planShopifyAssignment
+                          && planShopifyAssignment.status !== 'ready'
+                        )
                       }
                       onClick={() => void createPlanEvidence()}
                     >
@@ -5537,7 +6005,13 @@ export default function OperationsSection({
                 ? <CircularProgress size={16} />
                 : <Inventory2Rounded />}
             >
-              {planningOrder ? 'Planning order' : 'Confirm warehouse plan'}
+              {planningOrder
+                ? shadowTrainingPlanTarget
+                  ? 'Preparing simulation'
+                  : 'Planning order'
+                : shadowTrainingPlanTarget
+                  ? 'Confirm local training plan'
+                  : 'Confirm warehouse plan'}
             </Button>
           </DialogActions>
         </Box>
@@ -5573,6 +6047,79 @@ export default function OperationsSection({
               startIcon={releasingOrder ? <CircularProgress size={16} /> : <WarehouseRounded />}
             >
               {releasingOrder ? 'Releasing' : 'Confirm release'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={replanningCorrectionOpen}
+        onClose={closeReplanningCorrection}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={reopenForReplanning}>
+          <DialogTitle>Reopen order for replanning?</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                {detail?.availableActions.find(
+                  (item) => item.action === 'reopen_for_replanning',
+                )?.consequenceSummary
+                  || 'Only a planned order that has not been released to picker devices can be reopened.'}
+              </Alert>
+              <Alert severity="info">
+                Shopify or Faire remains authoritative for the order facts.
+                This does not edit the sales-channel order, call a carrier,
+                void a label, or reverse physical work.
+              </Alert>
+              <TextField
+                required
+                autoFocus
+                multiline
+                minRows={3}
+                label="Correction reason"
+                value={replanningCorrectionReason}
+                onChange={(event) => setReplanningCorrectionReason(event.target.value)}
+                inputProps={{ minLength: 8, maxLength: 500 }}
+                helperText={`${replanningCorrectionReason.trim().length}/500 · Minimum 8 characters · Retained in the immutable correction ledger`}
+              />
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={replanningCorrectionConfirmed}
+                    onChange={(event) => setReplanningCorrectionConfirmed(
+                      event.target.checked,
+                    )}
+                  />
+                )}
+                label="I reviewed this exact unreleased plan and want to return the order to Imported."
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closeReplanningCorrection}
+              disabled={reopeningForReplanning}
+            >
+              Keep current plan
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              color="warning"
+              disabled={
+                reopeningForReplanning
+                || replanningCorrectionReason.trim().length < 8
+                || !replanningCorrectionConfirmed
+              }
+              startIcon={reopeningForReplanning
+                ? <CircularProgress size={16} />
+                : <ReplayRounded />}
+            >
+              {reopeningForReplanning
+                ? 'Reopening order'
+                : 'Confirm operational correction'}
             </Button>
           </DialogActions>
         </Box>
@@ -5723,7 +6270,7 @@ export default function OperationsSection({
             <Stack spacing={2}>
               <Alert severity="warning">
                 This rerates every exact sealed package as one shipment with the
-                one or two carriers selected in the Shopify callback setup. It
+                exact TEST accounts selected in the Shopify callback setup. It
                 stores immutable checkout, pre-label fulfillment, variance, and
                 carrier-attempt evidence only.
               </Alert>

@@ -32,6 +32,8 @@ function offer(
     packagePlanHash,
     packageCount: 2,
     packageKeys,
+    carrierAccountGlobalId:
+      provider === 'ups_rest' ? 'gac0000001' : 'gac0000002',
     provider,
     serviceCode,
     serviceName: serviceCode,
@@ -121,6 +123,7 @@ test('selects the lowest-cost feasible service for the complete package set', ()
   ]))
 
   assert.equal(selection.carrierProvider, 'fedex_rest')
+  assert.equal(selection.carrierAccountGlobalId, 'gac0000002')
   assert.equal(selection.carrierName, 'FedEx')
   assert.equal(selection.serviceCode, 'fedex_ground')
   assert.equal(selection.carrierCostMinor, 900)
@@ -262,6 +265,37 @@ test('fails closed on currency drift, duplicate services, and invalid money', ()
       offer('fedex_rest', 'GROUND', { carrierCostMinor: 10.5 }),
     ])),
     'CANONICAL_FULFILLMENT_RATE_MONEY_INVALID',
+  )
+})
+
+test('keeps same-provider services from distinct carrier accounts independent', () => {
+  const selection = selectCanonicalFulfillmentRate(planningInput([
+    offer('ups_rest', 'GROUND', {
+      carrierAccountGlobalId: 'gac0000002',
+      rateEvidenceGlobalId: 'grq0000002',
+      carrierCostMinor: 1_000,
+    }),
+    offer('ups_rest', 'GROUND', {
+      carrierAccountGlobalId: 'gac0000001',
+      rateEvidenceGlobalId: 'grq0000001',
+      carrierCostMinor: 1_000,
+    }),
+  ]))
+
+  assert.equal(selection.carrierProvider, 'ups_rest')
+  assert.equal(selection.carrierAccountGlobalId, 'gac0000001')
+  assert.equal(selection.serviceCode, 'ground')
+  assert.equal(selection.policy.evaluatedOfferCount, 2)
+})
+
+test('rejects carrier offers without an exact carrier account identity', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        carrierAccountGlobalId: 'not-an-account',
+      }),
+    ])),
+    'CANONICAL_FULFILLMENT_RATE_ACCOUNT_INVALID',
   )
 })
 

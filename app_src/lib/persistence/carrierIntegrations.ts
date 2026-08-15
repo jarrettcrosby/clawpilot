@@ -1366,3 +1366,88 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
     return globalId
   })
 }
+
+export type CarrierProductionRateEvidenceInput = Omit<
+  CarrierSandboxRateEvidenceInput,
+  'provider' | 'purpose'
+> & {
+  provider: 'ups_rest' | 'fedex_rest'
+  purpose: 'cartonization_shipment_rate' | 'shipping_account_diagnostic'
+}
+
+/** Durable evidence for an explicitly production-bound, read-only rate call. */
+export async function writeCarrierProductionRateEvidenceInPostgres(
+  input: CarrierProductionRateEvidenceInput,
+) {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ global_id: string }>(
+      `INSERT INTO operations_carrier_rate_requests (
+         organization_id, integration_account_id, carrier_account_id,
+         provider, environment, purpose, adapter_version,
+         credential_version, request_hash, billing_relationship,
+         billing_selection_snapshot, redacted_request, redacted_response,
+         status, provider_reference, error_code, actor_email,
+         requested_at, completed_at, carrier_selection_key
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, 'production', $5, $6, $7, $8,
+         $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15,
+         CASE
+           WHEN $16 = 'system:shopify-carrier-service' THEN NULL
+           ELSE $16
+         END,
+         $17::timestamptz, $18::timestamptz, $19
+       )
+       RETURNING global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.carrierAccountId,
+        input.provider,
+        input.purpose,
+        input.adapterVersion,
+        input.credentialVersion,
+        input.requestHash,
+        input.billingRelationship,
+        JSON.stringify(input.billingSelectionSnapshot),
+        JSON.stringify(input.redactedRequest),
+        JSON.stringify(input.redactedResponse),
+        input.status,
+        input.providerReference,
+        input.errorCode,
+        input.actorEmail,
+        input.requestedAt,
+        input.completedAt,
+        input.carrierSelectionKey || null,
+      ],
+    )
+    const globalId = result.rows[0].global_id
+    await auditCarrier(client, {
+      actorEmail: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: input.status === 'succeeded'
+        ? input.purpose === 'shipping_account_diagnostic'
+          ? 'carrier.shipping_account_diagnostic_rate.succeeded'
+          : 'carrier.cartonization_shipment_rate.succeeded'
+        : input.purpose === 'shipping_account_diagnostic'
+          ? 'carrier.shipping_account_diagnostic_rate.failed'
+          : 'carrier.cartonization_shipment_rate.failed',
+      globalId: input.integrationGlobalId,
+      provider: input.provider,
+      environment: 'production',
+      payload: {
+        evidenceGlobalId: globalId,
+        carrierAccountGlobalId: input.carrierAccountGlobalId,
+        billingRelationship: input.billingRelationship,
+        purpose: input.purpose,
+        adapterVersion: input.adapterVersion,
+        credentialVersion: input.credentialVersion,
+        requestHash: input.requestHash,
+        rateCount: Array.isArray(input.redactedResponse.rates)
+          ? input.redactedResponse.rates.length
+          : 0,
+        ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      },
+    })
+    return globalId
+  })
+}

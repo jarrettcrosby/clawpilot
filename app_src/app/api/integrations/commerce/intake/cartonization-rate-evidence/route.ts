@@ -36,6 +36,9 @@ import {
 import {
   planSandboxGeometryRatePackages,
 } from '@/lib/operations/sandboxCartonizationRatePlan'
+import {
+  OperationsShadowTrainingError,
+} from '@/lib/operations/shadowTraining'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS,
@@ -60,6 +63,9 @@ import {
   readOperationalOrderPlanningProviderFromPostgres,
   ShopifyOrderPlanningAuthorityPersistenceError,
 } from '@/lib/persistence/shopifyOrderPlanningAuthority'
+import {
+  assertOperationsShadowTrainingEvidenceRequestInPostgres,
+} from '@/lib/persistence/operationShadowTraining'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -79,6 +85,10 @@ type NormalizedRateEvidenceRequestBase = {
   expectedCandidateRowVersion: number
   warehouseGlobalId: string
   idempotencyKey: string
+  shadowTraining: null | {
+    runGlobalId: string
+    expectedRowVersion: number
+  }
 }
 
 type NormalizedOperationalRateEvidenceRequest =
@@ -348,6 +358,26 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       8,
       160,
     ),
+    shadowTraining: input.shadowTraining === undefined
+      || input.shadowTraining === null
+      ? null
+      : (() => {
+          const shadowTraining = record(
+            input.shadowTraining,
+            'Shadow training authorization',
+          )
+          return {
+            runGlobalId: exactReference(
+              shadowTraining.runGlobalId,
+              /^gtrn(?:[0-9]{7}|[0-9a-v]{12})$/,
+              'Shadow training run Global ID',
+            ),
+            expectedRowVersion: exactInteger(
+              shadowTraining.expectedRowVersion,
+              'Shadow training run row version',
+            ),
+          }
+        })(),
   }
   if (evidenceMode === 'operational') {
     if (
@@ -364,6 +394,12 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       evidenceMode,
       selectedMaterials,
     } as NormalizedOperationalRateEvidenceRequest
+  }
+  if (base.shadowTraining) {
+    requestError(
+      'Shadow training authorization is accepted only with factual operational evidence',
+      'CARTONIZATION_RATE_EVIDENCE_SHADOW_TRAINING_MODE_INVALID',
+    )
   }
   if (!Array.isArray(input.assumedCommittedQuantities)) {
     requestError('Committed inventory assumptions must be an array')
@@ -442,6 +478,7 @@ function cartonizationRateEvidenceCommandHash(
       request.expectedCandidateRowVersion,
     warehouseGlobalId: request.warehouseGlobalId,
     evidenceMode: request.evidenceMode,
+    shadowTraining: request.shadowTraining,
     selectedMaterials,
   }
   if (request.evidenceMode === 'operational') {
@@ -487,6 +524,7 @@ function errorResponse(error: unknown) {
   if (
     error instanceof RateEvidenceRequestError
     || error instanceof HybridCartonizationPersistenceError
+    || error instanceof OperationsShadowTrainingError
     || error instanceof ShopifyOrderPlanningAuthorityError
     || error instanceof ShopifyOrderPlanningAuthorityPersistenceError
   ) {
@@ -643,7 +681,8 @@ export async function POST(req: NextRequest) {
   } | null = null
   try {
     const actor = await requireRequestUser(req)
-    if (!operationsCapabilities(actor).canManage) {
+    const capabilities = operationsCapabilities(actor)
+    if (!capabilities.canManage) {
       return json(
         {
           ok: false,
@@ -658,6 +697,27 @@ export async function POST(req: NextRequest) {
     assertCommerceIntakeRuntime()
     const organizationId = activeOperationsOrganizationId(actor)
     const request = normalizeRequest(await requestBody(req))
+    if (request.shadowTraining) {
+      if (!capabilities.canExecute) {
+        return json(
+          {
+            ok: false,
+            error: 'Warehouse-execution permission is required to prepare a local training simulation',
+            code: 'OPERATIONS_SHADOW_TRAINING_EXECUTE_REQUIRED',
+          },
+          403,
+        )
+      }
+      await assertOperationsShadowTrainingEvidenceRequestInPostgres({
+        organizationId,
+        runGlobalId: request.shadowTraining.runGlobalId,
+        expectedRunRowVersion: request.shadowTraining.expectedRowVersion,
+        accountGlobalId: request.accountGlobalId,
+        candidateGlobalId: request.candidateGlobalId,
+        expectedCandidateRowVersion: request.expectedCandidateRowVersion,
+        warehouseGlobalId: request.warehouseGlobalId,
+      })
+    }
     const semanticRequestHash =
       cartonizationRateEvidenceCommandHash(organizationId, request)
     const claim = await claimCartonizationRateEvidenceCommandInPostgres({
@@ -724,6 +784,7 @@ export async function POST(req: NextRequest) {
       : null
     const shopifyOrderPlanningAuthority =
       operationalProvider === 'shopify'
+      && !request.shadowTraining
         ? await inspectShopifyOrderPlanningAuthority({
             organizationId,
             accountGlobalId: request.accountGlobalId,
@@ -740,9 +801,11 @@ export async function POST(req: NextRequest) {
       expectedCandidateRowVersion:
         request.expectedCandidateRowVersion,
       warehouseGlobalId: request.warehouseGlobalId,
-      mode: request.evidenceMode === 'operational'
-        ? 'production'
-        : 'sandbox_demo',
+      mode: request.shadowTraining
+        ? 'shadow_training_simulated'
+        : request.evidenceMode === 'operational'
+          ? 'production'
+          : 'sandbox_demo',
       selectedMaterials: request.selectedMaterials.map((material) => ({
         materialGlobalId: material.materialGlobalId,
         expectedRowVersion: material.expectedRowVersion,
@@ -762,12 +825,17 @@ export async function POST(req: NextRequest) {
               || !material.maximumGrossWeightGrams
               || !material.unitCostMinor
               || !material.currency
-              || material.stockRowVersion === null
-              || material.stockRowVersion === undefined
-              || material.stockOnHandQuantity === null
-              || material.stockOnHandQuantity === undefined
-              || material.activeClaimedQuantity === undefined
-              || !material.availableQuantity
+              || (
+                !request.shadowTraining
+                && (
+                  material.stockRowVersion === null
+                  || material.stockRowVersion === undefined
+                  || material.stockOnHandQuantity === null
+                  || material.stockOnHandQuantity === undefined
+                  || material.activeClaimedQuantity === undefined
+                  || !material.availableQuantity
+                )
+              )
             ) {
               throw new RateEvidenceRequestError(
                 `${material.materialGlobalId} lacks factual rated exterior dimensions or tare`,
@@ -788,13 +856,15 @@ export async function POST(req: NextRequest) {
                   material.maximumGrossWeightGrams,
                 unitCostMinor: material.unitCostMinor,
                 currency: material.currency,
-                stock: {
-                  rowVersion: material.stockRowVersion,
-                  onHandQuantity: material.stockOnHandQuantity,
-                  activeClaimedQuantity:
-                    material.activeClaimedQuantity,
-                  availableQuantity: material.availableQuantity,
-                },
+                stock: request.shadowTraining
+                  ? null
+                  : {
+                      rowVersion: material.stockRowVersion!,
+                      onHandQuantity: material.stockOnHandQuantity!,
+                      activeClaimedQuantity:
+                        material.activeClaimedQuantity!,
+                      availableQuantity: material.availableQuantity!,
+                    },
               },
             }
           }).sort((left, right) => (
@@ -901,6 +971,9 @@ export async function POST(req: NextRequest) {
           recipePackages: plan.recipePackages,
           materials: read.input.materials,
           inventoryProducts: read.inventory.products,
+          availabilityMode: request.shadowTraining
+            ? 'shadow_training_simulated'
+            : 'operational',
           startingSequence: (
             Math.max(
               0,
@@ -1367,7 +1440,9 @@ export async function POST(req: NextRequest) {
     ))
 
     const planSnapshot = {
-      mode: request.evidenceMode === 'operational'
+      mode: request.shadowTraining
+        ? 'shadow_training'
+        : request.evidenceMode === 'operational'
         ? 'production'
         : 'sandbox_demo',
       carrierReadEnvironment: 'sandbox',
@@ -1398,6 +1473,20 @@ export async function POST(req: NextRequest) {
           : null,
       assumptions: plan.assumptions,
       blockers: plan.blockers,
+      ...(request.shadowTraining
+        ? {
+            shadowTraining: {
+              version: 'shadow-training-evidence-v1',
+              runGlobalId: request.shadowTraining.runGlobalId,
+              runRowVersion: request.shadowTraining.expectedRowVersion,
+              assignmentPolicy: 'local_simulation_only',
+              commerceProviderWrites: 0,
+              inventoryWrites: 0,
+              packagingStockWrites: 0,
+              productionPostage: 0,
+            },
+          }
+        : {}),
       ...(shopifyOrderPlanningAuthority
         ? {
             shopifyOrderPlanningAuthorityHash:
@@ -1428,7 +1517,24 @@ export async function POST(req: NextRequest) {
         shopifyOrderPlanningAuthority?.providerReads || 0,
     }
     const assumptionSnapshot = request.evidenceMode === 'operational'
-      ? {
+      ? request.shadowTraining
+        ? {
+            boundary:
+              'EXACT-ORDER SHADOW TRAINING OVERLAY WITH FACTUAL INPUTS AND READ-ONLY SANDBOX CARRIER ESTIMATES',
+            operatorSuppliedAssumptions: false,
+            operationalMaterialFacts: selectedMaterialRateAssumptions,
+            minimumOverrides: [],
+            inventoryAuthority:
+              'shadow_training_simulated_order_and_material_availability',
+            orderEligibilityAuthority: 'exact_order_shadow_training_authorization',
+            shopifyOrderPlanningAuthorityHash: null,
+            providerOrderReads: 0,
+            planClaimAuthority: 'training_overlay_only_no_inventory_claim',
+            committedInventory: read.inventory.lines,
+            inventoryProducts: read.inventory.products,
+            databaseEffects,
+          }
+        : {
           boundary:
             'OPERATIONAL PACK FACTS WITH READ-ONLY SANDBOX CARRIER ESTIMATES',
           operatorSuppliedAssumptions: false,

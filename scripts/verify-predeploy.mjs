@@ -40,6 +40,53 @@ if (!existsSync(resolve(root, 'app_src/package.json'))) {
   fail('missing app_src/package.json')
 }
 
+const rootPackage = readJson('package.json')
+const shadowTrainingTest = String(
+  rootPackage?.scripts?.['test:operation-shadow-training'] || '',
+)
+for (const requiredCommand of [
+  'node scripts/test-operation-shadow-training.mjs',
+  'node --experimental-strip-types --test app_src/tests/operations/shadow-training.test.mts',
+  'node scripts/test-operation-shadow-training-ui.mjs',
+  'node scripts/test-cartonization-rate-evidence.mjs',
+  'node scripts/test-commerce-intake-staging-postgres.mjs',
+  'node scripts/test-operation-shadow-training-postgres.mjs',
+  'node scripts/test-operation-shadow-training-health.mjs',
+]) {
+  if (!shadowTrainingTest.includes(requiredCommand)) {
+    fail(`test:operation-shadow-training must run "${requiredCommand}"`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:operations'] || '')
+    .includes('npm run test:operation-shadow-training')
+) {
+  fail('test:operations must run test:operation-shadow-training')
+}
+
+const orderReplanningCorrectionsTest = String(
+  rootPackage?.scripts?.['test:operation-order-replanning-corrections'] || '',
+)
+for (const requiredCommand of [
+  'node --experimental-strip-types --test app_src/tests/operations/order-replanning-correction.test.mts',
+  'node scripts/test-operation-order-replanning-ui.mjs',
+  'node scripts/test-operation-order-replanning-corrections-postgres.mjs',
+  'node scripts/test-operation-order-replanning-corrections-health.mjs',
+]) {
+  if (!orderReplanningCorrectionsTest.includes(requiredCommand)) {
+    fail(
+      'test:operation-order-replanning-corrections must run '
+      + `"${requiredCommand}"`,
+    )
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:operations'] || '')
+    .includes('npm run test:operation-order-replanning-corrections')
+) {
+  fail('test:operations must run test:operation-order-replanning-corrections')
+}
+
 if (!existsSync(resolve(root, 'app_src/vercel.json'))) {
   fail('missing app_src/vercel.json')
 }
@@ -130,6 +177,17 @@ for (const requiredPath of [
   'db/migrations/0283_operations_shopify_order_management.sql',
   'db/migrations/0284_operations_print_device_reference_privacy.sql',
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+  'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
+  'db/migrations/0287_operations_print_agent_pairing_grants.sql',
+  'db/migrations/0288_operations_shopify_location_routing.sql',
+  'db/migrations/0289_operations_shopify_location_administration.sql',
+  'db/migrations/0290_operations_shadow_training_runs.sql',
+  'db/migrations/0291_operations_order_replanning_corrections.sql',
+  'app_src/app/api/operations/print-agent/pair/route.ts',
+  'app_src/app/api/operations/print-agents/route.ts',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
   'app_src/app/api/operations/order-revisions/route.ts',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',
@@ -143,6 +201,11 @@ for (const requiredPath of [
   'app_src/lib/integrations/shopifyOrderWebhook.ts',
   'app_src/lib/integrations/shopifyOrderManagement.ts',
   'app_src/lib/integrations/shopifyOrderManagementRuntime.ts',
+  'app_src/lib/integrations/carrierShippingDiagnosticRate.ts',
+  'scripts/build-macos-print-agent-download.mjs',
+  'scripts/lib/deterministic-zip.mjs',
+  'scripts/lib/macos-print-agent-credential.mjs',
+  'scripts/manage-macos-print-agent.mjs',
   'app_src/lib/integrations/commerceOrderHistoryRequestFence.ts',
   'app_src/lib/integrations/commerceOrderHistoryPresentation.ts',
   'app_src/lib/integrations/commerceOrderHistoryHealth.ts',
@@ -174,6 +237,14 @@ for (const requiredPath of [
   'scripts/test-shopify-order-management-api.mjs',
   'scripts/test-shopify-order-management-ui.mjs',
   'scripts/test-shopify-order-management-health.mjs',
+  'scripts/test-carrier-shipping-account-diagnostics.mjs',
+  'scripts/test-carrier-shipping-diagnostic-actions.mjs',
+  'scripts/test-carrier-shipping-diagnostic-health.mjs',
+  'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',
+  'scripts/test-operation-print-agent-pairing.mjs',
+  'scripts/test-macos-print-agent-pairing-grant.mjs',
+  'scripts/test-macos-print-agent-download.mjs',
+  'scripts/test-submit-raw-print.mjs',
   'scripts/test-shipping-ui-fixture.mjs',
   'scripts/test-apple-manager-pick-management.mjs',
   'db/migrations/0002_pipeline_outbox_worker.sql',
@@ -497,6 +568,33 @@ for (const requiredPath of [
   'scripts/test-cartonization-preview.mjs',
   'scripts/test-cartonization-rate-evidence.mjs',
   'scripts/test-shopify-order-planning-authority.mjs',
+  'app_src/app/api/integrations/commerce/intake/planning-assignment/route.ts',
+  'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts',
+  'app_src/app/api/integrations/commerce/shopify/location-administration/route.ts',
+  'app_src/app/api/operations/route.ts',
+  'app_src/app/api/operations/training/route.ts',
+  'app_src/components/operations/OperationsSection.tsx',
+  'app_src/components/operations/ShadowOrderTrainingPanel.tsx',
+  'app_src/components/operations/ShopifyLocationAdministrationPanel.tsx',
+  'app_src/lib/integrations/shadowTrainingRuntime.ts',
+  'app_src/lib/integrations/shopifyLocationAdministration.ts',
+  'app_src/lib/integrations/shopifyLocationAdministrationRuntime.ts',
+  'app_src/lib/operations/shadowTraining.ts',
+  'app_src/lib/operations/operationalGeometryCartonization.ts',
+  'app_src/lib/persistence/commerceActiveTransitionAuthorization.ts',
+  'app_src/lib/persistence/operationShadowTraining.ts',
+  'app_src/lib/persistence/operations.ts',
+  'app_src/lib/persistence/shopifyLocationAdministration.ts',
+  'app_src/tests/operations/shadow-training.test.mts',
+  'app_src/tests/operations/order-replanning-correction.test.mts',
+  'scripts/test-operation-shadow-training.mjs',
+  'scripts/test-operation-shadow-training-ui.mjs',
+  'scripts/test-commerce-intake-staging-postgres.mjs',
+  'scripts/test-operation-shadow-training-postgres.mjs',
+  'scripts/test-operation-shadow-training-health.mjs',
+  'scripts/test-operation-order-replanning-ui.mjs',
+  'scripts/test-operation-order-replanning-corrections-postgres.mjs',
+  'scripts/test-operation-order-replanning-corrections-health.mjs',
   'scripts/test-canonical-fulfillment-planning-postgres.mjs',
   'scripts/test-operation-active-multi-package-execution-contracts.mjs',
   'scripts/test-operation-production-fulfillment-rerate-contracts.mjs',
@@ -521,6 +619,19 @@ for (const requiredPath of [
   'scripts/establish-ag-alchemy-carrier-sandbox.mjs',
   'scripts/prove-ag-alchemy-carrier-sandbox-rating.mjs',
   'scripts/test-commerce-integrations.mjs',
+  'scripts/test-commerce-sales-channel-catalog-ui.mjs',
+  'scripts/test-shopify-inventory-location-routing-ui.mjs',
+  'scripts/test-shopify-multilocation-inventory.mjs',
+  'scripts/test-shopify-multilocation-mapping-postgres.mjs',
+  'scripts/test-shopify-multilocation-refresh-postgres.mjs',
+  'scripts/test-shopify-location-routing-health.mjs',
+  'scripts/test-shopify-location-administration-runtime.mjs',
+  'scripts/test-shopify-location-administration-provider.mjs',
+  'scripts/test-shopify-location-administration-route.mjs',
+  'scripts/test-shopify-location-administration-postgres.mjs',
+  'scripts/test-shopify-location-administration-ui.mjs',
+  'scripts/test-shopify-location-administration-health.mjs',
+  'db/migrations/0288_operations_shopify_location_routing.sql',
   'scripts/test-faire-provider-write-execution.mjs',
   'scripts/test-faire-provider-write-authorization-postgres.mjs',
   'scripts/test-commerce-normalization-schema.mjs',
@@ -531,6 +642,7 @@ for (const requiredPath of [
   'scripts/test-commerce-inventory.mjs',
   'scripts/test-shopify-inventory-refresh-worker.mjs',
   'scripts/test-shopify-inventory-refresh-postgres.mjs',
+  'scripts/test-shopify-multilocation-refresh-postgres.mjs',
   'scripts/test-shopify-catalog-webhook-refresh.mjs',
   'scripts/test-shopify-webhook-receipt-health.mjs',
   'scripts/test-shopify-checkout-plan-rate-policy-postgres.mjs',

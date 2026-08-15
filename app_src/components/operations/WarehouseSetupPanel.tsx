@@ -48,7 +48,7 @@ import type { OperationsWorkspace } from '@/lib/operations/types'
 type Props = {
   workspace: OperationsWorkspace | null
   onRefresh: () => Promise<void>
-  onNavigate: (view: 'gl-coding' | 'printing') => void
+  onNavigate: (view: 'gl-coding' | 'printing' | 'imports') => void
 }
 
 type Warehouse = OperationsWorkspace['warehouses'][number]
@@ -425,6 +425,7 @@ function LocationCapacity({
 
 export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }: Props) {
   const { measurementSystem } = useMeasurementSystem()
+  const [warehouseSourceOpen, setWarehouseSourceOpen] = useState(false)
   const [warehouseEditor, setWarehouseEditor] = useState<Warehouse | 'new' | null>(null)
   const [locationEditor, setLocationEditor] = useState<{ warehouse: Warehouse; item: Location | null } | null>(null)
   const [setupGuideOpen, setSetupGuideOpen] = useState(false)
@@ -695,9 +696,9 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
             variant="contained"
             startIcon={<AddRounded />}
             disabled={!canManage}
-            onClick={() => openWarehouse('new')}
+            onClick={() => setWarehouseSourceOpen(true)}
           >
-            New warehouse
+            Create warehouse
           </Button>
         </Stack>
       </Stack>
@@ -924,6 +925,48 @@ export default function WarehouseSetupPanel({ workspace, onRefresh, onNavigate }
           <Typography color="text.secondary">The starter topology creates editable zones, docks, bins, staging areas, and work stations.</Typography>
         </Box>
       )}
+
+      <Dialog
+        open={warehouseSourceOpen}
+        onClose={() => setWarehouseSourceOpen(false)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>Create warehouse</DialogTitle>
+        <DialogContent>
+          <Stack gap={1.25} sx={{ pt: 1 }}>
+            <Button
+              variant="contained"
+              startIcon={<Inventory2Rounded />}
+              onClick={() => {
+                setWarehouseSourceOpen(false)
+                onNavigate('imports')
+              }}
+              sx={{ justifyContent: 'flex-start', py: 1.25 }}
+            >
+              From a connected sales channel
+            </Button>
+            <Typography variant="body2" color="text.secondary">
+              Choose a provider fulfillment location, review its address, and
+              create the standard ClawPilot warehouse topology from it.
+            </Typography>
+            <Button
+              variant="outlined"
+              startIcon={<WarehouseRounded />}
+              onClick={() => {
+                setWarehouseSourceOpen(false)
+                openWarehouse('new')
+              }}
+              sx={{ justifyContent: 'flex-start', py: 1.25 }}
+            >
+              Enter warehouse manually
+            </Button>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setWarehouseSourceOpen(false)}>Cancel</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={Boolean(warehouseEditor)} onClose={() => !saving && setWarehouseEditor(null)} fullWidth maxWidth="md">
         <Box component="form" onSubmit={submitWarehouse}>

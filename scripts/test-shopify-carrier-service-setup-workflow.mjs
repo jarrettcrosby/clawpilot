@@ -68,6 +68,23 @@ const userIntegrationsContract = read(
 )
 const proxy = read('app_src/proxy.ts')
 
+requireAll(setupPersistence, [
+  'carrier.allow_sender_billing',
+  'carrier.registered_address_fingerprint',
+  'integration.configuration',
+  'matchingWarehouseGlobalIds',
+  'readinessIssues: carrierReadinessIssues(row)',
+  "'sender_billing_not_allowed'",
+  "'production_rate_not_authorized'",
+], 'checkout account readiness projection')
+requireAll(setupPanel, [
+  'const directRateCarriers = useMemo(',
+  'const carrierIssues = (',
+  "'origin_does_not_match_warehouse'",
+  '(!checked && (atLimit || issues.length > 0))',
+  'selectedRuntimeBindings.every((binding) => (',
+], 'checkout account selection truth')
+
 function requireAll(source, contracts, surface) {
   for (const contract of contracts) {
     assert.ok(
@@ -304,6 +321,9 @@ assert.ok(
 const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
+  'updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres({',
+  "current.config?.registrationState === 'registered'",
+  'expectedRowVersion: current.config.rowVersion',
   'normalizeShopifyCheckoutPlanRatePolicy(',
   'body.planRateOptimization',
   "Object.prototype.hasOwnProperty.call(\n        body,\n        'planRateOptimization',",
@@ -1128,10 +1148,13 @@ requireAll(setupPanel, [
   'This is not an event webhook',
   'no manual webhook topic subscriptions belong on this URL',
   'Do not add it as an orders, products, inventory, or app event webhook.',
-  'Checkout rate carriers · select 1 or 2',
-  '<MenuItem value="">Not used for checkout rates</MenuItem>',
+  'Checkout rate sources',
+  "(['sandbox', 'production'] as const).map((environment) => {",
+  'TEST accounts',
+  'LIVE accounts',
+  'Save checkout rate sources',
   'carriers: selectedCarrierBindings',
-], 'one-or-two-carrier callback setup UI')
+], 'paired TEST and LIVE multi-account callback setup UI')
 requireAll(commercePanel, [
   'Shopify event webhook setup',
   'It is separate from the',
@@ -1141,35 +1164,38 @@ requireAll(commercePanel, [
 ], 'event webhook and cart-rate callback distinction')
 
 requireAll(checkoutRatingPersistence, [
-  'input.carriers.length < 1',
-  'input.carriers.length > 2',
-  'Checkout carrier providers and accounts must be unique',
+  'MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  'carrierEnvironmentCounts.sandbox',
+  'carrierEnvironmentCounts.production',
+  'Checkout carrier accounts must be unique',
   'current.carriers.length < 1',
-  'current.carriers.length > 2',
+  '> MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
   ').size !== current.carriers.length',
-], 'one-or-two-carrier application persistence fence')
+], 'paired TEST and LIVE multi-account application persistence fence')
 requireAll(callbackExecution, [
   'account.carriers.length < 1',
-  'account.carriers.length > 2',
-  'providers.size === account.carriers.length',
-  'configuredProviders.size !== carriers.length',
+  'MAX_CONFIGURED_CHECKOUT_CARRIER_ACCOUNTS',
+  'checkoutRuntimeCarrierBindings(account)',
+  'carrierAccountGlobalIds.size === account.carriers.length',
+  'runtimeCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
   'Checkout carrier configuration is not rate-ready',
-], 'one-or-two-carrier callback execution fence')
+], 'paired TEST and LIVE multi-account callback execution fence')
 requireAll(operationsPersistence, [
   'carrierRows.rows.length < 1',
-  'carrierRows.rows.length > 2',
+  'carrierRows.rows.length > CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
   "row.carrier_provider !== 'ups_rest'",
   "row.carrier_provider !== 'fedex_rest'",
   ').size !== carrierRows.rows.length',
-  'one or two unique configured UPS or FedEx sandbox accounts',
-], 'one-or-two-carrier downstream Shadow execution fence')
+  'unique configured UPS or FedEx sandbox accounts',
+], 'bounded multi-account downstream Shadow execution fence')
 requireAll(configuredCarriersMigration, [
   'CREATE OR REPLACE FUNCTION',
+  'operations_shopify_carrier_service_config_environment_is_ready(',
   'operations_shopify_carrier_service_config_is_ready(',
   "carrier_integration.provider IN ('ups_rest', 'fedex_rest')",
-  ') BETWEEN 1 AND 2',
-  'one or two selected unique verified UPS/FedEx bindings are ready',
-], 'one-or-two-carrier canonical database readiness')
+  ') BETWEEN 1 AND 8',
+  'one through eight selected unique verified direct UPS/FedEx accounts',
+], 'paired TEST and LIVE multi-account canonical database readiness')
 assert.doesNotMatch(
   configuredCarriersMigration,
   /selected\.carrier_provider = '(?:ups_rest|fedex_rest)'/u,

@@ -31,7 +31,6 @@ import ContentCopyRounded from '@mui/icons-material/ContentCopyRounded'
 import DownloadRounded from '@mui/icons-material/DownloadRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
 import InfoOutlined from '@mui/icons-material/InfoOutlined'
-import KeyRounded from '@mui/icons-material/KeyRounded'
 import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
@@ -83,7 +82,30 @@ type PrintAgentPayload = {
   error?: string
   agents?: OperationsPrintAgentWorkspace
   agent?: OperationsPrintAgentProfile
-  credential?: string | null
+  pairingGrant?: PrintAgentPairingGrant
+}
+
+type PrintAgentPairingGrant = {
+  id: string
+  pairingCode: string | null
+  expiresAt: string
+  warehouseId: string
+  name: string
+  supportedFormats: PrintFormat[]
+  supportedMedia: PrintMedia[]
+  supportedDocumentTypes: PrintDocumentType[]
+}
+
+type PrintAgentDistributionManifest = {
+  version: string
+  artifactHref: string
+  byteLength: number
+  sha256: string
+  checksumHref: string
+  signed: boolean
+  notarized: boolean
+  nodeMinimumMajor: number
+  deliveryBackend: string
 }
 
 type PrintJobPayload = {
@@ -113,6 +135,12 @@ const LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES =
 const BUNDLED_PRINTER_DEFAULT_FORMATS = LEGACY_BUNDLED_AGENT_FORMATS
 const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA
 const BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES = LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES
+const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'
+const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'
+const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`
+const MACOS_PRINT_AGENT_CHECKSUM_NAME = `${MACOS_PRINT_AGENT_DOWNLOAD_NAME}.sha256`
+const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'
+const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000
 
 const fieldSx = {
   minWidth: 0,
@@ -179,11 +207,46 @@ function timestamp(value: string | null) {
   return Number.isNaN(parsed.getTime()) ? 'Unknown' : parsed.toLocaleString()
 }
 
+function hasRecentPrintAgentHeartbeat(lastSeenAt: string | null, referenceAt: string) {
+  if (!lastSeenAt) return false
+  const lastSeen = new Date(lastSeenAt).getTime()
+  const reference = new Date(referenceAt).getTime()
+  if (!Number.isFinite(lastSeen) || !Number.isFinite(reference)) return false
+  const ageMs = reference - lastSeen
+  return ageMs >= 0 && ageMs <= PRINT_AGENT_HEARTBEAT_RECENT_MS
+}
+
 function formatBytes(value: number | null) {
   if (value === null || !Number.isFinite(value)) return 'Not available'
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function PrintAgentDistributionFacts({
+  manifest,
+}: {
+  manifest: PrintAgentDistributionManifest | null
+}) {
+  return (
+    <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap" useFlexGap>
+      <Typography variant="caption" color="text.secondary">
+        {manifest
+          ? `v${manifest.version} · ${formatBytes(manifest.byteLength)} · raw-network ZPL · unsigned/unnotarized · Node.js ${manifest.nodeMinimumMajor}+ · SHA-256 ${manifest.sha256.slice(0, 12)}…`
+          : 'macOS raw-network ZPL preview · unsigned and not notarized · Node.js 20 or newer required'}
+      </Typography>
+      <Button
+        component="a"
+        href={MACOS_PRINT_AGENT_CHECKSUM_PATH}
+        download={MACOS_PRINT_AGENT_CHECKSUM_NAME}
+        size="small"
+        variant="text"
+        sx={{ minWidth: 0, p: 0.25, fontSize: '0.72rem' }}
+      >
+        SHA-256
+      </Button>
+    </Stack>
+  )
 }
 
 function packageSize(
@@ -408,20 +471,58 @@ export default function PrinterConfigurationPanel() {
   const [enrollForm, setEnrollForm] = useState<AgentEnrollmentForm | null>(null)
   const [agentAction, setAgentAction] = useState<{
     agent: OperationsPrintAgentProfile
-    action: 'upgrade-bundled-capabilities' | 'rotate-credential' | 'revoke-agent'
+    action: 'upgrade-bundled-capabilities' | 'revoke-agent'
   } | null>(null)
   const [jobAction, setJobAction] = useState<{
     job: OperationsPrintJobListItem
     action: 'retry-job' | 'reprint-job' | 'cancel-job'
     reason: string
   } | null>(null)
-  const [credential, setCredential] = useState('')
+  const [pairingGrant, setPairingGrant] = useState<PrintAgentPairingGrant | null>(null)
   const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
   const [pairingBaseUrl, setPairingBaseUrl] = useState('https://dev.aiapp.eigenracing.com')
+  const [printAgentDistribution, setPrintAgentDistribution] =
+    useState<PrintAgentDistributionManifest | null>(null)
   const pairingCommand = `npm run print-agent:pair:macos -- --base-url '${pairingBaseUrl}'`
 
   useEffect(() => {
     setPairingBaseUrl(window.location.origin)
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        const response = await fetch(MACOS_PRINT_AGENT_MANIFEST_PATH, {
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        if (!response.ok) return
+        const manifest = await response.json() as Partial<PrintAgentDistributionManifest>
+        if (
+          manifest.artifactHref === MACOS_PRINT_AGENT_DOWNLOAD_PATH
+          && manifest.checksumHref === MACOS_PRINT_AGENT_CHECKSUM_PATH
+          && typeof manifest.version === 'string'
+          && /^\d+\.\d+\.\d+-preview\.\d+$/.test(manifest.version)
+          && typeof manifest.byteLength === 'number'
+          && Number.isSafeInteger(manifest.byteLength)
+          && manifest.byteLength > 0
+          && typeof manifest.sha256 === 'string'
+          && /^[a-f0-9]{64}$/.test(manifest.sha256)
+          && manifest.signed === false
+          && manifest.notarized === false
+          && manifest.nodeMinimumMajor === 20
+          && manifest.deliveryBackend === 'raw-network-zpl'
+        ) {
+          setPrintAgentDistribution(manifest as PrintAgentDistributionManifest)
+        }
+      } catch (caught) {
+        if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
+          setPrintAgentDistribution(null)
+        }
+      }
+    })()
+    return () => controller.abort()
   }, [])
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -695,7 +796,7 @@ export default function PrinterConfigurationPanel() {
     }
   }
 
-  async function enrollAgent() {
+  async function createPairingGrant() {
     if (!enrollForm) return
     if (
       !enrollForm.supportedFormats.length
@@ -716,7 +817,7 @@ export default function PrinterConfigurationPanel() {
           'Idempotency-Key': crypto.randomUUID(),
         },
         body: JSON.stringify({
-          action: 'enroll-agent',
+          action: 'create-pairing-grant',
           warehouseId: enrollForm.warehouseId,
           name: enrollForm.name.trim(),
           supportedFormats: enrollForm.supportedFormats,
@@ -725,17 +826,24 @@ export default function PrinterConfigurationPanel() {
         }),
       })
       const result = await responsePayload<PrintAgentPayload>(response)
-      if (!response.ok || !result.ok || !result.agent) {
-        throw new Error(result.error || 'Local print agent could not be enrolled')
+      if (!response.ok || !result.ok || !result.pairingGrant) {
+        throw new Error(result.error || 'Print Agent pairing code could not be created')
       }
       setEnrollForm(null)
-      if (result.credential) setCredential(result.credential)
-      setNotice(result.credential
-        ? `${result.agent.name} was enrolled`
-        : 'Agent already enrolled; rotate its credential to issue a new one')
-      await load()
+      if (!result.pairingGrant.pairingCode) {
+        setError(
+          'This pairing request was already completed. Create a new pairing code; the prior code cannot be shown again.',
+        )
+        return
+      }
+      setPairingGrant(result.pairingGrant)
+      setNotice(
+        `Pairing code created for ${result.pairingGrant.name}; it expires ${timestamp(result.pairingGrant.expiresAt)}`,
+      )
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Local print agent could not be enrolled')
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Print Agent pairing code could not be created')
     } finally {
       setSaving(false)
     }
@@ -751,7 +859,7 @@ export default function PrinterConfigurationPanel() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(agentAction.action !== 'revoke-agent'
+          ...(agentAction.action === 'upgrade-bundled-capabilities'
             ? { 'Idempotency-Key': crypto.randomUUID() }
             : {}),
         },
@@ -765,15 +873,10 @@ export default function PrinterConfigurationPanel() {
         throw new Error(result.error || 'Local print-agent action failed')
       }
       setAgentAction(null)
-      if (result.credential) setCredential(result.credential)
       setNotice(
         agentAction.action === 'upgrade-bundled-capabilities'
           ? `${result.agent.name} now supports bundled carrier, product-barcode, and location-barcode ZPL printing`
-          : agentAction.action === 'rotate-credential'
-            ? result.credential
-              ? `${result.agent.name} credential was rotated`
-              : 'Credential was already issued; rotate again with a new request to replace it'
-            : `${result.agent.name} was revoked and its printers were set offline`,
+          : `${result.agent.name} was revoked and its printers were set offline`,
       )
       await load()
     } catch (caught) {
@@ -1018,8 +1121,24 @@ export default function PrinterConfigurationPanel() {
                       {printer.connectionMode === 'local_agent' && (
                         <Chip
                           size="small"
-                          label={hasConnectedLocalPrintAgent(printer) ? 'Agent connected' : 'Configured'}
-                          color={hasConnectedLocalPrintAgent(printer) ? 'success' : 'warning'}
+                          label={
+                            hasConnectedLocalPrintAgent(printer)
+                            && hasRecentPrintAgentHeartbeat(
+                              printer.localPrintAgentLastSeenAt,
+                              printers.generatedAt,
+                            )
+                              ? 'Agent connected'
+                              : printer.localPrintAgentLastSeenAt ? 'Agent offline' : 'Configured'
+                          }
+                          color={
+                            hasConnectedLocalPrintAgent(printer)
+                            && hasRecentPrintAgentHeartbeat(
+                              printer.localPrintAgentLastSeenAt,
+                              printers.generatedAt,
+                            )
+                              ? 'success'
+                              : 'warning'
+                          }
                           variant="outlined"
                         />
                       )}
@@ -1078,27 +1197,94 @@ export default function PrinterConfigurationPanel() {
         </Box>
       ) : (
         <Box sx={{ pt: 2 }}>
-          <Stack direction="row" justifyContent="flex-end">
-            {agents?.capabilities.canManage && (
-              <Button
-                variant="contained"
-                startIcon={<TokenRounded />}
-                disabled={!printers?.warehouses[0]}
-                onClick={() => setEnrollForm(defaultEnrollmentForm(
-                  printers?.warehouses[0]?.id || '',
-                ))}
-              >
-                Enroll agent
-              </Button>
-            )}
-          </Stack>
+          <Box
+            component="section"
+            sx={{
+              p: { xs: 2, md: 2.5 },
+              border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: '10px',
+              backgroundColor: 'rgba(255,255,255,0.025)',
+            }}
+          >
+            <Stack
+              direction={{ xs: 'column', md: 'row' }}
+              justifyContent="space-between"
+              alignItems={{ xs: 'stretch', md: 'center' }}
+              gap={2}
+            >
+              <Box sx={{ minWidth: 0 }}>
+                <Typography fontWeight={700}>Set up local printing</Typography>
+                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                  Configure agents, printers, and routing in ClawPilot. The downloaded Mac pairing
+                  helper asks for the printer&apos;s local hostname/IP and port without sending that
+                  endpoint to ClawPilot.
+                </Typography>
+                <Box sx={{ mt: 0.75 }}>
+                  <PrintAgentDistributionFacts manifest={printAgentDistribution} />
+                </Box>
+              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexShrink={0}>
+                <Button
+                  component="a"
+                  href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
+                  download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
+                  variant="outlined"
+                  startIcon={<DownloadRounded />}
+                >
+                  Download macOS pairing helper
+                </Button>
+                {agents?.capabilities.canManage && (
+                  <Button
+                    variant="contained"
+                    startIcon={<TokenRounded />}
+                    disabled={!printers?.warehouses[0]}
+                    onClick={() => setEnrollForm(defaultEnrollmentForm(
+                      printers?.warehouses[0]?.id || '',
+                    ))}
+                  >
+                    Create pairing code
+                  </Button>
+                )}
+                <Button
+                  variant="text"
+                  startIcon={<PrintRounded />}
+                  onClick={() => setView('printers')}
+                >
+                  Configure printers
+                </Button>
+              </Stack>
+            </Stack>
+          </Box>
+          {!printers?.warehouses.length && (
+            <Alert severity="warning" sx={{ mt: 1.5 }}>
+              Create an active warehouse before creating a workspace pairing code.
+            </Alert>
+          )}
           {!agents?.agents.length ? (
-            <Box sx={{ py: 7, textAlign: 'center' }}>
+            <Box sx={{ py: 5, textAlign: 'center' }}>
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Download the Mac pairing helper, then create a one-time code for this workspace.
+              </Typography>
             </Box>
           ) : (
             <Stack sx={{ mt: 1 }}>
+              <Stack direction="row" justifyContent="flex-end" sx={{ mb: 0.5 }}>
+                {agents?.capabilities.canManage && (
+                  <Button
+                    size="small"
+                    variant="text"
+                    startIcon={<AddRounded />}
+                    disabled={!printers?.warehouses[0]}
+                    onClick={() => setEnrollForm(defaultEnrollmentForm(
+                      printers?.warehouses[0]?.id || '',
+                    ))}
+                  >
+                    Add another agent
+                  </Button>
+                )}
+              </Stack>
               {retiredAgentCount > 0 && (
                 <Alert severity="info" sx={{ mb: 1.5 }}>
                   {activeAgentCount} active local print {activeAgentCount === 1 ? 'agent' : 'agents'}.
@@ -1118,6 +1304,18 @@ export default function PrinterConfigurationPanel() {
                     <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
                       <Typography fontWeight={700}>{agent.name}</Typography>
                       <Chip size="small" label={label(agent.status)} color={statusColor(agent.status)} />
+                      {agent.status === 'active' && (
+                        <Chip
+                          size="small"
+                          label={hasRecentPrintAgentHeartbeat(agent.lastSeenAt, agents.generatedAt)
+                            ? 'Connected'
+                            : agent.lastSeenAt ? 'Seen before' : 'Waiting for connection'}
+                          color={hasRecentPrintAgentHeartbeat(agent.lastSeenAt, agents.generatedAt)
+                            ? 'success'
+                            : agent.lastSeenAt ? 'default' : 'warning'}
+                          variant="outlined"
+                        />
+                      )}
                       <Chip size="small" label={`Credential v${agent.credentialVersion}`} variant="outlined" />
                       <Chip
                         size="small"
@@ -1175,14 +1373,6 @@ export default function PrinterConfigurationPanel() {
                           </Button>
                         </Tooltip>
                       )}
-                      <Tooltip title={`Rotate ${agent.name} credential`}>
-                        <IconButton
-                          aria-label={`Rotate ${agent.name} credential`}
-                          onClick={() => setAgentAction({ agent, action: 'rotate-credential' })}
-                        >
-                          <KeyRounded />
-                        </IconButton>
-                      </Tooltip>
                       <Tooltip title={`Revoke ${agent.name}`}>
                         <IconButton
                           aria-label={`Revoke ${agent.name}`}
@@ -1803,7 +1993,7 @@ export default function PrinterConfigurationPanel() {
         fullWidth
         maxWidth="sm"
       >
-        <DialogTitle>Enroll local print agent</DialogTitle>
+        <DialogTitle>Create workspace pairing code</DialogTitle>
         {enrollForm && (
           <DialogContent dividers>
             <Stack spacing={2}>
@@ -1893,7 +2083,7 @@ export default function PrinterConfigurationPanel() {
           <Button onClick={() => setEnrollForm(null)} disabled={saving}>Cancel</Button>
           <Button
             variant="contained"
-            onClick={() => void enrollAgent()}
+            onClick={() => void createPairingGrant()}
             disabled={
               saving
               || !enrollForm
@@ -1903,7 +2093,7 @@ export default function PrinterConfigurationPanel() {
               || !enrollForm.supportedDocumentTypes.length
             }
           >
-            {saving ? 'Enrolling...' : 'Enroll'}
+            {saving ? 'Creating...' : 'Create pairing code'}
           </Button>
         </DialogActions>
       </Dialog>
@@ -1917,17 +2107,13 @@ export default function PrinterConfigurationPanel() {
         <DialogTitle>
           {agentAction?.action === 'upgrade-bundled-capabilities'
             ? 'Enable bundled barcode printing'
-            : agentAction?.action === 'rotate-credential'
-              ? 'Rotate agent credential'
-              : 'Revoke local print agent'}
+            : 'Revoke local print agent'}
         </DialogTitle>
         <DialogContent dividers>
           <Typography variant="body2" color="text.secondary">
             {agentAction?.action === 'upgrade-bundled-capabilities'
               ? `${agentAction.agent.name} will retain its credential and shipping support while adding the exact bundled product-label, location-label, and Zebra media capabilities. Reinstall the macOS LaunchAgent, or restart a repo-run bundled agent, before queueing barcode jobs.`
-              : agentAction?.action === 'rotate-credential'
-                ? `The current credential for ${agentAction.agent.name} will stop working immediately.`
-                : `${agentAction?.agent.name || 'This agent'} will be revoked and every assigned local-agent printer will be set offline.`}
+              : `${agentAction?.agent.name || 'This agent'} will be revoked and every assigned local-agent printer will be set offline.`}
           </Typography>
         </DialogContent>
         <DialogActions>
@@ -1942,7 +2128,7 @@ export default function PrinterConfigurationPanel() {
               ? 'Working...'
               : agentAction?.action === 'upgrade-bundled-capabilities'
                 ? 'Enable barcode printing'
-                : agentAction?.action === 'rotate-credential' ? 'Rotate' : 'Revoke'}
+                : 'Revoke'}
           </Button>
         </DialogActions>
       </Dialog>
@@ -2008,35 +2194,109 @@ export default function PrinterConfigurationPanel() {
         </DialogActions>
       </Dialog>
 
-      <Dialog open={Boolean(credential)} onClose={() => setCredential('')} fullWidth maxWidth="sm">
-        <DialogTitle>One-time agent credential</DialogTitle>
+      <Dialog
+        open={Boolean(pairingGrant?.pairingCode)}
+        onClose={() => setPairingGrant(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>Connect Print Agent</DialogTitle>
         <DialogContent dividers>
           <Stack spacing={2}>
-            <Alert severity="warning">
-              This credential is shown once. Rotate it if this dialog closes before the local agent is configured.
-            </Alert>
-            <Box
-              component="pre"
-              sx={{
-                m: 0,
-                p: 1.5,
-                border: '1px solid rgba(255,255,255,0.15)',
-                borderRadius: '6px',
-                overflowWrap: 'anywhere',
-                whiteSpace: 'pre-wrap',
-                fontSize: '0.8rem',
-              }}
-            >
-              {credential}
+            <Box>
+              <Typography fontWeight={700}>1. Download the macOS pairing helper</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                The download is credential-free. It never contains this workspace&apos;s pairing
+                code, printer IP, or ClawPilot session.
+              </Typography>
+              <Button
+                component="a"
+                href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
+                download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
+                variant="outlined"
+                startIcon={<DownloadRounded />}
+                sx={{ mt: 1 }}
+              >
+                Download macOS pairing helper
+              </Button>
+              <Box sx={{ mt: 0.75 }}>
+                <PrintAgentDistributionFacts manifest={printAgentDistribution} />
+              </Box>
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>Connect on this Mac</Typography>
+              <Typography fontWeight={700}>2. Copy the one-time pairing code</Typography>
+              <Alert severity="warning" sx={{ mt: 1 }}>
+                One-time pairing code: this short-lived code is shown once and expires{' '}
+                {timestamp(pairingGrant?.expiresAt || null)}. If it is lost or expires, create a
+                new pairing code; the prior code cannot be recovered.
+              </Alert>
+              <Box
+                component="pre"
+                sx={{
+                  mt: 1,
+                  mb: 1,
+                  p: 1.5,
+                  border: '1px solid rgba(255,255,255,0.15)',
+                  borderRadius: '6px',
+                  overflowWrap: 'anywhere',
+                  whiteSpace: 'pre-wrap',
+                  fontSize: '0.8rem',
+                }}
+              >
+                {pairingGrant?.pairingCode}
+              </Box>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<ContentCopyRounded />}
+                onClick={() => {
+                  if (pairingGrant?.pairingCode) {
+                    void navigator.clipboard.writeText(pairingGrant.pairingCode)
+                  }
+                }}
+              >
+                Copy pairing code
+              </Button>
+            </Box>
+            <Divider />
+            <Box>
+              <Typography fontWeight={700}>3. Connect on this Mac</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Run this from the ClawPilot checkout on the always-on Mac. The local pairing
-                command securely prompts for this credential, a unique workspace instance
-                name, and the printer hostname or IP. The printer IP stays on this Mac and is
-                never submitted to the hosted printer-configuration API.
+                Unzip the download and double-click ClawPilot Print Agent.command. Its Terminal
+                menu prompts for a unique workspace instance, this pairing code, and the printer
+                hostname/IP with its raw port, normally 9100.
+                The printer IP stays on this Mac and is never submitted to the hosted
+                printer-configuration API.
+              </Typography>
+            </Box>
+            <Box>
+              <Typography fontWeight={700}>4. Finish setup in ClawPilot</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                Return to Agents to confirm Connected, then use Printers to create the logical
+                printer profile, assign this agent, and choose its document routing.
+              </Typography>
+              <Button
+                size="small"
+                variant="text"
+                startIcon={<PrintRounded />}
+                onClick={() => {
+                  setPairingGrant(null)
+                  setView('printers')
+                }}
+                sx={{ mt: 0.5 }}
+              >
+                Configure printers
+              </Button>
+            </Box>
+            <Divider />
+            <Box component="details">
+              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
+                Advanced terminal pairing
+              </Box>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+                Repository checkouts can run the guided pairing command. It prompts locally for
+                the code and printer endpoint; neither value is placed in the command.
               </Typography>
               <Box
                 component="pre"
@@ -2065,22 +2325,25 @@ export default function PrinterConfigurationPanel() {
             <Box>
               <Typography fontWeight={700}>Pair another workspace</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Enroll an agent in that workspace and repeat pairing with a different local
-                instance name and that workspace&apos;s credential. You may enter the same local
-                printer IP; each workspace keeps its own agent identity, Keychain credential,
-                delivery ledger, and logical printer profile.
+                Keep the downloaded helper. Switch workspaces in ClawPilot, create a new pairing
+                code, then run the .command file again with a unique instance name. The same physical
+                printer may be used, while each workspace retains its own agent identity, Keychain
+                credential, delivery ledger, and logical printer profile.
               </Typography>
             </Box>
           </Stack>
         </DialogContent>
         <DialogActions>
           <Button
-            startIcon={<ContentCopyRounded />}
-            onClick={() => void navigator.clipboard.writeText(credential)}
+            startIcon={<RefreshRounded />}
+            onClick={() => {
+              setPairingGrant(null)
+              void load()
+            }}
           >
-            Copy
+            Refresh connection status
           </Button>
-          <Button variant="contained" onClick={() => setCredential('')}>Done</Button>
+          <Button variant="contained" onClick={() => setPairingGrant(null)}>Done</Button>
         </DialogActions>
       </Dialog>
       <BarcodeLabelsDialog

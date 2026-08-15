@@ -34,11 +34,13 @@ export default function IntegrationSettingsPanel({
   isOwner,
   canManageOrganizationIntegrations,
   canManageOperationsIntegrations,
+  onNavigate,
 }: {
   initialIntegration?: 'commerce'
   isOwner: boolean
   canManageOrganizationIntegrations: boolean
   canManageOperationsIntegrations: boolean
+  onNavigate?: (hash: string) => void
 }) {
   const [activeIntegration, setActiveIntegration] = useState<IntegrationKey>(
     initialIntegration === 'commerce' && canManageOperationsIntegrations
@@ -170,7 +172,7 @@ export default function IntegrationSettingsPanel({
       ) : null}
       {activeIntegration === 'commerce' ? (
         <Box role="tabpanel" id="integration-panel-commerce" aria-labelledby="integration-tab-commerce">
-          <CommerceIntegrationPanel />
+          <CommerceIntegrationPanel onNavigate={onNavigate} />
         </Box>
       ) : null}
       {activeIntegration === 'knowledge' && isOwner ? (

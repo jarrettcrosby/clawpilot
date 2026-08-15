@@ -383,7 +383,7 @@ for (const fragment of [
   'Local print agent',
   'Browser download',
   'Create a new profile to move a physical printer to another warehouse.',
-  'One-time agent credential',
+  'One-time pairing code',
   'Authorize reprint',
   'Cancel print job',
   'Retry print job',

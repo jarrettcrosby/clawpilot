@@ -104,6 +104,11 @@ final class PickingPhoneModel: ObservableObject {
     @Published var managerSelectedOrder: ManagerOrderDetail?
     @Published var managerStatus = "Loading Operations orders."
     @Published var isManagerBusy = false
+    @Published private(set) var hasPendingManagerOrderReplanning = false
+    @Published private(set) var isReplayingManagerOrderReplanning = false
+    @Published private(set) var managerOrderReplanningDetail: String?
+    @Published private(set) var managerOrderReplanningRefreshRequired = false
+    @Published private(set) var managerOrderReplanningRecoveryWorkspaceId: String?
     @Published var currentTask: PickTask?
     @Published var currentOrderNumber: String?
     @Published var currentScanStage: PickScanStage?
@@ -243,6 +248,12 @@ final class PickingPhoneModel: ObservableObject {
         }
         if hasPendingConfirmation {
             guard let recoveryWorkspaceId = pendingConfirmationRecoveryWorkspaceId else {
+                return false
+            }
+            return activeWorkspace?.organizationId != recoveryWorkspaceId
+        }
+        if hasPendingManagerOrderReplanning {
+            guard let recoveryWorkspaceId = managerOrderReplanningRecoveryWorkspaceId else {
                 return false
             }
             return activeWorkspace?.organizationId != recoveryWorkspaceId
@@ -531,7 +542,10 @@ final class PickingPhoneModel: ObservableObject {
         let resumedPendingConfirmation = resumedPendingHandoff
             ? true
             : await resumeDurableConfirmationIfNeeded()
-        if !resumedPendingHandoff && !resumedPendingConfirmation {
+        let resumedManagerReplanning = await resumeDurableManagerOrderReplanningIfNeeded()
+        if !resumedPendingHandoff
+            && !resumedPendingConfirmation
+            && !resumedManagerReplanning {
             resetPendingConfirmationBlocker()
             // Only an outbox-free queue reaches presentation here.
             // updateProjection independently checks it against the freshly
@@ -606,7 +620,10 @@ final class PickingPhoneModel: ObservableObject {
             let resumedPendingConfirmation = resumedPendingHandoff
                 ? true
                 : await resumeDurableConfirmationIfNeeded()
-            if !resumedPendingHandoff && !resumedPendingConfirmation {
+            let resumedManagerReplanning = await resumeDurableManagerOrderReplanningIfNeeded()
+            if !resumedPendingHandoff
+                && !resumedPendingConfirmation
+                && !resumedManagerReplanning {
                 status = "Signed in. Choose a workflow to begin."
             }
         } catch {
@@ -693,7 +710,10 @@ final class PickingPhoneModel: ObservableObject {
             let resumedPendingConfirmation = resumedPendingHandoff
                 ? true
                 : await resumeDurableConfirmationIfNeeded()
-            if !resumedPendingHandoff && !resumedPendingConfirmation {
+            let resumedManagerReplanning = await resumeDurableManagerOrderReplanningIfNeeded()
+            if !resumedPendingHandoff
+                && !resumedPendingConfirmation
+                && !resumedManagerReplanning {
                 status = "Signed in with Google. Choose a workflow to begin."
             }
         } catch PickingAPIError.rejected(let code, _) where code == "GOOGLE_SSO_LINK_REQUIRED" {
@@ -836,19 +856,27 @@ final class PickingPhoneModel: ObservableObject {
             && organizationId == pendingPickHandoffRecoveryWorkspaceId
         let isPendingConfirmationRecoverySwitch = hasPendingConfirmation
             && organizationId == pendingConfirmationRecoveryWorkspaceId
+        let isPendingManagerReplanningRecoverySwitch =
+            hasPendingManagerOrderReplanning
+            && organizationId == managerOrderReplanningRecoveryWorkspaceId
         let isPendingRecoverySwitch = isPendingHandoffRecoverySwitch
             || isPendingConfirmationRecoverySwitch
+            || isPendingManagerReplanningRecoverySwitch
         guard canSwitchWorkspace else {
             workspaceStatus = hasPendingPickHandoff
                 ? "Only the organization that owns the saved handoff can be selected until it finishes."
                 : (hasPendingConfirmation
                     ? "Only the organization that owns the saved confirmation can be selected until it is resolved."
-                    : "Wait for the current operation to finish before changing organizations.")
+                    : (hasPendingManagerOrderReplanning
+                        ? "Only the organization that owns the saved correction can be selected until it is resolved."
+                        : "Wait for the current operation to finish before changing organizations."))
             return
         }
-        guard (!hasPendingConfirmation && !hasPendingPickHandoff)
+        guard (!hasPendingConfirmation
+                && !hasPendingPickHandoff
+                && !hasPendingManagerOrderReplanning)
                 || isPendingRecoverySwitch else {
-            workspaceStatus = "The saved confirmation must be resolved in its original organization."
+            workspaceStatus = "The saved command must be resolved in its original organization."
             return
         }
         guard availableWorkspaces.contains(where: { $0.organizationId == organizationId }) else {
@@ -875,7 +903,9 @@ final class PickingPhoneModel: ObservableObject {
         isWorkspaceBusy = true
         workspaceStatus = isPendingRecoverySwitch
             ? "Returning to the organization that owns the saved picker command…"
-            : "Changing organization and clearing scoped mobile data…"
+            : (isPendingManagerReplanningRecoverySwitch
+                ? "Returning to the organization that owns the saved order correction…"
+                : "Changing organization and clearing scoped mobile data…")
         defer { finishWorkspaceSwitch() }
 
         do {
@@ -927,6 +957,8 @@ final class PickingPhoneModel: ObservableObject {
                 ? await resumeDurableConfirmationIfNeeded()
                 : false
             guard authenticationIsCurrent(operationGeneration) else { return }
+            let resumedManagerReplanning = await resumeDurableManagerOrderReplanningIfNeeded()
+            guard authenticationIsCurrent(operationGeneration) else { return }
 
             if canUseManager {
                 await loadManagerOperations()
@@ -942,8 +974,12 @@ final class PickingPhoneModel: ObservableObject {
             let name = sessionProfile?.activeWorkspace.name ?? "the selected organization"
             workspaceStatus = resumedPendingHandoff || resumedPendingConfirmation
                 ? "Now using " + name + ". The saved picker command remains protected until its server status is resolved."
-                : "Now using " + name + ". Organization-scoped data is refreshed."
-            if !resumedPendingHandoff && !resumedPendingConfirmation {
+                : (resumedManagerReplanning
+                    ? "Now using " + name + ". The saved order correction remains protected until it can be resolved."
+                    : "Now using " + name + ". Organization-scoped data is refreshed.")
+            if !resumedPendingHandoff
+                && !resumedPendingConfirmation
+                && !resumedManagerReplanning {
                 status = "Organization changed to " + name + "."
             }
         } catch PickingAPIError.sessionSuperseded {
@@ -1079,6 +1115,178 @@ final class PickingPhoneModel: ObservableObject {
             return true
         } catch {
             managerStatus = "Warehouse assignment failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func reopenManagerOrderForReplanning(reason: String) async -> Bool {
+        if walkthroughScreen != nil {
+            managerStatus = "Order correction is unavailable in walkthrough data."
+            return false
+        }
+        guard !hasPendingManagerOrderReplanning,
+              let order = managerSelectedOrder,
+              let profile = sessionProfile,
+              canUseManager else {
+            managerStatus = hasPendingManagerOrderReplanning
+                ? "Resolve the saved order correction before starting another one."
+                : "Refresh this order before reopening it."
+            return false
+        }
+        isManagerBusy = true
+        defer { isManagerBusy = false }
+        do {
+            let command = try ManagerOrderReplanningCommand(
+                order: order,
+                organizationId: profile.activeWorkspace.organizationId,
+                workerEmail: profile.effectiveUser.email,
+                reason: reason
+            )
+            try await cache.saveManagerOrderReplanningOutbox(command)
+            hasPendingManagerOrderReplanning = true
+            managerOrderReplanningRefreshRequired = false
+            managerOrderReplanningRecoveryWorkspaceId = nil
+            managerOrderReplanningDetail = "The exact correction is saved until ClawPilot acknowledges it."
+            let completed = await submitSavedManagerOrderReplanning(command)
+            if completed { await loadManagerOperations() }
+            return completed
+        } catch {
+            managerOrderReplanningDetail = error.localizedDescription
+            managerStatus = "Order correction was not started: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func retryPendingManagerOrderReplanning() async -> Bool {
+        guard hasPendingManagerOrderReplanning,
+              !isReplayingManagerOrderReplanning else { return false }
+        let pendingRemains = await resumeDurableManagerOrderReplanningIfNeeded()
+        if !pendingRemains && !managerOrderReplanningRefreshRequired {
+            await loadManagerOperations()
+            return true
+        }
+        return false
+    }
+
+    func refreshManagerAfterReplanningConflict() async {
+        guard managerOrderReplanningRefreshRequired else { return }
+        managerOrderReplanningRefreshRequired = false
+        managerOrderReplanningDetail = nil
+        managerSelectedOrder = nil
+        await loadManagerOperations()
+    }
+
+    @discardableResult
+    private func resumeDurableManagerOrderReplanningIfNeeded() async -> Bool {
+        guard !isReplayingManagerOrderReplanning else {
+            return hasPendingManagerOrderReplanning
+        }
+        let command: ManagerOrderReplanningCommand
+        do {
+            guard let loaded = try await cache.loadManagerOrderReplanningOutbox() else {
+                hasPendingManagerOrderReplanning = false
+                managerOrderReplanningRecoveryWorkspaceId = nil
+                return false
+            }
+            command = loaded
+        } catch {
+            hasPendingManagerOrderReplanning = true
+            managerOrderReplanningDetail = "The saved order correction could not be read safely."
+            managerStatus = "Saved order correction is protected."
+            return true
+        }
+
+        hasPendingManagerOrderReplanning = true
+        guard let profile = sessionProfile else {
+            managerOrderReplanningRecoveryWorkspaceId = nil
+            managerOrderReplanningDetail = "Sign in with the manager account that created this correction."
+            managerStatus = "Saved order correction is protected."
+            return true
+        }
+        guard profile.effectiveUser.email.lowercased() == command.workerEmail else {
+            managerOrderReplanningRecoveryWorkspaceId = nil
+            managerOrderReplanningDetail = "This correction belongs to \(command.workerEmail) and was not sent under the current session."
+            managerStatus = "Saved order correction is protected."
+            return true
+        }
+        guard profile.activeWorkspace.organizationId.lowercased()
+                == command.organizationId else {
+            managerOrderReplanningRecoveryWorkspaceId = profile.availableWorkspaces.contains {
+                $0.organizationId.lowercased() == command.organizationId
+            } ? command.organizationId : nil
+            managerOrderReplanningDetail = managerOrderReplanningRecoveryWorkspaceId == nil
+                ? "This account no longer has access to the organization that owns the saved correction."
+                : "Return to the organization that owns this saved correction before retrying it."
+            managerStatus = "Saved order correction belongs to a different organization."
+            return true
+        }
+        guard profile.mobileCapabilities.canUseManager else {
+            managerOrderReplanningRecoveryWorkspaceId = nil
+            managerOrderReplanningDetail = "Manager access is required to recover this saved correction."
+            managerStatus = "Saved order correction is protected."
+            return true
+        }
+        managerOrderReplanningRecoveryWorkspaceId = nil
+        return !(await submitSavedManagerOrderReplanning(command))
+    }
+
+    private func submitSavedManagerOrderReplanning(
+        _ command: ManagerOrderReplanningCommand
+    ) async -> Bool {
+        guard !isReplayingManagerOrderReplanning else { return false }
+        isReplayingManagerOrderReplanning = true
+        defer { isReplayingManagerOrderReplanning = false }
+        do {
+            try await cache.requireManagerOrderReplanningReplayIsUnblocked(command)
+            let result = try await api.reopenManagerOrderForReplanning(command)
+            try await cache.clearManagerOrderReplanningOutbox(command)
+            hasPendingManagerOrderReplanning = false
+            managerOrderReplanningDetail = nil
+            managerOrderReplanningRefreshRequired = false
+            managerOrderReplanningRecoveryWorkspaceId = nil
+            managerSelectedOrder = nil
+            managerStatus = result.replayed
+                ? "Saved correction confirmed. Order \(result.orderGlobalId) is ready for a fresh plan."
+                : "Order reopened for replanning with no carrier or storefront writes."
+            return true
+        } catch PickingAPIError.conflict(let code, let message) {
+            guard ManagerOrderReplanningConflictDisposition.forServerCode(code)
+                    == .quarantineStaleProjection else {
+                hasPendingManagerOrderReplanning = true
+                managerOrderReplanningDetail = code == "OPERATIONS_COMMAND_IN_PROGRESS"
+                    ? "ClawPilot is still processing this exact saved correction. Retry later with the same request and idempotency key."
+                    : "ClawPilot could not prove this conflict was a stale projection. The exact correction remains protected for manual retry."
+                managerStatus = code == "OPERATIONS_COMMAND_IN_PROGRESS"
+                    ? "Order correction is still processing."
+                    : "Saved correction remains pending: \(message)"
+                return false
+            }
+            do {
+                try await cache.quarantineManagerOrderReplanningOutbox(
+                    command,
+                    code: code,
+                    message: message
+                )
+                hasPendingManagerOrderReplanning = false
+                managerOrderReplanningRefreshRequired = true
+                managerOrderReplanningRecoveryWorkspaceId = nil
+                managerOrderReplanningDetail = "\(message) Refresh the order before reviewing a new correction."
+                managerStatus = "Order changed. Refresh required; the stale correction was quarantined and will not replay."
+            } catch {
+                hasPendingManagerOrderReplanning = true
+                managerOrderReplanningDetail = "ClawPilot rejected the stale correction, but its quarantine could not be completed: \(error.localizedDescription)"
+                managerStatus = "Saved correction remains blocked and requires recovery."
+            }
+            return false
+        } catch ManagerOrderReplanningClientError.pickerCommandPending {
+            hasPendingManagerOrderReplanning = true
+            managerOrderReplanningDetail = "Finish the saved pick confirmation, handoff, or scanned progress for this order, then retry this exact correction."
+            managerStatus = "Order correction is blocked by durable picker work."
+            return false
+        } catch {
+            hasPendingManagerOrderReplanning = true
+            managerOrderReplanningDetail = "The exact request and idempotency key remain saved for retry."
+            managerStatus = "Order correction remains pending: \(error.localizedDescription)"
             return false
         }
     }
@@ -1263,23 +1471,45 @@ final class PickingPhoneModel: ObservableObject {
                 // raced the journal write; never strand an outbox without queue
                 // ownership context.
                 guard try await cache.loadOutbox() == nil,
-                      try await cache.loadHandoffOutbox() == nil else {
+                      try await cache.loadHandoffOutbox() == nil,
+                      try await cache.loadManagerOrderReplanningOutbox() == nil else {
                     throw PickingContractError.contextMismatch
                 }
                 try await picking.clearQueue()
             case .targetWorkspacePreserveProtectedCommand:
-                _ = try await picking.restore()
-            case .blockedIdentity:
-                throw PickingContractError.contextMismatch
-            }
-
-            if transition.pickerCachePolicy == .preserveProtectedCommand {
-                guard await picking.queueIdentityMatches(
-                    organizationId: transition.targetOrganizationId,
-                    workerEmail: transition.workerEmail
-                ) else {
+                let confirmation = try await cache.loadOutbox()
+                let handoff = try await cache.loadHandoffOutbox()
+                let managerReplanning = try await cache
+                    .loadManagerOrderReplanningOutbox()
+                guard confirmation != nil
+                        || handoff != nil
+                        || managerReplanning != nil else {
                     throw PickingContractError.contextMismatch
                 }
+                if confirmation != nil || handoff != nil {
+                    _ = try await picking.restore()
+                    guard await picking.queueIdentityMatches(
+                        organizationId: transition.targetOrganizationId,
+                        workerEmail: transition.workerEmail
+                    ) else {
+                        throw PickingContractError.contextMismatch
+                    }
+                } else if managerReplanning != nil {
+                    // A manager correction does not depend on picker cache
+                    // state. Clear any queue from the source workspace while
+                    // the separate exact correction outbox remains durable.
+                    try await picking.clearQueue()
+                }
+                if let managerReplanning {
+                    guard managerReplanning.organizationId
+                            == transition.targetOrganizationId,
+                          managerReplanning.workerEmail
+                            == transition.workerEmail else {
+                        throw PickingContractError.contextMismatch
+                    }
+                }
+            case .blockedIdentity:
+                throw PickingContractError.contextMismatch
             }
 
             // Keep both phone and Watch nil while the transition is durable.
@@ -1344,6 +1574,11 @@ final class PickingPhoneModel: ObservableObject {
         managerPickManagement = nil
         managerSelectedPickAssignment = nil
         managerSelectedOrder = nil
+        hasPendingManagerOrderReplanning = false
+        isReplayingManagerOrderReplanning = false
+        managerOrderReplanningDetail = nil
+        managerOrderReplanningRefreshRequired = false
+        managerOrderReplanningRecoveryWorkspaceId = nil
         googleAuthState = nil
         isGoogleLinkBusy = false
         googleLinkStatus = "Each user links their own Google account after signing in with a magic code."

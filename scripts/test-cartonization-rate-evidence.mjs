@@ -211,6 +211,9 @@ function loadOperationalFaireRoute(
     providers = ['ups_rest', 'fedex_rest'],
     sandboxGeometry = false,
     planTransform = null,
+    shadowTraining = false,
+    sourceProvider = 'faire',
+    zeroMaterialStock = false,
   } = {},
 ) {
   const path =
@@ -252,7 +255,7 @@ function loadOperationalFaireRoute(
     readAt: '2026-08-02T20:00:00.000Z',
     account: {
       globalId: 'gia0000001',
-      provider: 'faire',
+      provider: sourceProvider,
       status: 'active',
     },
     candidate: {
@@ -281,14 +284,14 @@ function loadOperationalFaireRoute(
         productGlobalId: 'gpr0000001',
         requiredQuantity: 1,
         availabilityAuthority: 'operational_available',
-        operationalAvailableQuantity: 3,
+        operationalAvailableQuantity: shadowTraining ? 0 : 3,
         providerCommittedQuantity: 0,
         activeReservedQuantity: 0,
         assumedCommittedQuantity: 0,
-        effectiveAvailableQuantity: 3,
+        effectiveAvailableQuantity: shadowTraining ? 0 : 3,
         sourceLevelGlobalIds: [],
-        sourcePositionGlobalIds: ['giv0000001'],
-        sourceProjectionStates: ['projected'],
+        sourcePositionGlobalIds: shadowTraining ? [] : ['giv0000001'],
+        sourceProjectionStates: shadowTraining ? [] : ['projected'],
       }],
     },
     materialEvidence: [],
@@ -368,10 +371,10 @@ function loadOperationalFaireRoute(
         maximumGrossWeightGrams: 5000,
         unitCostMinor: 50,
         currency: 'USD',
-        stockRowVersion: 1,
-        stockOnHandQuantity: 5,
+        stockRowVersion: shadowTraining || zeroMaterialStock ? null : 1,
+        stockOnHandQuantity: shadowTraining || zeroMaterialStock ? 0 : 5,
         activeClaimedQuantity: 0,
-        availableQuantity: 5,
+        availableQuantity: shadowTraining || zeroMaterialStock ? 0 : 5,
       }],
     },
   }
@@ -472,6 +475,8 @@ function loadOperationalFaireRoute(
       }),
       sanitizedCarrierIntegrationError: (error) => error,
       testCarrierSandboxShipmentRate: async (input) => {
+        if (!observed.sequence) observed.sequence = []
+        observed.sequence.push(`carrier:${input.provider}`)
         observed.carrierReads.push(input)
         return {
           evidenceGlobalId: input.provider === 'ups_rest'
@@ -501,8 +506,11 @@ function loadOperationalFaireRoute(
     '@/lib/integrations/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityError: IntegrationError,
       inspectShopifyOrderPlanningAuthority: async () => {
+        observed.shopifyAuthorityCalls = (observed.shopifyAuthorityCalls || 0) + 1
         throw new Error(
-          'Faire operational evidence must not read Shopify authority',
+          shadowTraining
+            ? 'Exact Shadow training must not read Shopify planning authority'
+            : 'Faire operational evidence must not read Shopify authority',
         )
       },
     },
@@ -510,7 +518,7 @@ function loadOperationalFaireRoute(
       activeOperationsOrganizationId: () => (
         '00000000-0000-4000-8000-000000000001'
       ),
-      operationsCapabilities: () => ({ canManage: true, canView: true }),
+      operationsCapabilities: () => ({ canManage: true, canView: true, canExecute: true }),
     },
     '@/lib/operations/hybridCartonization': {
       planHybridCartonization: () => plan,
@@ -535,6 +543,9 @@ function loadOperationalFaireRoute(
             )
           },
     },
+    '@/lib/operations/shadowTraining': {
+      OperationsShadowTrainingError: PersistenceError,
+    },
     '@/lib/persistence/config': {
       isPostgresStorageEnabled: () => true,
     },
@@ -546,7 +557,7 @@ function loadOperationalFaireRoute(
       cartonizationRateEvidenceHash: evidenceHash,
       CartonizationRateEvidencePersistenceError: PersistenceError,
       claimCartonizationRateEvidenceCommandInPostgres: async () => ({
-        state: 'created',
+        state: (observed.sequence || (observed.sequence = [])).push('claim') && 'created',
       }),
       failCartonizationRateEvidenceCommandInPostgres: async (input) => {
         if (!observed.commandFailures) observed.commandFailures = []
@@ -567,6 +578,8 @@ function loadOperationalFaireRoute(
       }),
       readCartonizationRateEvidenceByGlobalId: async () => null,
       writeCartonizationRateEvidenceInPostgres: async (input) => {
+        if (!observed.sequence) observed.sequence = []
+        observed.sequence.push('write')
         observed.write = input
         return { globalId: 'gcte0000001' }
       },
@@ -574,13 +587,31 @@ function loadOperationalFaireRoute(
     '@/lib/persistence/hybridCartonization': {
       HybridCartonizationPersistenceError: PersistenceError,
       readHybridCartonizationInputFromPostgres: async (input) => {
+        if (!observed.sequence) observed.sequence = []
+        observed.sequence.push('read')
         observed.readInput = input
         return cartonizationRead
       },
     },
     '@/lib/persistence/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityPersistenceError: PersistenceError,
-      readOperationalOrderPlanningProviderFromPostgres: async () => 'faire',
+      readOperationalOrderPlanningProviderFromPostgres: async () => sourceProvider,
+    },
+    '@/lib/persistence/operationShadowTraining': {
+      assertOperationsShadowTrainingEvidenceRequestInPostgres: async (input) => {
+        if (!shadowTraining) {
+          throw new Error(
+            'Ordinary operational evidence must not authorize Shadow training',
+          )
+        }
+        if (!observed.sequence) observed.sequence = []
+        observed.sequence.push('training-auth')
+        observed.trainingAuthorization = input
+        return {
+          runGlobalId: input.runGlobalId,
+          runRowVersion: input.expectedRunRowVersion,
+        }
+      },
     },
     '@/lib/requestUser': {
       requireRequestUser: async () => ({ email: 'operator@example.com' }),
@@ -2185,6 +2216,134 @@ assert.equal(
 assert.equal(faireRouteObserved.write.packages[0].contentWeightGrams, 170)
 assert.equal(faireRouteObserved.write.packages[0].tareWeightGrams, 120)
 assert.equal(faireRouteObserved.write.packages[0].ratedGrossWeightGrams, 290)
+
+const trainingRouteObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+  sequence: [],
+  shopifyAuthorityCalls: 0,
+  trainingAuthorization: null,
+}
+const trainingRoute = loadOperationalFaireRoute(
+  trainingRouteObserved,
+  {
+    providers: ['ups_rest'],
+    shadowTraining: true,
+    sourceProvider: 'shopify',
+    zeroMaterialStock: true,
+  },
+)
+const trainingRouteResponse = await trainingRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'shopify-shadow-training-no-stock-route',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+      shadowTraining: {
+        runGlobalId: 'gtrn0000001',
+        expectedRowVersion: 0,
+      },
+    }),
+  },
+))
+assert.equal(trainingRouteResponse.status, 200)
+const trainingRoutePayload = await trainingRouteResponse.json()
+assert.equal(trainingRoutePayload.effects.providerWrites, 0)
+assert.equal(trainingRoutePayload.effects.providerOrderReads, 0)
+assert.equal(trainingRoutePayload.effects.inventoryWrites, 0)
+assert.equal(trainingRoutePayload.effects.postagePurchases, 0)
+assert.deepEqual(JSON.parse(JSON.stringify(
+  trainingRouteObserved.trainingAuthorization,
+)), {
+  organizationId: '00000000-0000-4000-8000-000000000001',
+  runGlobalId: 'gtrn0000001',
+  expectedRunRowVersion: 0,
+  accountGlobalId: 'gia0000001',
+  candidateGlobalId: 'gcoc0000001',
+  expectedCandidateRowVersion: 1,
+  warehouseGlobalId: 'gwh0000001',
+})
+assert.deepEqual(
+  trainingRouteObserved.sequence,
+  ['training-auth', 'claim', 'read', 'carrier:ups_rest', 'write'],
+  'Exact run authorization must finish before claim, local facts, or carrier I/O',
+)
+assert.equal(trainingRouteObserved.shopifyAuthorityCalls, 0)
+assert.equal(trainingRouteObserved.readInput.mode, 'shadow_training_simulated')
+assert.equal(trainingRouteObserved.write.inventorySyncRunGlobalId, null)
+assert.equal(trainingRouteObserved.write.requiredCarrierProviders.length, 1)
+assert.equal(trainingRouteObserved.carrierReads.length, 1)
+assert.equal(trainingRouteObserved.carrierReads[0].environment, 'sandbox')
+assert.equal(
+  trainingRouteObserved.write.materialRateAssumptions[0]
+    .operationalFacts.stock,
+  null,
+)
+assert.equal(
+  trainingRouteObserved.write.assumptionSnapshot.inventoryAuthority,
+  'shadow_training_simulated_order_and_material_availability',
+)
+assert.equal(
+  trainingRouteObserved.write.planSnapshot.shadowTraining.version,
+  'shadow-training-evidence-v1',
+)
+assert.equal(
+  trainingRouteObserved.write.planSnapshot.shadowTraining.runGlobalId,
+  'gtrn0000001',
+)
+assert.equal(
+  trainingRouteObserved.write.planSnapshot.shadowTraining.commerceProviderWrites,
+  0,
+)
+
+const ordinaryZeroStockObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+  sequence: [],
+}
+const ordinaryZeroStockRoute = loadOperationalFaireRoute(
+  ordinaryZeroStockObserved,
+  { providers: ['ups_rest'], zeroMaterialStock: true },
+)
+const ordinaryZeroStockResponse = await ordinaryZeroStockRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'ordinary-operational-no-stock-rejected',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+assert.equal(ordinaryZeroStockResponse.status, 422)
+const ordinaryZeroStockPayload = await ordinaryZeroStockResponse.json()
+assert.equal(
+  ordinaryZeroStockPayload.code,
+  'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_FACTS_REQUIRED',
+)
+assert.equal(ordinaryZeroStockObserved.carrierReads.length, 0)
+assert.equal(ordinaryZeroStockObserved.write, null)
 
 const upsOnlyObserved = {
   carrierReads: [],

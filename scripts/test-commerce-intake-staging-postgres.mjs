@@ -1042,6 +1042,9 @@ function loadOperationalWarehouseServices(pool) {
           'readShadowFulfillmentPreparation',
         ),
       },
+      '@/lib/persistence/operationShadowTraining': {
+        assertNoOpenOperationsShadowTrainingRunsForActivation: async () => {},
+      },
       '@/lib/persistence/sandboxCommerceE2eAuthorization': {
         readActiveSandboxCommerceE2eAuthorizationForOrderInPostgres:
           mustNotRun(
@@ -2545,6 +2548,7 @@ async function verifyFaireExactVariantPackBinding(
     )
     assert.equal(canonicalLine.rowCount, 1)
     const carrierAccounts = {}
+    const productionCarrierAccounts = {}
     for (const carrier of [
       { provider: 'ups_rest', name: 'Faire E2E UPS', lastFour: '9201' },
       { provider: 'fedex_rest', name: 'Faire E2E FedEx', lastFour: '9202' },
@@ -2598,6 +2602,60 @@ async function verifyFaireExactVariantPackBinding(
         integrationAccountId: connection.rows[0].id,
         carrierAccountId: carrierAccount.rows[0].id,
       }
+      const productionConnection = await operationalSeed.query(
+        `INSERT INTO operations_integration_accounts (
+           organization_id, provider, integration_type, environment,
+           display_name, status, configuration, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2, 'carrier', 'production',
+           $3, 'active', '{}'::jsonb, $4, $4
+         ) RETURNING id::text`,
+        [
+          ids.organization,
+          carrier.provider,
+          `${carrier.name} production`,
+          actorEmail,
+        ],
+      )
+      const productionCarrierAccount = await operationalSeed.query(
+        `INSERT INTO operations_carrier_accounts (
+           organization_id, integration_account_id, display_name,
+           sender_name, account_number_ciphertext, account_number_iv,
+           account_number_tag, account_number_last_four,
+           account_number_fingerprint, registered_address,
+           registered_address_fingerprint, address_verification,
+           status, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3,
+           'Faire E2E warehouse', $4, $5, $6, $7, $8,
+           $9::jsonb, $10, 'operator_attested', 'active', $11, $11
+         ) RETURNING id::text`,
+        [
+          ids.organization,
+          productionConnection.rows[0].id,
+          `${carrier.name} production account`,
+          `${carrier.provider}-production-ciphertext`,
+          `${carrier.provider}-production-iv`,
+          `${carrier.provider}-production-tag`,
+          carrier.lastFour,
+          hash(`${carrier.provider}:production-account`),
+          JSON.stringify({
+            name: 'Faire E2E warehouse',
+            line1: '16691 Gothard St',
+            line2: 'Suite Q',
+            city: 'Huntington Beach',
+            region: 'CA',
+            postalCode: '92647',
+            countryCode: 'US',
+          }),
+          hash(`${carrier.provider}:production-registered-address`),
+          actorEmail,
+        ],
+      )
+      productionCarrierAccounts[carrier.provider] = {
+        integrationAccountId: productionConnection.rows[0].id,
+        carrierAccountId: productionCarrierAccount.rows[0].id,
+      }
     }
     operational = {
       order: order.rows[0],
@@ -2611,6 +2669,7 @@ async function verifyFaireExactVariantPackBinding(
       materialStock: materialStock.rows[0],
       recipe: recipe.rows[0],
       carrierAccounts,
+      productionCarrierAccounts,
     }
     await operationalSeed.query('COMMIT')
   } catch (error) {
@@ -2928,6 +2987,126 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(cartonizationEvidence.inventorySyncRunGlobalId, null)
   assert.equal(cartonizationEvidence.packages.length, 1)
 
+  await pool.query(
+    `UPDATE operations_packaging_material_stock
+     SET is_available = false, on_hand_quantity = 0,
+         row_version = row_version + 1, updated_at = now()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, operational.materialStock.id],
+  )
+  const shadowTrainingMaterialFacts = materialFacts.map((fact) => ({
+    ...fact,
+    operationalFacts: {
+      ...fact.operationalFacts,
+      stock: null,
+    },
+  }))
+  const shadowTrainingPlanSnapshot = {
+    ...planSnapshot,
+    shadowTraining: {
+      version: 'shadow-training-evidence-v1',
+      runGlobalId: 'gtrn0000001',
+      runRowVersion: 0,
+      assignmentPolicy: 'local_simulation_only',
+      commerceProviderWrites: 0,
+      inventoryWrites: 0,
+      packagingStockWrites: 0,
+      productionPostage: 0,
+    },
+    availabilityAuthority:
+      'shadow_training_simulated_order_and_material_availability',
+  }
+  const shadowTrainingIdempotencyKey =
+    'commerce-staging-faire-shadow-training-zero-stock'
+  const shadowTrainingSemanticHash = hash(
+    'faire-e2e-shadow-training-zero-stock-evidence',
+  )
+  const shadowTrainingClaim = await warehouseServices.cartonizationRateEvidence
+    .claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId: ids.organization,
+      idempotencyKey: shadowTrainingIdempotencyKey,
+      semanticRequestHash: shadowTrainingSemanticHash,
+      actorEmail,
+    })
+  assert.equal(shadowTrainingClaim.state, 'claimed')
+  const shadowTrainingEvidence = await warehouseServices
+    .cartonizationRateEvidence.writeCartonizationRateEvidenceInPostgres({
+      ...cartonizationEvidenceInput,
+      idempotencyKey: shadowTrainingIdempotencyKey,
+      semanticRequestHash: shadowTrainingSemanticHash,
+      inventorySyncRunGlobalId: null,
+      planSnapshot: shadowTrainingPlanSnapshot,
+      planResultHash: warehouseServices.cartonizationRateEvidence
+        .cartonizationRateEvidenceHash(shadowTrainingPlanSnapshot),
+      assumptionSnapshot: {
+        operationalMaterialFacts: shadowTrainingMaterialFacts,
+      },
+      materialRateAssumptions: shadowTrainingMaterialFacts,
+    })
+  assert.equal(shadowTrainingEvidence.evidenceMode, 'operational')
+  assert.equal(shadowTrainingEvidence.inventorySyncRunGlobalId, null)
+  assert.equal(
+    shadowTrainingEvidence.planSnapshot.shadowTraining.assignmentPolicy,
+    'local_simulation_only',
+  )
+  const zeroStock = await pool.query(
+    `SELECT is_available, on_hand_quantity
+     FROM operations_packaging_material_stock
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, operational.materialStock.id],
+  )
+  assert.deepEqual(zeroStock.rows[0], {
+    is_available: false,
+    on_hand_quantity: 0,
+  }, 'Training evidence must not claim or replenish packaging stock')
+
+  const ordinaryZeroStockIdempotencyKey =
+    'commerce-staging-faire-ordinary-zero-stock-rejected'
+  const ordinaryZeroStockSemanticHash = hash(
+    'faire-e2e-ordinary-zero-stock-evidence',
+  )
+  await warehouseServices.cartonizationRateEvidence
+    .claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId: ids.organization,
+      idempotencyKey: ordinaryZeroStockIdempotencyKey,
+      semanticRequestHash: ordinaryZeroStockSemanticHash,
+      actorEmail,
+    })
+  await assert.rejects(
+    warehouseServices.cartonizationRateEvidence
+      .writeCartonizationRateEvidenceInPostgres({
+        ...cartonizationEvidenceInput,
+        idempotencyKey: ordinaryZeroStockIdempotencyKey,
+        semanticRequestHash: ordinaryZeroStockSemanticHash,
+        planSnapshot,
+        planResultHash: warehouseServices.cartonizationRateEvidence
+          .cartonizationRateEvidenceHash(planSnapshot),
+        assumptionSnapshot: {
+          operationalMaterialFacts: shadowTrainingMaterialFacts,
+        },
+        materialRateAssumptions: shadowTrainingMaterialFacts,
+      }),
+    (error) => {
+      assert.equal(
+        error.code,
+        'CARTONIZATION_RATE_EVIDENCE_MATERIAL_ASSUMPTIONS_INVALID',
+      )
+      return true
+    },
+    'Ordinary operational evidence must still reject missing stock authority',
+  )
+  await pool.query(
+    `UPDATE operations_packaging_material_stock
+     SET is_available = true, on_hand_quantity = 1,
+         row_version = $3, updated_at = now()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [
+      ids.organization,
+      operational.materialStock.id,
+      operational.materialStock.row_version,
+    ],
+  )
+
   const upsOnlyIdempotencyKey =
     'commerce-staging-faire-operational-cartonization-ups-only'
   const upsOnlySemanticRequestHash = hash(
@@ -2962,12 +3141,138 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(upsOnlyEvidence.shipmentRates.length, 1)
   assert.equal(upsOnlyEvidence.packages[0].quotes.length, 1)
 
+  const productionRateEvidence = {}
+  for (const [provider, carrier] of Object.entries(
+    operational.productionCarrierAccounts,
+  )) {
+    productionRateEvidence[provider] = (await pool.query(
+      `INSERT INTO operations_carrier_rate_requests (
+         organization_id, integration_account_id, carrier_account_id,
+         provider, environment, purpose, adapter_version,
+         credential_version, request_hash, redacted_request,
+         redacted_response, status, actor_email, requested_at, completed_at
+       )
+       SELECT request.organization_id, $2::uuid, $3::uuid,
+              request.provider, 'production', request.purpose,
+              'faire-e2e-production-acceptance-v1',
+              request.credential_version, $4,
+              request.redacted_request, request.redacted_response,
+              request.status, $5, request.requested_at, request.completed_at
+       FROM operations_carrier_rate_requests request
+       WHERE request.organization_id = $1::uuid
+         AND request.id = $6::uuid
+       RETURNING id::text, global_id`,
+      [
+        ids.organization,
+        carrier.integrationAccountId,
+        carrier.carrierAccountId,
+        hash(`faire-e2e-${provider}-production-shipment-rate`),
+        actorEmail,
+        rateEvidence[provider].id,
+      ],
+    )).rows[0]
+  }
+  const productionPlanSnapshot = {
+    ...planSnapshot,
+    carrierReadEnvironment: 'production',
+  }
+  const productionSeedPlanSnapshot = {
+    ...planSnapshot,
+    carrierReadEnvironment: 'sandbox',
+  }
+  const productionEvidenceIdempotencyKey =
+    'commerce-staging-faire-production-cartonization'
+  const productionEvidenceSemanticHash = hash(
+    'faire-e2e-production-cartonization-evidence',
+  )
+  const productionClaim = await warehouseServices.cartonizationRateEvidence
+    .claimCartonizationRateEvidenceCommandInPostgres({
+      organizationId: ids.organization,
+      idempotencyKey: productionEvidenceIdempotencyKey,
+      semanticRequestHash: productionEvidenceSemanticHash,
+      actorEmail,
+    })
+  assert.equal(productionClaim.state, 'claimed')
+  let productionEvidence = await warehouseServices.cartonizationRateEvidence
+    .writeCartonizationRateEvidenceInPostgres({
+      ...cartonizationEvidenceInput,
+      idempotencyKey: productionEvidenceIdempotencyKey,
+      semanticRequestHash: productionEvidenceSemanticHash,
+      planSnapshot: productionSeedPlanSnapshot,
+      planResultHash: warehouseServices.cartonizationRateEvidence
+        .cartonizationRateEvidenceHash(productionSeedPlanSnapshot),
+    })
+  // The development writer is intentionally sandbox-only. This disposable
+  // fixture then represents evidence sealed by the separate production-rate
+  // lane so the legacy Active canonical lifecycle remains covered without
+  // weakening either runtime boundary.
+  const productionFixture = await pool.connect()
+  try {
+    await productionFixture.query('BEGIN')
+    await productionFixture.query('SET LOCAL session_replication_role = replica')
+    await productionFixture.query(
+      `UPDATE operations_cartonization_rate_evidence
+       SET plan_snapshot = $3::jsonb, plan_result_hash = $4
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        ids.organization,
+        productionEvidence.globalId,
+        JSON.stringify(productionPlanSnapshot),
+        warehouseServices.cartonizationRateEvidence
+          .cartonizationRateEvidenceHash(productionPlanSnapshot),
+      ],
+    )
+    await productionFixture.query(
+      `UPDATE operations_cartonization_rate_evidence_quotes quote
+       SET carrier_rate_request_id = CASE quote.provider
+         WHEN 'ups_rest' THEN $3::uuid
+         WHEN 'fedex_rest' THEN $4::uuid
+         ELSE quote.carrier_rate_request_id
+       END
+       FROM operations_cartonization_rate_evidence evidence
+       WHERE evidence.organization_id = quote.organization_id
+         AND evidence.id = quote.evidence_id
+         AND evidence.organization_id = $1::uuid
+         AND evidence.global_id = $2`,
+      [
+        ids.organization,
+        productionEvidence.globalId,
+        productionRateEvidence.ups_rest.id,
+        productionRateEvidence.fedex_rest.id,
+      ],
+    )
+    await productionFixture.query('COMMIT')
+  } catch (error) {
+    await productionFixture.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    productionFixture.release()
+  }
+  productionEvidence = await warehouseServices.cartonizationRateEvidence
+    .readCartonizationRateEvidenceByGlobalId({
+      organizationId: ids.organization,
+      evidenceGlobalId: productionEvidence.globalId,
+    })
+  assert.ok(productionEvidence)
+  assert.equal(
+    productionEvidence.planSnapshot.carrierReadEnvironment,
+    'production',
+  )
+
+  await pool.query(
+    `UPDATE operations_activation_scopes
+     SET state = 'active', revision = revision + 1,
+         reason = 'Exercise canonical fulfillment only outside Shadow',
+         updated_by = $2, updated_at = now()
+     WHERE organization_id = $1::uuid`,
+    [ids.organization, actorEmail],
+  )
   const planned = await warehouseServices.operations
     .planOperationsOrderFromPostgres({
       organizationId: ids.organization,
       actorEmail,
       orderGlobalId: promoted.canonicalOrderGlobalId,
-      cartonizationEvidenceGlobalId: cartonizationEvidence.globalId,
+      cartonizationEvidenceGlobalId: productionEvidence.globalId,
       expectedRowVersion: operational.order.row_version,
       reason: 'Plan the exact Faire operational carton',
       idempotencyKey: 'commerce-staging-faire-operational-plan',
@@ -3058,6 +3363,14 @@ async function verifyFaireExactVariantPackBinding(
     pick_status: 'picked',
     wave_status: 'completed',
   })
+  await pool.query(
+    `UPDATE operations_activation_scopes
+     SET state = 'shadow', revision = revision + 1,
+         reason = 'Restore sandbox E2E authorization boundary',
+         updated_by = $2, updated_at = now()
+     WHERE organization_id = $1::uuid`,
+    [ids.organization, actorEmail],
+  )
 
   const authorizationInput = {
     organizationId: ids.organization,
@@ -3128,7 +3441,7 @@ async function verifyFaireExactVariantPackBinding(
     parcel_content_weight_grams: 170,
     parcel_tare_weight_grams: 20,
     parcel_gross_weight_grams: 190,
-    cartonization_evidence_global_id: cartonizationEvidence.globalId,
+    cartonization_evidence_global_id: productionEvidence.globalId,
     cartonization_package_key: recipePackage.packageKey,
     packaging_material_global_id: operational.material.global_id,
     approved_pack_recipe_global_id: operational.recipe.global_id,

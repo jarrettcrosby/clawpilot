@@ -172,6 +172,9 @@ const shippingServiceCodeMigration = read(
 const providerAttemptMigration = read(
   'db/migrations/0174_operations_shopify_checkout_provider_attempts.sql',
 )
+const configuredCarrierMigration = read(
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+)
 const rateWarmPolicyMigration = read(
   'db/migrations/0175_operations_shopify_checkout_rate_warm_policy.sql',
 )
@@ -518,12 +521,16 @@ includes(persistenceSource, [
   'AND receipt.lease_token = $3::uuid',
   'operations_shopify_carrier_service_config_is_ready',
   'callback_token_hash = $2',
-  "AND integration.environment = 'sandbox'",
+  "AND integration.environment IN ('sandbox', 'production')",
   'config.registration_state = \'registered\'',
   'config.registration_state = \'shadow_simulated\'',
   "account.configuration ->> 'accountName'",
   'AS store_entity_name',
-  'MAX_SHOPIFY_CHECKOUT_PROVIDER_ATTEMPTS',
+  'MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS',
+  'MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  'updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres',
+  "'clawpilot.shopify_carrier_binding_write_token'",
+  "'SHOPIFY_CHECKOUT_BINDING_UPDATE_RECEIPT_IN_FLIGHT'",
   'ShopifyCheckoutProviderAttemptInput',
   'ShopifyCheckoutRateReceiptProviderAttempt',
   'providerAttempts: ShopifyCheckoutProviderAttemptInput[]',
@@ -589,6 +596,25 @@ const receiptClaimRetry = section(
   'export async function claimShopifyCheckoutRateReceiptInPostgres',
   'function normalizeCompletion(',
   'checkout receipt claim retry wrapper',
+)
+const completionNormalization = section(
+  persistenceSource,
+  'function normalizeCompletion(',
+  'export async function completeShopifyCheckoutRateReceiptInPostgres',
+  'checkout receipt completion normalization',
+)
+includes(completionNormalization, [
+  'input.providerAttempts.length < 1',
+  '> MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS',
+  'Checkout provider attempts must use unique carrier accounts',
+  "attempt.status === 'degraded' && matchingOffers.length > 0",
+], 'account-keyed bounded carrier attempt completion')
+assert.equal(
+  completionNormalization.includes(
+    "attempt.status === 'succeeded' && matchingOffers.length < 1",
+  ),
+  false,
+  'a succeeded account may lose public service-code deduplication',
 )
 includes(receiptClaim, [
   'readConfigRowWithClient(client, input)',
@@ -1247,6 +1273,191 @@ includes(releaseSource, [
   'OPERATIONS_SHOPIFY_CHECKOUT_RATE_RECONCILIATION_REQUIRED',
 ], 'Shopify fulfillment lineage release guard')
 
+const completedShadowReplaySource = section(
+  operationsSource,
+  'async function completedShadowFulfillmentExecutionResult(',
+  'function shadowExecutionDestination(',
+  'Completed Shadow fulfillment replay',
+)
+includes(completedShadowReplaySource, [
+  "'result_global_id' | 'result_payload'",
+  'receipt.result_global_id',
+  'payload.fulfillmentExecutionGlobalId',
+  'fulfillment_run.selected_carrier_account_id',
+  'shipment_group.selected_carrier_account_id',
+  'operations_fulfillment_execution_rate_attempts attempt',
+  'rate_evidence.id = attempt.carrier_rate_request_id',
+  'rate_evidence.provider = attempt.carrier_provider',
+  'rate_evidence.carrier_account_id = attempt.carrier_account_id',
+  'retained.carrier_provider === attempt.provider',
+  'retained.rate_evidence_global_id === attempt.rateEvidenceGlobalId',
+  'retained.attempt_status === attempt.status',
+  'retained.failure_code === (attempt.failureCode ?? null)',
+  'matchedAttemptKeys.has(exactKey)',
+  'attempt.carrierAccountGlobalId',
+  '!== exact.carrier_account_global_id',
+  'providerAttempts.length !== exactAttempts.length',
+  'carrierAccountGlobalId: exact.carrier_account_global_id',
+  'carrierAccountGlobalId,',
+  'providerAttempts,',
+], 'Completed Shadow fulfillment exact-account replay')
+assert.doesNotMatch(
+  completedShadowReplaySource,
+  /retained\.carrier_provider === attempt\.provider\s*\)\)/u,
+  'same-provider replay must also bind each attempt to its distinct immutable rate-evidence row',
+)
+assert.match(
+  completedShadowReplaySource,
+  /typeof attempt\.carrierAccountGlobalId === 'string'[\s\S]*attempt\.carrierAccountGlobalId[\s\S]*!== exact\.carrier_account_global_id/u,
+  'a tampered preexisting per-attempt carrier account must fail replay instead of being silently overwritten',
+)
+
+function loadCompletedShadowReplay(exactRows) {
+  const harnessSource = `
+type QueryResultRow = Record<string, unknown>
+type CommandReceiptRow = {
+  result_global_id: string | null
+  result_payload: Record<string, unknown> | null
+}
+type OperationsShadowFulfillmentExecutionResult = Record<string, unknown>
+const CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS = 8
+class OperationsRequestError extends Error {
+  code: string
+  status: number
+  constructor(code: string, message: string, status: number) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+const exactRows = ${JSON.stringify(exactRows)}
+async function query<T>(): Promise<{ rows: T[] }> {
+  return { rows: exactRows as T[] }
+}
+${completedShadowReplaySource}
+module.exports = completedShadowFulfillmentExecutionResult
+`
+  const output = ts.transpileModule(harnessSource, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+    fileName: 'completed-shadow-replay-harness.ts',
+  }).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Error,
+    Map,
+    Object,
+    Promise,
+    Set,
+    String,
+    exports: module.exports,
+    module,
+  }, { filename: 'completed-shadow-replay-harness.ts' })
+  return module.exports
+}
+
+const sameProviderReplayRows = [
+  {
+    selected_carrier_account_global_id: 'gach00000000001',
+    carrier_provider: 'ups_rest',
+    carrier_account_global_id: 'gach00000000001',
+    attempt_status: 'succeeded',
+    failure_code: null,
+    rate_evidence_global_id: 'grq00000000001',
+    selected: true,
+  },
+  {
+    selected_carrier_account_global_id: 'gach00000000001',
+    carrier_provider: 'ups_rest',
+    carrier_account_global_id: 'gach00000000003',
+    attempt_status: 'degraded',
+    failure_code: 'UPS_RATE_TIMEOUT',
+    rate_evidence_global_id: 'grq00000000002',
+    selected: false,
+  },
+]
+const completedShadowReplay = loadCompletedShadowReplay(
+  sameProviderReplayRows,
+)
+const legacyReplayPayload = {
+  orderGlobalId: 'gor00000000001',
+  orderStatus: 'packed',
+  fulfillmentExecutionGlobalId: 'gofe00000000001',
+  shipmentGroupGlobalId: 'gshg00000000001',
+  providerAttempts: [
+    {
+      provider: 'ups_rest',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq00000000001',
+    },
+    {
+      provider: 'ups_rest',
+      status: 'degraded',
+      failureCode: 'UPS_RATE_TIMEOUT',
+      rateEvidenceGlobalId: 'grq00000000002',
+    },
+  ],
+}
+const rehydratedLegacyReplay = await completedShadowReplay(
+  '28500000-0000-4000-8000-000000000001',
+  {
+    result_global_id: 'gofe00000000001',
+    result_payload: legacyReplayPayload,
+  },
+)
+assert.equal(
+  rehydratedLegacyReplay.carrierAccountGlobalId,
+  'gach00000000001',
+  'legacy completed replay must restore the selected exact carrier account',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(rehydratedLegacyReplay.providerAttempts)),
+  [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gach00000000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq00000000001',
+    },
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gach00000000003',
+      status: 'degraded',
+      failureCode: 'UPS_RATE_TIMEOUT',
+      rateEvidenceGlobalId: 'grq00000000002',
+    },
+  ],
+  'two legacy same-provider attempts must rehydrate to their distinct immutable accounts',
+)
+await assert.rejects(
+  completedShadowReplay(
+    '28500000-0000-4000-8000-000000000001',
+    {
+      result_global_id: 'gofe00000000001',
+      result_payload: {
+        ...legacyReplayPayload,
+        providerAttempts: [
+          {
+            ...legacyReplayPayload.providerAttempts[0],
+            carrierAccountGlobalId: 'gach00000000003',
+          },
+          legacyReplayPayload.providerAttempts[1],
+        ],
+      },
+    },
+  ),
+  (error) => (
+    error?.code === 'OPERATIONS_COMMAND_RECEIPT_INVALID'
+    && /no longer match exact evidence/u.test(error.message)
+  ),
+  'a tampered existing per-attempt account must fail completed replay',
+)
+
 const policySnapshot = {
   algorithm: 'hybrid-v2',
   rateMode: 'whole_shipment',
@@ -1295,6 +1506,47 @@ assert.deepEqual(
     },
   ],
 )
+const sameProviderCarriers = normalizeShopifyCarrierServiceConfigInput({
+  ...validConfig,
+  carriers: [
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000003' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+  ],
+})
+assert.deepEqual(
+  JSON.parse(JSON.stringify(sameProviderCarriers.carriers)),
+  [
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000003' },
+  ],
+  'multiple exact accounts for the same provider must be accepted and sorted',
+)
+const maxCarrierBindings = Array.from({ length: 16 }, (_, index) => ({
+  provider: index < 8 ? 'ups_rest' : 'fedex_rest',
+  carrierAccountGlobalId: `gac${String(index + 1).padStart(7, '0')}`,
+}))
+assert.equal(
+  normalizeShopifyCarrierServiceConfigInput({
+    ...validConfig,
+    carriers: maxCarrierBindings,
+  }).carriers.length,
+  16,
+  'paired sets totaling sixteen exact direct carrier accounts must be accepted',
+)
+assert.throws(
+  () => normalizeShopifyCarrierServiceConfigInput({
+    ...validConfig,
+    carriers: [
+      ...maxCarrierBindings,
+      { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000017' },
+    ],
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID'
+  ),
+  'a seventeenth configured direct carrier account must be rejected',
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(normalizedConfig.carriers)),
   [
@@ -1323,6 +1575,30 @@ assert.throws(
     && error.code === 'SHOPIFY_CHECKOUT_CARRIER_BINDINGS_INVALID'
   ),
 )
+
+includes(configuredCarrierMigration, [
+  'PRIMARY KEY (organization_id, config_id, carrier_account_id)',
+  'PRIMARY KEY (organization_id, receipt_id, carrier_account_id)',
+  'operations_shopify_carrier_service_config_environment_is_ready(',
+  "config.id, 'sandbox'",
+  "config.id, 'production'",
+  "carrier_account.registered_address ->> 'line1'",
+  "warehouse.address ->> 'line1'",
+  ') BETWEEN 1 AND 16',
+  ') BETWEEN 1 AND 8',
+  'expected_account_count NOT BETWEEN 1 AND 8',
+  "WHEN 'shadow' THEN 'sandbox'",
+  "WHEN 'active' THEN 'production'",
+  "'clawpilot.shopify_carrier_binding_write_token'",
+  'degraded_attempt_with_offer_count',
+], 'paired environment account-keyed configured-carrier migration')
+assert.equal(
+  configuredCarrierMigration.includes(
+    'successful_attempt_without_offer_count',
+  ),
+  false,
+  '0285 finalization must allow a successful losing account without an offer',
+)
 assert.throws(
   () => normalizeShopifyCarrierServiceConfigInput({
     ...validConfig,
@@ -1330,7 +1606,7 @@ assert.throws(
       validConfig.carriers[0],
       {
         provider: 'ups_rest',
-        carrierAccountGlobalId: 'gac0000002',
+        carrierAccountGlobalId: 'gac0000001',
       },
     ],
   }),

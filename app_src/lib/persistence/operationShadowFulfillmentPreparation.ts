@@ -20,6 +20,7 @@ export async function readShadowFulfillmentPreparation(
     checkout_run_id: string
     checkout_run_global_id: string
     checkout_package_count: number
+    checkout_carrier_account_global_id: string
     checkout_provider: 'ups_rest' | 'fedex_rest'
     checkout_service_code: string
     checkout_service_name: string
@@ -29,6 +30,7 @@ export async function readShadowFulfillmentPreparation(
     fulfillment_run_id: string
     fulfillment_run_global_id: string
     fulfillment_package_count: number
+    fulfillment_carrier_account_global_id: string
     fulfillment_provider: 'ups_rest' | 'fedex_rest'
     fulfillment_service_code: string
     fulfillment_service_name: string
@@ -58,6 +60,8 @@ export async function readShadowFulfillmentPreparation(
        checkout_run.id::text AS checkout_run_id,
        checkout_run.global_id AS checkout_run_global_id,
        checkout_run.package_count AS checkout_package_count,
+       checkout_carrier_account.global_id
+         AS checkout_carrier_account_global_id,
        checkout_run.selected_provider AS checkout_provider,
        checkout_run.selected_service_code AS checkout_service_code,
        checkout_run.selected_service_name AS checkout_service_name,
@@ -69,6 +73,8 @@ export async function readShadowFulfillmentPreparation(
        fulfillment_run.id::text AS fulfillment_run_id,
        fulfillment_run.global_id AS fulfillment_run_global_id,
        fulfillment_run.package_count AS fulfillment_package_count,
+       fulfillment_carrier_account.global_id
+         AS fulfillment_carrier_account_global_id,
        fulfillment_run.selected_provider AS fulfillment_provider,
        fulfillment_run.selected_service_code AS fulfillment_service_code,
        fulfillment_run.selected_service_name AS fulfillment_service_name,
@@ -93,9 +99,19 @@ export async function readShadowFulfillmentPreparation(
      JOIN operations_pack_rate_runs checkout_run
        ON checkout_run.organization_id = execution.organization_id
       AND checkout_run.id = execution.checkout_pack_rate_run_id
+     JOIN operations_carrier_accounts checkout_carrier_account
+       ON checkout_carrier_account.organization_id
+         = checkout_run.organization_id
+      AND checkout_carrier_account.id
+        = checkout_run.selected_carrier_account_id
      JOIN operations_pack_rate_runs fulfillment_run
        ON fulfillment_run.organization_id = execution.organization_id
       AND fulfillment_run.id = execution.fulfillment_pack_rate_run_id
+     JOIN operations_carrier_accounts fulfillment_carrier_account
+       ON fulfillment_carrier_account.organization_id
+         = fulfillment_run.organization_id
+      AND fulfillment_carrier_account.id
+        = fulfillment_run.selected_carrier_account_id
      JOIN operations_pack_rate_variances variance
        ON variance.organization_id = execution.organization_id
       AND variance.checkout_run_id = execution.checkout_pack_rate_run_id
@@ -216,7 +232,7 @@ export async function readShadowFulfillmentPreparation(
         AND rate_evidence.id = attempt.carrier_rate_request_id
        WHERE attempt.organization_id = $1::uuid
          AND attempt.execution_id = $2::uuid
-       ORDER BY attempt.carrier_provider`,
+       ORDER BY carrier_account.global_id, attempt.carrier_provider`,
       [organizationId, execution.execution_id],
     ),
   ])
@@ -281,6 +297,8 @@ export async function readShadowFulfillmentPreparation(
       execution.checkout_run_global_id,
       execution.checkout_package_count,
       {
+        carrierAccountGlobalId:
+          execution.checkout_carrier_account_global_id,
         provider: execution.checkout_provider,
         serviceCode: execution.checkout_service_code,
         serviceName: execution.checkout_service_name,
@@ -294,6 +312,8 @@ export async function readShadowFulfillmentPreparation(
       execution.fulfillment_run_global_id,
       execution.fulfillment_package_count,
       {
+        carrierAccountGlobalId:
+          execution.fulfillment_carrier_account_global_id,
         provider: execution.fulfillment_provider,
         serviceCode: execution.fulfillment_service_code,
         serviceName: execution.fulfillment_service_name,

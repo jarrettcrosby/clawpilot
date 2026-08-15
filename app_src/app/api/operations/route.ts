@@ -14,6 +14,7 @@ import type {
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import { OperationsShadowTrainingError } from '@/lib/operations/shadowTraining'
 import { canRequestOperationsPickHandoff } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -49,6 +50,7 @@ import {
   recordWearablePickScanEvidenceFromPostgres,
   reconcileShopifyExternalFulfillmentFromPostgres,
   releaseOperationsOrderFromPostgres,
+  reopenOperationsOrderForReplanningInPostgres,
   requestOperationsPickHandoffFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -58,6 +60,7 @@ import {
   updateOperationsWarehouseInPostgres,
   verifyOperationsOrderPackFromPostgres,
 } from '@/lib/persistence/operations'
+import { assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres } from '@/lib/persistence/operationShadowTraining'
 import {
   createOperationsSandboxLabelInPostgres,
   voidOperationsSandboxLabelInPostgres,
@@ -119,6 +122,26 @@ const ORDER_STATUSES = new Set<OperationsOrderStatus>([
 ])
 const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
   'open', 'acknowledged', 'resolved', 'dismissed',
+])
+// Canonical fulfillment commands are never an execution path for a connected
+// Shopify/Faire order while Operations is in Shadow. Provider reconciliation
+// actions are intentionally absent: the canonical order must keep mirroring
+// provider state while an exact-order training overlay progresses separately.
+const SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS = new Set([
+  'plan-order',
+  'release-order',
+  'assign-picks',
+  'manage-pick-assignment',
+  'request-pick-handoff',
+  'record-pick-scan-evidence',
+  'confirm-picks',
+  'verify-pack',
+  'authorize-sandbox-commerce-e2e',
+  'prepare-shipment-execution',
+  'generate-packing-slip',
+  'confirm-shipment',
+  'create-sandbox-label',
+  'void-sandbox-label',
 ])
 const ACTIVATION_STATES = new Set<OperationsActivationState>([
   'disabled', 'shadow', 'read_only', 'active', 'frozen',
@@ -956,6 +979,9 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof OperationsShadowTrainingError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (error instanceof CommerceActiveTransitionPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
@@ -1054,6 +1080,16 @@ export async function POST(req: NextRequest) {
     const capabilities = operationsCapabilities(actor)
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
+    if (SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS.has(action)) {
+      await assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+      })
+    }
     if (action === 'create-warehouse') {
       if (!capabilities.canManage) {
         return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
@@ -1383,14 +1419,16 @@ export async function POST(req: NextRequest) {
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
+      const organizationId = activeOperationsOrganizationId(actor)
+      const orderGlobalId = globalIdValue(
+        body.orderGlobalId,
+        'Operations order',
+        ORDER_GLOBAL_ID,
+      )
       const result = await planOperationsOrderFromPostgres({
-        organizationId: activeOperationsOrganizationId(actor),
+        organizationId,
         actorEmail: actor.email,
-        orderGlobalId: globalIdValue(
-          body.orderGlobalId,
-          'Operations order',
-          ORDER_GLOBAL_ID,
-        ),
+        orderGlobalId,
         cartonizationEvidenceGlobalId: globalIdValue(
           body.cartonizationEvidenceGlobalId,
           'Cartonization evidence',
@@ -1431,6 +1469,77 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
+    }
+    if (action === 'reopen-order-for-replanning') {
+      if (!capabilities.canManage) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to correct warehouse work',
+          code: 'OPERATIONS_MANAGE_REQUIRED',
+        }, 403)
+      }
+      if (!capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute warehouse work corrections',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedPlanGlobalId',
+          'expectedPlanVersion',
+          'expectedCorrectionFingerprint',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const expectedCorrectionFingerprint = textValue(
+        body.expectedCorrectionFingerprint,
+        'Correction fingerprint',
+        64,
+      ).toLowerCase()
+      if (!SHA256.test(expectedCorrectionFingerprint)) {
+        requestError(
+          'OPERATIONS_REPLANNING_FINGERPRINT_INVALID',
+          'Correction fingerprint is invalid',
+        )
+      }
+      const result = await reopenOperationsOrderForReplanningInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedPlanGlobalId: globalIdValue(
+          body.expectedPlanGlobalId,
+          'Fulfillment plan',
+          /^gfp(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
+        expectedPlanVersion: integerValue(
+          body.expectedPlanVersion,
+          'Fulfillment plan version',
+          1,
+          2_147_483_647,
+        ),
+        expectedCorrectionFingerprint,
+        reason: textValue(body.reason, 'Correction reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
     }
     if (action === 'assign-picks') {
       if (!capabilities.canManage || !capabilities.canExecute) {

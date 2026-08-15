@@ -17,6 +17,7 @@ import {
   updateCarrierCredential,
 } from '@/lib/integrations/carrierIntegrations'
 import { carrierProductionLabelRuntimePolicy } from '@/lib/integrations/carrierProductionLabelRuntime'
+import { testCarrierProductionShippingDiagnosticRate } from '@/lib/integrations/carrierShippingDiagnosticRate'
 import {
   closeCarrierRateTestSampleLabel,
   createCarrierRateTestLabel,
@@ -102,7 +103,7 @@ function requireExecutor(actor: AppUser) {
   const capabilities = operationsCapabilities(actor)
   if (!capabilities.canManage || !capabilities.canExecute) {
     throw new CarrierIntegrationRequestError(
-      'Operations-management and warehouse-execution permissions are required for sandbox label actions',
+      'Operations-management and warehouse-execution permissions are required for carrier label actions',
       403,
       'CARRIER_EXECUTE_REQUIRED',
     )
@@ -288,7 +289,7 @@ function destinationInput(value: unknown) {
   }
   if (countryCode !== 'US') {
     throw new CarrierIntegrationRequestError(
-      'Sandbox label testing currently requires a US destination',
+      'Shipping account diagnostics currently require a US destination',
       400,
       'CARRIER_REQUEST_INVALID',
     )
@@ -302,6 +303,64 @@ function destinationInput(value: unknown) {
     postalCode,
     countryCode: 'US' as const,
   }
+}
+
+function diagnosticParcelInput(value: unknown) {
+  const parcel = objectField(value, 'Diagnostic parcel')
+  only(parcel, [
+    'description', 'length', 'width', 'height', 'dimensionUnit',
+    'weight', 'weightUnit',
+  ])
+  const decimal = (entry: unknown, label: string, maximum: number) => {
+    const parsed = typeof entry === 'number' ? entry : Number.NaN
+    if (
+      !Number.isFinite(parsed)
+      || parsed <= 0
+      || parsed > maximum
+      || Math.round(parsed * 1_000) / 1_000 !== parsed
+    ) {
+      throw new CarrierIntegrationRequestError(
+        `${label} must be a positive number no greater than ${maximum} with at most three decimals`,
+        400,
+        'CARRIER_REQUEST_INVALID',
+      )
+    }
+    return parsed
+  }
+  if (parcel.dimensionUnit !== 'IN' || parcel.weightUnit !== 'LB') {
+    throw new CarrierIntegrationRequestError(
+      'Diagnostic parcel units must be IN and LB',
+      400,
+      'CARRIER_REQUEST_INVALID',
+    )
+  }
+  return {
+    description: plainText(parcel.description, 'Parcel description', 120),
+    length: decimal(parcel.length, 'Parcel length', 108),
+    width: decimal(parcel.width, 'Parcel width', 108),
+    height: decimal(parcel.height, 'Parcel height', 108),
+    dimensionUnit: 'IN' as const,
+    weight: decimal(parcel.weight, 'Parcel weight', 150),
+    weightUnit: 'LB' as const,
+  }
+}
+
+function directShippingProvider(value: unknown): 'ups_rest' | 'fedex_rest' {
+  if (value === 'ups_rest' || value === 'fedex_rest') return value
+  throw new CarrierIntegrationRequestError(
+    'Shipping account diagnostics are available only for UPS and FedEx',
+    400,
+    'CARRIER_REQUEST_INVALID',
+  )
+}
+
+function diagnosticEnvironment(value: unknown): 'sandbox' | 'production' {
+  if (value === 'sandbox' || value === 'production') return value
+  throw new CarrierIntegrationRequestError(
+    'Shipping diagnostic environment is invalid',
+    400,
+    'CARRIER_REQUEST_INVALID',
+  )
 }
 
 function safeRateTestPrinter(
@@ -328,6 +387,7 @@ function safeRateTestLabel(
   return {
     globalId: label.globalId,
     rateEvidenceGlobalId: label.rateEvidenceGlobalId,
+    carrierAccountGlobalId: label.carrierAccountGlobalId,
     provider: label.provider,
     environment: label.environment,
     serviceCode: label.serviceCode,
@@ -336,10 +396,12 @@ function safeRateTestLabel(
     ratedAmount: label.ratedAmount,
     ratedCurrency: label.ratedCurrency,
     trackingNumber: label.trackingNumber,
-    lifecycleMode: carrierSandboxLabelLifecycleMode(
-      label.provider,
-      label.trackingNumber,
-    ),
+    lifecycleMode: label.environment === 'production'
+      ? 'carrier_void'
+      : carrierSandboxLabelLifecycleMode(
+          label.provider,
+          label.trackingNumber,
+        ),
     format: label.format,
     mediaSize: label.mediaSize,
     sourceKind: label.sourceKind,
@@ -389,6 +451,7 @@ function safeRateTestLabelAttempt(
     action: attempt.action,
     state: attempt.state,
     provider: attempt.provider,
+    environment: attempt.environment,
     serviceCode: attempt.serviceCode,
     selectedRate: attempt.selectedRate,
     reason: attempt.reason,
@@ -551,6 +614,54 @@ export async function PATCH(req: NextRequest) {
       })
       return json({ ok: true, canManage: true, integrations })
     }
+    if (action === 'test-shipping-diagnostic-rate') {
+      only(body, [
+        'action',
+        'provider',
+        'environment',
+        'integrationAccountGlobalId',
+        'carrierAccountGlobalId',
+        'destination',
+        'destinationResidential',
+        'parcel',
+      ])
+      const provider = directShippingProvider(body.provider)
+      const environment = diagnosticEnvironment(body.environment)
+      const carrierAccountGlobalId = plainText(
+        body.carrierAccountGlobalId,
+        'Carrier account reference',
+        64,
+      )
+      const destination = destinationInput(body.destination)
+      const parcel = diagnosticParcelInput(body.parcel)
+      const rateTest = environment === 'sandbox'
+        ? await testCarrierSandboxRate({
+            organizationId: organization,
+            provider,
+            environment,
+            carrierAccountGlobalId,
+            destination,
+            parcel,
+            actorEmail: actor.email,
+          })
+        : await testCarrierProductionShippingDiagnosticRate({
+            organizationId: organization,
+            actorEmail: actor.email,
+            provider,
+            integrationAccountGlobalId: plainText(
+              body.integrationAccountGlobalId,
+              'Production connection reference',
+              64,
+            ),
+            carrierAccountGlobalId,
+            destination: {
+              ...destination,
+              residential: body.destinationResidential === true,
+            },
+            parcel,
+          })
+      return json({ ok: true, canManage: true, rateTest })
+    }
     if (action === 'test-sandbox-rate') {
       only(body, [
         'action',
@@ -577,6 +688,11 @@ export async function PATCH(req: NextRequest) {
         'rateEvidenceGlobalId',
         'selectedRate',
         'destination',
+        'destinationResidential',
+        'parcel',
+        'shipFromPhone',
+        'shipToPhone',
+        'operatorConfirmation',
         'outputFormat',
         'reason',
         'idempotencyKey',
@@ -595,6 +711,20 @@ export async function PATCH(req: NextRequest) {
         rateEvidenceGlobalId,
         selectedRate,
         destination,
+        destinationResidential: body.destinationResidential === true,
+        parcel: body.parcel === undefined
+          ? undefined
+          : diagnosticParcelInput(body.parcel),
+        shipFromPhone: body.shipFromPhone === undefined
+          ? undefined
+          : plainText(body.shipFromPhone, 'Sender phone', 24),
+        shipToPhone: body.shipToPhone === undefined
+          ? undefined
+          : plainText(body.shipToPhone, 'Recipient phone', 24),
+        operatorConfirmation: body.operatorConfirmation === undefined
+          ? undefined
+          : plainText(body.operatorConfirmation, 'REAL POSTAGE confirmation', 300),
+        productionAuthorizedByOwnerAdmin: canRevealCredential(actor),
         outputFormat: labelOutputFormat(body.outputFormat),
         reason: plainText(body.reason, 'Test-label reason', 500),
         idempotencyKey: idempotencyKey(body.idempotencyKey),
