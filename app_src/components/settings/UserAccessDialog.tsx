@@ -2027,6 +2027,10 @@ export default function UserAccessDialog({
               currentUser?.role === 'owner'
               || currentUser?.permissions.manageOperations
             )}
+            onNavigate={(hash) => {
+              onClose()
+              window.location.hash = hash
+            }}
           />
         ) : null}
         {!loading && activeTab === 4 ? <SessionSecurityPanel /> : null}

@@ -9,6 +9,7 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import { assertNoOpenOperationsShadowTrainingRunsForActivation } from '@/lib/persistence/operationShadowTraining'
 import type {
   CommerceActiveContinuation,
 } from '@/lib/operations/commerceActiveSelection'
@@ -1351,6 +1352,7 @@ async function registeredShopifyCarrierServiceRebindings(
     callback_token_version: number
     row_version: string
     unsafe_authorization_exists: boolean
+    production_callback_ready: boolean
   }>(
     `SELECT
        config.id::text,
@@ -1390,7 +1392,12 @@ async function registeredShopifyCarrierServiceRebindings(
                AND authorized_mutation.expires_at <= now()
              )
            ) IS NOT TRUE
-       ) AS unsafe_authorization_exists
+       ) AS unsafe_authorization_exists,
+       operations_shopify_carrier_service_config_environment_is_ready(
+         config.organization_id,
+         config.id,
+         'production'
+       ) AS production_callback_ready
      FROM operations_shopify_carrier_service_configs config
      JOIN operations_integration_accounts account
        ON account.organization_id = config.organization_id
@@ -1431,10 +1438,11 @@ async function registeredShopifyCarrierServiceRebindings(
       row.activation_revision !== input.expectedActivationRevision
       || !row.service_gid
       || !SHOPIFY_CARRIER_SERVICE_GID.test(row.service_gid)
+      || row.production_callback_ready !== true
     ) {
       fail(
         'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_STALE',
-        'A registered Shopify CarrierService is not ready at the exact Shadow activation revision',
+        'A registered Shopify CarrierService does not have an exact ready LIVE carrier-account set at the Shadow activation revision',
       )
     }
     if (row.unsafe_authorization_exists) {
@@ -1749,6 +1757,10 @@ export async function consumeCommerceActiveTransitionAuthorizationInPostgres(
         'Operations activation changed before authorization consumption',
       )
     }
+    await assertNoOpenOperationsShadowTrainingRunsForActivation(
+      client,
+      scopedOrganizationId,
+    )
     const current = await client.query<{ current: boolean }>(
       `SELECT operations_commerce_active_preparation_is_current(
          $1::uuid,

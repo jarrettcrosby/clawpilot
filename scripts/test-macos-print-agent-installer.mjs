@@ -28,6 +28,8 @@ assert.match(result.plist, /FHMXLAB35\.local/)
 assert.doesNotMatch(result.plist, /CLAWPILOT_PRINT_AGENT_CREDENTIAL/)
 assert.doesNotMatch(result.plist, /cpprint\.v1\./)
 assert.match(result.runtimePath, /Application Support\/ClawPilot\/print-agent/)
+assert.match(result.runtimeDeviceHelperPath, /print-agent.*lib\/local-print-device\.mjs/)
+assert.match(result.runtimeDeliveryHelperPath, /print-agent.*lib\/submit-raw-print\.mjs/)
 if (process.platform === 'darwin') {
   const expectedNodePath = existsSync('/opt/homebrew/bin/node')
     ? '/opt/homebrew/bin/node'

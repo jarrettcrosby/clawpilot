@@ -72,6 +72,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/operations/print-agent/jobs'
+    || normalizedPath === '/api/operations/print-agent/pair'
     || normalizedPath === '/api/shortlinks'
     || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')

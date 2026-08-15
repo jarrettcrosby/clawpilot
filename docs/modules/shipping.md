@@ -111,6 +111,39 @@ read and update that same organization-scoped encrypted account, and activating
 one rating mode preserves an already-active second mode. This avoids duplicate
 credentials while keeping parcel and LTL readiness visible independently.
 
+### Guarded production-label exercise
+
+Direct UPS/FedEx one-off execution follows the selected connection environment:
+a production connection uses the production rate and Ship endpoints, while a
+sandbox connection remains on the provider sandbox. The live whole-shipment
+path is available in the hosted production lane and in the exact trusted
+ClawPilot Railway app service, project, and environment. Vercel deployments, browser
+previews, generic development markers, and local runtimes cannot authorize or
+select production postage.
+
+Railway development eligibility is only a runtime boundary. It does not grant
+carrier authority. Before any production provider call, the command still
+requires all of the following current facts:
+
+- Operations is Active and the actor can manage, execute, and activate
+  Operations;
+- the exact production UPS/FedEx connection is active, verified, and separately
+  authorized for both `production_rate` and `production_label`;
+- one active sender-billing account matches the sealed packed-rate evidence;
+- every package is still packed, its immutable dimensions, weight, contents,
+  and selected unexpired whole-shipment offer still match, and no competing
+  active label or shipment exists;
+- the operator supplies the explicit live-postage confirmation for the single
+  idempotent purchase and the durable pre-call fence still passes.
+
+A successful request creates real production postage and may incur charges.
+The complete label group must be reviewed and then voided through ClawPilot for
+an approved development exercise. Revoking `production_label` immediately
+blocks new purchases but deliberately does not disable the exact-account void
+path, so already purchased postage cannot be stranded. Provider acceptance is
+not claimed by the runtime or unit tests; it requires a separately authorized
+live exercise and recorded create/void evidence.
+
 ## Hermetic contract regression
 
 `npm run test:shipping-package-catalog` runs both the catalog/UI contract and

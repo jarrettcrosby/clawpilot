@@ -145,8 +145,16 @@ mock.module('@/lib/operations/shopifyCheckoutRating', {
 
 mock.module('@/lib/integrations/carrierCheckoutRate', {
   namedExports: {
+    CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS: 8,
     rateOptimizedCheckoutPlans:
       unexpectedDownstreamCall('carrier_rate_optimization'),
+  },
+})
+
+mock.module('@/lib/integrations/shopifyCarrierServiceProductionRate', {
+  namedExports: {
+    rateShopifyProductionCheckoutShipment:
+      unexpectedDownstreamCall('production_provider_rate'),
   },
 })
 

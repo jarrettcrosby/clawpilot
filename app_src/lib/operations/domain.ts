@@ -59,6 +59,7 @@ export function availableOperationsOrderActions(input: {
   nativeOneOffGroupReady?: boolean
   nativeOneOffGroupBlockedReason?: string | null
   shopifyExternalFulfillmentReconciliationRequired?: boolean
+  replanningCorrection?: OperationsOrderActionAvailability | null
 }): OperationsOrderActionAvailability[] {
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
@@ -242,7 +243,7 @@ export function availableOperationsOrderActions(input: {
       || 'Exact checkout, carton, allocation, and UPS/FedEx sandbox evidence is required.'
   }
 
-  return [
+  const actions: OperationsOrderActionAvailability[] = [
     {
       action: 'release_to_warehouse',
       label: 'Release to warehouse',
@@ -280,6 +281,85 @@ export function availableOperationsOrderActions(input: {
       blockedReason: shipmentBlockedReason,
     },
   ]
+  if (input.replanningCorrection) actions.push(input.replanningCorrection)
+  return actions
+}
+
+export function operationsOrderReplanningActionAvailability(input: {
+  activationState: OperationsActivationState
+  canManage: boolean
+  canExecute: boolean
+  sourceProvider: string
+  orderType: string
+  status: OperationsOrderStatus
+  planStatus: string | null
+  waveStatus: string | null
+  exactStateReady: boolean
+  exactStateBlockedCode?: string | null
+  exactStateBlockedReason?: string | null
+  expectedPlanGlobalId?: string | null
+  expectedPlanVersion?: number | null
+  expectedCorrectionFingerprint?: string | null
+}): OperationsOrderActionAvailability {
+  let blockedCode: string | null = null
+  let blockedReason: string | null = null
+  if (!input.canManage) {
+    blockedCode = 'OPERATIONS_MANAGE_REQUIRED'
+    blockedReason = 'Operations manage permission is required.'
+  } else if (!input.canExecute) {
+    blockedCode = 'OPERATIONS_EXECUTE_REQUIRED'
+    blockedReason = 'Operations execute permission is required.'
+  } else if (input.activationState !== 'active') {
+    blockedCode = 'OPERATIONS_REPLANNING_ACTIVE_REQUIRED'
+    blockedReason = 'Operational correction is available only in Operations Active.'
+  } else if (!['shopify', 'faire'].includes(input.sourceProvider)) {
+    blockedCode = 'OPERATIONS_REPLANNING_PROVIDER_INVALID'
+    blockedReason = 'Only a connected Shopify or Faire order can be reopened for replanning.'
+  } else if (input.orderType === 'one_off' || input.sourceProvider === 'clawpilot_native') {
+    blockedCode = 'OPERATIONS_REPLANNING_ORDER_TYPE_INVALID'
+    blockedReason = 'Native one-off and mock orders use their own correction workflow.'
+  } else if (input.status === 'released') {
+    blockedCode = 'OPERATIONS_REPLANNING_RELEASED_RECALL_REQUIRED'
+    blockedReason = 'Released work cannot be reopened until ClawPilot can recall and receive acknowledgement from every picker device holding this wave.'
+  } else if (input.status !== 'planned') {
+    blockedCode = 'OPERATIONS_REPLANNING_STATUS_INVALID'
+    blockedReason = 'Only a planned order that has not been released to pickers can be reopened.'
+  } else if (
+    input.planStatus !== 'planned'
+    || input.waveStatus !== null
+  ) {
+    blockedCode = 'OPERATIONS_REPLANNING_PLAN_STATE_INVALID'
+    blockedReason = 'The current planned order has already entered warehouse release state.'
+  } else if (!input.exactStateReady) {
+    blockedCode = input.exactStateBlockedCode || 'OPERATIONS_REPLANNING_STATE_INVALID'
+    blockedReason = input.exactStateBlockedReason
+      || 'Warehouse or execution evidence prevents this order from being reopened safely.'
+  } else if (
+    !input.expectedPlanGlobalId
+    || !Number.isSafeInteger(input.expectedPlanVersion)
+    || Number(input.expectedPlanVersion) < 1
+    || !/^[a-f0-9]{64}$/.test(input.expectedCorrectionFingerprint || '')
+  ) {
+    blockedCode = 'OPERATIONS_REPLANNING_FINGERPRINT_UNAVAILABLE'
+    blockedReason = 'Refresh the order before reopening it for replanning.'
+  }
+
+  const enabled = blockedReason === null
+  return {
+    action: 'reopen_for_replanning',
+    label: 'Reopen for replanning',
+    enabled,
+    blockedCode,
+    blockedReason,
+    consequenceSummary: enabled
+      ? 'Cancels the unreleased local plan, releases active inventory and packaging claims, and returns the unchanged provider order to Imported. No carrier or storefront calls are made.'
+      : null,
+    expectedPlanGlobalId: input.expectedPlanGlobalId || null,
+    expectedPlanVersion: input.expectedPlanVersion || null,
+    expectedCorrectionFingerprint: enabled
+      ? input.expectedCorrectionFingerprint || null
+      : null,
+  }
 }
 
 function integer(value: unknown, fallback = 0): number {

@@ -174,7 +174,7 @@ test('fingerprint is canonical across line order and ephemeral contact changes',
   )
 })
 
-test('fingerprint coalesces progressive address enrichment within one rate zone', () => {
+test('fingerprint separates every rate-material destination address', () => {
   const zipOnly = fixture()
   Object.assign(zipOnly.rate.destination, {
     province: null,
@@ -186,7 +186,7 @@ test('fingerprint coalesces progressive address enrichment within one rate zone'
 
   assert.equal(
     SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION,
-    'shopify-carrier-service-rate-v2',
+    'shopify-carrier-service-rate-v3',
   )
   const zipOnlyFingerprint = fingerprintShopifyCarrierServiceRateRequest(
     parseShopifyCarrierServiceRateRequest(zipOnly),
@@ -195,10 +195,10 @@ test('fingerprint coalesces progressive address enrichment within one rate zone'
     parseShopifyCarrierServiceRateRequest(fullAddress),
   )
 
-  assert.equal(
+  assert.notEqual(
     zipOnlyFingerprint,
     fullAddressFingerprint,
-    'ZIP-only and enriched callbacks must reuse one receipt',
+    'ZIP-only and enriched callbacks must never reuse one LIVE-rate receipt',
   )
 
   const differentZip = fixture()

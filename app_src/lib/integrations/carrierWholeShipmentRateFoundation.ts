@@ -50,14 +50,14 @@ export const FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES = Object.freeze({
 
 export type CarrierWholeShipmentRateParty = {
   name: string
-  phone: string
+  phone: string | null
   line1: string
   line2: string | null
   city: string
   region: string
   postalCode: string
   countryCode: 'US'
-  residential: boolean
+  residential: boolean | null
 }
 
 export type CarrierWholeShipmentRateDestination = {
@@ -68,7 +68,7 @@ export type CarrierWholeShipmentRateDestination = {
   region: string | null
   postalCode: string
   countryCode: 'US'
-  residential: boolean
+  residential: boolean | null
 }
 
 export type CarrierWholeShipmentRateParcel = {
@@ -160,11 +160,15 @@ export type CarrierWholeShipmentRateRequestEvidence = {
   shipment: {
     originFingerprint: string
     destinationFingerprint: string
-    origin: { region: string; countryCode: 'US'; residential: boolean }
+    origin: {
+      region: string
+      countryCode: 'US'
+      residential: boolean | null
+    }
     destination: {
       region: string | null
       countryCode: 'US'
-      residential: boolean
+      residential: boolean | null
     }
     fedexPickupType: CarrierWholeShipmentFedexPickupType | null
     parcels: NormalizedCarrierWholeShipmentRateParcel[]
@@ -384,6 +388,10 @@ function booleanValue(value: unknown, label: string) {
   return value
 }
 
+function nullableBooleanValue(value: unknown, label: string) {
+  return value === null ? null : booleanValue(value, label)
+}
+
 function usPhone(value: unknown, label: string) {
   const phone = plainText(value, label, 24)
   if (!/^\+?[0-9() .-]+$/.test(phone)) {
@@ -395,6 +403,10 @@ function usPhone(value: unknown, label: string) {
     throw new Error(`${label} must be a ten-digit US phone number`)
   }
   return digits
+}
+
+function nullableUsPhone(value: unknown, label: string) {
+  return value === null ? null : usPhone(value, label)
 }
 
 function expectedCurrency(value: unknown): 'USD' {
@@ -464,14 +476,17 @@ function normalizeParty(value: unknown): CarrierWholeShipmentRateParty {
   const input = record(value)
   return {
     name: plainText(input.name, 'Origin name', 120),
-    phone: usPhone(input.phone, 'Origin phone'),
+    phone: nullableUsPhone(input.phone, 'Origin phone'),
     line1: plainText(input.line1, 'Origin address line 1', 160),
     line2: optionalPlainText(input.line2, 'Origin address line 2', 120),
     city: plainText(input.city, 'Origin city', 100),
     region: usRegion(input.region, 'Origin region'),
     postalCode: usPostalCode(input.postalCode, 'Origin postal code'),
     countryCode: usCountry(input.countryCode, 'Origin country code'),
-    residential: booleanValue(input.residential, 'Origin residential classification'),
+    residential: nullableBooleanValue(
+      input.residential,
+      'Origin residential classification',
+    ),
   }
 }
 
@@ -501,7 +516,7 @@ function normalizeDestination(
     region: regionValue ? usRegion(regionValue, 'Destination region') : null,
     postalCode: usPostalCode(input.postalCode, 'Destination postal code'),
     countryCode: usCountry(input.countryCode, 'Destination country code'),
-    residential: booleanValue(
+    residential: nullableBooleanValue(
       input.residential,
       'Destination residential classification',
     ),
@@ -513,13 +528,26 @@ export function carrierWholeShipmentRateAddressFingerprints(input: {
   destination: CarrierWholeShipmentRateDestination
 }): CarrierWholeShipmentRateAddressFingerprints {
   const origin = normalizeParty(input.origin)
-  const destination = normalizeDestination(input.destination)
   return deepFreeze({
     originFingerprint: hash({ version: 'carrier-rate-origin-v1', origin }),
-    destinationFingerprint: hash({
-      version: 'carrier-rate-destination-v1',
-      destination,
-    }),
+    destinationFingerprint: carrierWholeShipmentRateDestinationFingerprint(
+      input.destination,
+    ),
+  })
+}
+
+/**
+ * Canonical destination identity used by production whole-shipment evidence.
+ * Callers that prepare durable authority before the provider read must use
+ * this helper instead of reproducing the fingerprint algorithm.
+ */
+export function carrierWholeShipmentRateDestinationFingerprint(
+  value: CarrierWholeShipmentRateDestination,
+) {
+  const destination = normalizeDestination(value)
+  return hash({
+    version: 'carrier-rate-destination-v1',
+    destination,
   })
 }
 
@@ -721,7 +749,7 @@ function fedexRequest(
         contact: {
           personName: origin.name,
           companyName: origin.name,
-          phoneNumber: origin.phone,
+          ...(origin.phone ? { phoneNumber: origin.phone } : {}),
         },
         address: {
           streetLines: [origin.line1, ...(origin.line2 ? [origin.line2] : [])],
@@ -729,7 +757,9 @@ function fedexRequest(
           stateOrProvinceCode: origin.region,
           postalCode: origin.postalCode,
           countryCode: origin.countryCode,
-          residential: origin.residential,
+          ...(origin.residential === null
+            ? {}
+            : { residential: origin.residential }),
         },
       },
       recipient: {
@@ -748,7 +778,9 @@ function fedexRequest(
             : {}),
           postalCode: destination.postalCode,
           countryCode: destination.countryCode,
-          residential: destination.residential,
+          ...(destination.residential === null
+            ? {}
+            : { residential: destination.residential }),
         },
       },
       pickupType,
@@ -780,7 +812,9 @@ function upsParty(address: CarrierWholeShipmentRateParty) {
       StateProvinceCode: address.region,
       PostalCode: address.postalCode,
       CountryCode: address.countryCode,
-      ...(address.residential ? { ResidentialAddressIndicator: '' } : {}),
+      ...(address.residential === true
+        ? { ResidentialAddressIndicator: '' }
+        : {}),
     },
   }
 }
@@ -801,7 +835,9 @@ function upsDestination(address: CarrierWholeShipmentRateDestination) {
       ...(address.region ? { StateProvinceCode: address.region } : {}),
       PostalCode: address.postalCode,
       CountryCode: address.countryCode,
-      ...(address.residential ? { ResidentialAddressIndicator: '' } : {}),
+      ...(address.residential === true
+        ? { ResidentialAddressIndicator: '' }
+        : {}),
     },
   }
 }
@@ -1269,7 +1305,10 @@ function exactList(value: unknown, label: string): unknown[] {
 function upsAddress(
   value: unknown,
   label: string,
-  options: { destination: boolean },
+  options: {
+    destination: boolean
+    residential: boolean | null
+  },
 ) {
   const source = record(value)
   const expectedKeys = [
@@ -1293,6 +1332,12 @@ function upsAddress(
   ) {
     throw new Error(`${label} residential indicator is invalid`)
   }
+  if (
+    (address.ResidentialAddressIndicator === '')
+      !== (options.residential === true)
+  ) {
+    throw new Error(`${label} residential indicator does not match evidence`)
+  }
   const lines = address.AddressLine === undefined
     ? []
     : exactList(address.AddressLine, `${label} lines`)
@@ -1304,7 +1349,7 @@ function upsAddress(
     region: address.StateProvinceCode ?? null,
     postalCode: address.PostalCode,
     countryCode: address.CountryCode,
-    residential: address.ResidentialAddressIndicator === '',
+    residential: options.residential,
   }
 }
 
@@ -1420,21 +1465,30 @@ function assertUpsBodyIntegrity(
   const originAddress = upsAddress(
     shipFrom.Address,
     'UPS origin address',
-    { destination: false },
+    {
+      destination: false,
+      residential: redacted.shipment.origin.residential,
+    },
   )
   const shipperAddress = upsAddress(
     shipper.Address,
     'UPS shipper address',
-    { destination: false },
+    {
+      destination: false,
+      residential: redacted.shipment.origin.residential,
+    },
   )
   const destinationAddress = upsAddress(
     shipTo.Address,
     'UPS destination address',
-    { destination: true },
+    {
+      destination: true,
+      residential: redacted.shipment.destination.residential,
+    },
   )
   const origin = normalizeParty({
     name: shipFrom.Name,
-    phone: '0000000000',
+    phone: null,
     ...originAddress,
   })
   const destination = normalizeDestination({
@@ -1559,7 +1613,7 @@ function fedexAddress(value: unknown, label: string, destination: boolean) {
     ...(source.stateOrProvinceCode === undefined ? [] : ['stateOrProvinceCode']),
     'postalCode',
     'countryCode',
-    'residential',
+    ...(source.residential === undefined ? [] : ['residential']),
   ]
   const address = exactObject(value, expectedKeys, label)
   const lines = address.streetLines === undefined
@@ -1575,7 +1629,7 @@ function fedexAddress(value: unknown, label: string, destination: boolean) {
     region: address.stateOrProvinceCode ?? null,
     postalCode: address.postalCode,
     countryCode: address.countryCode,
-    residential: address.residential,
+    residential: address.residential ?? null,
   }
 }
 
@@ -1663,9 +1717,14 @@ function assertFedexBodyIntegrity(
     ['contact', 'address'],
     'FedEx shipper',
   )
+  const contactSource = record(shipper.contact)
   const contact = exactObject(
     shipper.contact,
-    ['personName', 'companyName', 'phoneNumber'],
+    [
+      'personName',
+      'companyName',
+      ...(contactSource.phoneNumber === undefined ? [] : ['phoneNumber']),
+    ],
     'FedEx shipper contact',
   )
   if (contact.personName !== contact.companyName) {
@@ -1673,7 +1732,7 @@ function assertFedexBodyIntegrity(
   }
   const origin = normalizeParty({
     name: contact.personName,
-    phone: contact.phoneNumber,
+    phone: contact.phoneNumber ?? null,
     ...fedexAddress(shipper.address, 'FedEx origin address', false),
   })
   const recipient = exactObject(
@@ -1882,7 +1941,7 @@ function normalizeRequestEvidence(
           originSource.countryCode,
           'Origin evidence country code',
         ),
-        residential: booleanValue(
+        residential: nullableBooleanValue(
           originSource.residential,
           'Origin evidence residential classification',
         ),
@@ -1893,7 +1952,7 @@ function normalizeRequestEvidence(
           destinationSource.countryCode,
           'Destination evidence country code',
         ),
-        residential: booleanValue(
+        residential: nullableBooleanValue(
           destinationSource.residential,
           'Destination evidence residential classification',
         ),

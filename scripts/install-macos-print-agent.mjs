@@ -99,6 +99,9 @@ const runtimeDirectory = path.join(
   slug,
 )
 const runtimePath = path.join(runtimeDirectory, 'run-local-print-agent.mjs')
+const runtimeLibraryDirectory = path.join(runtimeDirectory, 'lib')
+const runtimeDeviceHelperPath = path.join(runtimeLibraryDirectory, 'local-print-device.mjs')
+const runtimeDeliveryHelperPath = path.join(runtimeLibraryDirectory, 'submit-raw-print.mjs')
 const ledgerPath = path.join(runtimeDirectory, 'claim-ledger.json')
 const logsDirectory = path.join(home, 'Library', 'Logs', 'ClawPilot')
 const stdoutPath = path.join(logsDirectory, `${slug}.log`)
@@ -106,6 +109,16 @@ const stderrPath = path.join(logsDirectory, `${slug}.error.log`)
 const sourceRuntime = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'run-local-print-agent.mjs',
+)
+const sourceDeviceHelper = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'lib',
+  'local-print-device.mjs',
+)
+const sourceDeliveryHelper = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'lib',
+  'submit-raw-print.mjs',
 )
 const userDomain = `gui/${process.getuid()}`
 
@@ -191,6 +204,8 @@ if (flags.has('--dry-run')) {
     label,
     plistPath,
     runtimePath,
+    runtimeDeviceHelperPath,
+    runtimeDeliveryHelperPath,
     ledgerPath,
     credentialEmbedded: plist.includes('cpprint.v1.'),
     plist,
@@ -198,7 +213,13 @@ if (flags.has('--dry-run')) {
   process.exit(0)
 }
 
-if (!existsSync(sourceRuntime)) throw new Error('The local print-agent runtime is missing')
+if (
+  !existsSync(sourceRuntime)
+  || !existsSync(sourceDeviceHelper)
+  || !existsSync(sourceDeliveryHelper)
+) {
+  throw new Error('The local print-agent runtime is missing')
+}
 execFileSync(
   '/usr/bin/security',
   ['find-generic-password', '-s', keychainService, '-a', keychainAccount, '-w'],
@@ -207,9 +228,14 @@ execFileSync(
 
 mkdirSync(launchAgentsDirectory, { recursive: true, mode: 0o700 })
 mkdirSync(runtimeDirectory, { recursive: true, mode: 0o700 })
+mkdirSync(runtimeLibraryDirectory, { recursive: true, mode: 0o700 })
 mkdirSync(logsDirectory, { recursive: true, mode: 0o700 })
 copyFileSync(sourceRuntime, runtimePath)
+copyFileSync(sourceDeviceHelper, runtimeDeviceHelperPath)
+copyFileSync(sourceDeliveryHelper, runtimeDeliveryHelperPath)
 chmodSync(runtimePath, 0o755)
+chmodSync(runtimeDeviceHelperPath, 0o644)
+chmodSync(runtimeDeliveryHelperPath, 0o755)
 writeFileSync(plistPath, plist, { mode: 0o600 })
 
 try {

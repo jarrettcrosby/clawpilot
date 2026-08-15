@@ -489,6 +489,12 @@ async function verify(databaseUrl) {
   const transactionControl = { beforeCommit: null }
   try {
     const fixture = await seed(pool)
+    // This acceptance isolates the 0283 unresolved-attempt race. The 0290
+    // Shadow canonical-plan fence has its own PostgreSQL acceptance suite.
+    await pool.query(
+      `ALTER TABLE operations_fulfillment_plans
+       DISABLE TRIGGER guard_shadow_commerce_canonical_plan_insert`,
+    )
     const persistence = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyOrderManagement.ts',
       {

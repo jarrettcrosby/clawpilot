@@ -111,6 +111,1387 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
   'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
+
+// Exact structural attestation for 0288. This is intentionally stricter than
+// checking schema_migrations: mapped refresh work must not run if a column,
+// constraint, foreign key, or rolling-deployment single-flight index drifts.
+const OPERATIONS_SHOPIFY_LOCATION_ROUTING_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0288_operations_shopify_location_routing.sql'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_commerce_inventory_location_mappings',
+        'ownership_classification', 'text', true, '''unknown''::text'
+      ),
+      (
+        'operations_commerce_inventory_location_mappings',
+        'provider_snapshot_json', 'jsonb', true, '''{}''::jsonb'
+      ),
+      (
+        'operations_commerce_inventory_location_mappings',
+        'provider_snapshot_hash', 'text', false, NULL
+      ),
+      (
+        'operations_commerce_inventory_location_mappings',
+        'provider_observed_at', 'timestamp with time zone', false, NULL
+      ),
+      (
+        'operations_commerce_inventory_location_mappings',
+        'inventory_import_enabled', 'boolean', true, 'true'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'location_mapping_id', 'uuid', false, NULL
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'location_mapping_row_version', 'bigint', false, NULL
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'provider_location_id', 'text', false, NULL
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'inventory_location_id', 'uuid', false, NULL
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'inventory_pool_id', 'uuid', false, NULL
+      )
+    ) AS required_column(
+      table_name, column_name, type_name, not_null, default_expression
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_attribute installed_column
+      LEFT JOIN pg_attrdef installed_default
+        ON installed_default.adrelid = installed_column.attrelid
+       AND installed_default.adnum = installed_column.attnum
+      WHERE installed_column.attrelid =
+              to_regclass(required_column.table_name)
+        AND installed_column.attname = required_column.column_name
+        AND installed_column.atttypid =
+              required_column.type_name::regtype
+        AND installed_column.attnotnull = required_column.not_null
+        AND NOT installed_column.attisdropped
+        AND (
+          (
+            required_column.default_expression IS NULL
+            AND installed_default.oid IS NULL
+          )
+          OR pg_get_expr(
+            installed_default.adbin,
+            installed_default.adrelid
+          ) = required_column.default_expression
+        )
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_commerce_inventory_location_mappings',
+        'operations_commerce_inventory_location_mappings_ownership_valid',
+        'CHECK ((ownership_classification = ANY (ARRAY[''unknown''::text, ''merchant_managed''::text, ''fulfillment_service''::text])))'
+      ),
+      (
+        'operations_commerce_inventory_location_mappings',
+        'operations_commerce_inventory_location_mappings_snapshot_valid',
+        'CHECK (((jsonb_typeof(provider_snapshot_json) = ''object''::text) AND (((provider_snapshot_hash IS NULL) AND (provider_observed_at IS NULL) AND (provider_snapshot_json = ''{}''::jsonb)) OR ((provider_snapshot_hash ~ ''^[a-f0-9]{64}$''::text) AND (provider_observed_at IS NOT NULL)))))'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'operations_shopify_inventory_refresh_jobs_status_check',
+        'CHECK ((status = ANY (ARRAY[''pending''::text, ''processing''::text, ''failed''::text, ''succeeded''::text, ''cancelled''::text, ''dead''::text, ''mapped_pending''::text, ''mapped_processing''::text, ''mapped_failed''::text, ''mapped_succeeded''::text, ''mapped_cancelled''::text, ''mapped_dead''::text])))'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'operations_shopify_inventory_refresh_lease_valid',
+        'CHECK ((((status = ANY (ARRAY[''processing''::text, ''mapped_processing''::text])) AND (locked_at IS NOT NULL) AND (locked_by IS NOT NULL) AND (lock_token IS NOT NULL) AND (lease_expires_at IS NOT NULL) AND (lease_expires_at > locked_at)) OR ((status <> ALL (ARRAY[''processing''::text, ''mapped_processing''::text])) AND (locked_at IS NULL) AND (locked_by IS NULL) AND (lock_token IS NULL) AND (lease_expires_at IS NULL))))'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'operations_shopify_inventory_refresh_completion_valid',
+        'CHECK (((status = ANY (ARRAY[''succeeded''::text, ''cancelled''::text, ''dead''::text, ''mapped_succeeded''::text, ''mapped_cancelled''::text, ''mapped_dead''::text])) = (completed_at IS NOT NULL)))'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'operations_shopify_inventory_refresh_mapping_fence_complete',
+        'CHECK ((((location_mapping_id IS NULL) AND (location_mapping_row_version IS NULL) AND (provider_location_id IS NULL) AND (inventory_location_id IS NULL) AND (inventory_pool_id IS NULL)) OR ((location_mapping_id IS NOT NULL) AND (location_mapping_row_version IS NOT NULL) AND (location_mapping_row_version >= 0) AND (provider_location_id IS NOT NULL) AND ((length(btrim(provider_location_id)) >= 1) AND (length(btrim(provider_location_id)) <= 512)) AND (provider_location_id !~ ''[[:cntrl:]]''::text) AND (inventory_location_id IS NOT NULL) AND (inventory_pool_id IS NOT NULL))))'
+      ),
+      (
+        'operations_shopify_inventory_refresh_jobs',
+        'operations_shopify_inventory_refresh_mapping_status_consistent',
+        'CHECK ((((location_mapping_id IS NULL) AND (status !~~ ''mapped_%''::text)) OR ((location_mapping_id IS NOT NULL) AND (status ~~ ''mapped_%''::text))))'
+      )
+    ) AS required_check(table_name, constraint_name, definition)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint installed_check
+      WHERE installed_check.conrelid =
+              to_regclass(required_check.table_name)
+        AND installed_check.conname = required_check.constraint_name
+        AND installed_check.contype = 'c'
+        AND installed_check.convalidated
+        AND pg_get_constraintdef(installed_check.oid) =
+              required_check.definition
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_shopify_inventory_refresh_mapping_fkey',
+        ARRAY[
+          'organization_id', 'integration_account_id', 'location_mapping_id'
+        ]::name[],
+        'operations_commerce_inventory_location_mappings',
+        ARRAY[
+          'organization_id', 'integration_account_id', 'id'
+        ]::name[]
+      ),
+      (
+        'operations_shopify_inventory_refresh_inventory_location_fkey',
+        ARRAY[
+          'organization_id', 'warehouse_id', 'inventory_location_id'
+        ]::name[],
+        'operations_locations',
+        ARRAY['organization_id', 'warehouse_id', 'id']::name[]
+      ),
+      (
+        'operations_shopify_inventory_refresh_inventory_pool_fkey',
+        ARRAY['organization_id', 'inventory_pool_id']::name[],
+        'operations_inventory_pools',
+        ARRAY['organization_id', 'id']::name[]
+      )
+    ) AS required_fk(
+      constraint_name, local_columns, reference_table, reference_columns
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint installed_fk
+      WHERE installed_fk.conrelid =
+              to_regclass('operations_shopify_inventory_refresh_jobs')
+        AND installed_fk.confrelid =
+              to_regclass(required_fk.reference_table)
+        AND installed_fk.conname = required_fk.constraint_name
+        AND installed_fk.contype = 'f'
+        AND installed_fk.convalidated
+        AND installed_fk.confdeltype = 'r'
+        AND ARRAY(
+          SELECT installed_local.attname
+          FROM unnest(installed_fk.conkey) WITH ORDINALITY
+            local_key(attnum, ordinal)
+          JOIN pg_attribute installed_local
+            ON installed_local.attrelid = installed_fk.conrelid
+           AND installed_local.attnum = local_key.attnum
+          ORDER BY local_key.ordinal
+        ) = required_fk.local_columns
+        AND ARRAY(
+          SELECT installed_reference.attname
+          FROM unnest(installed_fk.confkey) WITH ORDINALITY
+            reference_key(attnum, ordinal)
+          JOIN pg_attribute installed_reference
+            ON installed_reference.attrelid = installed_fk.confrelid
+           AND installed_reference.attnum = reference_key.attnum
+          ORDER BY reference_key.ordinal
+        ) = required_fk.reference_columns
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'idx_operations_shopify_inventory_refresh_active_account',
+        ARRAY['organization_id', 'integration_account_id']::name[],
+        '(status = ANY (ARRAY[''pending''::text, ''processing''::text, ''failed''::text]))'
+      ),
+      (
+        'idx_operations_shopify_inventory_refresh_active_mapping',
+        ARRAY[
+          'organization_id', 'integration_account_id', 'location_mapping_id'
+        ]::name[],
+        '((location_mapping_id IS NOT NULL) AND (status = ANY (ARRAY[''mapped_pending''::text, ''mapped_processing''::text, ''mapped_failed''::text])))'
+      ),
+      (
+        'idx_operations_shopify_inventory_refresh_processing_account',
+        ARRAY['organization_id', 'integration_account_id']::name[],
+        '(status = ''mapped_processing''::text)'
+      )
+    ) AS required_index(index_name, column_names, predicate)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_index installed_index
+      WHERE installed_index.indexrelid =
+              to_regclass(required_index.index_name)
+        AND installed_index.indrelid =
+              to_regclass('operations_shopify_inventory_refresh_jobs')
+        AND installed_index.indisunique
+        AND installed_index.indisvalid
+        AND installed_index.indisready
+        AND ARRAY(
+          SELECT installed_column.attname
+          FROM unnest(installed_index.indkey::smallint[]) WITH ORDINALITY
+            indexed_attribute(attnum, ordinal)
+          JOIN pg_attribute installed_column
+            ON installed_column.attrelid = installed_index.indrelid
+           AND installed_column.attnum = indexed_attribute.attnum
+          ORDER BY indexed_attribute.ordinal
+        ) = required_index.column_names
+        AND pg_get_expr(
+          installed_index.indpred,
+          installed_index.indrelid
+      ) = required_index.predicate
+    )
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM pg_index projection_target_index
+    WHERE projection_target_index.indexrelid = to_regclass(
+            'idx_operations_commerce_inventory_active_projection_target'
+          )
+      AND projection_target_index.indrelid = to_regclass(
+            'operations_commerce_inventory_location_mappings'
+          )
+      AND projection_target_index.indisunique
+      AND projection_target_index.indisvalid
+      AND projection_target_index.indisready
+      AND ARRAY(
+        SELECT projection_target_column.attname
+        FROM unnest(projection_target_index.indkey::smallint[])
+          WITH ORDINALITY indexed_attribute(attnum, ordinal)
+        JOIN pg_attribute projection_target_column
+          ON projection_target_column.attrelid =
+                projection_target_index.indrelid
+         AND projection_target_column.attnum = indexed_attribute.attnum
+        ORDER BY indexed_attribute.ordinal
+      ) = ARRAY[
+        'organization_id', 'warehouse_id', 'location_id',
+        'inventory_pool_id'
+      ]::name[]
+      AND pg_get_expr(
+        projection_target_index.indpred,
+        projection_target_index.indrelid
+      ) = '((active = true) AND (inventory_import_enabled = true))'
+  )
+`
+
+// Exact structural attestation for 0289. The three catalog hashes pin every
+// installed column, CHECK constraint, and foreign key on the authorization,
+// one-shot attempt, and immutable outcome ledgers. The remaining clauses pin
+// the safety-critical unique indexes, function bodies, and enabled triggers so
+// a same-named but weakened provider-write control cannot report healthy.
+const OPERATIONS_SHOPIFY_LOCATION_ADMINISTRATION_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename =
+      '0289_operations_shopify_location_administration.sql'
+  )
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shopify_location_administration_authorizations'),
+        ('operations_shopify_location_administration_attempts'),
+        ('operations_shopify_location_administration_outcomes')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_column.attnum::text,
+              installed_column.attname,
+              format_type(
+                installed_column.atttypid,
+                installed_column.atttypmod
+              ),
+              installed_column.attnotnull::text,
+              COALESCE(
+                pg_get_expr(
+                  installed_default.adbin,
+                  installed_default.adrelid
+                ),
+                ''
+              )
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_column.attnum
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_attribute installed_column
+      ON installed_column.attrelid = installed_table.oid
+    LEFT JOIN pg_attrdef installed_default
+      ON installed_default.adrelid = installed_column.attrelid
+     AND installed_default.adnum = installed_column.attnum
+    WHERE installed_column.attnum > 0
+      AND NOT installed_column.attisdropped
+  ) = 'cbbc8b291f3fa65763de5d4535fd8ff93d8ce1802d43fe4241640edc930d7c58'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shopify_location_administration_authorizations'),
+        ('operations_shopify_location_administration_attempts'),
+        ('operations_shopify_location_administration_outcomes')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_check.conname,
+              installed_check.convalidated::text,
+              pg_get_constraintdef(installed_check.oid)
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_check.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_constraint installed_check
+      ON installed_check.conrelid = installed_table.oid
+     AND installed_check.contype = 'c'
+  ) = '3e805985730407b50af636736bbe8ef66373214d3a73b1262afd0e6bdf7e9e9c'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shopify_location_administration_authorizations'),
+        ('operations_shopify_location_administration_attempts'),
+        ('operations_shopify_location_administration_outcomes')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_fk.conname,
+              installed_fk.convalidated::text,
+              installed_fk.confdeltype::text,
+              installed_fk.confupdtype::text,
+              pg_get_constraintdef(installed_fk.oid)
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_fk.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_constraint installed_fk
+      ON installed_fk.conrelid = installed_table.oid
+     AND installed_fk.contype = 'f'
+  ) = '3330bdef494fa4d7f7658398a68594639e3cb68ee7f8e1dc4a90e44d467adf64'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_shopify_location_administration_authorizations',
+        'ops_shopify_location_admin_one_unresolved_account_idx',
+        ARRAY['organization_id', 'integration_account_id']::name[],
+        '(status = ANY (ARRAY[''processing''::text, ''unknown''::text]))'
+      ),
+      (
+        'operations_shopify_location_administration_authorizations',
+        'ops_shopify_location_admin_auth_idempotency_unique',
+        ARRAY[
+          'organization_id', 'integration_account_id', 'idempotency_key'
+        ]::name[],
+        NULL
+      ),
+      (
+        'operations_shopify_location_administration_attempts',
+        'ops_shopify_location_admin_attempt_authorization_unique',
+        ARRAY['organization_id', 'authorization_id']::name[],
+        NULL
+      ),
+      (
+        'operations_shopify_location_administration_outcomes',
+        'ops_shopify_location_admin_outcome_state_unique',
+        ARRAY[
+          'organization_id', 'authorization_id', 'outcome_state'
+        ]::name[],
+        NULL
+      )
+    ) AS required_index(
+      table_name, index_name, column_names, predicate
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_index installed_index
+      WHERE installed_index.indexrelid =
+              to_regclass(required_index.index_name)
+        AND installed_index.indrelid =
+              to_regclass(required_index.table_name)
+        AND installed_index.indisunique
+        AND installed_index.indisvalid
+        AND installed_index.indisready
+        AND installed_index.indexprs IS NULL
+        AND installed_index.indnkeyatts =
+              cardinality(required_index.column_names)
+        AND installed_index.indnatts =
+              cardinality(required_index.column_names)
+        AND ARRAY(
+          SELECT installed_column.attname
+          FROM unnest(installed_index.indkey::smallint[]) WITH ORDINALITY
+            indexed_attribute(attnum, ordinal)
+          JOIN pg_attribute installed_column
+            ON installed_column.attrelid = installed_index.indrelid
+           AND installed_column.attnum = indexed_attribute.attnum
+          ORDER BY indexed_attribute.ordinal
+        ) = required_index.column_names
+        AND pg_get_expr(
+          installed_index.indpred,
+          installed_index.indrelid
+        ) IS NOT DISTINCT FROM required_index.predicate
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_shopify_location_admin_actor_current(uuid,text,text)',
+        'sql', 's',
+        '73d54458ab0e4365c5cf00aacd46c1f1d2b79a408a623c550d90e05304d33b6a'
+      ),
+      (
+        'operations_shopify_location_admin_is_current(uuid,uuid)',
+        'sql', 's',
+        '607e63fb075aa325859a421cdb4189ccee7b42c70e1fe4aa4f994b878e305e3e'
+      ),
+      (
+        'protect_shopify_location_admin_authorization()',
+        'plpgsql', 'v',
+        'f9296999f1f9d05397084d8783abe0831cccfe1077710ff47db5b5a402af1f4a'
+      ),
+      (
+        'protect_shopify_location_admin_attempt()',
+        'plpgsql', 'v',
+        'd8293a79b42c6b4a013048ef2beccb043b883926af275751e60648cf5c5195c8'
+      ),
+      (
+        'protect_shopify_location_admin_outcome()',
+        'plpgsql', 'v',
+        'b86cd878d3775a1ef6cde16896f364574ac0e414cfeb4621833e1e52c001eb8a'
+      )
+    ) AS required_function(
+      signature, language_name, volatility, source_sha256
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_proc installed_function
+      JOIN pg_language installed_language
+        ON installed_language.oid = installed_function.prolang
+      WHERE installed_function.oid =
+              to_regprocedure(required_function.signature)
+        AND installed_function.prokind = 'f'
+        AND installed_language.lanname = required_function.language_name
+        AND installed_function.provolatile::text =
+              required_function.volatility
+        AND encode(
+          digest(
+            convert_to(
+              regexp_replace(
+                btrim(
+                  regexp_replace(
+                    installed_function.prosrc,
+                    E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                    ' ',
+                    'g'
+                  )
+                ),
+                '[[:space:]]+',
+                ' ',
+                'g'
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
+        ) = required_function.source_sha256
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_shopify_location_administration_authorizations',
+        'validate_shopify_location_admin_auth_insert', 5,
+        'protect_shopify_location_admin_authorization()'
+      ),
+      (
+        'operations_shopify_location_administration_authorizations',
+        'protect_shopify_location_admin_auth_write', 27,
+        'protect_shopify_location_admin_authorization()'
+      ),
+      (
+        'operations_shopify_location_administration_attempts',
+        'protect_shopify_location_admin_attempt_write', 31,
+        'protect_shopify_location_admin_attempt()'
+      ),
+      (
+        'operations_shopify_location_administration_outcomes',
+        'protect_shopify_location_admin_outcome_write', 31,
+        'protect_shopify_location_admin_outcome()'
+      )
+    ) AS required_trigger(
+      table_name, trigger_name, trigger_type, function_signature
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger installed_trigger
+      WHERE installed_trigger.tgrelid =
+              to_regclass(required_trigger.table_name)
+        AND installed_trigger.tgname = required_trigger.trigger_name
+        AND installed_trigger.tgtype = required_trigger.trigger_type
+        AND installed_trigger.tgenabled = 'O'
+        AND NOT installed_trigger.tgisinternal
+        AND installed_trigger.tgconstraint = 0
+        AND installed_trigger.tgfoid =
+              to_regprocedure(required_trigger.function_signature)
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'gsla',
+        'operations.shopify_location_administration_authorization'
+      ),
+      (
+        'gslt',
+        'operations.shopify_location_administration_attempt'
+      ),
+      (
+        'gslo',
+        'operations.shopify_location_administration_outcome'
+      )
+    ) AS required_reference(prefix, entity_type)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM global_reference_entity_types installed_reference
+      WHERE installed_reference.prefix = required_reference.prefix
+        AND installed_reference.entity_type = required_reference.entity_type
+    )
+  )
+`
+
+// Exact structural attestation for 0290. The catalog hashes pin every column,
+// CHECK constraint, and foreign key across the five local-only training
+// ledgers. The remaining clauses pin the one-open-run fence and every
+// safety-critical function and trigger that prevents training evidence from
+// becoming canonical inventory, reservation, shipment, postage, or export
+// authority.
+const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0290_operations_shadow_training_runs.sql'
+  )
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shadow_training_runs'),
+        ('operations_shadow_training_packages'),
+        ('operations_shadow_training_pick_tasks'),
+        ('operations_shadow_training_label_links'),
+        ('operations_shadow_training_events')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_column.attnum::text,
+              installed_column.attname,
+              format_type(
+                installed_column.atttypid,
+                installed_column.atttypmod
+              ),
+              installed_column.attnotnull::text,
+              COALESCE(
+                pg_get_expr(
+                  installed_default.adbin,
+                  installed_default.adrelid
+                ),
+                ''
+              )
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_column.attnum
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_attribute installed_column
+      ON installed_column.attrelid = installed_table.oid
+    LEFT JOIN pg_attrdef installed_default
+      ON installed_default.adrelid = installed_column.attrelid
+     AND installed_default.adnum = installed_column.attnum
+    WHERE installed_column.attnum > 0
+      AND NOT installed_column.attisdropped
+  ) = '94b2140dfccc4cbe4be93f7a012209f62c42e843571e98478eaed8138f184ca4'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shadow_training_runs'),
+        ('operations_shadow_training_packages'),
+        ('operations_shadow_training_pick_tasks'),
+        ('operations_shadow_training_label_links'),
+        ('operations_shadow_training_events')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_check.conname,
+              installed_check.convalidated::text,
+              pg_get_constraintdef(installed_check.oid)
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_check.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_constraint installed_check
+      ON installed_check.conrelid = installed_table.oid
+     AND installed_check.contype = 'c'
+  ) = '901e43b88b31a4b9351fcfd47922662d4279521cee47565dc58acbf316097286'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shadow_training_runs'),
+        ('operations_shadow_training_packages'),
+        ('operations_shadow_training_pick_tasks'),
+        ('operations_shadow_training_label_links'),
+        ('operations_shadow_training_events')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_fk.conname,
+              installed_fk.convalidated::text,
+              installed_fk.confdeltype::text,
+              installed_fk.confupdtype::text,
+              pg_get_constraintdef(installed_fk.oid)
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_fk.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_constraint installed_fk
+      ON installed_fk.conrelid = installed_table.oid
+     AND installed_fk.contype = 'f'
+  ) = '499e300e70604fc04b2439d060ffebd1e2115211b8d98d9ce008c23334713db2'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shadow_training_runs'),
+        ('operations_shadow_training_packages'),
+        ('operations_shadow_training_pick_tasks'),
+        ('operations_shadow_training_label_links'),
+        ('operations_shadow_training_events')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_unique.conname,
+              installed_unique.contype::text,
+              installed_unique.convalidated::text,
+              pg_get_constraintdef(installed_unique.oid)
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_unique.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_constraint installed_unique
+      ON installed_unique.conrelid = installed_table.oid
+     AND installed_unique.contype IN ('p', 'u')
+  ) = 'c22cef6f8aa8f8fb01e82a154d6c4e93e8ed79eda97a2539ff91c6bdcd4ec834'
+  AND (
+    WITH target_table(table_name) AS (
+      VALUES
+        ('operations_shadow_training_runs'),
+        ('operations_shadow_training_packages'),
+        ('operations_shadow_training_pick_tasks'),
+        ('operations_shadow_training_label_links'),
+        ('operations_shadow_training_events')
+    )
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_index_table.relname,
+              installed_index.indisunique::text,
+              installed_index.indisprimary::text,
+              installed_index.indisvalid::text,
+              installed_index.indisready::text,
+              installed_index.indisreplident::text,
+              installed_index.indnkeyatts::text,
+              installed_index.indnatts::text,
+              pg_get_indexdef(installed_index.indexrelid),
+              COALESCE(
+                pg_get_expr(
+                  installed_index.indpred,
+                  installed_index.indrelid
+                ),
+                ''
+              )
+            ),
+            chr(10) ORDER BY
+              installed_table.relname,
+              installed_index_table.relname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM target_table required_table
+    JOIN pg_class installed_table
+      ON installed_table.oid = to_regclass(required_table.table_name)
+    JOIN pg_index installed_index
+      ON installed_index.indrelid = installed_table.oid
+     AND installed_index.indisunique
+    JOIN pg_class installed_index_table
+      ON installed_index_table.oid = installed_index.indexrelid
+  ) = '16a6e0621dc8e4baa112f231a094243cfd222230f73ecba4b842ba3006f2dba4'
+  AND EXISTS (
+    SELECT 1
+    FROM pg_index installed_index
+    WHERE installed_index.indexrelid =
+            to_regclass('operations_shadow_training_runs_one_open_order')
+      AND installed_index.indrelid =
+            to_regclass('operations_shadow_training_runs')
+      AND installed_index.indisunique
+      AND installed_index.indisvalid
+      AND installed_index.indisready
+      AND installed_index.indexprs IS NULL
+      AND installed_index.indnkeyatts = 2
+      AND installed_index.indnatts = 2
+      AND ARRAY(
+        SELECT installed_column.attname
+        FROM unnest(installed_index.indkey::smallint[]) WITH ORDINALITY
+          indexed_attribute(attnum, ordinal)
+        JOIN pg_attribute installed_column
+          ON installed_column.attrelid = installed_index.indrelid
+         AND installed_column.attnum = indexed_attribute.attnum
+        ORDER BY indexed_attribute.ordinal
+      ) = ARRAY['organization_id', 'source_order_id']::name[]
+      AND pg_get_expr(
+        installed_index.indpred,
+        installed_index.indrelid
+      ) = '(state <> ''reset''::text)'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'validate_operations_shadow_training_package_fact()',
+        'plpgsql', 'v',
+        '6898d7e22abcb3963c55bac7f3eb30cef0eda6dd8ca030d36e1bf99d3f683cd0'
+      ),
+      (
+        'validate_operations_shadow_training_pick_fact()',
+        'plpgsql', 'v',
+        '340ca4ea1323121e8316f852e9240f21cc99fb23bf53eb312d923617347c3bce'
+      ),
+      (
+        'validate_operations_shadow_training_plan_coverage()',
+        'plpgsql', 'v',
+        '1ec65dc17177ce3d53776ebb035f175f0d7ba10900d2dc5de88bfb31aafd5ea0'
+      ),
+      (
+        'protect_operations_shadow_training_run()',
+        'plpgsql', 'v',
+        '9a033b6182465d99682fc1ecee2dca0302ac95f726b1f2b3d1ef6c7bc932371a'
+      ),
+      (
+        'validate_operations_shadow_training_run_identity()',
+        'plpgsql', 'v',
+        '4d0a836345d3bc310ad27d9ae4f74a25b0bc2bf246e10712b3e2427bd168cf93'
+      ),
+      (
+        'protect_operations_shadow_training_package()',
+        'plpgsql', 'v',
+        '8425b26ae132be23ef0b835fc03b5ac35bf0b42b2728a098ff1184f62f4fa1fc'
+      ),
+      (
+        'protect_operations_shadow_training_pick_task()',
+        'plpgsql', 'v',
+        'c1fa92771860f78c76184fae9ffa538cb772d25efd0fadc23d2f72192f106e21'
+      ),
+      (
+        'protect_operations_shadow_training_event()',
+        'plpgsql', 'v',
+        'e15f2304f2daa3d4ec1238374d052368f57c68bf6df030bbdd21735e245bf230'
+      ),
+      (
+        'validate_operations_shadow_training_label_link()',
+        'plpgsql', 'v',
+        '786a373981688256f1f83b94208b405a2b6446d04a21678a2a76a4110005d14e'
+      ),
+      (
+        'guard_shadow_commerce_canonical_write()',
+        'plpgsql', 'v',
+        'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3'
+      ),
+      (
+        'guard_shadow_training_activation_change()',
+        'plpgsql', 'v',
+        'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f'
+      )
+    ) AS required_function(
+      signature, language_name, volatility, source_sha256
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_proc installed_function
+      JOIN pg_language installed_language
+        ON installed_language.oid = installed_function.prolang
+      WHERE installed_function.oid =
+              to_regprocedure(required_function.signature)
+        AND installed_function.prokind = 'f'
+        AND installed_language.lanname = required_function.language_name
+        AND installed_function.provolatile::text =
+              required_function.volatility
+        AND encode(
+          digest(
+            convert_to(
+              regexp_replace(
+                btrim(
+                  regexp_replace(
+                    installed_function.prosrc,
+                    E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                    ' ',
+                    'g'
+                  )
+                ),
+                '[[:space:]]+',
+                ' ',
+                'g'
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
+        ) = required_function.source_sha256
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'operations_shadow_training_packages',
+        'validate_operations_shadow_training_package_fact_commit',
+        5, true, true, true,
+        'validate_operations_shadow_training_package_fact()'
+      ),
+      (
+        'operations_shadow_training_pick_tasks',
+        'validate_operations_shadow_training_pick_fact_commit',
+        5, true, true, true,
+        'validate_operations_shadow_training_pick_fact()'
+      ),
+      (
+        'operations_shadow_training_runs',
+        'validate_operations_shadow_training_plan_coverage_update',
+        19, false, false, false,
+        'validate_operations_shadow_training_plan_coverage()'
+      ),
+      (
+        'operations_shadow_training_runs',
+        'validate_operations_shadow_training_run_identity_mutation',
+        23, false, false, false,
+        'validate_operations_shadow_training_run_identity()'
+      ),
+      (
+        'operations_shadow_training_runs',
+        'protect_operations_shadow_training_run_mutation',
+        27, false, false, false,
+        'protect_operations_shadow_training_run()'
+      ),
+      (
+        'operations_shadow_training_packages',
+        'protect_operations_shadow_training_package_mutation',
+        27, false, false, false,
+        'protect_operations_shadow_training_package()'
+      ),
+      (
+        'operations_shadow_training_pick_tasks',
+        'protect_operations_shadow_training_pick_task_mutation',
+        27, false, false, false,
+        'protect_operations_shadow_training_pick_task()'
+      ),
+      (
+        'operations_shadow_training_events',
+        'protect_operations_shadow_training_event_mutation',
+        27, false, false, false,
+        'protect_operations_shadow_training_event()'
+      ),
+      (
+        'operations_shadow_training_label_links',
+        'validate_operations_shadow_training_label_link_mutation',
+        31, false, false, false,
+        'validate_operations_shadow_training_label_link()'
+      ),
+      (
+        'operations_fulfillment_plans',
+        'guard_shadow_commerce_canonical_plan_insert',
+        23, false, false, false,
+        'guard_shadow_commerce_canonical_write()'
+      ),
+      (
+        'operations_reservations',
+        'guard_shadow_commerce_canonical_reservation_insert',
+        23, false, false, false,
+        'guard_shadow_commerce_canonical_write()'
+      ),
+      (
+        'operations_shipments',
+        'guard_shadow_commerce_canonical_shipment_insert',
+        23, false, false, false,
+        'guard_shadow_commerce_canonical_write()'
+      ),
+      (
+        'operations_commerce_fulfillment_exports',
+        'guard_shadow_commerce_canonical_export_insert',
+        23, false, false, false,
+        'guard_shadow_commerce_canonical_write()'
+      ),
+      (
+        'operations_activation_scopes',
+        'guard_shadow_training_activation_change_insert',
+        7, false, false, false,
+        'guard_shadow_training_activation_change()'
+      ),
+      (
+        'operations_activation_scopes',
+        'guard_shadow_training_activation_change_update',
+        19, false, false, false,
+        'guard_shadow_training_activation_change()'
+      ),
+      (
+        'operations_activation_scopes',
+        'guard_shadow_training_activation_change_delete',
+        11, false, false, false,
+        'guard_shadow_training_activation_change()'
+      )
+    ) AS required_trigger(
+      table_name, trigger_name, trigger_type, constraint_trigger,
+      trigger_deferrable, initially_deferred, function_signature
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_trigger installed_trigger
+      WHERE installed_trigger.tgrelid =
+              to_regclass(required_trigger.table_name)
+        AND installed_trigger.tgname = required_trigger.trigger_name
+        AND installed_trigger.tgtype = required_trigger.trigger_type
+        AND installed_trigger.tgenabled = 'O'
+        AND NOT installed_trigger.tgisinternal
+        AND (installed_trigger.tgconstraint <> 0) =
+              required_trigger.constraint_trigger
+        AND installed_trigger.tgdeferrable =
+              required_trigger.trigger_deferrable
+        AND installed_trigger.tginitdeferred =
+              required_trigger.initially_deferred
+        AND installed_trigger.tgfoid =
+              to_regprocedure(required_trigger.function_signature)
+        AND ARRAY(
+          SELECT installed_update_column.attname
+          FROM unnest(installed_trigger.tgattr::smallint[])
+            WITH ORDINALITY update_attribute(attnum, ordinal)
+          JOIN pg_attribute installed_update_column
+            ON installed_update_column.attrelid = installed_trigger.tgrelid
+           AND installed_update_column.attnum = update_attribute.attnum
+          ORDER BY update_attribute.ordinal
+        ) = CASE
+          WHEN required_trigger.trigger_name IN (
+            'validate_operations_shadow_training_plan_coverage_update',
+            'guard_shadow_training_activation_change_update'
+          ) THEN ARRAY['state']::name[]
+          ELSE ARRAY[]::name[]
+        END
+    )
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      ('gtrn', 'operations.shadow_training_run'),
+      ('gtpk', 'operations.shadow_training_package'),
+      ('gtpt', 'operations.shadow_training_pick_task'),
+      ('gtll', 'operations.shadow_training_label_link'),
+      ('gtev', 'operations.shadow_training_event')
+    ) AS required_reference(prefix, entity_type)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM global_reference_entity_types installed_reference
+      WHERE installed_reference.prefix = required_reference.prefix
+        AND installed_reference.entity_type = required_reference.entity_type
+    )
+  )
+`
+
+// Exact structural attestation for the planned-only 0291 correction ledger.
+// The migration checksum and catalog hashes pin every column, CHECK, foreign
+// key, primary/unique constraint, and index. Function-source and trigger
+// hashes keep the validation and append-only fences intact, while the exact
+// global reference binding keeps correction evidence in its registered
+// namespace.
+const OPERATIONS_ORDER_REPLANNING_CORRECTIONS_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0291_operations_order_replanning_corrections.sql'
+      AND checksum =
+        '6ac42626a53b421d1d5085e0f2ddc578df29ec400d2a70bc156ce9c9fbb0ff60'
+  )
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_column.attnum::text,
+              installed_column.attname,
+              format_type(
+                installed_column.atttypid,
+                installed_column.atttypmod
+              ),
+              installed_column.attnotnull::text,
+              COALESCE(
+                pg_get_expr(
+                  installed_default.adbin,
+                  installed_default.adrelid
+                ),
+                ''
+              )
+            ),
+            chr(10) ORDER BY installed_column.attnum
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_attribute installed_column
+      ON installed_column.attrelid = installed_table.oid
+    LEFT JOIN pg_attrdef installed_default
+      ON installed_default.adrelid = installed_column.attrelid
+     AND installed_default.adnum = installed_column.attnum
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+      AND installed_column.attnum > 0
+      AND NOT installed_column.attisdropped
+  ) = '2938b378a5b5bcca279c528b86d7b1df9182abfd31351d1c7fe39735aee4ec67'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_check.conname,
+              installed_check.convalidated::text,
+              pg_get_constraintdef(installed_check.oid)
+            ),
+            chr(10) ORDER BY installed_check.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_constraint installed_check
+      ON installed_check.conrelid = installed_table.oid
+     AND installed_check.contype = 'c'
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+  ) = '803de41c0651fcdb789c3cb0713fdd4b624fc193734971d6ce3685bcd32f3b44'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_fk.conname,
+              installed_fk.convalidated::text,
+              installed_fk.confdeltype::text,
+              installed_fk.confupdtype::text,
+              pg_get_constraintdef(installed_fk.oid)
+            ),
+            chr(10) ORDER BY installed_fk.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_constraint installed_fk
+      ON installed_fk.conrelid = installed_table.oid
+     AND installed_fk.contype = 'f'
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+  ) = '2187b8e068b269a9b028016c289bcbafb015d21cc5741af9662af9ac755f888c'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_unique.conname,
+              installed_unique.contype::text,
+              installed_unique.convalidated::text,
+              pg_get_constraintdef(installed_unique.oid)
+            ),
+            chr(10) ORDER BY installed_unique.conname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_constraint installed_unique
+      ON installed_unique.conrelid = installed_table.oid
+     AND installed_unique.contype IN ('p', 'u')
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+  ) = '48bcb77441900d0f09ef13a570e6cb2a9d14af7d7731de14224aa02771f11348'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_index_table.relname,
+              installed_index.indisunique::text,
+              installed_index.indisprimary::text,
+              installed_index.indisvalid::text,
+              installed_index.indisready::text,
+              installed_index.indisreplident::text,
+              installed_index.indnkeyatts::text,
+              installed_index.indnatts::text,
+              pg_get_indexdef(installed_index.indexrelid),
+              COALESCE(
+                pg_get_expr(
+                  installed_index.indpred,
+                  installed_index.indrelid
+                ),
+                ''
+              )
+            ),
+            chr(10) ORDER BY installed_index_table.relname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_index installed_index
+      ON installed_index.indrelid = installed_table.oid
+    JOIN pg_class installed_index_table
+      ON installed_index_table.oid = installed_index.indexrelid
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+  ) = '767b517b2911b4f3e4e527605531e4bcbc46701fbb69c4aa7421e85b865b4951'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM (VALUES
+      (
+        'validate_operations_order_replanning_correction()',
+        'plpgsql', 'v',
+        '9e9d9e682d1aeefb8a08476ea4c2c48139eb0857d82824c48925d4f4654b9041'
+      ),
+      (
+        'reject_operations_order_replanning_correction_mutation()',
+        'plpgsql', 'v',
+        '6ff446c0be811717eb351904655a3b6b1f846c8cb0fd71da15f2c06da1d5ca42'
+      )
+    ) AS required_function(
+      signature, language_name, volatility, source_sha256
+    )
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM pg_proc installed_function
+      JOIN pg_language installed_language
+        ON installed_language.oid = installed_function.prolang
+      WHERE installed_function.oid =
+              to_regprocedure(required_function.signature)
+        AND installed_function.prokind = 'f'
+        AND installed_language.lanname = required_function.language_name
+        AND installed_function.provolatile::text =
+              required_function.volatility
+        AND encode(
+          digest(
+            convert_to(
+              regexp_replace(
+                btrim(
+                  regexp_replace(
+                    installed_function.prosrc,
+                    E'(^|[\\n\\r])[[:blank:]]*--[^\\n\\r]*',
+                    ' ',
+                    'g'
+                  )
+                ),
+                '[[:space:]]+',
+                ' ',
+                'g'
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
+        ) = required_function.source_sha256
+    )
+  )
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              installed_table.relname,
+              installed_trigger.tgname,
+              installed_trigger.tgtype::text,
+              (installed_trigger.tgconstraint <> 0)::text,
+              installed_trigger.tgdeferrable::text,
+              installed_trigger.tginitdeferred::text,
+              installed_trigger.tgenabled::text,
+              installed_trigger.tgfoid::regprocedure::text,
+              installed_trigger.tgattr::text
+            ),
+            chr(10) ORDER BY installed_trigger.tgname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_class installed_table
+    JOIN pg_trigger installed_trigger
+      ON installed_trigger.tgrelid = installed_table.oid
+     AND NOT installed_trigger.tgisinternal
+    WHERE installed_table.oid =
+            to_regclass('operations_order_replanning_corrections')
+  ) = '14ac1ff9cfe3b8e46f113db57f19c591b01b363fe107865b79e9ed2cdedbc96f'
+  AND EXISTS (
+    SELECT 1
+    FROM global_reference_entity_types installed_reference
+    WHERE installed_reference.prefix = 'gorc'
+      AND installed_reference.entity_type =
+            'operations.order_replanning_correction'
+      AND installed_reference.display_name = 'Order replanning correction'
+  )
+`
 function commerceRevisionEvidenceConfiguration() {
   try {
     const configuration = resolveCommerceOrderRevisionEvidenceKeyConfig({
@@ -489,6 +1870,20 @@ export async function GET() {
           operations_carrier_billing_integrity_migration_applied: boolean
           operations_carrier_billing_review_migration_applied: boolean
           operations_print_delivery_migration_applied: boolean
+          operations_print_device_reference_privacy_applied: boolean
+          operations_print_agent_pairing_grants_applied: boolean
+          shopify_carrier_configured_carriers_applied: boolean
+          carrier_shipping_diagnostics_applied: boolean
+          carrier_shipping_diagnostic_attempt_counts: Record<
+            'sandbox' | 'production',
+            {
+              prepared: number
+              stalePrepared: number
+              succeeded: number
+              failed: number
+              unknown: number
+            }
+          >
           crm_native_activity_projection_migration_applied: boolean
           crm_contact_identity_aliases_migration_applied: boolean
           operations_settlement_lifecycle_migration_applied: boolean
@@ -545,6 +1940,10 @@ export async function GET() {
           operations_pack_rate_pricing_semantics_applied: boolean
           operations_carrier_billing_mud_applied: boolean
           operations_shopify_inventory_refresh_migration_applied: boolean
+          operations_shopify_location_routing_applied: boolean
+          operations_shopify_location_administration_applied: boolean
+          operations_shadow_training_applied: boolean
+          operations_order_replanning_corrections_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
           operations_shopify_catalog_webhook_refresh_applied: boolean
           operations_commerce_pack_evidence_fingerprint_applied: boolean
@@ -1268,6 +2667,18 @@ export async function GET() {
                 WHERE filename =
                   '0169_operations_shopify_inventory_refresh_queue.sql'
               ) AS operations_shopify_inventory_refresh_migration_applied,
+              (
+                ${OPERATIONS_SHOPIFY_LOCATION_ROUTING_HEALTH_SQL}
+              ) AS operations_shopify_location_routing_applied,
+              (
+                ${OPERATIONS_SHOPIFY_LOCATION_ADMINISTRATION_HEALTH_SQL}
+              ) AS operations_shopify_location_administration_applied,
+              (
+                ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
+              ) AS operations_shadow_training_applied,
+              (
+                ${OPERATIONS_ORDER_REPLANNING_CORRECTIONS_HEALTH_SQL}
+              ) AS operations_order_replanning_corrections_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2817,6 +4228,933 @@ export async function GET() {
                 )
               )
                 AS operations_shopify_order_management_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0284_operations_print_device_reference_privacy.sql'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger print_delivery_guard
+                WHERE print_delivery_guard.tgrelid =
+                  to_regclass('operations_print_delivery_attempts')
+                  AND print_delivery_guard.tgname =
+                    'protect_operations_print_delivery_attempt_write'
+                  AND print_delivery_guard.tgfoid =
+                    to_regprocedure('protect_operations_append_only()')
+                  AND NOT print_delivery_guard.tgisinternal
+                  AND print_delivery_guard.tgenabled = 'O'
+                  AND print_delivery_guard.tgtype = 27
+              )
+              AND to_regprocedure(
+                'normalize_operations_print_delivery_device_reference()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger print_device_reference_guard
+                WHERE print_device_reference_guard.tgrelid =
+                  to_regclass('operations_print_delivery_attempts')
+                  AND print_device_reference_guard.tgname =
+                    'normalize_operations_print_delivery_device_reference_write'
+                  AND print_device_reference_guard.tgfoid = to_regprocedure(
+                    'normalize_operations_print_delivery_device_reference()'
+                  )
+                  AND NOT print_device_reference_guard.tgisinternal
+                  AND print_device_reference_guard.tgenabled = 'O'
+                  AND print_device_reference_guard.tgtype = 7
+              ) AS operations_print_device_reference_privacy_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0287_operations_print_agent_pairing_grants.sql'
+              )
+              AND to_regclass(
+                'operations_print_agent_pairing_grants'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_print_agent_pairing_grant()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger pairing_grant_guard
+                WHERE pairing_grant_guard.tgrelid = to_regclass(
+                  'operations_print_agent_pairing_grants'
+                )
+                  AND pairing_grant_guard.tgname =
+                    'protect_operations_print_agent_pairing_grant_write'
+                  AND pairing_grant_guard.tgfoid = to_regprocedure(
+                    'protect_operations_print_agent_pairing_grant()'
+                  )
+                  AND NOT pairing_grant_guard.tgisinternal
+                  AND pairing_grant_guard.tgenabled = 'O'
+                  AND pairing_grant_guard.tgtype = 27
+              ) AS operations_print_agent_pairing_grants_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0285_shopify_carrier_service_configured_carriers.sql'
+              )
+              AND to_regprocedure(
+                'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
+              ) IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_shopify_carrier_service_config_carriers',
+                    'operations_shopify_carrier_service_config_carriers_pkey',
+                    'PRIMARY KEY (organization_id, config_id, carrier_account_id)'
+                  ),
+                  (
+                    'operations_shopify_checkout_rate_receipt_provider_attempts',
+                    'operations_shopify_checkout_rate_receipt_provider_attempts_pkey',
+                    'PRIMARY KEY (organization_id, receipt_id, carrier_account_id)'
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'operations_pack_rate_run_rate_choices_pkey',
+                    'PRIMARY KEY (organization_id, id)'
+                  ),
+                  (
+                    'operations_fulfillment_execution_rate_attempts',
+                    'operations_fulfillment_execution_rate_attempts_pkey',
+                    'PRIMARY KEY (organization_id, execution_id, carrier_account_id)'
+                  ),
+                  (
+                    'operations_pack_rate_runs',
+                    'operations_pack_rate_runs_selected_carrier_account_fkey',
+                    'FOREIGN KEY (organization_id, selected_carrier_account_id) REFERENCES operations_carrier_accounts(organization_id, id) ON DELETE RESTRICT'
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'operations_pack_rate_run_rate_choices_account_fkey',
+                    'FOREIGN KEY (organization_id, carrier_account_id) REFERENCES operations_carrier_accounts(organization_id, id) ON DELETE RESTRICT'
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'operations_shipment_groups_selected_carrier_account_fkey',
+                    'FOREIGN KEY (organization_id, selected_carrier_account_id) REFERENCES operations_carrier_accounts(organization_id, id) ON DELETE RESTRICT'
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'operations_shipment_groups_run_account_fkey',
+                    'FOREIGN KEY (organization_id, fulfillment_pack_rate_run_id, selected_carrier_account_id) REFERENCES operations_pack_rate_runs(organization_id, id, selected_carrier_account_id) ON DELETE RESTRICT'
+                  ),
+                  (
+                    'operations_fulfillment_execution_rate_attempts',
+                    'operations_fulfillment_rate_attempts_account_fkey',
+                    'FOREIGN KEY (organization_id, carrier_account_id) REFERENCES operations_carrier_accounts(organization_id, id) ON DELETE RESTRICT'
+                  )
+                ) AS required_shopify_carrier_constraint(
+                  table_name, constraint_name, definition
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_constraint installed_constraint
+                  WHERE installed_constraint.conrelid =
+                    to_regclass(required_shopify_carrier_constraint.table_name)
+                    AND installed_constraint.conname =
+                      required_shopify_carrier_constraint.constraint_name
+                    AND pg_get_constraintdef(installed_constraint.oid) =
+                      required_shopify_carrier_constraint.definition
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_class installed_index_class
+                JOIN pg_index installed_index
+                  ON installed_index.indexrelid = installed_index_class.oid
+                WHERE installed_index_class.relname =
+                  'operations_pack_rate_choices_account_service_unique'
+                  AND installed_index.indrelid = to_regclass(
+                    'operations_pack_rate_run_rate_choices'
+                  )
+                  AND installed_index.indisunique
+                  AND ARRAY(
+                    SELECT installed_column.attname
+                    FROM unnest(installed_index.indkey::smallint[])
+                      WITH ORDINALITY AS indexed_attribute(attnum, ordinal)
+                    JOIN pg_attribute installed_column
+                      ON installed_column.attrelid = installed_index.indrelid
+                     AND installed_column.attnum = indexed_attribute.attnum
+                    ORDER BY indexed_attribute.ordinal
+                  ) = ARRAY[
+                    'organization_id', 'run_id', 'carrier_account_id',
+                    'provider', 'service_code'
+                  ]::name[]
+                  AND pg_get_expr(
+                    installed_index.indpred,
+                    installed_index.indrelid
+                  ) = '(carrier_account_id IS NOT NULL)'
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  ('operations_pack_rate_runs', 'selected_carrier_account_id'),
+                  ('operations_pack_rate_run_rate_choices', 'carrier_account_id'),
+                  ('operations_shipment_groups', 'selected_carrier_account_id'),
+                  ('operations_fulfillment_execution_rate_attempts', 'carrier_account_id')
+                ) AS required_shopify_carrier_column(table_name, column_name)
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_attribute installed_column
+                  WHERE installed_column.attrelid =
+                    to_regclass(required_shopify_carrier_column.table_name)
+                    AND installed_column.attname =
+                      required_shopify_carrier_column.column_name
+                    AND installed_column.atttypid = 'uuid'::regtype
+                    AND NOT installed_column.attisdropped
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  ('validate_operations_shopify_carrier_service_config_child()'),
+                  ('derive_operations_legacy_pack_rate_run_account()'),
+                  ('derive_operations_legacy_pack_rate_choice_account()'),
+                  ('derive_operations_legacy_shipment_group_account()'),
+                  ('validate_operations_pack_rate_choice_account()'),
+                  ('validate_operations_shipment_group_account()'),
+                  ('validate_operations_pack_rate_account_lineage_complete()'),
+                  ('validate_operations_fulfillment_account_lineage_complete()'),
+                  ('operations_shopify_carrier_configuration_allows_rating(jsonb,text)'),
+                  ('operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'),
+                  ('operations_shopify_carrier_service_config_is_ready(uuid,uuid)'),
+                  ('operations_shopify_checkout_carrier_parcels_match(uuid,uuid,jsonb)'),
+                  ('operations_shopify_checkout_carrier_selection_key(text,text)'),
+                  ('operations_legacy_shopify_receipt_offer_carrier_account_id(uuid,text,text,text,text,bigint,text)'),
+                  ('operations_legacy_shopify_config_carrier_account_id(uuid,text,text)'),
+                  ('operations_legacy_shopify_fulfillment_attempt_carrier_account_id(uuid,uuid,text,boolean)'),
+                  ('derive_operations_legacy_shopify_carrier_selection_key()'),
+                  ('validate_one_off_rate_selection_key()'),
+                  ('protect_operations_shopify_checkout_rate_receipt_offer()'),
+                  ('protect_op_shopify_checkout_provider_attempt()'),
+                  ('validate_op_shopify_checkout_attempt_finalization()'),
+                  ('validate_operations_fulfillment_execution()')
+                ) AS required_shopify_carrier_function(function_signature)
+                WHERE to_regprocedure(
+                  required_shopify_carrier_function.function_signature
+                ) IS NULL
+              )
+              AND regexp_replace(
+                pg_get_functiondef(
+                  to_regprocedure('validate_operations_fulfillment_execution()')
+                ),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%attempt.carrier_account_id = run.selected_carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(
+                  to_regprocedure('validate_operations_fulfillment_execution()')
+                ),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%choice.carrier_account_id = attempt.carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_configuration_allows_rating(jsonb,text)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%WHEN ''production'' THEN (%production_rate%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%requested_environment IN (''sandbox'', ''production'')%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_integration.environment = requested_environment%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_account.id = selected.carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%operations_shopify_carrier_configuration_allows_rating( carrier_integration.configuration, requested_environment )%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%activation.state = ''shadow''%config.id, ''sandbox''%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%activation.state = ''active''%config.id, ''production''%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'derive_operations_legacy_shopify_carrier_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_integration.environment = CASE receipt.activation_state%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'derive_operations_legacy_shopify_carrier_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.carrier_selection_key := operations_shopify_checkout_carrier_selection_key(%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'derive_operations_legacy_shopify_carrier_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.actor_email IS NOT NULL%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_one_off_rate_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.actor_email IS NULL AND NEW.purpose = ''cartonization_shipment_rate''%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_one_off_rate_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_integration.environment = CASE receipt.activation_state%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_one_off_rate_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.carrier_selection_key = operations_shopify_checkout_carrier_selection_key(%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_one_off_rate_selection_key()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%operations_one_off_carrier_selection_key( NEW.provider,%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_shopify_checkout_rate_receipt_offer()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%rate_evidence.carrier_selection_key = operations_shopify_checkout_carrier_selection_key(%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_op_shopify_checkout_provider_attempt()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%selected.carrier_account_id = NEW.carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_op_shopify_checkout_provider_attempt()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_integration.environment = CASE receipt.activation_state%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_op_shopify_checkout_provider_attempt()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%rate_evidence.carrier_selection_key = operations_shopify_checkout_carrier_selection_key(%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_op_shopify_checkout_attempt_finalization()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%selected.carrier_account_id = attempt.carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_op_shopify_checkout_attempt_finalization()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%carrier_integration.environment = CASE NEW.activation_state%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_op_shopify_checkout_attempt_finalization()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%rate_evidence.carrier_selection_key IS DISTINCT FROM operations_shopify_checkout_carrier_selection_key(%'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_shopify_carrier_service_config_materials',
+                    'validate_shopify_cs_config_material_write',
+                    'validate_operations_shopify_carrier_service_config_child()',
+                    31
+                  ),
+                  (
+                    'operations_shopify_carrier_service_config_carriers',
+                    'validate_shopify_cs_config_carrier_write',
+                    'validate_operations_shopify_carrier_service_config_child()',
+                    31
+                  ),
+                  (
+                    'operations_pack_rate_runs',
+                    'a_derive_operations_legacy_pack_rate_run_account',
+                    'derive_operations_legacy_pack_rate_run_account()',
+                    23
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'a_derive_operations_legacy_pack_rate_choice_account',
+                    'derive_operations_legacy_pack_rate_choice_account()',
+                    23
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'a_derive_operations_legacy_shipment_group_account',
+                    'derive_operations_legacy_shipment_group_account()',
+                    23
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'validate_operations_pack_rate_choice_account_write',
+                    'validate_operations_pack_rate_choice_account()',
+                    23
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'validate_operations_shipment_group_account_write',
+                    'validate_operations_shipment_group_account()',
+                    23
+                  ),
+                  (
+                    'operations_carrier_rate_requests',
+                    'derive_operations_legacy_shopify_carrier_selection_key_write',
+                    'derive_operations_legacy_shopify_carrier_selection_key()',
+                    7
+                  ),
+                  (
+                    'operations_carrier_rate_requests',
+                    'validate_one_off_rate_selection_key_write',
+                    'validate_one_off_rate_selection_key()',
+                    23
+                  ),
+                  (
+                    'operations_shopify_checkout_rate_receipt_offers',
+                    'protect_operations_shopify_checkout_rate_receipt_offer_write',
+                    'protect_operations_shopify_checkout_rate_receipt_offer()',
+                    31
+                  ),
+                  (
+                    'operations_shopify_checkout_rate_receipt_provider_attempts',
+                    'protect_op_shopify_checkout_provider_attempt_write',
+                    'protect_op_shopify_checkout_provider_attempt()',
+                    31
+                  ),
+                  (
+                    'operations_shopify_checkout_rate_receipts',
+                    'validate_op_shopify_checkout_attempt_finalization',
+                    'validate_op_shopify_checkout_attempt_finalization()',
+                    19
+                  )
+                ) AS required_shopify_carrier_ordinary_trigger(
+                  table_name, trigger_name, function_signature, trigger_type
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_trigger installed_shopify_carrier_trigger
+                  WHERE installed_shopify_carrier_trigger.tgrelid =
+                    to_regclass(
+                      required_shopify_carrier_ordinary_trigger.table_name
+                    )
+                    AND installed_shopify_carrier_trigger.tgname =
+                      required_shopify_carrier_ordinary_trigger.trigger_name
+                    AND installed_shopify_carrier_trigger.tgfoid =
+                      to_regprocedure(
+                        required_shopify_carrier_ordinary_trigger.function_signature
+                      )
+                    AND NOT installed_shopify_carrier_trigger.tgisinternal
+                    AND installed_shopify_carrier_trigger.tgenabled = 'O'
+                    AND installed_shopify_carrier_trigger.tgtype =
+                      required_shopify_carrier_ordinary_trigger.trigger_type
+                    AND installed_shopify_carrier_trigger.tgconstraint = 0
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_pack_rate_runs',
+                    'validate_operations_pack_rate_account_run_deferred',
+                    'validate_operations_pack_rate_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'validate_operations_pack_rate_account_choice_deferred',
+                    'validate_operations_pack_rate_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_fulfillment_executions',
+                    'validate_operations_fulfillment_account_execution_deferred',
+                    'validate_operations_fulfillment_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'validate_operations_fulfillment_account_group_deferred',
+                    'validate_operations_fulfillment_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_fulfillment_execution_rate_attempts',
+                    'validate_operations_fulfillment_account_attempt_deferred',
+                    'validate_operations_fulfillment_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_pack_rate_run_rate_choices',
+                    'validate_operations_fulfillment_account_choice_deferred',
+                    'validate_operations_fulfillment_account_lineage_complete()',
+                    5
+                  ),
+                  (
+                    'operations_fulfillment_executions',
+                    'validate_operations_fulfillment_execution_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_shipment_groups',
+                    'validate_operations_fulfillment_group_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_fulfillment_execution_rate_attempts',
+                    'validate_operations_fulfillment_attempts_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_fulfillment_execution_lines',
+                    'validate_operations_fulfillment_lines_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_fulfillment_execution_packages',
+                    'validate_operations_fulfillment_packages_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_label_attempts',
+                    'validate_operations_fulfillment_label_attempt_link_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_labels',
+                    'validate_operations_fulfillment_label_link_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  ),
+                  (
+                    'operations_shipments',
+                    'validate_operations_fulfillment_shipment_link_deferred',
+                    'validate_operations_fulfillment_execution()',
+                    21
+                  )
+                ) AS required_shopify_carrier_deferred_trigger(
+                  table_name, trigger_name, function_signature, trigger_type
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_trigger installed_shopify_carrier_trigger
+                  JOIN pg_constraint installed_shopify_carrier_constraint
+                    ON installed_shopify_carrier_constraint.oid =
+                      installed_shopify_carrier_trigger.tgconstraint
+                  WHERE installed_shopify_carrier_trigger.tgrelid =
+                    to_regclass(
+                      required_shopify_carrier_deferred_trigger.table_name
+                    )
+                    AND installed_shopify_carrier_trigger.tgname =
+                      required_shopify_carrier_deferred_trigger.trigger_name
+                    AND installed_shopify_carrier_trigger.tgfoid =
+                      to_regprocedure(
+                        required_shopify_carrier_deferred_trigger.function_signature
+                      )
+                    AND NOT installed_shopify_carrier_trigger.tgisinternal
+                    AND installed_shopify_carrier_trigger.tgenabled = 'O'
+                    AND installed_shopify_carrier_trigger.tgtype =
+                      required_shopify_carrier_deferred_trigger.trigger_type
+                    AND installed_shopify_carrier_constraint.contype = 't'
+                    AND installed_shopify_carrier_constraint.condeferrable
+                    AND installed_shopify_carrier_constraint.condeferred
+                )
+              )
+                AS shopify_carrier_configured_carriers_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0286_carrier_shipping_account_diagnostics.sql'
+              )
+              AND to_regprocedure(
+                'validate_operations_carrier_shipping_diagnostic_lineage()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_carrier_shipping_diagnostic_authority()'
+              ) IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_activation_scopes',
+                    'operations_activation_scopes_shipping_diagnostic_lease_valid'
+                  ),
+                  (
+                    'operations_integration_accounts',
+                    'operations_integration_accounts_shipping_diagnostic_lease_valid'
+                  ),
+                  (
+                    'operations_carrier_credentials',
+                    'operations_carrier_credentials_shipping_diagnostic_lease_valid'
+                  ),
+                  (
+                    'operations_carrier_accounts',
+                    'operations_carrier_accounts_shipping_diagnostic_lease_valid'
+                  )
+                ) AS required_diagnostic_lease(table_name, constraint_name)
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_attribute installed_lease_column
+                  JOIN pg_attrdef installed_lease_default
+                    ON installed_lease_default.adrelid =
+                      installed_lease_column.attrelid
+                   AND installed_lease_default.adnum =
+                      installed_lease_column.attnum
+                  WHERE installed_lease_column.attrelid =
+                    to_regclass(required_diagnostic_lease.table_name)
+                    AND installed_lease_column.attname =
+                      'production_shipping_diagnostic_lease_count'
+                    AND installed_lease_column.atttypid = 'integer'::regtype
+                    AND installed_lease_column.attnotnull
+                    AND NOT installed_lease_column.attisdropped
+                    AND pg_get_expr(
+                      installed_lease_default.adbin,
+                      installed_lease_default.adrelid
+                    ) = '0'
+                )
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM pg_constraint installed_lease_constraint
+                  WHERE installed_lease_constraint.conrelid =
+                    to_regclass(required_diagnostic_lease.table_name)
+                    AND installed_lease_constraint.conname =
+                      required_diagnostic_lease.constraint_name
+                    AND pg_get_constraintdef(
+                      installed_lease_constraint.oid
+                    ) = 'CHECK ((production_shipping_diagnostic_lease_count >= 0))'
+                )
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_carrier_rate_test_label_attempts',
+                    'operations_carrier_test_attempts_live_account_open_unique',
+                    ARRAY[
+                      'organization_id', 'carrier_account_id'
+                    ]::name[],
+                    '((environment = ''production''::text) AND (action = ''create''::text) AND (state = ANY (ARRAY[''prepared''::text, ''unknown''::text])))'
+                  ),
+                  (
+                    'operations_carrier_rate_test_labels',
+                    'operations_carrier_test_labels_live_account_active_unique',
+                    ARRAY[
+                      'organization_id', 'carrier_account_id'
+                    ]::name[],
+                    '((environment = ''production''::text) AND (status = ''created''::text))'
+                  )
+                ) AS required_diagnostic_fence_index(
+                  table_name, index_name, column_names, predicate
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_class installed_fence_index_class
+                  JOIN pg_index installed_fence_index
+                    ON installed_fence_index.indexrelid =
+                      installed_fence_index_class.oid
+                  WHERE installed_fence_index_class.relname =
+                    required_diagnostic_fence_index.index_name
+                    AND installed_fence_index.indrelid = to_regclass(
+                      required_diagnostic_fence_index.table_name
+                    )
+                    AND installed_fence_index.indisunique
+                    AND installed_fence_index.indisvalid
+                    AND installed_fence_index.indisready
+                    AND ARRAY(
+                      SELECT installed_fence_column.attname
+                      FROM unnest(installed_fence_index.indkey::smallint[])
+                        WITH ORDINALITY AS indexed_attribute(attnum, ordinal)
+                      JOIN pg_attribute installed_fence_column
+                        ON installed_fence_column.attrelid =
+                          installed_fence_index.indrelid
+                       AND installed_fence_column.attnum =
+                          indexed_attribute.attnum
+                      ORDER BY indexed_attribute.ordinal
+                    ) = required_diagnostic_fence_index.column_names
+                    AND pg_get_expr(
+                      installed_fence_index.indpred,
+                      installed_fence_index.indrelid
+                    ) = required_diagnostic_fence_index.predicate
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_class diagnostic_health_index_class
+                JOIN pg_index diagnostic_health_index
+                  ON diagnostic_health_index.indexrelid =
+                    diagnostic_health_index_class.oid
+                WHERE diagnostic_health_index_class.relname =
+                  'operations_carrier_rate_test_attempts_health_recent_idx'
+                  AND diagnostic_health_index.indrelid = to_regclass(
+                    'operations_carrier_rate_test_label_attempts'
+                  )
+                  AND diagnostic_health_index.indisvalid
+                  AND diagnostic_health_index.indisready
+                  AND pg_get_indexdef(
+                    diagnostic_health_index.indexrelid
+                  ) LIKE '%(requested_at DESC, id DESC) INCLUDE (environment, state)%'
+              )
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%evidence.purpose = ''shipping_account_diagnostic'' AND evidence.environment <> ''production''%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%evidence.integration_account_id <> NEW.integration_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%evidence.carrier_account_id <> NEW.carrier_account_id%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.environment IN (''sandbox'', ''production'')%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.environment = ''sandbox''%label.account_number_fingerprint = carrier_account.account_number_fingerprint%integration.environment = ''sandbox''%credential.credential_version = NEW.credential_version%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%production_label%activation.state = ''active''%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%FOR UPDATE OF integration, credential, carrier_account, activation%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%credentialFingerprint%credential.credential_fingerprint%accountNumberFingerprint%carrier_account.account_number_fingerprint%registeredAddressFingerprint%carrier_account.registered_address_fingerprint%senderName%carrier_account.sender_name%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'validate_operations_carrier_shipping_diagnostic_lineage()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%diagnostic_row->>''action'' = ''void''%credential.credential_version = NEW.credential_version%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%attempt_row.environment <> ''production''%attempt_row.action <> ''create''%lease_delta := 1%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%UPDATE operations_activation_scopes%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_carrier_shipping_diagnostic_authority()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%production_shipping_diagnostic_lease_count%operations_activation_scopes%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_carrier_shipping_diagnostic_authority()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%production_rate%production_label%verification_status%allow_sender_billing%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_carrier_shipping_diagnostic_authority()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.credential_ciphertext%NEW.credential_iv%NEW.credential_tag%NEW.credential_fingerprint%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_carrier_shipping_diagnostic_authority()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.account_number_ciphertext%NEW.account_number_iv%NEW.account_number_tag%NEW.encryption_version%NEW.account_number_fingerprint%NEW.registered_address%NEW.registered_address_fingerprint%NEW.sender_name%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'protect_operations_carrier_shipping_diagnostic_authority()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%NEW.account_number_last_four%OLD.account_number_ciphertext%OLD.account_number_last_four%OLD.registered_address%OLD.sender_name%'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'operations_carrier_rate_test_labels',
+                    'validate_operations_carrier_shipping_diagnostic_label',
+                    'validate_operations_carrier_shipping_diagnostic_lineage()',
+                    7
+                  ),
+                  (
+                    'operations_carrier_rate_test_label_attempts',
+                    'validate_operations_carrier_shipping_diagnostic_attempt',
+                    'validate_operations_carrier_shipping_diagnostic_lineage()',
+                    7
+                  ),
+                  (
+                    'operations_carrier_rate_test_label_attempts',
+                    'maintain_operations_carrier_shipping_diagnostic_authority_lease',
+                    'maintain_operations_carrier_shipping_diagnostic_authority_lease()',
+                    29
+                  ),
+                  (
+                    'operations_activation_scopes',
+                    'protect_operations_carrier_shipping_diagnostic_activation',
+                    'protect_operations_carrier_shipping_diagnostic_authority()',
+                    19
+                  ),
+                  (
+                    'operations_integration_accounts',
+                    'protect_operations_carrier_shipping_diagnostic_integration',
+                    'protect_operations_carrier_shipping_diagnostic_authority()',
+                    19
+                  ),
+                  (
+                    'operations_carrier_credentials',
+                    'protect_operations_carrier_shipping_diagnostic_credential',
+                    'protect_operations_carrier_shipping_diagnostic_authority()',
+                    19
+                  ),
+                  (
+                    'operations_carrier_accounts',
+                    'protect_operations_carrier_shipping_diagnostic_account',
+                    'protect_operations_carrier_shipping_diagnostic_authority()',
+                    19
+                  )
+                ) AS required_diagnostic_trigger(
+                  table_name, trigger_name, function_signature, trigger_type
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_trigger installed_diagnostic_trigger
+                  WHERE installed_diagnostic_trigger.tgrelid =
+                    to_regclass(required_diagnostic_trigger.table_name)
+                    AND installed_diagnostic_trigger.tgname =
+                      required_diagnostic_trigger.trigger_name
+                    AND installed_diagnostic_trigger.tgfoid =
+                      to_regprocedure(
+                        required_diagnostic_trigger.function_signature
+                      )
+                    AND NOT installed_diagnostic_trigger.tgisinternal
+                    AND installed_diagnostic_trigger.tgenabled = 'O'
+                    AND installed_diagnostic_trigger.tgtype =
+                      required_diagnostic_trigger.trigger_type
+                    AND installed_diagnostic_trigger.tgconstraint = 0
+                )
+              ) AS carrier_shipping_diagnostics_applied,
+              (
+                SELECT jsonb_build_object(
+                  'sandbox', jsonb_build_object(
+                    'prepared', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'sandbox'
+                        AND diagnostic_attempt.state = 'prepared'
+                    ),
+                    'stalePrepared', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'sandbox'
+                        AND diagnostic_attempt.state = 'prepared'
+                        AND diagnostic_attempt.requested_at <
+                          now() - interval '2 minutes'
+                    ),
+                    'succeeded', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'sandbox'
+                        AND diagnostic_attempt.state = 'succeeded'
+                    ),
+                    'failed', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'sandbox'
+                        AND diagnostic_attempt.state = 'failed'
+                    ),
+                    'unknown', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'sandbox'
+                        AND diagnostic_attempt.state = 'unknown'
+                    )
+                  ),
+                  'production', jsonb_build_object(
+                    'prepared', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'production'
+                        AND diagnostic_attempt.state = 'prepared'
+                    ),
+                    'stalePrepared', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'production'
+                        AND diagnostic_attempt.state = 'prepared'
+                        AND diagnostic_attempt.requested_at <
+                          now() - interval '2 minutes'
+                    ),
+                    'succeeded', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'production'
+                        AND diagnostic_attempt.state = 'succeeded'
+                    ),
+                    'failed', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'production'
+                        AND diagnostic_attempt.state = 'failed'
+                    ),
+                    'unknown', count(*) FILTER (
+                      WHERE diagnostic_attempt.environment = 'production'
+                        AND diagnostic_attempt.state = 'unknown'
+                    )
+                  )
+                )
+                FROM (
+                  SELECT recent_attempt.environment,
+                         recent_attempt.state,
+                         recent_attempt.requested_at
+                  FROM operations_carrier_rate_test_label_attempts
+                    recent_attempt
+                  ORDER BY recent_attempt.requested_at DESC,
+                           recent_attempt.id DESC
+                  LIMIT 500
+                ) diagnostic_attempt
+              ) AS carrier_shipping_diagnostic_attempt_counts,
               NOT EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -2921,6 +5259,10 @@ export async function GET() {
             && row?.operations_carrier_billing_integrity_migration_applied
             && row?.operations_carrier_billing_review_migration_applied
             && row?.operations_print_delivery_migration_applied
+            && row?.operations_print_device_reference_privacy_applied
+            && row?.operations_print_agent_pairing_grants_applied
+            && row?.shopify_carrier_configured_carriers_applied
+            && row?.carrier_shipping_diagnostics_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
             && row?.operations_settlement_lifecycle_migration_applied
@@ -2977,6 +5319,10 @@ export async function GET() {
             && row?.operations_pack_rate_pricing_semantics_applied
             && row?.operations_carrier_billing_mud_applied
             && row?.operations_shopify_inventory_refresh_migration_applied
+            && row?.operations_shopify_location_routing_applied
+            && row?.operations_shopify_location_administration_applied
+            && row?.operations_shadow_training_applied
+            && row?.operations_order_replanning_corrections_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
             && row?.operations_commerce_pack_evidence_fingerprint_applied
@@ -3023,6 +5369,55 @@ export async function GET() {
             && row?.operations_shopify_order_management_applied
             && row?.migration_checksums_present
           ),
+          carrierShippingDiagnostics: {
+            status: row?.carrier_shipping_diagnostics_applied
+              ? 'ready'
+              : 'migration-pending',
+            attempts: row?.carrier_shipping_diagnostic_attempt_counts || null,
+          },
+          printAgentPairing: {
+            status: row?.operations_print_agent_pairing_grants_applied
+              ? 'ready'
+              : 'migration-pending',
+          },
+          shopifyLocationRouting: {
+            status: row?.operations_shopify_location_routing_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shopifyLocationAdministration: {
+            status: row?.operations_shopify_location_administration_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shadowTraining: {
+            status: row?.operations_shadow_training_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          orderReplanningCorrections: {
+            status: row?.operations_order_replanning_corrections_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+        }
+        const carrierDiagnosticAttempts =
+          row?.carrier_shipping_diagnostic_attempt_counts
+        if (
+          (carrierDiagnosticAttempts?.sandbox?.stalePrepared || 0) > 0
+          || (carrierDiagnosticAttempts?.production?.stalePrepared || 0) > 0
+        ) {
+          warnings.push(
+            'Carrier shipping diagnostics have stale prepared attempts requiring review before retry.',
+          )
+        }
+        if (
+          (carrierDiagnosticAttempts?.sandbox?.unknown || 0) > 0
+          || (carrierDiagnosticAttempts?.production?.unknown || 0) > 0
+        ) {
+          warnings.push(
+            'Carrier shipping diagnostics have unknown provider outcomes requiring manual review; do not retry.',
+          )
         }
         if (canonicalOrderRevisionHealth) {
           commerceOrderReconciliationWorker = {
@@ -3293,6 +5688,10 @@ export async function GET() {
           || !row?.operations_carrier_billing_integrity_migration_applied
           || !row?.operations_carrier_billing_review_migration_applied
           || !row?.operations_print_delivery_migration_applied
+          || !row?.operations_print_device_reference_privacy_applied
+          || !row?.operations_print_agent_pairing_grants_applied
+          || !row?.shopify_carrier_configured_carriers_applied
+          || !row?.carrier_shipping_diagnostics_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied
           || !row?.operations_settlement_lifecycle_migration_applied
@@ -3349,6 +5748,10 @@ export async function GET() {
           || !row?.operations_pack_rate_pricing_semantics_applied
           || !row?.operations_carrier_billing_mud_applied
           || !row?.operations_shopify_inventory_refresh_migration_applied
+          || !row?.operations_shopify_location_routing_applied
+          || !row?.operations_shopify_location_administration_applied
+          || !row?.operations_shadow_training_applied
+          || !row?.operations_order_replanning_corrections_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
           || !row?.operations_shopify_catalog_webhook_refresh_applied
           || !row?.operations_commerce_pack_evidence_fingerprint_applied

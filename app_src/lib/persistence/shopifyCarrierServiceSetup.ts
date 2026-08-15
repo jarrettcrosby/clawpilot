@@ -1,5 +1,12 @@
 import type { QueryResultRow } from 'pg'
 import { query } from '@/lib/persistence/postgres'
+import {
+  carrierAccountAddressFingerprint,
+} from '@/lib/integrations/carrierCredentialCrypto'
+import {
+  isSourceManagedCarrierConfiguration,
+  managedCarrierDelegationAllows,
+} from '@/lib/integrations/carrierManagedDelegation'
 
 type ActivationRow = QueryResultRow & {
   state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
@@ -12,6 +19,7 @@ type WarehouseRow = QueryResultRow & {
   global_id: string
   name: string
   status: 'active' | 'inactive'
+  address: Record<string, unknown>
 }
 
 type MaterialRow = QueryResultRow & {
@@ -42,6 +50,9 @@ type CarrierRow = QueryResultRow & {
   account_status: 'needs_configuration' | 'active' | 'disabled'
   integration_status: 'active' | 'disabled' | 'error'
   verification_status: 'unverified' | 'verified' | 'failed'
+  allow_sender_billing: boolean
+  registered_address_fingerprint: string
+  configuration: Record<string, unknown>
 }
 
 type EvidenceSummaryRow = QueryResultRow & {
@@ -108,6 +119,10 @@ export type ShopifyCarrierServiceSetupReference = {
     accountStatus: CarrierRow['account_status']
     integrationStatus: CarrierRow['integration_status']
     verificationStatus: CarrierRow['verification_status']
+    allowSenderBilling: boolean
+    allowedCapabilities: string[] | null
+    matchingWarehouseGlobalIds: string[]
+    readinessIssues: string[]
   }>
   evidence: {
     totalReceipts: number
@@ -139,6 +154,68 @@ function number(value: string | number | null) {
   return Number.isSafeInteger(parsed) ? parsed : 0
 }
 
+function warehouseAddressFingerprint(
+  value: unknown,
+) {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return null
+    }
+    const address = value as Record<string, unknown>
+    const countryCode = address.countryCode ?? address.country
+    if (typeof countryCode !== 'string' || !countryCode.trim()) return null
+    return carrierAccountAddressFingerprint({
+      line1: address.line1 ?? address.address1,
+      line2: address.line2 ?? address.address2 ?? null,
+      city: address.city,
+      region: address.regionCode ?? address.region ?? address.state,
+      postalCode: address.postalCode ?? address.zip,
+      countryCode,
+    })
+  } catch {
+    return null
+  }
+}
+
+function carrierCapabilityReady(row: CarrierRow) {
+  const configuration = row.configuration
+    && typeof row.configuration === 'object'
+    && !Array.isArray(row.configuration)
+    ? row.configuration
+    : {}
+  const capability = row.environment === 'production'
+    ? 'production_rate'
+    : 'sandbox_rate'
+  if (isSourceManagedCarrierConfiguration(configuration)) {
+    return managedCarrierDelegationAllows(configuration, capability)
+  }
+  const configured = configuration.allowedCapabilities
+  return Array.isArray(configured)
+    ? configured.includes(capability)
+    : row.environment === 'sandbox'
+}
+
+function carrierReadinessIssues(row: CarrierRow) {
+  return [
+    ...(row.environment !== 'sandbox' && row.environment !== 'production'
+      ? ['environment_not_supported']
+      : []),
+    ...(row.account_status !== 'active' ? ['account_not_active'] : []),
+    ...(row.integration_status !== 'active'
+      ? ['connection_not_active']
+      : []),
+    ...(row.verification_status !== 'verified'
+      ? ['credential_not_verified']
+      : []),
+    ...(!row.allow_sender_billing ? ['sender_billing_not_allowed'] : []),
+    ...(!carrierCapabilityReady(row)
+      ? [row.environment === 'production'
+          ? 'production_rate_not_authorized'
+          : 'sandbox_rate_not_authorized']
+      : []),
+  ]
+}
+
 export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
   input: {
     organizationId: string
@@ -160,7 +237,7 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
       [input.organizationId],
     ),
     query<WarehouseRow>(
-      `SELECT global_id, name, status
+      `SELECT global_id, name, status, address
        FROM operations_warehouses
        WHERE organization_id = $1::uuid
        ORDER BY
@@ -212,7 +289,10 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
          carrier.account_number_last_four,
          carrier.status AS account_status,
          integration.status AS integration_status,
-         credential.verification_status
+         credential.verification_status,
+         carrier.allow_sender_billing,
+         carrier.registered_address_fingerprint,
+         integration.configuration
        FROM operations_carrier_accounts carrier
        JOIN operations_integration_accounts integration
          ON integration.organization_id = carrier.organization_id
@@ -319,6 +399,12 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
 
   const activation = activationResult.rows[0]
   const summary = evidenceSummaryResult.rows[0]
+  const warehouseFingerprintByGlobalId = new Map(
+    warehouseResult.rows.flatMap((warehouse) => {
+      const fingerprint = warehouseAddressFingerprint(warehouse.address)
+      return fingerprint ? [[warehouse.global_id, fingerprint] as const] : []
+    }),
+  )
   return {
     activation: activation
       ? {
@@ -348,6 +434,20 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
       accountStatus: row.account_status,
       integrationStatus: row.integration_status,
       verificationStatus: row.verification_status,
+      allowSenderBilling: row.allow_sender_billing === true,
+      allowedCapabilities: Array.isArray(
+        row.configuration?.allowedCapabilities,
+      )
+        ? row.configuration.allowedCapabilities.filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : null,
+      matchingWarehouseGlobalIds: [...warehouseFingerprintByGlobalId]
+        .filter(([, fingerprint]) => (
+          fingerprint === row.registered_address_fingerprint
+        ))
+        .map(([globalId]) => globalId),
+      readinessIssues: carrierReadinessIssues(row),
     })),
     evidence: {
       totalReceipts: number(summary?.total_receipts || 0),

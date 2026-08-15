@@ -26,6 +26,16 @@ export class CarrierIntegrationSourceManagedError extends Error {
   }
 }
 
+export class CarrierProductionLabelNotReadyError extends Error {
+  readonly status = 409
+  readonly code = 'CARRIER_PRODUCTION_LABEL_NOT_READY'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'CarrierProductionLabelNotReadyError'
+  }
+}
+
 type CarrierConnectionRow = {
   id: string
   global_id: string
@@ -533,6 +543,7 @@ function assertUserManagedCarrierConnection(
 type LockedCarrierConnection = {
   id: string
   global_id: string
+  status: 'active' | 'disabled' | 'error'
   configuration: Record<string, unknown>
   credential_configured: boolean
 }
@@ -563,7 +574,8 @@ async function lockedUserManagedCarrierConnection(
 ) {
   const requireCredential = options.requireCredential !== false
   const result = await client.query<LockedCarrierConnection>(
-    `SELECT account.id::text, account.global_id, account.configuration,
+    `SELECT account.id::text, account.global_id, account.status,
+            account.configuration,
             EXISTS (
               SELECT 1
               FROM operations_carrier_credentials credential
@@ -1146,6 +1158,11 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
       environment: 'production',
     })
     if (input.enabled) {
+      if (connection.status !== 'active') {
+        throw new CarrierProductionLabelNotReadyError(
+          'Enable the production carrier connection before authorizing live postage',
+        )
+      }
       const readiness = await client.query<{
         activation_state: string | null
         verified: boolean
@@ -1176,14 +1193,19 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
         [input.organizationId, connection.id],
       )
       const row = readiness.rows[0]
-      if (
-        !row
-        || row.activation_state !== 'active'
-        || !row.verified
-        || Number(row.sender_account_count) < 1
-      ) {
-        throw new Error(
-          'Live postage authorization requires Active Operations, an enabled verified production credential, and an active sender-billing account',
+      if (!row || row.activation_state !== 'active') {
+        throw new CarrierProductionLabelNotReadyError(
+          'Move Operations to Active before authorizing live postage',
+        )
+      }
+      if (!row.verified) {
+        throw new CarrierProductionLabelNotReadyError(
+          'Verify the production carrier credential before authorizing live postage',
+        )
+      }
+      if (Number(row.sender_account_count) < 1) {
+        throw new CarrierProductionLabelNotReadyError(
+          'Add and enable a production sender-billing account before authorizing live postage',
         )
       }
     }
@@ -1327,6 +1349,91 @@ export async function writeCarrierSandboxRateEvidenceInPostgres(
       globalId: input.integrationGlobalId,
       provider: input.provider,
       environment: 'sandbox',
+      payload: {
+        evidenceGlobalId: globalId,
+        carrierAccountGlobalId: input.carrierAccountGlobalId,
+        billingRelationship: input.billingRelationship,
+        purpose: input.purpose,
+        adapterVersion: input.adapterVersion,
+        credentialVersion: input.credentialVersion,
+        requestHash: input.requestHash,
+        rateCount: Array.isArray(input.redactedResponse.rates)
+          ? input.redactedResponse.rates.length
+          : 0,
+        ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+      },
+    })
+    return globalId
+  })
+}
+
+export type CarrierProductionRateEvidenceInput = Omit<
+  CarrierSandboxRateEvidenceInput,
+  'provider' | 'purpose'
+> & {
+  provider: 'ups_rest' | 'fedex_rest'
+  purpose: 'cartonization_shipment_rate' | 'shipping_account_diagnostic'
+}
+
+/** Durable evidence for an explicitly production-bound, read-only rate call. */
+export async function writeCarrierProductionRateEvidenceInPostgres(
+  input: CarrierProductionRateEvidenceInput,
+) {
+  return withTransaction(async (client) => {
+    const result = await client.query<{ global_id: string }>(
+      `INSERT INTO operations_carrier_rate_requests (
+         organization_id, integration_account_id, carrier_account_id,
+         provider, environment, purpose, adapter_version,
+         credential_version, request_hash, billing_relationship,
+         billing_selection_snapshot, redacted_request, redacted_response,
+         status, provider_reference, error_code, actor_email,
+         requested_at, completed_at, carrier_selection_key
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, 'production', $5, $6, $7, $8,
+         $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15,
+         CASE
+           WHEN $16 = 'system:shopify-carrier-service' THEN NULL
+           ELSE $16
+         END,
+         $17::timestamptz, $18::timestamptz, $19
+       )
+       RETURNING global_id`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.carrierAccountId,
+        input.provider,
+        input.purpose,
+        input.adapterVersion,
+        input.credentialVersion,
+        input.requestHash,
+        input.billingRelationship,
+        JSON.stringify(input.billingSelectionSnapshot),
+        JSON.stringify(input.redactedRequest),
+        JSON.stringify(input.redactedResponse),
+        input.status,
+        input.providerReference,
+        input.errorCode,
+        input.actorEmail,
+        input.requestedAt,
+        input.completedAt,
+        input.carrierSelectionKey || null,
+      ],
+    )
+    const globalId = result.rows[0].global_id
+    await auditCarrier(client, {
+      actorEmail: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: input.status === 'succeeded'
+        ? input.purpose === 'shipping_account_diagnostic'
+          ? 'carrier.shipping_account_diagnostic_rate.succeeded'
+          : 'carrier.cartonization_shipment_rate.succeeded'
+        : input.purpose === 'shipping_account_diagnostic'
+          ? 'carrier.shipping_account_diagnostic_rate.failed'
+          : 'carrier.cartonization_shipment_rate.failed',
+      globalId: input.integrationGlobalId,
+      provider: input.provider,
+      environment: 'production',
       payload: {
         evidenceGlobalId: globalId,
         carrierAccountGlobalId: input.carrierAccountGlobalId,

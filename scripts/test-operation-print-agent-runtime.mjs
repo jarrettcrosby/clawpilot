@@ -295,6 +295,15 @@ async function createPrinter(pool, fixture, input) {
   const media = input.media || ['letter']
   const documents = input.documents || ['packing_slip']
   const printerType = input.printerType || 'nonthermal'
+  if (input.agentId && input.agentConnected !== false) {
+    await pool.query(
+      `UPDATE operations_print_agents
+       SET last_seen_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, input.agentId],
+    )
+  }
   return insertReturning(
     pool,
     `INSERT INTO operations_printers (
@@ -934,6 +943,216 @@ async function verifyRuntime(connectionString) {
       },
     )
     const fixture = await seedBase(pool)
+    const pairingInput = {
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Pairing-grant Zebra agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `pairing-grant-${fixture.suffix}`,
+      ...printing.DEFAULT_PRINT_AGENT_CAPABILITIES,
+    }
+    const pairingIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres(pairingInput)
+    assert.match(
+      pairingIssue.pairingGrant.pairingCode,
+      /^cppair\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
+    )
+    assert.ok(
+      Date.parse(pairingIssue.pairingGrant.expiresAt) > Date.now(),
+      'Pairing grants must expire in the future',
+    )
+    const persistedPairingSecret = await pool.query(
+      `SELECT secret_hash, status, print_agent_id
+       FROM operations_print_agent_pairing_grants
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, pairingIssue.pairingGrant.id],
+    )
+    assert.match(persistedPairingSecret.rows[0].secret_hash, /^[a-f0-9]{64}$/)
+    assert.equal(
+      JSON.stringify(persistedPairingSecret.rows[0]).includes(
+        pairingIssue.pairingGrant.pairingCode,
+      ),
+      false,
+      'Plaintext cppair grants must never be persisted',
+    )
+    assert.equal(persistedPairingSecret.rows[0].status, 'pending')
+    assert.equal(persistedPairingSecret.rows[0].print_agent_id, null)
+
+    const pairingIssueReplay = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres(pairingInput)
+    assert.equal(
+      pairingIssueReplay.pairingGrant.id,
+      pairingIssue.pairingGrant.id,
+    )
+    assert.equal(
+      pairingIssueReplay.pairingGrant.pairingCode,
+      null,
+      'Idempotent browser replays must not recover plaintext cppair grants',
+    )
+    await expectRejected(
+      () => persistence.createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Different pairing plan',
+      }),
+      /different print-agent pairing request/,
+    )
+
+    const pairingRedemption = await persistence
+      .redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: `redeem-pairing-${fixture.suffix}`,
+      })
+    assert.equal(pairingRedemption.replayed, false)
+    assert.match(
+      pairingRedemption.credential,
+      /^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i,
+    )
+    assert.equal(
+      pairingRedemption.agent.id,
+      pairingRedemption.credential.split('.')[2],
+      'Redeemed credential must use the grant-reserved agent identity',
+    )
+    assert.ok(
+      await persistence.authenticateOperationsPrintAgentInPostgres(
+        pairingRedemption.credential,
+      ),
+      'A redeemed credential must authenticate immediately',
+    )
+    const redeemedGrant = await pool.query(
+      `SELECT status, print_agent_id::text, redemption_idempotency_key
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [pairingIssue.pairingGrant.id],
+    )
+    assert.deepEqual(redeemedGrant.rows[0], {
+      status: 'redeemed',
+      print_agent_id: pairingRedemption.agent.id,
+      redemption_idempotency_key: `redeem-pairing-${fixture.suffix}`,
+    })
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: pairingIssue.pairingGrant.pairingCode,
+        idempotencyKey: `redeem-replay-${fixture.suffix}`,
+      }),
+      /already used/,
+    )
+
+    const concurrentIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Concurrent pairing agent',
+        idempotencyKey: `pairing-concurrent-${fixture.suffix}`,
+      })
+    const concurrentRedemptions = await Promise.allSettled([
+      persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: concurrentIssue.pairingGrant.pairingCode,
+        idempotencyKey: `pairing-concurrent-a-${fixture.suffix}`,
+      }),
+      persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: concurrentIssue.pairingGrant.pairingCode,
+        idempotencyKey: `pairing-concurrent-b-${fixture.suffix}`,
+      }),
+    ])
+    assert.equal(
+      concurrentRedemptions.filter((result) => result.status === 'fulfilled').length,
+      1,
+      'Exactly one concurrent redemption may receive a cpprint credential',
+    )
+    assert.equal(
+      concurrentRedemptions.filter((result) => result.status === 'rejected').length,
+      1,
+    )
+    assert.match(
+      String(
+        concurrentRedemptions.find((result) => result.status === 'rejected')
+          ?.reason?.message || '',
+      ),
+      /already used/,
+    )
+
+    const invalidSecretIssue = await persistence
+      .createOperationsPrintAgentPairingGrantInPostgres({
+        ...pairingInput,
+        name: 'Wrong-secret pairing agent',
+        idempotencyKey: `pairing-wrong-secret-${fixture.suffix}`,
+      })
+    const correctPairingCode = invalidSecretIssue.pairingGrant.pairingCode
+    const finalCharacter = correctPairingCode.at(-1)
+    const wrongPairingCode = `${correctPairingCode.slice(0, -1)}${
+      finalCharacter === 'A' ? 'B' : 'A'
+    }`
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: wrongPairingCode,
+        idempotencyKey: `pairing-wrong-${fixture.suffix}`,
+      }),
+      /pairing code is invalid/i,
+    )
+    const stillPendingGrant = await pool.query(
+      `SELECT status, print_agent_id
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [invalidSecretIssue.pairingGrant.id],
+    )
+    assert.deepEqual(stillPendingGrant.rows[0], {
+      status: 'pending',
+      print_agent_id: null,
+    })
+    const validAfterWrongSecret = await persistence
+      .redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: correctPairingCode,
+        idempotencyKey: `pairing-valid-after-wrong-${fixture.suffix}`,
+      })
+    assert.ok(validAfterWrongSecret.credential)
+
+    const expiredMaterial = persistence.createOperationsPrintAgentPairingCode()
+    const expiredReservedAgentId = randomUUID()
+    await pool.query(
+      `INSERT INTO operations_print_agent_pairing_grants (
+         id, organization_id, warehouse_id, reserved_agent_id, name,
+         secret_hash, supported_formats, supported_media,
+         supported_document_types, request_fingerprint, idempotency_key,
+         created_by, created_at, expires_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5,
+         $6, $7::text[], $8::text[], $9::text[], $10, $11, $12,
+         clock_timestamp() - interval '11 minutes',
+         clock_timestamp() - interval '1 minute'
+       )`,
+      [
+        expiredMaterial.pairingGrantId,
+        fixture.organizationId,
+        fixture.warehouseId,
+        expiredReservedAgentId,
+        'Expired pairing agent',
+        expiredMaterial.secretHash,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedFormats,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedMedia,
+        printing.DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes,
+        persistence.operationsPrintDeliveryFingerprint({ expired: true }),
+        `pairing-expired-${fixture.suffix}`,
+        fixture.actorEmail,
+      ],
+    )
+    await expectRejected(
+      () => persistence.redeemOperationsPrintAgentPairingGrantInPostgres({
+        pairingCode: expiredMaterial.pairingCode,
+        idempotencyKey: `redeem-expired-${fixture.suffix}`,
+      }),
+      /expired/,
+    )
+    const expiredGrant = await pool.query(
+      `SELECT status, expired_at IS NOT NULL AS expired
+       FROM operations_print_agent_pairing_grants
+       WHERE id = $1::uuid`,
+      [expiredMaterial.pairingGrantId],
+    )
+    assert.deepEqual(expiredGrant.rows[0], {
+      status: 'expired',
+      expired: true,
+    })
+
     const legacyBundledEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,
       warehouseId: fixture.warehouseId,
@@ -1027,6 +1246,40 @@ async function verifyRuntime(connectionString) {
       /Only the exact legacy bundled Zebra capability profile/,
     )
 
+    const printSource = await seedPrintSource(pool, fixture)
+    const neverConnectedPrinter = await createPrinter(pool, fixture, {
+      code: `NEVER-CONNECTED-${fixture.suffix}`,
+      name: 'Configured printer whose agent never connected',
+      priority: 1,
+      agentId: primaryEnrollment.agent.id,
+      agentConnected: false,
+      isDefault: false,
+    })
+    const neverConnectedContent = `never-connected-${fixture.suffix}`
+    await assert.rejects(
+      () => persistence.enqueueOperationsPrintJobInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `never-connected-${fixture.suffix}`,
+        warehouseId: fixture.warehouseId,
+        preferredPrinterGlobalId: neverConnectedPrinter.global_id,
+        document: {
+          type: 'packing_slip',
+          format: 'PDF',
+          media: 'letter',
+          contentSha256: createHash('sha256').update(neverConnectedContent).digest('hex'),
+          byteLength: Buffer.byteLength(neverConnectedContent),
+          storageReference: `clawpilot-document:never-connected-${fixture.suffix}`,
+          sourceOrderGlobalId: printSource.order.global_id,
+        },
+      }),
+      (error) => (
+        error.code === 'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED'
+        && error.status === 409
+      ),
+      'Durable enqueue must fail closed until the configured agent first connects',
+    )
+
     const fallback = await createPrinter(pool, fixture, {
       code: `FALLBACK-${fixture.suffix}`,
       name: 'Fallback packing-slip printer',
@@ -1042,8 +1295,6 @@ async function verifyRuntime(connectionString) {
       isDefault: true,
       fallbackId: fallback.id,
     })
-    const printSource = await seedPrintSource(pool, fixture)
-
     const content = `packing-slip-${fixture.suffix}`
     const queued = await persistence.enqueueOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
@@ -1175,6 +1426,27 @@ async function verifyRuntime(connectionString) {
     assert.equal(delivered.status, 'delivered')
     assert.ok(delivered.deliveredAt)
     assert.equal(duplicateAck.status, 'delivered')
+    const deliveredReference = delivered.attemptHistory.find((attempt) => (
+      attempt.state === 'delivered'
+    ))?.deviceJobReference
+    assert.match(
+      deliveredReference,
+      /^local-device\.legacy\.v1\.redacted$/,
+    )
+    assert.doesNotMatch(deliveredReference, new RegExp(`device-${fixture.suffix}`))
+    const storedReference = await pool.query(
+      `SELECT attempt.device_job_reference
+       FROM operations_print_delivery_attempts attempt
+       JOIN operations_print_jobs job
+         ON job.organization_id = attempt.organization_id
+        AND job.id = attempt.print_job_id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = $2
+         AND attempt.state = 'delivered'
+       LIMIT 1`,
+      [fixture.organizationId, queued.globalId],
+    )
+    assert.equal(storedReference.rows[0].device_job_reference, deliveredReference)
 
     const reprint = await persistence.reprintOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
@@ -1957,6 +2229,203 @@ async function verifyRuntime(connectionString) {
   }
 }
 
+async function verifyDeviceReferencePrivacyMigration(connectionString) {
+  const pool = new Pool({ connectionString, connectionTimeoutMillis: 5_000 })
+  try {
+    const oldWriterTarget = await insertReturning(
+      pool,
+      `SELECT
+         job.organization_id::text,
+         job.id::text AS print_job_id,
+         job.printer_id::text,
+         job.claimed_by_print_agent_id::text AS print_agent_id,
+         job.current_claim_attempt_id::text AS claim_attempt_id
+       FROM operations_print_jobs job
+       WHERE job.status = 'claimed'
+         AND job.claimed_by_print_agent_id IS NOT NULL
+         AND job.current_claim_attempt_id IS NOT NULL
+       ORDER BY job.updated_at DESC, job.id
+       LIMIT 1`,
+    )
+    const oldWriterAttempt = await insertReturning(
+      pool,
+      `INSERT INTO operations_print_delivery_attempts (
+         organization_id, print_job_id, printer_id,
+         state, actor_type, print_agent_id, claim_attempt_id,
+         idempotency_key, request_fingerprint,
+         device_job_reference, delivery_evidence
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         'delivered', 'local_print_agent', $4::uuid, $5::uuid,
+         $6, $7, '192.168.4.199:9100', 'local_agent_acknowledgement'
+       )
+       RETURNING id::text, device_job_reference`,
+      [
+        oldWriterTarget.organization_id,
+        oldWriterTarget.print_job_id,
+        oldWriterTarget.printer_id,
+        oldWriterTarget.print_agent_id,
+        oldWriterTarget.claim_attempt_id,
+        `old-writer-device-reference-${randomUUID()}`,
+        createHash('sha256')
+          .update(`old-writer-device-reference:${randomUUID()}`)
+          .digest('hex'),
+      ],
+    )
+    assert.equal(
+      oldWriterAttempt.device_job_reference,
+      'local-device.legacy.v1.redacted',
+      'Migration guard must normalize a rolling-deploy old-writer insert',
+    )
+
+    const candidates = await pool.query(
+      `SELECT id::text
+       FROM operations_print_delivery_attempts
+       WHERE state = 'delivered'
+         AND device_job_reference IS NOT NULL
+       ORDER BY occurred_at, id
+       LIMIT 3`,
+    )
+    assert.equal(candidates.rowCount, 3)
+    const rawAttemptId = candidates.rows[0].id
+    const opaqueAttemptId = candidates.rows[1].id
+    const malformedOpaqueAttemptId = candidates.rows[2].id
+    const opaqueReference = `local-device.v1.${'A'.repeat(43)}`
+
+    await pool.query('BEGIN')
+    try {
+      await pool.query(
+        `ALTER TABLE operations_print_delivery_attempts
+           DISABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+      )
+      await pool.query(
+        `UPDATE operations_print_delivery_attempts
+         SET device_job_reference = CASE id
+           WHEN $1::uuid THEN '192.168.4.146:9100'
+           WHEN $2::uuid THEN $4
+           WHEN $3::uuid THEN 'local-device.v1.not-valid'
+           ELSE device_job_reference
+         END
+         WHERE id IN ($1::uuid, $2::uuid, $3::uuid)`,
+        [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId, opaqueReference],
+      )
+      await pool.query(
+        `ALTER TABLE operations_print_delivery_attempts
+           ENABLE TRIGGER protect_operations_print_delivery_attempt_write`,
+      )
+      await pool.query('COMMIT')
+    } catch (error) {
+      await pool.query('ROLLBACK')
+      throw error
+    }
+
+    const before = await pool.query(
+      `SELECT id::text, to_jsonb(attempt) - 'device_job_reference' AS invariant
+       FROM operations_print_delivery_attempts attempt
+       WHERE id IN ($1::uuid, $2::uuid, $3::uuid)
+       ORDER BY id`,
+      [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId],
+    )
+    await pool.query('BEGIN')
+    try {
+      await pool.query(
+        read('db/migrations/0284_operations_print_device_reference_privacy.sql'),
+      )
+      await pool.query('COMMIT')
+    } catch (error) {
+      await pool.query('ROLLBACK')
+      throw error
+    }
+    const after = await pool.query(
+      `SELECT
+         id::text,
+         device_job_reference,
+         to_jsonb(attempt) - 'device_job_reference' AS invariant
+       FROM operations_print_delivery_attempts attempt
+       WHERE id IN ($1::uuid, $2::uuid, $3::uuid)
+       ORDER BY id`,
+      [rawAttemptId, opaqueAttemptId, malformedOpaqueAttemptId],
+    )
+    assert.deepEqual(
+      after.rows.map((row) => ({ id: row.id, invariant: row.invariant })),
+      before.rows,
+      'Privacy migration must preserve every attempt fact except the local device reference',
+    )
+    const byId = new Map(after.rows.map((row) => [row.id, row.device_job_reference]))
+    assert.equal(byId.get(rawAttemptId), 'local-device.legacy.v1.redacted')
+    assert.equal(byId.get(opaqueAttemptId), opaqueReference)
+    assert.equal(
+      byId.get(malformedOpaqueAttemptId),
+      'local-device.legacy.v1.redacted',
+    )
+
+    const privacyEvidence = await pool.query(
+      `SELECT
+         NOT EXISTS (
+           SELECT 1
+           FROM operations_print_delivery_attempts
+           WHERE device_job_reference IS NOT NULL
+             AND NOT (
+               device_job_reference ~
+                 '^local-device[.]v1[.][A-Za-z0-9_-]{43}$'
+               OR device_job_reference = 'local-device.legacy.v1.redacted'
+             )
+         ) AS no_raw_references,
+         EXISTS (
+           SELECT 1
+           FROM schema_migrations
+           WHERE filename =
+             '0284_operations_print_device_reference_privacy.sql'
+             AND checksum ~ '^[0-9a-f]{64}$'
+         ) AS migration_recorded,
+         EXISTS (
+           SELECT 1
+           FROM pg_trigger guard
+           WHERE guard.tgrelid =
+             to_regclass('operations_print_delivery_attempts')
+             AND guard.tgname =
+               'protect_operations_print_delivery_attempt_write'
+             AND guard.tgfoid =
+               to_regprocedure('protect_operations_append_only()')
+             AND NOT guard.tgisinternal
+             AND guard.tgenabled = 'O'
+             AND guard.tgtype = 27
+         ) AS guard_enabled,
+         EXISTS (
+           SELECT 1
+           FROM pg_trigger normalization_guard
+           WHERE normalization_guard.tgrelid =
+             to_regclass('operations_print_delivery_attempts')
+             AND normalization_guard.tgname =
+               'normalize_operations_print_delivery_device_reference_write'
+             AND normalization_guard.tgfoid = to_regprocedure(
+               'normalize_operations_print_delivery_device_reference()'
+             )
+             AND NOT normalization_guard.tgisinternal
+             AND normalization_guard.tgenabled = 'O'
+             AND normalization_guard.tgtype = 7
+         ) AS normalization_guard_enabled`,
+    )
+    assert.deepEqual(privacyEvidence.rows[0], {
+      no_raw_references: true,
+      migration_recorded: true,
+      guard_enabled: true,
+      normalization_guard_enabled: true,
+    })
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_print_delivery_attempts
+         SET device_job_reference = 'must-not-write'
+         WHERE id = $1::uuid`,
+        [rawAttemptId],
+      ),
+      /append-only/i,
+    )
+  } finally {
+    await pool.end()
+  }
+}
+
 async function main() {
   command('docker', ['info'], { timeout: 30_000 })
   const container = `clawpilot-print-agent-runtime-${process.pid}-${randomUUID().slice(0, 8)}`
@@ -1981,6 +2450,7 @@ async function main() {
     await verifyLegacyPrinterNormalization(connectionString)
     await verifyAgentCapabilityBackfill(connectionString)
     await verifyRuntime(connectionString)
+    await verifyDeviceReferencePrivacyMigration(connectionString)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
       cwd: root,

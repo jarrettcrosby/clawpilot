@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  CHECKOUT_RATE_MAX_ACCOUNT_CALLS,
+  CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
   CheckoutShipmentRateError,
   rateCheckoutShipment,
   rateOptimizedCheckoutPlans,
@@ -56,9 +58,10 @@ function result(
       currency: 'USD',
       transitDays: 3,
       deliveryDate: '2026-08-03',
-      evidenceGlobalId: selection.provider === 'ups_rest'
-        ? 'grq0000001'
-        : 'grq0000002',
+      evidenceGlobalId: selection.carrierAccountGlobalId.replace(
+        /^gac/,
+        'grq',
+      ),
     }],
   }
 }
@@ -139,6 +142,8 @@ test('rates the complete package set exactly once per configured carrier', async
   )
   assert.equal(response.packageCount, 2)
   assert.equal(response.offers.length, 2)
+  assert.deepEqual(response.configuredAccounts, carriers)
+  assert.deepEqual(response.successfulAccounts, carriers)
   assert.deepEqual(response.configuredProviders, ['ups_rest', 'fedex_rest'])
   assert.deepEqual(response.successfulProviders, ['ups_rest', 'fedex_rest'])
   assert.deepEqual(response.providerAttempts, [
@@ -166,6 +171,215 @@ test('rates the complete package set exactly once per configured carrier', async
       { carrierCode: 'fedex', amountMinor: 3962 },
       { carrierCode: 'ups', amountMinor: 4285 },
     ],
+  )
+})
+
+test('rates one configured carrier without requiring the other provider', async () => {
+  const calls: string[] = []
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers: [carriers[0]!],
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection) => {
+      calls.push(selection.provider)
+      return result(selection, '42.85')
+    },
+  })
+
+  assert.deepEqual(calls, ['ups_rest'])
+  assert.deepEqual(response.configuredAccounts, [carriers[0]])
+  assert.deepEqual(response.successfulAccounts, [carriers[0]])
+  assert.deepEqual(response.configuredProviders, ['ups_rest'])
+  assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.equal(response.providerAttempts.length, 1)
+  assert.equal(response.offers.length, 1)
+  assert.equal(response.offers[0]?.carrierCode, 'ups')
+})
+
+test('preserves every same-provider account and its evidence independently', async () => {
+  const configuredAccounts: CheckoutRateCarrierSelection[] = [
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000003' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000002' },
+  ]
+  const calls: string[] = []
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers: configuredAccounts,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection) => {
+      calls.push(selection.carrierAccountGlobalId)
+      if (selection.carrierAccountGlobalId === 'gac0000002') {
+        throw providerFailure(
+          'CARRIER_PROVIDER_TIMEOUT',
+          'grq0000002',
+          'second UPS account timed out',
+        )
+      }
+      return result(selection, '42.85')
+    },
+  })
+
+  assert.deepEqual(calls, [
+    'gac0000001',
+    'gac0000002',
+    'gac0000003',
+  ])
+  assert.deepEqual(response.configuredAccounts, [
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000002' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000003' },
+  ])
+  assert.deepEqual(response.successfulAccounts, [
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+    { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000003' },
+  ])
+  assert.deepEqual(response.configuredProviders, ['ups_rest'])
+  assert.deepEqual(response.successfulProviders, ['ups_rest'])
+  assert.deepEqual(response.providerAttempts, [
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000001',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000001',
+    },
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000002',
+      status: 'degraded',
+      failureCode: 'CARRIER_PROVIDER_TIMEOUT',
+      rateEvidenceGlobalId: 'grq0000002',
+    },
+    {
+      provider: 'ups_rest',
+      carrierAccountGlobalId: 'gac0000003',
+      status: 'succeeded',
+      failureCode: null,
+      rateEvidenceGlobalId: 'grq0000003',
+    },
+  ])
+  assert.deepEqual(
+    response.offers.map((offer) => offer.carrierAccountGlobalId),
+    ['gac0000001', 'gac0000003'],
+  )
+})
+
+test('rejects a duplicate carrier-account binding before invoking adapters', async () => {
+  let calls = 0
+  await assert.rejects(
+    rateCheckoutShipment({
+      destination,
+      parcels,
+      carriers: [
+        { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+        { provider: 'fedex_rest', carrierAccountGlobalId: 'gac0000001' },
+      ],
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      invoke: async (selection) => {
+        calls += 1
+        return result(selection, '42.85')
+      },
+    }),
+    (error: unknown) => (
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_CARRIERS_INVALID'
+    ),
+  )
+  assert.equal(calls, 0)
+})
+
+test('rejects carrier-account fanout above the bounded maximum', async () => {
+  let calls = 0
+  const overLimit = Array.from(
+    { length: CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS + 1 },
+    (_, index): CheckoutRateCarrierSelection => ({
+      provider: index % 2 === 0 ? 'ups_rest' : 'fedex_rest',
+      carrierAccountGlobalId: `gac${String(index + 1).padStart(7, '0')}`,
+    }),
+  )
+
+  await assert.rejects(
+    rateCheckoutShipment({
+      destination,
+      parcels,
+      carriers: overLimit,
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      invoke: async (selection) => {
+        calls += 1
+        return result(selection, '42.85')
+      },
+    }),
+    (error: unknown) => (
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_CARRIERS_INVALID'
+    ),
+  )
+  assert.equal(calls, 0)
+})
+
+test('rates the bounded maximum number of unique carrier accounts', async () => {
+  const atLimit = Array.from(
+    { length: CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS },
+    (_, index): CheckoutRateCarrierSelection => ({
+      provider: index % 2 === 0 ? 'ups_rest' : 'fedex_rest',
+      carrierAccountGlobalId: `gac${String(index + 1).padStart(7, '0')}`,
+    }),
+  ).reverse()
+
+  const response = await rateCheckoutShipment({
+    destination,
+    parcels,
+    carriers: atLimit,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    invoke: async (selection) => result(selection, '42.85'),
+  })
+
+  assert.equal(response.configuredAccounts.length, 8)
+  assert.equal(response.successfulAccounts.length, 8)
+  assert.equal(response.providerAttempts.length, 8)
+  assert.equal(response.offers.length, 8)
+  assert.deepEqual(
+    response.configuredAccounts.map(({ carrierAccountGlobalId }) => (
+      carrierAccountGlobalId
+    )),
+    Array.from({ length: 8 }, (_, index) => (
+      `gac${String(index + 1).padStart(7, '0')}`
+    )),
+  )
+})
+
+test('identifies the exact account missing degraded rate evidence', async () => {
+  await assert.rejects(
+    rateCheckoutShipment({
+      destination,
+      parcels,
+      carriers: [
+        { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+        { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000002' },
+      ],
+      currency: 'USD',
+      deadlineAt: Date.now() + 5_000,
+      invoke: async (selection) => {
+        if (selection.carrierAccountGlobalId === 'gac0000002') {
+          throw new Error('provider failed before evidence was durable')
+        }
+        return result(selection, '42.85')
+      },
+    }),
+    (error: unknown) => (
+      error instanceof CheckoutShipmentRateError
+      && error.code === 'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED'
+      && error.provider === 'ups_rest'
+      && error.carrierAccountGlobalId === 'gac0000002'
+    ),
   )
 })
 
@@ -332,6 +546,112 @@ test('stable candidate and service identifiers resolve exact ties', async () => 
 
   assert.equal(response.selectedCandidate.candidateKey, 'candidate-a')
   assert.equal(response.selectedOffer.carrierCode, 'fedex')
+})
+
+test('stable account identity resolves same-provider service ties', async () => {
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates: [{
+      candidateKey: 'candidate-a',
+      parcels: [parcels[0]],
+      materialCostMinor: 25,
+      unusedCubeMm3: 100,
+    }],
+    carriers: [
+      { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000002' },
+      { provider: 'ups_rest', carrierAccountGlobalId: 'gac0000001' },
+    ],
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => optimizedResult(
+      selection,
+      request.parcels.length,
+      '10.00',
+    ),
+  })
+
+  assert.equal(
+    response.selectedOffer.carrierAccountGlobalId,
+    'gac0000001',
+  )
+})
+
+test('bounds eight-account optimization to sixteen complete account calls', async () => {
+  const accountBindings = Array.from(
+    { length: CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS },
+    (_, index): CheckoutRateCarrierSelection => ({
+      provider: index % 2 === 0 ? 'ups_rest' : 'fedex_rest',
+      carrierAccountGlobalId: `gac${String(index + 1).padStart(7, '0')}`,
+    }),
+  )
+  const candidates = Array.from({ length: 4 }, (_, index) => ({
+    candidateKey: `candidate-${index + 1}`,
+    parcels: [parcels[0]],
+    materialCostMinor: index,
+    unusedCubeMm3: 100 + index,
+  }))
+  const calls: string[] = []
+
+  const response = await rateOptimizedCheckoutPlans({
+    destination,
+    candidates,
+    carriers: accountBindings,
+    currency: 'USD',
+    deadlineAt: Date.now() + 5_000,
+    policy: {
+      ...priceFirstPolicy,
+      objectivePriority: [...priceFirstPolicy.objectivePriority],
+    },
+    invoke: async (selection, request) => {
+      calls.push(selection.carrierAccountGlobalId)
+      return optimizedResult(selection, request.parcels.length, '10.00')
+    },
+  })
+
+  assert.equal(calls.length, CHECKOUT_RATE_MAX_ACCOUNT_CALLS)
+  assert.deepEqual(
+    calls.reduce<Record<string, number>>((counts, accountId) => ({
+      ...counts,
+      [accountId]: (counts[accountId] ?? 0) + 1,
+    }), {}),
+    Object.fromEntries(accountBindings.map((binding) => [
+      binding.carrierAccountGlobalId,
+      2,
+    ])),
+  )
+  assert.deepEqual(
+    response.candidateAttempts.map((attempt) => ({
+      key: attempt.candidate.candidateKey,
+      accountAttemptCount: attempt.result?.providerAttempts.length ?? 0,
+      failureCode: attempt.failureCode,
+    })),
+    [
+      {
+        key: 'candidate-1',
+        accountAttemptCount: 8,
+        failureCode: null,
+      },
+      {
+        key: 'candidate-2',
+        accountAttemptCount: 8,
+        failureCode: null,
+      },
+      {
+        key: 'candidate-3',
+        accountAttemptCount: 0,
+        failureCode: 'CHECKOUT_RATE_ACCOUNT_CALL_BUDGET_EXHAUSTED',
+      },
+      {
+        key: 'candidate-4',
+        accountAttemptCount: 0,
+        failureCode: 'CHECKOUT_RATE_ACCOUNT_CALL_BUDGET_EXHAUSTED',
+      },
+    ],
+  )
 })
 
 test('stored objective priority changes selection without changing code', async () => {

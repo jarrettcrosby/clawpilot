@@ -11,6 +11,7 @@ import {
 
 type TimestampValue = string | Date
 type Provider = 'ups_rest' | 'fedex_rest'
+type Environment = 'sandbox' | 'production'
 type AttemptState = 'prepared' | 'succeeded' | 'failed' | 'unknown'
 
 export type CarrierRateTestSelectedRate = {
@@ -28,7 +29,7 @@ export type CarrierRateTestLabelListItem = {
   voidAttemptGlobalId: string | null
   carrierAccountGlobalId: string
   provider: Provider
-  environment: 'sandbox'
+  environment: Environment
   credentialVersion: number
   serviceCode: string
   serviceName: string
@@ -59,12 +60,15 @@ export type CarrierRateTestCreateContext = {
   carrierAccountId: string
   carrierAccountGlobalId: string
   provider: Provider
+  environment: Environment
+  purpose: 'sandbox_rate_test' | 'shipping_account_diagnostic'
   credentialVersion: number
   requestHash: string
   billingRelationship: 'sender' | 'recipient' | 'third_party'
   billingSelectionSnapshot: Record<string, unknown>
   redactedRequest: Record<string, unknown>
   redactedResponse: Record<string, unknown>
+  completedAt: string
 }
 
 export type CarrierRateTestLabelProviderContext = {
@@ -77,6 +81,7 @@ export type CarrierRateTestLabelProviderContext = {
   carrierAccountId: string
   carrierAccountGlobalId: string
   provider: Provider
+  environment: Environment
   credentialVersion: number
   accountNumberFingerprint: string
   rateRequestHash: string
@@ -99,6 +104,7 @@ export type CarrierRateTestLabelAttemptListItem = {
   action: 'create' | 'void'
   state: AttemptState
   provider: Provider
+  environment: Environment
   serviceCode: string
   selectedRate: CarrierRateTestSelectedRate
   reason: string
@@ -126,7 +132,7 @@ type LabelRow = {
   void_attempt_global_id: string | null
   carrier_account_global_id: string
   provider: Provider
-  environment: 'sandbox'
+  environment: Environment
   credential_version: number
   service_code: string
   service_name: string
@@ -156,6 +162,7 @@ type AttemptRow = {
   action: 'create' | 'void'
   state: AttemptState
   provider: Provider
+  environment: Environment
   service_code: string
   selected_rate: Record<string, unknown>
   reason: string
@@ -193,7 +200,7 @@ const LABEL_SELECT = `
     JOIN operations_carrier_rate_requests rate
       ON rate.organization_id = label.organization_id
      AND rate.id = label.rate_request_id
-     AND rate.purpose = 'sandbox_rate_test'
+     AND rate.purpose IN ('sandbox_rate_test', 'shipping_account_diagnostic')
     JOIN operations_carrier_accounts carrier_account
       ON carrier_account.organization_id = label.organization_id
      AND carrier_account.id = label.carrier_account_id
@@ -213,7 +220,7 @@ const ATTEMPT_SELECT = `
   SELECT attempt.global_id,
          rate.global_id AS rate_evidence_global_id,
          label.global_id AS label_global_id,
-         attempt.action, attempt.state, attempt.provider,
+         attempt.action, attempt.state, attempt.provider, attempt.environment,
          attempt.service_code, attempt.selected_rate, attempt.reason,
          attempt.error_code,
          attempt.redacted_response->'providerErrorCodes' AS provider_error_codes,
@@ -236,7 +243,7 @@ const ATTEMPT_SELECT = `
     JOIN operations_carrier_rate_requests rate
       ON rate.organization_id = attempt.organization_id
      AND rate.id = attempt.rate_request_id
-     AND rate.purpose = 'sandbox_rate_test'
+     AND rate.purpose IN ('sandbox_rate_test', 'shipping_account_diagnostic')
     LEFT JOIN operations_carrier_rate_test_labels label
       ON label.organization_id = attempt.organization_id
      AND label.id = attempt.label_id`
@@ -347,6 +354,7 @@ function attemptItem(
     action: row.action,
     state: row.state,
     provider: row.provider,
+    environment: row.environment,
     serviceCode: row.service_code,
     selectedRate: storedSelectedRate(row.selected_rate),
     reason: row.reason,
@@ -463,6 +471,8 @@ export async function readCarrierRateTestCreateContextInPostgres(input: {
     carrier_account_id: string
     carrier_account_global_id: string
     provider: Provider
+    environment: Environment
+    purpose: CarrierRateTestCreateContext['purpose']
     credential_version: number
     request_hash: string
     billing_relationship: CarrierRateTestCreateContext['billingRelationship']
@@ -470,13 +480,16 @@ export async function readCarrierRateTestCreateContextInPostgres(input: {
     redacted_request: Record<string, unknown>
     redacted_response: Record<string, unknown>
     status: 'succeeded' | 'failed'
+    completed_at: TimestampValue
   }>(
     `SELECT rate.id::text, rate.global_id,
             rate.integration_account_id::text, integration.global_id AS integration_global_id,
             rate.carrier_account_id::text, carrier_account.global_id AS carrier_account_global_id,
-            rate.provider, rate.credential_version, rate.request_hash,
+            rate.provider, rate.environment, rate.purpose,
+            rate.credential_version, rate.request_hash,
             rate.billing_relationship, rate.billing_selection_snapshot,
-            rate.redacted_request, rate.redacted_response, rate.status
+            rate.redacted_request, rate.redacted_response, rate.status,
+            rate.completed_at
        FROM operations_carrier_rate_requests rate
        JOIN operations_integration_accounts integration
          ON integration.organization_id = rate.organization_id
@@ -487,7 +500,10 @@ export async function readCarrierRateTestCreateContextInPostgres(input: {
         AND carrier_account.id = rate.carrier_account_id
       WHERE rate.organization_id = $1::uuid
         AND rate.global_id = $2
-        AND rate.purpose = 'sandbox_rate_test'
+        AND rate.purpose IN (
+          'sandbox_rate_test',
+          'shipping_account_diagnostic'
+        )
       LIMIT 1`,
     [input.organizationId, input.rateEvidenceGlobalId],
   )
@@ -514,12 +530,15 @@ export async function readCarrierRateTestCreateContextInPostgres(input: {
     carrierAccountId: row.carrier_account_id,
     carrierAccountGlobalId: row.carrier_account_global_id,
     provider: row.provider,
+    environment: row.environment,
+    purpose: row.purpose,
     credentialVersion: row.credential_version,
     requestHash: row.request_hash,
     billingRelationship: row.billing_relationship,
     billingSelectionSnapshot: row.billing_selection_snapshot,
     redactedRequest: row.redacted_request,
     redactedResponse: row.redacted_response,
+    completedAt: iso(row.completed_at)!,
   }
 }
 
@@ -533,6 +552,8 @@ type PrepareCreateInput = CarrierRateTestCreateContext & {
   selectedRate: CarrierRateTestSelectedRate
   outputFormat: 'ZPL' | 'PDF' | 'PNG'
   adapterVersion: string
+  preparedProviderEvidence?: Record<string, unknown>
+  operatorConfirmation?: string | null
 }
 
 export async function prepareCarrierRateTestLabelCreateInPostgres(
@@ -550,6 +571,12 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
       client,
       `carrier-rate-test-label:service:${input.organizationId}:${input.rateRequestId}:${input.selectedRate.serviceCode}:${input.selectedRate.rateType || ''}`,
     )
+    if (input.environment === 'production') {
+      await acquireTransactionAdvisoryLock(
+        client,
+        `carrier-rate-test-label:production-account:${input.organizationId}:${input.carrierAccountId}`,
+      )
+    }
     const replay = await client.query<{
       id: string
       global_id: string
@@ -598,53 +625,82 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
         409,
       )
     }
-    const fence = await client.query<{ state: AttemptState; global_id: string }>(
-      `SELECT state, global_id
-         FROM operations_carrier_rate_test_label_attempts
-        WHERE organization_id = $1::uuid
-          AND rate_request_id = $2::uuid
-          AND service_code = $3
-          AND COALESCE(rate_type, '') = COALESCE($4::text, '')
-          AND state IN ('prepared', 'unknown')
-        LIMIT 1
-        FOR SHARE`,
-      [
-        input.organizationId,
-        input.rateRequestId,
-        input.selectedRate.serviceCode,
-        input.selectedRate.rateType,
-      ],
-    )
+    const fence = input.environment === 'production'
+      ? await client.query<{ state: AttemptState; global_id: string }>(
+          `SELECT state, global_id
+             FROM operations_carrier_rate_test_label_attempts
+            WHERE organization_id = $1::uuid
+              AND carrier_account_id = $2::uuid
+              AND environment = 'production'
+              AND action = 'create'
+              AND state IN ('prepared', 'unknown')
+            LIMIT 1
+            FOR SHARE`,
+          [input.organizationId, input.carrierAccountId],
+        )
+      : await client.query<{ state: AttemptState; global_id: string }>(
+          `SELECT state, global_id
+             FROM operations_carrier_rate_test_label_attempts
+            WHERE organization_id = $1::uuid
+              AND rate_request_id = $2::uuid
+              AND service_code = $3
+              AND COALESCE(rate_type, '') = COALESCE($4::text, '')
+              AND state IN ('prepared', 'unknown')
+            LIMIT 1
+            FOR SHARE`,
+          [
+            input.organizationId,
+            input.rateRequestId,
+            input.selectedRate.serviceCode,
+            input.selectedRate.rateType,
+          ],
+        )
     if (fence.rows[0]) {
       throw new OperationsRequestError(
         fence.rows[0].state === 'unknown'
           ? 'CARRIER_RATE_TEST_LABEL_OUTCOME_UNKNOWN'
           : 'CARRIER_RATE_TEST_LABEL_IN_PROGRESS',
-        'An unresolved carrier label attempt already exists for this exact rate',
+        input.environment === 'production'
+          ? `Unresolved LIVE label attempt ${fence.rows[0].global_id} already fences this exact carrier account; reconcile it before buying more postage`
+          : 'An unresolved carrier label attempt already exists for this exact rate',
         409,
       )
     }
-    const active = await client.query<{ global_id: string }>(
-      `SELECT global_id
-         FROM operations_carrier_rate_test_labels
-        WHERE organization_id = $1::uuid
-          AND rate_request_id = $2::uuid
-          AND service_code = $3
-          AND COALESCE(rate_type, '') = COALESCE($4::text, '')
-          AND status = 'created'
-        LIMIT 1
-        FOR SHARE`,
-      [
-        input.organizationId,
-        input.rateRequestId,
-        input.selectedRate.serviceCode,
-        input.selectedRate.rateType,
-      ],
-    )
+    const active = input.environment === 'production'
+      ? await client.query<{ global_id: string }>(
+          `SELECT global_id
+             FROM operations_carrier_rate_test_labels
+            WHERE organization_id = $1::uuid
+              AND carrier_account_id = $2::uuid
+              AND environment = 'production'
+              AND status = 'created'
+            LIMIT 1
+            FOR SHARE`,
+          [input.organizationId, input.carrierAccountId],
+        )
+      : await client.query<{ global_id: string }>(
+          `SELECT global_id
+             FROM operations_carrier_rate_test_labels
+            WHERE organization_id = $1::uuid
+              AND rate_request_id = $2::uuid
+              AND service_code = $3
+              AND COALESCE(rate_type, '') = COALESCE($4::text, '')
+              AND status = 'created'
+            LIMIT 1
+            FOR SHARE`,
+          [
+            input.organizationId,
+            input.rateRequestId,
+            input.selectedRate.serviceCode,
+            input.selectedRate.rateType,
+          ],
+        )
     if (active.rows[0]) {
       throw new OperationsRequestError(
         'CARRIER_RATE_TEST_LABEL_ALREADY_EXISTS',
-        `This rate already has active test label ${active.rows[0].global_id}`,
+        input.environment === 'production'
+          ? `LIVE label ${active.rows[0].global_id} is still active on this exact carrier account; void it before buying more postage`
+          : `This rate already has active test label ${active.rows[0].global_id}`,
         409,
       )
     }
@@ -657,8 +713,8 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
          request_hash, redacted_request, actor_email
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'create', 'prepared',
-         $5, 'sandbox', $6, $7, $8, $9::jsonb, $10, $11, $12, $13,
-         $14, $15::jsonb, $16
+         $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14,
+         $15, $16::jsonb, $17
        )
        RETURNING id::text, global_id`,
       [
@@ -667,6 +723,7 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
         input.integrationAccountId,
         input.carrierAccountId,
         input.provider,
+        input.environment,
         input.credentialVersion,
         input.selectedRate.serviceCode,
         input.selectedRate.rateType,
@@ -682,6 +739,9 @@ export async function prepareCarrierRateTestLabelCreateInPostgres(
           destinationFingerprint: input.destinationFingerprint,
           selectedRate: input.selectedRate,
           outputFormat: input.outputFormat,
+          environment: input.environment,
+          operatorConfirmation: input.operatorConfirmation || null,
+          preparedProviderEvidence: input.preparedProviderEvidence || null,
         }),
         input.actorEmail,
       ],
@@ -771,6 +831,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
       carrier_account_id: string
       carrier_account_global_id: string
       provider: Provider
+      environment: Environment
       credential_version: number
       selected_rate: Record<string, unknown>
       destination_fingerprint: string
@@ -784,7 +845,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
               attempt.integration_account_id::text,
               attempt.carrier_account_id::text,
               carrier_account.global_id AS carrier_account_global_id,
-              attempt.provider, attempt.credential_version,
+              attempt.provider, attempt.environment, attempt.credential_version,
               attempt.selected_rate, attempt.destination_fingerprint,
               COALESCE(
                 attempt.redacted_request->>'outputFormat',
@@ -794,7 +855,10 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
          JOIN operations_carrier_rate_requests rate
            ON rate.organization_id = attempt.organization_id
           AND rate.id = attempt.rate_request_id
-          AND rate.purpose = 'sandbox_rate_test'
+          AND rate.purpose IN (
+            'sandbox_rate_test',
+            'shipping_account_diagnostic'
+          )
          JOIN operations_carrier_accounts carrier_account
            ON carrier_account.organization_id = attempt.organization_id
           AND carrier_account.integration_account_id = attempt.integration_account_id
@@ -868,9 +932,9 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
          content_sha256, provider_reference, redacted_provider_evidence,
          create_attempt_id, created_by
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'sandbox', $6,
-         $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-         $19, $20, $21, $22::bytea, $23, $24, $25::jsonb, $26::uuid, $27
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
+         $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+         $20, $21, $22, $23::bytea, $24, $25, $26::jsonb, $27::uuid, $28
        )
        RETURNING id::text, global_id`,
       [
@@ -879,6 +943,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         attempt.integration_account_id,
         attempt.carrier_account_id,
         attempt.provider,
+        attempt.environment,
         attempt.credential_version,
         input.accountNumberFingerprint,
         attempt.rate_request_hash,
@@ -937,7 +1002,7 @@ export async function finalizeCarrierRateTestLabelCreateInPostgres(input: {
         createAttemptGlobalId: input.attemptGlobalId,
         carrierAccountGlobalId: attempt.carrier_account_global_id,
         provider: attempt.provider,
-        environment: 'sandbox',
+        environment: attempt.environment,
         serviceCode: selectedRate.serviceCode,
         rateType: selectedRate.rateType,
         format: input.format,
@@ -1012,6 +1077,7 @@ export async function readCarrierRateTestLabelProviderContextInPostgres(input: {
     carrier_account_id: string
     carrier_account_global_id: string
     provider: Provider
+    environment: Environment
     credential_version: number
     account_number_fingerprint: string
     rate_request_hash: string
@@ -1030,7 +1096,7 @@ export async function readCarrierRateTestLabelProviderContextInPostgres(input: {
             label.rate_request_id::text, rate.global_id AS rate_evidence_global_id,
             label.integration_account_id::text, integration.global_id AS integration_global_id,
             label.carrier_account_id::text, carrier_account.global_id AS carrier_account_global_id,
-            label.provider, label.credential_version,
+            label.provider, label.environment, label.credential_version,
             label.account_number_fingerprint, label.rate_request_hash,
             label.destination_fingerprint, label.service_code, label.service_name,
             label.rate_type, label.rated_amount, label.rated_currency,
@@ -1040,7 +1106,10 @@ export async function readCarrierRateTestLabelProviderContextInPostgres(input: {
        JOIN operations_carrier_rate_requests rate
          ON rate.organization_id = label.organization_id
         AND rate.id = label.rate_request_id
-        AND rate.purpose = 'sandbox_rate_test'
+        AND rate.purpose IN (
+          'sandbox_rate_test',
+          'shipping_account_diagnostic'
+        )
        JOIN operations_integration_accounts integration
          ON integration.organization_id = label.organization_id
         AND integration.id = label.integration_account_id
@@ -1072,6 +1141,7 @@ export async function readCarrierRateTestLabelProviderContextInPostgres(input: {
     carrierAccountId: row.carrier_account_id,
     carrierAccountGlobalId: row.carrier_account_global_id,
     provider: row.provider,
+    environment: row.environment,
     credentialVersion: row.credential_version,
     accountNumberFingerprint: row.account_number_fingerprint,
     rateRequestHash: row.rate_request_hash,
@@ -1148,6 +1218,7 @@ export async function prepareCarrierRateTestLabelVoidInPostgres(input: {
   idempotencyKey: string
   attemptRequestHash: string
   adapterVersion: string
+  preparedProviderEvidence?: Record<string, unknown>
 }): Promise<
   | { disposition: 'prepared'; attemptId: string; attemptGlobalId: string }
   | { disposition: 'replayed'; label: CarrierRateTestLabelListItem }
@@ -1248,8 +1319,8 @@ export async function prepareCarrierRateTestLabelVoidInPostgres(input: {
          request_hash, redacted_request, actor_email
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'void', 'prepared',
-         $6, 'sandbox', $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15,
-         $16::jsonb, $17
+         $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16,
+         $17::jsonb, $18
        ) RETURNING id::text, global_id`,
       [
         input.organizationId,
@@ -1258,6 +1329,7 @@ export async function prepareCarrierRateTestLabelVoidInPostgres(input: {
         input.label.carrierAccountId,
         input.label.labelId,
         input.label.provider,
+        input.label.environment,
         input.credentialVersion,
         input.label.serviceCode,
         input.label.rateType,
@@ -1271,6 +1343,8 @@ export async function prepareCarrierRateTestLabelVoidInPostgres(input: {
           labelGlobalId: input.label.labelGlobalId,
           rateEvidenceGlobalId: input.label.rateEvidenceGlobalId,
           carrierAccountGlobalId: input.label.carrierAccountGlobalId,
+          environment: input.label.environment,
+          preparedProviderEvidence: input.preparedProviderEvidence || null,
         }),
         input.actorEmail,
       ],

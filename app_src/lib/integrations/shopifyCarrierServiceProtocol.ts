@@ -8,12 +8,12 @@ const MAX_ITEM_GRAMS = 1_000_000
 const MAX_TOTAL_GRAMS = BigInt(2_000_000_000_000)
 const MAX_ITEM_PRICE_MINOR = 9_000_000_000_000
 const MAX_TOTAL_PRICE_MINOR = BigInt(9_000_000_000_000_000)
-const MAX_RATES = 50
+export const SHOPIFY_CARRIER_SERVICE_MAX_RATES = 50
 const MAX_RATE_AMOUNT_MINOR = BigInt(9_000_000_000_000_000)
 const MAX_PROPERTY_NODES = 256
 const MAX_PROPERTY_DEPTH = 5
 export const SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION =
-  'shopify-carrier-service-rate-v2'
+  'shopify-carrier-service-rate-v3'
 
 const CURRENCY_PATTERN = /^[A-Z]{3}$/
 const COUNTRY_PATTERN = /^[A-Z]{2}$/
@@ -723,17 +723,6 @@ function canonicalAddress(address: ShopifyCarrierServiceAddress) {
   }
 }
 
-function canonicalDestinationRateZone(
-  address: ShopifyCarrierServiceAddress,
-) {
-  const canonicalText = (value: string | null) =>
-    value === null ? null : value.toLowerCase()
-  return {
-    countryCode: address.countryCode,
-    postalCode: canonicalText(address.postalCode),
-  }
-}
-
 function canonicalItem(item: ShopifyCarrierServiceItem) {
   return {
     productId: item.productId,
@@ -760,7 +749,7 @@ export function fingerprintShopifyCarrierServiceRateRequest(
   const canonical = {
     version: SHOPIFY_CARRIER_SERVICE_FINGERPRINT_VERSION,
     origin: canonicalAddress(request.origin),
-    destination: canonicalDestinationRateZone(request.destination),
+    destination: canonicalAddress(request.destination),
     items,
     currency: request.currency,
     locale: request.locale,
@@ -943,10 +932,13 @@ function deliveryDate(value: unknown, path: string): string | null {
 export function buildShopifyCarrierServiceRateResponse(
   quotes: readonly ShopifyCarrierServiceRateQuote[],
 ): ShopifyCarrierServiceRateResponse {
-  if (!Array.isArray(quotes) || quotes.length > MAX_RATES) {
+  if (
+    !Array.isArray(quotes)
+    || quotes.length > SHOPIFY_CARRIER_SERVICE_MAX_RATES
+  ) {
     protocolError(
       'rates',
-      `rates must be an array with at most ${MAX_RATES} entries`,
+      `rates must be an array with at most ${SHOPIFY_CARRIER_SERVICE_MAX_RATES} entries`,
       'SHOPIFY_CARRIER_RESPONSE_INVALID',
     )
   }

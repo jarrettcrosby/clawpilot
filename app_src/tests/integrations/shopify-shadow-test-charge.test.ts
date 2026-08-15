@@ -23,6 +23,9 @@ const {
   shopifyShadowTestChargePolicyFence,
   ShopifyShadowTestChargeError,
 } = await import('../../lib/integrations/shopifyShadowTestCharge.ts')
+const { collapseShopifyCheckoutRateSourceOffers } = await import(
+  '../../lib/integrations/shopifyCheckoutRateSourceOffers.ts'
+)
 
 const offers: CheckoutRateOffer[] = [
   {
@@ -89,6 +92,75 @@ test('zeros only the exact selected stable service and retains receipt evidence'
       subsidyReason: null,
     },
   ])
+})
+
+test('charges every account quote for one public service before collapsing', () => {
+  const duplicateAccountOffers: CheckoutRateOffer[] = [
+    offers[0],
+    {
+      ...offers[0],
+      carrierAccountGlobalId: 'gac0000003',
+      amountMinor: 799,
+      transitDays: 4,
+      deliveryDate: '2026-08-04',
+      evidenceGlobalId: 'gre0000003',
+    },
+  ]
+  const charged = applyShopifyShadowTestCharge({
+    activationState: 'shadow',
+    policy: {
+      shadowTestChargeMode: 'zero_single_service',
+      shadowTestServiceCode: 'clawpilot:ups:ground',
+      shadowTestSubsidyReason: 'Authorized zero-dollar checkout test',
+    },
+    offers: duplicateAccountOffers,
+  })
+  assert.deepEqual(
+    charged.map((offer) => offer.customerChargeMinor),
+    [0, 0],
+  )
+  const collapsed = collapseShopifyCheckoutRateSourceOffers(charged)
+  assert.equal(collapsed.length, 1)
+  assert.equal(collapsed[0]?.carrierAccountGlobalId, 'gac0000003')
+  assert.equal(collapsed[0]?.amountMinor, 799)
+})
+
+test('collapses duplicate public services by exact deterministic tie order', () => {
+  const duplicateAccountOffers: CheckoutRateOffer[] = [
+    {
+      ...offers[0],
+      carrierAccountGlobalId: 'gac0000003',
+      amountMinor: 799,
+      transitDays: 4,
+      deliveryDate: '2026-08-04',
+      evidenceGlobalId: 'gre0000003',
+    },
+    {
+      ...offers[0],
+      carrierAccountGlobalId: 'gac0000004',
+      amountMinor: 799,
+      transitDays: 3,
+      deliveryDate: '2026-08-03',
+      evidenceGlobalId: 'gre0000004',
+    },
+    {
+      ...offers[0],
+      carrierAccountGlobalId: 'gac0000002',
+      amountMinor: 799,
+      transitDays: 3,
+      deliveryDate: '2026-08-03',
+      evidenceGlobalId: 'gre0000002',
+    },
+  ]
+  const charged = applyShopifyShadowTestCharge({
+    activationState: 'active',
+    policy: null,
+    offers: duplicateAccountOffers,
+  })
+  const collapsed = collapseShopifyCheckoutRateSourceOffers(charged)
+  assert.equal(collapsed.length, 1)
+  assert.equal(collapsed[0]?.carrierAccountGlobalId, 'gac0000002')
+  assert.equal(collapsed[0]?.evidenceGlobalId, 'gre0000002')
 })
 
 test('fails closed when the configured stable service is unavailable', () => {

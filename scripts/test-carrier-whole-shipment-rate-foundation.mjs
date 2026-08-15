@@ -112,6 +112,7 @@ assert.deepEqual(
     'MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES',
     'UPS_WHOLE_SHIPMENT_PACKAGING_TYPES',
     'carrierWholeShipmentRateAddressFingerprints',
+    'carrierWholeShipmentRateDestinationFingerprint',
     'carrierWholeShipmentRateEndpoint',
     'parseCarrierWholeShipmentRateResponse',
     'prepareCarrierWholeShipmentRateRequest',
@@ -125,6 +126,7 @@ const {
   MAX_CARRIER_WHOLE_SHIPMENT_RATE_PACKAGES,
   UPS_WHOLE_SHIPMENT_PACKAGING_TYPES,
   carrierWholeShipmentRateAddressFingerprints,
+  carrierWholeShipmentRateDestinationFingerprint,
   carrierWholeShipmentRateEndpoint,
   parseCarrierWholeShipmentRateResponse,
   prepareCarrierWholeShipmentRateRequest,
@@ -246,6 +248,15 @@ const base = {
   expectedCurrency: 'USD',
   fedexPickupType: null,
 }
+
+assert.equal(
+  carrierWholeShipmentRateDestinationFingerprint(base.destination),
+  carrierWholeShipmentRateAddressFingerprints({
+    origin: base.origin,
+    destination: base.destination,
+  }).destinationFingerprint,
+  'the exported destination helper must match prepared production evidence',
+)
 
 const upsProduction = prepareCarrierWholeShipmentRateRequest(base)
 const upsProductionAgain = prepareCarrierWholeShipmentRateRequest(clone(base))
@@ -413,6 +424,114 @@ assert.equal(
   '20lb bulk case',
 )
 assertDeepFrozen(fedexProduction, 'prepared FedEx request')
+
+const unknownAddressInput = clone(base)
+unknownAddressInput.origin.phone = null
+unknownAddressInput.origin.residential = null
+unknownAddressInput.destination.residential = null
+const unknownUps = prepareCarrierWholeShipmentRateRequest(
+  unknownAddressInput,
+)
+const unknownBinding = {
+  origin: unknownAddressInput.origin,
+  destination: unknownAddressInput.destination,
+  matchesAccountNumber: (candidate) => candidate === accountNumber,
+}
+assert.equal(
+  unknownUps.body.RateRequest.Shipment.ShipFrom.Address
+    .ResidentialAddressIndicator,
+  undefined,
+)
+assert.equal(
+  unknownUps.body.RateRequest.Shipment.ShipTo.Address
+    .ResidentialAddressIndicator,
+  undefined,
+)
+assert.equal(unknownUps.redactedRequest.shipment.origin.residential, null)
+assert.equal(
+  unknownUps.redactedRequest.shipment.destination.residential,
+  null,
+)
+assert.equal(
+  sealPreparedCarrierWholeShipmentRateRequest(
+    unknownUps,
+    unknownBinding,
+  ).requestHash,
+  unknownUps.requestHash,
+)
+
+const falseAddressInput = clone(unknownAddressInput)
+falseAddressInput.origin.residential = false
+falseAddressInput.destination.residential = false
+const falseUps = prepareCarrierWholeShipmentRateRequest(falseAddressInput)
+assert.deepEqual(
+  plain(unknownUps.body),
+  plain(falseUps.body),
+  'UPS omits the residential indicator for both false and unknown',
+)
+assert.notEqual(
+  unknownUps.requestHash,
+  falseUps.requestHash,
+  'sealed evidence must preserve unknown separately from false',
+)
+
+const unknownFedexInput = clone(unknownAddressInput)
+unknownFedexInput.binding.provider = 'fedex_rest'
+for (const parcel of unknownFedexInput.parcels) {
+  parcel.packageCode = 'YOUR_PACKAGING'
+}
+unknownFedexInput.fedexPickupType = 'USE_SCHEDULED_PICKUP'
+const unknownFedex = prepareCarrierWholeShipmentRateRequest(
+  unknownFedexInput,
+)
+const unknownFedexShipment = unknownFedex.body.requestedShipment
+assert.equal(
+  unknownFedexShipment.shipper.contact.phoneNumber,
+  undefined,
+)
+assert.equal(
+  unknownFedexShipment.shipper.address.residential,
+  undefined,
+)
+assert.equal(
+  unknownFedexShipment.recipient.address.residential,
+  undefined,
+)
+assert.equal(unknownFedex.redactedRequest.shipment.origin.residential, null)
+assert.equal(
+  unknownFedex.redactedRequest.shipment.destination.residential,
+  null,
+)
+assert.equal(
+  sealPreparedCarrierWholeShipmentRateRequest(
+    unknownFedex,
+    {
+      origin: unknownFedexInput.origin,
+      destination: unknownFedexInput.destination,
+      matchesAccountNumber: (candidate) => candidate === accountNumber,
+    },
+  ).requestHash,
+  unknownFedex.requestHash,
+)
+
+const inventedUpsResidential = clone(unknownUps)
+inventedUpsResidential.body.RateRequest.Shipment.ShipTo.Address
+  .ResidentialAddressIndicator = ''
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(
+    inventedUpsResidential,
+  ),
+  /integrity check failed/,
+)
+const inventedFedexResidential = clone(unknownFedex)
+inventedFedexResidential.body.requestedShipment.recipient.address.residential =
+  false
+assert.throws(
+  () => sealPreparedCarrierWholeShipmentRateRequest(
+    inventedFedexResidential,
+  ),
+  /integrity check failed/,
+)
 
 const upsRecipientInput = clone(base)
 upsRecipientInput.billing = {

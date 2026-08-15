@@ -39,6 +39,26 @@ use these rows to project webhook quantities, select a partial read, change the
 inventory freshness interval, or infer that missing webhook topics were
 registered.
 
+Migration `0290` adds the order-specific Shadow training overlay. Use it only
+for an imported Shopify or Faire order from an active verified sandbox or
+production commerce connection while Operations remains `shadow`; never use a
+mock account. **Enable training** seals the exact order/candidate/account
+generation, then advances only the local training packages and pick tasks.
+Provider revisions continue to update the canonical mirrored order. A source
+change after sealing is displayed but does not rewrite the training snapshot.
+The simulation may use factual active Product and packaging definitions with
+simulated order/material availability, so a provider-managed or unmapped
+Shopify assignment and zero inventory or packaging stock do not block the
+exercise. Confirm after each command that canonical plans, reservations,
+inventory, packaging claims, waves, picks, operational packages, shipments,
+labels, postage, billables, tracking, and commerce exports remain unchanged and
+that all four provider/stock mutation counters remain `0`. Use Shipping
+Settings separately for sandbox account and printer diagnostics. Do not attach
+that diagnostic label to the training order or interpret simulated completion
+as provider fulfillment. Reset a completed exercise before attempting to move
+Operations out of Shadow; an unresolved carrier result must be reconciled
+instead of retried.
+
 Migration `0178` adds one tenant- and Shopify-account-scoped row per exact
 Customer GID for checkout audience intent, optimistic row-version fences,
 paginated reads without a customer-count cap, zero-write Shadow state,
@@ -372,7 +392,7 @@ The current warehouse screen establishes editable facility, operating-profile, h
 15. On success, confirm the order is `picking`, the wave is `completed`, every pick task is `picked`, and the active reservation remains intact for the later pack/ship consumption command. ClawPilot-authoritative picks append the existing zero-delta local pick evidence; Shopify-authoritative picks rely on task, domain, and audit evidence and must not append a local inventory ledger row.
 16. Verify the package details and use **Verify pack** only after every required pick is complete. Record a specific operational reason and submit once. The command rechecks the exact order version, selected plan, wave, picks, package state, active organization, blocking exceptions, and command receipt before changing state.
 17. On success, confirm the order and package are `packed`, one pack-fee billable event exists for each applicable directive, the active reservation remains retained for shipment consumption, and no shipment, label, or print job was created by pack verification itself.
-18. While Operations is in `shadow`, an eligible packed Shopify order with its exact current checkout reconciliation and configured UPS and FedEx sandbox accounts exposes **Prepare shipment in Shadow**. Enter a specific preparation reason and submit once. The browser retains one idempotency key for the exact order version and reason. ClawPilot reads every configured eligible carrier once outside the database transaction with the same complete package array, then rechecks the order and configuration before finalization.
+18. While Operations is in `shadow`, an eligible packed Shopify order with its exact current checkout reconciliation and one through eight selected direct UPS/FedEx sandbox billing accounts exposes **Prepare shipment in Shadow**. Multiple accounts from the same carrier are allowed; account Global ID, rather than carrier brand, is the execution and evidence identity. Enter a specific preparation reason and submit once. The browser retains one idempotency key for the exact order version and reason. ClawPilot reads every configured eligible account once outside the database transaction with the same complete package array, then rechecks the order and configuration before finalization.
 19. Reload the order after preparation. Confirm exactly one durable Shadow preparation exists for the canonical order. A fresh idempotency key must not create a second preparation. Confirm the persistent evidence separates checkout packages/rate from fulfillment packages/rate, shows one selected carrier service covering every fulfillment package, labels the checkout-to-fulfillment difference as an estimated variance, and shows each UPS/FedEx attempt. Confirm every allocation displays both its stage-native line/product identity and exact Shopify ProductVariant GID. Allocation variance must compare summed quantity by physical package plus ProductVariant GID, never raw checkout line keys against canonical order-line Global IDs; remove or alter any comparison identity and confirm the preparation fails closed. Confirm the remaining canonical variance causes are derived from the immutable package/service/rate rows, with package-count delta displayed separately. Confirm provider, postage, label, and commerce write counters are all `0`.
 20. Confirm the evidence explicitly says no shipment, tracking number, final packing slip, or provider fulfillment exists. Shadow preparation is rerating and comparison evidence only. It is not permission to print carrier paperwork, dispatch goods, update Shopify/Faire, or describe the order as shipped. Change activation state in a controlled test and confirm the durable preparation remains inspectable; label create and void controls must remain disabled unless the current state is Active.
 21. If the order matches the fixed sandbox fixture, follow the separate sandbox label create-and-void procedure. Label execution is not available for an arbitrary address, product, package, production credential, or production order.

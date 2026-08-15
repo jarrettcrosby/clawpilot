@@ -43,6 +43,7 @@ export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
   | 'reconcile_external_fulfillment'
+  | 'reopen_for_replanning'
   | 'verify_pack'
   | 'prepare_fulfillment'
   | 'confirm_shipment'
@@ -52,6 +53,26 @@ export type OperationsOrderActionAvailability = {
   label: string
   enabled: boolean
   blockedReason: string | null
+  blockedCode?: string | null
+  consequenceSummary?: string | null
+  expectedPlanGlobalId?: string | null
+  expectedPlanVersion?: number | null
+  expectedCorrectionFingerprint?: string | null
+}
+
+export type OperationsOrderReplanningCorrectionResult = {
+  orderGlobalId: string
+  orderStatus: 'imported'
+  previousRowVersion: number
+  rowVersion: number
+  correctionGlobalId: string
+  cancelledPlanGlobalId: string
+  releasedLocalReservationCount: number
+  releasedProviderCommitmentCount: number
+  releasedPackagingClaimCount: number
+  providerReads: 0
+  providerWrites: 0
+  replayed: boolean
 }
 
 export type OperationsExternalFulfillmentReconciliationResult = {
@@ -676,6 +697,7 @@ export type OperationsShadowFulfillmentPreparationStage = {
   packageCount: number
   packages: OperationsShadowFulfillmentPreparationPackage[]
   selectedRate: {
+    carrierAccountGlobalId: string
     provider: 'ups_rest' | 'fedex_rest'
     serviceCode: string
     serviceName: string
@@ -1166,6 +1188,7 @@ export type OperationsPlanCommandResult = OperationsOrderCommandResult & {
   fulfillmentPlanGlobalId: string
   cartonizationEvidenceGlobalId: string
   packageCount: number
+  carrierAccountGlobalId: string
   carrier: string
   serviceCode: string
   serviceName: string
@@ -1187,6 +1210,7 @@ export type OperationsShadowFulfillmentExecutionResult = {
   varianceGlobalId: string
   packageCount: number
   carrier: 'UPS' | 'FedEx'
+  carrierAccountGlobalId: string
   provider: 'ups_rest' | 'fedex_rest'
   serviceCode: string
   serviceName: string

@@ -356,6 +356,21 @@ export function supportsPrintAgentRoute(
     && capabilities.supportedDocumentTypes.includes(request.documentType)
 }
 
+export function hasConnectedLocalPrintAgent(
+  printer: Pick<
+    OperationsPrinterProfile,
+    | 'connectionMode'
+    | 'localPrintAgentGlobalId'
+    | 'localPrintAgentStatus'
+    | 'localPrintAgentLastSeenAt'
+  >,
+) {
+  return printer.connectionMode === 'local_agent'
+    && Boolean(printer.localPrintAgentGlobalId)
+    && printer.localPrintAgentStatus === 'active'
+    && Boolean(printer.localPrintAgentLastSeenAt)
+}
+
 export function isPrinterCapabilitySetValid(input: {
   printerType: PrinterType
   supportedFormats: PrintFormat[]
@@ -383,11 +398,7 @@ export function supportsPrinterRoute(
   ) {
     return false
   }
-  return !request.durable || (
-    printer.connectionMode === 'local_agent'
-    && Boolean(printer.localPrintAgentGlobalId)
-    && printer.localPrintAgentStatus === 'active'
-  )
+  return !request.durable || hasConnectedLocalPrintAgent(printer)
 }
 
 export function printerCanFallbackFor(

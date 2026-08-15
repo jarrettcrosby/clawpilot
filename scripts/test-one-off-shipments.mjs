@@ -59,11 +59,60 @@ const oneOffConstants = runModule(
   (specifier) => requireFromApp(specifier),
 )
 
+const productionLabelRuntime = runModule(
+  'app_src/lib/integrations/carrierProductionLabelRuntime.ts',
+  (specifier) => requireFromApp(specifier),
+)
+
 const operationsContract = runModule(
   'app_src/lib/operations/oneOffShipments.ts',
-  (specifier) => specifier === '@/lib/operations/oneOffShipmentConstants'
-    ? oneOffConstants
-    : requireFromApp(specifier),
+  (specifier) => {
+    if (specifier === '@/lib/operations/oneOffShipmentConstants') return oneOffConstants
+    if (specifier === '@/lib/integrations/carrierProductionLabelRuntime') {
+      return productionLabelRuntime
+    }
+    return requireFromApp(specifier)
+  },
+)
+
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+    RAILWAY_ENVIRONMENT_NAME: 'development',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntime
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+  }),
+  'production',
+  'Trusted Railway development must expose the production one-off carrier environment',
+)
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+  }),
+  'sandbox',
+  'A generic local development runtime must not expose production postage',
+)
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+    RAILWAY_ENVIRONMENT_NAME: 'development',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntime
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+    VERCEL: '1',
+    VERCEL_ENV: 'preview',
+  }),
+  'sandbox',
+  'A Vercel preview must remain unable to select production postage',
 )
 
 const clientAttempts = runModule(
@@ -485,6 +534,9 @@ assertRequestError((input) => {
 }, 'OPERATIONS_ONE_OFF_PACKAGE_SELECTION_UNSUPPORTED')
 
 const persistenceSource = read('app_src/lib/persistence/oneOffShipments.ts')
+const groupPersistenceSource = read(
+  'app_src/lib/persistence/operationOneOffShipping.ts',
+)
 const routeSource = read('app_src/app/api/operations/one-off-shipments/route.ts')
 const migrationSource = read('db/migrations/0258_operations_one_off_shipments.sql')
 const uiSource = read('app_src/components/operations/OneOffShipmentDialog.tsx')
@@ -494,6 +546,21 @@ const mutableScopePosition = persistenceSource.indexOf('resolveQuoteScope', comm
 assert.ok(
   commandPosition >= 0 && mutableScopePosition > commandPosition,
   'An idempotent quote replay must be resolved before mutable scope and carrier checks',
+)
+assert.match(
+  persistenceSource,
+  /enabledOneOffRateSources\(organizationId, undefined, 'sandbox'\)[\s\S]*enabledOneOffRateSources\(organizationId, undefined, 'production'\)/,
+  'The workspace must retain both sandbox TEST and production LIVE carrier choices',
+)
+assert.match(
+  persistenceSource,
+  /executionModes: \[[\s\S]*mode: 'test'[\s\S]*environment: 'sandbox'[\s\S]*mode: 'live'[\s\S]*environment: 'production'/,
+  'TEST and LIVE must remain distinct selectable execution modes',
+)
+assert.match(
+  groupPersistenceSource,
+  /input\.executionMode === 'live'[\s\S]*resolveCarrierProductionShippingRuntime\([\s\S]*resolveCarrierSandboxShippingRuntime\(/,
+  'The selected execution mode must resolve the matching production or sandbox provider runtime',
 )
 
 for (const fragment of [

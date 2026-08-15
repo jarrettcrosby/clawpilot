@@ -50,6 +50,7 @@ import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import SyncRounded from '@mui/icons-material/SyncRounded'
 import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
 import IntegrationSetupJourney, {
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
@@ -374,6 +375,20 @@ type FaireForm = {
   confirmLiveAccess: boolean
 }
 
+const COMMERCE_PROVIDER_OPTIONS: readonly {
+  provider: CommerceProvider
+  description: string
+}[] = [
+  {
+    provider: 'shopify',
+    description: 'Connect a merchant-owned Shopify Dev Dashboard app.',
+  },
+  {
+    provider: 'faire',
+    description: 'Connect a Faire brand API key or approved Custom App.',
+  },
+]
+
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
@@ -586,7 +601,11 @@ function webhookSubscriptionReadiness(
   }
 }
 
-export default function CommerceIntegrationPanel() {
+export default function CommerceIntegrationPanel({
+  onNavigate,
+}: {
+  onNavigate?: (hash: string) => void
+} = {}) {
   const [integrations, setIntegrations] = useState<CommerceState>({
     organizationId: '',
     accounts: [],
@@ -630,6 +649,9 @@ export default function CommerceIntegrationPanel() {
     scopeProfile: 'connection_test',
     confirmLiveAccess: false,
   })
+  const [providerCatalogOpen, setProviderCatalogOpen] = useState(false)
+  const [selectedSetupProvider, setSelectedSetupProvider] =
+    useState<CommerceProvider | null>(null)
   const [setupChecklistProvider, setSetupChecklistProvider] = useState<CommerceProvider | null>(null)
   const setupScopeInputRef = useRef<
     HTMLInputElement | HTMLTextAreaElement | null
@@ -885,6 +907,7 @@ export default function CommerceIntegrationPanel() {
     )
     if (saved) {
       setRevealedCredential(null)
+      setSelectedSetupProvider(null)
       setShopify((current) => ({
         ...current,
         clientId: '',
@@ -909,6 +932,7 @@ export default function CommerceIntegrationPanel() {
       )
       if (saved) {
         setRevealedCredential(null)
+        setSelectedSetupProvider(null)
         setFaire((current) => ({
           ...current,
           apiKey: '',
@@ -1165,39 +1189,46 @@ export default function CommerceIntegrationPanel() {
   const setupPermissionGuidanceKey = setupChecklistProvider === 'faire'
     ? `faire:${faire.authPath}:${faire.scopeProfile}`
     : setupChecklistProvider || ''
+  const configuredAccounts = integrations.accounts.filter(
+    (account) => account.configured,
+  )
+  const setupInProgressAccounts = integrations.accounts.filter(
+    (account) => !account.configured,
+  )
+  const configuredProviders = COMMERCE_PROVIDER_OPTIONS
+    .map(({ provider }) => provider)
+    .filter((provider) => configuredAccounts.some(
+      (account) => account.provider === provider,
+    ))
 
   return (
     <Stack spacing={3}>
       <Box>
-        <Stack direction="row" spacing={1} alignItems="center">
-          <StorefrontRounded color="primary" />
-          <Typography variant="h6">Sales channels</Typography>
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          spacing={1.5}
+          alignItems={{ sm: 'center' }}
+          justifyContent="space-between"
+        >
+          <Stack direction="row" spacing={1} alignItems="center">
+            <StorefrontRounded color="primary" />
+            <Typography variant="h6">Sales channels</Typography>
+          </Stack>
+          <Button
+            variant="contained"
+            startIcon={<AddRounded />}
+            onClick={() => setProviderCatalogOpen(true)}
+            sx={actionButtonSx}
+          >
+            Add sales channel
+          </Button>
         </Stack>
         <Typography color="text.secondary" sx={{ mt: 0.75, maxWidth: 900 }}>
-          Shopify stores and Faire brands are commerce channels for distributed
-          order operations. They are separate from restaurant POS and
+          Connect and manage the commerce channels used for distributed order
+          operations. Sales channels are separate from restaurant POS and
           accounting integrations such as Toast.
         </Typography>
       </Box>
-
-      <Alert severity="info">
-        These are user-owned custom integrations. Create the application in
-        the provider portal first. Shopify verifies the installed
-        merchant-owned app credentials directly. For a single Faire brand,
-        generate the final API key in Faire Brand Portal and paste it below.
-        Custom App OAuth remains available when Faire accepts that app&apos;s
-        authorization flow.
-      </Alert>
-      <Alert severity="warning">
-        A verified connection authorizes automatic read-only product catalog
-        synchronization with no second approval. ClawPilot initializes the
-        resumed policy and queues work only when product-read access, the
-        development runtime, and the Operations product target are eligible.
-        It may create exact product records and mappings in this workspace but
-        cannot write to Shopify or Faire. Canonical order import, inventory
-        mutation, fulfillment export, multi-merchant OAuth, and production
-        provider writes remain unavailable or separately controlled.
-      </Alert>
       <Dialog
         open={setupChecklistProvider !== null}
         onClose={() => setSetupChecklistProvider(null)}
@@ -1377,17 +1408,181 @@ export default function CommerceIntegrationPanel() {
           <Button onClick={() => setSetupChecklistProvider(null)}>Close</Button>
         </DialogActions>
       </Dialog>
+      <Dialog
+        open={providerCatalogOpen}
+        onClose={() => setProviderCatalogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Add sales channel</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Choose a provider to begin its existing connection journey. A
+            connected provider stays managed below instead of opening another
+            connection from this catalog.
+          </Typography>
+          {!canManage ? (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              Manage-integration access is required to start or resume setup.
+            </Alert>
+          ) : null}
+          <Stack spacing={1.5}>
+            {COMMERCE_PROVIDER_OPTIONS.map(({ provider, description }) => {
+              const providerConfigured = configuredAccounts.some(
+                (account) => account.provider === provider,
+              )
+              const providerSetupInProgress = setupInProgressAccounts.some(
+                (account) => account.provider === provider,
+              )
+              return (
+                <Card key={provider} variant="outlined">
+                  <CardContent>
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      spacing={1.5}
+                      justifyContent="space-between"
+                      alignItems={{ sm: 'center' }}
+                    >
+                      <Box>
+                        <Stack direction="row" spacing={1} alignItems="center">
+                          <Typography fontWeight={700}>
+                            {providerLabel(provider)}
+                          </Typography>
+                          <Chip
+                            size="small"
+                            color={providerConfigured
+                              ? 'success'
+                              : providerSetupInProgress
+                                ? 'warning'
+                                : 'default'}
+                            label={providerConfigured
+                              ? 'Connected'
+                              : providerSetupInProgress
+                                ? 'Setup in progress'
+                                : 'Available'}
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                          {description}
+                        </Typography>
+                      </Box>
+                      <Button
+                        variant="outlined"
+                        disabled={!canManage || providerConfigured}
+                        onClick={() => {
+                          setSelectedSetupProvider(provider)
+                          setProviderCatalogOpen(false)
+                          setSetupChecklistProvider(null)
+                        }}
+                      >
+                        {providerConfigured
+                          ? 'Connected'
+                          : providerSetupInProgress
+                            ? 'Resume setup'
+                            : 'Set up'}
+                      </Button>
+                    </Stack>
+                  </CardContent>
+                </Card>
+              )
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProviderCatalogOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       {error ? <Alert severity="error">{error}</Alert> : null}
       {notice ? <Alert severity="success">{notice}</Alert> : null}
 
-      <Box
+      {setupInProgressAccounts.length ? (
+        <Box>
+          <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
+            Setup in progress
+          </Typography>
+          <Stack spacing={1.5}>
+            {setupInProgressAccounts.map((account) => (
+              <Card key={account.globalId} variant="outlined">
+                <CardContent>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1.5}
+                    justifyContent="space-between"
+                    alignItems={{ sm: 'center' }}
+                  >
+                    <Box>
+                      <Typography fontWeight={700}>{account.displayName}</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {providerLabel(account.provider)} · {account.environment}
+                        {' · '}{account.verificationStatus === 'failed'
+                          ? 'Connection needs attention'
+                          : 'Connection not completed'}
+                      </Typography>
+                    </Box>
+                    <Button
+                      variant="outlined"
+                      disabled={!canManage || pendingAction !== ''}
+                      onClick={() => setSelectedSetupProvider(account.provider)}
+                    >
+                      Resume setup
+                    </Button>
+                  </Stack>
+                </CardContent>
+              </Card>
+            ))}
+          </Stack>
+        </Box>
+      ) : null}
+
+      {selectedSetupProvider ? (
+        <Stack spacing={2}>
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            spacing={1}
+            justifyContent="space-between"
+            alignItems={{ sm: 'center' }}
+          >
+            <Box>
+              <Typography variant="subtitle1" fontWeight={700}>
+                Set up {providerLabel(selectedSetupProvider)}
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Complete this provider&apos;s connection journey, then manage the
+                connected channel below.
+              </Typography>
+            </Box>
+            <Button
+              variant="text"
+              onClick={() => {
+                setSelectedSetupProvider(null)
+                setSetupChecklistProvider(null)
+              }}
+            >
+              Close setup
+            </Button>
+          </Stack>
+          <Alert severity="info">
+            These are user-owned custom integrations. Create the application in
+            the provider portal first. {selectedSetupProvider === 'shopify'
+              ? 'Shopify verifies the installed merchant-owned app credentials directly.'
+              : 'For one Faire brand, generate the final API key in Faire Brand Portal, or use Custom App OAuth when Faire accepts that flow.'}
+          </Alert>
+          <Alert severity="warning">
+            A verified connection authorizes automatic read-only product catalog
+            synchronization with no second approval. ClawPilot queues work only
+            when product-read access, the development runtime, and the Operations
+            product target are eligible. Canonical order import, inventory mutation,
+            fulfillment export, and provider writes remain separately controlled.
+          </Alert>
+          <Box
         sx={{
           display: 'grid',
           gridTemplateColumns: 'minmax(0, 1fr)',
           gap: 2,
         }}
       >
-        <Card variant="outlined">
+        {selectedSetupProvider === 'shopify' ? (
+          <Card variant="outlined">
           <CardContent>
             <Stack
               component="form"
@@ -1610,7 +1805,7 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'shopify-receipts',
-                    label: 'Choose signed receipt handling',
+                    label: 'Signed receipt setup',
                     state: shopifyReceiptState,
                     optional: true,
                     description:
@@ -1745,9 +1940,11 @@ export default function CommerceIntegrationPanel() {
               </Button>
             </Stack>
           </CardContent>
-        </Card>
+          </Card>
+        ) : null}
 
-        <Card variant="outlined">
+        {selectedSetupProvider === 'faire' ? (
+          <Card variant="outlined">
           <CardContent>
             <Stack component="form" spacing={2} onSubmit={connectFaire}>
               <Box>
@@ -2141,20 +2338,24 @@ export default function CommerceIntegrationPanel() {
               </Button>
             </Stack>
           </CardContent>
-        </Card>
-      </Box>
+          </Card>
+        ) : null}
+          </Box>
+        </Stack>
+      ) : null}
 
       <Box>
         <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
-          Connected channel identities
+          Connected sales channels
         </Typography>
-        {integrations.accounts.length === 0 ? (
+        {configuredAccounts.length === 0 ? (
           <Alert severity="info">
-            No Shopify store or Faire brand is connected for this organization.
+            No sales channels are connected yet. Choose Add sales channel to
+            start a provider setup.
           </Alert>
         ) : (
           <Stack spacing={2}>
-            {integrations.accounts.map((account) => {
+            {configuredAccounts.map((account) => {
               const accountName = typeof account.configuration.accountName === 'string'
                 ? account.configuration.accountName
                 : account.displayName
@@ -2549,6 +2750,49 @@ export default function CommerceIntegrationPanel() {
                       </Box>
 
                       {account.provider === 'shopify' ? (
+                        <Box
+                          sx={{
+                            border: 1,
+                            borderColor: 'divider',
+                            borderRadius: 2,
+                            p: 1.5,
+                          }}
+                        >
+                          <Stack
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1}
+                            alignItems={{ sm: 'center' }}
+                            justifyContent="space-between"
+                          >
+                            <Box>
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Fulfillment locations &amp; warehouses
+                              </Typography>
+                              <Typography variant="body2" color="text.secondary">
+                                Read Shopify locations, map an existing warehouse,
+                                or create a ClawPilot warehouse from an eligible
+                                merchant-managed Shopify location.
+                              </Typography>
+                            </Box>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              onClick={() => {
+                                if (onNavigate) {
+                                  onNavigate('#operations/imports')
+                                } else {
+                                  window.location.hash = '#operations/imports'
+                                }
+                              }}
+                              sx={{ flexShrink: 0 }}
+                            >
+                              Configure locations
+                            </Button>
+                          </Stack>
+                        </Box>
+                      ) : null}
+
+                      {account.provider === 'shopify' ? (
                         <ShopifyCarrierServiceSetupPanel
                           accountGlobalId={account.globalId}
                           displayName={account.displayName}
@@ -2558,22 +2802,25 @@ export default function CommerceIntegrationPanel() {
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
                           <Typography variant="subtitle2" fontWeight={700}>
-                            Signed receipt setup
+                            Shopify event webhook setup
                           </Typography>
                           <Typography
                             variant="body2"
                             color="text.secondary"
                             sx={{ mb: 1 }}
                           >
-                            Use the account-specific URL below for shop-specific
-                            webhook subscriptions. Test connection performs a
+                            Use the account-specific URL below only for Shopify
+                            event subscriptions such as app scope, inventory,
+                            and product changes. It is separate from the
+                            CarrierService POST callback used for live cart and
+                            checkout rates above. Test connection performs a
                             live, read-only discovery and reports whether every
-                            required subscription points to this exact URL. One
-                            valid signed delivery separately verifies the stored
-                            app secret; neither check writes to Shopify. Run Test
-                            connection at least every 24 hours until automated
-                            subscription rediscovery is available; readiness
-                            fails closed when that evidence expires.
+                            required event subscription points to this exact
+                            URL. One valid signed delivery separately verifies
+                            the stored app secret; neither check writes to
+                            Shopify. Run Test connection at least every 24 hours
+                            until automated subscription rediscovery is
+                            available; readiness fails closed when that evidence expires.
                           </Typography>
                           <Stack spacing={1} sx={{ mb: 1 }}>
                             {webhookSubscriptionGroups.map((group) => (
@@ -2598,7 +2845,7 @@ export default function CommerceIntegrationPanel() {
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>
                                 <Typography variant="subtitle2" fontWeight={700}>
-                                  Webhook setup plan
+                                  Event webhook setup plan
                                 </Typography>
                                 <Typography variant="caption" color="text.secondary">
                                   Provider registration and ClawPilot processing readiness are tracked separately.
@@ -2640,10 +2887,10 @@ export default function CommerceIntegrationPanel() {
                           >
                             <TextField
                               fullWidth
-                              label="Signed webhook receipt URL"
+                              label="Signed Shopify event webhook URL"
                               value={account.webhookUrl}
                               InputProps={{ readOnly: true }}
-                              helperText="Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
+                              helperText="Do not use this URL for Shopify CarrierService cart rates. Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
                               sx={fieldSx}
                             />
                             <Button
@@ -3343,7 +3590,7 @@ export default function CommerceIntegrationPanel() {
         )}
       </Box>
 
-      {catalog ? (
+      {catalog && configuredProviders.length ? (
         <Accordion disableGutters>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}>
             <Box>
@@ -3366,8 +3613,11 @@ export default function CommerceIntegrationPanel() {
                 <TableHead>
                   <TableRow>
                     <TableCell>Capability</TableCell>
-                    <TableCell>Shopify</TableCell>
-                    <TableCell>Faire</TableCell>
+                    {configuredProviders.map((provider) => (
+                      <TableCell key={provider}>
+                        {providerLabel(provider)}
+                      </TableCell>
+                    ))}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -3382,7 +3632,7 @@ export default function CommerceIntegrationPanel() {
                           {definition.owner}
                         </Typography>
                       </TableCell>
-                      {(['shopify', 'faire'] as const).map((provider) => {
+                      {configuredProviders.map((provider) => {
                         const descriptor = catalog.providers[provider]
                         const available =
                           descriptor.providerAvailableCapabilities.includes(
@@ -3437,12 +3687,15 @@ export default function CommerceIntegrationPanel() {
             <Divider sx={{ my: 2 }} />
             <Typography variant="subtitle2">Provider scopes and permissions</Typography>
             <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
-              {(catalog.providers.shopify.providerScopes || []).map((scope) => (
-                <Chip key={`shopify-${scope}`} size="small" label={`Shopify: ${scope}`} />
-              ))}
-              {(catalog.providers.faire.providerScopes || []).map((scope) => (
-                <Chip key={scope} size="small" label={scope} />
-              ))}
+              {configuredProviders.flatMap((provider) => (
+                catalog.providers[provider].providerScopes || []
+              ).map((scope) => (
+                <Chip
+                  key={`${provider}-${scope}`}
+                  size="small"
+                  label={`${providerLabel(provider)}: ${scope}`}
+                />
+              )))}
             </Stack>
             <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
               Scope chips are shown for setup reference only; ClawPilot verifies scope evidence
@@ -3452,18 +3705,15 @@ export default function CommerceIntegrationPanel() {
         </Accordion>
       ) : null}
 
-      <Typography variant="caption" color="text.secondary">
-        Shopify custom integrations exchange merchant-owned Dev Dashboard app
-        credentials for short-lived tokens when needed. A Faire single-brand
-        connection sends its encrypted generated API key only in the
-        provider-required access-token header. Faire OAuth uses an
-        authorization-code exchange when the provider accepts that path.
-        Application credentials are encrypted and masked by default; an
-        authorized owning-organization administrator can request an audited
-        30-second reveal of current Shopify or Faire OAuth application
-        credentials. Provider API keys, access tokens, and refresh tokens are
-        never returned.
-      </Typography>
+      {configuredProviders.length ? (
+        <Typography variant="caption" color="text.secondary">
+          Connected sales-channel application credentials are encrypted and
+          masked by default. An authorized owning-organization administrator
+          can request an audited 30-second reveal only where the provider
+          credential type supports it. Provider API keys, access tokens, and
+          refresh tokens are never returned.
+        </Typography>
+      ) : null}
     </Stack>
   )
 }

@@ -63,6 +63,23 @@ print agent:
 - a dedicated always-on workstation or print server is preferable to relying on
   an operator's browser tab.
 
+The web app remains the control plane: operators enroll or rotate a
+warehouse-scoped agent, create a short-lived pairing code, bind printer profiles,
+and inspect last-seen and job evidence under **Operations > Printing**. The
+macOS download is the local delivery plane. It asks for the printer hostname
+or IP locally, stores the credential in Keychain, and installs the LaunchAgent.
+Neither path replaces the other.
+
+The current download is served without embedded organization data or a
+credential at `/downloads/ClawPilot-Print-Agent-macOS.zip`. It is an unsigned,
+unnotarized preview ZIP rather than a signed `.app` or `.pkg`, supports macOS
+and raw network ZPL only, and requires Node.js 20 or newer. After extraction,
+open **ClawPilot Print Agent.command** to pair an instance, test raw printer
+reachability without claiming or printing a job, stop an instance, or begin a
+new uniquely named pairing. A native signed/notarized application remains a
+separate distribution milestone; the download does not imply those release
+controls.
+
 Do not vendor an indiscriminate collection of GitHub printer drivers into the
 agent. Prefer carrier-native output, driverless IPP/CUPS where the device
 supports it, signed vendor software, or a maintained printing bridge with a
@@ -74,8 +91,8 @@ and printer model before it may advertise compatibility.
 
 Open **Operations > Printing**.
 
-1. In **Agents**, enroll one agent for the warehouse and declare only the formats, media, and document types its installed runtime can actually deliver.
-2. Retain the one-time credential in the local agent configuration. ClawPilot stores only its verifier.
+1. In **Agents**, create a short-lived pairing code for the warehouse and declare only the formats, media, and document types its installed runtime can actually deliver.
+2. Redeem the one-time `cppair.v1` code on the Mac. The helper stores the resulting `cpprint.v1` runtime credential in Keychain; that credential remains valid until the agent is revoked.
 3. In **Printers**, configure the device capabilities and bind it to an enrolled agent whose declared capabilities contain the entire printer profile.
 4. Keep an unbound local-agent printer offline.
 5. For thermal devices, select only the physical label sizes loaded and
@@ -86,7 +103,7 @@ Open **Operations > Printing**.
 7. Optionally select one same-warehouse fallback that supports every configured document, format, and medium on the primary.
 8. Mark the profile online only after the real device path is ready. ClawPilot rejects an assignment whose printer capabilities exceed the agent, and the worker repeats its runtime capabilities on every claim so a credential/runtime mismatch fails closed before payload delivery.
 
-Rotating an agent credential invalidates the prior credential immediately. Revoking an agent is terminal, unbinds its printer profiles, and sets those local-agent printers offline.
+Revoking an agent is terminal, invalidates its runtime credential, unbinds its printer profiles, and sets those local-agent printers offline. Create a new pairing code and agent when replacing a revoked installation.
 
 `nonthermal` is the canonical printer kind for office printers. `office` remains
 the station type and is not a printer kind. Migration `0094` normalizes legacy
@@ -98,11 +115,11 @@ The canonical agent endpoint is:
 
 `POST /api/operations/print-agent/jobs`
 
-Send the one-time credential as:
+Send the runtime credential as:
 
 `Authorization: Bearer <credential>`
 
-New enrollment and rotation credentials use the versioned shape:
+Runtime credentials use the versioned shape and remain valid until the agent is revoked:
 
 `cpprint.v1.<agent-uuid>.<secret>`
 
@@ -210,11 +227,53 @@ an escalation rather than the default application command.
 For an always-on macOS workstation, store the enrolled credential in Keychain
 and install a user-scoped LaunchAgent:
 
+The guided path prompts for a short-lived `cppair.v1` pairing code through
+macOS Keychain, redeems it over HTTPS, replaces that Keychain item locally with
+the `cpprint.v1` runtime credential, and then installs the LaunchAgent. The
+server redemption and local Keychain update are separate crash boundaries; if
+the response is lost, revoke the resulting agent and create a new pairing code.
+Direct
+`cpprint.v1` input remains explicit legacy/manual compatibility. It also asks
+for the printer endpoint in the local terminal. Neither value is placed in the
+shell command, and the hostname or IP is not submitted to the hosted printer
+configuration API:
+
+```bash
+npm run print-agent:pair:macos -- \
+  --base-url 'https://dev.aiapp.eigenracing.com'
+```
+
+The downloadable menu invokes this same tested pairing and installer path. An
+uninstall removes only the selected LaunchAgent. It intentionally retains the
+Keychain item, opaque device key, and delivery ledger so a lost acknowledgement
+or uncertain prior device write cannot become an automatic resend. To re-pair,
+revoke the web-enrolled agent, create a new pairing code, and use a new unique local instance;
+the download does not silently delete or adopt retained state.
+
+Use a unique workspace/printer instance name for every organization. The same
+physical network printer may be paired to another workspace by repeating the
+local command with that workspace's own enrolled credential and a different
+instance name. Each organization retains a separate printer profile, agent
+identity, Keychain item, and delivery ledger. Same-Mac instances targeting the
+same endpoint serialize raw printer writes through an operating-system kernel
+lock. The kernel releases that lock if a delivery process exits or crashes;
+the agent never takes a lock from a process merely because a file is old.
+Guided pairing also treats an existing local runtime directory as retained
+state even when the current deployment has no property list or Keychain item.
+It refuses that instance name rather than deleting a delivery ledger or device
+key. A fresh pairing attempt uses its own transaction marker and removes only
+installer artifacts proven to belong to that attempt; if durable or unknown
+runtime state appears, it preserves the runtime and requires recovery or a new
+unique instance name.
+
+The lower-level manual installation remains available for repair and custom
+automation:
+
 ```bash
 security add-generic-password -U \
   -s 'com.clawpilot.print-agent.dev' \
   -a 'FHMXLAB35' \
-  -w 'cpprint.v1.<agent-uuid>.<secret>'
+  -w
 
 npm run print-agent:install:macos -- \
   --name 'FHMXLAB35 Zebra' \
@@ -232,10 +291,28 @@ does not exist. Use the same arguments with `--uninstall` to stop and remove
 the LaunchAgent; the Keychain item and delivery ledger remain for an explicit
 operator cleanup.
 
+The runtime stores a private mode-0600 device-reference key beside its local
+claim ledger. A successful acknowledgement sends an opaque, keyed device
+reference instead of the configured hostname or IP. Older installed agents
+remain compatible: the server replaces any new legacy raw device reference
+with the non-correlatable constant `local-device.legacy.v1.redacted` before
+persistence. Migration `0284` replaces only historical non-`local-device.*`
+or malformed values in that column with the same constant. It also installs a
+`BEFORE INSERT` normalization guard so an older application writer cannot add
+a raw endpoint during a rolling deployment, then attests both that guard and
+the exact append-only write guard. No raw printer hostname or IP is returned
+in application projections.
+
 If the runtime restarts after bytes may have reached the printer but before an
 acknowledgement is recorded, it reports `PRINT_OUTCOME_UNCERTAIN` and fences
-automatic resend. An operator must inspect the device and use the controlled
-retry or reprint workflow.
+automatic resend across replacement claim tokens for the same immutable
+job/artifact. An operator must inspect the device and decide the physical
+outcome before intentionally producing another copy.
+
+If device delivery is recorded locally but the acknowledgement HTTP response
+is lost, the ledger remains `delivered`; the runtime does not downgrade the
+delivery or send a retryable failure. A later current claim is acknowledged
+from that durable evidence without resending the artifact.
 
 PDF and PNG are not converted to ZPL. To deliver either format, enroll a
 separate agent/runtime that natively supports that exact format and media, then
@@ -259,7 +336,13 @@ A claim returns only jobs for online printers assigned to the authenticated agen
 
 The document object contains its immutable SHA-256 digest, byte length, format, media, and storage reference. An active carrier label may also include its payload inline. The agent must verify the digest and byte length before submitting the document to the device.
 
-Persist each `claimToken` in the agent's local work ledger before sending output to a printer, and never submit the same token twice. Claim responses are replayable so a lost HTTP response cannot lease additional work.
+Persist the job, document, content digest, and `claimToken` in the agent's local
+work ledger before sending output to a printer. A replacement lease token does
+not authorize resending an immutable artifact whose prior delivery is recorded
+as started or outcome-uncertain. When the ledger proves delivery completed but
+the acknowledgement was lost, the runtime acknowledges the current claim
+without resending. Claim responses are replayable so a lost HTTP response
+cannot lease additional work.
 
 ### Acknowledge
 

@@ -25,6 +25,9 @@ const setupPersistence = read(
 const checkoutRatingPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const callbackExecution = read(
+  'app_src/lib/integrations/shopifyCarrierServiceCallback.ts',
+)
 const operationsPersistence = read(
   'app_src/lib/persistence/operations.ts',
 )
@@ -49,6 +52,11 @@ const receiptAuthorityMigration = read(
 const nameAlignmentMigration = read(
   'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
 )
+const configuredCarriersMigration = read(
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+)
+const healthRoute = read('app_src/app/api/health/route.ts')
+const predeployVerification = read('scripts/verify-predeploy.mjs')
 const externalEffectsPersistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -59,6 +67,23 @@ const userIntegrationsContract = read(
   'docs/modules/user-integrations.md',
 )
 const proxy = read('app_src/proxy.ts')
+
+requireAll(setupPersistence, [
+  'carrier.allow_sender_billing',
+  'carrier.registered_address_fingerprint',
+  'integration.configuration',
+  'matchingWarehouseGlobalIds',
+  'readinessIssues: carrierReadinessIssues(row)',
+  "'sender_billing_not_allowed'",
+  "'production_rate_not_authorized'",
+], 'checkout account readiness projection')
+requireAll(setupPanel, [
+  'const directRateCarriers = useMemo(',
+  'const carrierIssues = (',
+  "'origin_does_not_match_warehouse'",
+  '(!checked && (atLimit || issues.length > 0))',
+  'selectedRuntimeBindings.every((binding) => (',
+], 'checkout account selection truth')
 
 function requireAll(source, contracts, surface) {
   for (const contract of contracts) {
@@ -296,6 +321,9 @@ assert.ok(
 const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
+  'updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres({',
+  "current.config?.registrationState === 'registered'",
+  'expectedRowVersion: current.config.rowVersion',
   'normalizeShopifyCheckoutPlanRatePolicy(',
   'body.planRateOptimization',
   "Object.prototype.hasOwnProperty.call(\n        body,\n        'planRateOptimization',",
@@ -1110,6 +1138,77 @@ requireAll(setupPanel, [
   'Open Packaging Materials',
   'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
 ], 'customer-facing setup panel')
+requireAll(setupPanel, [
+  "key: 'cart-rate-callback'",
+  "label: 'Shopify cart-rate callback'",
+  "label: 'Exact POST callback URL'",
+  'copyable: true',
+  "label: 'Shopify registration'",
+  "value: 'write_shipping'",
+  'This is not an event webhook',
+  'no manual webhook topic subscriptions belong on this URL',
+  'Do not add it as an orders, products, inventory, or app event webhook.',
+  'Checkout rate sources',
+  "(['sandbox', 'production'] as const).map((environment) => {",
+  'TEST accounts',
+  'LIVE accounts',
+  'Save checkout rate sources',
+  'carriers: selectedCarrierBindings',
+], 'paired TEST and LIVE multi-account callback setup UI')
+requireAll(commercePanel, [
+  'Shopify event webhook setup',
+  'It is separate from the',
+  'CarrierService POST callback used for live cart and',
+  'Signed Shopify event webhook URL',
+  'Do not use this URL for Shopify CarrierService cart rates.',
+], 'event webhook and cart-rate callback distinction')
+
+requireAll(checkoutRatingPersistence, [
+  'MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  'carrierEnvironmentCounts.sandbox',
+  'carrierEnvironmentCounts.production',
+  'Checkout carrier accounts must be unique',
+  'current.carriers.length < 1',
+  '> MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  ').size !== current.carriers.length',
+], 'paired TEST and LIVE multi-account application persistence fence')
+requireAll(callbackExecution, [
+  'account.carriers.length < 1',
+  'MAX_CONFIGURED_CHECKOUT_CARRIER_ACCOUNTS',
+  'checkoutRuntimeCarrierBindings(account)',
+  'carrierAccountGlobalIds.size === account.carriers.length',
+  'runtimeCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
+  'Checkout carrier configuration is not rate-ready',
+], 'paired TEST and LIVE multi-account callback execution fence')
+requireAll(operationsPersistence, [
+  'carrierRows.rows.length < 1',
+  'carrierRows.rows.length > CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
+  "row.carrier_provider !== 'ups_rest'",
+  "row.carrier_provider !== 'fedex_rest'",
+  ').size !== carrierRows.rows.length',
+  'unique configured UPS or FedEx sandbox accounts',
+], 'bounded multi-account downstream Shadow execution fence')
+requireAll(configuredCarriersMigration, [
+  'CREATE OR REPLACE FUNCTION',
+  'operations_shopify_carrier_service_config_environment_is_ready(',
+  'operations_shopify_carrier_service_config_is_ready(',
+  "carrier_integration.provider IN ('ups_rest', 'fedex_rest')",
+  ') BETWEEN 1 AND 8',
+  'one through eight selected unique verified direct UPS/FedEx accounts',
+], 'paired TEST and LIVE multi-account canonical database readiness')
+assert.doesNotMatch(
+  configuredCarriersMigration,
+  /selected\.carrier_provider = '(?:ups_rest|fedex_rest)'/u,
+  'canonical readiness must not require both provider names',
+)
+requireAll(healthRoute, [
+  'shopify_carrier_configured_carriers_applied',
+  '0285_shopify_carrier_service_configured_carriers.sql',
+  "'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'",
+], 'configured-carrier migration health gate')
+requireAll(predeployVerification, [
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+], 'configured-carrier predeploy path gate')
 assert.equal(
   /[A-Z0-9._%+-]+@(?:episcs\.com|gmail\.com)/iu.test(setupPanel),
   false,
@@ -1145,8 +1244,9 @@ assert.ok(
   'callback URL must be authorization-gated before it enters setup state',
 )
 requireAll(setupPanel, [
-  'facts: setup?.callbackUrl ? [{',
-  "label: 'Callback URL'",
+  "key: 'cart-rate-callback'",
+  "label: 'Exact POST callback URL'",
+  'value: setup.callbackUrl',
   'setup && !setup.canActivate',
   'Owner or authorized administrator permission is required to view the',
   'callback URL or change registration state.',

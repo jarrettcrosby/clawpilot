@@ -40,6 +40,7 @@ function loadPrinting() {
 
 const {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  hasConnectedLocalPrintAgent,
   LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   isDocumentMediaCompatible,
   isPrinterCapabilitySetValid,
@@ -103,8 +104,21 @@ const labelRequest = {
 }
 
 const primary = printer()
+assert.equal(hasConnectedLocalPrintAgent(primary), true)
 assert.equal(selectPrinterRoute([primary], labelRequest)?.printer.globalId, primary.globalId)
 assert.equal(selectPrinterRoute([primary], labelRequest)?.usedFallback, false)
+const configuredNeverConnected = printer({ localPrintAgentLastSeenAt: null })
+assert.equal(hasConnectedLocalPrintAgent(configuredNeverConnected), false)
+assert.equal(
+  selectPrinterRoute([configuredNeverConnected], { ...labelRequest, durable: true }),
+  null,
+  'A configured printer must not accept durable work before its agent first connects',
+)
+assert.equal(
+  selectPrinterRoute([configuredNeverConnected], { ...labelRequest, durable: false })?.printer.globalId,
+  configuredNeverConnected.globalId,
+  'A never-connected agent must not prevent non-durable profile preconfiguration',
+)
 
 const fallback = printer({
   id: 'fallback-id',
@@ -313,6 +327,8 @@ for (const fragment of [
   'reprint_of_job_id',
   "'operations.print_job.reprinted'",
   'physicalOutputVerified: false',
+  'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
+  'A compatible printer is configured, but its local print agent has never connected',
 ]) assert.ok(delivery.includes(fragment), `Print delivery persistence missing ${fragment}`)
 
 const route = read('app_src/app/api/operations/printers/route.ts')
@@ -367,13 +383,17 @@ for (const fragment of [
   'Local print agent',
   'Browser download',
   'Create a new profile to move a physical printer to another warehouse.',
-  'One-time agent credential',
+  'One-time pairing code',
   'Authorize reprint',
   'Cancel print job',
   'Retry print job',
   'does not prove physical output',
   'Print job details',
   'Agent heartbeat',
+  'Agent never connected',
+  'Agent connected',
+  'Configured',
+  'No device delivery yet',
   'Last device delivery',
   'Package dimensions',
   'Document integrity',
@@ -383,6 +403,7 @@ for (const fragment of [
   'const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes',
   'const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA',
   'function agentSupportsPrinter(',
+  'hasConnectedLocalPrintAgent(printer)',
   'containsAll(agent.supportedFormats, printer.supportedFormats)',
   'containsAll(agent.supportedMedia, printer.supportedMedia)',
   'containsAll(agent.supportedDocumentTypes, printer.supportedDocumentTypes)',

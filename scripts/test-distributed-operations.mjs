@@ -1296,6 +1296,9 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  const shadowTraining = loadTypeScriptModule(
+    'app_src/lib/operations/shadowTraining.ts',
+  )
   const calls = {
     reads: [],
     proofs: [],
@@ -1361,6 +1364,7 @@ async function verifyRouteBehavior() {
           throw new Error('Active preparation is covered by its focused route contract')
         },
       },
+      '@/lib/operations/shadowTraining': shadowTraining,
       '@/lib/persistence/commerceActiveTransitionAuthorization': {
         CommerceActiveTransitionPersistenceError,
         prepareCommerceActiveTransitionInPostgres: async (input) => {
@@ -1450,6 +1454,10 @@ async function verifyRouteBehavior() {
               'Distributed Operations route contract does not cancel provider orders',
             )
           },
+      },
+      '@/lib/persistence/operationShadowTraining': {
+        assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres:
+          async () => {},
       },
       '@/lib/persistence/operations': {
         OperationsRequestError,
@@ -3987,6 +3995,10 @@ async function verifyPostgresAcceptance(databaseUrl) {
         },
         '@/lib/persistence/operationShadowFulfillmentPreparation': {
           readShadowFulfillmentPreparation: async () => null,
+        },
+        '@/lib/persistence/operationShadowTraining': {
+          assertNoOpenOperationsShadowTrainingRunsForActivation:
+            async () => {},
         },
         '@/lib/persistence/sandboxCommerceE2eAuthorization': {
           requireActiveSandboxCommerceE2eAuthorization: async () => {

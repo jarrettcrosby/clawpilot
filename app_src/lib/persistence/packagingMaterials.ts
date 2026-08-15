@@ -1651,6 +1651,34 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
         )
       }
       if (receipt.status === 'succeeded' && receipt.result_payload) {
+        const materialGlobalIds = Array.isArray(
+          receipt.result_payload.materialGlobalIds,
+        )
+          ? receipt.result_payload.materialGlobalIds.filter(
+            (value): value is string => typeof value === 'string',
+          )
+          : []
+        const currentMaterials = materialGlobalIds.length
+          ? await client.query<{ count: string }>(
+            `SELECT count(*)::text AS count
+             FROM operations_packaging_materials
+             WHERE organization_id = $1::uuid
+               AND global_id = ANY($2::text[])
+               AND status <> 'retired'`,
+            [input.organizationId, materialGlobalIds],
+          )
+          : { rows: [{ count: '0' }] }
+        if (
+          materialGlobalIds.length !== STARTER_PACKAGING_MATERIALS.length
+          || integer(currentMaterials.rows[0]?.count || '0')
+            !== materialGlobalIds.length
+        ) {
+          throw new PackagingMaterialRequestError(
+            'PACKAGING_MATERIAL_STARTER_REPLAY_STALE',
+            'This starter-assortment command already completed, but one or more of its materials were later removed. Start a new creation command.',
+            409,
+          )
+        }
         return {
           ...receipt.result_payload,
           replayed: true,
@@ -1846,7 +1874,7 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
       aggregateType: 'operations.packaging_material',
       aggregateId: starters.rows[0].global_id,
       organizationId: input.organizationId,
-      eventKey: `operations:packaging-material-starter:${input.organizationId}:v${STARTER_ASSORTMENT_VERSION}`,
+      eventKey: `operations:packaging-material-starter:${input.organizationId}:v${STARTER_ASSORTMENT_VERSION}:${createdReceipt.rows[0].id}`,
       payload: {
         assortmentVersion: STARTER_ASSORTMENT_VERSION,
         createdCount,

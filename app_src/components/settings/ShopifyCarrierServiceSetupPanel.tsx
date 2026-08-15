@@ -21,6 +21,9 @@ import IntegrationSetupJourney, {
 } from '@/components/settings/IntegrationSetupJourney'
 import ShopifyCustomerRatePolicyPanel
   from '@/components/settings/ShopifyCustomerRatePolicyPanel'
+import {
+  CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
+} from '@/lib/integrations/carrierCheckoutRate'
 
 type Provider = 'ups_rest' | 'fedex_rest'
 type PlanRateObjective =
@@ -297,6 +300,10 @@ type ShopifyCarrierServiceSetup = {
       accountStatus: 'needs_configuration' | 'active' | 'disabled'
       integrationStatus: 'active' | 'disabled' | 'error'
       verificationStatus: 'unverified' | 'verified' | 'failed'
+      allowSenderBilling: boolean
+      allowedCapabilities: string[] | null
+      matchingWarehouseGlobalIds: string[]
+      readinessIssues: string[]
     }>
     evidence: {
       totalReceipts: number
@@ -412,9 +419,9 @@ export default function ShopifyCarrierServiceSetupPanel({
   const [notice, setNotice] = useState('')
   const [warehouseGlobalId, setWarehouseGlobalId] = useState('')
   const [materialGlobalIds, setMaterialGlobalIds] = useState<string[]>([])
-  const [carrierAccounts, setCarrierAccounts] = useState<
-    Record<Provider, string>
-  >({ ups_rest: '', fedex_rest: '' })
+  const [carrierAccountGlobalIds, setCarrierAccountGlobalIds] = useState<
+    string[]
+  >([])
   const [
     checkoutBrandNameOverride,
     setCheckoutBrandNameOverride,
@@ -449,14 +456,11 @@ export default function ShopifyCarrierServiceSetupPanel({
       next.config?.materials.map((material) => material.materialGlobalId)
         || [],
     )
-    setCarrierAccounts({
-      ups_rest: next.config?.carriers.find(
-        (carrier) => carrier.provider === 'ups_rest',
-      )?.carrierAccountGlobalId || '',
-      fedex_rest: next.config?.carriers.find(
-        (carrier) => carrier.provider === 'fedex_rest',
-      )?.carrierAccountGlobalId || '',
-    })
+    setCarrierAccountGlobalIds(
+      next.config?.carriers.map(
+        (carrier) => carrier.carrierAccountGlobalId,
+      ) || [],
+    )
     setCheckoutBrandNameOverride(next.namePreference.overrideName || '')
     const nextPlanRateOptimization =
       next.config?.planRateOptimization ?? DEFAULT_PLAN_RATE_OPTIMIZATION
@@ -556,26 +560,92 @@ export default function ShopifyCarrierServiceSetupPanel({
     ),
     [setup, warehouseGlobalId],
   )
-  const environmentCarriers = useMemo(
+  const selectedRateEnvironment = setup?.reference.activation.state
+    === 'shadow'
+    ? 'sandbox'
+    : setup?.reference.activation.state === 'active'
+      ? 'production'
+      : null
+  const callbackRateLaneExecutable = selectedRateEnvironment !== null
+  const directRateCarriers = useMemo(
     () => (setup?.reference.carrierAccounts || []).filter(
       (carrier) => (
-        carrier.environment === setup?.account.environment
-        && carrier.accountStatus === 'active'
-        && carrier.integrationStatus === 'active'
-        && carrier.verificationStatus === 'verified'
+        carrier.environment === 'sandbox'
+        || carrier.environment === 'production'
       ),
     ),
     [setup],
   )
+  const selectedCarrierBindings = directRateCarriers
+    .filter((carrier) => carrierAccountGlobalIds.includes(carrier.globalId))
+    .map((carrier) => ({
+      provider: carrier.provider,
+      carrierAccountGlobalId: carrier.globalId,
+    }))
+    .sort((left, right) => (
+      left.provider.localeCompare(right.provider)
+      || left.carrierAccountGlobalId.localeCompare(
+        right.carrierAccountGlobalId,
+      )
+    ))
+  const selectedSandboxBindings = selectedCarrierBindings.filter(
+    (binding) => directRateCarriers.some((carrier) => (
+      carrier.globalId === binding.carrierAccountGlobalId
+      && carrier.environment === 'sandbox'
+    )),
+  )
+  const selectedProductionBindings = selectedCarrierBindings.filter(
+    (binding) => directRateCarriers.some((carrier) => (
+      carrier.globalId === binding.carrierAccountGlobalId
+      && carrier.environment === 'production'
+    )),
+  )
+  const selectedRuntimeBindings = selectedRateEnvironment === 'sandbox'
+    ? selectedSandboxBindings
+    : selectedRateEnvironment === 'production'
+      ? selectedProductionBindings
+      : []
+  const carrierIssues = (
+    carrier: (typeof directRateCarriers)[number],
+  ) => [
+    ...carrier.readinessIssues,
+    ...(
+      warehouseGlobalId
+      && !carrier.matchingWarehouseGlobalIds.includes(warehouseGlobalId)
+        ? ['origin_does_not_match_warehouse']
+        : []
+    ),
+  ]
+  const carrierIssueLabel = (issue: string) => ({
+    account_not_active: 'account disabled',
+    connection_not_active: 'connection disabled',
+    credential_not_verified: 'credential not verified',
+    sender_billing_not_allowed: 'sender billing off',
+    sandbox_rate_not_authorized: 'TEST rating not authorized',
+    production_rate_not_authorized: 'LIVE rating not authorized',
+    origin_does_not_match_warehouse: 'origin differs from warehouse',
+    environment_not_supported: 'environment unsupported',
+  }[issue] || 'not rate-ready')
   const bindingsReady = Boolean(
-    warehouseGlobalId
+    callbackRateLaneExecutable
+    && warehouseGlobalId
     && materialGlobalIds.length >= 1
     && materialGlobalIds.length <= 8
     && materialGlobalIds.every((globalId) => (
       eligibleMaterials.some((material) => material.globalId === globalId)
     ))
-    && carrierAccounts.ups_rest
-    && carrierAccounts.fedex_rest
+    && selectedRuntimeBindings.length >= 1
+    && selectedSandboxBindings.length
+      <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+    && selectedProductionBindings.length
+      <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+    && selectedRuntimeBindings.every((binding) => (
+      directRateCarriers.some((carrier) => (
+        carrier.globalId === binding.carrierAccountGlobalId
+        && carrier.provider === binding.provider
+        && carrierIssues(carrier).length === 0
+      ))
+    ))
   )
   const registered = setup?.config?.registrationState === 'registered'
   const activeRevisionBindingRequired = Boolean(
@@ -686,10 +756,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         expectedRowVersion: material?.rowVersion,
       }
     }),
-    carriers: (['ups_rest', 'fedex_rest'] as const).map((provider) => ({
-      provider,
-      carrierAccountGlobalId: carrierAccounts[provider],
-    })),
+    carriers: selectedCarrierBindings,
     inventoryMaxAgeSeconds: 900,
     quoteTtlSeconds: 900,
     orderReconciliationWindowSeconds: 86400,
@@ -792,33 +859,129 @@ export default function ShopifyCarrierServiceSetupPanel({
         </Button>
       </Box>
 
-      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
-        {(['ups_rest', 'fedex_rest'] as const).map((provider) => (
-          <FormControl size="small" fullWidth key={provider}>
-            <InputLabel id={`${provider}-${accountGlobalId}`}>
-              {providerLabel(provider)} account
-            </InputLabel>
-            <Select
-              labelId={`${provider}-${accountGlobalId}`}
-              label={`${providerLabel(provider)} account`}
-              value={carrierAccounts[provider]}
-              disabled={Boolean(registered) || Boolean(busy)}
-              onChange={(event) => setCarrierAccounts((current) => ({
-                ...current,
-                [provider]: event.target.value,
-              }))}
+      <Box>
+        <Typography variant="body2" fontWeight={700}>
+          Checkout rate sources
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          Keep separate TEST and LIVE account groups on the same Shopify
+          service. Each group supports 1–{CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS}{' '}
+          active, verified direct UPS or FedEx accounts. Every account in the
+          active group rates the same whole-shipment carton plan; Shopify
+          receives the lowest eligible result for each carrier service.
+        </Typography>
+        <Typography variant="caption" color="text.secondary" display="block">
+          {selectedRateEnvironment === 'production'
+            ? 'Active executes only the LIVE group. It never falls back to TEST and checkout rating does not buy postage or create labels.'
+            : 'Shadow executes only the TEST group. The saved LIVE group remains available for an explicit Active transition.'}
+        </Typography>
+      </Box>
+      {(['sandbox', 'production'] as const).map((environment) => {
+        const selectedInEnvironment = environment === 'sandbox'
+          ? selectedSandboxBindings
+          : selectedProductionBindings
+        return (
+          <Box key={environment}>
+            <Stack
+              direction="row"
+              justifyContent="space-between"
+              alignItems="baseline"
             >
-              {environmentCarriers
-                .filter((carrier) => carrier.provider === provider)
-                .map((carrier) => (
-                  <MenuItem key={carrier.globalId} value={carrier.globalId}>
-                    {carrier.displayName} · ••••{carrier.accountNumberLastFour}
-                  </MenuItem>
-                ))}
-            </Select>
-          </FormControl>
-        ))}
-      </Stack>
+              <Typography variant="body2" fontWeight={700}>
+                {environment === 'sandbox' ? 'TEST accounts' : 'LIVE accounts'}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                {selectedInEnvironment.length}/
+                {CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS} selected
+              </Typography>
+            </Stack>
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              {(['ups_rest', 'fedex_rest'] as const).map((provider) => {
+                const accounts = directRateCarriers.filter(
+                  (carrier) => (
+                    carrier.provider === provider
+                    && carrier.environment === environment
+                  ),
+                )
+                return (
+                  <Box key={`${environment}:${provider}`} sx={{ flex: 1 }}>
+                    <Typography variant="caption" fontWeight={700}>
+                      {providerLabel(provider)} · direct parcel
+                    </Typography>
+                    <Stack>
+                      {accounts.length ? accounts.map((carrier) => {
+                        const checked = carrierAccountGlobalIds.includes(
+                          carrier.globalId,
+                        )
+                        const atLimit = selectedInEnvironment.length
+                          >= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+                        const issues = carrierIssues(carrier)
+                        return (
+                          <FormControlLabel
+                            key={carrier.globalId}
+                            disabled={
+                              Boolean(busy)
+                              || (!checked && (atLimit || issues.length > 0))
+                            }
+                            control={(
+                              <Checkbox
+                                size="small"
+                                checked={checked}
+                                onChange={(event) => {
+                                  setCarrierAccountGlobalIds((current) => (
+                                    event.target.checked
+                                      ? [...current, carrier.globalId]
+                                      : current.filter(
+                                          (globalId) => (
+                                            globalId !== carrier.globalId
+                                          ),
+                                        )
+                                  ))
+                                }}
+                              />
+                            )}
+                            label={`${carrier.displayName} · ••••${
+                              carrier.accountNumberLastFour
+                            }${issues.length
+                              ? ` — ${issues.map(carrierIssueLabel).join(', ')}`
+                              : ''}`}
+                          />
+                        )
+                      }) : (
+                        <Typography variant="caption" color="text.secondary">
+                          No configured {environment === 'sandbox'
+                            ? 'TEST'
+                            : 'LIVE'} account
+                        </Typography>
+                      )}
+                    </Stack>
+                  </Box>
+                )
+              })}
+            </Stack>
+          </Box>
+        )
+      })}
+      <Box>
+        <Typography variant="caption" fontWeight={700}>
+          Not checkout executable yet
+        </Typography>
+        <Stack>
+          {[
+            'USPS parcel — Credentials can be verified; the checkout rate adapter is not implemented.',
+            'WWEX parcel — One-off sandbox rating works; the Shopify checkout callback is not connected.',
+            'WWEX LTL — Account freight policy + item contents + chosen pallet plan must produce packed density, then freight class, then a quote; checkout execution is not connected.',
+            'R+L LTL — Production quote client only; account freight policy, pallet-density classification, and checkout orchestration are not implemented.',
+          ].map((capability) => (
+            <FormControlLabel
+              key={capability}
+              disabled
+              control={<Checkbox size="small" checked={false} />}
+              label={capability}
+            />
+          ))}
+        </Stack>
+      </Box>
       <Box>
         <Typography variant="body2" fontWeight={700}>
           Whole-shipment carton and rate objective
@@ -926,10 +1089,14 @@ export default function ShopifyCarrierServiceSetupPanel({
       </Box>
       <Button
         variant="contained"
-        disabled={!bindingsReady || Boolean(busy) || Boolean(registered)}
+        disabled={!bindingsReady || Boolean(busy)}
         onClick={() => void saveConfig()}
       >
-        {busy === 'save-config' ? 'Saving…' : 'Save exact callback setup'}
+        {busy === 'save-config'
+          ? 'Saving…'
+          : registered
+            ? 'Save checkout rate sources'
+            : 'Save exact callback setup'}
       </Button>
     </Stack>
   )
@@ -1121,7 +1288,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       key: 'bindings',
       label: 'Choose warehouse, materials, and carrier accounts',
       description:
-        'This exact revision controls inventory freshness, cartonization, and a single whole-shipment request to each configured carrier.',
+        `This exact revision controls inventory freshness, cartonization, and one whole-shipment request to each of up to ${CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS} selected direct parcel accounts.`,
       state: stepState(
         Boolean(setup?.config),
         Boolean(connectionReady),
@@ -1129,6 +1296,47 @@ export default function ShopifyCarrierServiceSetupPanel({
       ),
       action: configAction,
     },
+    ...(setup?.config ? [{
+      key: 'cart-rate-callback',
+      label: 'Shopify cart-rate callback',
+      description:
+        'Shopify sends an HTTPS POST to this exact CarrierService endpoint while calculating cart and checkout shipping rates. This is not an event webhook, and no manual webhook topic subscriptions belong on this URL.',
+      state: stepState(
+        Boolean(
+          registered
+          && setup.config.serviceGid
+          && setup.callbackUrl,
+        ),
+        Boolean(setup.callbackUrl),
+        Boolean(!setup.callbackUrl),
+      ),
+      facts: [
+        ...(setup.callbackUrl ? [{
+          label: 'Exact POST callback URL',
+          value: setup.callbackUrl,
+          copyable: true,
+        }] : []),
+        {
+          label: 'Shopify registration',
+          value: registered
+            ? `Registered · ${setup.config.serviceGid || 'ID unavailable'}`
+            : setup.config.registrationState === 'shadow_simulated'
+              ? 'Simulated · authorization still required'
+              : 'Not registered',
+        },
+        {
+          label: 'Required Shopify scope',
+          value: 'write_shipping',
+        },
+      ],
+      action: (
+        <Alert severity={registered ? 'success' : 'info'}>
+          {registered
+            ? 'Shopify has this callback registered on the exact CarrierService shown above. Cart and checkout rate requests use POST automatically.'
+            : 'ClawPilot registers this URL on a Shopify CarrierService only after the zero-write simulation and one-time authorization below. Do not add it as an orders, products, inventory, or app event webhook.'}
+        </Alert>
+      ),
+    }] : []),
     ...(setup?.config ? [{
       key: 'carrier-service-name',
       label: registered
@@ -1428,11 +1636,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         Boolean(simulated),
         Boolean(recoveryRequired),
       ),
-      facts: setup?.callbackUrl ? [{
-        label: 'Callback URL',
-        value: setup.callbackUrl,
-        copyable: true,
-      }] : [],
+      facts: [],
       action: (
         <Stack spacing={1}>
           <Alert severity="warning">

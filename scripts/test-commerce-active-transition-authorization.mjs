@@ -283,13 +283,25 @@ function verifySourceContracts() {
   )
   for (const fragment of [
     'implementation?: Record<',
-    'selectable: implemented && scopeEligible',
+    'selectable: implemented && scopeEligible && carrierServiceEligible',
     'disabled={!option.selectable}',
-    "option.unavailableReason === 'not_implemented'",
+    "reason === 'not_implemented'",
     'Provider-supported capabilities remain',
-    'commerceActiveInitialSelection({',
+    'commerceActiveInitialSelectionWithCarrierServices({',
     'preservationBlockers.length',
     'No immediately preceding Active Shopify cohort was found',
+    'readShopifyCarrierServiceActivationSetups(',
+    '/api/integrations/commerce/shopify/carrier-service',
+    "payload.setup.account?.globalId !== accountGlobalId",
+    "payload.setup.config.registrationState === 'registered'",
+    'SHOPIFY_CARRIER_SERVICE_GID_PATTERN.test(',
+    "carrierServiceSetups[account.globalId] || { status: 'unavailable' as const }",
+    "capability === 'shipping_rate_callbacks'",
+    "return 'Set up CarrierService first'",
+    "return 'CarrierService status unavailable'",
+    'cannot preserve shipping_rate_callbacks until its exact Shopify CarrierService is registered.',
+    'cannot preserve shipping_rate_callbacks because its CarrierService setup status could not be verified.',
+    'Fulfillment and tracking remain independently selectable.',
   ]) {
     assert.ok(
       operationsUi.includes(fragment),
@@ -763,6 +775,10 @@ async function verifyDisposablePostgres() {
             },
           },
           '@/lib/integrations/commerceCapabilities': capabilityCatalog,
+          '@/lib/persistence/operationShadowTraining': {
+            assertNoOpenOperationsShadowTrainingRunsForActivation:
+              async () => {},
+          },
           '@/lib/persistence/postgres': postgresMock,
         },
       },

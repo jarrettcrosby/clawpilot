@@ -73,7 +73,11 @@ export type CheckoutRateProviderAttempt = {
 export type CheckoutShipmentRateResult = {
   rateScope: 'multi_package_shipment'
   packageCount: number
+  configuredAccounts: CheckoutRateCarrierSelection[]
+  successfulAccounts: CheckoutRateCarrierSelection[]
+  /** Distinct-provider compatibility summary; account evidence is above. */
   configuredProviders: CheckoutRateCarrierProvider[]
+  /** Distinct-provider compatibility summary; account evidence is above. */
   successfulProviders: CheckoutRateCarrierProvider[]
   providerAttempts: CheckoutRateProviderAttempt[]
   offers: CheckoutRateOffer[]
@@ -131,16 +135,19 @@ export type OptimizedCheckoutPlanRateResult = {
 export class CheckoutShipmentRateError extends Error {
   readonly code: string
   readonly provider: CheckoutRateCarrierProvider | null
+  readonly carrierAccountGlobalId: string | null
 
   constructor(
     code: string,
     message: string,
     provider: CheckoutRateCarrierProvider | null = null,
+    carrierAccountGlobalId: string | null = null,
   ) {
     super(message)
     this.name = 'CheckoutShipmentRateError'
     this.code = code
     this.provider = provider
+    this.carrierAccountGlobalId = carrierAccountGlobalId
   }
 }
 
@@ -151,14 +158,28 @@ const EVIDENCE_GLOBAL_ID = /^grq(?:[0-9]{7}|[0-9a-v]{12})$/
 const CURRENCY = /^[A-Z]{3}$/
 const DECIMAL_MONEY = /^(?:0|[1-9][0-9]{0,12})(?:\.[0-9]{1,2})?$/
 export const CHECKOUT_RATE_ALTERNATIVE_BUDGET_MS = 1_000
+/**
+ * Hard checkout fanout bound for executable direct-parcel accounts. This
+ * allows multiple accounts per UPS/FedEx adapter without letting tenant
+ * configuration exhaust the shared checkout deadline. USPS and LTL require
+ * their own executable adapters before they can join this union.
+ */
+export const CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS = 8
+export const CHECKOUT_RATE_MAX_ACCOUNT_CALLS = 16
 const CHECKOUT_RATE_EVIDENCE_GRACE_MS = 750
 
 function rateError(
   code: string,
   message: string,
   provider: CheckoutRateCarrierProvider | null = null,
+  carrierAccountGlobalId: string | null = null,
 ): never {
-  throw new CheckoutShipmentRateError(code, message, provider)
+  throw new CheckoutShipmentRateError(
+    code,
+    message,
+    provider,
+    carrierAccountGlobalId,
+  )
 }
 
 function positiveFinite(value: unknown, label: string) {
@@ -220,13 +241,17 @@ function normalizeParcels(value: CheckoutRateParcel[]) {
 }
 
 function normalizeCarriers(value: CheckoutRateCarrierSelection[]) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 2) {
+  if (
+    !Array.isArray(value)
+    || value.length < 1
+    || value.length > CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+  ) {
     rateError(
       'CHECKOUT_RATE_CARRIERS_INVALID',
-      'Checkout rating requires one or two configured carriers',
+      `Checkout rating requires between 1 and ${CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS} configured carrier accounts`,
     )
   }
-  const seen = new Set<CheckoutRateCarrierProvider>()
+  const seenAccountGlobalIds = new Set<string>()
   return value.map((selection) => {
     if (
       !selection
@@ -234,25 +259,35 @@ function normalizeCarriers(value: CheckoutRateCarrierSelection[]) {
         selection.provider !== 'ups_rest'
         && selection.provider !== 'fedex_rest'
       )
-      || seen.has(selection.provider)
       || !ACCOUNT_GLOBAL_ID.test(selection.carrierAccountGlobalId)
+      || seenAccountGlobalIds.has(selection.carrierAccountGlobalId)
     ) {
       rateError(
         'CHECKOUT_RATE_CARRIERS_INVALID',
-        'Checkout carriers must be unique configured UPS or FedEx accounts',
+        'Checkout carrier account bindings must have unique canonical Global IDs and an executable UPS or FedEx provider',
       )
     }
-    seen.add(selection.provider)
+    seenAccountGlobalIds.add(selection.carrierAccountGlobalId)
     return { ...selection }
-  })
+  }).sort((left, right) => (
+    left.carrierAccountGlobalId.localeCompare(
+      right.carrierAccountGlobalId,
+    )
+    || left.provider.localeCompare(right.provider)
+  ))
 }
 
-function amountMinor(value: unknown, provider: CheckoutRateCarrierProvider) {
+function amountMinor(
+  value: unknown,
+  provider: CheckoutRateCarrierProvider,
+  carrierAccountGlobalId: string,
+) {
   if (typeof value !== 'string' || !DECIMAL_MONEY.test(value)) {
     rateError(
       'CHECKOUT_RATE_AMOUNT_INVALID',
       'Carrier rate amount must be an exact nonnegative decimal',
       provider,
+      carrierAccountGlobalId,
     )
   }
   const [whole, fraction = ''] = value.split('.')
@@ -262,6 +297,7 @@ function amountMinor(value: unknown, provider: CheckoutRateCarrierProvider) {
       'CHECKOUT_RATE_AMOUNT_INVALID',
       'Carrier rate amount exceeds the supported range',
       provider,
+      carrierAccountGlobalId,
     )
   }
   return minor
@@ -287,6 +323,7 @@ function normalizeProviderResult(
       'CHECKOUT_RATE_PROVIDER_RESPONSE_INVALID',
       'Carrier returned an invalid whole-shipment rate response',
       expected.provider,
+      expected.carrierAccountGlobalId,
     )
   }
   const seen = new Set<string>()
@@ -321,6 +358,7 @@ function normalizeProviderResult(
         'CHECKOUT_RATE_PROVIDER_RESPONSE_INVALID',
         'Carrier returned invalid or duplicate service evidence',
         expected.provider,
+        expected.carrierAccountGlobalId,
       )
     }
     seen.add(rate.serviceCode)
@@ -330,7 +368,11 @@ function normalizeProviderResult(
       carrierCode: expected.provider === 'ups_rest' ? 'ups' : 'fedex',
       serviceLevelCode: rate.serviceCode.toLowerCase(),
       serviceName: rate.serviceName.trim(),
-      amountMinor: amountMinor(rate.amount, expected.provider),
+      amountMinor: amountMinor(
+        rate.amount,
+        expected.provider,
+        expected.carrierAccountGlobalId,
+      ),
       currency: normalizedCurrency,
       transitDays: rate.transitDays,
       deliveryDate: rate.deliveryDate,
@@ -360,6 +402,7 @@ function safeProviderRateEvidenceGlobalId(error: unknown) {
 function providerResultRateEvidenceGlobalId(
   offers: CheckoutRateOffer[],
   provider: CheckoutRateCarrierProvider,
+  carrierAccountGlobalId: string,
 ) {
   const evidenceGlobalIds = new Set(
     offers.map(({ evidenceGlobalId }) => evidenceGlobalId),
@@ -369,6 +412,7 @@ function providerResultRateEvidenceGlobalId(
       'CHECKOUT_RATE_PROVIDER_RESPONSE_INVALID',
       'Carrier services must share one durable whole-shipment rate evidence record',
       provider,
+      carrierAccountGlobalId,
     )
   }
   return offers[0]!.evidenceGlobalId
@@ -469,10 +513,7 @@ export async function rateCheckoutShipment(input: {
     offers: CheckoutRateOffer[]
     error: unknown
   }
-  const settledByProvider = new Map<
-    CheckoutRateCarrierProvider,
-    ProviderOutcome
-  >()
+  const settledByAccount = new Map<string, ProviderOutcome>()
   let providerWork: Promise<ProviderOutcome[]> | null = null
 
   const timeout = new Promise<ProviderOutcome[]>((resolve, reject) => {
@@ -493,7 +534,7 @@ export async function rateCheckoutShipment(input: {
           )
         : null
       const outcomes = completedOutcomes ?? carriers.map((selection) => (
-        settledByProvider.get(selection.provider) ?? {
+        settledByAccount.get(selection.carrierAccountGlobalId) ?? {
           attempt: {
             provider: selection.provider,
             carrierAccountGlobalId: selection.carrierAccountGlobalId,
@@ -560,12 +601,13 @@ export async function rateCheckoutShipment(input: {
             rateEvidenceGlobalId: providerResultRateEvidenceGlobalId(
               offers,
               selection.provider,
+              selection.carrierAccountGlobalId,
             ),
           },
           offers,
           error: null,
         }
-        settledByProvider.set(selection.provider, outcome)
+        settledByAccount.set(selection.carrierAccountGlobalId, outcome)
         return outcome
       } catch (error) {
         const outcome = {
@@ -579,7 +621,7 @@ export async function rateCheckoutShipment(input: {
           offers: [],
           error,
         }
-        settledByProvider.set(selection.provider, outcome)
+        settledByAccount.set(selection.carrierAccountGlobalId, outcome)
         return outcome
       }
     }))
@@ -609,6 +651,7 @@ export async function rateCheckoutShipment(input: {
           'CHECKOUT_RATE_PROVIDER_EVIDENCE_REQUIRED',
           `${outcome.attempt.provider} did not retain durable rate evidence`,
           outcome.attempt.provider,
+          outcome.attempt.carrierAccountGlobalId,
         )
       }
       return {
@@ -619,17 +662,33 @@ export async function rateCheckoutShipment(input: {
     return {
       rateScope: 'multi_package_shipment',
       packageCount: parcels.length,
-      configuredProviders: carriers.map(({ provider }) => provider),
-      successfulProviders: outcomes.flatMap((outcome) => (
+      configuredAccounts: carriers.map((selection) => ({ ...selection })),
+      successfulAccounts: outcomes.flatMap((outcome) => (
+        outcome.attempt.status === 'succeeded'
+          ? [{
+              provider: outcome.attempt.provider,
+              carrierAccountGlobalId:
+                outcome.attempt.carrierAccountGlobalId,
+            }]
+          : []
+      )),
+      configuredProviders: [...new Set(
+        carriers.map(({ provider }) => provider),
+      )],
+      successfulProviders: [...new Set(outcomes.flatMap((outcome) => (
         outcome.attempt.status === 'succeeded'
           ? [outcome.attempt.provider]
           : []
-      )),
+      )))],
       providerAttempts,
       offers: offers.sort((left, right) => (
         left.amountMinor - right.amountMinor
         || left.carrierCode.localeCompare(right.carrierCode)
+        || left.carrierAccountGlobalId.localeCompare(
+          right.carrierAccountGlobalId,
+        )
         || left.serviceLevelCode.localeCompare(right.serviceLevelCode)
+        || left.evidenceGlobalId.localeCompare(right.evidenceGlobalId)
       )),
       completedAt: new Date(now()).toISOString(),
     }
@@ -672,8 +731,14 @@ function comparePlanRateEvaluation(
   return (
     left.candidateKey.localeCompare(right.candidateKey)
     || left.offer.carrierCode.localeCompare(right.offer.carrierCode)
+    || left.offer.carrierAccountGlobalId.localeCompare(
+      right.offer.carrierAccountGlobalId,
+    )
     || left.offer.serviceLevelCode.localeCompare(
       right.offer.serviceLevelCode,
+    )
+    || left.offer.evidenceGlobalId.localeCompare(
+      right.offer.evidenceGlobalId,
     )
   )
 }
@@ -769,6 +834,7 @@ export async function rateOptimizedCheckoutPlans(input: {
   ) => Promise<CheckoutRateProviderResult>
   now?: () => number
 }): Promise<OptimizedCheckoutPlanRateResult> {
+  const carriers = normalizeCarriers(input.carriers)
   if (
     !Array.isArray(input.candidates)
     || input.candidates.length < 1
@@ -854,10 +920,14 @@ export async function rateOptimizedCheckoutPlans(input: {
   }
   const now = input.now ?? Date.now
   const baselineCandidate = candidates[0]
+  const ratedCandidateLimit = Math.max(1, Math.min(
+    input.policy.maxCandidates,
+    Math.floor(CHECKOUT_RATE_MAX_ACCOUNT_CALLS / carriers.length),
+  ))
   const baselineResult = await rateCheckoutShipment({
     destination: input.destination,
     parcels: baselineCandidate.parcels,
-    carriers: input.carriers,
+    carriers,
     currency: input.currency,
     deadlineAt: input.deadlineAt,
     signal: input.signal,
@@ -885,7 +955,10 @@ export async function rateOptimizedCheckoutPlans(input: {
     candidate: baselineCandidate,
     result: baselineResult,
   }]
-  const alternatives = candidates.slice(1)
+  const alternatives = candidates.slice(1, ratedCandidateLimit)
+  const callBudgetSkippedAlternatives = candidates.slice(
+    ratedCandidateLimit,
+  )
   if (alternatives.length) {
     const remainingAtStart = input.deadlineAt - now()
     const alternativeDeadlineAt = Math.min(
@@ -909,7 +982,7 @@ export async function rateOptimizedCheckoutPlans(input: {
           result: await rateCheckoutShipment({
             destination: input.destination,
             parcels: candidate.parcels,
-            carriers: input.carriers,
+            carriers,
             currency: input.currency,
             deadlineAt: alternativeDeadlineAt,
             signal: input.signal,
@@ -959,6 +1032,15 @@ export async function rateOptimizedCheckoutPlans(input: {
         }
       })
     }
+  }
+  for (const candidate of callBudgetSkippedAlternatives) {
+    candidateAttempts.push({
+      candidate,
+      status: 'degraded',
+      result: null,
+      evaluation: null,
+      failureCode: 'CHECKOUT_RATE_ACCOUNT_CALL_BUDGET_EXHAUSTED',
+    })
   }
   const candidateEvaluations = candidateAttempts
     .flatMap((attempt) => attempt.evaluation ? [attempt.evaluation] : [])

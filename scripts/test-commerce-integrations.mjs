@@ -1168,7 +1168,7 @@ includes(integrationSettings, [
   "initialIntegration === 'commerce' && canManageOperationsIntegrations",
   "key: 'commerce'",
   "label: 'Sales channels'",
-  '<CommerceIntegrationPanel />',
+  '<CommerceIntegrationPanel onNavigate={onNavigate} />',
   'canManageOperationsIntegrations',
 ], 'Integration settings navigation')
 const appHeader = read('app_src/components/AppHeader.tsx')

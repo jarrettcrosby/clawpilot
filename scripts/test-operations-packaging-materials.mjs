@@ -312,6 +312,8 @@ for (const fragment of [
   'createStarterPackagingAssortmentInPostgres',
   'operations_command_receipts',
   'PACKAGING_MATERIAL_STARTER_CODE_CONFLICT',
+  'PACKAGING_MATERIAL_STARTER_REPLAY_STALE',
+  '${createdReceipt.rows[0].id}',
   "starterRow.source !== 'starter_assortment'",
   'PACKAGING_MATERIAL_VERSION_CONFLICT',
   'PACKAGING_MATERIAL_STOCK_VERSION_CONFLICT',
@@ -392,6 +394,9 @@ for (const fragment of [
   'Create starter assortment',
   'Add material',
   'Activate material',
+  'Finish setup',
+  'Needed before activation:',
+  'openActivationSetup',
   'Edit stock',
   'Products missing dimensions',
   'Warehouse stock gaps',
@@ -406,10 +411,17 @@ for (const fragment of [
   'Idempotency-Key',
   'Shopify default',
   'globalThis.crypto.randomUUID()',
+  'const starterCommandKey = useRef<string | null>(null)',
+  'if (terminalResponse) starterCommandKey.current = null',
   'if (terminalResponse) importCommandKey.current = null',
 ]) {
   assert.ok(panel.includes(fragment), `Packaging materials panel missing ${fragment}`)
 }
+assert.equal(
+  panel.includes("'packaging-materials:starter-assortment:v1'"),
+  false,
+  'An intentional starter creation must not remain pinned to the first receipt',
+)
 assert.equal(
   panel.includes('shopify-packages:${importAccountGlobalId}:${importPreview.fileSha256}'),
   false,
