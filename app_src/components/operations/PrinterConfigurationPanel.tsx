@@ -1278,13 +1278,19 @@ export default function PrinterConfigurationPanel() {
             justifyContent="flex-end"
             spacing={1}
           >
-            <DeveloperPrintAgentDownloadButton />
+            {customerMacPrintAgent && (
+              <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+            )}
+            {customerWindowsPrintAgent && (
+              <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+            )}
+            {!customerPrintAgentRelease && <DeveloperPrintAgentDownloadButton />}
             <Button
               variant="outlined"
               startIcon={<TokenRounded />}
               onClick={() => setView('agents')}
             >
-              {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
+              {printAgentSetupReady
                 ? 'Configure network printer'
                 : 'View local agent status'}
             </Button>
@@ -2118,7 +2124,9 @@ export default function PrinterConfigurationPanel() {
                     <Typography variant="body2">
                       {ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
                         ? 'Enter the Zebra hostname/IP and raw port 9100 in the developer helper on the controlled development Mac, not in this hosted form.'
-                        : 'The Zebra hostname/IP and raw port 9100 will be entered only in the signed and notarized native Mac Print Agent after it is released, not in this hosted form.'}
+                        : customerPrintAgentRelease
+                          ? 'Enter the Zebra private network IP and raw port 9100 in the signed ClawPilot Print Agent for macOS or Windows, not in this hosted form.'
+                          : 'A verified signed Print Agent release is required before entering the Zebra private network IP and raw port 9100; this hosted form never collects it.'}
                       {' '}This form defines routing and capabilities only. New Zebra profiles
                       retain the 4 x 6 carrier-label preset; select only the label sizes physically
                       loaded and calibrated.
@@ -2558,7 +2566,7 @@ export default function PrinterConfigurationPanel() {
                 In the Print Agent choose Pair workspace. Confirm the trusted ClawPilot site, then
                 enter the printer&apos;s private network IPv4 address and raw port 9100. The app probes
                 reachability without sending printer bytes or claiming a job. The endpoint remains
-                encrypted on this computer and is never sent to ClawPilot.
+                only in this computer&apos;s protected per-user app data and is never sent to ClawPilot.
               </Typography>
             </Box>
             <Divider />
