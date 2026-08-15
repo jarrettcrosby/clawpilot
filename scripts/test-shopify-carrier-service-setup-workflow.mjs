@@ -321,9 +321,11 @@ assert.ok(
 const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
-  'updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres({',
+  'updateRegisteredShopifyCarrierServiceRateSourcesInPostgres({',
   "current.config?.registrationState === 'registered'",
   'expectedRowVersion: current.config.rowVersion',
+  "warehouseGlobalId: String(body.warehouseGlobalId || ''),",
+  'materials,',
   'normalizeShopifyCheckoutPlanRatePolicy(',
   'body.planRateOptimization',
   "Object.prototype.hasOwnProperty.call(\n        body,\n        'planRateOptimization',",

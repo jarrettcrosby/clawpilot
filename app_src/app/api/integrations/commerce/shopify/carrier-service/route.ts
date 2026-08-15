@@ -56,7 +56,7 @@ import {
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
-  updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres,
+  updateRegisteredShopifyCarrierServiceRateSourcesInPostgres,
   updateShopifyCarrierServicePlanRatePolicyInPostgres,
   updateShopifyCarrierServiceRateWarmPolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
@@ -1272,15 +1272,6 @@ export async function POST(req: NextRequest) {
             carrierAccountGlobalId: selected.carrierAccountGlobalId as string,
           }
         })
-      if (current.config?.registrationState === 'registered') {
-        await updateRegisteredShopifyCarrierServiceCarrierBindingsInPostgres({
-          organizationId: context.organizationId,
-          accountGlobalId: accountId,
-          expectedRowVersion: current.config.rowVersion,
-          carriers,
-          actorEmail: context.actor.email,
-        })
-      } else {
       const materials = array(body.materials, 'Packaging materials')
         .map((item) => {
           const selected = record(item, 'Packaging material')
@@ -1291,6 +1282,17 @@ export async function POST(req: NextRequest) {
             expectedRowVersion: Number(selected.expectedRowVersion),
           }
         })
+      if (current.config?.registrationState === 'registered') {
+        await updateRegisteredShopifyCarrierServiceRateSourcesInPostgres({
+          organizationId: context.organizationId,
+          accountGlobalId: accountId,
+          expectedRowVersion: current.config.rowVersion,
+          warehouseGlobalId: String(body.warehouseGlobalId || ''),
+          materials,
+          carriers,
+          actorEmail: context.actor.email,
+        })
+      } else {
       const callbackTokenVersion = current.config
         ? current.config.callbackTokenVersion + 1
         : 1

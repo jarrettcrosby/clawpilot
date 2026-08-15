@@ -14,6 +14,8 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const migration = '0285_shopify_carrier_service_configured_carriers.sql'
 const diagnosticMigration = '0286_carrier_shipping_account_diagnostics.sql'
+const registeredRateSourceMigration =
+  '0292_shopify_registered_rate_source_refresh.sql'
 
 const repeatHex = (digit) => String(digit).repeat(64)
 
@@ -1427,6 +1429,14 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       new URL(`../db/migrations/${diagnosticMigration}`, import.meta.url),
     ),
   ).digest('hex')
+  const registeredRateSourceChecksum = crypto.createHash('sha256').update(
+    readFileSync(
+      new URL(
+        `../db/migrations/${registeredRateSourceMigration}`,
+        import.meta.url,
+      ),
+    ),
+  ).digest('hex')
   await legacyPool.query(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        filename text PRIMARY KEY,
@@ -1436,8 +1446,15 @@ async function runRollingMigrationAcceptance(databaseUrl) {
   )
   await legacyPool.query(
     `INSERT INTO schema_migrations (filename, checksum)
-     VALUES ($1, $2), ($3, $4)`,
-    [migration, migrationChecksum, diagnosticMigration, diagnosticChecksum],
+     VALUES ($1, $2), ($3, $4), ($5, $6)`,
+    [
+      migration,
+      migrationChecksum,
+      diagnosticMigration,
+      diagnosticChecksum,
+      registeredRateSourceMigration,
+      registeredRateSourceChecksum,
+    ],
   )
   command('node', ['scripts/db-migrate.mjs'], {
     env: { ...process.env, DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
@@ -1451,7 +1468,7 @@ async function runRollingMigrationAcceptance(databaseUrl) {
     await client.query(
       `DELETE FROM schema_migrations
        WHERE filename = ANY($1::text[])`,
-      [[migration, diagnosticMigration]],
+      [[migration, diagnosticMigration, registeredRateSourceMigration]],
     )
   } finally {
     client.release()
@@ -2463,7 +2480,33 @@ async function main() {
              '28500000-0000-4000-8000-000000000001'::uuid
            AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
       )
+      await client.query(
+        `UPDATE operations_packaging_materials
+         SET row_version = 2,
+             updated_at = now()
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000050'::uuid`,
+      )
       await client.query('SET session_replication_role = origin')
+      assert.equal(
+        await isReady(client),
+        false,
+        'a registered config must fail closed after a selected material revision changes',
+      )
+      await assert.rejects(
+        client.query(
+          `DELETE FROM operations_shopify_carrier_service_config_materials
+           WHERE organization_id =
+               '28500000-0000-4000-8000-000000000001'::uuid
+             AND config_id =
+               '28500000-0000-4000-8000-000000000090'::uuid
+             AND packaging_material_id =
+               '28500000-0000-4000-8000-000000000050'::uuid`,
+        ),
+        /Disable the provider CarrierService/u,
+        'registered material bindings must reject unfenced direct edits',
+      )
       await assert.rejects(
         client.query(
           `DELETE FROM operations_shopify_carrier_service_config_carriers
@@ -2484,6 +2527,23 @@ async function main() {
            'clawpilot.shopify_carrier_binding_write_token',
            '28500000-0000-4000-8000-000000000090:1',
            true
+         )`,
+      )
+      await client.query(
+        `DELETE FROM operations_shopify_carrier_service_config_materials
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND config_id =
+             '28500000-0000-4000-8000-000000000090'::uuid`,
+      )
+      await client.query(
+        `INSERT INTO operations_shopify_carrier_service_config_materials (
+           organization_id, config_id, selection_sequence,
+           packaging_material_id, packaging_material_row_version
+         ) VALUES (
+           '28500000-0000-4000-8000-000000000001'::uuid,
+           '28500000-0000-4000-8000-000000000090'::uuid,
+           1, '28500000-0000-4000-8000-000000000050'::uuid, 2
          )`,
       )
       await client.query(
@@ -2514,6 +2574,20 @@ async function main() {
            AND row_version = 1`,
       )
       await client.query('COMMIT')
+      const refreshedMaterial = await client.query(
+        `SELECT packaging_material_row_version::text AS row_version
+         FROM operations_shopify_carrier_service_config_materials
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND config_id =
+             '28500000-0000-4000-8000-000000000090'::uuid`,
+      )
+      assert.equal(refreshedMaterial.rows[0]?.row_version, '2')
+      assert.equal(
+        await isReady(client),
+        true,
+        'an exact token-fenced material and carrier refresh must restore registered readiness',
+      )
 
       await client.query('SET session_replication_role = replica')
       await client.query(

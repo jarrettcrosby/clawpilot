@@ -177,6 +177,7 @@ for (const requiredPath of [
   'db/migrations/0283_operations_shopify_order_management.sql',
   'db/migrations/0284_operations_print_device_reference_privacy.sql',
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+  'db/migrations/0292_shopify_registered_rate_source_refresh.sql',
   'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
   'db/migrations/0287_operations_print_agent_pairing_grants.sql',
   'db/migrations/0288_operations_shopify_location_routing.sql',
