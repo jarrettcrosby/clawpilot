@@ -275,14 +275,30 @@ export async function POST(req: NextRequest) {
         'Retry delay is invalid',
       )
     }
+    const errorCode = text(command.value.errorCode, 'Failure code', 64)
+    const printerUnavailable = command.value.printerUnavailable === true
+    if (
+      errorCode === 'PRINT_OUTCOME_UNCERTAIN'
+      && (
+        command.value.retryable !== false
+        || printerUnavailable
+        || retryAfterSeconds !== 0
+      )
+    ) {
+      requestError(
+        'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
+        'An uncertain physical print outcome is terminal and may not be retried automatically',
+        409,
+      )
+    }
     const job = await failOperationsPrintJobInPostgres({
       agent,
       ...identity,
       idempotencyKey: idempotencyKey(req),
-      errorCode: text(command.value.errorCode, 'Failure code', 64),
+      errorCode,
       errorMessage: text(command.value.errorMessage, 'Failure message', 1000),
       retryable: command.value.retryable,
-      printerUnavailable: command.value.printerUnavailable === true,
+      printerUnavailable,
       retryAfterSeconds,
     })
     return json({ ok: true, job })

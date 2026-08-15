@@ -207,6 +207,7 @@ for (const requiredPath of [
   'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
   'db/migrations/0287_operations_print_agent_pairing_grants.sql',
   'db/migrations/0295_operations_print_agent_pairing_recovery_envelopes.sql',
+  'db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql',
   'db/migrations/0288_operations_shopify_location_routing.sql',
   'db/migrations/0289_operations_shopify_location_administration.sql',
   'db/migrations/0290_operations_shadow_training_runs.sql',

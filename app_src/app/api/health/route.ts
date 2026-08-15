@@ -1942,6 +1942,7 @@ export async function GET() {
           operations_print_device_reference_privacy_applied: boolean
           operations_print_agent_pairing_grants_applied: boolean
           operations_print_agent_pairing_recovery_applied: boolean
+          operations_print_outcome_uncertain_fence_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
           shopify_checkout_audience_policy_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
@@ -4400,6 +4401,58 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0296_operations_print_outcome_uncertain_retry_fence.sql'
+              )
+              AND to_regprocedure(
+                'prevent_operations_uncertain_print_retry()'
+              ) IS NOT NULL
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'prevent_operations_uncertain_print_retry()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%FROM operations_print_jobs job%FOR UPDATE%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'prevent_operations_uncertain_print_retry()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%previous_error_code = ''PRINT_OUTCOME_UNCERTAIN''%'
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger uncertain_retry_guard
+                WHERE uncertain_retry_guard.tgrelid = to_regclass(
+                  'operations_print_delivery_attempts'
+                )
+                  AND uncertain_retry_guard.tgname =
+                    'prevent_operations_uncertain_print_retry_write'
+                  AND uncertain_retry_guard.tgfoid = to_regprocedure(
+                    'prevent_operations_uncertain_print_retry()'
+                  )
+                  AND uncertain_retry_guard.tgenabled = 'O'
+                  AND uncertain_retry_guard.tgtype = 7
+                  AND NOT uncertain_retry_guard.tgisinternal
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_print_jobs stranded_job
+                JOIN operations_print_agents stranded_agent
+                  ON stranded_agent.organization_id = stranded_job.organization_id
+                 AND stranded_agent.id = stranded_job.claimed_by_print_agent_id
+                JOIN operations_printers stranded_printer
+                  ON stranded_printer.organization_id = stranded_job.organization_id
+                 AND stranded_printer.id = stranded_job.printer_id
+                WHERE stranded_job.status = 'claimed'
+                  AND (
+                    stranded_agent.status <> 'active'
+                    OR stranded_printer.local_print_agent_id
+                      IS DISTINCT FROM stranded_agent.id
+                  )
+              ) AS operations_print_outcome_uncertain_fence_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
               AND EXISTS (
@@ -5382,6 +5435,7 @@ export async function GET() {
             && row?.operations_print_device_reference_privacy_applied
             && row?.operations_print_agent_pairing_grants_applied
             && row?.operations_print_agent_pairing_recovery_applied
+            && row?.operations_print_outcome_uncertain_fence_applied
             && row?.shopify_carrier_configured_carriers_applied
             && row?.shopify_checkout_audience_policy_applied
             && row?.carrier_shipping_diagnostics_applied
@@ -5505,6 +5559,9 @@ export async function GET() {
             recoverySafe: Boolean(
               row?.operations_print_agent_pairing_recovery_applied,
             ),
+            deliveryOutcomeFence: row?.operations_print_outcome_uncertain_fence_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
@@ -5822,6 +5879,7 @@ export async function GET() {
           || !row?.operations_print_device_reference_privacy_applied
           || !row?.operations_print_agent_pairing_grants_applied
           || !row?.operations_print_agent_pairing_recovery_applied
+          || !row?.operations_print_outcome_uncertain_fence_applied
           || !row?.shopify_carrier_configured_carriers_applied
           || !row?.shopify_checkout_audience_policy_applied
           || !row?.carrier_shipping_diagnostics_applied

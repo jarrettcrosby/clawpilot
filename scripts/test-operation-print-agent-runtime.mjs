@@ -1402,7 +1402,7 @@ async function verifyRuntime(connectionString) {
          $6, $7::text[], $8::text[],
          $9::text[], 'redeemed', $10,
          $11, $12, clock_timestamp() - interval '2 minutes',
-         clock_timestamp() + interval '8 minutes',
+         clock_timestamp() + interval '7 minutes 59 seconds',
          clock_timestamp() - interval '1 minute', $4::uuid, $13, $14
        )`,
       [
@@ -1733,6 +1733,8 @@ async function verifyRuntime(connectionString) {
     assert.equal(primaryClaim.length, 1)
     assert.equal(primaryClaim[0].globalId, queued.globalId)
     assert.equal(primaryClaim[0].document.media, 'letter')
+    assert.ok(Number.isFinite(Date.parse(primaryClaim[0].serverNow)))
+    assert.ok(Date.parse(primaryClaim[0].claimExpiresAt) > Date.parse(primaryClaim[0].serverNow))
     const duplicatePrimaryClaim = await persistence.claimOperationsPrintJobsInPostgres({
       agent: primaryAgent,
       idempotencyKey: `primary-claim-${fixture.suffix}`,
@@ -1746,6 +1748,20 @@ async function verifyRuntime(connectionString) {
       primaryClaim[0].claimToken,
     )
 
+    await expectRejected(
+      () => persistence.failOperationsPrintJobInPostgres({
+        agent: primaryAgent,
+        jobGlobalId: queued.globalId,
+        claimToken: primaryClaim[0].claimToken,
+        idempotencyKey: `invalid-uncertain-retry-${fixture.suffix}`,
+        errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+        errorMessage: 'A buggy agent asked to retry an uncertain physical result',
+        retryable: true,
+        printerUnavailable: true,
+        retryAfterSeconds: 30,
+      }),
+      /terminal and may not be retried automatically/,
+    )
     const failed = await persistence.failOperationsPrintJobInPostgres({
       agent: primaryAgent,
       jobGlobalId: queued.globalId,
@@ -2300,6 +2316,27 @@ async function verifyRuntime(connectionString) {
       /not authorized to release sandbox label bytes/,
     )
     await restoreManagedConnection()
+    await expectRejected(
+      () => persistence.rotateOperationsPrintAgentCredentialInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: primaryEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+        idempotencyKey: `rotate-with-active-claim-${fixture.suffix}`,
+      }),
+      /current print claim to finish or resolve it before rotating/,
+    )
+    const resolvedManagedClaim = await persistence.failOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: managedClaim[0].globalId,
+      claimToken: managedClaim[0].claimToken,
+      idempotencyKey: `managed-claim-resolved-before-rotation-${fixture.suffix}`,
+      errorCode: 'TEST_FAILURE',
+      errorMessage: 'No bytes were sent during the authorization drift test',
+      retryable: false,
+      printerUnavailable: false,
+      retryAfterSeconds: 0,
+    })
+    assert.equal(resolvedManagedClaim.status, 'failed')
 
     const retryLabel = await seedRateTestLabel(
       pool,
@@ -2623,6 +2660,18 @@ async function verifyRuntime(connectionString) {
       },
     })
     assert.equal(revokedJob.status, 'queued')
+    const revokedAgentContext = await persistence.authenticateOperationsPrintAgentInPostgres(
+      revokedEnrollment.credential,
+    )
+    const revokedClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: revokedAgentContext,
+      idempotencyKey: `revoked-route-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(revokedClaim.length, 1)
+    assert.equal(revokedClaim[0].globalId, revokedJob.globalId)
     await persistence.revokeOperationsPrintAgentInPostgres({
       organizationId: fixture.organizationId,
       printAgentGlobalId: revokedEnrollment.agent.globalId,
@@ -2634,6 +2683,125 @@ async function verifyRuntime(connectionString) {
       ),
       null,
     )
+
+    const legacyRevokedEnrollment = await persistence.enrollOperationsPrintAgentInPostgres({
+      organizationId: fixture.organizationId,
+      warehouseId: fixture.warehouseId,
+      name: 'Rolling-upgrade revoked print agent',
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `legacy-revoked-agent-${fixture.suffix}`,
+      ...packingCapabilities,
+    })
+    const legacyRevokedPrinter = await createPrinter(pool, fixture, {
+      code: `LEGACY-REVOKED-${fixture.suffix}`,
+      name: 'Rolling-upgrade revoked printer',
+      priority: 71,
+      agentId: legacyRevokedEnrollment.agent.id,
+      isDefault: false,
+    })
+    const legacyRevokedContent = `legacy-revoked-route-${fixture.suffix}`
+    const legacyRevokedJob = await persistence.enqueueOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `legacy-revoked-route-${fixture.suffix}`,
+      warehouseId: fixture.warehouseId,
+      preferredPrinterGlobalId: legacyRevokedPrinter.global_id,
+      maxAttempts: 3,
+      document: {
+        type: 'packing_slip',
+        format: 'PDF',
+        media: 'letter',
+        contentSha256: createHash('sha256').update(legacyRevokedContent).digest('hex'),
+        byteLength: Buffer.byteLength(legacyRevokedContent),
+        storageReference: `clawpilot-document:legacy-revoked-route-${fixture.suffix}`,
+        sourceOrderGlobalId: printSource.order.global_id,
+      },
+    })
+    const legacyRevokedAgentContext =
+      await persistence.authenticateOperationsPrintAgentInPostgres(
+        legacyRevokedEnrollment.credential,
+      )
+    const legacyRevokedClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: legacyRevokedAgentContext,
+      idempotencyKey: `legacy-revoked-route-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(legacyRevokedClaim.length, 1)
+    assert.equal(legacyRevokedClaim[0].globalId, legacyRevokedJob.globalId)
+    // Reproduce a pre-fix/rolling-upgrade state: the agent and printer were
+    // revoked/unbound but the job projection was left claimed.
+    await pool.query(
+      `UPDATE operations_printers
+       SET local_print_agent_id = NULL,
+           status = 'offline',
+           row_version = row_version + 1,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, legacyRevokedPrinter.id],
+    )
+    await pool.query(
+      `UPDATE operations_print_agents
+       SET status = 'revoked',
+           revoked_by = $3,
+           revoked_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, legacyRevokedEnrollment.agent.id, fixture.actorEmail],
+    )
+    const repairedLegacyRevocation =
+      await persistence.revokeOperationsPrintAgentInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: legacyRevokedEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+      })
+    assert.equal(repairedLegacyRevocation.status, 'revoked')
+    const replayedLegacyRevocation =
+      await persistence.revokeOperationsPrintAgentInPostgres({
+        organizationId: fixture.organizationId,
+        printAgentGlobalId: legacyRevokedEnrollment.agent.globalId,
+        actorEmail: fixture.actorEmail,
+      })
+    assert.equal(replayedLegacyRevocation.status, 'revoked')
+    const repairedLegacyClaim = await insertReturning(
+      pool,
+      `SELECT
+         job.status,
+         job.claimed_by_print_agent_id::text,
+         job.current_claim_attempt_id::text,
+         job.claim_expires_at,
+         latest.error_code,
+         count(*) FILTER (
+           WHERE attempt.error_code = 'PRINT_OUTCOME_UNCERTAIN'
+         )::integer AS uncertain_attempts
+       FROM operations_print_jobs job
+       JOIN LATERAL (
+         SELECT latest_attempt.error_code
+         FROM operations_print_delivery_attempts latest_attempt
+         WHERE latest_attempt.organization_id = job.organization_id
+           AND latest_attempt.print_job_id = job.id
+         ORDER BY latest_attempt.sequence_number DESC
+         LIMIT 1
+       ) latest ON true
+       JOIN operations_print_delivery_attempts attempt
+         ON attempt.organization_id = job.organization_id
+        AND attempt.print_job_id = job.id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = $2
+       GROUP BY job.id, latest.error_code`,
+      [fixture.organizationId, legacyRevokedJob.globalId],
+    )
+    assert.deepEqual(repairedLegacyClaim, {
+      status: 'failed',
+      claimed_by_print_agent_id: null,
+      current_claim_attempt_id: null,
+      claim_expires_at: null,
+      error_code: 'PRINT_OUTCOME_UNCERTAIN',
+      uncertain_attempts: 1,
+    })
+
     const workspace = await persistence.readOperationsPrintJobWorkspaceFromPostgres({
       organizationId: fixture.organizationId,
       canView: true,
@@ -2666,8 +2834,22 @@ async function verifyRuntime(connectionString) {
     assert.equal(persistedRevokedJob.status, 'failed')
     assert.equal(
       persistedRevokedJob.attemptHistory.at(-1).errorCode,
-      'PRINT_ROUTE_UNAVAILABLE',
+      'PRINT_OUTCOME_UNCERTAIN',
     )
+    assert.equal(persistedRevokedJob.claimExpiresAt, null)
+    assert.deepEqual(
+      persistedRevokedJob.attemptHistory.map((attempt) => attempt.state),
+      ['queued', 'claimed', 'failed'],
+    )
+    const lingeringRevokedClaims = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_print_jobs
+       WHERE organization_id = $1::uuid
+         AND status = 'claimed'
+         AND claimed_by_print_agent_id = $2::uuid`,
+      [fixture.organizationId, revokedEnrollment.agent.id],
+    )
+    assert.equal(lingeringRevokedClaims.rows[0].count, 0)
     const revokedPrinterState = await insertReturning(
       pool,
       `SELECT status, local_print_agent_id
@@ -2747,14 +2929,12 @@ async function verifyRuntime(connectionString) {
       rerouteAudit.payload.sourceShipmentGlobalId,
       printSource.shipment.global_id,
     )
-    const routeUnavailableAudit = auditCalls.find((event) => (
-      event.eventType === 'operations.print_job.route_unavailable'
+    const revokedOutcomeAudit = auditCalls.find((event) => (
+      event.eventType === 'operations.print_job.outcome_uncertain'
       && event.aggregateId === revokedJob.globalId
     ))
-    assert.equal(
-      routeUnavailableAudit.payload.sourceOrderGlobalId,
-      printSource.order.global_id,
-    )
+    assert.equal(revokedOutcomeAudit.payload.errorCode, 'PRINT_OUTCOME_UNCERTAIN')
+    assert.equal(revokedOutcomeAudit.payload.automaticRetryBlocked, true)
     assert.ok(!JSON.stringify(auditCalls).includes(content))
   } finally {
     await pool.end()

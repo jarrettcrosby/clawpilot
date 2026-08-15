@@ -256,6 +256,7 @@ type RateTestLabelPrintAuthorizationRow = {
 
 type PrintClaimRow = {
   claim_token: string
+  server_now: TimestampValue
   claim_expires_at: TimestampValue
   attempt_number: number
   global_id: string
@@ -2527,6 +2528,23 @@ export async function rotateOperationsPrintAgentCredentialInPostgres(input: {
         409,
       )
     }
+    const activeClaim = await client.query(
+      `SELECT 1
+       FROM operations_print_jobs
+       WHERE organization_id = $1::uuid
+         AND status = 'claimed'
+         AND claimed_by_print_agent_id = $2::uuid
+       LIMIT 1
+       FOR UPDATE`,
+      [organizationId, current.rows[0].id],
+    )
+    if (activeClaim.rows[0]) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CLAIM_ACTIVE',
+        'Wait for the current print claim to finish or resolve it before rotating this credential',
+        409,
+      )
+    }
     const generated = createOperationsPrintAgentCredential(current.rows[0].id)
     await client.query(
       `UPDATE operations_print_agents
@@ -2599,6 +2617,75 @@ export async function revokeOperationsPrintAgentInPostgres(input: {
         'Local print agent was not found',
         404,
       )
+    }
+    // Sweep unresolved claims even when this is an idempotent replay against
+    // an already-revoked agent. That repairs pre-fix/rolling-deploy rows which
+    // would otherwise remain claimed forever after their only credential was
+    // revoked.
+    const activeClaims = await client.query<{
+        id: string
+        global_id: string
+        printer_id: string
+        current_claim_attempt_id: string
+      }>(
+        `SELECT
+           job.id::text,
+           job.global_id,
+           job.printer_id::text,
+           job.current_claim_attempt_id::text
+         FROM operations_print_jobs job
+         WHERE job.organization_id = $1::uuid
+           AND job.status = 'claimed'
+           AND job.claimed_by_print_agent_id = $2::uuid
+         ORDER BY job.id
+         FOR UPDATE OF job`,
+        [organizationId, current.rows[0].id],
+      )
+    for (const claim of activeClaims.rows) {
+        const idempotencyKey = `print-agent:revoke:${input.printAgentGlobalId}:uncertain:${claim.current_claim_attempt_id}`
+        const requestFingerprint = fingerprint({
+          action: 'revoke-print-agent-claim-outcome-uncertain',
+          printAgentGlobalId: input.printAgentGlobalId,
+          printJobGlobalId: claim.global_id,
+          claimToken: claim.current_claim_attempt_id,
+        })
+        await client.query(
+          `INSERT INTO operations_print_delivery_attempts (
+             organization_id, print_job_id, printer_id,
+             state, actor_type, claim_attempt_id,
+             idempotency_key, request_fingerprint,
+             error_code, error_message
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid,
+             'failed', 'system', $4::uuid,
+             $5, $6,
+             'PRINT_OUTCOME_UNCERTAIN',
+             'Print agent was revoked while this claim was unresolved; automatic retry is blocked'
+           )`,
+          [
+            organizationId,
+            claim.id,
+            claim.printer_id,
+            claim.current_claim_attempt_id,
+            idempotencyKey,
+            requestFingerprint,
+          ],
+        )
+        await recordAuditEvent({
+          actor: actorEmail,
+          eventType: 'operations.print_job.outcome_uncertain',
+          aggregateType: 'operations.print_job',
+          aggregateId: claim.global_id,
+          eventKey: `operations:print-job:agent-revoked:${claim.current_claim_attempt_id}`,
+          organizationId,
+          payload: {
+            printJobGlobalId: claim.global_id,
+            printAgentGlobalId: input.printAgentGlobalId,
+            claimToken: claim.current_claim_attempt_id,
+            errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+            automaticRetryBlocked: true,
+          },
+        }, client)
     }
     if (current.rows[0].status === 'active') {
       await client.query(
@@ -4494,6 +4581,7 @@ async function claimedJobs(
   const result = await client.query<PrintClaimRow>(
     `SELECT
        attempt.id::text AS claim_token,
+       clock_timestamp() AS server_now,
        attempt.claim_expires_at,
        attempt.attempt_number,
        job.global_id,
@@ -4590,6 +4678,7 @@ async function claimedJobs(
     return {
       globalId: row.global_id,
       claimToken: row.claim_token,
+      serverNow: iso(row.server_now) as string,
       claimExpiresAt: iso(row.claim_expires_at) as string,
       document: {
         globalId: row.artifact_global_id,
@@ -5084,6 +5173,20 @@ export async function failOperationsPrintJobInPostgres(input: {
     )
   }
   const idempotencyKey = `print-agent:${input.agent.globalId}:fail:${callerKey}`
+  if (
+    errorCode === 'PRINT_OUTCOME_UNCERTAIN'
+    && (
+      input.retryable === true
+      || input.printerUnavailable === true
+      || Number(input.retryAfterSeconds) !== 0
+    )
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
+      'An uncertain physical print outcome is terminal and may not be retried automatically',
+      409,
+    )
+  }
   const requestFingerprint = fingerprint({
     action: 'fail',
     jobGlobalId: input.jobGlobalId,

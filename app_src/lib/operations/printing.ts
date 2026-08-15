@@ -283,6 +283,7 @@ export type OperationsPrintAgentContext = {
 export type OperationsPrintClaimJob = {
   globalId: string
   claimToken: string
+  serverNow: string
   claimExpiresAt: string
   document: {
     globalId: string
