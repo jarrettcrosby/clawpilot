@@ -218,15 +218,19 @@ async function verifyActivationRunConcurrency(pool, fixture) {
     })
     await activationClient.query('BEGIN')
     let activationSettled = false
-    const activationAttempt = activationClient.query(
-      `UPDATE operations_activation_scopes
-       SET state = 'active', revision = revision + 1,
-           updated_by = $2, updated_at = now()
-       WHERE organization_id = $1::uuid`,
-      [fixture.organizationId, actorEmail],
-    ).finally(() => {
-      activationSettled = true
-    })
+    const activationAttempt = rejected(
+      activationClient.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'active', revision = revision + 1,
+             updated_by = $2, updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [fixture.organizationId, actorEmail],
+      ).finally(() => {
+        activationSettled = true
+      }),
+      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
+      'A committed training run must win over a concurrent Active transition',
+    )
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
     assert.equal(
       activationSettled,
@@ -234,11 +238,7 @@ async function verifyActivationRunConcurrency(pool, fixture) {
       'Active transition must wait for the concurrent training authorization lock',
     )
     await runClient.query('COMMIT')
-    await rejected(
-      activationAttempt,
-      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-      'A committed training run must win over a concurrent Active transition',
-    )
+    await activationAttempt
     await activationClient.query('ROLLBACK')
   } finally {
     await runClient.query('ROLLBACK').catch(() => undefined)
@@ -267,12 +267,16 @@ async function verifyActivationRunConcurrency(pool, fixture) {
     )
     await blockedRunClient.query('BEGIN')
     let runSettled = false
-    const runAttempt = insertRun(blockedRunClient, fixture, {
-      generation: 21,
-      idempotencyKey: 'shadow-training-concurrent-active-first',
-    }).finally(() => {
-      runSettled = true
-    })
+    const runAttempt = rejected(
+      insertRun(blockedRunClient, fixture, {
+        generation: 21,
+        idempotencyKey: 'shadow-training-concurrent-active-first',
+      }).finally(() => {
+        runSettled = true
+      }),
+      /Shadow training authorization requires/u,
+      'A committed Active transition must win over a concurrent training authorization',
+    )
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
     assert.equal(
       runSettled,
@@ -280,11 +284,7 @@ async function verifyActivationRunConcurrency(pool, fixture) {
       'Training authorization must wait for the concurrent activation lock',
     )
     await activeFirstClient.query('COMMIT')
-    await rejected(
-      runAttempt,
-      /Shadow training authorization requires/u,
-      'A committed Active transition must win over a concurrent training authorization',
-    )
+    await runAttempt
     await blockedRunClient.query('ROLLBACK')
   } finally {
     await activeFirstClient.query('ROLLBACK').catch(() => undefined)
