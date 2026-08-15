@@ -775,6 +775,10 @@ async function verifyDisposablePostgres() {
             },
           },
           '@/lib/integrations/commerceCapabilities': capabilityCatalog,
+          '@/lib/persistence/operationShadowTraining': {
+            assertNoOpenOperationsShadowTrainingRunsForActivation:
+              async () => {},
+          },
           '@/lib/persistence/postgres': postgresMock,
         },
       },
