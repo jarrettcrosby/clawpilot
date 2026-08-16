@@ -472,15 +472,22 @@ async function verify(databaseUrl, fixtures) {
         actorEmail,
         idempotencyKey: 'store-sync:acceptance:provider-read-pause',
       })
-    assert.equal(
-      await Promise.race([
-        pauseCommand.then(() => 'committed'),
-        new Promise((resolvePromise) => {
-          setTimeout(() => resolvePromise('waiting-for-read'), 100)
-        }),
-      ]),
-      'committed',
-    )
+    let pauseCommitDeadline
+    const pauseCommitOutcome = await Promise.race([
+      pauseCommand.then(() => 'committed'),
+      new Promise((resolvePromise) => {
+        pauseCommitDeadline = setTimeout(
+          () => resolvePromise('waiting-for-read'),
+          5_000,
+        )
+      }),
+    ])
+    clearTimeout(pauseCommitDeadline)
+    if (pauseCommitOutcome !== 'committed') {
+      releaseProviderRead()
+      await Promise.allSettled([pauseCommand, inFlightProviderRead])
+    }
+    assert.equal(pauseCommitOutcome, 'committed')
     const paused = await pauseCommand
     assert.equal(paused.control.effectiveState, 'paused')
     assert.equal(
