@@ -59,4 +59,5 @@ test('Windows worker lifetime uses the native supervisor and kill-on-close job',
     '../scripts/build-windows-lock-helper.mjs',
   ), 'utf8')
   assert.match(buildSource, /'\/MT'/)
+  assert.match(buildSource, /windowsVerbatimArguments:\s*true/)
 })

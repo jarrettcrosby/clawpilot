@@ -56,6 +56,11 @@ const result = spawnSync('cmd.exe', ['/d', '/s', '/c', command], {
   cwd: outputDirectory,
   encoding: 'utf8',
   stdio: ['ignore', 'pipe', 'pipe'],
+  // The command already contains the exact quoting required by cmd.exe for
+  // VsDevCmd.bat and the source/output paths. Node's default Windows argument
+  // quoting escapes those embedded quotes, causing cmd to look for a literal
+  // executable whose name begins with a quote on hosted runners.
+  windowsVerbatimArguments: true,
 })
 if (result.error || result.status !== 0) {
   process.stderr.write(`${result.stdout || ''}${result.stderr || ''}`)

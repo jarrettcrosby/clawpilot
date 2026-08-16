@@ -28,6 +28,7 @@ const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-packaged-runtime
 const credential = `cpprint.v1.00000000-0000-4000-8000-000000000001.${'A'.repeat(43)}`
 const zpl = '^XA^FO20,20^FDClawPilot packaged worker smoke^FS^XZ'
 const actions = []
+const requests = []
 const printerBytes = []
 const smokeTimeoutMs = 30_000
 
@@ -44,6 +45,7 @@ const api = http.createServer((request, response) => {
     assert.equal(request.headers.authorization, `Bearer ${credential}`)
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
     actions.push(body.action)
+    requests.push(body)
     const payload = body.action === 'claim' ? {
       ok: true,
       jobs: [{
@@ -115,7 +117,17 @@ try {
     0,
     `Packaged worker failed or timed out (${signal || 'no signal'}): ${Buffer.concat(stderr).toString('utf8')}`,
   )
-  assert.deepEqual(actions, ['claim', 'acknowledge'])
+  const diagnostic = () => JSON.stringify({
+    requests,
+    stdout: Buffer.concat(stdout).toString('utf8'),
+    stderr: Buffer.concat(stderr).toString('utf8'),
+    ledger: JSON.parse(readFileSync(path.join(temporary, 'claim-ledger.json'), 'utf8')),
+  })
+  assert.deepEqual(
+    actions,
+    ['claim', 'acknowledge'],
+    `Packaged worker did not acknowledge the exact smoke claim: ${diagnostic()}`,
+  )
   assert.equal(Buffer.concat(printerBytes).toString('utf8'), zpl)
   const ledger = JSON.parse(readFileSync(path.join(temporary, 'claim-ledger.json'), 'utf8'))
   assert.equal(Object.values(ledger.deliveries)[0].state, 'acknowledged')
