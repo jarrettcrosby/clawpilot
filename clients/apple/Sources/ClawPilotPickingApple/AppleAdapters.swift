@@ -686,6 +686,162 @@ public struct ManagerOrderSummary: Decodable, Equatable, Identifiable, Sendable 
     }
 }
 
+public struct ManagerOperationsCapabilities: Decodable, Equatable, Sendable {
+    public let canActivate: Bool
+}
+
+public enum ManagerStoreSyncDesiredState: String, Codable, Equatable, Sendable {
+    case running
+    case paused
+}
+
+public enum ManagerStoreSyncEffectiveState: String, Decodable, Equatable, Sendable {
+    case running
+    case paused
+}
+
+public enum ManagerStoreSyncEffectiveReason: String, Decodable, Equatable, Sendable {
+    case operationsDisabledOverride = "OPERATIONS_DISABLED_OVERRIDE"
+    case operationsFrozenOverride = "OPERATIONS_FROZEN_OVERRIDE"
+    case controlMissing = "STORE_SYNC_CONTROL_MISSING"
+    case accountUnavailable = "STORE_SYNC_ACCOUNT_UNAVAILABLE"
+    case explicitRunning = "STORE_SYNC_EXPLICIT_RUNNING"
+    case explicitPausedDraining = "STORE_SYNC_EXPLICIT_PAUSED_DRAINING"
+    case explicitPaused = "STORE_SYNC_EXPLICIT_PAUSED"
+    case legacyShadowRunning = "STORE_SYNC_LEGACY_SHADOW_RUNNING"
+    case legacyActiveRunning = "STORE_SYNC_LEGACY_ACTIVE_RUNNING"
+    case legacyReadOnlyPaused = "STORE_SYNC_LEGACY_READ_ONLY_PAUSED"
+
+    public var expectedState: ManagerStoreSyncEffectiveState {
+        switch self {
+        case .explicitRunning, .legacyShadowRunning, .legacyActiveRunning:
+            .running
+        default:
+            .paused
+        }
+    }
+}
+
+public struct ManagerStoreSyncControl: Decodable, Equatable, Identifiable, Sendable {
+    public let accountGlobalId: String
+    public let provider: String
+    public let environment: String
+    public let displayName: String
+    public let accountStatus: String
+    public let desiredState: ManagerStoreSyncDesiredState
+    public let effectiveState: ManagerStoreSyncEffectiveState
+    public let effectiveReason: ManagerStoreSyncEffectiveReason
+    public let effectiveReasonLabel: String
+    public let explicitChoice: Bool
+    public let revision: Int
+    public let reason: String
+    public let updatedAt: String
+
+    public var id: String { accountGlobalId }
+
+    public var isContractValid: Bool {
+        accountGlobalId.range(
+            of: #"^gia(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil
+            && ["shopify", "faire"].contains(provider)
+            && ["mock", "sandbox", "production"].contains(environment)
+            && ["active", "disabled", "error"].contains(accountStatus)
+            && effectiveState == effectiveReason.expectedState
+            && revision >= 1
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !effectiveReasonLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+public struct ManagerOperationsOverview: Equatable, Sendable {
+    public let orders: [ManagerOrderSummary]
+    public let storeSync: [ManagerStoreSyncControl]
+    public let capabilities: ManagerOperationsCapabilities
+}
+
+public enum ManagerStoreSyncClientError: Error, Equatable, Sendable {
+    case invalidControl
+    case invalidReason
+    case invalidIdempotencyKey
+    case mismatchedResponse
+}
+
+extension ManagerStoreSyncClientError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidControl:
+            "Refresh the exact Store sync control before changing it."
+        case .invalidReason:
+            "Enter a readable Store sync reason between 1 and 500 characters."
+        case .invalidIdempotencyKey:
+            "The Store sync retry identity is invalid."
+        case .mismatchedResponse:
+            "ClawPilot returned Store sync evidence that did not match the reviewed change."
+        }
+    }
+}
+
+public struct ManagerStoreSyncCommand: Encodable, Equatable, Sendable {
+    public let action = "update-commerce-store-sync"
+    public let accountGlobalId: String
+    public let desiredState: ManagerStoreSyncDesiredState
+    public let expectedDesiredState: ManagerStoreSyncDesiredState
+    public let expectedRevision: Int
+    public let reason: String
+    public let idempotencyKey: String
+
+    public init(
+        control: ManagerStoreSyncControl,
+        desiredState: ManagerStoreSyncDesiredState,
+        reason: String,
+        idempotencyKey: String = "store-sync:\(UUID().uuidString.lowercased())"
+    ) throws {
+        guard control.isContractValid else {
+            throw ManagerStoreSyncClientError.invalidControl
+        }
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedReason.isEmpty,
+              normalizedReason.count <= 500,
+              normalizedReason.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ManagerStoreSyncClientError.invalidReason
+        }
+        guard idempotencyKey.range(
+            of: #"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$"#,
+            options: .regularExpression
+        ) != nil else {
+            throw ManagerStoreSyncClientError.invalidIdempotencyKey
+        }
+        self.accountGlobalId = control.accountGlobalId
+        self.desiredState = desiredState
+        expectedDesiredState = control.desiredState
+        expectedRevision = control.revision
+        self.reason = normalizedReason
+        self.idempotencyKey = idempotencyKey
+    }
+}
+
+public struct ManagerStoreSyncUpdateResult: Decodable, Equatable, Sendable {
+    public let control: ManagerStoreSyncControl
+
+    public func validated(
+        for command: ManagerStoreSyncCommand
+    ) throws -> ManagerStoreSyncControl {
+        guard control.isContractValid,
+              control.accountGlobalId == command.accountGlobalId,
+              control.desiredState == command.desiredState,
+              control.explicitChoice,
+              control.revision == command.expectedRevision + 1,
+              control.reason == command.reason else {
+            throw ManagerStoreSyncClientError.mismatchedResponse
+        }
+        return control
+    }
+}
+
 public struct ManagerOrderActionAvailability: Decodable, Equatable, Sendable {
     public let action: String
     public let label: String
@@ -1477,10 +1633,19 @@ public actor PickingAPIClient {
         struct Workspace: Decodable {
             let orders: [ManagerOrderSummary]
             let selectedOrder: ManagerOrderDetail?
+            let storeSync: [ManagerStoreSyncControl]?
+            let capabilities: ManagerOperationsCapabilities?
         }
 
         let ok: Bool
         let operations: Workspace?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerStoreSyncEnvelope: Decodable {
+        let ok: Bool
+        let result: ManagerStoreSyncUpdateResult?
         let code: String?
         let error: String?
     }
@@ -1548,6 +1713,15 @@ public actor PickingAPIClient {
         let reason: String
     }
 
+    private struct ManagerStoreSyncBody: Encodable {
+        let action: String
+        let accountGlobalId: String
+        let desiredState: ManagerStoreSyncDesiredState
+        let expectedDesiredState: ManagerStoreSyncDesiredState
+        let expectedRevision: Int
+        let reason: String
+    }
+
     private struct ConfirmBody: Encodable {
         let action: String
         let orderGlobalId: String
@@ -1600,6 +1774,7 @@ public actor PickingAPIClient {
             HTTPCookieStorage.shared.cookieAcceptPolicy = .always
             self.session = URLSession(configuration: configuration)
         }
+        encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .clawPilotFractionalISO8601
         decoder.dateDecodingStrategy = .iso8601
     }
@@ -1857,6 +2032,83 @@ public actor PickingAPIClient {
             )
         }
         return operations.orders
+    }
+
+    public func fetchManagerOperations() async throws -> ManagerOperationsOverview {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
+        guard envelope.ok,
+              let operations = envelope.operations,
+              let controls = operations.storeSync,
+              let capabilities = operations.capabilities,
+              controls.allSatisfy(\.isContractValid),
+              Set(controls.map(\.accountGlobalId)).count == controls.count else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_MANAGER_FAILED",
+                message: envelope.error ?? "Manager Operations controls are unavailable"
+            )
+        }
+        return ManagerOperationsOverview(
+            orders: operations.orders,
+            storeSync: controls,
+            capabilities: capabilities
+        )
+    }
+
+    public func updateManagerStoreSync(
+        _ command: ManagerStoreSyncCommand
+    ) async throws -> ManagerStoreSyncControl {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ManagerStoreSyncBody(
+            action: command.action,
+            accountGlobalId: command.accountGlobalId,
+            desiredState: command.desiredState,
+            expectedDesiredState: command.expectedDesiredState,
+            expectedRevision: command.expectedRevision,
+            reason: command.reason
+        ))
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(ManagerStoreSyncEnvelope.self, from: data)
+        if http.statusCode == 409 {
+            throw PickingAPIError.conflict(
+                code: envelope?.code ?? "COMMERCE_STORE_SYNC_REVISION_CONFLICT",
+                message: envelope?.error
+                    ?? "Store sync changed after it was reviewed. Refresh and choose again."
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            if http.statusCode == 429 {
+                let seconds = Int(
+                    http.value(forHTTPHeaderField: "Retry-After") ?? ""
+                ) ?? 60
+                throw PickingAPIError.rateLimited(
+                    retryAfterSeconds: max(1, seconds)
+                )
+            }
+            if let envelope {
+                throw PickingAPIError.rejected(
+                    code: envelope.code ?? "COMMERCE_STORE_SYNC_UPDATE_FAILED",
+                    message: envelope.error ?? "Store sync was not changed"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return try result.validated(for: command)
     }
 
     public func fetchManagerOrderDetail(_ orderGlobalId: String) async throws -> ManagerOrderDetail {

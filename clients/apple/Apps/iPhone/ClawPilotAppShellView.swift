@@ -11,6 +11,7 @@ private enum AppShellTheme {
     static let primary = Color(red: 168 / 255, green: 199 / 255, blue: 250 / 255)
     static let primaryText = Color(red: 0 / 255, green: 29 / 255, blue: 54 / 255)
     static let mint = Color(red: 79 / 255, green: 209 / 255, blue: 184 / 255)
+    static let amber = Color(red: 255 / 255, green: 184 / 255, blue: 77 / 255)
     static let text = Color(red: 228 / 255, green: 225 / 255, blue: 236 / 255)
     static let muted = Color(red: 202 / 255, green: 196 / 255, blue: 208 / 255)
 }
@@ -679,13 +680,99 @@ private struct ManagerModuleView: View {
     }
 }
 
+private struct ManagerStoreSyncPrompt: Identifiable {
+    let control: ManagerStoreSyncControl
+    let desiredState: ManagerStoreSyncDesiredState
+
+    var id: String { "\(control.accountGlobalId):\(desiredState.rawValue)" }
+}
+
+private struct ManagerStoreSyncConfirmationView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: PickingPhoneModel
+    let prompt: ManagerStoreSyncPrompt
+    @State private var reason = ""
+
+    private var normalizedReason: String {
+        reason.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Reviewed connection") {
+                    LabeledContent("Connection", value: prompt.control.displayName)
+                    LabeledContent(
+                        "Current desired",
+                        value: prompt.control.desiredState == .running
+                            ? "Running" : "Paused"
+                    )
+                    LabeledContent(
+                        "New desired",
+                        value: prompt.desiredState == .running
+                            ? "Running" : "Paused"
+                    )
+                    LabeledContent(
+                        "Current effective",
+                        value: prompt.control.effectiveState == .running
+                            ? "Running" : "Paused"
+                    )
+                }
+
+                Section("Required reason") {
+                    TextField(
+                        "Why should automatic Store sync change?",
+                        text: $reason,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...6)
+                    Text("Desired and Effective stay separate. Disabled or Frozen can still pause execution and will show the exact reason.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button(
+                        prompt.desiredState == .running
+                            ? "Confirm Running" : "Confirm Paused"
+                    ) {
+                        Task {
+                            if await model.updateManagerStoreSync(
+                                control: prompt.control,
+                                desiredState: prompt.desiredState,
+                                reason: normalizedReason
+                            ) {
+                                dismiss()
+                            }
+                        }
+                    }
+                    .disabled(
+                        normalizedReason.isEmpty
+                        || normalizedReason.count > 500
+                        || model.isManagerStoreSyncBusy
+                    )
+                }
+            }
+            .navigationTitle("Store sync")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 private struct ManagerPickingOperationsView: View {
     @ObservedObject var model: PickingPhoneModel
+    @State private var storeSyncPrompt: ManagerStoreSyncPrompt?
 
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 13) {
                 WorkspaceSwitcherCard(model: model, compact: true)
+                storeSyncControls
                 currentAssignments
                 completedPickHistory
                 pickerPerformance
@@ -746,6 +833,165 @@ private struct ManagerPickingOperationsView: View {
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
+        .sheet(item: $storeSyncPrompt) { prompt in
+            ManagerStoreSyncConfirmationView(model: model, prompt: prompt)
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
+        }
+    }
+
+    private var storeSyncControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Store sync")
+                        .font(.headline)
+                        .foregroundStyle(AppShellTheme.text)
+                    Text("Automatic store catalog, order, image, and inventory mirroring")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                if model.isManagerStoreSyncBusy {
+                    ProgressView().tint(AppShellTheme.primary)
+                }
+            }
+
+            if model.managerStoreSyncControls.isEmpty {
+                Text("No Shopify or Faire connections expose a Store sync control in this organization.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppShellTheme.muted)
+            } else {
+                ForEach(model.managerStoreSyncControls) { control in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(control.displayName)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(AppShellTheme.text)
+                                Text("\(control.provider.capitalized) · \(control.environment.capitalized) · \(control.accountStatus.capitalized)")
+                                    .font(.caption)
+                                    .foregroundStyle(AppShellTheme.muted)
+                            }
+                            Spacer()
+                            Text("v\(control.revision)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(AppShellTheme.muted)
+                        }
+
+                        HStack(spacing: 8) {
+                            storeSyncBadge(
+                                label: "Desired",
+                                value: control.desiredState == .running ? "Running" : "Paused",
+                                active: control.desiredState == .running
+                            )
+                            storeSyncBadge(
+                                label: "Effective",
+                                value: control.effectiveState == .running ? "Running" : "Paused",
+                                active: control.effectiveState == .running
+                            )
+                        }
+
+                        Text(control.effectiveReasonLabel)
+                            .font(.caption)
+                            .foregroundStyle(
+                                control.effectiveState == .running
+                                    ? AppShellTheme.mint
+                                    : AppShellTheme.muted
+                            )
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if control.explicitChoice == false {
+                            Text("Confirm Running or Paused once to make this connection independent from the legacy Advanced safety default.")
+                                .font(.caption)
+                                .foregroundStyle(AppShellTheme.amber)
+                        }
+
+                        if model.canManageStoreSync {
+                            HStack(spacing: 10) {
+                                Button(control.desiredState == .running && !control.explicitChoice
+                                    ? "Confirm Running"
+                                    : "Run") {
+                                    storeSyncPrompt = ManagerStoreSyncPrompt(
+                                        control: control,
+                                        desiredState: .running
+                                    )
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(
+                                    model.isManagerStoreSyncBusy
+                                    || (control.explicitChoice
+                                        && control.desiredState == .running)
+                                )
+
+                                Button("Pause") {
+                                    storeSyncPrompt = ManagerStoreSyncPrompt(
+                                        control: control,
+                                        desiredState: .paused
+                                    )
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(
+                                    model.isManagerStoreSyncBusy
+                                    || (control.explicitChoice
+                                        && control.desiredState == .paused)
+                                )
+                            }
+                        } else {
+                            Text("View only. An organization owner or authorized administrator can change Store sync.")
+                                .font(.caption)
+                                .foregroundStyle(AppShellTheme.muted)
+                        }
+                    }
+                    .padding(12)
+                    .background(
+                        AppShellTheme.canvas.opacity(0.6),
+                        in: RoundedRectangle(cornerRadius: 14)
+                    )
+                }
+            }
+
+            if model.hasPendingManagerStoreSyncChange {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.managerStoreSyncStatus
+                        ?? "The exact Store sync change is saved for retry.")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.amber)
+                    Button("Retry exact saved change") {
+                        Task { _ = await model.retryPendingManagerStoreSyncChange() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isManagerStoreSyncBusy)
+                }
+            } else if let status = model.managerStoreSyncStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func storeSyncBadge(
+        label: String,
+        value: String,
+        active: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.semibold))
+            Text(value)
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(active ? AppShellTheme.mint : AppShellTheme.muted)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            (active ? AppShellTheme.mint : AppShellTheme.muted).opacity(0.1),
+            in: RoundedRectangle(cornerRadius: 10)
+        )
     }
 
     private var currentAssignments: some View {

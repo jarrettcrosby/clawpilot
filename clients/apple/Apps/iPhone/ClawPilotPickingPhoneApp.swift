@@ -97,6 +97,11 @@ final class PickingPhoneModel: ObservableObject {
     @Published var workspaceStatus = "Orders, assigned picks, people, and UPH follow this organization."
     @Published var sessionProfile: ClawPilotSessionProfile?
     @Published var managerOrders: [ManagerOrderSummary] = []
+    @Published var managerStoreSyncControls: [ManagerStoreSyncControl] = []
+    @Published private(set) var canManageStoreSync = false
+    @Published private(set) var isManagerStoreSyncBusy = false
+    @Published private(set) var hasPendingManagerStoreSyncChange = false
+    @Published private(set) var managerStoreSyncStatus: String?
     @Published var managerPickers: [ManagerPicker] = []
     @Published var pickerPerformance: [PickerPerformanceMetric] = []
     @Published var managerPickManagement: ManagerPickManagementWorkspace?
@@ -172,6 +177,7 @@ final class PickingPhoneModel: ObservableObject {
     private var dismissedCountContextToken: String?
     private var authenticationGeneration: UInt64 = 0
     private var workspaceSwitchCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingManagerStoreSyncCommand: ManagerStoreSyncCommand?
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -237,8 +243,10 @@ final class PickingPhoneModel: ObservableObject {
             && !isRequestingPickHandoff
             && !isWorkspaceBusy
             && !isManagerBusy
+            && !isManagerStoreSyncBusy
             && !isQueueBusy
             && !hasPendingWorkspaceTransition
+            && !hasPendingManagerStoreSyncChange
         guard idle else { return false }
         if hasPendingPickHandoff {
             guard let recoveryWorkspaceId = pendingPickHandoffRecoveryWorkspaceId else {
@@ -526,6 +534,7 @@ final class PickingPhoneModel: ObservableObject {
         } catch {
             sessionProfile = nil
             isAuthenticated = false
+            clearManagerStoreSyncState()
             status = "Sign in to continue."
             return
         }
@@ -869,7 +878,9 @@ final class PickingPhoneModel: ObservableObject {
                     ? "Only the organization that owns the saved confirmation can be selected until it is resolved."
                     : (hasPendingManagerOrderReplanning
                         ? "Only the organization that owns the saved correction can be selected until it is resolved."
-                        : "Wait for the current operation to finish before changing organizations."))
+                        : (hasPendingManagerStoreSyncChange
+                            ? "Retry or refresh the saved Store sync change before changing organizations."
+                            : "Wait for the current operation to finish before changing organizations.")))
             return
         }
         guard (!hasPendingConfirmation
@@ -924,6 +935,7 @@ final class PickingPhoneModel: ObservableObject {
             guard authenticationIsCurrent(operationGeneration) else { return }
 
             managerOrders = []
+            clearManagerStoreSyncState()
             managerPickers = []
             pickerPerformance = []
             managerPickManagement = nil
@@ -989,6 +1001,7 @@ final class PickingPhoneModel: ObservableObject {
             guard authenticationIsCurrent(operationGeneration) else { return }
             sessionProfile = nil
             isAuthenticated = false
+            clearManagerStoreSyncState()
             workspaceStatus = "Your session expired while changing organizations. Sign in again."
             status = "Sign in to continue."
         } catch {
@@ -1021,8 +1034,14 @@ final class PickingPhoneModel: ObservableObject {
         defer { isManagerBusy = false }
         var failures: [String] = []
         do {
-            managerOrders = try await api.fetchManagerOrders()
+            let overview = try await api.fetchManagerOperations()
+            managerOrders = overview.orders
+            managerStoreSyncControls = overview.storeSync
+            canManageStoreSync = overview.capabilities.canActivate
+            reconcilePendingManagerStoreSyncChange()
         } catch {
+            managerStoreSyncControls = []
+            canManageStoreSync = false
             failures.append("orders: \(error.localizedDescription)")
         }
         do {
@@ -1054,6 +1073,112 @@ final class PickingPhoneModel: ObservableObject {
                 ? "No Operations orders are available."
                 : "Review an order to wave and assign its picks."
         }
+    }
+
+    func updateManagerStoreSync(
+        control: ManagerStoreSyncControl,
+        desiredState: ManagerStoreSyncDesiredState,
+        reason: String
+    ) async -> Bool {
+        guard canUseManager, canManageStoreSync else {
+            managerStoreSyncStatus = "Only an organization owner or authorized administrator may change Store sync."
+            return false
+        }
+        let command: ManagerStoreSyncCommand
+        do {
+            if let pendingManagerStoreSyncCommand {
+                guard pendingManagerStoreSyncCommand.accountGlobalId
+                        == control.accountGlobalId,
+                      pendingManagerStoreSyncCommand.desiredState
+                        == desiredState,
+                      pendingManagerStoreSyncCommand.reason
+                        == reason.trimmingCharacters(in: .whitespacesAndNewlines)
+                else {
+                    managerStoreSyncStatus = "Retry or refresh the saved Store sync change before starting another one."
+                    return false
+                }
+                command = pendingManagerStoreSyncCommand
+            } else {
+                command = try ManagerStoreSyncCommand(
+                    control: control,
+                    desiredState: desiredState,
+                    reason: reason
+                )
+                pendingManagerStoreSyncCommand = command
+                hasPendingManagerStoreSyncChange = true
+            }
+        } catch {
+            managerStoreSyncStatus = error.localizedDescription
+            return false
+        }
+        return await submitManagerStoreSync(command)
+    }
+
+    func retryPendingManagerStoreSyncChange() async -> Bool {
+        guard let pendingManagerStoreSyncCommand else {
+            managerStoreSyncStatus = "There is no saved Store sync change to retry."
+            return false
+        }
+        return await submitManagerStoreSync(pendingManagerStoreSyncCommand)
+    }
+
+    private func submitManagerStoreSync(
+        _ command: ManagerStoreSyncCommand
+    ) async -> Bool {
+        guard !isManagerStoreSyncBusy else { return false }
+        isManagerStoreSyncBusy = true
+        defer { isManagerStoreSyncBusy = false }
+        do {
+            let control = try await api.updateManagerStoreSync(command)
+            if let index = managerStoreSyncControls.firstIndex(where: {
+                $0.accountGlobalId == control.accountGlobalId
+            }) {
+                managerStoreSyncControls[index] = control
+            } else {
+                managerStoreSyncControls.append(control)
+            }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = control.effectiveReasonLabel
+            return true
+        } catch PickingAPIError.conflict(let code, let message) {
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "\(message) (\(code))"
+            await loadManagerOperations()
+            return false
+        } catch {
+            managerStoreSyncStatus = "The exact Store sync change remains saved for retry: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func reconcilePendingManagerStoreSyncChange() {
+        guard let command = pendingManagerStoreSyncCommand else { return }
+        guard let control = managerStoreSyncControls.first(where: {
+            $0.accountGlobalId == command.accountGlobalId
+        }) else { return }
+        if control.desiredState == command.desiredState,
+           control.explicitChoice,
+           control.revision == command.expectedRevision + 1,
+           control.reason == command.reason {
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = control.effectiveReasonLabel
+        } else if control.revision != command.expectedRevision {
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "Store sync changed after it was reviewed. Review the refreshed control before trying again."
+        }
+    }
+
+    private func clearManagerStoreSyncState() {
+        managerStoreSyncControls = []
+        canManageStoreSync = false
+        isManagerStoreSyncBusy = false
+        hasPendingManagerStoreSyncChange = false
+        managerStoreSyncStatus = nil
+        pendingManagerStoreSyncCommand = nil
     }
 
     func loadManagerOrder(_ order: ManagerOrderSummary) async {
@@ -1569,6 +1694,7 @@ final class PickingPhoneModel: ObservableObject {
             ? "Signed out."
             : "Signed out on this device. The server sign-out response was unavailable."
         managerOrders = []
+        clearManagerStoreSyncState()
         managerPickers = []
         pickerPerformance = []
         managerPickManagement = nil
