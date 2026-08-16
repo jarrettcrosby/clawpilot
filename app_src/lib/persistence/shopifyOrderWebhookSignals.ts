@@ -10,6 +10,10 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 import type {
   CommerceRuntimeCredentialRecord,
 } from '@/lib/persistence/commerceIntegrations'
@@ -1283,6 +1287,7 @@ async function insertExactObservation(
  */
 export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
   claim: ShopifyOrderWebhookTargetClaim
+  providerReadLease: CommerceStoreSyncProviderReadLease
   observation: CommerceOrderObservationInput
   readAllOrdersScopeObserved: boolean
   returnHistoryScopeObserved: boolean
@@ -1302,6 +1307,13 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
     )
   }
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.claim.organizationId,
+      integrationAccountId: input.claim.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'automatic',
+      readKind: 'shopify_webhook_hydration',
+    })
     const target = await client.query(
       `SELECT 1
        FROM operations_shopify_order_webhook_targets target
@@ -1556,6 +1568,45 @@ export async function failShopifyOrderWebhookExactReadInPostgres(input: {
       providerWrites: 0 as const,
     })
   })
+}
+
+export async function parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(
+  input: { claim: ShopifyOrderWebhookTargetClaim },
+) {
+  const parked = await query(
+    `UPDATE operations_shopify_order_webhook_targets
+     SET claim_state = 'pending',
+         claimed_dirty_version = NULL,
+         claimed_signal_global_id = NULL,
+         claimed_provider_updated_at = NULL,
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = clock_timestamp(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND integration_account_id = $3::uuid
+       AND credential_generation = $4
+       AND policy_revision = $5
+       AND claim_state = 'processing'
+       AND claimed_dirty_version = $6
+       AND lock_token = $7::uuid
+     RETURNING id`,
+    [
+      input.claim.organizationId,
+      input.claim.id,
+      input.claim.integrationAccountId,
+      input.claim.credentialGeneration,
+      input.claim.policyRevision,
+      input.claim.capturedDirtyVersion,
+      input.claim.lockToken,
+    ],
+  )
+  return { parked: parked.rowCount === 1 }
 }
 
 export async function readShopifyOrderWebhookSignalHealthFromPostgres() {

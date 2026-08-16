@@ -62,6 +62,23 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           'app_src/lib/operations/commerceStoreSync.ts',
         )
       }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '00000000-0000-4000-8000-000000000298',
+              organizationId: input.organizationId,
+              integrationAccountId: input.integrationAccountId,
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            })
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }

@@ -268,6 +268,11 @@ function loadInventoryPersistence(pool) {
       if (specifier === '@/lib/operations/shopifyInventoryProjection') {
         return projection
       }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') return postgres
       if (specifier.startsWith('@/')) return {}
       return requireFromApp(specifier)
@@ -592,6 +597,7 @@ async function applyInventoryEvidence(pool, inventoryPersistence, job) {
       idempotencyKey,
       requestHash,
       actorEmail: null,
+      providerReadAuthority: 'automatic',
     })
   const capture = await inventoryPersistence
     .captureShopifyInventorySnapshotInPostgres({
@@ -874,6 +880,65 @@ async function exercise(pool) {
       status: 'mapped_pending',
     },
   ])
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Pause inventory without cancelling retained work',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.account, actorEmail],
+  )
+  const pausedInventoryJobsBefore = (
+    await pool.query(
+      `SELECT id::text, status, attempt_count, cancel_requested,
+              requested_dirty_version::text, locked_at, locked_by,
+              lock_token::text, lease_expires_at, updated_at
+       FROM operations_shopify_inventory_refresh_jobs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'failed', 'mapped_pending', 'mapped_failed')
+       ORDER BY id`,
+      [ids.organization, ids.account],
+    )
+  ).rows
+  for (let pausedCycle = 0; pausedCycle < 2; pausedCycle += 1) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.queueAutomaticShopifyInventoryRefreshesInPostgres(),
+      )),
+      { queued: 0, cancelled: 0 },
+    )
+  }
+  const pausedInventoryJobsAfter = (
+    await pool.query(
+      `SELECT id::text, status, attempt_count, cancel_requested,
+              requested_dirty_version::text, locked_at, locked_by,
+              lock_token::text, lease_expires_at, updated_at
+       FROM operations_shopify_inventory_refresh_jobs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'failed', 'mapped_pending', 'mapped_failed')
+       ORDER BY id`,
+      [ids.organization, ids.account],
+    )
+  ).rows
+  assert.deepEqual(
+    pausedInventoryJobsAfter,
+    pausedInventoryJobsBefore,
+    'repeated Paused inventory scheduler cycles must preserve retained work',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'running', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Resume retained inventory work',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.account, actorEmail],
+  )
   const oldClaimAgainstMapped = await claimWithLegacySql(
     pool,
     'pre-0288-worker-after-fanout',

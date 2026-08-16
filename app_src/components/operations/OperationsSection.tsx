@@ -90,7 +90,9 @@ import type {
   CommerceStoreSyncUpdateResult,
 } from '@/lib/operations/commerceStoreSync'
 import {
+  CommerceStoreSyncHttpError,
   commerceStoreSyncControlMatchesCommand,
+  commerceStoreSyncPendingResolution,
 } from '@/lib/operations/commerceStoreSync'
 import {
   type OneOffCarrierGroupCommandResult,
@@ -2740,7 +2742,7 @@ export default function OperationsSection({
     if (orderGlobalId) params.set('order', orderGlobalId)
     try {
       const response = await fetch(`/api/operations?${params.toString()}`, { cache: 'no-store', signal })
-      const payload = await response.json() as OperationsPayload
+      const payload = await response.json().catch(() => ({})) as OperationsPayload
       if (!response.ok || !payload.operations) throw new Error(payload.error || 'Operations data is unavailable')
       setWorkspace(payload.operations)
       setCommerceFulfillmentRecoveryEnabled(
@@ -4746,11 +4748,14 @@ export default function OperationsSection({
         }),
       })
       const payload = await response.json() as OperationsPayload
-      if (
-        !response.ok
-        || !payload.result
-        || !('control' in payload.result)
-      ) {
+      if (!response.ok) {
+        throw new CommerceStoreSyncHttpError(
+          response.status,
+          payload.error || 'Store sync could not be updated',
+          payload.code,
+        )
+      }
+      if (!payload.result || !('control' in payload.result)) {
         throw new Error(payload.error || 'Store sync could not be updated')
       }
       if (!commerceStoreSyncControlMatchesCommand(
@@ -4765,19 +4770,26 @@ export default function OperationsSection({
       )
       await loadWorkspace(selectedGlobalId)
     } catch (caught) {
-      const refreshed = await loadWorkspace(selectedGlobalId)
+      const refreshed = await loadWorkspace(selectedGlobalId).catch(() => null)
       const reconciled = refreshed?.storeSync.find(
         (candidate) => candidate.accountGlobalId === accountGlobalId,
       )
-      if (reconciled && commerceStoreSyncControlMatchesCommand(
+      const resolution = commerceStoreSyncPendingResolution(
         reconciled,
         command,
-      )) {
+        caught,
+      )
+      if (resolution === 'applied' && reconciled) {
         pendingStoreSyncCommands.current.delete(accountGlobalId)
         setNotice(
           `${reconciled.displayName} Store sync is ${reconciled.effectiveState}. ${reconciled.effectiveReasonLabel}`,
         )
         setError('')
+      } else if (resolution === 'definitive_rejection') {
+        pendingStoreSyncCommands.current.delete(accountGlobalId)
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} Current Store sync state was refreshed. Review it before trying again.`,
+        )
       } else {
         setError(
           `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,

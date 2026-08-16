@@ -1942,6 +1942,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         observedAt: receivedAt,
         providerUpdatedAt: input.productDeletion.providerUpdatedAt,
         actorEmail: current.actor_email,
+        providerReadAuthority: 'automatic',
       }, client)
     }
     const existing = await client.query<{

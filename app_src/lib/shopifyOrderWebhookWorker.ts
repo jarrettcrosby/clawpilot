@@ -6,10 +6,23 @@ import {
   assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres,
   claimShopifyOrderWebhookTargetsInPostgres,
   failShopifyOrderWebhookExactReadInPostgres,
+  parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 const MAX_TARGETS_PER_RUN = 5
 const PROVIDER_READS_PER_TARGET = 3
+
+function isStoreSyncReadPause(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
+    || code === 'SHOPIFY_ORDER_WEBHOOK_PROVIDER_READ_FENCE_CHANGED'
+}
 
 export const shopifyOrderWebhookWorkerLimits = Object.freeze({
   maxTargetsPerRun: MAX_TARGETS_PER_RUN,
@@ -46,31 +59,43 @@ export async function processShopifyOrderWebhookSignals(input: {
   let linesAppended = 0
   let eventsAppended = 0
   let failurePersistenceErrors = 0
+  let parked = 0
   for (const claim of claims) {
     try {
       await assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
         claim,
       )
-      const read = await readExactShopifyOrderHistoryObservation({
+      const completed = await withCommerceStoreSyncProviderReadFenceInPostgres({
         organizationId: claim.organizationId,
-        accountGlobalId: claim.accountGlobalId,
-        expectedCredentialGeneration: claim.credentialGeneration,
-        externalOrderId: claim.externalOrderId,
-      })
-      if (
-        read.provider !== 'shopify'
-        || read.providerReads !== PROVIDER_READS_PER_TARGET
-        || read.providerWrites !== 0
-        || read.observation.externalOrderId !== claim.externalOrderId
-        || read.observation.observationKind !== 'webhook_exact_read'
-      ) {
-        throw new Error('Shopify order webhook exact-read authority changed')
-      }
-      const completed = await appendShopifyOrderWebhookExactReadInPostgres({
-        claim,
-        observation: read.observation,
-        readAllOrdersScopeObserved: read.readAllOrdersScopeObserved,
-        returnHistoryScopeObserved: read.returnHistoryScopeObserved,
+        integrationAccountId: claim.integrationAccountId,
+        authorityKind: 'automatic',
+        readKind: 'shopify_webhook_hydration',
+        intentKey: `${claim.id}:${claim.lockToken}:${claim.capturedDirtyVersion}`,
+        acquiredBy: input.workerId,
+        read: async (providerReadLease) => {
+          const read = await readExactShopifyOrderHistoryObservation({
+            organizationId: claim.organizationId,
+            accountGlobalId: claim.accountGlobalId,
+            expectedCredentialGeneration: claim.credentialGeneration,
+            externalOrderId: claim.externalOrderId,
+          })
+          if (
+            read.provider !== 'shopify'
+            || read.providerReads !== PROVIDER_READS_PER_TARGET
+            || read.providerWrites !== 0
+            || read.observation.externalOrderId !== claim.externalOrderId
+            || read.observation.observationKind !== 'webhook_exact_read'
+          ) {
+            throw new Error('Shopify order webhook exact-read authority changed')
+          }
+          return appendShopifyOrderWebhookExactReadInPostgres({
+            claim,
+            providerReadLease,
+            observation: read.observation,
+            readAllOrdersScopeObserved: read.readAllOrdersScopeObserved,
+            returnHistoryScopeObserved: read.returnHistoryScopeObserved,
+          })
+        },
       })
       succeeded += 1
       providerReads += completed.providerReads
@@ -79,6 +104,15 @@ export async function processShopifyOrderWebhookSignals(input: {
       linesAppended += completed.linesAppended
       eventsAppended += completed.eventsAppended
     } catch (error) {
+      if (isStoreSyncReadPause(error)) {
+        const disposition =
+          await parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres({
+            claim,
+          })
+        if (disposition.parked) parked += 1
+        else stale += 1
+        continue
+      }
       try {
         const result = await failShopifyOrderWebhookExactReadInPostgres({
           claim,
@@ -108,6 +142,7 @@ export async function processShopifyOrderWebhookSignals(input: {
     linesAppended,
     eventsAppended,
     failurePersistenceErrors,
+    parked,
     eventDrivenDrainCadenceSeconds: 60 as const,
     scheduledPollBackstopMinutes: 30 as const,
     providerReadOnly: true as const,

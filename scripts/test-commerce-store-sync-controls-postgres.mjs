@@ -23,6 +23,14 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const ts = requireFromApp('typescript')
 
+const {
+  OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL,
+} = loadTypeScript(
+  'app_src/lib/persistence/commerceStoreSyncHealth.ts',
+)
+
 function loadTypeScript(path, mocks = {}) {
   const output = ts.transpileModule(
     readFileSync(resolve(root, path), 'utf8'),
@@ -54,6 +62,8 @@ function loadTypeScript(path, mocks = {}) {
     exports: module.exports,
     module,
     process,
+    setInterval,
+    clearInterval,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
@@ -90,6 +100,214 @@ function postgresAdapter(pool) {
       )
     },
   }
+}
+
+async function storeSyncFunctionHealth(client) {
+  const result = await client.query(
+    `SELECT ${OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL} AS healthy`,
+  )
+  return result.rows[0]?.healthy === true
+}
+
+async function storeSyncStructureHealth(client) {
+  const result = await client.query(
+    `SELECT ${OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL} AS healthy`,
+  )
+  return result.rows[0]?.healthy === true
+}
+
+async function storeSyncRewrittenFunctionHealth(client) {
+  const result = await client.query(
+    `SELECT ${OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL}
+       AS healthy`,
+  )
+  return result.rows[0]?.healthy === true
+}
+
+async function readStoreSyncHealthCatalog(client) {
+  const signatures = [
+    'public.operations_commerce_store_sync_effective_reason(uuid,uuid)',
+    'public.operations_commerce_store_sync_is_running(uuid,uuid)',
+    'public.operations_commerce_provider_read_authority_is_current(uuid,uuid,text)',
+    'public.operations_commerce_product_image_read_authority_is_current(uuid,uuid,text,integer,text)',
+    'public.guard_operations_commerce_product_image_read_authority()',
+    'public.guard_operations_commerce_store_sync_read_lease()',
+    'public.seed_operations_commerce_store_sync_control()',
+    'public.protect_commerce_order_sync_session_lineage()',
+    'public.protect_commerce_order_observation_lineage()',
+    'public.commerce_order_observation_accepts_children(uuid,uuid)',
+    'public.protect_shopify_order_webhook_read()',
+    'public.protect_shopify_order_webhook_target()',
+    'public.guard_operations_commerce_product_image_binding()',
+    'public.protect_operations_commerce_store_sync_receipt()',
+    'public.validate_operations_commerce_store_sync_identity()',
+    'public.operations_shopify_inventory_read_config_is_ready(uuid,uuid)',
+    'public.operations_commerce_product_image_account_is_current(uuid,uuid,text,integer)',
+    'public.operations_commerce_product_image_account_lineage_is_current(uuid,uuid,text,integer)',
+    'public.operations_commerce_product_image_mapping_targets(uuid,uuid,text,text)',
+    'public.operations_commerce_product_image_job_fences_are_current(uuid,uuid)',
+    'public.operations_commerce_product_image_projection_fences_are_current(uuid,uuid)',
+  ]
+  const functionRows = await client.query(
+    `WITH required(signature) AS (
+       SELECT unnest($1::text[])
+     )
+     SELECT required.signature,
+            encode(digest(convert_to(btrim(regexp_replace(
+              installed.prosrc, '[[:space:]]+', ' ', 'g'
+            )), 'UTF8'), 'sha256'), 'hex') AS body_sha256,
+            language.lanname,
+            installed.provolatile,
+            installed.proisstrict,
+            installed.prosecdef,
+            installed.proleakproof,
+            installed.proparallel,
+            installed.proconfig,
+            pg_get_function_result(installed.oid) AS result_type
+     FROM required
+     JOIN pg_proc installed
+       ON installed.oid = to_regprocedure(required.signature)
+     JOIN pg_language language ON language.oid = installed.prolang
+     ORDER BY required.signature`,
+    [signatures],
+  )
+  const rewrittenHash = await client.query(
+    `WITH required(signature) AS (
+       SELECT unnest($1::text[])
+     )
+     SELECT encode(digest(convert_to(string_agg(concat_ws(
+       '|', required.signature,
+       btrim(regexp_replace(installed.prosrc, '[[:space:]]+', ' ', 'g')),
+       language.lanname, installed.provolatile::text,
+       installed.proisstrict::text, installed.prosecdef::text,
+       installed.proleakproof::text, installed.proparallel::text,
+       COALESCE(array_to_string(installed.proconfig, ','), ''),
+       pg_get_function_result(installed.oid)
+     ), chr(10) ORDER BY required.signature), 'UTF8'), 'sha256'), 'hex')
+       AS value
+     FROM required
+     JOIN pg_proc installed
+       ON installed.oid = to_regprocedure(required.signature)
+     JOIN pg_language language ON language.oid = installed.prolang`,
+    [signatures],
+  )
+  const structure = await client.query(
+    `SELECT
+       (SELECT encode(digest(convert_to(string_agg(concat_ws(
+         '|', installed_table.relname, installed_constraint.conname,
+         installed_constraint.contype::text,
+         installed_constraint.convalidated::text,
+         installed_constraint.confdeltype::text,
+         installed_constraint.confupdtype::text,
+         pg_get_constraintdef(installed_constraint.oid)
+       ), chr(10) ORDER BY installed_table.relname,
+          installed_constraint.conname), 'UTF8'), 'sha256'), 'hex')
+        FROM pg_constraint installed_constraint
+        JOIN pg_class installed_table
+          ON installed_table.oid = installed_constraint.conrelid
+        WHERE installed_constraint.conrelid IN (
+          to_regclass('operations_commerce_store_sync_controls'),
+          to_regclass('operations_commerce_store_sync_change_receipts'),
+          to_regclass('operations_commerce_store_sync_read_leases')
+        ) OR installed_constraint.conname IN (
+          'commerce_intake_read_intents_authority_valid',
+          'ops_commerce_image_set_authority_valid',
+          'ops_commerce_image_job_authority_valid'
+        )) AS constraint_hash,
+       (SELECT encode(digest(convert_to(string_agg(concat_ws(
+         '|', installed_table.relname, installed_index_class.relname,
+         installed_index.indisprimary::text,
+         installed_index.indisunique::text,
+         installed_index.indisvalid::text,
+         installed_index.indisready::text,
+         installed_index.indkey::text,
+         pg_get_indexdef(installed_index.indexrelid)
+       ), chr(10) ORDER BY installed_table.relname,
+          installed_index_class.relname), 'UTF8'), 'sha256'), 'hex')
+        FROM pg_index installed_index
+        JOIN pg_class installed_table
+          ON installed_table.oid = installed_index.indrelid
+        JOIN pg_class installed_index_class
+          ON installed_index_class.oid = installed_index.indexrelid
+        WHERE installed_index.indrelid IN (
+          to_regclass('operations_commerce_store_sync_controls'),
+          to_regclass('operations_commerce_store_sync_change_receipts'),
+          to_regclass('operations_commerce_store_sync_read_leases')
+        )) AS index_hash,
+       (SELECT encode(digest(convert_to(string_agg(concat_ws(
+         '|', table_name, column_name, ordinal_position::text,
+         data_type, udt_schema, udt_name, is_nullable,
+         COALESCE(column_default, '<null>'), is_identity,
+         COALESCE(identity_generation, '<null>'), is_generated,
+         COALESCE(generation_expression, '<null>'),
+         COALESCE(collation_schema, '<null>'),
+         COALESCE(collation_name, '<null>'),
+         COALESCE(character_maximum_length::text, '<null>'),
+         COALESCE(numeric_precision::text, '<null>'),
+         COALESCE(numeric_scale::text, '<null>'),
+         COALESCE(datetime_precision::text, '<null>')
+       ), chr(10) ORDER BY table_name, column_name), 'UTF8'), 'sha256'), 'hex')
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND (
+          table_name IN (
+            'operations_commerce_store_sync_controls',
+            'operations_commerce_store_sync_change_receipts',
+            'operations_commerce_store_sync_read_leases'
+          )
+          OR (table_name IN (
+            'operations_commerce_intake_read_intents',
+            'operations_commerce_product_image_observation_sets',
+            'operations_commerce_product_image_import_jobs'
+          ) AND column_name = 'provider_read_authority')
+        )) AS column_hash`,
+  )
+  return {
+    functions: functionRows.rows,
+    rewrittenHash: rewrittenHash.rows[0]?.value,
+    ...structure.rows[0],
+  }
+}
+
+async function assertFunctionTamperDetected(pool, tamperSql) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    assert.equal(await storeSyncFunctionHealth(client), true)
+    await client.query(tamperSql)
+    assert.equal(await storeSyncFunctionHealth(client), false)
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+    client.release()
+  }
+  assert.equal(await storeSyncFunctionHealth(pool), true)
+}
+
+async function assertStructureTamperDetected(pool, tamperSql) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    assert.equal(await storeSyncStructureHealth(client), true)
+    await client.query(tamperSql)
+    assert.equal(await storeSyncStructureHealth(client), false)
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+    client.release()
+  }
+  assert.equal(await storeSyncStructureHealth(pool), true)
+}
+
+async function assertRewrittenFunctionTamperDetected(pool, tamperSql) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    assert.equal(await storeSyncRewrittenFunctionHealth(client), true)
+    await client.query(tamperSql)
+    assert.equal(await storeSyncRewrittenFunctionHealth(client), false)
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+    client.release()
+  }
+  assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
 }
 
 async function withReplicaFixture(pool, work) {
@@ -217,6 +435,345 @@ async function verify(databaseUrl, fixtures) {
       assert.equal(row.explicit_choice, false)
       assert.equal(Number(row.revision), 1)
     }
+
+    const active = fixtures.find((value) => value.state === 'active')
+    assert.ok(active)
+    let releaseProviderRead
+    let markProviderReadStarted
+    const providerReadStarted = new Promise((resolvePromise) => {
+      markProviderReadStarted = resolvePromise
+    })
+    const providerReadRelease = new Promise((resolvePromise) => {
+      releaseProviderRead = resolvePromise
+    })
+    const inFlightProviderRead =
+      persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'automatic',
+        readKind: 'order_history',
+        intentKey: 'acceptance:active:order-history:1',
+        acquiredBy: actorEmail,
+        read: async () => {
+          markProviderReadStarted()
+          await providerReadRelease
+          return 'provider-read-finished-before-pause'
+        },
+      })
+    await providerReadStarted
+    const pauseCommand =
+      persistence.updateCommerceStoreSyncControlInPostgres({
+        organizationId: active.organizationId,
+        accountGlobalId: active.globalId,
+        desiredState: 'paused',
+        expectedDesiredState: 'running',
+        expectedRevision: 1,
+        reason: 'Pause while a precommitted provider read drains',
+        actorEmail,
+        idempotencyKey: 'store-sync:acceptance:provider-read-pause',
+      })
+    assert.equal(
+      await Promise.race([
+        pauseCommand.then(() => 'committed'),
+        new Promise((resolvePromise) => {
+          setTimeout(() => resolvePromise('waiting-for-read'), 100)
+        }),
+      ]),
+      'committed',
+    )
+    const paused = await pauseCommand
+    assert.equal(paused.control.effectiveState, 'paused')
+    assert.equal(
+      paused.control.effectiveReason,
+      'STORE_SYNC_EXPLICIT_PAUSED_DRAINING',
+    )
+    releaseProviderRead()
+    await assert.rejects(
+      inFlightProviderRead,
+      (error) => error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST',
+    )
+    const settledPaused = (
+      await persistence.readCommerceStoreSyncControlsFromPostgres(
+        active.organizationId,
+      )
+    ).find((control) => control.accountGlobalId === active.globalId)
+    assert.equal(settledPaused?.effectiveReason, 'STORE_SYNC_EXPLICIT_PAUSED')
+
+    let postPauseProviderCalls = 0
+    await assert.rejects(
+      persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'automatic',
+        readKind: 'order_history',
+        intentKey: 'acceptance:active:order-history:post-pause',
+        acquiredBy: actorEmail,
+        async read() {
+          postPauseProviderCalls += 1
+          return 'must-not-run'
+        },
+      }),
+      (error) => (
+        error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+      ),
+    )
+    assert.equal(postPauseProviderCalls, 0)
+    await assert.rejects(
+      pool.query(
+        `INSERT INTO operations_commerce_store_sync_read_leases (
+           id, organization_id, integration_account_id, authority_kind,
+           read_kind, intent_fingerprint_sha256,
+           control_revision, activation_revision, acquired_by,
+           acquired_at, heartbeat_at, expires_at
+         ) VALUES (
+           gen_random_uuid(), $1::uuid, $2::uuid, 'automatic',
+           'order_history', repeat('e', 64),
+           (SELECT revision FROM operations_commerce_store_sync_controls
+            WHERE organization_id = $1::uuid
+              AND integration_account_id = $2::uuid),
+           (SELECT revision FROM operations_activation_scopes
+            WHERE organization_id = $1::uuid),
+           $3,
+           date_trunc('milliseconds', statement_timestamp()),
+           date_trunc('milliseconds', statement_timestamp()),
+           date_trunc('milliseconds', statement_timestamp())
+             + interval '60 seconds'
+         )`,
+        [active.organizationId, active.accountId, actorEmail],
+      ),
+      /requires current exact authority/u,
+    )
+    let manualProviderCalls = 0
+    assert.equal(
+      await persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'manual_read_only',
+        readKind: 'order_revision',
+        intentKey: 'acceptance:active:manual-order-refresh:1',
+        acquiredBy: actorEmail,
+        async read() {
+          manualProviderCalls += 1
+          return 'manual-read-completed-under-pause'
+        },
+      }),
+      'manual-read-completed-under-pause',
+    )
+    assert.equal(manualProviderCalls, 1)
+    let emergencyProviderCalls = 0
+    for (const emergencyState of ['disabled', 'frozen']) {
+      const emergency = fixtures.find((value) => value.state === emergencyState)
+      assert.ok(emergency)
+      await assert.rejects(
+        persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+          organizationId: emergency.organizationId,
+          integrationAccountId: emergency.accountId,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_revision',
+          intentKey: `acceptance:${emergencyState}:manual-order-refresh:1`,
+          acquiredBy: actorEmail,
+          async read() {
+            emergencyProviderCalls += 1
+            return 'must-not-run'
+          },
+        }),
+        (error) => error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+      )
+    }
+    assert.equal(emergencyProviderCalls, 0)
+    await assert.rejects(
+      persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'manual_read_only',
+        readKind: 'order_revision',
+        intentKey: 'acceptance:active:manual-order-refresh:1',
+        acquiredBy: actorEmail,
+        async read() {
+          manualProviderCalls += 1
+          return 'duplicate-intent-must-not-run'
+        },
+      }),
+      (error) => (
+        error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
+      ),
+    )
+    assert.equal(manualProviderCalls, 1)
+    const resumed =
+      await persistence.updateCommerceStoreSyncControlInPostgres({
+        organizationId: active.organizationId,
+        accountGlobalId: active.globalId,
+        desiredState: 'running',
+        expectedDesiredState: 'paused',
+        expectedRevision: 2,
+        reason: 'Resume after bounded provider read acceptance',
+        actorEmail,
+        idempotencyKey: 'store-sync:acceptance:provider-read-resume',
+      })
+    assert.equal(resumed.control.effectiveState, 'running')
+
+    let releaseCapturedRead
+    let markCapturedRead
+    const capturedReadCommitted = new Promise((resolvePromise) => {
+      markCapturedRead = resolvePromise
+    })
+    const capturedReadRelease = new Promise((resolvePromise) => {
+      releaseCapturedRead = resolvePromise
+    })
+    let capturedLeaseId = null
+    const captureBeforePause =
+      persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'automatic',
+        readKind: 'order_history',
+        intentKey: 'acceptance:active:capture-before-pause',
+        acquiredBy: actorEmail,
+        read: async (providerReadLease) => {
+          capturedLeaseId = providerReadLease.id
+          const client = await pool.connect()
+          try {
+            await client.query('BEGIN')
+            await persistence
+              .assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
+                client,
+                {
+                  organizationId: active.organizationId,
+                  integrationAccountId: active.accountId,
+                  lease: providerReadLease,
+                  authorityKind: 'automatic',
+                  readKind: 'order_history',
+                },
+              )
+            await client.query('COMMIT')
+          } catch (error) {
+            await client.query('ROLLBACK')
+            throw error
+          } finally {
+            client.release()
+          }
+          markCapturedRead()
+          await capturedReadRelease
+          return 'captured-before-pause'
+        },
+      })
+    await capturedReadCommitted
+    const pausedAfterCapture =
+      await persistence.updateCommerceStoreSyncControlInPostgres({
+        organizationId: active.organizationId,
+        accountGlobalId: active.globalId,
+        desiredState: 'paused',
+        expectedDesiredState: 'running',
+        expectedRevision: 3,
+        reason: 'Pause after exact provider evidence capture committed',
+        actorEmail,
+        idempotencyKey: 'store-sync:acceptance:pause-after-capture',
+      })
+    assert.equal(pausedAfterCapture.control.desiredState, 'paused')
+    releaseCapturedRead()
+    assert.equal(await captureBeforePause, 'captured-before-pause')
+    const capturedLease = await pool.query(
+      `SELECT captured_at IS NOT NULL AS captured,
+              release_reason
+       FROM operations_commerce_store_sync_read_leases
+       WHERE id = $1::uuid`,
+      [capturedLeaseId],
+    )
+    assert.equal(capturedLease.rows[0].captured, true)
+    assert.equal(capturedLease.rows[0].release_reason, 'completed')
+    await persistence.updateCommerceStoreSyncControlInPostgres({
+      organizationId: active.organizationId,
+      accountGlobalId: active.globalId,
+      desiredState: 'running',
+      expectedDesiredState: 'paused',
+      expectedRevision: 4,
+      reason: 'Resume after capture-before-pause proof',
+      actorEmail,
+      idempotencyKey: 'store-sync:acceptance:resume-after-capture',
+    })
+
+    let releaseStaleCapture
+    let markStaleReadStarted
+    const staleReadStarted = new Promise((resolvePromise) => {
+      markStaleReadStarted = resolvePromise
+    })
+    const staleCaptureRelease = new Promise((resolvePromise) => {
+      releaseStaleCapture = resolvePromise
+    })
+    let staleLeaseId = null
+    let staleCaptureCommitted = false
+    const pauseBeforeCapture =
+      persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+        organizationId: active.organizationId,
+        integrationAccountId: active.accountId,
+        authorityKind: 'automatic',
+        readKind: 'order_history',
+        intentKey: 'acceptance:active:pause-resume-before-capture',
+        acquiredBy: actorEmail,
+        read: async (providerReadLease) => {
+          staleLeaseId = providerReadLease.id
+          markStaleReadStarted()
+          await staleCaptureRelease
+          const client = await pool.connect()
+          try {
+            await client.query('BEGIN')
+            await persistence
+              .assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
+                client,
+                {
+                  organizationId: active.organizationId,
+                  integrationAccountId: active.accountId,
+                  lease: providerReadLease,
+                  authorityKind: 'automatic',
+                  readKind: 'order_history',
+                },
+              )
+            await client.query('COMMIT')
+            staleCaptureCommitted = true
+          } catch (error) {
+            await client.query('ROLLBACK')
+            throw error
+          } finally {
+            client.release()
+          }
+          return 'must-not-commit'
+        },
+      })
+    await staleReadStarted
+    await persistence.updateCommerceStoreSyncControlInPostgres({
+      organizationId: active.organizationId,
+      accountGlobalId: active.globalId,
+      desiredState: 'paused',
+      expectedDesiredState: 'running',
+      expectedRevision: 5,
+      reason: 'Pause before stale provider response capture',
+      actorEmail,
+      idempotencyKey: 'store-sync:acceptance:pause-before-capture',
+    })
+    await persistence.updateCommerceStoreSyncControlInPostgres({
+      organizationId: active.organizationId,
+      accountGlobalId: active.globalId,
+      desiredState: 'running',
+      expectedDesiredState: 'paused',
+      expectedRevision: 6,
+      reason: 'Resume with a new Store sync generation',
+      actorEmail,
+      idempotencyKey: 'store-sync:acceptance:resume-before-stale-capture',
+    })
+    releaseStaleCapture()
+    await assert.rejects(
+      pauseBeforeCapture,
+      (error) => error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST',
+    )
+    assert.equal(staleCaptureCommitted, false)
+    const staleLease = await pool.query(
+      `SELECT captured_at, release_reason
+       FROM operations_commerce_store_sync_read_leases
+       WHERE id = $1::uuid`,
+      [staleLeaseId],
+    )
+    assert.equal(staleLease.rows[0].captured_at, null)
+    assert.equal(staleLease.rows[0].release_reason, 'failed')
 
     const shadow = fixtures.find((value) => value.state === 'shadow')
     assert.ok(shadow)
@@ -499,6 +1056,228 @@ async function verify(databaseUrl, fixtures) {
       ),
       /append-only/i,
     )
+
+    const functionBodyTampers = [
+      `CREATE OR REPLACE FUNCTION
+         operations_commerce_store_sync_effective_reason(
+           requested_organization_id uuid,
+           requested_integration_account_id uuid
+         )
+       RETURNS text LANGUAGE sql STABLE
+       AS $$ SELECT 'STORE_SYNC_EXPLICIT_RUNNING'::text $$`,
+      `CREATE OR REPLACE FUNCTION
+         operations_commerce_store_sync_is_running(
+           requested_organization_id uuid,
+           requested_integration_account_id uuid
+         )
+       RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`,
+      `CREATE OR REPLACE FUNCTION
+         seed_operations_commerce_store_sync_control()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+      `CREATE OR REPLACE FUNCTION
+         protect_operations_commerce_store_sync_receipt()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN OLD; END $$`,
+      `CREATE OR REPLACE FUNCTION
+         validate_operations_commerce_store_sync_identity()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+      `CREATE OR REPLACE FUNCTION
+         operations_shopify_inventory_read_config_is_ready(
+           requested_organization_id uuid,
+           requested_config_id uuid
+         )
+       RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`,
+      `CREATE OR REPLACE FUNCTION
+         operations_commerce_provider_read_authority_is_current(
+           requested_organization_id uuid,
+           requested_integration_account_id uuid,
+           requested_authority text
+         )
+       RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`,
+      `CREATE OR REPLACE FUNCTION
+         operations_commerce_product_image_read_authority_is_current(
+           requested_organization_id uuid,
+           requested_integration_account_id uuid,
+           requested_provider text,
+           requested_credential_generation integer,
+           requested_authority text
+         )
+       RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT true $$`,
+      `CREATE OR REPLACE FUNCTION
+         guard_operations_commerce_product_image_read_authority()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+      `CREATE OR REPLACE FUNCTION
+         guard_operations_commerce_store_sync_read_lease()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+    ]
+    for (const tamperSql of functionBodyTampers) {
+      await assertFunctionTamperDetected(pool, tamperSql)
+    }
+
+    await assertRewrittenFunctionTamperDetected(
+      pool,
+      `CREATE OR REPLACE FUNCTION
+         protect_commerce_order_sync_session_lineage()
+       RETURNS trigger LANGUAGE plpgsql
+       AS $$ BEGIN RETURN NEW; END $$`,
+    )
+    await assertRewrittenFunctionTamperDetected(
+      pool,
+      `CREATE OR REPLACE FUNCTION
+         operations_commerce_product_image_projection_fences_are_current(
+           requested_organization_id uuid,
+           requested_job_id uuid
+         )
+       RETURNS boolean LANGUAGE plpgsql STABLE SECURITY INVOKER
+       SET search_path = pg_catalog, public
+       AS $$ BEGIN RETURN true; END $$`,
+    )
+
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_controls
+         DROP CONSTRAINT
+           operations_commerce_store_sync_controls_desired_state_check;
+       ALTER TABLE operations_commerce_store_sync_controls
+         ADD CONSTRAINT
+           operations_commerce_store_sync_controls_desired_state_check
+         CHECK (true)`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_read_leases
+         DROP CONSTRAINT
+           operations_commerce_store_sync_read_leases_authority_valid;
+       ALTER TABLE operations_commerce_store_sync_read_leases
+         ADD CONSTRAINT
+           operations_commerce_store_sync_read_leases_authority_valid
+         CHECK (true)`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_intake_read_intents
+         ALTER COLUMN provider_read_authority SET DEFAULT 'automatic'`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_controls
+         ALTER COLUMN explicit_choice DROP NOT NULL`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_change_receipts
+         ALTER COLUMN response_json TYPE varchar(8192)`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_store_sync_read_leases
+         DISABLE TRIGGER
+           guard_operations_commerce_store_sync_read_lease_write`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER guard_operations_commerce_image_job_authority_write
+         ON operations_commerce_product_image_import_jobs;
+       CREATE TRIGGER guard_operations_commerce_image_job_authority_write
+         BEFORE UPDATE ON operations_commerce_product_image_import_jobs
+         FOR EACH ROW EXECUTE FUNCTION
+           validate_operations_commerce_store_sync_identity()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER protect_operations_commerce_store_sync_receipt_write
+         ON operations_commerce_store_sync_change_receipts;
+       CREATE TRIGGER protect_operations_commerce_store_sync_receipt_write
+         BEFORE UPDATE OR DELETE
+         ON operations_commerce_store_sync_change_receipts
+         FOR EACH ROW WHEN (false)
+         EXECUTE FUNCTION protect_operations_commerce_store_sync_receipt()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER validate_operations_commerce_store_sync_identity_write
+         ON operations_commerce_store_sync_controls;
+       CREATE TRIGGER validate_operations_commerce_store_sync_identity_write
+         BEFORE INSERT OR UPDATE
+         ON operations_commerce_store_sync_controls
+         FOR EACH ROW WHEN (false)
+         EXECUTE FUNCTION validate_operations_commerce_store_sync_identity()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER seed_operations_commerce_store_sync_control_write
+         ON operations_integration_accounts;
+       CREATE TRIGGER seed_operations_commerce_store_sync_control_write
+         AFTER INSERT ON operations_integration_accounts
+         FOR EACH ROW WHEN (false)
+         EXECUTE FUNCTION seed_operations_commerce_store_sync_control()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_lookalike;
+       CREATE TABLE store_sync_lookalike.operations_commerce_intake_read_intents (
+         provider_read_authority text,
+         CONSTRAINT commerce_intake_read_intents_authority_valid CHECK (true)
+       );
+       ALTER TABLE public.operations_commerce_intake_read_intents
+         DROP CONSTRAINT commerce_intake_read_intents_authority_valid`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_lookalike;
+       CREATE TABLE store_sync_lookalike.operations_commerce_store_sync_read_leases (
+         provider_read_authority text
+       );
+       CREATE TRIGGER guard_operations_commerce_store_sync_read_lease_write
+         BEFORE INSERT OR UPDATE OR DELETE
+         ON store_sync_lookalike.operations_commerce_store_sync_read_leases
+         FOR EACH ROW EXECUTE FUNCTION
+           guard_operations_commerce_store_sync_read_lease();
+       DROP TRIGGER guard_operations_commerce_store_sync_read_lease_write
+         ON public.operations_commerce_store_sync_read_leases`,
+    )
+    const expiredLeaseClient = await pool.connect()
+    try {
+      await expiredLeaseClient.query('BEGIN')
+      await expiredLeaseClient.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      await expiredLeaseClient.query(
+        `INSERT INTO operations_commerce_store_sync_read_leases (
+           id, organization_id, integration_account_id, authority_kind,
+           read_kind, intent_fingerprint_sha256,
+           control_revision, activation_revision, acquired_by,
+           acquired_at, heartbeat_at, expires_at
+         ) VALUES (
+           gen_random_uuid(), $1::uuid, $2::uuid, 'automatic',
+           'order_history', repeat('f', 64),
+           (SELECT revision FROM operations_commerce_store_sync_controls
+            WHERE organization_id = $1::uuid
+              AND integration_account_id = $2::uuid),
+           (SELECT revision FROM operations_activation_scopes
+            WHERE organization_id = $1::uuid),
+           $3,
+           clock_timestamp() - interval '61 seconds',
+           clock_timestamp() - interval '61 seconds',
+           clock_timestamp() - interval '1 second'
+         )`,
+        [active.organizationId, active.accountId, actorEmail],
+      )
+      await expiredLeaseClient.query('COMMIT')
+      assert.equal(await storeSyncStructureHealth(pool), false)
+      const reconciled = await persistence
+        .reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres()
+      assert.equal(reconciled.reconciled, 1)
+      assert.equal(await storeSyncStructureHealth(pool), true)
+    } finally {
+      await expiredLeaseClient.query('ROLLBACK').catch(() => {})
+      expiredLeaseClient.release()
+    }
+    assert.equal(await storeSyncStructureHealth(pool), true)
 
     const structural = await pool.query(
       `SELECT

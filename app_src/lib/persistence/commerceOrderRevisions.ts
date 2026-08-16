@@ -25,6 +25,10 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 const REVISION_INTERVAL = '30 minutes'
@@ -80,6 +84,7 @@ export type CommerceOrderRevisionClaim = Readonly<{
 
 export type CommerceOrderRevisionObservationInput = Readonly<{
   claim: CommerceOrderRevisionClaim
+  providerReadLease: CommerceStoreSyncProviderReadLease
   sourceRevision: string
   sourceHash: string
   revisionHash: string
@@ -1095,6 +1100,37 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
 ): Promise<CommerceOrderRevisionCaptureResult> {
   const observation = validatedObservation(input)
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.claim.organizationId,
+      integrationAccountId: input.claim.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: observation.trigger.kind === 'manager'
+        ? 'manual_read_only'
+        : 'automatic',
+      readKind: 'order_revision',
+    })
+    if (observation.trigger.kind === 'manager') {
+      const command = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM operations_command_receipts
+         WHERE id = $1::uuid
+           AND organization_id = $2::uuid
+           AND command_type = 'operations.commerce_order_revision.refresh'
+           AND actor_email = $3
+           AND target_global_id = $4
+           AND status = 'processing'
+         FOR UPDATE`,
+        [
+          observation.trigger.commandReceiptId,
+          input.claim.organizationId,
+          observation.trigger.actorEmail,
+          input.claim.canonicalOrderGlobalId,
+        ],
+      )
+      if (!command.rows[0]) {
+        throw new Error('Manager order revision command authority is stale')
+      }
+    }
     // Match the Operations command lock order: canonical order first, then
     // revision target. This prevents order->target versus target->order
     // deadlocks while making capture row-version checks atomic.
@@ -1132,6 +1168,8 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = account.organization_id
        WHERE target.id = $1::uuid
          AND target.organization_id = $2::uuid
          AND target.claim_state = 'processing'
@@ -1140,8 +1178,10 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
          AND target.locked_until > now()
          AND credential.verification_status = 'verified'
          AND credential.credential_version = account.commerce_credential_generation
-         AND ${STORE_SYNC_RUNNING_SQL}
-       FOR UPDATE OF target, account, credential`,
+         AND ${observation.trigger.kind === 'manager'
+           ? "activation.state NOT IN ('disabled', 'frozen')"
+           : STORE_SYNC_RUNNING_SQL}
+       FOR UPDATE OF target, account, credential, activation`,
       [
         input.claim.targetId,
         input.claim.organizationId,
@@ -1422,6 +1462,48 @@ export async function failCommerceOrderRevisionTargetInPostgres(input: {
     ],
   )
   return result.rows[0]?.claim_state || null
+}
+
+export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres(
+  input: {
+    claim: CommerceOrderRevisionClaim
+    workerId: string
+  },
+) {
+  validateClaim(input.claim)
+  const workerId = boundedText(
+    input.workerId,
+    'Commerce order revision worker ID',
+    200,
+  )
+  if (workerId !== input.claim.workerId) {
+    throw new Error('Commerce order revision pause disposition is invalid')
+  }
+  const result = await query(
+    `UPDATE operations_commerce_order_revision_targets
+     SET claim_state = 'ready',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         next_check_at = now(),
+         locked_by = NULL,
+         lock_token = NULL,
+         locked_until = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         row_version = row_version + 1,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND organization_id = $2::uuid
+       AND claim_state = 'processing'
+       AND locked_by = $3
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.claim.targetId,
+      input.claim.organizationId,
+      workerId,
+      input.claim.leaseToken,
+    ],
+  )
+  return result.rowCount === 1
 }
 
 export class CommerceOrderRevisionGateError extends Error {

@@ -6,6 +6,7 @@ export type CommerceStoreSyncEffectiveReason =
   | 'STORE_SYNC_CONTROL_MISSING'
   | 'STORE_SYNC_ACCOUNT_UNAVAILABLE'
   | 'STORE_SYNC_EXPLICIT_RUNNING'
+  | 'STORE_SYNC_EXPLICIT_PAUSED_DRAINING'
   | 'STORE_SYNC_EXPLICIT_PAUSED'
   | 'STORE_SYNC_LEGACY_SHADOW_RUNNING'
   | 'STORE_SYNC_LEGACY_ACTIVE_RUNNING'
@@ -42,14 +43,64 @@ export type CommerceStoreSyncPendingCommand = {
   idempotencyKey: string
 }
 
+export type CommerceStoreSyncCommandState = {
+  accountGlobalId: string
+  desiredState: CommerceStoreSyncDesiredState
+  explicitChoice: boolean
+  revision: number | null
+  reason: string | null
+}
+
+export class CommerceStoreSyncHttpError extends Error {
+  readonly status: number
+  readonly code: string | null
+
+  constructor(status: number, message: string, code?: string | null) {
+    super(message)
+    this.name = 'CommerceStoreSyncHttpError'
+    this.status = status
+    this.code = code || null
+  }
+}
+
+export type CommerceStoreSyncPendingResolution =
+  | 'applied'
+  | 'definitive_rejection'
+  | 'retain_exact_retry'
+
 export function commerceStoreSyncControlMatchesCommand(
-  control: CommerceStoreSyncControl,
+  control: CommerceStoreSyncCommandState,
   command: CommerceStoreSyncPendingCommand,
 ) {
   return control.accountGlobalId === command.accountGlobalId
     && control.desiredState === command.desiredState
     && control.explicitChoice === true
     && control.revision === command.expectedRevision + 1
+    && control.reason === command.reason
+}
+
+export function commerceStoreSyncHttpFailureIsDefinitive(status: number) {
+  return status >= 400
+    && status < 500
+    && status !== 408
+    && status !== 425
+    && status !== 429
+}
+
+export function commerceStoreSyncPendingResolution(
+  refreshedControl: CommerceStoreSyncCommandState | null | undefined,
+  command: CommerceStoreSyncPendingCommand,
+  failure: unknown,
+): CommerceStoreSyncPendingResolution {
+  if (
+    refreshedControl
+    && commerceStoreSyncControlMatchesCommand(refreshedControl, command)
+  ) return 'applied'
+  if (
+    failure instanceof CommerceStoreSyncHttpError
+    && commerceStoreSyncHttpFailureIsDefinitive(failure.status)
+  ) return 'definitive_rejection'
+  return 'retain_exact_retry'
 }
 
 export const COMMERCE_STORE_SYNC_EFFECTIVE_REASON_LABELS:
@@ -64,6 +115,8 @@ Record<CommerceStoreSyncEffectiveReason, string> = {
     'Paused because this commerce connection is not active.',
   STORE_SYNC_EXPLICIT_RUNNING:
     'Running by an explicit Store sync choice.',
+  STORE_SYNC_EXPLICIT_PAUSED_DRAINING:
+    'Paused for new automatic reads; pre-existing provider reads are draining.',
   STORE_SYNC_EXPLICIT_PAUSED:
     'Paused by an explicit Store sync choice.',
   STORE_SYNC_LEGACY_SHADOW_RUNNING:

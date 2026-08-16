@@ -93,6 +93,23 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/operations/commerceStoreSync.ts',
         )
       }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '00000000-0000-4000-8000-000000000298',
+              organizationId: input.organizationId,
+              integrationAccountId: input.integrationAccountId,
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            })
+          },
+        }
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -2355,7 +2372,8 @@ includes(workflowSource, [
   'Choose product decision',
   'automatic identity across Shopify and Faire',
   'automation never guesses that two source records are',
-  'Catalog reads continue in',
+  'This saved choice is independent of whether automatic',
+  'While Store sync is Paused, no automatic catalog',
   'retain unmatched products',
   "'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'",
   'payload.command?.productIntake',

@@ -181,6 +181,10 @@ const auditWriterMock = {
   },
 }
 
+const commerceStoreSyncMock = {
+  async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+}
+
 const suiteCrmProductImageProjection = loadTypeScriptModule(
   'app_src/lib/persistence/suiteCrmProductImageProjection.ts',
   {
@@ -198,10 +202,21 @@ const imageImports = loadTypeScriptModule(
     '@/lib/auditWriter': auditWriterMock,
     '@/lib/crm/productImageAssets': productImageAssets,
     '@/lib/persistence/postgres': persistenceMock,
+    '@/lib/persistence/commerceStoreSync': commerceStoreSyncMock,
     '@/lib/persistence/suiteCrmProductImageProjection':
       suiteCrmProductImageProjection,
   },
 )
+for (const exportName of [
+  'reconcileCommerceProductImageSetInPostgres',
+  'reconcileCommerceProductImageSetWithClient',
+]) {
+  const original = imageImports[exportName]
+  imageImports[exportName] = (input, ...rest) => original({
+    providerReadAuthority: 'automatic',
+    ...input,
+  }, ...rest)
+}
 const crmImageAssets = loadTypeScriptModule(
   'app_src/lib/persistence/crmProductImageAssets.ts',
   {
@@ -432,6 +447,7 @@ function observationInput(tenant, values) {
     sourceHash: values.sourceHash,
     observedAt: values.observedAt ?? nextObservationTimestamp(),
     actorEmail: values.actorEmail ?? tenant.actorEmail,
+    providerReadAuthority: values.providerReadAuthority ?? 'automatic',
     maxAttempts: values.maxAttempts,
   }
 }
@@ -451,6 +467,7 @@ function imageSetInput(tenant, values) {
     observedAt: observation.observedAt,
     providerUpdatedAt: observation.providerUpdatedAt,
     actorEmail: observation.actorEmail,
+    providerReadAuthority: observation.providerReadAuthority,
     maxAttempts: observation.maxAttempts,
     images: removed ? [] : [{
       providerImageId: observation.providerImageId,
@@ -497,6 +514,16 @@ async function completeClaim(claim, bytes, mimeType, sourceEvidence = {}) {
     sourceByteLength: sourceEvidence.sourceByteLength ?? bytes.byteLength,
     sourceContentSha256: sourceEvidence.sourceContentSha256 ?? sha256(bytes),
     normalizationVersion: sourceEvidence.normalizationVersion ?? 'identity-v1',
+    providerReadLease: {
+      id: randomUUID(),
+      organizationId: claim.organizationId,
+      integrationAccountId: claim.integrationAccountId,
+      authorityKind: claim.providerReadAuthority || 'automatic',
+      readKind: 'product_image_import',
+      controlRevision: 1,
+      activationRevision: 1,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    },
   })
 }
 
@@ -825,11 +852,12 @@ async function verifyImports(pool) {
          organization_id, integration_account_id, provider,
          credential_generation, external_product_id, product_source_hash,
          image_set_complete, image_identity_count,
-         image_identity_set_sha256, snapshot_sha256, observed_at, created_by
+         image_identity_set_sha256, snapshot_sha256, observed_at,
+         provider_read_authority, created_by
        ) VALUES (
          $1::uuid, $2::uuid, 'shopify', 1,
          'gid://shopify/Product/100', $3, true, 1, $4, $5,
-         clock_timestamp(), $6
+         clock_timestamp(), 'automatic', $6
        ) RETURNING id::text`,
       [
         alpha.organizationId,
@@ -2210,6 +2238,63 @@ async function verifyImports(pool) {
   const setClock = Date.now() - 120_000
   const setObservedAt = (offsetSeconds) =>
     new Date(setClock + offsetSeconds * 1_000).toISOString()
+  await addProduct(pool, alpha, {
+    key: 'manual-authority-set',
+    name: 'Manual authority set product',
+    externalProductId: 'gid://shopify/Product/610',
+    variants: ['gid://shopify/ProductVariant/611'],
+  })
+  const manualAuthoritySetInput = {
+    ...setBase,
+    externalProductId: 'gid://shopify/Product/610',
+    observedAt: setObservedAt(5),
+    productSourceHash: sha256('manual-authority-product-source'),
+    imageSetComplete: true,
+    providerReadAuthority: 'manual_read_only',
+    images: [{
+      providerImageId: 'manual-authority-image',
+      locatorSha256: sha256('manual-authority-locator'),
+      sequence: 0,
+      altText: 'Manual authority image',
+      sourceHash: sha256('manual-authority-source'),
+    }],
+  }
+  const manualAuthoritySet = await imageImports
+    .reconcileCommerceProductImageSetInPostgres(manualAuthoritySetInput)
+  assert.equal(manualAuthoritySet.active.length, 1)
+  const manualAuthorityEvidence = await pool.query(
+    `SELECT observation_set.provider_read_authority AS set_authority,
+            job.provider_read_authority AS job_authority
+     FROM operations_commerce_product_image_observation_sets observation_set
+     JOIN operations_commerce_product_image_observations observation
+       ON observation.organization_id = observation_set.organization_id
+      AND observation.integration_account_id =
+            observation_set.integration_account_id
+      AND observation.observation_set_id = observation_set.id
+     JOIN operations_commerce_product_image_import_jobs job
+       ON job.organization_id = observation.organization_id
+      AND job.integration_account_id = observation.integration_account_id
+      AND job.observation_id = observation.id
+     WHERE observation_set.organization_id = $1::uuid
+       AND observation_set.integration_account_id = $2::uuid
+       AND observation_set.external_product_id =
+             'gid://shopify/Product/610'`,
+    [alpha.organizationId, alpha.accountId],
+  )
+  assert.deepEqual(manualAuthorityEvidence.rows, [{
+    set_authority: 'manual_read_only',
+    job_authority: 'manual_read_only',
+  }])
+  const manualAuthorityReplay = await imageImports
+    .reconcileCommerceProductImageSetInPostgres(manualAuthoritySetInput)
+  assert.equal(manualAuthorityReplay.active[0].replayed, true)
+  await assertImportCode(
+    imageImports.reconcileCommerceProductImageSetInPostgres({
+      ...manualAuthoritySetInput,
+      providerReadAuthority: 'automatic',
+    }),
+    'COMMERCE_PRODUCT_IMAGE_SNAPSHOT_AUTHORITY_CONFLICT',
+  )
   await assertImportCode(
     imageImports.reconcileCommerceProductImageSetInPostgres({
       ...setBase,
@@ -2555,8 +2640,8 @@ async function verifyImports(pool) {
     observations: 0,
   })
 
-  // A claim is fenced to the exact activation revision. Freezing Operations
-  // after the claim must prevent persistence without losing the durable work.
+  // Frozen is an emergency override for both automatic and permissioned manual
+  // provider-read authority. Freezing after claim must reject local capture.
   const frozenProduct = await addProduct(pool, gamma, {
     key: 'activation-freeze',
     name: 'Activation freeze product',
@@ -2586,7 +2671,7 @@ async function verifyImports(pool) {
   )
   await assertImportCode(
     completeClaim(frozenClaim, ONE_PIXEL_PNG, 'image/png'),
-    'COMMERCE_PRODUCT_IMAGE_FENCE_STALE',
+    'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
   )
   const frozenWrites = await pool.query(
     `SELECT

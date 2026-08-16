@@ -19,6 +19,10 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const INVENTORY_POOL_NAME = 'Shopify Available-to-Promise'
 const INVENTORY_LOT_CODE = 'SHOPIFY_ATP'
@@ -66,18 +70,27 @@ export class CommerceInventoryPersistenceError extends Error {
   }
 }
 
-async function lockShopifyInventoryStoreSyncRunning(
+type ShopifyInventoryProviderReadAuthority =
+  | 'automatic'
+  | 'manual_read_only'
+
+async function lockShopifyInventoryProviderReadAuthority(
   client: PoolClient,
   runtime: Pick<
     CommerceRuntimeCredentialRecord,
     'organizationId' | 'integrationAccountId'
   >,
+  authority: ShopifyInventoryProviderReadAuthority,
 ) {
-  const result = await client.query<{ effective_reason: string }>(
+  const result = await client.query<{
+    effective_reason: string
+    activation_state: string
+  }>(
     `SELECT operations_commerce_store_sync_effective_reason(
        account.organization_id,
        account.id
-     ) AS effective_reason
+     ) AS effective_reason,
+       activation.state AS activation_state
      FROM operations_integration_accounts account
      JOIN operations_commerce_store_sync_controls control
        ON control.organization_id = account.organization_id
@@ -88,13 +101,17 @@ async function lockShopifyInventoryStoreSyncRunning(
        AND account.id = $2::uuid
        AND account.integration_type = 'commerce'
        AND account.provider = 'shopify'
-       AND operations_commerce_store_sync_is_running(
-         account.organization_id,
-         account.id
+       AND activation.state NOT IN ('disabled', 'frozen')
+       AND (
+         $3 = 'manual_read_only'
+         OR operations_commerce_store_sync_is_running(
+           account.organization_id,
+           account.id
+         )
        )
      LIMIT 1
      FOR UPDATE OF account, control, activation`,
-    [runtime.organizationId, runtime.integrationAccountId],
+    [runtime.organizationId, runtime.integrationAccountId, authority],
   )
   if (!result.rows[0]) {
     persistenceError(
@@ -179,6 +196,7 @@ export type ShopifyInventoryAttempt = {
   replayed: boolean
   captured: boolean
   leaseToken: string | null
+  providerReadAuthority: ShopifyInventoryProviderReadAuthority
 }
 
 export type ShopifyInventoryRefreshExpectedFence = {
@@ -672,6 +690,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
   idempotencyKey: string
   requestHash: string
   actorEmail: string | null
+  providerReadAuthority: ShopifyInventoryProviderReadAuthority
 }): Promise<ShopifyInventoryAttempt> {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -819,9 +838,14 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
         replayed: true,
         captured: true,
         leaseToken: null,
+        providerReadAuthority: input.providerReadAuthority,
       }
     }
-    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.providerReadAuthority,
+    )
     if (latest?.state === 'prepared') {
       if (latest.captured) {
         const leaseToken = await capturedAttemptLease(latest)
@@ -834,6 +858,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           replayed: false,
           captured: true,
           leaseToken,
+          providerReadAuthority: input.providerReadAuthority,
         }
       }
       if (latest.lease_is_live) {
@@ -931,6 +956,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           replayed: false,
           captured: true,
           leaseToken,
+          providerReadAuthority: input.providerReadAuthority,
         }
       }
       if (active.lease_is_live) {
@@ -1008,6 +1034,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           providerWrites: 0,
           orderQuantityAdjustment: 0,
           readOnly: true,
+          providerReadAuthority: input.providerReadAuthority,
         }),
         attemptNumber,
         input.actorEmail,
@@ -1022,6 +1049,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       replayed: false,
       captured: false,
       leaseToken: inserted.rows[0].lease_token,
+      providerReadAuthority: input.providerReadAuthority,
     }
   })
 }
@@ -1134,6 +1162,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
   requestHash: string
   snapshot: ShopifyInventorySnapshot
   actorEmail: string | null
+  providerReadLease: CommerceStoreSyncProviderReadLease
 }): Promise<ShopifyInventoryCapture> {
   if (!input.attempt.leaseToken) {
     persistenceError(
@@ -1155,6 +1184,13 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
     )
   }
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.runtime.organizationId,
+      integrationAccountId: input.runtime.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: input.attempt.providerReadAuthority,
+      readKind: 'shopify_inventory',
+    })
     await acquireTransactionAdvisoryLock(
       client,
       [
@@ -1216,9 +1252,15 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         }),
       }
     }
-    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
-    const lease = await client.query(
-      `SELECT id
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.attempt.providerReadAuthority,
+    )
+    const lease = await client.query<{ provider_read_authority: string }>(
+      `SELECT id,
+              redacted_request->>'providerReadAuthority'
+                AS provider_read_authority
        FROM operations_commerce_provider_attempts
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -1243,6 +1285,14 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
       persistenceError(
         'SHOPIFY_INVENTORY_READ_LEASE_LOST',
         'The Shopify inventory response arrived after its durable lease ended',
+        409,
+      )
+    }
+    if (lease.rows[0]?.provider_read_authority
+        !== input.attempt.providerReadAuthority) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_READ_AUTHORITY_INVALID',
+        'The durable Shopify inventory read authority does not match this capture',
         409,
       )
     }
@@ -1422,9 +1472,27 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
        AND state = 'prepared'
        AND lease_token = $5::uuid
        AND lease_expires_at > clock_timestamp()
-       AND operations_commerce_store_sync_is_running(
-         organization_id,
-         integration_account_id
+       AND redacted_request->>'providerReadAuthority' = $6
+       AND EXISTS (
+         SELECT 1
+         FROM operations_integration_accounts account
+         JOIN operations_commerce_store_sync_controls control
+           ON control.organization_id = account.organization_id
+          AND control.integration_account_id = account.id
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = account.organization_id
+         WHERE account.organization_id =
+                 operations_commerce_provider_attempts.organization_id
+           AND account.id =
+                 operations_commerce_provider_attempts.integration_account_id
+           AND activation.state NOT IN ('disabled', 'frozen')
+           AND (
+             $6 = 'manual_read_only'
+             OR operations_commerce_store_sync_is_running(
+               account.organization_id,
+               account.id
+             )
+           )
        )
      RETURNING id`,
     [
@@ -1433,6 +1501,7 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
       input.attempt.id,
       SYNC_ACTION,
       input.attempt.leaseToken,
+      input.attempt.providerReadAuthority,
     ],
   )
   return renewed.rowCount === 1
@@ -1557,7 +1626,11 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         replayed: true,
       }
     }
-    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.attempt.providerReadAuthority,
+    )
     if (input.expectedRefreshFence) {
       const expected = input.expectedRefreshFence
       const refreshFence = await client.query(
@@ -1687,6 +1760,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       lease_expires_at: Date | null
       lease_is_live: boolean
       state: string
+      provider_read_authority: string | null
     }>(
       `SELECT capture.request_hash, capture.snapshot_hash,
               capture.provider_location_id, capture.level_count,
@@ -1698,7 +1772,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
                 AND attempt.lease_expires_at IS NOT NULL
                 AND attempt.lease_expires_at > clock_timestamp()
               ) AS lease_is_live,
-              attempt.state
+              attempt.state,
+              attempt.redacted_request->>'providerReadAuthority'
+                AS provider_read_authority
        FROM operations_commerce_inventory_captures capture
        JOIN operations_commerce_provider_attempts attempt
          ON attempt.organization_id = capture.organization_id
@@ -1731,6 +1807,8 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       || captured.location_id !== input.target.location.id
       || captured.credential_version !== input.runtime.credentialVersion
       || captured.adapter_version !== SHOPIFY_INVENTORY_ADAPTER_VERSION
+      || captured.provider_read_authority
+        !== input.attempt.providerReadAuthority
       || !input.attempt.leaseToken
       || captured.lease_token !== input.attempt.leaseToken
       || !captured.lease_is_live

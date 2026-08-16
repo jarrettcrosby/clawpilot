@@ -9,6 +9,11 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const POLL_INTERVAL = '30 minutes'
 const POLL_LEASE = '10 minutes'
@@ -200,7 +205,6 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
                  job.credential_version
              AND credential.credential_version = job.credential_version
              AND credential.verification_status = 'verified'
-             AND ${STORE_SYNC_RUNNING_SQL}
              AND activation.revision = job.activation_revision
              AND ${REQUESTED_READ_ACCOUNT_SQL}
          )`,
@@ -539,6 +543,9 @@ async function lockCurrentJob(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls store_sync
+         ON store_sync.organization_id = account.organization_id
+        AND store_sync.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
        WHERE job.id = $1::uuid
@@ -556,7 +563,8 @@ async function lockCurrentJob(
          AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
-       FOR UPDATE OF job`,
+       FOR UPDATE OF job
+       FOR SHARE OF store_sync`,
       [
         target.id,
         target.organizationId,
@@ -572,10 +580,10 @@ async function lockCurrentJob(
 export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
   input: {
     target: FaireInventoryPollTarget
-    read: () => Promise<T>
+    read: (lease: CommerceStoreSyncProviderReadLease) => Promise<T>
   },
 ) {
-  return withTransaction(async (client) => {
+  const current = await withTransaction(async (client) => {
     const current = await client.query(
       `SELECT job.id
        FROM operations_faire_inventory_poll_jobs job
@@ -585,6 +593,9 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls store_sync
+         ON store_sync.organization_id = account.organization_id
+        AND store_sync.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
        WHERE job.id = $1::uuid
@@ -604,7 +615,7 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
          AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
-       FOR SHARE OF job, account, credential, activation`,
+       FOR SHARE OF job, account, credential, store_sync, activation`,
       [
         input.target.id,
         input.target.organizationId,
@@ -620,15 +631,28 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
         { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
       )
     }
-    // Keep shared locks only around the bounded provider GETs. Activation,
-    // account, or credential mutation must wait, so no read starts after its
-    // authorization fence changes.
-    return input.read()
+    return true
+  })
+  if (!current) {
+    throw Object.assign(
+      new Error('Faire inventory polling authority changed'),
+      { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
+    )
+  }
+  return withCommerceStoreSyncProviderReadFenceInPostgres({
+    organizationId: input.target.organizationId,
+    integrationAccountId: input.target.integrationAccountId,
+    authorityKind: 'automatic',
+    readKind: 'faire_inventory_poll',
+    intentKey: `${input.target.id}:${input.target.lockToken}`,
+    acquiredBy: 'system:faire-inventory-poll',
+    read: input.read,
   })
 }
 
 export async function completeFaireInventoryPollPageInPostgres(input: {
   target: FaireInventoryPollTarget
+  providerReadLease?: CommerceStoreSyncProviderReadLease
   selectors: FaireInventoryPollSelector[]
   observations: FaireInventoryObservation[]
   hasMore: boolean
@@ -652,6 +676,21 @@ export async function completeFaireInventoryPollPageInPostgres(input: {
     throw new Error('Faire inventory continuation selector is invalid')
   }
   return withTransaction(async (client) => {
+    if (input.selectors.length > 0) {
+      if (!input.providerReadLease) {
+        throw Object.assign(
+          new Error('Faire inventory provider-read lease evidence is required'),
+          { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
+        )
+      }
+      await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+        organizationId: input.target.organizationId,
+        integrationAccountId: input.target.integrationAccountId,
+        lease: input.providerReadLease,
+        authorityKind: 'automatic',
+        readKind: 'faire_inventory_poll',
+      })
+    }
     const job = await lockCurrentJob(client, input.target)
     if (!job) {
       return { leaseLost: true, completed: false, continued: false }
@@ -905,6 +944,50 @@ export async function failFaireInventoryPollJobInPostgres(input: {
       })
     }
     return { leaseLost: false, dead, retrying: !dead, errorCode }
+  })
+}
+
+export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
+  target: FaireInventoryPollTarget
+}) {
+  return withTransaction(async (client) => {
+    const parked = await client.query(
+      `UPDATE operations_faire_inventory_poll_jobs
+       SET status = 'pending',
+           attempt_count = GREATEST(0, attempt_count - 1),
+           available_at = clock_timestamp(),
+           locked_at = NULL,
+           locked_by = NULL,
+           lock_token = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+           completed_at = NULL,
+           updated_at = clock_timestamp()
+       WHERE id = $1::uuid
+         AND organization_id = $3::uuid
+         AND integration_account_id = $4::uuid
+         AND status = 'processing'
+         AND lock_token = $2::uuid
+       RETURNING id`,
+      [
+        input.target.id,
+        input.target.lockToken,
+        input.target.organizationId,
+        input.target.integrationAccountId,
+      ],
+    )
+    if (parked.rowCount !== 1) return { leaseLost: true, parked: false }
+    await client.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'idle',
+           last_error_code = NULL,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'inventory'`,
+      [input.target.organizationId, input.target.integrationAccountId],
+    )
+    return { leaseLost: false, parked: true }
   })
 }
 

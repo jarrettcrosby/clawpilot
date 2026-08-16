@@ -12,6 +12,10 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -150,6 +154,8 @@ async function readTargetWithClient(
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = account.organization_id
      JOIN crm_products product
        ON product.pipeline_id = channel_state.pipeline_id
       AND product.id = channel_state.product_id
@@ -177,16 +183,13 @@ async function readTargetWithClient(
        AND account.integration_type = 'commerce'
        AND account.provider = 'faire'
        AND account.status = 'active'
-       AND operations_commerce_store_sync_is_running(
-         account.organization_id,
-         account.id
-       )
+       AND activation.state NOT IN ('disabled', 'frozen')
        AND credential.verification_status = 'verified'
        AND credential.external_account_id = account.external_account_id
        AND credential.credential_version =
              account.commerce_credential_generation
      LIMIT 1${input.lock
-      ? ' FOR SHARE OF channel_state, account, credential, product, product_mapping'
+      ? ' FOR SHARE OF channel_state, account, credential, activation, product, product_mapping'
       : ''}`,
     [input.organizationId, input.productId, input.channelStateGlobalId],
   )
@@ -232,8 +235,16 @@ export async function reconcileExactFaireProductImageRefreshInPostgres(input: {
   productSourceHash: string
   actorEmail: string
   images: ReconcileCommerceProductImageSetInput['images']
+  providerReadLease: CommerceStoreSyncProviderReadLease
 }): Promise<ReconcileCommerceProductImageSetResult> {
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.target.organizationId,
+      integrationAccountId: input.target.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'manual_read_only',
+      readKind: 'product_image_import',
+    })
     await acquireTransactionAdvisoryLock(
       client,
       `faire-product-image-refresh:${input.target.organizationId}:${input.target.channelStateGlobalId}`,
@@ -265,6 +276,7 @@ export async function reconcileExactFaireProductImageRefreshInPostgres(input: {
       imageSetComplete: false,
       observedAt: input.observedAt,
       actorEmail: input.actorEmail,
+      providerReadAuthority: 'manual_read_only',
       images: input.images,
     }, client)
   })

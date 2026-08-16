@@ -224,6 +224,9 @@ const historyRuntime = loadTypeScript(
         }
       },
     },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
+    },
   },
 )
 
@@ -1093,6 +1096,9 @@ const adapterHistoryRuntime = loadTypeScript(
         encrypted: {},
       }),
     },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
+    },
   },
 )
 const shopifyTrackingDetail = (trackingNumber, revision, status = 'SUCCESS') => ({
@@ -1689,6 +1695,9 @@ const workerRuntime = loadTypeScript(
       async readCommerceOrderSyncCursorKeyReadinessFromPostgres() {
         return { ready: true, referencedKeyIds: [] }
       },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
     },
   },
 )

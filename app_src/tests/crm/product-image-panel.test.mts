@@ -19,6 +19,13 @@ const faireProductImageRoute = readFileSync(
   ),
   'utf8',
 )
+const shopifyPublishing = panel.slice(
+  panel.indexOf('data-testid="crm-shopify-image-publishing"'),
+)
+const fairePublishing = panel.slice(
+  panel.indexOf('data-testid="crm-faire-image-publishing"'),
+  panel.indexOf('data-testid="crm-shopify-image-publishing"'),
+)
 
 test('Product image panel uses the manager-scoped immutable asset API', () => {
   assert.match(
@@ -101,7 +108,7 @@ test('Shopify publishing stays Shadow and requires one exact resource authorizat
   assert.match(panel, /expectedAssetRowVersion/)
   assert.match(panel, /expectedAssetContentSha256/)
   assert.match(panel, /shadowSimulationEffectGlobalId/)
-  assert.doesNotMatch(panel, /idempotencyKey/)
+  assert.doesNotMatch(shopifyPublishing, /idempotencyKey/)
   assert.match(panel, /Shopify received zero writes/)
   assert.match(
     panel,
@@ -142,7 +149,55 @@ test('Faire publishing requires exact Shadow simulation and a one-use two-write 
   assert.match(panel, /state: 'reconciliation_required'/)
   assert.match(panel, /The Faire effect identity was retained/)
   assert.match(panel, /if \(!executeProviderWrite\) setFaireProjection\(null\)/)
-  assert.doesNotMatch(panel, /faire.*idempotencyKey/is)
+  assert.doesNotMatch(fairePublishing, /idempotencyKey/)
+})
+
+test('explicit Faire refresh remains available while automatic Store sync is paused', () => {
+  assert.match(panel, /MANUAL_FAIRE_READ_ALLOWED_REASONS/)
+  assert.match(panel, /'STORE_SYNC_EXPLICIT_PAUSED'/)
+  assert.match(panel, /'STORE_SYNC_EXPLICIT_PAUSED_DRAINING'/)
+  assert.match(panel, /'STORE_SYNC_LEGACY_READ_ONLY_PAUSED'/)
+  assert.doesNotMatch(
+    panel.slice(
+      panel.indexOf('const MANUAL_FAIRE_READ_ALLOWED_REASONS'),
+      panel.indexOf('const RECOVERY_OUTCOMES'),
+    ),
+    /OPERATIONS_(?:DISABLED|FROZEN)_OVERRIDE/,
+  )
+  assert.match(panel, /selectedFaireManualReadAllowed/)
+  assert.match(panel, /selectedFaireStoreSyncNormallyPaused/)
+  assert.match(
+    panel,
+    /Automatic Store sync remains paused, while this explicit[\s\S]*owner or administrator refresh remains available/,
+  )
+  assert.match(panel, /emergency override or[\s\S]*connection issue is resolved/)
+  assert.doesNotMatch(panel, /set Store sync[\s\S]*to Running before making a new Faire provider read/)
+  assert.match(
+    panel,
+    /state\?\.imageImportAvailable !== true[\s\S]*!selectedFaireManualReadAllowed[\s\S]*!selectedFaireChannelEvidence/,
+  )
+})
+
+test('explicit Faire refresh retries one exact idempotent command', () => {
+  assert.match(panel, /const pendingFaireRefresh = useRef/)
+  assert.match(panel, /const fingerprint = JSON\.stringify\(command\)/)
+  assert.match(
+    panel,
+    /pendingFaireRefresh\.current\?\.fingerprint !== fingerprint/,
+  )
+  assert.match(
+    panel,
+    /`faire-product-image-refresh:\$\{globalThis\.crypto\.randomUUID\(\)\}`/,
+  )
+  assert.match(panel, /body: JSON\.stringify\(\{ \.\.\.command, idempotencyKey \}\)/)
+  assert.match(
+    panel,
+    /response\.status >= 400 && response\.status < 500[\s\S]*pendingFaireRefresh\.current = null/,
+  )
+  assert.match(
+    panel,
+    /if \(!response\.ok \|\| payload\.ok !== true \|\| !payload\.refresh\)[\s\S]*throw new Error[\s\S]*pendingFaireRefresh\.current = null/,
+  )
 })
 
 test('Faire recovery survives reload and exposes only exact-effect readback', () => {

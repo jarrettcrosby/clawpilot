@@ -21,6 +21,10 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const POLICY_VERSION = 'commerce-order-sync-policy-v1'
 const BACKFILL_LEASE = '10 minutes'
@@ -1687,7 +1691,6 @@ export async function claimCommerceOrderBackfillsInPostgres(input: {
             AND policy.authority = 'provider'
            JOIN operations_activation_scopes activation
              ON activation.organization_id = account.organization_id
-            AND ${STORE_SYNC_RUNNING_SQL}
            WHERE account.organization_id = session.organization_id
              AND account.id = session.integration_account_id
              AND account.integration_type = 'commerce'
@@ -2019,6 +2022,7 @@ export async function readCommerceOrderBackfillCursorFromPostgres(
 
 export async function appendCommerceOrderBackfillPageInPostgres(input: {
   job: CommerceOrderBackfillJob
+  providerReadLease: CommerceStoreSyncProviderReadLease
   pageNumber: number
   providerRecordsSeen: number
   observations: readonly CommerceOrderObservationInput[]
@@ -2135,6 +2139,13 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       ? 'available'
       : 'unavailable'
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.job.organizationId,
+      integrationAccountId: input.job.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'automatic',
+      readKind: 'order_history',
+    })
     const session = (
       await client.query<{
         id: string
@@ -2547,6 +2558,40 @@ export async function failCommerceOrderBackfillInPostgres(input: {
     leaseLost: false,
     status: result.rows[0].status,
     code,
+    providerWrites: 0 as const,
+  }
+}
+
+export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
+  input: { job: CommerceOrderBackfillJob },
+) {
+  const result = await query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'pending',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         completed_at = NULL,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND global_id = $3
+       AND status = 'processing'
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.job.organizationId,
+      input.job.id,
+      input.job.globalId,
+      input.job.lockToken,
+    ],
+  )
+  return {
+    parked: result.rowCount === 1,
     providerWrites: 0 as const,
   }
 }

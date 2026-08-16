@@ -583,6 +583,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(firstImageDelete)), {
   observedAt: durableReceiptObservedAt,
   providerUpdatedAt: exactDeletion.providerUpdatedAt,
   actorEmail: 'owner@example.com',
+  providerReadAuthority: 'automatic',
 })
 
 replayExistingReceipt = false

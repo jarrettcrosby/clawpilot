@@ -91,7 +91,7 @@ if (
 
 if (
   String(rootPackage?.scripts?.['test:commerce-store-sync'] || '')
-    !== 'node scripts/test-commerce-store-sync-ui.mjs && node scripts/test-commerce-store-sync-controls-postgres.mjs'
+    !== 'node --experimental-strip-types --test app_src/tests/operations/commerce-store-sync-recovery.test.ts && node scripts/test-commerce-store-sync-ui.mjs && node scripts/test-commerce-store-sync-controls-postgres.mjs && node scripts/test-commerce-catalog-cursor-reconciliation-postgres.mjs'
 ) {
   fail(
     'test:commerce-store-sync must run the disposable PostgreSQL acceptance',
@@ -208,8 +208,10 @@ for (const requiredPath of [
   'db/migrations/0298_operations_commerce_store_sync_controls.sql',
   'app_src/lib/operations/commerceStoreSync.ts',
   'app_src/lib/persistence/commerceStoreSync.ts',
+  'app_src/tests/operations/commerce-store-sync-recovery.test.ts',
   'scripts/test-commerce-store-sync-controls-postgres.mjs',
   'scripts/test-commerce-store-sync-ui.mjs',
+  'scripts/test-commerce-catalog-cursor-reconciliation-postgres.mjs',
   'db/migrations/0274_operations_commerce_order_revision_apply.sql',
   'db/migrations/0275_operations_one_off_carrier_selection.sql',
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',

@@ -585,6 +585,7 @@ const workerClaims = [
 ]
 const captureCalls = []
 const failCalls = []
+const parkCalls = []
 const providerReadClaims = []
 const storeSyncAssertions = []
 let claimedInput = null
@@ -650,6 +651,25 @@ const workerModule = loadTypeScriptModule(
         failCalls.push(input)
         return 'failed'
       },
+      async parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres(input) {
+        parkCalls.push(input)
+        return true
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      CommerceStoreSyncProviderReadFenceError: class extends Error {},
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({
+          id: '00000000-0000-4000-8000-000000000298',
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          authorityKind: input.authorityKind,
+          readKind: input.readKind,
+          controlRevision: 1,
+          activationRevision: 1,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        })
+      },
     },
   },
 )
@@ -663,7 +683,8 @@ assert.equal(claimedInput.limit, 3)
 assert.equal(workerResult.claimed, 3)
 assert.equal(workerResult.captured, 1)
 assert.equal(workerResult.changed, 1)
-assert.equal(workerResult.failed, 2)
+assert.equal(workerResult.failed, 1)
+assert.equal(workerResult.parked, 1)
 assert.equal(workerResult.providerReadsPerCapture, 2)
 assert.equal(workerResult.providerWrites, 0)
 assert.equal(workerResult.canonicalOrderWrites, 0)
@@ -672,7 +693,6 @@ assert.deepEqual(
   { ...workerResult.failureCodes },
   {
     FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED: 1,
-    COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED: 1,
   },
 )
 assert.deepEqual(storeSyncAssertions, workerClaims.map(
@@ -685,15 +705,13 @@ assert.equal(captureCalls.length, 1)
 assert.equal(captureCalls[0].sourceHash, 'a'.repeat(64))
 assert.equal(captureCalls[0].providerReads, 2)
 assert.equal(captureCalls[0].providerWrites, 0)
-assert.equal(failCalls.length, 2)
+assert.equal(failCalls.length, 1)
 assert.equal(
   failCalls[0].errorCode,
   'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',
 )
-assert.equal(
-  failCalls[1].errorCode,
-  'COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED',
-)
+assert.equal(parkCalls.length, 1)
+assert.equal(parkCalls[0].claim, workerClaims[2])
 
 const workerSource = read('app_src/lib/commerceFaireOrderRevisionWorker.ts')
 assert.match(workerSource, /claimCommerceOrderRevisionTargetsInPostgres/u)
@@ -701,6 +719,7 @@ assert.match(workerSource, /assertCommerceOrderRevisionStoreSyncRunningInPostgre
 assert.match(workerSource, /CommerceOrderRevisionStoreSyncPausedError/u)
 assert.match(workerSource, /captureCommerceOrderRevisionObservationInPostgres/u)
 assert.match(workerSource, /failCommerceOrderRevisionTargetInPostgres/u)
+assert.match(workerSource, /parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres/u)
 assert.match(workerSource, /canonicalOrderWrites: 0 as const/u)
 assert.doesNotMatch(workerSource, /cancelFaireOrder|moveOrderToProcessing/u)
 

@@ -754,23 +754,33 @@ export default function ShopifyInventoryPanel({
   const [page, setPage] = useState(0)
   const syncIdempotencyKeys = useRef(new Map<string, string>())
   const mappingIdempotencyKeys = useRef(new Map<string, string>())
+  const loadIdempotencyKeys = useRef(new Map<string, string>())
   const rowsPerPage = 10
 
   const load = useCallback(async (
     signal?: AbortSignal,
     mappingGlobalId?: string,
   ) => {
+    const loadKey = mappingGlobalId || 'summary'
+    const requestIdempotencyKey =
+      loadIdempotencyKeys.current.get(loadKey) || idempotencyKey()
+    loadIdempotencyKeys.current.set(loadKey, requestIdempotencyKey)
     const params = new URLSearchParams({ accountGlobalId })
     if (mappingGlobalId) params.set('mappingGlobalId', mappingGlobalId)
     const response = await fetch(
       `/api/integrations/commerce/inventory?${params.toString()}`,
-      { cache: 'no-store', signal },
+      {
+        cache: 'no-store',
+        signal,
+        headers: { 'Idempotency-Key': requestIdempotencyKey },
+      },
     )
     const payload = await response.json() as InventoryPayload
     if (!response.ok || !payload.inventory) {
       throw new Error(payload.error || 'Shopify inventory is unavailable.')
     }
     setInventory(payload.inventory)
+    loadIdempotencyKeys.current.delete(loadKey)
     setSelectedMappingGlobalId((current) => {
       const mappings = payload.inventory?.mappings || []
       if (mappingGlobalId && mappings.some(
@@ -801,6 +811,7 @@ export default function ShopifyInventoryPanel({
     setWarehouseImport(null)
     syncIdempotencyKeys.current.clear()
     mappingIdempotencyKeys.current.clear()
+    loadIdempotencyKeys.current.clear()
     load(controller.signal)
       .catch((caught) => {
         if (

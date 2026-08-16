@@ -742,7 +742,6 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
                  = job.credential_version
                AND credential.credential_version = job.credential_version
                AND credential.verification_status = 'verified'
-               AND ${STORE_SYNC_RUNNING_SQL}
                AND ${PRODUCT_READABLE_CONNECTION_SQL}
            )
          )`,
@@ -1318,6 +1317,37 @@ export async function failCommerceCatalogSyncJobInPostgres(input: {
     }
     return { dead, leaseLost: false, code }
   })
+}
+
+export async function parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres(
+  input: { job: CommerceCatalogSyncJob },
+) {
+  const parked = await query(
+    `UPDATE operations_commerce_catalog_sync_jobs
+     SET status = 'pending',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         completed_at = NULL,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND organization_id = $2::uuid
+       AND integration_account_id = $3::uuid
+       AND status = 'processing'
+       AND lock_token = $4::uuid
+       AND cancel_requested = false
+     RETURNING id`,
+    [
+      input.job.id,
+      input.job.organizationId,
+      input.job.integrationAccountId,
+      input.job.lockToken,
+    ],
+  )
+  return { parked: parked.rowCount === 1 }
 }
 
 export async function readCommerceCatalogSyncStateWithClient(

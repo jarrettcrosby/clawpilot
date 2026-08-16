@@ -74,7 +74,7 @@ const worker = loadTypeScriptModule(
         fetchCommerceProviderImage: unused,
       },
       '@/lib/integrations/commerceProviderImageSource': {
-        readCurrentCommerceProviderImageSources: unused,
+        withCurrentCommerceProviderImageSources: unused,
         selectCommerceProviderImageSource: unused,
       },
       '@/lib/persistence/commerceProductImageImports': {
@@ -82,8 +82,12 @@ const worker = loadTypeScriptModule(
         claimCommerceProductImageImportJobsInPostgres: unused,
         completeCommerceProductImageImportJobInPostgres: unused,
         failCommerceProductImageImportJobInPostgres: unused,
+        parkCommerceProductImageImportForStoreSyncPauseInPostgres: unused,
         recordCommerceProductImageImportWorkerHeartbeatInPostgres: unused,
         resolveWaitingCommerceProductImageImportJobsInPostgres: unused,
+      },
+      '@/lib/persistence/commerceStoreSync': {
+        withCommerceStoreSyncProviderReadFenceInPostgres: unused,
       },
     },
   },
@@ -127,6 +131,7 @@ function claim(overrides = {}) {
     leaseToken: '88888888-8888-4888-8888-888888888888',
     leaseExpiresAt: '2026-08-01T12:02:00.000Z',
     actorEmail: 'operator@example.com',
+    providerReadAuthority: 'automatic',
     ...overrides,
   }
 }
@@ -202,11 +207,13 @@ function fixture(input = {}) {
     resolve: [],
     claims: [],
     currentChecks: [],
+    providerReadFences: [],
     reads: [],
     selections: [],
     fetches: [],
     completions: [],
     failures: [],
+    parks: [],
     heartbeats: [],
   }
   const sources = input.sources || [{
@@ -228,10 +235,28 @@ function fixture(input = {}) {
       state.currentChecks.push(args)
       if (input.currentError) throw input.currentError
     },
-    async readSources(args) {
+    async withProviderReadFence(args) {
+      state.providerReadFences.push({
+        organizationId: args.organizationId,
+        integrationAccountId: args.integrationAccountId,
+      })
+      if (input.providerReadFenceError) {
+        throw input.providerReadFenceError
+      }
+      return args.read()
+    },
+    async withSources(args) {
+      state.providerReadFences.push({
+        organizationId: args.organizationId,
+        accountGlobalId: args.accountGlobalId,
+        authorityKind: args.authorityKind,
+      })
+      if (input.providerReadFenceError) {
+        throw input.providerReadFenceError
+      }
       state.reads.push(args)
       if (input.readError) throw input.readError
-      return sources
+      return args.consume(sources)
     },
     selectSource(args) {
       state.selections.push(args)
@@ -268,6 +293,11 @@ function fixture(input = {}) {
         state: input.failureState || (args.retryable ? 'retry' : 'dead'),
         attemptCount: 1,
       }
+    },
+    async park(args) {
+      state.parks.push(args)
+      if (input.parkError) throw input.parkError
+      return { parked: input.parked !== false }
     },
     async heartbeat(args) {
       state.heartbeats.push(args)
@@ -381,11 +411,40 @@ test('Store sync pause after claim stops image provider reads and retries safely
     assert.equal(run.state.currentChecks.length, 1)
     assert.equal(run.state.reads.length, 0)
     assert.equal(run.state.fetches.length, 0)
-    assert.equal(run.state.failures.length, 1)
-    assert.equal(run.state.failures[0].retryable, true)
-    assert.equal(result.retried, 1)
+    assert.equal(run.state.failures.length, 0)
+    assert.equal(run.state.parks.length, 1)
+    assert.equal(result.parked, 1)
     assert.equal(
       result.errorCodes.COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED,
+      1,
+    )
+  },
+)
+
+test('committed Store sync Pause blocks the shared source and byte-read fence',
+  async () => {
+    const run = fixture({
+      providerReadFenceError: codedError(
+        'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+        409,
+        'Store sync is Paused for this commerce connection',
+      ),
+    })
+    const result = await worker.processCommerceProductImageImports(
+      { workerId: 'image-worker-provider-fence-paused' },
+      run.dependencies,
+    )
+
+    assert.equal(run.state.currentChecks.length, 1)
+    assert.equal(run.state.providerReadFences.length, 1)
+    assert.equal(run.state.reads.length, 0)
+    assert.equal(run.state.fetches.length, 0)
+    assert.equal(run.state.completions.length, 0)
+    assert.equal(run.state.failures.length, 0)
+    assert.equal(run.state.parks.length, 1)
+    assert.equal(result.parked, 1)
+    assert.equal(
+      result.errorCodes.COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED,
       1,
     )
   },
@@ -695,7 +754,7 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
   for (const fragment of [
     'resolveWaitingCommerceProductImageImportJobsInPostgres',
     'claimCommerceProductImageImportJobsInPostgres',
-    'readCurrentCommerceProviderImageSources',
+    'withCurrentCommerceProviderImageSources',
     'selectCommerceProviderImageSource',
     'fetchCommerceProviderImage',
     'completeCommerceProductImageImportJobInPostgres',
@@ -716,7 +775,11 @@ test('worker route, proxy, and poller are wired without unsafe output paths', ()
   assert.ok(!workerSource.includes('console.'))
   assert.ok(!workerSource.includes('error.message'))
   assert.ok(!workerSource.includes('String(error)'))
-  assert.equal(workerSource.match(/selected\.url/g)?.length, 1)
+  assert.equal(
+    workerSource.match(/selected\.url/g)?.length,
+    2,
+    'cache-miss and cache-hit byte reads must each use the exact selected locator',
+  )
   assert.ok(!workerSource.includes('providerWrites: 1'))
   assert.ok(proxySource.includes('/api/integrations/commerce/images/process'))
   assert.ok(pollerSource.includes('COMMERCE_PRODUCT_IMAGE_IMPORT_POLL_MS'))

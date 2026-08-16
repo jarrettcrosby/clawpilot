@@ -18,6 +18,7 @@ import {
   claimFaireInventoryPollJobsInPostgres,
   completeFaireInventoryPollPageInPostgres,
   failFaireInventoryPollJobInPostgres,
+  parkFaireInventoryPollForStoreSyncPauseInPostgres,
   queueAutomaticFaireInventoryPollsInPostgres,
   readFaireInventoryPollSelectorsInPostgres,
   recordFaireInventoryPollWorkerHeartbeatInPostgres,
@@ -45,6 +46,14 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function inventoryError(code: string, message: string, status = 409): never {
   throw new CommerceIntegrationRequestError(message, status, code)
+}
+
+function isStoreSyncReadPause(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
 }
 
 function exactBrandIdentity(value: unknown, expectedBrandId: string) {
@@ -220,47 +229,48 @@ async function processTarget(target: FaireInventoryPollTarget) {
     })
   }
   const runtime = await faireRuntime(target)
-  const response = await withFaireInventoryPollProviderReadFenceInPostgres({
+  return withFaireInventoryPollProviderReadFenceInPostgres({
     target,
-    read: async () => {
+    read: async (providerReadLease) => {
       exactBrandIdentity(
         await probeFaireBrandProfile(runtime.options),
         runtime.externalAccountId,
       )
-      return listFaireInventory(runtime.options, {
+      const response = await listFaireInventory(runtime.options, {
         productVariantIds: page.selectors.map(
           (selector) => selector.externalVariantId,
         ),
       })
+      const expected = new Set(
+        page.selectors.map((selector) => selector.externalVariantId),
+      )
+      if (
+        Object.keys(response.inventories).some(
+          (externalVariantId) => !expected.has(externalVariantId),
+        )
+      ) {
+        inventoryError(
+          'FAIRE_INVENTORY_RESPONSE_SCOPE_INVALID',
+          'Faire returned inventory outside the requested selector scope',
+          502,
+        )
+      }
+      const observations = page.selectors.map((selector) => (
+        normalizeFaireInventoryObservation(
+          selector,
+          response.inventories[selector.externalVariantId],
+        )
+      ))
+      return completeFaireInventoryPollPageInPostgres({
+        target,
+        providerReadLease,
+        selectors: page.selectors,
+        observations,
+        hasMore: page.hasMore,
+        nextSelectorAfter: page.nextSelectorAfter,
+        observedAt: new Date().toISOString(),
+      })
     },
-  })
-  const expected = new Set(
-    page.selectors.map((selector) => selector.externalVariantId),
-  )
-  if (
-    Object.keys(response.inventories).some(
-      (externalVariantId) => !expected.has(externalVariantId),
-    )
-  ) {
-    inventoryError(
-      'FAIRE_INVENTORY_RESPONSE_SCOPE_INVALID',
-      'Faire returned inventory outside the requested selector scope',
-      502,
-    )
-  }
-  const observations = page.selectors.map((selector) => (
-    normalizeFaireInventoryObservation(
-      selector,
-      response.inventories[selector.externalVariantId],
-    )
-  ))
-  return completeFaireInventoryPollPageInPostgres({
-    target,
-    selectors: page.selectors,
-    observations,
-    hasMore: page.hasMore,
-    nextSelectorAfter: page.nextSelectorAfter,
-    observedAt: new Date().toISOString(),
   })
 }
 
@@ -276,6 +286,7 @@ export async function processFaireInventoryPollOutbox(input: {
   let retried = 0
   let dead = 0
   let leaseLost = 0
+  let parked = 0
   let recoveredLeases = 0
   let variantsObserved = 0
   let quantityFactsObserved = 0
@@ -307,6 +318,13 @@ export async function processFaireInventoryPollOutbox(input: {
       untrackedFactsObserved += Number(result.untrackedCount || 0)
       missingVariantsObserved += Number(result.missingCount || 0)
     } catch (error) {
+      if (isStoreSyncReadPause(error)) {
+        const disposition =
+          await parkFaireInventoryPollForStoreSyncPauseInPostgres({ target })
+        if (disposition.parked) parked += 1
+        else leaseLost += 1
+        continue
+      }
       const failure = await failFaireInventoryPollJobInPostgres({
         target,
         error,
@@ -325,6 +343,7 @@ export async function processFaireInventoryPollOutbox(input: {
     retried,
     dead,
     leaseLost,
+    parked,
     recoveredLeases,
     variantsObserved,
     quantityFactsObserved,

@@ -30,7 +30,9 @@ import type {
   CommerceStoreSyncPendingCommand,
 } from '@/lib/operations/commerceStoreSync'
 import {
+  CommerceStoreSyncHttpError,
   commerceStoreSyncControlMatchesCommand,
+  commerceStoreSyncPendingResolution,
 } from '@/lib/operations/commerceStoreSync'
 
 type Provider = 'ups_rest' | 'fedex_rest'
@@ -631,12 +633,20 @@ export default function ShopifyCarrierServiceSetupPanel({
           reason: command.reason,
         }),
       })
-      const payload = await response.json() as {
+      const payload = await response.json().catch(() => ({})) as {
         ok?: boolean
+        code?: string
         error?: string
         result?: { control?: CommerceStoreSyncControl }
       }
-      if (!response.ok || !payload.result?.control) {
+      if (!response.ok) {
+        throw new CommerceStoreSyncHttpError(
+          response.status,
+          payload.error || 'Store sync could not be updated',
+          payload.code,
+        )
+      }
+      if (!payload.result?.control) {
         throw new Error(payload.error || 'Store sync could not be updated')
       }
       if (!commerceStoreSyncControlMatchesCommand(
@@ -651,16 +661,24 @@ export default function ShopifyCarrierServiceSetupPanel({
       )
       await load()
     } catch (caught) {
-      const refreshed = await load()
-      if (refreshed && commerceStoreSyncControlMatchesCommand(
-        refreshed.storeSync,
+      const refreshed = await load().catch(() => null)
+      const refreshedControl = refreshed?.storeSync
+      const resolution = commerceStoreSyncPendingResolution(
+        refreshedControl,
         command,
-      )) {
+        caught,
+      )
+      if (resolution === 'applied' && refreshedControl) {
         pendingStoreSyncCommand.current = null
         setNotice(
-          `Store sync is ${refreshed.storeSync.effectiveState}. ${refreshed.storeSync.effectiveReasonLabel}`,
+          `Store sync is ${refreshedControl.effectiveState}. ${refreshedControl.effectiveReasonLabel}`,
         )
         setError('')
+      } else if (resolution === 'definitive_rejection') {
+        pendingStoreSyncCommand.current = null
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} Current Store sync state was refreshed. Review it before trying again.`,
+        )
       } else {
         setError(
           `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,

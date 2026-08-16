@@ -63,6 +63,14 @@ import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
 import {
+  OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL,
+} from '@/lib/persistence/commerceStoreSyncHealth'
+import {
+  reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceIntake'
 import {
@@ -1865,6 +1873,7 @@ export async function GET() {
 
     if (storage === 'postgres') {
       try {
+        await reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres()
         const result = await query<{
           now: string
           worker_migration_applied: boolean
@@ -4523,7 +4532,7 @@ export async function GET() {
                 WHERE filename =
                   '0298_operations_commerce_store_sync_controls.sql'
                   AND checksum =
-                    'e76fb50ebf7188746f26a21a8cc9d0191fd6b4b43ce15d7729715a615e4a26d2'
+                    '48f1a4014dbca95b242491060d679256a1813e939f20ccf332b1170ab396458b'
               )
               AND to_regclass(
                 'operations_commerce_store_sync_controls'
@@ -4531,6 +4540,10 @@ export async function GET() {
               AND to_regclass(
                 'operations_commerce_store_sync_change_receipts'
               ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_store_sync_read_leases'
+              ) IS NOT NULL
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL}
               AND (
                 SELECT string_agg(
                   column_name || ':' || data_type || ':' || is_nullable || ':'
@@ -4635,24 +4648,8 @@ export async function GET() {
                 )
                   AND indisvalid AND indisready AND indisunique
               )
-              AND to_regprocedure(
-                'operations_commerce_store_sync_effective_reason(uuid,uuid)'
-              ) IS NOT NULL
-              AND to_regprocedure(
-                'operations_commerce_store_sync_is_running(uuid,uuid)'
-              ) IS NOT NULL
-              AND to_regprocedure(
-                'seed_operations_commerce_store_sync_control()'
-              ) IS NOT NULL
-              AND to_regprocedure(
-                'validate_operations_commerce_store_sync_identity()'
-              ) IS NOT NULL
-              AND to_regprocedure(
-                'protect_operations_commerce_store_sync_receipt()'
-              ) IS NOT NULL
-              AND to_regprocedure(
-                'operations_shopify_inventory_read_config_is_ready(uuid,uuid)'
-              ) IS NOT NULL
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL}
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL}
               AND EXISTS (
                 SELECT 1
                 FROM pg_trigger installed_trigger

@@ -54,6 +54,9 @@ import {
   readShopifyInventoryRefreshDirtyVersionInPostgres,
   readShopifyInventoryRefreshRecoveryStateFromPostgres,
 } from '@/lib/persistence/shopifyInventoryRefresh'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/
 const INVENTORY_MAPPING_GLOBAL_ID = /^gilm(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -347,6 +350,7 @@ function selectLocation(
 function requestHash(
   stored: CommerceRuntimeCredentialRecord,
   target: ShopifyInventoryTarget,
+  providerReadAuthority: 'automatic' | 'manual_read_only',
 ) {
   return createHash('sha256').update(JSON.stringify({
     policyVersion: 'shopify-inventory-atp-v2',
@@ -364,6 +368,7 @@ function requestHash(
       target.existingMapping?.externalLocationId || null,
     inventoryPoolId: target.existingMapping?.inventoryPoolId || null,
     requiredScopes: REQUIRED_SCOPES,
+    providerReadAuthority,
     quantityStates: [
       'available',
       'incoming',
@@ -446,7 +451,11 @@ async function shopifyInventoryProviderContext(
 
 async function discoverShopifyInventoryLocations(
   stored: CommerceRuntimeCredentialRecord,
-  options: { fresh?: boolean } = {},
+  options: {
+    fresh?: boolean
+    intentKey: string
+    acquiredBy: string
+  },
 ) {
   const cacheKey = [
     stored.organizationId,
@@ -458,10 +467,18 @@ async function discoverShopifyInventoryLocations(
   if (!options.fresh && cached && cached.expiresAt > now) {
     return cached.locations
   }
-  const locations = (async () => {
-    const provider = await shopifyInventoryProviderContext(stored)
-    return listShopifyInventoryLocations(provider.credential)
-  })()
+  const locations = withCommerceStoreSyncProviderReadFenceInPostgres({
+    organizationId: stored.organizationId,
+    integrationAccountId: stored.integrationAccountId,
+    authorityKind: 'manual_read_only',
+    readKind: 'shopify_inventory',
+    intentKey: `location-discovery:${options.intentKey}`,
+    acquiredBy: options.acquiredBy,
+    read: async () => {
+      const provider = await shopifyInventoryProviderContext(stored)
+      return listShopifyInventoryLocations(provider.credential)
+    },
+  })
   locationDiscoveryCache.set(cacheKey, {
     expiresAt: now + LOCATION_DISCOVERY_TTL_MS,
     locations,
@@ -541,12 +558,17 @@ export async function getShopifyInventoryState(input: {
   organizationId: unknown
   accountGlobalId: unknown
   mappingGlobalId?: unknown
+  idempotencyKey: unknown
+  actorEmail: string
 }) {
   try {
     assertShopifyInventoryRuntime()
     const stored = await runtime(input)
     const mappingGlobalId = nullableMappingGlobalId(input.mappingGlobalId)
-    const providerLocations = await discoverShopifyInventoryLocations(stored)
+    const providerLocations = await discoverShopifyInventoryLocations(stored, {
+      intentKey: normalizeIdempotencyKey(input.idempotencyKey),
+      acquiredBy: input.actorEmail,
+    })
     return await inventoryState(stored, {
       mappingGlobalId,
       providerLocations,
@@ -662,7 +684,11 @@ export async function mapShopifyInventoryLocation(input: {
     const stored = await runtime(input)
     const providerLocations = await discoverShopifyInventoryLocations(
       stored,
-      { fresh: true },
+      {
+        fresh: true,
+        intentKey: idempotencyKey,
+        acquiredBy: input.actorEmail,
+      },
     )
     const providerLocation = providerLocations.find(
       (location) => location.id === externalLocationId,
@@ -739,7 +765,11 @@ export async function createShopifyInventoryWarehouseAndMap(input: {
     const stored = await runtime(input)
     const providerLocations = await discoverShopifyInventoryLocations(
       stored,
-      { fresh: true },
+      {
+        fresh: true,
+        intentKey: idempotencyKey,
+        acquiredBy: input.actorEmail,
+      },
     )
     const providerLocation = providerLocations.find(
       (location) => location.id === externalLocationId,
@@ -876,13 +906,17 @@ export async function syncShopifyInventory(input: {
         'The automatic inventory pool changed before refresh',
       )
     }
-    const hash = requestHash(stored, target)
+    const providerReadAuthority = input.expectedRefreshFence
+      ? 'automatic' as const
+      : 'manual_read_only' as const
+    const hash = requestHash(stored, target, providerReadAuthority)
     attempt = await prepareShopifyInventoryReadInPostgres({
       runtime: stored,
       target,
       idempotencyKey,
       requestHash: hash,
       actorEmail,
+      providerReadAuthority,
     })
     if (attempt.replayed) {
       if (!attempt.runGlobalId) {
@@ -935,37 +969,67 @@ export async function syncShopifyInventory(input: {
         ? 'automatic_exact_address'
         : 'automatic_single_location'
     } else {
-      await progress({ phase: 'credential' })
-      const provider = await shopifyInventoryProviderContext(stored)
-      await progress({ phase: 'authorized' })
-      const locations = await listShopifyInventoryLocations(
-        provider.credential,
-      )
-      await progress({ phase: 'locations' })
-      const selected = selectLocation(target, locations)
-      mappingMethod = selected.method
-      const snapshot = await fetchShopifyInventorySnapshot(
-        provider.credential,
-        selected.location,
-        {
-          onProgress: async (current) => progress({
-            phase: current.phase,
-            pageCount: current.pageCount,
-          }),
-        },
-      )
-      await progress({
-        phase: 'snapshot',
-        pageCount: snapshot.pageCount,
-      })
-      capture = await captureShopifyInventorySnapshotInPostgres({
-        runtime: stored,
-        target,
-        attempt,
-        requestHash: hash,
-        snapshot,
-        actorEmail,
-      })
+      const providerRuntime = stored
+      if (!providerRuntime) {
+        throw new CommerceInventoryPersistenceError(
+          'SHOPIFY_INVENTORY_CONNECTION_REQUIRED',
+          'Shopify inventory connection changed before provider read',
+        )
+      }
+      const readAttempt = attempt
+      if (!readAttempt) {
+        throw new CommerceInventoryPersistenceError(
+          'SHOPIFY_INVENTORY_READ_ATTEMPT_REQUIRED',
+          'Shopify inventory read attempt evidence is unavailable',
+        )
+      }
+      const providerRead =
+        await withCommerceStoreSyncProviderReadFenceInPostgres({
+          organizationId: providerRuntime.organizationId,
+          integrationAccountId: providerRuntime.integrationAccountId,
+          authorityKind: providerReadAuthority,
+          readKind: 'shopify_inventory',
+          intentKey: `${readAttempt.id}:${readAttempt.leaseToken || 'captured'}`,
+          acquiredBy: actorEmail || 'system:shopify-inventory-refresh',
+          read: async (providerReadLease) => {
+            await progress({ phase: 'credential' })
+            const provider = await shopifyInventoryProviderContext(
+              providerRuntime,
+            )
+            await progress({ phase: 'authorized' })
+            const locations = await listShopifyInventoryLocations(
+              provider.credential,
+            )
+            await progress({ phase: 'locations' })
+            const selected = selectLocation(target, locations)
+            const snapshot = await fetchShopifyInventorySnapshot(
+              provider.credential,
+              selected.location,
+              {
+                onProgress: async (current) => progress({
+                  phase: current.phase,
+                  pageCount: current.pageCount,
+                }),
+              },
+            )
+            await progress({
+              phase: 'snapshot',
+              pageCount: snapshot.pageCount,
+            })
+            const capture = await captureShopifyInventorySnapshotInPostgres({
+              runtime: providerRuntime,
+              target,
+              attempt: readAttempt,
+              providerReadLease,
+              requestHash: hash,
+              snapshot,
+              actorEmail,
+            })
+            return { mappingMethod: selected.method, capture }
+          },
+        })
+      mappingMethod = providerRead.mappingMethod
+      capture = providerRead.capture
     }
     const applied = await applyShopifyInventorySnapshotInPostgres({
       runtime: stored,

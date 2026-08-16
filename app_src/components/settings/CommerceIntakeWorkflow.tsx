@@ -79,7 +79,9 @@ import {
 } from '@/lib/measurements'
 import {
   COMMERCE_STORE_SYNC_EFFECTIVE_REASON_LABELS,
+  CommerceStoreSyncHttpError,
   commerceStoreSyncControlMatchesCommand,
+  commerceStoreSyncPendingResolution,
   type CommerceStoreSyncControl,
   type CommerceStoreSyncDesiredState,
   type CommerceStoreSyncEffectiveReason,
@@ -366,6 +368,8 @@ type CommerceIntake = {
       | 'frozen'
     activationRevision?: number | null
     operatorCommandsAllowed?: boolean
+    manualProviderReadsAllowed?: boolean
+    localReviewCommandsAllowed?: boolean
     storeSync?: {
       desiredState: 'running' | 'paused'
       effectiveState: 'running' | 'paused'
@@ -1731,10 +1735,18 @@ export default function CommerceIntakeWorkflow({
         }),
       })
       const payload = await response.json().catch(() => ({})) as {
+        code?: string
         error?: string
         result?: { control?: CommerceStoreSyncControl }
       }
-      if (!response.ok || !payload.result?.control) {
+      if (!response.ok) {
+        throw new CommerceStoreSyncHttpError(
+          response.status,
+          payload.error || 'Store sync could not be updated',
+          payload.code,
+        )
+      }
+      if (!payload.result?.control) {
         throw new Error(payload.error || 'Store sync could not be updated')
       }
       if (!commerceStoreSyncControlMatchesCommand(
@@ -1744,22 +1756,31 @@ export default function CommerceIntakeWorkflow({
         throw new Error('Store sync returned a response for a different command')
       }
       pendingStoreSyncCommand.current = null
-      await loadIntake()
+      await loadIntake().catch(() => null)
       setNotice(
         `Store sync is ${payload.result.control.effectiveState}. ${payload.result.control.effectiveReasonLabel}`,
       )
     } catch (caught) {
       const refreshed = await loadIntake().catch(() => null)
       const refreshedControl = refreshed?.policy?.storeSync
-      if (
-        refreshedControl?.desiredState === command.desiredState
-        && refreshedControl.explicitChoice === true
-        && refreshedControl.revision === command.expectedRevision + 1
-      ) {
+      const refreshedCommandState = refreshedControl
+        ? { ...refreshedControl, accountGlobalId }
+        : null
+      const resolution = commerceStoreSyncPendingResolution(
+        refreshedCommandState,
+        command,
+        caught,
+      )
+      if (resolution === 'applied' && refreshedControl) {
         pendingStoreSyncCommand.current = null
         setError('')
         setNotice(
-          `Store sync is ${refreshedControl.effectiveState}. ${refreshedControl.effectiveReason}`,
+          `Store sync is ${refreshedControl.effectiveState}. ${COMMERCE_STORE_SYNC_EFFECTIVE_REASON_LABELS[refreshedControl.effectiveReason as CommerceStoreSyncEffectiveReason] || refreshedControl.effectiveReason}`,
+        )
+      } else if (resolution === 'definitive_rejection') {
+        pendingStoreSyncCommand.current = null
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} Current Store sync state was refreshed. Review it before trying again.`,
         )
       } else {
         setError(
@@ -1835,6 +1856,10 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const manualProviderReadsAllowed =
+    intake?.policy?.manualProviderReadsAllowed === true
+  const localReviewCommandsAllowed =
+    intake?.policy?.localReviewCommandsAllowed === true
   const providerMirrorAllowed =
     intake?.policy?.storeSync?.effectiveState === 'running'
   const providerMirrorReason = intake?.policy?.storeSync?.effectiveReason
@@ -2242,10 +2267,10 @@ export default function CommerceIntakeWorkflow({
     safeIssuePage * workbenchPageSize,
     (safeIssuePage + 1) * workbenchPageSize,
   )
-  const recommendedAction = !operatorCommandsAllowed
+  const recommendedAction = !localReviewCommandsAllowed
     ? {
-        label: 'Enable reviewed imports',
-        detail: 'Operations must be in Shadow or Active mode before records can be reviewed.',
+        label: 'Review workflow access',
+        detail: 'Local review and configuration are unavailable under the current account, permission, or emergency safety state.',
         tab: 'overview' as WorkbenchTab,
       }
     : totalUnresolvedProductCount > 0
@@ -2274,11 +2299,17 @@ export default function CommerceIntakeWorkflow({
               detail: 'Complete required details, validate, and add each approved order.',
               tab: 'orders' as WorkbenchTab,
             }
-          : {
-              label: 'Check for products and orders',
-              detail: 'Start or refresh the bounded provider reads below.',
-              tab: 'overview' as WorkbenchTab,
-            }
+          : !manualProviderReadsAllowed
+            ? {
+                label: 'Review provider-read access',
+                detail: 'Explicit one-off provider reads are unavailable under the current connection or emergency safety state.',
+                tab: 'overview' as WorkbenchTab,
+              }
+            : {
+                label: 'Check for products and orders',
+                detail: 'Start or refresh the bounded provider reads below.',
+                tab: 'overview' as WorkbenchTab,
+              }
 
   function reportCsvError(requestError: unknown) {
     setError(
@@ -2445,7 +2476,7 @@ export default function CommerceIntakeWorkflow({
   async function applyProductDecisionCsv() {
     if (
       pendingAction
-      || !operatorCommandsAllowed
+      || !localReviewCommandsAllowed
       || !csvImportPreview?.ok
       || csvImportPreview.decisions.length === 0
     ) return
@@ -2527,7 +2558,7 @@ export default function CommerceIntakeWorkflow({
   async function retryOrderMoneyRejectionGroup(group: RejectionGroup) {
     if (
       pendingAction
-      || !providerMirrorAllowed
+      || !manualProviderReadsAllowed
       || group.resourceType !== 'order'
       || group.code !== 'COMMERCE_ORDER_MONEY_INCOMPLETE'
     ) return
@@ -2682,7 +2713,8 @@ export default function CommerceIntakeWorkflow({
     if (
       pendingAction
       || enabled === automaticProductCreationEnabled
-      || (enabled && (!providerMirrorAllowed || !connectionReady))
+      || !canManage
+      || !localReviewCommandsAllowed
     ) return
     await postCommand(
       'set-product-intake-policy',
@@ -2744,7 +2776,7 @@ export default function CommerceIntakeWorkflow({
   async function createAllNewCatalogProducts() {
     if (
       pendingAction
-      || !operatorCommandsAllowed
+      || !localReviewCommandsAllowed
       || bulkCreatableProductCandidates.length === 0
     ) return
 
@@ -3362,7 +3394,7 @@ export default function CommerceIntakeWorkflow({
 
   async function runCartonizationPreview() {
     const candidate = cartonizationCandidate
-    if (!canManage || !operatorCommandsAllowed) {
+    if (!canManage || !localReviewCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to run a pack-plan preview.',
       )
@@ -3444,7 +3476,7 @@ export default function CommerceIntakeWorkflow({
 
   async function createCartonizationRateEvidence() {
     const candidate = cartonizationCandidate
-    if (!canManage || !operatorCommandsAllowed) {
+    if (!canManage || !localReviewCommandsAllowed) {
       setCartonizationError(
         'Organization manager or administrator permission is required to compare carrier rates.',
       )
@@ -4045,19 +4077,15 @@ export default function CommerceIntakeWorkflow({
                   variant="contained"
                   disabled={Boolean(pendingAction)}
                   onClick={() => {
-                    if (!operatorCommandsAllowed) {
-                      if (activationRecoveryAvailable) {
-                        void initializeShadowActivation()
-                      } else {
-                        window.location.hash = 'operations'
-                      }
+                    if (!localReviewCommandsAllowed) {
+                      window.location.hash = 'operations'
                       return
                     }
                     setWorkbenchTab(recommendedAction.tab)
                   }}
                   sx={actionButtonSx}
                 >
-                  {!operatorCommandsAllowed && !activationRecoveryAvailable
+                  {!localReviewCommandsAllowed
                     ? 'Review Operations access'
                     : recommendedAction.label}
                 </Button>
@@ -4308,11 +4336,12 @@ export default function CommerceIntakeWorkflow({
           </Card>
           {!providerMirrorAllowed ? (
             <Alert severity="warning">
-              New provider catalog, order, image, and inventory mirroring is
-              Paused for this connection ({providerMirrorReason}). Existing
-              mirrored data remains available. An Operations administrator can
-              set Desired Store sync to Running in this connection workspace
-              before starting or retrying provider reads.
+              New automatic provider catalog, order, image, and inventory
+              mirroring is Paused for this connection ({providerMirrorReason}).
+              Existing mirrored data remains available.{' '}
+              {manualProviderReadsAllowed
+                ? 'Permissioned one-off read-only checks and refreshes remain available; they do not resume automatic mirroring.'
+                : 'One-off provider reads are also unavailable under the current connection or emergency safety state.'}
             </Alert>
           ) : null}
           {!operatorCommandsAllowed ? (
@@ -4338,11 +4367,14 @@ export default function CommerceIntakeWorkflow({
                 </Stack>
               )}
             >
-              Resolution and promotion are locked while Operations activation
-              is {humanize(intake?.policy?.activationState || 'not initialized')}.
+              Canonical promotion and execution commands are locked while
+              Operations activation is{' '}
+              {humanize(intake?.policy?.activationState || 'not initialized')}.
+              Local review and configuration use their own capability and
+              remain available when shown above.
               {activationRecoveryAvailable
-                ? ' Enable Shadow here to unlock the reviewed workflow.'
-                : ' Review Operations activation before continuing.'}
+                ? ' Enable Shadow only when you are ready to unlock execution.'
+                : ' Review Operations activation before executing.'}
             </Alert>
           ) : null}
           {(
@@ -4542,7 +4574,7 @@ export default function CommerceIntakeWorkflow({
                           color="warning"
                           disabled={
                             Boolean(pendingAction)
-                            || !providerMirrorAllowed
+                            || !manualProviderReadsAllowed
                           }
                           onClick={() => {
                             void postCommand(
@@ -4566,7 +4598,7 @@ export default function CommerceIntakeWorkflow({
                           : <CloudDownloadRounded />}
                         disabled={
                           Boolean(pendingAction)
-                          || !providerMirrorAllowed
+                          || !manualProviderReadsAllowed
                         }
                         onClick={() => {
                           void postCommand(
@@ -4818,7 +4850,7 @@ export default function CommerceIntakeWorkflow({
                                 startIcon={<RefreshRounded />}
                                 disabled={
                                   Boolean(pendingAction)
-                                  || !providerMirrorAllowed
+                                  || !manualProviderReadsAllowed
                                 }
                                 onClick={() => {
                                   void retryOrderMoneyRejectionGroup(group)
@@ -4916,7 +4948,7 @@ export default function CommerceIntakeWorkflow({
                             startIcon={<RefreshRounded />}
                             disabled={
                               Boolean(pendingAction)
-                              || !providerMirrorAllowed
+                              || !manualProviderReadsAllowed
                             }
                             onClick={() => {
                               void postCommand(
@@ -4973,7 +5005,7 @@ export default function CommerceIntakeWorkflow({
                             startIcon={<BlockRounded />}
                             disabled={
                               Boolean(pendingAction)
-                              || !operatorCommandsAllowed
+                              || !localReviewCommandsAllowed
                               || !exclusionReason.trim()
                             }
                             onClick={() => {
@@ -5073,7 +5105,7 @@ export default function CommerceIntakeWorkflow({
                 startIcon={<FileUploadRounded />}
                 disabled={
                   Boolean(pendingAction)
-                  || !operatorCommandsAllowed
+                  || !localReviewCommandsAllowed
                   || unresolvedProductCount === 0
                 }
                 onClick={() => csvInputRef.current?.click()}
@@ -5200,13 +5232,8 @@ export default function CommerceIntakeWorkflow({
                       checked={automaticProductCreationEnabled}
                       disabled={
                         Boolean(pendingAction)
-                        || (
-                          !automaticProductCreationEnabled
-                          && (
-                            !providerMirrorAllowed
-                            || !connectionReady
-                          )
-                        )
+                        || !canManage
+                        || !localReviewCommandsAllowed
                       }
                       onChange={(_event, checked) => {
                         void saveAutomaticProductCreationPolicy(checked)
@@ -5223,16 +5250,15 @@ export default function CommerceIntakeWorkflow({
                         Automatically create unmatched provider products
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
-                        The verified sales-channel connection is the
-                        authorization for automatic read-only catalog sync; no
-                        second approval is required. Catalog reads continue in
-                        either mode so existing provider mappings stay current.
-                        Turn this on to create and map safe unmatched products
-                        automatically; turn it off to retain unmatched products
-                        for operator review without pausing catalog reads. A
-                        terminal sweep is not retried by repairing eligibility
-                        alone; an authorized operator must explicitly start a
-                        fresh reconciliation.
+                        This saved choice is independent of whether automatic
+                        Store sync is currently Running. Turn it on to create and
+                        map safe unmatched products when automatic catalog sync
+                        runs; turn it off to retain unmatched products for
+                        review. While Store sync is Paused, no automatic catalog
+                        read or auto-create executes, but permissioned one-off
+                        read-only checks remain separate. A terminal sweep is not
+                        retried by repairing eligibility alone; an authorized
+                        operator must explicitly start a fresh reconciliation.
                         ClawPilot never writes to {providerLabel(provider)} or
                         changes an order.
                       </Typography>
@@ -5383,9 +5409,9 @@ export default function CommerceIntakeWorkflow({
                     {!connectionReady
                       ? `Reconnect and verify ${providerLabel(provider)} before catalog sync can resume.`
                       : `Set Store sync to Running before resumed catalog sync can run (${providerMirrorReason}).`}
-                    {' '}If the policy is already on, turning it off remains
-                    available even when the connection or Operations is later
-                    restricted.
+                    {' '}The desired unmatched-product behavior can still be
+                    configured whenever local review controls are available;
+                    automatic execution waits for eligible Store sync.
                   </Typography>
                   ) : null}
               </Stack>
@@ -5442,7 +5468,7 @@ export default function CommerceIntakeWorkflow({
                       }
                       disabled={
                         Boolean(pendingAction)
-                        || !operatorCommandsAllowed
+                        || !localReviewCommandsAllowed
                         || bulkCreatableProductCandidates.length === 0
                       }
                       onClick={() => {
@@ -5669,7 +5695,7 @@ export default function CommerceIntakeWorkflow({
                 const actionsLocked = (
                   terminal
                   || mapped
-                  || !operatorCommandsAllowed
+                  || !localReviewCommandsAllowed
                   || !Number.isInteger(candidate.rowVersion)
                 )
                 const mapKey =
@@ -6234,7 +6260,7 @@ export default function CommerceIntakeWorkflow({
                       disabled={
                         Boolean(pendingAction)
                         || !canManage
-                        || !operatorCommandsAllowed
+                        || !localReviewCommandsAllowed
                         || !faireRetailerBindingInputValid
                       }
                       onClick={() => void reviewFaireCustomerBinding()}
@@ -6273,7 +6299,7 @@ export default function CommerceIntakeWorkflow({
                             disabled={
                               Boolean(pendingAction)
                               || !canManage
-                              || !operatorCommandsAllowed
+                              || !localReviewCommandsAllowed
                             }
                             onClick={() => {
                               void confirmFaireCustomerBinding()
@@ -6331,7 +6357,7 @@ export default function CommerceIntakeWorkflow({
                       startIcon={<CloudDownloadRounded />}
                       disabled={
                         Boolean(pendingAction)
-                        || !providerMirrorAllowed
+                        || !manualProviderReadsAllowed
                         || !exactFaireOrderIdValid
                       }
                       onClick={() => {
@@ -6389,8 +6415,10 @@ export default function CommerceIntakeWorkflow({
                 const unavailableReason = candidateUnavailableReason(candidate)
                 const candidateLocked = Boolean(unavailableReason)
                   || !operatorCommandsAllowed
+                const localReviewLocked = Boolean(unavailableReason)
+                  || !localReviewCommandsAllowed
                 const refreshLocked = (
-                  !providerMirrorAllowed
+                  !manualProviderReadsAllowed
                   ||
                   !Number.isInteger(candidate.rowVersion)
                   || candidate.state === 'promoted'
@@ -6654,7 +6682,7 @@ export default function CommerceIntakeWorkflow({
                           </Alert>
                         ) : null}
 
-                        {!candidateLocked ? (
+                        {!localReviewLocked ? (
                           <>
                         <Accordion disableGutters variant="outlined">
                           <AccordionSummary
@@ -6867,7 +6895,7 @@ export default function CommerceIntakeWorkflow({
                                           <Button
                                             variant="outlined"
                                             disabled={
-                                              candidateLocked
+                                              localReviewLocked
                                               || Boolean(pendingAction)
                                               || !draft.productGlobalId
                                               || !validPrice(draft)
@@ -6931,7 +6959,7 @@ export default function CommerceIntakeWorkflow({
                                           <Button
                                             variant="outlined"
                                             disabled={
-                                              candidateLocked
+                                              localReviewLocked
                                               || Boolean(pendingAction)
                                               || !draft.name.trim()
                                               || !validPrice(draft)
@@ -7339,7 +7367,7 @@ export default function CommerceIntakeWorkflow({
                                 <Button
                                   variant="outlined"
                                   disabled={
-                                    candidateLocked
+                                    localReviewLocked
                                     || Boolean(pendingAction)
                                     || !customer.customerGlobalId
                                   }
@@ -7413,7 +7441,7 @@ export default function CommerceIntakeWorkflow({
                               <Button
                                 variant="outlined"
                                 disabled={
-                                  candidateLocked
+                                  localReviewLocked
                                   || Boolean(pendingAction)
                                   || !customer.name.trim()
                                 }
@@ -7723,7 +7751,7 @@ export default function CommerceIntakeWorkflow({
                               startIcon={<CheckCircleOutlineRounded />}
                               disabled={
                                 Boolean(pendingAction)
-                                || !operatorCommandsAllowed
+                                || !localReviewCommandsAllowed
                               }
                               onClick={() => {
                                 void postCommand(
@@ -7747,7 +7775,7 @@ export default function CommerceIntakeWorkflow({
                             variant="outlined"
                             startIcon={<CheckCircleOutlineRounded />}
                             disabled={
-                              candidateLocked || Boolean(pendingAction)
+                              localReviewLocked || Boolean(pendingAction)
                             }
                             onClick={() => {
                               void postCommand(
@@ -7771,7 +7799,7 @@ export default function CommerceIntakeWorkflow({
                               disabled={
                                 packPlanningLocked
                                 || Boolean(pendingAction)
-                                || !operatorCommandsAllowed
+                                || !localReviewCommandsAllowed
                                 || !canManage
                               }
                               title={!canManage
@@ -7793,6 +7821,7 @@ export default function CommerceIntakeWorkflow({
                             startIcon={<PublishRounded />}
                             disabled={
                               Boolean(pendingAction)
+                              || !operatorCommandsAllowed
                               || candidate.state !== 'ready'
                             }
                             onClick={() => {
@@ -7855,7 +7884,7 @@ export default function CommerceIntakeWorkflow({
                               startIcon={<BlockRounded />}
                               disabled={
                                 Boolean(pendingAction)
-                                || !operatorCommandsAllowed
+                                || !localReviewCommandsAllowed
                                 || !(unsupportedReasons[
                                   candidate.globalId
                                 ] || '').trim()
@@ -9123,7 +9152,7 @@ export default function CommerceIntakeWorkflow({
               promotedWarehousePlanning
               || cartonizationLoading
               || !canManage
-              || !operatorCommandsAllowed
+              || !localReviewCommandsAllowed
               || !selectedCartonizationWarehouseGlobalId
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
@@ -9147,7 +9176,7 @@ export default function CommerceIntakeWorkflow({
               promotedWarehousePlanning
               || cartonizationLoading
               || !canManage
-              || !operatorCommandsAllowed
+              || !localReviewCommandsAllowed
               || selectedCartonizationMaterialGlobalIds.length < 1
               || selectedCartonizationMaterialGlobalIds.length > 8
               || !selectedCartonizationWarehouseGlobalId

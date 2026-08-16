@@ -121,6 +121,23 @@ const worker = loadTypeScriptModule(
         failures.push(input)
         return { status: 'failed', providerWrites: 0 }
       },
+      async parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres() {
+        return { parked: true }
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({
+          id: '00000000-0000-4000-8000-000000000298',
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          authorityKind: input.authorityKind,
+          readKind: input.readKind,
+          controlRevision: 1,
+          activationRevision: 1,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        })
+      },
     },
   },
 )

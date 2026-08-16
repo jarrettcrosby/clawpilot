@@ -7,6 +7,7 @@ import {
   claimCommerceCatalogSyncJobsInPostgres,
   completeCommerceCatalogSyncPageInPostgres,
   failCommerceCatalogSyncJobInPostgres,
+  parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres,
   queueAutomaticCommerceCatalogSyncsInPostgres,
   type CommerceCatalogSyncJob,
 } from '@/lib/persistence/commerceCatalogSync'
@@ -53,6 +54,15 @@ function catalogSweepError(code: string, message: string) {
   const error = new Error(message) as Error & { code?: string }
   error.code = code
   return error
+}
+
+function isStoreSyncReadPause(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
+    || code === 'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED'
 }
 
 function sweepStartedAtMs(job: CommerceCatalogSyncJob) {
@@ -159,6 +169,7 @@ export async function processCommerceCatalogSyncOutbox(input: {
   let jobsFailed = 0
   let jobsDead = 0
   let jobsCancelled = 0
+  let jobsParked = 0
   for (const job of jobs) {
     try {
       assertCommerceCatalogSweepCanRead(job)
@@ -231,6 +242,13 @@ export async function processCommerceCatalogSyncOutbox(input: {
       if (completion.hasNextBatch) jobsRequeued += 1
       else jobsCompleted += 1
     } catch (error) {
+      if (isStoreSyncReadPause(error)) {
+        const disposition =
+          await parkCommerceCatalogSyncJobForStoreSyncPauseInPostgres({ job })
+        if (disposition.parked) jobsParked += 1
+        else jobsCancelled += 1
+        continue
+      }
       const failure = await failCommerceCatalogSyncJobInPostgres({
         job,
         error,
@@ -254,6 +272,7 @@ export async function processCommerceCatalogSyncOutbox(input: {
     jobsFailed,
     jobsDead,
     jobsCancelled,
+    jobsParked,
     heldProductDeletionsSelected: productDeletionReplay.selected,
     heldProductDeletionsReconciled: productDeletionReplay.reconciled,
     heldProductDeletionsRemaining: productDeletionReplay.held,

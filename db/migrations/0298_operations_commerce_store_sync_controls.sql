@@ -59,6 +59,182 @@ CREATE TABLE IF NOT EXISTS operations_commerce_store_sync_change_receipts (
 COMMENT ON TABLE operations_commerce_store_sync_change_receipts IS
   'Append-only idempotency and revision evidence for Store sync changes.';
 
+-- Automatic provider reads acquire a short durable lease before any network
+-- request. Store sync changes serialize only with this acquisition, not with
+-- the network request itself. This lets Desired=Paused commit promptly while
+-- an already-acquired read is reported as draining. Heartbeats keep a live
+-- read visible; an abandoned process ages out conservatively.
+CREATE TABLE IF NOT EXISTS operations_commerce_store_sync_read_leases (
+  id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL,
+  integration_account_id uuid NOT NULL,
+  authority_kind text NOT NULL,
+  read_kind text NOT NULL,
+  intent_fingerprint_sha256 text NOT NULL,
+  control_revision bigint NOT NULL,
+  activation_revision bigint NOT NULL,
+  acquired_by text NOT NULL,
+  acquired_at timestamptz NOT NULL DEFAULT now(),
+  heartbeat_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL,
+  captured_at timestamptz,
+  released_at timestamptz,
+  release_reason text,
+  CONSTRAINT operations_commerce_store_sync_read_leases_authority_valid CHECK (
+    authority_kind IN ('automatic', 'manual_read_only')
+  ),
+  CONSTRAINT operations_commerce_store_sync_read_leases_kind_valid CHECK (
+    read_kind IN (
+    'catalog_intake',
+    'order_history',
+    'order_revision',
+    'shopify_webhook_hydration',
+    'shopify_inventory',
+    'product_image_import',
+    'faire_inventory_poll'
+  )),
+  CONSTRAINT operations_commerce_store_sync_read_leases_intent_valid CHECK (
+    intent_fingerprint_sha256 ~ '^[a-f0-9]{64}$'
+  ),
+  CONSTRAINT operations_commerce_store_sync_read_leases_revision_valid CHECK (
+    control_revision > 0 AND activation_revision > 0
+  ),
+  CONSTRAINT operations_commerce_store_sync_read_leases_actor_valid CHECK (
+    length(btrim(acquired_by)) BETWEEN 1 AND 200
+    AND acquired_by !~ '[[:cntrl:]]'
+  ),
+  CONSTRAINT operations_commerce_store_sync_read_leases_release_valid CHECK (
+    release_reason IN ('completed', 'failed', 'expired')
+  ),
+  CONSTRAINT operations_commerce_store_sync_read_leases_account_fkey
+    FOREIGN KEY (organization_id, integration_account_id)
+    REFERENCES operations_commerce_store_sync_controls(
+      organization_id, integration_account_id
+    ) ON DELETE RESTRICT,
+  CONSTRAINT operations_commerce_store_sync_read_leases_time_valid CHECK (
+    heartbeat_at >= acquired_at
+    AND expires_at > heartbeat_at
+    AND expires_at <= heartbeat_at + interval '65 seconds'
+    AND (
+      captured_at IS NULL
+      OR (captured_at >= acquired_at AND captured_at < expires_at)
+    )
+    AND (
+      (released_at IS NULL AND release_reason IS NULL)
+      OR (
+        released_at IS NOT NULL
+        AND release_reason IS NOT NULL
+        AND released_at >= acquired_at
+      )
+    )
+  )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+  operations_commerce_store_sync_read_leases_intent_unique
+ON operations_commerce_store_sync_read_leases (
+  organization_id,
+  integration_account_id,
+  authority_kind,
+  read_kind,
+  intent_fingerprint_sha256
+);
+
+CREATE INDEX IF NOT EXISTS
+  operations_commerce_store_sync_read_leases_active_idx
+ON operations_commerce_store_sync_read_leases (
+  organization_id,
+  integration_account_id,
+  expires_at
+)
+WHERE released_at IS NULL;
+
+COMMENT ON TABLE operations_commerce_store_sync_read_leases IS
+  'Durable bounded automatic/manual provider-read intent leases. Automatic active leases make an explicit Pause report draining; neither lease kind grants provider-write authority.';
+
+ALTER TABLE operations_commerce_intake_read_intents
+  ADD COLUMN IF NOT EXISTS provider_read_authority text;
+UPDATE operations_commerce_intake_read_intents
+SET provider_read_authority = 'automatic'
+WHERE provider_read_authority IS NULL;
+ALTER TABLE operations_commerce_intake_read_intents
+  ALTER COLUMN provider_read_authority SET NOT NULL;
+ALTER TABLE operations_commerce_intake_read_intents
+  DROP CONSTRAINT IF EXISTS commerce_intake_read_intents_authority_valid;
+ALTER TABLE operations_commerce_intake_read_intents
+  ADD CONSTRAINT commerce_intake_read_intents_authority_valid CHECK (
+    provider_read_authority IN ('automatic', 'manual_read_only')
+  );
+
+ALTER TABLE operations_commerce_product_image_observation_sets
+  ADD COLUMN IF NOT EXISTS provider_read_authority text;
+UPDATE operations_commerce_product_image_observation_sets
+SET provider_read_authority = 'automatic'
+WHERE provider_read_authority IS NULL;
+ALTER TABLE operations_commerce_product_image_observation_sets
+  ALTER COLUMN provider_read_authority SET NOT NULL;
+ALTER TABLE operations_commerce_product_image_observation_sets
+  DROP CONSTRAINT IF EXISTS ops_commerce_image_set_authority_valid;
+ALTER TABLE operations_commerce_product_image_observation_sets
+  ADD CONSTRAINT ops_commerce_image_set_authority_valid CHECK (
+    provider_read_authority IN ('automatic', 'manual_read_only')
+  );
+
+ALTER TABLE operations_commerce_product_image_import_jobs
+  ADD COLUMN IF NOT EXISTS provider_read_authority text;
+UPDATE operations_commerce_product_image_import_jobs job
+SET provider_read_authority = observation_set.provider_read_authority
+FROM operations_commerce_product_image_observations observation
+JOIN operations_commerce_product_image_observation_sets observation_set
+  ON observation_set.organization_id = observation.organization_id
+ AND observation_set.integration_account_id =
+       observation.integration_account_id
+ AND observation_set.id = observation.observation_set_id
+WHERE job.organization_id = observation.organization_id
+  AND job.integration_account_id = observation.integration_account_id
+  AND job.observation_id = observation.id
+  AND job.provider_read_authority IS NULL;
+UPDATE operations_commerce_product_image_import_jobs
+SET provider_read_authority = 'automatic'
+WHERE provider_read_authority IS NULL;
+ALTER TABLE operations_commerce_product_image_import_jobs
+  ALTER COLUMN provider_read_authority SET NOT NULL;
+ALTER TABLE operations_commerce_product_image_import_jobs
+  DROP CONSTRAINT IF EXISTS ops_commerce_image_job_authority_valid;
+ALTER TABLE operations_commerce_product_image_import_jobs
+  ADD CONSTRAINT ops_commerce_image_job_authority_valid CHECK (
+    provider_read_authority IN ('automatic', 'manual_read_only')
+  );
+
+CREATE OR REPLACE FUNCTION
+  guard_operations_commerce_product_image_read_authority()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND NEW.provider_read_authority
+           IS DISTINCT FROM OLD.provider_read_authority THEN
+    RAISE EXCEPTION 'Commerce product image read authority is immutable';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS guard_operations_commerce_image_set_authority_write
+  ON operations_commerce_product_image_observation_sets;
+CREATE TRIGGER guard_operations_commerce_image_set_authority_write
+BEFORE UPDATE ON operations_commerce_product_image_observation_sets
+FOR EACH ROW EXECUTE FUNCTION
+  guard_operations_commerce_product_image_read_authority();
+
+DROP TRIGGER IF EXISTS guard_operations_commerce_image_job_authority_write
+  ON operations_commerce_product_image_import_jobs;
+CREATE TRIGGER guard_operations_commerce_image_job_authority_write
+BEFORE UPDATE ON operations_commerce_product_image_import_jobs
+FOR EACH ROW EXECUTE FUNCTION
+  guard_operations_commerce_product_image_read_authority();
+
 INSERT INTO operations_commerce_store_sync_controls (
   organization_id,
   integration_account_id,
@@ -117,6 +293,17 @@ AS $$
     WHEN control.explicit_choice AND control.desired_state = 'running'
       THEN 'STORE_SYNC_EXPLICIT_RUNNING'
     WHEN control.explicit_choice AND control.desired_state = 'paused'
+         AND EXISTS (
+           SELECT 1
+           FROM operations_commerce_store_sync_read_leases lease
+           WHERE lease.organization_id = account.organization_id
+             AND lease.integration_account_id = account.id
+             AND lease.authority_kind = 'automatic'
+             AND lease.released_at IS NULL
+             AND lease.expires_at > clock_timestamp()
+         )
+      THEN 'STORE_SYNC_EXPLICIT_PAUSED_DRAINING'
+    WHEN control.explicit_choice AND control.desired_state = 'paused'
       THEN 'STORE_SYNC_EXPLICIT_PAUSED'
     WHEN activation.state = 'shadow'
       THEN 'STORE_SYNC_LEGACY_SHADOW_RUNNING'
@@ -155,6 +342,76 @@ AS $$
       'STORE_SYNC_LEGACY_ACTIVE_RUNNING'
     ),
     false
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION operations_commerce_provider_read_authority_is_current(
+  requested_organization_id uuid,
+  requested_integration_account_id uuid,
+  requested_authority text
+)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT CASE requested_authority
+    WHEN 'automatic' THEN
+      operations_commerce_store_sync_is_running(
+        requested_organization_id,
+        requested_integration_account_id
+      )
+    WHEN 'manual_read_only' THEN EXISTS (
+      SELECT 1
+      FROM operations_integration_accounts account
+      JOIN operations_commerce_store_sync_controls control
+        ON control.organization_id = account.organization_id
+       AND control.integration_account_id = account.id
+      JOIN operations_activation_scopes activation
+        ON activation.organization_id = account.organization_id
+      WHERE account.organization_id = requested_organization_id
+        AND account.id = requested_integration_account_id
+        AND account.integration_type = 'commerce'
+        AND account.provider IN ('shopify', 'faire')
+        AND account.status = 'active'
+        AND activation.state NOT IN ('disabled', 'frozen')
+    )
+    ELSE false
+  END
+$$;
+
+CREATE OR REPLACE FUNCTION
+  operations_commerce_product_image_read_authority_is_current(
+    requested_organization_id uuid,
+    requested_integration_account_id uuid,
+    requested_provider text,
+    requested_credential_generation integer,
+    requested_authority text
+  )
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM operations_integration_accounts account
+    JOIN operations_commerce_credentials credential
+      ON credential.organization_id = account.organization_id
+     AND credential.integration_account_id = account.id
+     AND credential.external_account_id = account.external_account_id
+    WHERE account.organization_id = requested_organization_id
+      AND account.id = requested_integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider = requested_provider
+      AND account.status = 'active'
+      AND account.commerce_credential_generation =
+            requested_credential_generation
+      AND credential.credential_version = requested_credential_generation
+      AND credential.verification_status = 'verified'
+      AND operations_commerce_provider_read_authority_is_current(
+        account.organization_id,
+        account.id,
+        requested_authority
+      )
   )
 $$;
 
@@ -386,14 +643,24 @@ BEGIN
     RAISE EXCEPTION 'Commerce product image bindings cannot be deleted';
   END IF;
 
-  IF NOT public.operations_commerce_product_image_account_is_current(
-    NEW.organization_id,
-    NEW.integration_account_id,
-    NEW.provider,
-    NEW.credential_generation
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.operations_commerce_product_image_import_jobs authority_job
+    WHERE authority_job.organization_id = NEW.organization_id
+      AND authority_job.integration_account_id = NEW.integration_account_id
+      AND authority_job.id = NEW.latest_import_job_id
+      AND authority_job.provider = NEW.provider
+      AND authority_job.credential_generation = NEW.credential_generation
+      AND public.operations_commerce_product_image_read_authority_is_current(
+        NEW.organization_id,
+        NEW.integration_account_id,
+        NEW.provider,
+        NEW.credential_generation,
+        authority_job.provider_read_authority
+      )
   ) THEN
     RAISE EXCEPTION
-      'Commerce product image binding requires the current verified account credential and Store sync authority';
+      'Commerce product image binding requires the current verified account credential and exact provider-read authority';
   END IF;
 
   IF TG_OP = 'INSERT' THEN
@@ -608,6 +875,101 @@ DROP TRIGGER IF EXISTS protect_operations_commerce_store_sync_receipt_write
 CREATE TRIGGER protect_operations_commerce_store_sync_receipt_write
 BEFORE UPDATE OR DELETE ON operations_commerce_store_sync_change_receipts
 FOR EACH ROW EXECUTE FUNCTION protect_operations_commerce_store_sync_receipt();
+
+CREATE OR REPLACE FUNCTION guard_operations_commerce_store_sync_read_lease()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'Store sync provider-read lease evidence cannot be deleted';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.released_at IS NOT NULL
+       OR NEW.release_reason IS NOT NULL
+       OR NEW.heartbeat_at IS DISTINCT FROM NEW.acquired_at
+       OR NOT operations_commerce_provider_read_authority_is_current(
+         NEW.organization_id,
+         NEW.integration_account_id,
+         NEW.authority_kind
+       ) THEN
+      RAISE EXCEPTION
+        'Store sync provider-read lease requires current exact authority';
+    END IF;
+    RETURN NEW;
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    IF ROW(
+      NEW.id,
+      NEW.organization_id,
+      NEW.integration_account_id,
+      NEW.authority_kind,
+      NEW.read_kind,
+      NEW.intent_fingerprint_sha256,
+      NEW.control_revision,
+      NEW.activation_revision,
+      NEW.acquired_by,
+      NEW.acquired_at
+    ) IS DISTINCT FROM ROW(
+      OLD.id,
+      OLD.organization_id,
+      OLD.integration_account_id,
+      OLD.authority_kind,
+      OLD.read_kind,
+      OLD.intent_fingerprint_sha256,
+      OLD.control_revision,
+      OLD.activation_revision,
+      OLD.acquired_by,
+      OLD.acquired_at
+    ) THEN
+      RAISE EXCEPTION 'Store sync provider-read lease identity is immutable';
+    END IF;
+    IF OLD.released_at IS NOT NULL AND ROW(
+      NEW.heartbeat_at,
+      NEW.expires_at,
+      NEW.captured_at,
+      NEW.released_at,
+      NEW.release_reason
+    ) IS DISTINCT FROM ROW(
+      OLD.heartbeat_at,
+      OLD.expires_at,
+      OLD.captured_at,
+      OLD.released_at,
+      OLD.release_reason
+    ) THEN
+      RAISE EXCEPTION 'Released Store sync provider-read lease evidence is immutable';
+    END IF;
+    IF OLD.captured_at IS NOT NULL
+       AND NEW.captured_at IS DISTINCT FROM OLD.captured_at THEN
+      RAISE EXCEPTION 'Store sync provider-read capture evidence is immutable';
+    END IF;
+    IF OLD.captured_at IS NULL
+       AND NEW.captured_at IS NOT NULL
+       AND (
+         NEW.released_at IS NOT NULL
+         OR NEW.captured_at < OLD.acquired_at
+         OR NEW.captured_at >= OLD.expires_at
+       ) THEN
+      RAISE EXCEPTION 'Store sync provider-read capture requires a live lease';
+    END IF;
+    IF OLD.released_at IS NULL AND NEW.released_at IS NULL
+       AND ROW(NEW.heartbeat_at, NEW.expires_at)
+             IS DISTINCT FROM ROW(OLD.heartbeat_at, OLD.expires_at)
+       AND (NEW.heartbeat_at <= OLD.heartbeat_at
+            OR NEW.expires_at <= OLD.expires_at) THEN
+      RAISE EXCEPTION 'Store sync provider-read lease heartbeat must advance';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS guard_operations_commerce_store_sync_read_lease_write
+  ON operations_commerce_store_sync_read_leases;
+CREATE TRIGGER guard_operations_commerce_store_sync_read_lease_write
+BEFORE INSERT OR UPDATE OR DELETE
+ON operations_commerce_store_sync_read_leases
+FOR EACH ROW EXECUTE FUNCTION guard_operations_commerce_store_sync_read_lease();
 
 CREATE OR REPLACE FUNCTION validate_operations_commerce_store_sync_identity()
 RETURNS trigger
@@ -987,9 +1349,10 @@ BEGIN
 
   IF NOT FOUND
     OR job_row.pipeline_id IS NULL
-    OR NOT public.operations_commerce_store_sync_is_running(
+    OR NOT public.operations_commerce_provider_read_authority_is_current(
       job_row.organization_id,
-      job_row.integration_account_id
+      job_row.integration_account_id,
+      job_row.provider_read_authority
     )
     OR NOT public.operations_commerce_product_image_observation_is_current_active(
       job_row.organization_id,

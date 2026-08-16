@@ -176,6 +176,11 @@ function loadPersistence(pool) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') return postgres
       if (specifier.startsWith('@/')) return {}
       return requireFromApp(specifier)
@@ -318,6 +323,7 @@ async function applyInventorySnapshot(input) {
     idempotencyKey,
     requestHash,
     actorEmail,
+    providerReadAuthority: 'automatic',
   })
   const capture = await input.persistence
     .captureShopifyInventorySnapshotInPostgres({
@@ -331,6 +337,16 @@ async function applyInventorySnapshot(input) {
         input.state,
       ),
       actorEmail,
+      providerReadLease: {
+        id: randomUUID(),
+        organizationId: runtime.organizationId,
+        integrationAccountId: runtime.integrationAccountId,
+        authorityKind: 'automatic',
+        readKind: 'shopify_inventory',
+        controlRevision: 1,
+        activationRevision: 1,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
     })
   const applied = await input.persistence
     .applyShopifyInventorySnapshotInPostgres({

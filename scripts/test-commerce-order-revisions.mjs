@@ -14,6 +14,7 @@ const [
   intake,
   adapter,
   worker,
+  faireWorker,
   operations,
   route,
   workspace,
@@ -29,6 +30,7 @@ const [
   read('app_src/lib/integrations/commerceIntake.ts'),
   read('app_src/lib/integrations/shopifyOrderRevision.ts'),
   read('app_src/lib/commerceShopifyOrderRevisionWorker.ts'),
+  read('app_src/lib/commerceFaireOrderRevisionWorker.ts'),
   read('app_src/lib/persistence/operations.ts'),
   read('app_src/app/api/operations/route.ts'),
   read('app_src/components/operations/OperationsSection.tsx'),
@@ -70,11 +72,27 @@ for (const exportedContract of [
   assert.match(persistence, new RegExp(`export (?:async )?(?:function|class) ${exportedContract}`))
 }
 assert.match(persistence, /FOR UPDATE OF target SKIP LOCKED/u)
-assert.ok(
-  worker.indexOf('await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)')
-    < worker.indexOf('await inspectShopifyCanonicalOrderRevision(claim)'),
-  'Shopify revision work must recheck exact Store sync before provider I/O',
-)
+for (const [source, adapterName] of [
+  [worker, 'inspectShopifyCanonicalOrderRevision'],
+  [faireWorker, 'inspectFaireCanonicalOrderRevision'],
+]) {
+  assert.ok(
+    source.indexOf(
+      'await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)',
+    ) < source.indexOf(
+      'await withCommerceStoreSyncProviderReadFenceInPostgres({',
+    ),
+    'Revision work must recheck the exact claim before its shared provider fence',
+  )
+  assert.match(
+    source,
+    new RegExp(
+      `read: async \\(providerReadLease\\) => \\{[\\s\\S]*`
+        + `await ${adapterName}\\(claim\\)[\\s\\S]*providerReadLease`,
+    ),
+    'Revision provider I/O must run inside the shared Store sync lock',
+  )
+}
 assert.match(worker, /error instanceof CommerceOrderRevisionStoreSyncPausedError/u)
 assert.match(persistence, /COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED/u)
 assert.match(persistence, /claim_state = 'processing'/u)
