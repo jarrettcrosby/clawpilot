@@ -182,7 +182,7 @@ export default function ShadowOrderTrainingPanel({
           action,
           orderGlobalId,
           confirmation: SHADOW_TRAINING_CONFIRMATION,
-          reason: 'Enable this exact order for local-only Shadow training',
+          reason: 'Enable this exact order for local-only order training',
         }
         : {
           action,
@@ -237,7 +237,7 @@ export default function ShadowOrderTrainingPanel({
           disabled={!canExecute || disabled || Boolean(pending)}
           onClick={() => void command(
             'enable',
-            'Enable this exact order for local-only Shadow training',
+            'Enable this exact order for local-only order training',
           )}
         >
           Enable training
@@ -263,16 +263,16 @@ export default function ShadowOrderTrainingPanel({
         Local training overlay: 0 store writes, 0 production postage, 0 operational inventory changes, and 0 packaging-stock changes.
       </Alert>
       {run.activationChanged && (
-        <Alert severity="warning">
-          Operations mode changed after this run was enabled. Only Reset training run is available; reset and enable a new run before continuing.
+        <Alert severity="info">
+          The advanced safety profile changed after this run was enabled. This exact local training run remains available because it cannot write to the connected store, production postage, operational inventory, or packaging stock.
         </Alert>
       )}
-      {run.restartRequiredBeforePlan && !run.activationChanged && (
+      {run.restartRequiredBeforePlan && (
         <Alert severity="warning">
           The store line or product facts changed before a local training plan was sealed. Reset this run and enable a new run from the latest imported order; Prepare training order is unavailable.
         </Alert>
       )}
-      {run.sourceChanged && !run.restartRequiredBeforePlan && !run.activationChanged && (
+      {run.sourceChanged && !run.restartRequiredBeforePlan && (
         <Alert severity="warning">
           The store order has changed to {run.sourceStatus}. Provider state is still mirrored; the exact authorized training snapshot remains available and is not rewritten.
         </Alert>
@@ -283,7 +283,6 @@ export default function ShadowOrderTrainingPanel({
       </Typography>
       {run.state === 'enabled'
         && !run.restartRequiredBeforePlan
-        && !run.activationChanged
         && run.availableActions.includes('plan') && (
         <Button
           fullWidth

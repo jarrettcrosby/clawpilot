@@ -788,6 +788,11 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
     FROM schema_migrations
     WHERE filename = '0290_operations_shadow_training_runs.sql'
   )
+  AND EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0300_operations_order_training_independent_control.sql'
+  )
   AND (
     WITH target_table(table_name) AS (
       VALUES
@@ -1059,7 +1064,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'validate_operations_shadow_training_run_identity()',
         'plpgsql', 'v',
-        '4d0a836345d3bc310ad27d9ae4f74a25b0bc2bf246e10712b3e2427bd168cf93'
+        '0464f9df69afe0e49bae8a800839b911037dc56ba50d6faf156418eb8b285d45'
       ),
       (
         'protect_operations_shadow_training_package()',
@@ -1089,7 +1094,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'guard_shadow_training_activation_change()',
         'plpgsql', 'v',
-        'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f'
+        'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053'
       )
     ) AS required_function(
       signature, language_name, volatility, source_sha256

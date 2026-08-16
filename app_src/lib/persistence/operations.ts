@@ -136,7 +136,6 @@ import {
 } from '@/lib/persistence/cartonizationRateEvidence'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import { readShadowFulfillmentPreparation } from '@/lib/persistence/operationShadowFulfillmentPreparation'
-import { assertNoOpenOperationsShadowTrainingRunsForActivation } from '@/lib/persistence/operationShadowTraining'
 import { readDefaultProductPackagingWithClient } from '@/lib/persistence/productPackaging'
 import {
   acquireTransactionAdvisoryLock,
@@ -5661,10 +5660,6 @@ export async function updateOperationsActivationInPostgres(input: {
     }
     const current = await resolveActivation(client, organizationId, true)
     if (input.state === 'active') {
-      await assertNoOpenOperationsShadowTrainingRunsForActivation(
-        client,
-        organizationId,
-      )
       const sandboxPlan = await client.query<{ global_id: string }>(
         `SELECT plan.global_id
          FROM operations_fulfillment_plans plan

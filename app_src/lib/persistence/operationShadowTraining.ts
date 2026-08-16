@@ -404,8 +404,7 @@ function mapRun(
     || row.current_candidate_source_hash !== row.authorization_candidate_source_hash
   )
   const activationChanged = (
-    row.current_activation_state !== 'shadow'
-    || row.current_activation_revision !== row.authorization_activation_revision
+    row.current_activation_revision !== row.authorization_activation_revision
   )
   const restartRequiredBeforePlan = (
     row.state === 'enabled'
@@ -434,11 +433,9 @@ function mapRun(
     warehouse: row.warehouse_global_id && row.warehouse_name
       ? { globalId: row.warehouse_global_id, name: row.warehouse_name }
       : null,
-    availableActions: row.current_activation_state === 'shadow'
-      ? activationChanged || restartRequiredBeforePlan
-        ? shadowTrainingAvailableActions(row.state).filter((action) => action === 'reset')
-        : shadowTrainingAvailableActions(row.state)
-      : [],
+    availableActions: restartRequiredBeforePlan
+      ? shadowTrainingAvailableActions(row.state).filter((action) => action === 'reset')
+      : shadowTrainingAvailableActions(row.state),
     counters: {
       commerceProviderReads: row.commerce_provider_read_count,
       commerceProviderWrites: 0,
@@ -1019,25 +1016,7 @@ function assertLockedRun(input: {
   run: Awaited<ReturnType<typeof lockedRun>>
   action: OperationsShadowTrainingAction
   expectedRowVersion: number
-  allowActivationRevisionDrift?: boolean
 }) {
-  if (input.run.activation_state !== 'shadow') {
-    throw new OperationsShadowTrainingError(
-      'Training commands require Operations Shadow.',
-      409,
-      'OPERATIONS_SHADOW_TRAINING_SHADOW_REQUIRED',
-    )
-  }
-  if (
-    !input.allowActivationRevisionDrift
-    && input.run.activation_revision !== input.run.authorization_activation_revision
-  ) {
-    throw new OperationsShadowTrainingError(
-      'Operations activation changed after training was enabled. Reset and authorize a new run.',
-      409,
-      'OPERATIONS_SHADOW_TRAINING_ACTIVATION_CHANGED',
-    )
-  }
   if (Number(input.run.row_version) !== input.expectedRowVersion) {
     throw new OperationsShadowTrainingError(
       'Training changed after it was opened. Refresh before continuing.',
@@ -1549,7 +1528,6 @@ export async function resetOperationsShadowTrainingInPostgres(input: {
       run,
       action: 'reset',
       expectedRowVersion,
-      allowActivationRevisionDrift: true,
     })
     const unresolved = await client.query<{ status: string }>(
       `SELECT status
@@ -1623,11 +1601,19 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
     order_status: string
     source_provider: string
     integration_type: string
+    open_training: boolean
   }>(
     `SELECT activation.state AS activation_state,
             source_order.status AS order_status,
             source_order.source_provider,
-            account.integration_type
+            account.integration_type,
+            EXISTS (
+              SELECT 1
+              FROM operations_shadow_training_runs training_run
+              WHERE training_run.organization_id = source_order.organization_id
+                AND training_run.source_order_id = source_order.id
+                AND training_run.state <> 'reset'
+            ) AS open_training
      FROM operations_orders source_order
      JOIN operations_integration_accounts account
        ON account.organization_id = source_order.organization_id
@@ -1640,6 +1626,13 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
     [input.organizationId, input.orderGlobalId],
   )
   const row = result.rows[0]
+  if (row?.open_training === true) {
+    throw new OperationsShadowTrainingError(
+      'This order has an open local training run. Reset that run before creating canonical fulfillment work.',
+      409,
+      'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED',
+    )
+  }
   if (
     row?.activation_state === 'shadow'
     && (row.source_provider === 'shopify' || row.source_provider === 'faire')
@@ -1649,29 +1642,6 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
       'Shopify and Faire orders remain provider-mirrored in Shadow. Enable training for an untouched imported order to run a local simulation.',
       409,
       'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED',
-    )
-  }
-}
-
-export async function assertNoOpenOperationsShadowTrainingRunsForActivation(
-  client: Queryable,
-  organizationId: string,
-) {
-  const result = await client.query<{ global_id: string }>(
-    `SELECT global_id
-     FROM operations_shadow_training_runs
-     WHERE organization_id = $1::uuid
-       AND state <> 'reset'
-     ORDER BY created_at, id
-     LIMIT 1
-     FOR SHARE`,
-    [organizationId],
-  )
-  if (result.rows[0]) {
-    throw new OperationsShadowTrainingError(
-      `Reset or reconcile training run ${result.rows[0].global_id} before activating Operations.`,
-      409,
-      'OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED',
     )
   }
 }
@@ -1736,8 +1706,6 @@ export async function assertOperationsShadowTrainingEvidenceRequestInPostgres(in
          AND candidate.row_version = $5
          AND candidate.row_version = run.authorization_candidate_row_version
          AND candidate.source_hash = run.authorization_candidate_source_hash
-         AND activation.state = 'shadow'
-         AND activation.revision = run.authorization_activation_revision
        LIMIT 1
        FOR SHARE OF run, source_order, account, credential, candidate, activation, warehouse`,
       [

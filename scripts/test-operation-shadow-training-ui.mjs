@@ -29,10 +29,11 @@ for (const fragment of [
   'window.confirm(',
   'only the last local training step',
   'run.activationChanged',
+  'This exact local training run remains available',
   'run.restartRequiredBeforePlan',
   'trainingEvidenceSealed',
   'cartonizationEvidenceGlobalId: run.cartonizationEvidenceGlobalId',
-  'reset and enable a new run',
+  'Reset this run and enable a new run',
   "run.availableActions.includes('plan')",
   'SHADOW_TRAINING_CONFIRMATION',
 ]) {
@@ -50,8 +51,9 @@ for (const forbidden of [
 
 for (const fragment of [
   '<ShadowOrderTrainingPanel',
-  'activationState === \'shadow\'',
+  'const trainingProviderOrder',
   "['shopify', 'faire'].includes(order.sourceProvider)",
+  '<DetailSection title="Order training">',
   'setShadowTrainingPlanTarget(trainingTarget || null)',
   'setPlanCartonizationEvidenceGlobalId(sealedTrainingEvidence)',
   'if (detail && !sealedTrainingEvidence)',

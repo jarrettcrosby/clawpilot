@@ -1203,6 +1203,10 @@ function OrderDetailDrawer({
     && order?.sourceProvider
     && ['shopify', 'faire'].includes(order.sourceProvider),
   )
+  const trainingProviderOrder = Boolean(
+    order?.sourceProvider
+    && ['shopify', 'faire'].includes(order.sourceProvider),
+  )
   const primaryAction = canPlanImportedOrder
     ? undefined
     : shadowProviderOrder
@@ -1341,8 +1345,8 @@ function OrderDetailDrawer({
           overflowY: 'auto',
         }}>
           <Stack spacing={3}>
-            {shadowProviderOrder && order && (
-              <DetailSection title="Shadow training">
+            {trainingProviderOrder && order && (
+              <DetailSection title="Order training">
                 <ShadowOrderTrainingPanel
                   orderGlobalId={order.globalId}
                   canExecute={canExecute}

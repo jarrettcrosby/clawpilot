@@ -1,5 +1,13 @@
 export const SHADOW_TRAINING_CONFIRMATION = 'local_training_only' as const
 
+const ORDER_TRAINING_SAFETY_STATES = new Set([
+  'disabled',
+  'shadow',
+  'read_only',
+  'active',
+  'frozen',
+])
+
 export type OperationsShadowTrainingState =
   | 'enabled'
   | 'planned'
@@ -41,11 +49,11 @@ export function assertShadowTrainingEligibility(input: {
   accountEnvironment: string
   credentialVerificationStatus: string
 }) {
-  if (input.activationState !== 'shadow') {
+  if (!ORDER_TRAINING_SAFETY_STATES.has(input.activationState)) {
     throw new OperationsShadowTrainingError(
-      'Training can be enabled only while Operations is in Shadow.',
+      'Order training requires a current Operations safety profile.',
       409,
-      'OPERATIONS_SHADOW_TRAINING_SHADOW_REQUIRED',
+      'OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED',
     )
   }
   if (input.orderStatus !== 'imported') {

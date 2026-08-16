@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 const [
   migration,
+  independentControlMigration,
   domain,
   persistence,
   runtime,
@@ -18,6 +19,7 @@ const [
   operationalGeometry,
 ] = await Promise.all([
   read('db/migrations/0290_operations_shadow_training_runs.sql'),
+  read('db/migrations/0300_operations_order_training_independent_control.sql'),
   read('app_src/lib/operations/shadowTraining.ts'),
   read('app_src/lib/persistence/operationShadowTraining.ts'),
   read('app_src/lib/integrations/shadowTrainingRuntime.ts'),
@@ -66,6 +68,25 @@ assert.equal(
   false,
   'canonical Shadow write fence must not reopen after provider status mirroring',
 )
+
+for (const fragment of [
+  "activation.state IN (",
+  "'disabled', 'shadow', 'read_only', 'active', 'frozen'",
+  'activation.revision = NEW.authorization_activation_revision',
+  'Order training requires an exact current safety profile',
+  "IF TG_OP = 'DELETE'",
+  'OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED',
+]) {
+  assert.ok(
+    independentControlMigration.includes(fragment),
+    `0300 independent training control is missing ${fragment}`,
+  )
+}
+assert.equal(
+  independentControlMigration.includes("NEW.state = 'active'"),
+  false,
+  'Order training must not block switching the advanced safety profile to Active',
+)
 assert.equal(
   migration.includes("OLD.state = 'shadow'\n     AND NEW.state <> 'shadow'"),
   false,
@@ -90,7 +111,6 @@ for (const fragment of [
   "candidate.workflow_state = 'promoted'",
   'evidence.candidateRowVersion !== Number(run.authorization_candidate_row_version)',
   'evidence.candidateSourceHash !== run.authorization_candidate_source_hash',
-  'assertNoOpenOperationsShadowTrainingRunsForActivation',
   'undoOperationsShadowTrainingInPostgres',
   "eventType: 'shadow_training.undo'",
   'commerceProviderWrites: 0',
@@ -100,6 +120,7 @@ for (const fragment of [
   'training_evidence_sealed',
   "evidence.status IN ('succeeded', 'partial')",
   'restartRequiredBeforePlan',
+  'This order has an open local training run',
 ]) {
   assert.ok(persistence.includes(fragment), `persistence fence is missing ${fragment}`)
 }
@@ -156,13 +177,15 @@ for (const providerMirrorAction of [
   )
 }
 
-assert.ok(
+assert.equal(
   operationsPersistence.includes('assertNoOpenOperationsShadowTrainingRunsForActivation'),
-  'direct activation path is missing the mapped open-training preflight',
+  false,
+  'Order training must not block a direct advanced safety profile change',
 )
-assert.ok(
+assert.equal(
   commerceActivation.includes('assertNoOpenOperationsShadowTrainingRunsForActivation'),
-  'authorized commerce activation is missing the mapped open-training preflight',
+  false,
+  'Order training must not block an authorized Active transition',
 )
 
 for (const fragment of [

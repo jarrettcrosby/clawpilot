@@ -9,7 +9,6 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
-import { assertNoOpenOperationsShadowTrainingRunsForActivation } from '@/lib/persistence/operationShadowTraining'
 import type {
   CommerceActiveContinuation,
 } from '@/lib/operations/commerceActiveSelection'
@@ -1757,10 +1756,6 @@ export async function consumeCommerceActiveTransitionAuthorizationInPostgres(
         'Operations activation changed before authorization consumption',
       )
     }
-    await assertNoOpenOperationsShadowTrainingRunsForActivation(
-      client,
-      scopedOrganizationId,
-    )
     const current = await client.query<{ current: boolean }>(
       `SELECT operations_commerce_active_preparation_is_current(
          $1::uuid,

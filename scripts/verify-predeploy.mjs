@@ -212,6 +212,7 @@ for (const requiredPath of [
   'db/migrations/0288_operations_shopify_location_routing.sql',
   'db/migrations/0289_operations_shopify_location_administration.sql',
   'db/migrations/0290_operations_shadow_training_runs.sql',
+  'db/migrations/0300_operations_order_training_independent_control.sql',
   'db/migrations/0291_operations_order_replanning_corrections.sql',
   'app_src/app/api/operations/print-agent/pair/route.ts',
   'app_src/app/api/operations/print-agent/cleanup-status/route.ts',

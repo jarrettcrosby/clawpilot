@@ -218,28 +218,30 @@ async function verifyActivationRunConcurrency(pool, fixture) {
     })
     await activationClient.query('BEGIN')
     let activationSettled = false
-    const activationAttempt = rejected(
-      activationClient.query(
-        `UPDATE operations_activation_scopes
-         SET state = 'active', revision = revision + 1,
-             updated_by = $2, updated_at = now()
-         WHERE organization_id = $1::uuid`,
-        [fixture.organizationId, actorEmail],
-      ).finally(() => {
-        activationSettled = true
-      }),
-      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-      'A committed training run must win over a concurrent Active transition',
-    )
+    const activationAttempt = activationClient.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'active', revision = revision + 1,
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid
+       RETURNING state`,
+      [fixture.organizationId, actorEmail],
+    ).finally(() => {
+      activationSettled = true
+    })
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
     assert.equal(
       activationSettled,
       false,
-      'Active transition must wait for the concurrent training authorization lock',
+      'A profile change must serialize behind concurrent training authorization',
     )
     await runClient.query('COMMIT')
-    await activationAttempt
-    await activationClient.query('ROLLBACK')
+    const activationResult = await activationAttempt
+    assert.equal(
+      activationResult.rows[0].state,
+      'active',
+      'An open local training run must not block an Active profile change',
+    )
+    await activationClient.query('COMMIT')
   } finally {
     await runClient.query('ROLLBACK').catch(() => undefined)
     await activationClient.query('ROLLBACK').catch(() => undefined)
@@ -252,6 +254,14 @@ async function verifyActivationRunConcurrency(pool, fixture) {
     fixture,
     concurrentRun,
     'Finish run-first activation concurrency proof',
+  )
+
+  await pool.query(
+    `UPDATE operations_activation_scopes
+     SET state = 'shadow', revision = revision + 1,
+         updated_by = $2, updated_at = now()
+     WHERE organization_id = $1::uuid`,
+    [fixture.organizationId, actorEmail],
   )
 
   const activeFirstClient = await pool.connect()
@@ -274,8 +284,8 @@ async function verifyActivationRunConcurrency(pool, fixture) {
       }).finally(() => {
         runSettled = true
       }),
-      /Shadow training authorization requires/u,
-      'A committed Active transition must win over a concurrent training authorization',
+      /exact current safety profile|authorization requires/u,
+      'A stale profile revision must not authorize a concurrent training run',
     )
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
     assert.equal(
@@ -292,6 +302,17 @@ async function verifyActivationRunConcurrency(pool, fixture) {
     activeFirstClient.release()
     blockedRunClient.release()
   }
+
+  const activeRun = await insertRun(pool, fixture, {
+    generation: 21,
+    idempotencyKey: 'order-training-current-active-retry',
+  })
+  await resetRun(
+    pool,
+    fixture,
+    activeRun,
+    'Fresh current Active authorization remains available for local training',
+  )
 
   await pool.query(
     `UPDATE operations_activation_scopes
@@ -860,8 +881,8 @@ async function verify(databaseUrl) {
         accountEnvironment: 'mock',
         idempotencyKey: 'shadow-training-mock-rejected',
       }),
-      /account_environment|Shadow training source/u,
-      'Mock commerce accounts must not authorize Shadow training',
+      /account_environment|Order training source/u,
+      'Mock commerce accounts must not authorize Order training',
     )
     for (const counterColumn of [
       'commerce_provider_write_count',
@@ -894,16 +915,18 @@ async function verify(databaseUrl) {
     assert.match(sandboxRun.global_id, /^gtrn[0-9a-v]{12}$/u)
     assert.match(productionRun.global_id, /^gtrn[0-9a-v]{12}$/u)
 
-    await rejected(
-      pool.query(
-        `UPDATE operations_activation_scopes
-         SET state = 'active', revision = revision + 1,
-             updated_by = $2, updated_at = now()
-         WHERE organization_id = $1::uuid`,
-        [ids.organization, actorEmail],
-      ),
-      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-      'Shadow cannot become Active while a training run remains open',
+    const activeWithOpenTraining = await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'active', revision = revision + 1,
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid
+       RETURNING state`,
+      [ids.organization, actorEmail],
+    )
+    assert.equal(
+      activeWithOpenTraining.rows[0].state,
+      'active',
+      'A local-only training run must not block an Active profile change',
     )
     await rejected(
       pool.query(
@@ -911,43 +934,35 @@ async function verify(databaseUrl) {
          WHERE organization_id = $1::uuid`,
         [ids.organization],
       ),
-      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-      'An activation scope cannot be deleted while a training run remains open',
+      /OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED/u,
+      'The safety profile row cannot be deleted while a training run remains open',
     )
     await withReplicaSession(pool, (client) => client.query(
       `DELETE FROM operations_activation_scopes
        WHERE organization_id = $1::uuid`,
       [ids.organization],
     ))
-    await rejected(
-      pool.query(
-        `INSERT INTO operations_activation_scopes (
-           organization_id, data_pipeline_id, state, revision,
-           reason, updated_by
-         ) VALUES ($1::uuid, $2::uuid, 'active', 2, $3, $4)`,
-        [
-          ids.organization,
-          ids.pipeline,
-          'Attempt to bypass the open training interlock',
-          actorEmail,
-        ],
-      ),
-      /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-      'A missing activation scope cannot be recreated Active while training remains open',
-    )
-    await pool.query(
+    const restoredProfile = await pool.query(
       `INSERT INTO operations_activation_scopes (
          organization_id, data_pipeline_id, state, revision,
          reason, updated_by
-       ) VALUES ($1::uuid, $2::uuid, 'shadow', 2, $3, $4)`,
+       ) VALUES ($1::uuid, $2::uuid, 'active', 2, $3, $4)
+       RETURNING state`,
       [
         ids.organization,
         ids.pipeline,
-        'Restore Shadow after activation insert-fence proof',
+        'Restore the safety profile without stranding local training',
         actorEmail,
       ],
     )
-    for (const allowedState of ['frozen', 'disabled', 'read_only']) {
+    assert.equal(restoredProfile.rows[0].state, 'active')
+    for (const allowedState of [
+      'disabled',
+      'shadow',
+      'read_only',
+      'active',
+      'frozen',
+    ]) {
       const safeExit = await pool.query(
         `UPDATE operations_activation_scopes
          SET state = $2, revision = revision + 1,
@@ -958,24 +973,6 @@ async function verify(databaseUrl) {
       )
       assert.equal(safeExit.rows[0].state, allowedState)
       await verifyCanonicalWriteGuards(pool, shopify)
-      await rejected(
-        pool.query(
-          `UPDATE operations_activation_scopes
-           SET state = 'active', revision = revision + 1,
-               updated_by = $2, updated_at = now()
-           WHERE organization_id = $1::uuid`,
-          [ids.organization, actorEmail],
-        ),
-        /OPERATIONS_SHADOW_TRAINING_RESET_REQUIRED/u,
-        `${allowedState} cannot become Active while training remains open`,
-      )
-      await pool.query(
-        `UPDATE operations_activation_scopes
-         SET state = 'shadow', revision = revision + 1,
-             updated_by = $2, updated_at = now()
-         WHERE organization_id = $1::uuid`,
-        [ids.organization, actorEmail],
-      )
     }
     const activationProjection = shadowTrainingPersistence(pool)
     const activationDriftedRun = await activationProjection
@@ -986,15 +983,69 @@ async function verify(databaseUrl) {
     assert.equal(activationDriftedRun.run.activationChanged, true)
     assert.deepEqual(
       Array.from(activationDriftedRun.run.availableActions),
-      ['reset'],
-      'Activation revision drift after emergency mode changes exposes only Reset',
+      ['plan', 'reset'],
+      'Profile changes must not strand an exact local training run',
     )
     await resetRun(pool, shopify, sandboxRun, 'Finish environment eligibility')
     await resetRun(pool, faire, productionRun, 'Finish production eligibility')
+
+    const independentProfileTraining = shadowTrainingPersistence(pool)
+    for (const [index, safetyState] of [
+      'disabled',
+      'shadow',
+      'read_only',
+      'active',
+      'frozen',
+    ].entries()) {
+      await pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = $2, revision = revision + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [ids.organization, safetyState, actorEmail],
+      )
+      const modeRun = await independentProfileTraining
+        .enableOperationsShadowTrainingInPostgres({
+          organizationId: ids.organization,
+          actorEmail,
+          orderGlobalId: shopify.order.global_id,
+          confirmation: 'local_training_only',
+          reason: `Prove local Order training is available in ${safetyState}`,
+          idempotencyKey: `order-training-enable-${index}-${safetyState}`,
+        })
+      assert.equal(modeRun.state, 'enabled')
+      assert.equal(
+        modeRun.activationChanged,
+        false,
+        `${safetyState} is the authorization-time profile, not immediate drift`,
+      )
+      assert.deepEqual(
+        Array.from(modeRun.availableActions),
+        ['plan', 'reset'],
+        `${safetyState} must expose the complete local training start boundary`,
+      )
+      const resetModeRun = await independentProfileTraining
+        .resetOperationsShadowTrainingInPostgres({
+          organizationId: ids.organization,
+          actorEmail,
+          runGlobalId: modeRun.globalId,
+          expectedRowVersion: modeRun.rowVersion,
+          reason: `Finish ${safetyState} Order training availability proof`,
+          idempotencyKey: `order-training-reset-${index}-${safetyState}`,
+        })
+      assert.equal(resetModeRun.state, 'reset')
+    }
+    await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'shadow', revision = revision + 1,
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [ids.organization, actorEmail],
+    )
     await verifyActivationRunConcurrency(pool, shopify)
 
     const planRun = await insertRun(pool, shopify, {
-      generation: 2,
+      generation: 30,
       idempotencyKey: 'shadow-training-valid-plan',
     })
     const planEvidence = await createSealedEvidence(
@@ -1289,6 +1340,13 @@ async function verify(databaseUrl) {
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [ids.organization, shopify.order.id, actorEmail],
     ))
+    await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'read_only', revision = revision + 1,
+           updated_by = $2, updated_at = now()
+       WHERE organization_id = $1::uuid`,
+      [ids.organization, actorEmail],
+    )
     const mirroredOrder = await persistence
       .readOperationsShadowTrainingForOrderInPostgres({
         organizationId: ids.organization,
@@ -1299,7 +1357,7 @@ async function verify(databaseUrl) {
     assert.equal(mirroredOrder.run.rowVersion, 0)
     assert.equal(mirroredOrder.run.candidateChanged, false)
     assert.equal(mirroredOrder.run.restartRequiredBeforePlan, false)
-    assert.equal(mirroredOrder.run.activationChanged, false)
+    assert.equal(mirroredOrder.run.activationChanged, true)
     assert.deepEqual(
       Array.from(mirroredOrder.run.availableActions),
       ['plan', 'reset'],
@@ -1321,12 +1379,19 @@ async function verify(databaseUrl) {
     assert.match(persistedRun.pickTasks[0].globalId, /^gtpt[0-9a-v]{12}$/u)
 
     const persistenceTransitions = [
-      ['releaseOperationsShadowTrainingInPostgres', 'released', 'release'],
-      ['confirmOperationsShadowTrainingPicksInPostgres', 'picked', 'pick'],
-      ['verifyOperationsShadowTrainingPackInPostgres', 'packed', 'pack'],
-      ['completeOperationsShadowTrainingInPostgres', 'completed', 'complete'],
+      ['releaseOperationsShadowTrainingInPostgres', 'released', 'release', 'disabled'],
+      ['confirmOperationsShadowTrainingPicksInPostgres', 'picked', 'pick', 'active'],
+      ['verifyOperationsShadowTrainingPackInPostgres', 'packed', 'pack', 'frozen'],
+      ['completeOperationsShadowTrainingInPostgres', 'completed', 'complete', 'shadow'],
     ]
-    for (const [method, expectedState, key] of persistenceTransitions) {
+    for (const [method, expectedState, key, safetyState] of persistenceTransitions) {
+      await pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = $2, revision = revision + 1,
+             updated_by = $3, updated_at = now()
+         WHERE organization_id = $1::uuid`,
+        [ids.organization, safetyState, actorEmail],
+      )
       persistedRun = await persistence[method]({
         organizationId: ids.organization,
         actorEmail,
@@ -1336,6 +1401,11 @@ async function verify(databaseUrl) {
         idempotencyKey: `shadow-training-persistence-${key}`,
       })
       assert.equal(persistedRun.state, expectedState)
+      assert.equal(
+        persistedRun.activationChanged,
+        true,
+        `${safetyState} remains an audit difference, not a local-training blocker`,
+      )
     }
     assert.equal(persistedRun.rowVersion, 5)
     assert.ok(persistedRun.completedAt)
@@ -1526,7 +1596,7 @@ async function verify(databaseUrl) {
 
     const preSealDriftAuthorization = await currentAuthorization(pool, shopify)
     const preSealDriftRun = await insertRun(pool, shopify, {
-      generation: 4,
+      generation: 40,
       idempotencyKey: 'shadow-training-pre-seal-candidate-drift',
     })
     await pool.query(
@@ -1571,7 +1641,7 @@ async function verify(databaseUrl) {
     )
 
     const driftRun = await insertRun(pool, shopify, {
-      generation: 5,
+      generation: 41,
       idempotencyKey: 'shadow-training-candidate-drift',
     })
     const driftEvidence = await createSealedEvidence(
@@ -1789,7 +1859,7 @@ async function verify(databaseUrl) {
     )
 
     const downstreamRun = await insertRun(pool, shopify, {
-      generation: 6,
+      generation: 42,
       idempotencyKey: 'shadow-training-downstream-primer',
     })
     await resetRun(pool, shopify, downstreamRun, 'Prime downstream fence')
@@ -1807,7 +1877,7 @@ async function verify(databaseUrl) {
     ))
     await rejected(
       insertRun(pool, shopify, {
-        generation: 7,
+        generation: 43,
         idempotencyKey: 'shadow-training-downstream-rejected',
       }),
       /untouched imported connected-store order/u,
