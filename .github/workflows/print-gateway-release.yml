@@ -39,6 +39,7 @@ jobs:
       - run: node scripts/test-local-print-device.mjs
       - run: node scripts/test-operation-print-agent-pairing.mjs
       - run: node scripts/test-operation-print-agent-cleanup-status.mjs
+      - run: node scripts/test-operation-print-agent-runtime.mjs
       - run: node scripts/test-operations-print-delivery.mjs --contracts-only
       - id: version
         shell: bash

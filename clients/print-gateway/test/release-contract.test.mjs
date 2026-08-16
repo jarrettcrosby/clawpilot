@@ -46,6 +46,7 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
     'node scripts/test-local-print-device.mjs',
     'node scripts/test-operation-print-agent-pairing.mjs',
     'node scripts/test-operation-print-agent-cleanup-status.mjs',
+    'node scripts/test-operation-print-agent-runtime.mjs',
     'node scripts/test-operations-print-delivery.mjs --contracts-only',
     'run smoke:packaged',
     'Execute the exact mounted, signed, stapled DMG payload',
