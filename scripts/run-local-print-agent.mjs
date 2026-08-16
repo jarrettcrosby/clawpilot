@@ -341,6 +341,14 @@ async function submitRaw(payload, job, timeoutMs = 10_000) {
   error.code = String(result?.code || disposition.code)
   error.acceptedBytes = disposition.acceptedBytes
   error.deliveryStarted = disposition.deliveryStarted
+  if (process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1') {
+    error.helperDiagnostic = {
+      exitCode: execution.code,
+      signal: execution.signal,
+      stdout: execution.stdout,
+      stderr: execution.stderr,
+    }
+  }
   throw error
 }
 
@@ -957,6 +965,12 @@ async function handleJob(config, ledger, job, deviceReference) {
       retryable,
       acceptedBytes,
       deliveryStarted,
+      ...(process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1'
+        ? {
+          failureDetail: error?.message || null,
+          helperDiagnostic: error?.helperDiagnostic || null,
+        }
+        : {}),
     })
     return
   }
