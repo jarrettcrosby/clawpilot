@@ -761,6 +761,26 @@ public struct ManagerOperationsOverview: Equatable, Sendable {
     public let capabilities: ManagerOperationsCapabilities
 }
 
+public struct ManagerStoreSyncSubmissionFence: Equatable, Sendable {
+    public let authenticationGeneration: UInt64
+    public let organizationId: String
+
+    public init(authenticationGeneration: UInt64, organizationId: String) {
+        self.authenticationGeneration = authenticationGeneration
+        self.organizationId = organizationId
+    }
+
+    public func permitsStateMutation(
+        currentAuthenticationGeneration: UInt64,
+        currentOrganizationId: String?,
+        isAuthenticated: Bool
+    ) -> Bool {
+        isAuthenticated
+            && currentAuthenticationGeneration == authenticationGeneration
+            && currentOrganizationId == organizationId
+    }
+}
+
 public enum ManagerStoreSyncClientError: Error, Equatable, Sendable {
     case invalidControl
     case invalidReason
@@ -2062,6 +2082,8 @@ public actor PickingAPIClient {
     public func updateManagerStoreSync(
         _ command: ManagerStoreSyncCommand
     ) async throws -> ManagerStoreSyncControl {
+        await beginAuthenticatedMutation()
+        defer { finishAuthenticatedMutation() }
         var request = URLRequest(url: try endpoint("/api/operations"))
         request.httpMethod = "POST"
         request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -2100,10 +2122,10 @@ public actor PickingAPIClient {
                     retryAfterSeconds: max(1, seconds)
                 )
             }
-            if let envelope {
+            if (400..<500).contains(http.statusCode) {
                 throw PickingAPIError.rejected(
-                    code: envelope.code ?? "COMMERCE_STORE_SYNC_UPDATE_FAILED",
-                    message: envelope.error ?? "Store sync was not changed"
+                    code: envelope?.code ?? "COMMERCE_STORE_SYNC_UPDATE_REJECTED",
+                    message: envelope?.error ?? "Store sync was not changed"
                 )
             }
             throw PickingAPIError.invalidResponse

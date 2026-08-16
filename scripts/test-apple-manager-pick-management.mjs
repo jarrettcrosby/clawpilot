@@ -29,10 +29,12 @@ for (const fragment of [
   'command.assignedTo != nil || interventionExceptionGlobalId != nil',
   'public struct ManagerStoreSyncControl',
   'public struct ManagerStoreSyncCommand',
+  'public struct ManagerStoreSyncSubmissionFence',
   'public func fetchManagerOperations()',
   'public func updateManagerStoreSync(',
   'action = "update-commerce-store-sync"',
   'control.revision == command.expectedRevision + 1',
+  'await beginAuthenticatedMutation()',
   'request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")',
 ]) {
   assert.ok(adapters.includes(fragment), `Apple adapter is missing ${fragment}`)
@@ -46,7 +48,7 @@ for (const fragment of [
   'managerOrders = overview.orders',
   'managerStoreSyncControls = overview.storeSync',
   'canManageStoreSync = overview.capabilities.canActivate',
-  'managerPickManagement = try await api.fetchManagerPickManagement()',
+  'let pickManagement = try await api.fetchManagerPickManagement()',
   'Some manager data is unavailable',
   'Available orders remain usable.',
   'func managePickerAssignment(',
@@ -59,6 +61,13 @@ for (const fragment of [
   'func updateManagerStoreSync(',
   'func retryPendingManagerStoreSyncChange()',
   'reconcilePendingManagerStoreSyncChange()',
+  'managerStoreSyncOperationIsCurrent(',
+  'installReplacementAuthenticationProfile(',
+  'finishManagerStoreSyncSubmission(',
+  'await waitForManagerStoreSyncSubmissionToFinish()',
+  'catch PickingAPIError.rejected(let code, let message)',
+  'catch PickingAPIError.rateLimited(let seconds)',
+  'The Store sync change was rejected and was not retained',
   'Retry or refresh the saved Store sync change before changing organizations.',
 ]) {
   assert.ok(model.includes(fragment), `iPhone manager model is missing ${fragment}`)
@@ -125,6 +134,9 @@ for (const fragment of [
   'manager Store sync decodes desired and effective state separately',
   'manager Store sync sends the exact revision fenced command',
   'manager Store sync retries a lost response byte identically',
+  'manager Store sync classifies a definitive rejection as not applied',
+  'manager Store sync keeps a server failure outcome ambiguous',
+  'manager Store sync rejects late state after sign-out or workspace replacement',
   'every Store sync effective reason has one exact effective state',
   'captured[0].1 == captured[1].1',
 ]) {

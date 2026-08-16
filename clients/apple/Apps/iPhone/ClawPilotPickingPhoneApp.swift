@@ -177,6 +177,7 @@ final class PickingPhoneModel: ObservableObject {
     private var dismissedCountContextToken: String?
     private var authenticationGeneration: UInt64 = 0
     private var workspaceSwitchCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var managerStoreSyncCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     private var pendingManagerStoreSyncCommand: ManagerStoreSyncCommand?
 
     var canSendCode: Bool {
@@ -529,8 +530,7 @@ final class PickingPhoneModel: ObservableObject {
         let restoredProfile: ClawPilotSessionProfile
         do {
             restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
-            isAuthenticated = true
+            installReplacementAuthenticationProfile(restoredProfile)
         } catch {
             sessionProfile = nil
             isAuthenticated = false
@@ -610,10 +610,9 @@ final class PickingPhoneModel: ObservableObject {
         }
         do {
             let restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
+            installReplacementAuthenticationProfile(restoredProfile)
             isRestoringSession = true
             defer { isRestoringSession = false }
-            isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
@@ -700,11 +699,10 @@ final class PickingPhoneModel: ObservableObject {
                 }
             }
             let restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
+            installReplacementAuthenticationProfile(restoredProfile)
             isRestoringSession = true
             defer { isRestoringSession = false }
             email = restoredProfile.effectiveUser.email
-            isAuthenticated = true
             isLocallyLocked = false
             biometrics.rememberAuthenticatedSession()
             let transitionRecovery = await recoverWorkspaceTransitionIfNeeded(
@@ -1030,40 +1028,92 @@ final class PickingPhoneModel: ObservableObject {
             managerStatus = "Manager access is not assigned to this account."
             return
         }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return }
         isManagerBusy = true
-        defer { isManagerBusy = false }
+        defer {
+            if managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) {
+                isManagerBusy = false
+            }
+        }
         var failures: [String] = []
         do {
             let overview = try await api.fetchManagerOperations()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             managerOrders = overview.orders
             managerStoreSyncControls = overview.storeSync
             canManageStoreSync = overview.capabilities.canActivate
             reconcilePendingManagerStoreSyncChange()
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             managerStoreSyncControls = []
             canManageStoreSync = false
             failures.append("orders: \(error.localizedDescription)")
         }
         do {
-            managerPickers = try await api.fetchManagerPickers()
+            let pickers = try await api.fetchManagerPickers()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerPickers = pickers
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             failures.append("picker access: \(error.localizedDescription)")
         }
         do {
-            pickerPerformance = try await api.fetchPickerPerformance()
+            let performance = try await api.fetchPickerPerformance()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            pickerPerformance = performance
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             failures.append("performance: \(error.localizedDescription)")
         }
         do {
-            managerPickManagement = try await api.fetchManagerPickManagement()
-            if let eligible = managerPickManagement?.eligiblePickers,
-               eligible.isEmpty == false {
+            let pickManagement = try await api.fetchManagerPickManagement()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerPickManagement = pickManagement
+            let eligible = pickManagement.eligiblePickers
+            if eligible.isEmpty == false {
                 managerPickers = eligible
             }
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             managerPickManagement = nil
             failures.append("current assignments/history: \(error.localizedDescription)")
         }
+        guard managerStoreSyncOperationIsCurrent(
+            generation: operationGeneration,
+            organizationId: operationOrganizationId
+        ) else { return }
         if failures.isEmpty == false {
             managerStatus = "Some manager data is unavailable (\(failures.joined(separator: "; "))). Available orders remain usable."
         } else if managerPickManagement?.current.isEmpty == false {
@@ -1126,10 +1176,25 @@ final class PickingPhoneModel: ObservableObject {
         _ command: ManagerStoreSyncCommand
     ) async -> Bool {
         guard !isManagerStoreSyncBusy else { return false }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return false }
         isManagerStoreSyncBusy = true
-        defer { isManagerStoreSyncBusy = false }
+        defer {
+            finishManagerStoreSyncSubmission(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            )
+        }
         do {
             let control = try await api.updateManagerStoreSync(command)
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
             if let index = managerStoreSyncControls.firstIndex(where: {
                 $0.accountGlobalId == control.accountGlobalId
             }) {
@@ -1142,12 +1207,55 @@ final class PickingPhoneModel: ObservableObject {
             managerStoreSyncStatus = control.effectiveReasonLabel
             return true
         } catch PickingAPIError.conflict(let code, let message) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
             pendingManagerStoreSyncCommand = nil
             hasPendingManagerStoreSyncChange = false
             managerStoreSyncStatus = "\(message) (\(code))"
             await loadManagerOperations()
             return false
+        } catch PickingAPIError.rejected(let code, let message) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "The Store sync change was rejected and was not retained: \(message) (\(code)). Review the refreshed control before trying again."
+            await loadManagerOperations()
+            return false
+        } catch PickingAPIError.unauthorized {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "Your session expired before Store sync could be changed. Sign in and review the current control."
+            return false
+        } catch PickingAPIError.invalidOrigin {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "The configured ClawPilot server is invalid. The Store sync change was not sent or retained."
+            return false
+        } catch PickingAPIError.rateLimited(let seconds) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            managerStoreSyncStatus = "The exact Store sync change remains saved for retry after \(seconds) seconds."
+            return false
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
             managerStoreSyncStatus = "The exact Store sync change remains saved for retry: \(error.localizedDescription)"
             return false
         }
@@ -1668,6 +1776,7 @@ final class PickingPhoneModel: ObservableObject {
         sessionProfile = nil
         clearPublishedPickProjection()
         await waitForWorkspaceSwitchToFinish()
+        await waitForManagerStoreSyncSubmissionToFinish()
         var serverLogoutError: Error?
         do {
             try await api.logout()
@@ -1693,6 +1802,7 @@ final class PickingPhoneModel: ObservableObject {
         status = serverLogoutError == nil
             ? "Signed out."
             : "Signed out on this device. The server sign-out response was unavailable."
+        isManagerBusy = false
         managerOrders = []
         clearManagerStoreSyncState()
         managerPickers = []
@@ -1712,6 +1822,51 @@ final class PickingPhoneModel: ObservableObject {
 
     private func authenticationIsCurrent(_ generation: UInt64) -> Bool {
         generation == authenticationGeneration && isAuthenticated
+    }
+
+    private func installReplacementAuthenticationProfile(
+        _ profile: ClawPilotSessionProfile
+    ) {
+        authenticationGeneration &+= 1
+        clearManagerStoreSyncState()
+        sessionProfile = profile
+        isAuthenticated = true
+    }
+
+    private func managerStoreSyncOperationIsCurrent(
+        generation: UInt64,
+        organizationId: String
+    ) -> Bool {
+        ManagerStoreSyncSubmissionFence(
+            authenticationGeneration: generation,
+            organizationId: organizationId
+        ).permitsStateMutation(
+            currentAuthenticationGeneration: authenticationGeneration,
+            currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            isAuthenticated: isAuthenticated
+        )
+    }
+
+    private func waitForManagerStoreSyncSubmissionToFinish() async {
+        guard isManagerStoreSyncBusy else { return }
+        await withCheckedContinuation { continuation in
+            managerStoreSyncCompletionWaiters.append(continuation)
+        }
+    }
+
+    private func finishManagerStoreSyncSubmission(
+        generation: UInt64,
+        organizationId: String
+    ) {
+        if managerStoreSyncOperationIsCurrent(
+            generation: generation,
+            organizationId: organizationId
+        ) {
+            isManagerStoreSyncBusy = false
+        }
+        let waiters = managerStoreSyncCompletionWaiters
+        managerStoreSyncCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     private func waitForWorkspaceSwitchToFinish() async {
