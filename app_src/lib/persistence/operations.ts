@@ -54,6 +54,7 @@ import {
   cartonizeSinglePackage,
   DeterministicFulfillmentOptimizer,
   operationsOrderReplanningActionAvailability,
+  operationsOrderReplanningProfileAllowsCorrection,
   priceContract,
   selectPromiseRate,
 } from '@/lib/operations/domain'
@@ -2658,7 +2659,7 @@ async function readOperationsOrderReplanningProjection(
     ...overrides,
   })
   if (
-    activation.state !== 'active'
+    !operationsOrderReplanningProfileAllowsCorrection(activation.state)
     || !input.canManage
     || !input.canExecute
     || !['shopify', 'faire'].includes(order.source_provider)

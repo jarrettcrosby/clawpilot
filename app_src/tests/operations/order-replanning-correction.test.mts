@@ -28,15 +28,17 @@ function correction(overrides: Partial<Parameters<
   })
 }
 
-test('projects one exact Active planned-order correction action', () => {
-  const action = correction()
-  assert.equal(action.action, 'reopen_for_replanning')
-  assert.equal(action.enabled, true)
-  assert.equal(action.blockedCode, null)
-  assert.equal(action.expectedPlanGlobalId, 'gfp0000001')
-  assert.equal(action.expectedPlanVersion, 1)
-  assert.equal(action.expectedCorrectionFingerprint, fingerprint)
-  assert.match(action.consequenceSummary || '', /No carrier or storefront calls/u)
+test('projects one exact local correction in every non-emergency profile', () => {
+  for (const activationState of ['shadow', 'read_only', 'active'] as const) {
+    const action = correction({ activationState })
+    assert.equal(action.action, 'reopen_for_replanning')
+    assert.equal(action.enabled, true)
+    assert.equal(action.blockedCode, null)
+    assert.equal(action.expectedPlanGlobalId, 'gfp0000001')
+    assert.equal(action.expectedPlanVersion, 1)
+    assert.equal(action.expectedCorrectionFingerprint, fingerprint)
+    assert.match(action.consequenceSummary || '', /No carrier or storefront calls/u)
+  }
 })
 
 test('keeps released correction visible but blocks it pending device recall', () => {
@@ -54,9 +56,10 @@ test('keeps released correction visible but blocks it pending device recall', ()
   assert.equal(released.expectedCorrectionFingerprint, null)
 })
 
-test('does not expose an executable correction outside Active commerce work', () => {
+test('emergency profiles and invalid commerce work remain blocked', () => {
   const cases = [
-    correction({ activationState: 'shadow' }),
+    correction({ activationState: 'disabled' }),
+    correction({ activationState: 'frozen' }),
     correction({ sourceProvider: 'mock-commerce' }),
     correction({ sourceProvider: 'clawpilot_native', orderType: 'one_off' }),
     correction({ status: 'picking', planStatus: 'released' }),
@@ -67,6 +70,10 @@ test('does not expose an executable correction outside Active commerce work', ()
     assert.equal(action.enabled, false)
     assert.equal(action.expectedCorrectionFingerprint, null)
   }
+  assert.equal(
+    correction({ activationState: 'frozen' }).blockedCode,
+    'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED',
+  )
 })
 
 test('carries the server exact-state blocker and fails closed without a fingerprint', () => {

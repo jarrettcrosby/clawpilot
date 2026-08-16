@@ -285,6 +285,12 @@ export function availableOperationsOrderActions(input: {
   return actions
 }
 
+export function operationsOrderReplanningProfileAllowsCorrection(
+  activationState: OperationsActivationState,
+) {
+  return ['shadow', 'read_only', 'active'].includes(activationState)
+}
+
 export function operationsOrderReplanningActionAvailability(input: {
   activationState: OperationsActivationState
   canManage: boolean
@@ -309,9 +315,11 @@ export function operationsOrderReplanningActionAvailability(input: {
   } else if (!input.canExecute) {
     blockedCode = 'OPERATIONS_EXECUTE_REQUIRED'
     blockedReason = 'Operations execute permission is required.'
-  } else if (input.activationState !== 'active') {
-    blockedCode = 'OPERATIONS_REPLANNING_ACTIVE_REQUIRED'
-    blockedReason = 'Operational correction is available only in Operations Active.'
+  } else if (!operationsOrderReplanningProfileAllowsCorrection(
+    input.activationState,
+  )) {
+    blockedCode = 'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED'
+    blockedReason = 'Disabled and Frozen stop operational corrections. This zero-provider-write correction is available in Shadow, Read only, or Active.'
   } else if (!['shopify', 'faire'].includes(input.sourceProvider)) {
     blockedCode = 'OPERATIONS_REPLANNING_PROVIDER_INVALID'
     blockedReason = 'Only a connected Shopify or Faire order can be reopened for replanning.'

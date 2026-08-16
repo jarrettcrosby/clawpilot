@@ -305,7 +305,7 @@ const ACTIVATION_OPTIONS: Array<{
   {
     value: 'read_only',
     label: 'Read only',
-    description: 'Allows viewing, health checks, reconciliation, and evidence export only.',
+    description: 'Allows viewing, health checks, reconciliation, evidence export, and explicitly confirmed zero-provider-write corrections.',
   },
   {
     value: 'active',

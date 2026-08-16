@@ -113,4 +113,4 @@ for (const fragment of [
   assert.ok(operations.includes(fragment), `Shadow training regressed at ${fragment}`)
 }
 
-console.log('Active order-replanning web contract passed.')
+console.log('Independent order-replanning web contract passed.')
