@@ -123,6 +123,7 @@ test('packaging contains exact runtime, native Windows helper, and no PowerShell
   assert.equal(packageJson.build.nsis.deleteAppDataOnUninstall, false)
   const resources = [
     ...packageJson.build.extraResources,
+    ...packageJson.build.mac.extraResources,
     ...packageJson.build.win.extraResources,
   ].map((entry) => entry.to)
   for (const required of [
@@ -130,6 +131,7 @@ test('packaging contains exact runtime, native Windows helper, and no PowerShell
     'runtime/lib/local-print-device.mjs',
     'runtime/lib/submit-raw-print.mjs',
     'runtime/lib/print-agent-pairing-credential.mjs',
+    'runtime/lib/clawpilot-print-lock',
     'runtime/lib/clawpilot-print-lock.exe',
   ]) assert.ok(resources.includes(required), `Missing exact runtime resource ${required}`)
   assert.doesNotMatch(packageSource, /\.ps1|PowerShell|ExecutionPolicy/i)
@@ -151,6 +153,7 @@ test('release verifier proves signatures, hardened runtime, and payload architec
     'for (const filePath of pePayloads) assertValidWindowsSignature(filePath)',
     "'Uninstall ClawPilot Print Agent.exe'",
     'assertNoConcreteSecretsInPaths([appPath])',
+    'The native macOS endpoint-lock helper is missing from the packaged app',
     'assertNoConcreteSecretsInPaths([unpackedDirectory])',
     'sourceCommit',
   ]) assert.ok(verifier.includes(proof), `Release verifier is missing ${proof}`)

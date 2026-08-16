@@ -6,6 +6,46 @@ import { localPrinterLockInvocation } from '../../../scripts/lib/local-print-dev
 import { workerLifetimeLockInvocation } from '../src/lib/worker-manager.mjs'
 
 const helperPath = 'C:\\Program Files\\ClawPilot\\resources\\runtime\\lib\\clawpilot-print-lock.exe'
+const macHelperPath = '/Applications/ClawPilot Print Agent.app/Contents/Resources/runtime/lib/clawpilot-print-lock'
+
+test('macOS endpoint and worker lifetime locks use the bundled native helper', () => {
+  const endpoint = localPrinterLockInvocation({
+    platform: 'darwin',
+    lockPath: '/Library/Application Support/ClawPilot/endpoint.lock',
+    timeoutSeconds: 15,
+    command: '/Applications/ClawPilot Print Agent.app/Contents/MacOS/ClawPilot Print Agent',
+    args: ['/Applications/ClawPilot Print Agent.app/Contents/Resources/runtime/lib/submit-raw-print.mjs'],
+    macHelperPath,
+    fileExists: (value) => value === macHelperPath,
+  })
+  assert.equal(endpoint.command, macHelperPath)
+  assert.deepEqual(endpoint.args.slice(0, 6), [
+    '--lock-path',
+    '/Library/Application Support/ClawPilot/endpoint.lock',
+    '--timeout-ms',
+    '15000',
+    '--command',
+    '/Applications/ClawPilot Print Agent.app/Contents/MacOS/ClawPilot Print Agent',
+  ])
+
+  const lifetime = workerLifetimeLockInvocation({
+    platform: 'darwin',
+    lockPath: '/Library/Application Support/ClawPilot/worker.lock',
+    command: '/Applications/ClawPilot Print Agent.app/Contents/MacOS/ClawPilot Print Agent',
+    args: ['/Applications/ClawPilot Print Agent.app/Contents/Resources/runtime/run-local-print-agent.mjs'],
+    macHelperPath,
+    fileExists: (value) => value === macHelperPath,
+  })
+  assert.equal(lifetime.command, macHelperPath)
+  assert.equal(lifetime.args[3], '1')
+
+  const helperSource = readFileSync(path.resolve(
+    import.meta.dirname,
+    '../native/macos/clawpilot-print-lock.c',
+  ), 'utf8')
+  assert.match(helperSource, /flock\(descriptor, LOCK_EX \| LOCK_NB\)/)
+  assert.match(helperSource, /execv\(command, &argv\[command_index\]\)/)
+})
 
 test('Windows endpoint delivery uses bundled native named-mutex helper without PowerShell', () => {
   const digest = 'a'.repeat(64)

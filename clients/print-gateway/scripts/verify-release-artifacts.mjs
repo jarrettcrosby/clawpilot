@@ -85,6 +85,17 @@ function verifyMac() {
     const apps = readdirSync(mountPoint).filter((name) => name.endsWith('.app'))
     if (apps.length !== 1) throw new Error(`Expected one application in DMG, found ${apps.length}`)
     const appPath = path.join(mountPoint, apps[0])
+    const nativeLockHelper = path.join(
+      appPath,
+      'Contents',
+      'Resources',
+      'runtime',
+      'lib',
+      'clawpilot-print-lock',
+    )
+    if (!existsSync(nativeLockHelper)) {
+      throw new Error('The native macOS endpoint-lock helper is missing from the packaged app')
+    }
     assertNoConcreteSecretsInPaths([appPath])
     assertUniversalMachOPayload(appPath, {
       architecturesFor(filePath) {

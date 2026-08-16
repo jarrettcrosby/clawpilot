@@ -95,19 +95,39 @@ export function localPrinterLockInvocation({
   timeoutSeconds,
   command,
   args,
+  macHelperPath = process.env.CLAWPILOT_MACOS_PRINT_LOCK_HELPER || path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'clawpilot-print-lock',
+  ),
   windowsHelperPath = process.env.CLAWPILOT_WINDOWS_PRINT_LOCK_HELPER || path.join(
     path.dirname(fileURLToPath(import.meta.url)),
     'clawpilot-print-lock.exe',
   ),
   fileExists = existsSync,
 }) {
-  if (platform === 'darwin' && existsSync('/usr/bin/lockf')) {
-    return {
-      command: '/usr/bin/lockf',
-      args: ['-t', String(timeoutSeconds), lockPath, command, ...args],
+  if (platform === 'darwin') {
+    if (fileExists(macHelperPath)) {
+      return {
+        command: macHelperPath,
+        args: [
+          '--lock-path',
+          lockPath,
+          '--timeout-ms',
+          String(timeoutSeconds * 1_000),
+          '--command',
+          command,
+          ...args,
+        ],
+      }
+    }
+    if (fileExists('/usr/bin/lockf')) {
+      return {
+        command: '/usr/bin/lockf',
+        args: ['-t', String(timeoutSeconds), lockPath, command, ...args],
+      }
     }
   }
-  if (platform === 'linux' && existsSync('/usr/bin/flock')) {
+  if (platform === 'linux' && fileExists('/usr/bin/flock')) {
     return {
       command: '/usr/bin/flock',
       args: ['-E', '75', '-w', String(timeoutSeconds), lockPath, command, ...args],

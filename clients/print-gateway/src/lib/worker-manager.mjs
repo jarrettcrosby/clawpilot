@@ -51,11 +51,28 @@ export function workerLifetimeLockInvocation({
   lockPath,
   command,
   args,
+  macHelperPath,
   windowsHelperPath,
   fileExists = existsSync,
 }) {
-  if (platform === 'darwin' && fileExists('/usr/bin/lockf')) {
-    return { command: '/usr/bin/lockf', args: ['-t', '0', lockPath, command, ...args] }
+  if (platform === 'darwin') {
+    if (fileExists(macHelperPath)) {
+      return {
+        command: macHelperPath,
+        args: [
+          '--lock-path',
+          lockPath,
+          '--timeout-ms',
+          '1',
+          '--command',
+          command,
+          ...args,
+        ],
+      }
+    }
+    if (fileExists('/usr/bin/lockf')) {
+      return { command: '/usr/bin/lockf', args: ['-t', '0', lockPath, command, ...args] }
+    }
   }
   if (platform === 'linux' && fileExists('/usr/bin/flock')) {
     return { command: '/usr/bin/flock', args: ['-F', '-E', '75', '-n', lockPath, command, ...args] }
@@ -209,6 +226,7 @@ export class WorkerManager extends EventEmitter {
       lockPath: paths.workerLockPath,
       command: this.executablePath,
       args: [this.runtimePath],
+      macHelperPath: path.join(path.dirname(this.runtimePath), 'lib', 'clawpilot-print-lock'),
       windowsHelperPath: path.join(path.dirname(this.runtimePath), 'lib', 'clawpilot-print-lock.exe'),
     })
     const child = this.spawnImplementation(invocation.command, invocation.args, {
