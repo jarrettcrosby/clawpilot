@@ -18,8 +18,8 @@ import {
   readShopifyCheckoutRateWarmPolicy,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
 import {
-  readShopifyCheckoutAudiencePolicy,
-} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+  readShopifyCheckoutRateControl,
+} from '@/lib/operations/shopifyCheckoutRateControl'
 import {
   loadShopifyRateWarmResponse,
   type ShopifyRateWarmDependencies,
@@ -30,7 +30,7 @@ import {
   readShopifyRateWarmRuntimeByShopFromPostgres,
 } from '@/lib/persistence/shopifyRateWarm'
 import {
-  readActiveShopifyCustomerRatePolicyFromPostgres,
+  readShopifyCheckoutCustomerRatePolicyFromPostgres,
 } from '@/lib/persistence/shopifyCustomerRatePolicies'
 
 function decryptedShopifyCredential(
@@ -61,10 +61,10 @@ const DEFAULT_DEPENDENCIES: ShopifyRateWarmDependencies = {
   readShopHint: readShopifyAppProxyShopHint,
   verifyProxy: verifyShopifyAppProxyRequest,
   readPolicy: readShopifyCheckoutRateWarmPolicy,
-  readAudiencePolicy: readShopifyCheckoutAudiencePolicy,
+  readRateControl: readShopifyCheckoutRateControl,
   async isShadowCustomerAllowed(customerId, tenant) {
     const customerPolicy =
-      await readActiveShopifyCustomerRatePolicyFromPostgres({
+      await readShopifyCheckoutCustomerRatePolicyFromPostgres({
         organizationId: tenant.organizationId,
         accountGlobalId: tenant.accountGlobalId,
         shopifyCustomerGid: customerId,

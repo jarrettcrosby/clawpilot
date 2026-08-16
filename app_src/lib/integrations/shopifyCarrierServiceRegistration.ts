@@ -1562,8 +1562,9 @@ async function finalizeAuthorizedFailure(input: {
 
 /**
  * Execute the sole Shopify provider mutation authorized by a consumed,
- * revision-fenced, resource-scoped Active grant. Global Operations remains
- * Shadow. The caller must claim the authorization
+ * credential/config/simulation-fenced, resource-scoped checkout-setup grant.
+ * The caller must claim the authorization while Operations remains in a
+ * provider-write-capable safety state
  * before invoking this function; credential decryption and every provider
  * network call happen strictly after that durable single-consumption record.
  */
@@ -1604,7 +1605,9 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     shopifyCarrierServiceRegistrationRequestHash(mutation)
   if (
     authorization.status !== 'claimed'
-    || authorization.activationState !== 'shadow'
+    || !['shadow', 'read_only', 'active'].includes(
+      authorization.activationState,
+    )
     || authorization.providerWriteActivationRevision === null
     || authorization.operation !== mutation.operation
     || authorization.requestHash !== requestHash
@@ -1631,25 +1634,6 @@ export async function executeAuthorizedShopifyCarrierServiceMutation(
     'Mutation finalizer',
     200,
   )
-  if (
-    mutation.operation === 'create'
-    && authorization.accountEnvironment !== 'sandbox'
-  ) {
-    return finalizeAuthorizedFailure({
-      authorization,
-      dependencies,
-      error: new ShopifyCarrierServiceRegistrationError({
-        code: 'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
-        message:
-          'New Shopify CarrierService registration is sandbox-only',
-        status: 409,
-      }),
-      stage: 'environment_policy',
-      providerMutationAttempted: false,
-      finalizedBy,
-    })
-  }
-
   let runtime: CommerceRuntimeCredentialRecord | null
   try {
     runtime = await dependencies.readRuntimeCredential({

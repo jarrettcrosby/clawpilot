@@ -1066,14 +1066,6 @@ function loadOperationalWarehouseServices(pool) {
         readDefaultProductPackagingWithClient: async () => new Map(),
       },
       '@/lib/persistence/shopifyCheckoutRating': {
-        lockShopifyCarrierServiceConfigWritersForActivationWithClient:
-          mustNotRun(
-            'lockShopifyCarrierServiceConfigWritersForActivationWithClient',
-          ),
-        rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient:
-          mustNotRun(
-            'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient',
-          ),
         shopifyCheckoutRateLineageIsRequired: () => false,
         shopifyCheckoutRateOutcomeAllowsFulfillment: () => false,
       },

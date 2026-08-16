@@ -1,3 +1,8 @@
+import {
+  shopifyCheckoutRateControlCanServe,
+// @ts-expect-error Node's strip-types test runner requires the explicit source extension.
+} from '../operations/shopifyCheckoutRateControl.ts'
+
 export type ShopifyCustomerRateDestination = {
   address1: string
   address2: string
@@ -21,7 +26,7 @@ export type ShopifyRateWarmTenant = {
   organizationId: string
   accountGlobalId: string
   shopDomain: string
-  activationState: 'shadow' | 'active'
+  activationState: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
   environment: 'sandbox' | 'production'
   policyRevision: number
   policySnapshot: Record<string, unknown>
@@ -34,6 +39,7 @@ export type ShopifyRateWarmResponse = {
   enabled: boolean
   mode: 'hosted_ajax'
   policyRevision: number
+  rateSource: 'sandbox' | 'production'
   cartFingerprint: string
   concurrency: number
   debounceMs: number
@@ -78,10 +84,15 @@ export type ShopifyRateWarmDependencies = {
   readPolicy: (
     policySnapshot: Record<string, unknown>,
   ) => ShopifyRateWarmPolicy
-  readAudiencePolicy: (
+  readRateControl: (
     policySnapshot: Record<string, unknown>,
+    context: {
+      activationState: ShopifyRateWarmTenant['activationState']
+      accountEnvironment: ShopifyRateWarmTenant['environment']
+    },
   ) => {
-    mode: 'off' | 'restricted_customers' | 'all_eligible'
+    audience: 'off' | 'restricted_customers' | 'all_eligible'
+    rateSource: 'sandbox' | 'production'
   }
   isShadowCustomerAllowed: (
     customerId: string,
@@ -147,6 +158,7 @@ function response(input: {
   tenant: ShopifyRateWarmTenant
   policy: ShopifyRateWarmPolicy
   cartFingerprint: string
+  rateSource: 'sandbox' | 'production'
   destinations?: ShopifyCustomerRateDestination[]
   coverage?: ShopifyRateWarmResponse['coverage']
 }): ShopifyRateWarmResponse {
@@ -158,6 +170,7 @@ function response(input: {
       && input.tenant.policyRevision >= 0
       ? input.tenant.policyRevision
       : 0,
+    rateSource: input.rateSource,
     cartFingerprint: input.cartFingerprint,
     concurrency: input.policy.concurrency,
     debounceMs: input.policy.debounceMs,
@@ -205,43 +218,47 @@ export async function loadShopifyRateWarmResponse(input: {
   }
 
   const policy = tenantPolicy(tenant, input.dependencies)
-  let shadowAudienceAllowed = false
-  if (tenant.activationState === 'shadow') {
-    let audienceMode: 'off' | 'restricted_customers' | 'all_eligible'
-    try {
-      audienceMode = input.dependencies.readAudiencePolicy(
-        tenant.policySnapshot,
-      ).mode
-    } catch {
-      audienceMode = 'off'
-    }
-    if (
-      tenant.environment === 'sandbox'
-      && audienceMode === 'all_eligible'
-    ) {
-      shadowAudienceAllowed = true
-    } else if (
-      tenant.environment === 'sandbox'
-      && audienceMode === 'restricted_customers'
-    ) {
-      shadowAudienceAllowed =
-        await input.dependencies.isShadowCustomerAllowed(
-          identity.customerId,
-          tenant,
-        )
-    }
+  let rateControl: ReturnType<
+    ShopifyRateWarmDependencies['readRateControl']
+  > | null = null
+  try {
+    rateControl = input.dependencies.readRateControl(
+      tenant.policySnapshot,
+      {
+        activationState: tenant.activationState,
+        accountEnvironment: tenant.environment,
+      },
+    )
+  } catch {
+    rateControl = null
   }
+  const rateControlCanServe = Boolean(
+    rateControl
+    && shopifyCheckoutRateControlCanServe({
+      control: {
+        version: 'shopify-checkout-rate-control-v1',
+        audience: rateControl.audience,
+        rateSource: rateControl.rateSource,
+      },
+      activationState: tenant.activationState,
+      accountEnvironment: tenant.environment,
+    }),
+  )
+  const customerAllowed = !rateControlCanServe
+    ? false
+    : rateControl?.audience === 'all_eligible'
+      ? true
+      : rateControl?.audience === 'restricted_customers'
+        ? await input.dependencies.isShadowCustomerAllowed(
+            identity.customerId,
+            tenant,
+          )
+        : false
   const enabled = (
     policy.enabled
     && policy.mode === 'hosted_ajax'
-    && (
-      tenant.activationState === 'active'
-      || (
-        tenant.activationState === 'shadow'
-        && tenant.environment === 'sandbox'
-        && shadowAudienceAllowed
-      )
-    )
+    && rateControlCanServe
+    && customerAllowed
   )
   if (!enabled) {
     return response({
@@ -249,6 +266,7 @@ export async function loadShopifyRateWarmResponse(input: {
       tenant,
       policy,
       cartFingerprint: identity.cartFingerprint,
+      rateSource: rateControl?.rateSource || 'sandbox',
     })
   }
 
@@ -273,6 +291,7 @@ export async function loadShopifyRateWarmResponse(input: {
     tenant,
     policy,
     cartFingerprint: identity.cartFingerprint,
+    rateSource: rateControl?.rateSource || 'sandbox',
     destinations,
     coverage: {
       scanned: result.counts.scanned,

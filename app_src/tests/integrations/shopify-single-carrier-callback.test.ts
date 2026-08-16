@@ -70,11 +70,24 @@ const productionProviderCalls: Array<Record<string, unknown>> = []
 let completionCalls = 0
 let failureCalls = 0
 let rateScenario: 'cheapest' | 'tie' | 'degraded' = 'cheapest'
-let callbackActivationState: 'shadow' | 'active' = 'shadow'
+let callbackActivationState: 'shadow' | 'read_only' | 'active' = 'shadow'
+let checkoutRateSource: 'sandbox' | 'production' = 'sandbox'
+let checkoutAudienceMode: 'restricted_customers' | 'all_eligible' =
+  'restricted_customers'
+let customerPolicy = {
+  mode: 'show_all' as 'show_all' | 'hide_all' | 'include_only' | 'exclude',
+  serviceCodes: [] as string[],
+  policyHash: createHash('sha256').update('customer-policy').digest('hex'),
+  rowVersion: 1,
+  shadowTestChargeMode: 'carrier_rate' as const,
+  shadowTestServiceCode: null,
+  shadowTestSubsidyReason: null,
+}
 let staleCarrierEnvironment: 'sandbox' | 'production' | null = null
 let cachedReceipt: Record<string, unknown> | null = null
 let serveCachedReceipt = false
 let lastCompletionInput: CompletionInput | null = null
+let mappedVariantReady = true
 
 const planRateOptimization = {
   version: 'shopify-checkout-plan-rate-objective-v2',
@@ -101,7 +114,23 @@ const account = {
   callbackTokenVersion: 1,
   policyRevision: 1,
   policyHash: createHash('sha256').update('policy').digest('hex'),
-  policySnapshot: { planRateOptimization },
+  get policySnapshot() {
+    return {
+      planRateOptimization,
+      checkoutRateControl: {
+        version: 'shopify-checkout-rate-control-v1' as const,
+        audience: checkoutAudienceMode,
+        rateSource: checkoutRateSource,
+      },
+    }
+  },
+  get checkoutRateControl() {
+    return {
+      version: 'shopify-checkout-rate-control-v1' as const,
+      audience: checkoutAudienceMode,
+      rateSource: checkoutRateSource,
+    }
+  },
   warehouseId: '33333333-3333-4333-8333-333333333333',
   warehouseGlobalId: 'gwh0000001',
   warehouseName: 'AG Alchemy',
@@ -321,18 +350,10 @@ const plannedCandidate = {
   },
 } as const
 
-mock.module('@/lib/integrations/shopifyShadowCheckoutAllowlist', {
-  namedExports: {
-    configuredShopifyNumericIdentifierSet() {
-      return new Set(['258644705304'])
-    },
-  },
-})
-
 mock.module('@/lib/persistence/shopifyCustomerRatePolicies', {
   namedExports: {
-    async readActiveShopifyCustomerRatePolicyFromPostgres() {
-      return { mode: 'show_all' }
+    async readShopifyCheckoutCustomerRatePolicyFromPostgres() {
+      return customerPolicy
     },
   },
 })
@@ -348,6 +369,7 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
         environment: account.environment,
         activationState: callbackActivationState,
         policySnapshot: account.policySnapshot,
+        checkoutRateControl: account.checkoutRateControl,
       }
     },
     async lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres() {
@@ -373,6 +395,9 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
     },
     async readCachedShopifyCheckoutRateReceiptInPostgres() {
       return serveCachedReceipt ? cachedReceipt : null
+    },
+    async assertShopifyCheckoutRatingRuntimeReadyInPostgres() {
+      return true
     },
     async claimShopifyCheckoutRateReceiptInPostgres() {
       return {
@@ -557,6 +582,9 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
 mock.module('@/lib/persistence/shopifyCheckoutContext', {
   namedExports: {
     async readShopifyCheckoutContextFromPostgres() {
+      if (!mappedVariantReady) {
+        throw new Error('Shopify checkout variant mapping is unavailable')
+      }
       return context
     },
   },
@@ -703,7 +731,7 @@ function callbackRequest() {
 }
 
 function resetScenario(input: {
-  activation?: 'shadow' | 'active'
+  activation?: 'shadow' | 'read_only' | 'active'
   rates?: typeof rateScenario
   staleEnvironment?: 'sandbox' | 'production'
 } = {}) {
@@ -713,10 +741,26 @@ function resetScenario(input: {
   failureCalls = 0
   rateScenario = input.rates ?? 'cheapest'
   callbackActivationState = input.activation ?? 'shadow'
+  checkoutRateSource = callbackActivationState === 'active'
+    ? 'production'
+    : 'sandbox'
+  checkoutAudienceMode = callbackActivationState === 'active'
+    ? 'all_eligible'
+    : 'restricted_customers'
+  customerPolicy = {
+    mode: 'show_all',
+    serviceCodes: [],
+    policyHash: createHash('sha256').update('customer-policy').digest('hex'),
+    rowVersion: 1,
+    shadowTestChargeMode: 'carrier_rate',
+    shadowTestServiceCode: null,
+    shadowTestSubsidyReason: null,
+  }
   staleCarrierEnvironment = input.staleEnvironment ?? null
   cachedReceipt = null
   serveCachedReceipt = false
   lastCompletionInput = null
+  mappedVariantReady = true
 }
 
 async function executeCallback() {
@@ -800,6 +844,24 @@ test('Shadow fans out same-provider accounts, publishes the cheapest service, an
     assert.equal(completionCalls, 1)
   })
 
+test('restricted checkout uses ordinary mapping readiness without a hidden environment allowlist',
+  async () => {
+    resetScenario({ rates: 'cheapest' })
+    const mapped = await executeCallback()
+    assert.equal(mapped.authenticated && mapped.httpStatus, 200)
+    assert.equal(mapped.authenticated && mapped.response.rates.length, 1)
+
+    resetScenario({ rates: 'cheapest' })
+    mappedVariantReady = false
+    const unmapped = await executeCallback()
+    assert.equal(unmapped.authenticated, true)
+    assert.equal(unmapped.authenticated && unmapped.httpStatus, 503)
+    assert.deepEqual(unmapped.authenticated && unmapped.response, { rates: [] })
+    assert.equal(providerCalls.length, 0)
+    assert.equal(productionProviderCalls.length, 0)
+    assert.equal(completionCalls, 0)
+  })
+
 test('same-price service ties select the lower carrier account Global ID',
   async () => {
     resetScenario({ rates: 'tie' })
@@ -815,6 +877,86 @@ test('same-price service ties select the lower carrier account Global ID',
       firstCarrierAccountGlobalId,
     )
     assert.equal(lastCompletionInput.providerAttempts.length, 2)
+  })
+
+for (const policyScenario of [
+  { mode: 'show_all' as const, serviceCodes: [] },
+  { mode: 'include_only' as const, serviceCodes: ['clawpilot:ups:03'] },
+  { mode: 'exclude' as const, serviceCodes: ['clawpilot:ups:01'] },
+]) {
+  test(`restricted ${policyScenario.mode} filters fresh and cached checkout offers`,
+    async () => {
+      resetScenario({ rates: 'cheapest' })
+      customerPolicy = {
+        ...customerPolicy,
+        mode: policyScenario.mode,
+        serviceCodes: policyScenario.serviceCodes,
+        policyHash: createHash('sha256')
+          .update(JSON.stringify(policyScenario))
+          .digest('hex'),
+      }
+
+      const result = await executeCallback()
+      assert.equal(result.authenticated, true)
+      assert.equal(result.authenticated && result.httpStatus, 200)
+      assert.equal(result.authenticated && result.response.rates.length, 1)
+      assert.equal(completionCalls, 1)
+      const providerCallCount = providerCalls.length
+
+      serveCachedReceipt = true
+      const replay = await executeCallback()
+      assert.equal(replay.authenticated, true)
+      assert.deepEqual(
+        replay.authenticated && replay.response,
+        result.authenticated && result.response,
+      )
+      assert.equal(providerCalls.length, providerCallCount)
+      assert.equal(completionCalls, 1)
+    })
+}
+
+test('restricted include/exclude/hide filters never replay a disallowed cached service',
+  async () => {
+    resetScenario({ rates: 'cheapest' })
+    const initial = await executeCallback()
+    assert.equal(initial.authenticated && initial.httpStatus, 200)
+    assert.ok(cachedReceipt)
+    const providerCallCount = providerCalls.length
+    serveCachedReceipt = true
+
+    for (const policy of [
+      { mode: 'include_only' as const, serviceCodes: ['clawpilot:ups:01'] },
+      { mode: 'exclude' as const, serviceCodes: ['clawpilot:ups:03'] },
+    ]) {
+      customerPolicy = {
+        ...customerPolicy,
+        ...policy,
+        policyHash: createHash('sha256')
+          .update(JSON.stringify(policy))
+          .digest('hex'),
+        rowVersion: customerPolicy.rowVersion + 1,
+      }
+      const result = await executeCallback()
+      assert.equal(result.authenticated, true)
+      assert.equal(result.authenticated && result.httpStatus, 503)
+      assert.deepEqual(result.authenticated && result.response, { rates: [] })
+      assert.equal(providerCalls.length, providerCallCount)
+    }
+
+    customerPolicy = {
+      ...customerPolicy,
+      mode: 'hide_all',
+      serviceCodes: [],
+      policyHash: createHash('sha256').update('hide-all').digest('hex'),
+      rowVersion: customerPolicy.rowVersion + 1,
+    }
+    const hidden = await executeCallback()
+    assert.deepEqual(hidden, {
+      authenticated: true,
+      httpStatus: 200,
+      response: { rates: [] },
+    })
+    assert.equal(providerCalls.length, providerCallCount)
   })
 
 test('one degraded account retains exact attempt evidence while the successful account remains eligible',

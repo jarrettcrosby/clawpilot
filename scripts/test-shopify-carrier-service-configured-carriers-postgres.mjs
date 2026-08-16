@@ -16,6 +16,8 @@ const migration = '0285_shopify_carrier_service_configured_carriers.sql'
 const diagnosticMigration = '0286_carrier_shipping_account_diagnostics.sql'
 const registeredRateSourceMigration =
   '0292_shopify_registered_rate_source_refresh.sql'
+const checkoutRateControlMigration =
+  '0299_operations_shopify_checkout_rate_control.sql'
 
 const repeatHex = (digit) => String(digit).repeat(64)
 
@@ -396,6 +398,11 @@ async function seedFixture(client) {
              "minIntervalMs": 1000,
              "supportedCountries": ["US"],
              "staleCartAbort": true
+           },
+           "checkoutRateControl": {
+             "version": "shopify-checkout-rate-control-v1",
+             "audience": "restricted_customers",
+             "rateSource": "sandbox"
            }
          }'::jsonb,
          900, 900, 86400,
@@ -720,6 +727,7 @@ async function seedProcessingReceipt(client, {
   id,
   globalId,
   activationState,
+  rateSource = activationState === 'active' ? 'production' : 'sandbox',
   carrierDestinationFingerprint,
   idempotencyKey,
 }) {
@@ -730,7 +738,7 @@ async function seedProcessingReceipt(client, {
       `INSERT INTO operations_shopify_checkout_rate_receipts (
          id, global_id, organization_id, integration_account_id, config_id,
          config_row_version, credential_generation, activation_revision,
-         activation_state, policy_revision, policy_hash, warehouse_id,
+         activation_state, rate_source, policy_revision, policy_hash, warehouse_id,
          algorithm_version, request_fingerprint, destination_fingerprint,
          carrier_destination_fingerprint, line_quantity_fingerprint,
          request_evidence_hash, redacted_request_snapshot, currency,
@@ -743,7 +751,7 @@ async function seedProcessingReceipt(client, {
          '28500000-0000-4000-8000-000000000001'::uuid,
          '28500000-0000-4000-8000-000000000010'::uuid,
          '28500000-0000-4000-8000-000000000090'::uuid,
-         1, 1, 1, $3, 1, repeat('f', 64),
+         1, 1, 1, $3, $7, 1, repeat('f', 64),
          '28500000-0000-4000-8000-000000000040'::uuid,
          'disposable-one-or-two-carriers-v1', repeat('1', 64),
          repeat('2', 64), $4, repeat('3', 64), repeat('4', 64),
@@ -761,6 +769,7 @@ async function seedProcessingReceipt(client, {
         carrierDestinationFingerprint,
         idempotencyKey,
         createdAt,
+        rateSource,
       ],
     )
   } finally {
@@ -1437,6 +1446,14 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       ),
     ),
   ).digest('hex')
+  const checkoutRateControlChecksum = crypto.createHash('sha256').update(
+    readFileSync(
+      new URL(
+        `../db/migrations/${checkoutRateControlMigration}`,
+        import.meta.url,
+      ),
+    ),
+  ).digest('hex')
   await legacyPool.query(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        filename text PRIMARY KEY,
@@ -1446,7 +1463,7 @@ async function runRollingMigrationAcceptance(databaseUrl) {
   )
   await legacyPool.query(
     `INSERT INTO schema_migrations (filename, checksum)
-     VALUES ($1, $2), ($3, $4), ($5, $6)`,
+     VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8)`,
     [
       migration,
       migrationChecksum,
@@ -1454,6 +1471,8 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       diagnosticChecksum,
       registeredRateSourceMigration,
       registeredRateSourceChecksum,
+      checkoutRateControlMigration,
+      checkoutRateControlChecksum,
     ],
   )
   command('node', ['scripts/db-migrate.mjs'], {
@@ -1468,7 +1487,12 @@ async function runRollingMigrationAcceptance(databaseUrl) {
     await client.query(
       `DELETE FROM schema_migrations
        WHERE filename = ANY($1::text[])`,
-      [[migration, diagnosticMigration, registeredRateSourceMigration]],
+      [[
+        migration,
+        diagnosticMigration,
+        registeredRateSourceMigration,
+        checkoutRateControlMigration,
+      ]],
     )
   } finally {
     client.release()

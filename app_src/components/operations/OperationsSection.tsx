@@ -360,28 +360,8 @@ type CommerceActiveAccountOption = {
     capability: CommerceActiveWriteCapability
     selectable: boolean
     unavailableReason: 'not_implemented' | 'missing_scope' | null
-    carrierServiceUnavailableReason:
-      | 'carrier_service_required'
-      | 'carrier_service_status_unavailable'
-      | null
     unavailableDetail: string | null
   }>
-}
-
-type ShopifyCarrierServiceActivationSetup = {
-  status: 'registered' | 'missing' | 'unavailable'
-}
-
-type ShopifyCarrierServiceSetupPayload = {
-  ok?: boolean
-  setup?: {
-    account?: { globalId?: unknown }
-    config?: null | {
-      accountGlobalId?: unknown
-      registrationState?: unknown
-      serviceGid?: unknown
-    }
-  }
 }
 
 type CommerceActiveCatalogPayload = {
@@ -446,51 +426,6 @@ const COMMERCE_ACTIVE_WRITE_CAPABILITIES: Record<
   ],
 }
 
-const SHOPIFY_CARRIER_SERVICE_GID_PATTERN =
-  /^gid:\/\/shopify\/DeliveryCarrierService\/[1-9][0-9]*$/
-
-async function readShopifyCarrierServiceActivationSetups(
-  accountGlobalIds: readonly string[],
-): Promise<Record<string, ShopifyCarrierServiceActivationSetup>> {
-  const entries = await Promise.all(accountGlobalIds.map(async (accountGlobalId) => {
-    try {
-      const response = await fetch(
-        '/api/integrations/commerce/shopify/carrier-service'
-        + `?accountGlobalId=${encodeURIComponent(accountGlobalId)}`,
-        { cache: 'no-store' },
-      )
-      const payload = await response.json() as ShopifyCarrierServiceSetupPayload
-      if (
-        !response.ok
-        || payload.ok !== true
-        || !payload.setup
-        || payload.setup.account?.globalId !== accountGlobalId
-        || !Object.prototype.hasOwnProperty.call(payload.setup, 'config')
-      ) {
-        return [accountGlobalId, { status: 'unavailable' }] as const
-      }
-      if (payload.setup.config === null) {
-        return [accountGlobalId, { status: 'missing' }] as const
-      }
-      const registered = (
-        payload.setup.config?.accountGlobalId === accountGlobalId
-        && payload.setup.config.registrationState === 'registered'
-        && typeof payload.setup.config.serviceGid === 'string'
-        && SHOPIFY_CARRIER_SERVICE_GID_PATTERN.test(
-          payload.setup.config.serviceGid,
-        )
-      )
-      return [
-        accountGlobalId,
-        { status: registered ? 'registered' : 'missing' },
-      ] as const
-    } catch {
-      return [accountGlobalId, { status: 'unavailable' }] as const
-    }
-  }))
-  return Object.fromEntries(entries)
-}
-
 const OperationsTabScrollButton = forwardRef<HTMLButtonElement, TabScrollButtonProps>(
   function OperationsTabScrollButton({ direction, disabled, onClick, ...props }, ref) {
     const label = direction === 'left'
@@ -551,14 +486,9 @@ function displayStatus(status: string) {
 function commerceActiveUnavailableLabel(
   option: CommerceActiveAccountOption['capabilities'][number],
 ) {
-  const reason = option.carrierServiceUnavailableReason
-    || option.unavailableReason
+  const reason = option.unavailableReason
   if (reason === 'not_implemented') return 'Not implemented'
   if (reason === 'missing_scope') return 'Missing scope'
-  if (reason === 'carrier_service_required') return 'Set up CarrierService first'
-  if (reason === 'carrier_service_status_unavailable') {
-    return 'CarrierService status unavailable'
-  }
   return ''
 }
 
@@ -570,9 +500,6 @@ function stringValues(value: unknown) {
 
 function commerceActiveAccountOptions(
   payload: CommerceActiveCatalogPayload,
-  carrierServiceSetups: Readonly<
-    Record<string, ShopifyCarrierServiceActivationSetup>
-  >,
 ): CommerceActiveAccountOption[] {
   const accounts = payload.integrations?.accounts || []
   const providers = payload.catalog?.providers || {}
@@ -599,38 +526,16 @@ function commerceActiveAccountOptions(
         requiredScopes?.length
         && requiredScopes.every((scope) => grantedScopes.has(scope)),
       )
-      const carrierServiceSetup = (
-        account.provider === 'shopify'
-        && capability === 'shipping_rate_callbacks'
-      )
-        ? carrierServiceSetups[account.globalId] || { status: 'unavailable' as const }
-        : null
-      const carrierServiceEligible = (
-        !carrierServiceSetup || carrierServiceSetup.status === 'registered'
-      )
       const unavailableReason = !implemented
         ? 'not_implemented' as const
         : !scopeEligible
           ? 'missing_scope' as const
           : null
-      const carrierServiceUnavailableReason = (
-        implemented && scopeEligible && carrierServiceSetup?.status === 'missing'
-      )
-        ? 'carrier_service_required' as const
-        : implemented && scopeEligible
-          && carrierServiceSetup?.status === 'unavailable'
-          ? 'carrier_service_status_unavailable' as const
-          : null
       return {
         capability,
-        selectable: implemented && scopeEligible && carrierServiceEligible,
+        selectable: implemented && scopeEligible,
         unavailableReason,
-        carrierServiceUnavailableReason,
-        unavailableDetail: carrierServiceUnavailableReason === 'carrier_service_required'
-          ? 'Register this exact Shopify store CarrierService before selecting checkout-rate callbacks. Fulfillment and tracking remain independently selectable.'
-          : carrierServiceUnavailableReason === 'carrier_service_status_unavailable'
-            ? 'ClawPilot could not verify this store CarrierService setup, so checkout-rate callbacks remain unavailable. Close and reopen this review to retry.'
-            : null,
+        unavailableDetail: null,
       }
     })
 
@@ -646,44 +551,6 @@ function commerceActiveAccountOptions(
     || left.displayName.localeCompare(right.displayName)
     || left.accountGlobalId.localeCompare(right.accountGlobalId)
   ))
-}
-
-function commerceActiveInitialSelectionWithCarrierServices(input: {
-  accounts: CommerceActiveAccountOption[]
-  continuation: CommerceActiveContinuation | null
-  expectedShadowActivationRevision: number
-}) {
-  const initial = commerceActiveInitialSelection(input)
-  if (!input.continuation) return initial
-
-  const replacedBlockers = new Set<string>()
-  const carrierServiceBlockers: string[] = []
-  for (const priorAccount of input.continuation.shopifyAccounts) {
-    if (!priorAccount.writeCapabilities.includes('shipping_rate_callbacks')) continue
-    const option = input.accounts
-      .find((account) => account.accountGlobalId === priorAccount.accountGlobalId)
-      ?.capabilities.find(
-        (candidate) => candidate.capability === 'shipping_rate_callbacks',
-      )
-    if (!option?.carrierServiceUnavailableReason) continue
-    replacedBlockers.add(
-      `${priorAccount.accountGlobalId} cannot preserve shipping_rate_callbacks because it is not implemented.`,
-    )
-    carrierServiceBlockers.push(
-      option.carrierServiceUnavailableReason === 'carrier_service_required'
-        ? `${priorAccount.accountGlobalId} cannot preserve shipping_rate_callbacks until its exact Shopify CarrierService is registered.`
-        : `${priorAccount.accountGlobalId} cannot preserve shipping_rate_callbacks because its CarrierService setup status could not be verified.`,
-    )
-  }
-  return {
-    ...initial,
-    preservationBlockers: [
-      ...initial.preservationBlockers.filter(
-        (blocker) => !replacedBlockers.has(blocker),
-      ),
-      ...carrierServiceBlockers,
-    ],
-  }
 }
 
 function providerForCarrier(carrier: string): 'ups_rest' | 'fedex_rest' | null {
@@ -4478,21 +4345,7 @@ export default function OperationsSection({
       if (!response.ok || !payload.integrations || !payload.catalog) {
         throw new Error(payload.error || 'Commerce integration accounts are unavailable')
       }
-      const carrierServiceSetups =
-        await readShopifyCarrierServiceActivationSetups(
-          (payload.integrations.accounts || [])
-            .filter((account) => (
-              account.provider === 'shopify'
-              && account.configured
-              && account.verificationStatus === 'verified'
-              && ['active', 'disabled'].includes(account.status)
-            ))
-            .map((account) => account.globalId),
-        )
-      const accounts = commerceActiveAccountOptions(
-        payload,
-        carrierServiceSetups,
-      )
+      const accounts = commerceActiveAccountOptions(payload)
       if (accounts.length === 0) {
         throw new Error(
           'No verified Shopify or Faire account is available for provider-write review.',
@@ -4501,7 +4354,7 @@ export default function OperationsSection({
       setCommerceActiveAccounts(accounts)
       const continuation =
         payload.integrations.commerceActiveContinuation || null
-      const initialSelection = commerceActiveInitialSelectionWithCarrierServices({
+      const initialSelection = commerceActiveInitialSelection({
         accounts,
         continuation,
         expectedShadowActivationRevision: workspace.activation.revision,
@@ -5703,8 +5556,7 @@ export default function OperationsSection({
                           label={(
                             <Stack direction="row" spacing={1} alignItems="center">
                               <span>{displayStatus(option.capability)}</span>
-                              {(option.unavailableReason
-                                || option.carrierServiceUnavailableReason) && (
+                              {option.unavailableReason && (
                                 <Tooltip
                                   title={option.unavailableDetail
                                     || commerceActiveUnavailableLabel(option)}

@@ -19,6 +19,10 @@ export type ShopifyCarrierServiceMutationEnvironment =
   | 'sandbox'
   | 'production'
 export type ShopifyCarrierServiceMutationActorRole = 'owner' | 'admin'
+export type ShopifyCarrierServiceMutationActivationState =
+  | 'shadow'
+  | 'read_only'
+  | 'active'
 export type ShopifyCarrierServiceMutationOutcomeState =
   | 'succeeded'
   | 'failed'
@@ -50,7 +54,7 @@ type AuthorizationRow = QueryResultRow & {
   account_environment: ShopifyCarrierServiceMutationEnvironment
   credential_generation: number
   config_row_version: string | number
-  activation_state: 'shadow'
+  activation_state: ShopifyCarrierServiceMutationActivationState
   activation_revision: number
   simulation_activation_revision: number
   provider_write_activation_revision: number | null
@@ -102,7 +106,7 @@ export type ShopifyCarrierServiceMutationAuthorization = {
   accountEnvironment: ShopifyCarrierServiceMutationEnvironment
   credentialGeneration: number
   configRowVersion: number
-  activationState: 'shadow'
+  activationState: ShopifyCarrierServiceMutationActivationState
   activationRevision: number
   simulationActivationRevision: number
   providerWriteActivationRevision: number | null
@@ -602,6 +606,8 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
     operation: ShopifyCarrierServiceMutationOperation
     accountEnvironment: ShopifyCarrierServiceMutationEnvironment
     credentialGeneration: number
+    providerWriteActivationState:
+      ShopifyCarrierServiceMutationActivationState
     configActivationRevision: number
     simulationActivationRevision: number
     providerWriteActivationRevision: number
@@ -651,6 +657,8 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
       1,
       Number.MAX_SAFE_INTEGER,
     ),
+    providerWriteActivationState:
+      rawInput.providerWriteActivationState,
     configActivationRevision: integer(
       rawInput.configActivationRevision,
       'Configuration activation revision',
@@ -722,21 +730,20 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
       400,
     )
   }
+  if (!['shadow', 'read_only', 'active'].includes(
+    input.providerWriteActivationState,
+  )) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_MUTATION_ACTIVATION_INVALID',
+      'CarrierService provider writes require Read only, Shadow, or Active Operations safety',
+      409,
+    )
+  }
   if (!['sandbox', 'production'].includes(input.accountEnvironment)) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_MUTATION_ENVIRONMENT_INVALID',
       'CarrierService provider writes require an exact sandbox or production environment',
       400,
-    )
-  }
-  if (
-    input.operation === 'create'
-    && input.accountEnvironment !== 'sandbox'
-  ) {
-    fail(
-      'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
-      'New Shopify CarrierService registration is sandbox-only; production is limited to exact removal and reconciliation',
-      409,
     )
   }
   if (
@@ -860,8 +867,8 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
            authorized_by, authorized_role, expires_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7,
-           $8::bigint, 'shadow', $9, $10, $11, $12, $13, $14, $15,
-           $16, $17, $18, $19, now() + ($20::text || ' seconds')::interval
+           $8::bigint, $9, $10, $11, $12, $13, $14, $15, $16,
+           $17, $18, $19, $20, now() + ($21::text || ' seconds')::interval
          )
          ON CONFLICT (
            organization_id, integration_account_id, operation,
@@ -877,6 +884,7 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
         input.accountEnvironment,
         input.credentialGeneration,
         input.expectedConfigRowVersion,
+        input.providerWriteActivationState,
         input.configActivationRevision,
         input.simulationActivationRevision,
         input.providerWriteActivationRevision,
@@ -906,16 +914,17 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
            AND authorized_mutation.account_environment = $7
            AND authorized_mutation.credential_generation = $8
            AND authorized_mutation.config_row_version = $9::bigint
-           AND authorized_mutation.activation_revision = $10
-           AND authorized_mutation.simulation_activation_revision = $11
-           AND authorized_mutation.provider_write_activation_revision = $12
-           AND authorized_mutation.aggregate_hash = $13
-           AND authorized_mutation.request_hash = $14
-           AND authorized_mutation.expected_service_gid IS NOT DISTINCT FROM $15
-           AND authorized_mutation.confirmation_hash = $16
-           AND authorized_mutation.confirmation_statement_version = $17
-           AND authorized_mutation.authorized_by = $18
-           AND authorized_mutation.authorized_role = $19`,
+           AND authorized_mutation.activation_state = $10
+           AND authorized_mutation.activation_revision = $11
+           AND authorized_mutation.simulation_activation_revision = $12
+           AND authorized_mutation.provider_write_activation_revision = $13
+           AND authorized_mutation.aggregate_hash = $14
+           AND authorized_mutation.request_hash = $15
+           AND authorized_mutation.expected_service_gid IS NOT DISTINCT FROM $16
+           AND authorized_mutation.confirmation_hash = $17
+           AND authorized_mutation.confirmation_statement_version = $18
+           AND authorized_mutation.authorized_by = $19
+           AND authorized_mutation.authorized_role = $20`,
         [
           input.organizationId,
           facts.rows[0].integration_account_id,
@@ -926,6 +935,7 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
           input.accountEnvironment,
           input.credentialGeneration,
           input.expectedConfigRowVersion,
+          input.providerWriteActivationState,
           input.configActivationRevision,
           input.simulationActivationRevision,
           input.providerWriteActivationRevision,
@@ -977,13 +987,13 @@ export async function authorizeShopifyCarrierServiceMutationInPostgres(
           operation: input.operation,
           accountEnvironment: input.accountEnvironment,
           credentialGeneration: input.credentialGeneration,
-          simulationMode: 'shadow',
+          simulationMode: 'zero_write',
           configActivationRevision:
             input.configActivationRevision,
           simulationActivationRevision:
             input.simulationActivationRevision,
-          providerWriteMode: 'resource_scoped_active',
-          globalOperationsMode: 'shadow',
+          providerWriteMode: 'resource_scoped_checkout_setup',
+          globalOperationsMode: input.providerWriteActivationState,
           providerWriteActivationRevision:
             input.providerWriteActivationRevision,
           aggregateHash: input.aggregateHash,

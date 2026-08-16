@@ -13,6 +13,12 @@ const read = (relativePath) => readFileSync(
 const policy = read(
   'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
 )
+const rateControl = read(
+  'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+)
+const pendingCommand = read(
+  'app_src/lib/operations/shopifyCheckoutRateControlCommand.ts',
+)
 const guard = read(
   'app_src/lib/integrations/shopifyShadowCheckoutGuard.ts',
 )
@@ -31,11 +37,14 @@ const route = read(
 const persistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const customerPolicies = read(
+  'app_src/lib/persistence/shopifyCustomerRatePolicies.ts',
+)
 const panel = read(
   'app_src/components/settings/ShopifyCarrierServiceSetupPanel.tsx',
 )
 const migration = read(
-  'db/migrations/0293_shopify_checkout_audience_policy.sql',
+  'db/migrations/0299_operations_shopify_checkout_rate_control.sql',
 )
 const packageJson = JSON.parse(read('package.json'))
 
@@ -63,24 +72,55 @@ requireAll(policy, [
 
 requireAll(guard, [
   'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF',
-  'SHOPIFY_SHADOW_GUARD_ALL_ELIGIBLE_SANDBOX_REQUIRED',
   'customerRequired?: boolean',
   'variantAllowlistRequired?: boolean',
   'input.customerRequired !== false',
   'input.variantAllowlistRequired !== false',
 ], 'Shadow audience guard')
 
+requireAll(rateControl, [
+  "'shopify-checkout-rate-control-v1'",
+  "'off'",
+  "'restricted_customers'",
+  "'all_eligible'",
+  "'sandbox'",
+  "'production'",
+  'shopifyCheckoutRateControlCanServe',
+  'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED',
+  'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN',
+], 'explicit checkout-rate control')
+
+requireAll(pendingCommand, [
+  'accountGlobalId: string',
+  'configGlobalId: string',
+  'persistShopifyCheckoutRateControlPendingCommand',
+  'storage.setItem(key, encoded)',
+  'const retained = storage.getItem(key)',
+  'assertShopifyCheckoutRateControlCommandResult',
+  'result.accountGlobalId !== input.accountGlobalId',
+  'input.command.accountGlobalId !== input.accountGlobalId',
+  'input.command.configGlobalId !== input.configGlobalId',
+  'result.idempotencyKey !== input.command.idempotencyKey',
+  'result.providerWrites !== 0',
+], 'durable browser-session command replay')
+
 requireAll(callback, [
   'lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres({',
   "checkpoint: 'account_authenticated'",
-  "audience.mode === 'off'",
-  "audience.mode === 'all_eligible'",
-  "account.environment !== 'sandbox'",
-  "audience.mode === 'restricted_customers'",
-  'variantAllowlistRequired:',
-  'readActiveShopifyCustomerRatePolicyFromPostgres({',
+  "audience === 'off'",
+  "audience === 'all_eligible'",
+  "audience === 'restricted_customers'",
+  'variantAllowlistRequired: false',
+  'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
+  'filterCheckoutProviderResultForCustomerPolicy(',
+  'shopifyCustomerRatePolicyAllowsService(',
   'readShopifyCheckoutContextFromPostgres({',
 ], 'callback audience boundary')
+assert.doesNotMatch(
+  callback,
+  /SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS|configuredShopifyNumericIdentifierSet/u,
+  'Restricted checkout must not retain a hidden environment variant gate',
+)
 
 assert.ok(
   callback.indexOf(
@@ -88,73 +128,69 @@ assert.ok(
   ) < callback.indexOf(
     'lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres({',
   ),
-  'The authenticated Off kill switch must precede strict rating readiness',
+  'The authenticated Off boundary must precede strict rating readiness',
 )
 
 requireAll(rateWarm, [
-  'readAudiencePolicy:',
-  "audienceMode = 'off'",
-  "audienceMode === 'all_eligible'",
-  "audienceMode === 'restricted_customers'",
+  'readRateControl:',
+  'shopifyCheckoutRateControlCanServe({',
+  'rateControlCanServe',
+  'activationState: tenant.activationState',
+  'accountEnvironment: tenant.environment',
+  "rateControl?.audience === 'all_eligible'",
+  "rateControl?.audience === 'restricted_customers'",
   'isShadowCustomerAllowed(',
-  'shadowAudienceAllowed',
+  'customerAllowed',
 ], 'audience-aware checkout rate warming')
+assert.ok(
+  rateWarm.indexOf('shopifyCheckoutRateControlCanServe({')
+    < rateWarm.indexOf('isShadowCustomerAllowed('),
+  'Effective checkout controls must stop warming before customer-policy reads',
+)
 requireAll(rateWarmRuntime, [
-  'readShopifyCheckoutAudiencePolicy',
-  'readAudiencePolicy: readShopifyCheckoutAudiencePolicy',
+  'readShopifyCheckoutRateControl',
+  'readRateControl: readShopifyCheckoutRateControl',
 ], 'rate-warm audience runtime wiring')
 
 const allEligibleBranch = callback.slice(
-  callback.indexOf("audience.mode === 'all_eligible'"),
+  callback.indexOf("audience === 'all_eligible'"),
   callback.indexOf(
-    'readActiveShopifyCustomerRatePolicyFromPostgres({',
+    'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
   ),
 )
 assert.match(
   allEligibleBranch,
-  /variantAllowlistRequired:\s*audience\.mode === 'restricted_customers'/u,
-  'All eligible must bypass only the legacy Shadow variant allowlist',
-)
-assert.match(
-  allEligibleBranch,
-  /if \(audience\.mode === 'all_eligible'\) \{\s*return \{ allowed: true, customerPolicy: null \}/u,
+  /audience === 'all_eligible'\) \{\s*return \{ allowed: true, customerPolicy: null \}/u,
   'All eligible guest carts must bypass customer-policy lookup',
 )
 
 requireAll(route, [
-  "action === 'save-checkout-audience'",
+  "action === 'save-checkout-rate-control'",
   'requireActivator(context.capabilities.canActivate)',
-  "current.reference.activation.state !== 'shadow'",
-  'normalizeShopifyCheckoutAudiencePolicy(',
-  'updateShopifyCarrierServiceAudiencePolicyInPostgres({',
-  "shadowCheckoutAudience.mode === 'all_eligible'",
-  "current.account.environment !== 'sandbox'",
-  'SHOPIFY_CHECKOUT_AUDIENCE_SANDBOX_REQUIRED',
+  'normalizeShopifyCheckoutRateControl(',
+  'updateShopifyCarrierServiceRateControlInPostgres({',
+  'SHOPIFY_CHECKOUT_RATE_CONTROL_MIGRATION_REQUIRED',
+  'customerPolicySummary.checkoutEligibleCount',
 ], 'authenticated audience API')
 
 requireAll(persistence, [
   'lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres(',
   "config.callback_token_hash = $2",
-  "activation.state IN ('shadow', 'active')",
-  'updateShopifyCarrierServiceAudiencePolicyInPostgres(',
+  'updateShopifyCarrierServiceRateControlInPostgres(',
   'expectedRowVersion:',
-  "current.activation_state !== 'shadow'",
-  "current.account_status !== 'active'",
-  "current.verification_status !== 'verified'",
-  'current.credential_version !== current.credential_generation',
-  "input.shadowCheckoutAudience.mode === 'all_eligible'",
-  "current.account_environment !== 'sandbox'",
-  'SHOPIFY_CHECKOUT_AUDIENCE_SANDBOX_REQUIRED',
+  'input.checkoutRateControl',
+  'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_CONFLICT',
+  'response_json',
   'SET policy_revision = policy_revision + 1',
   'row_version = row_version + 1',
-  'operations.shopify_carrier_service.checkout_audience_updated',
+  'operations.shopify_carrier_service.checkout_rate_control_updated',
   'providerRegistrationRetained: true',
   'providerWrites: 0',
 ], 'optimistic zero-provider-write audience persistence')
 
 const audiencePersistence = persistence.slice(
   persistence.indexOf(
-    'export async function updateShopifyCarrierServiceAudiencePolicyInPostgres',
+    'export async function updateShopifyCarrierServiceRateControlInPostgres',
   ),
   persistence.indexOf(
     'export async function finalizeShopifyCarrierServiceRegistrationInPostgres',
@@ -167,41 +203,52 @@ assert.doesNotMatch(
 )
 
 requireAll(panel, [
-  'The Shopify callback remains registered store-wide.',
   'Off — return no ClawPilot rates',
-  'Restricted customers — require an exact active policy',
+  'Restricted customers — require an exact local policy',
   'All eligible checkouts',
-  "disabled={setup.account.environment !== 'sandbox'}",
-  "run('save-checkout-audience'",
-  'Save checkout audience',
+  'persistShopifyCheckoutRateControlPendingCommand(',
+  'selectShopifyCheckoutRateControlFormState({',
+  'assertShopifyCheckoutRateControlCommandResult({',
+  'setPendingRateControlCommand(retainedPending)',
+  "setCheckoutRateControlReason(rateControlForm.reason ?? '')",
+  'pendingRateControlCommand.accountGlobalId === accountGlobalId',
+  'Retry exact pending save',
+  'Eligible restricted customers',
   'const callbackServingReady = Boolean(',
-  'Not serving · CarrierService setup incomplete or stale',
-  'Not serving · All eligible requires a sandbox store',
-  'Verify the checkout-rate kill switch',
-  'authenticated callback must return an empty 200 response',
+  'new authenticated ClawPilot callback returns an empty 200',
+  'prior successful customer-neutral rate response for up to 15 minutes',
+  'exactly mapped shippable item',
 ], 'checkout-audience UI')
+assert.doesNotMatch(
+  panel,
+  /checkout-rate kill switch|isolated allowlisted item/u,
+  'Checkout setup must not claim an immediate kill switch or hidden variant allowlist',
+)
 
 requireAll(migration, [
-  'operations_shopify_checkout_audience_policy_is_valid(input jsonb)',
+  'operations_shopify_checkout_rate_control_is_valid(input jsonb)',
   "jsonb_typeof(input) IS DISTINCT FROM 'object'",
-  '(SELECT count(*) FROM jsonb_object_keys(input)) <> 2',
+  '(SELECT count(*) FROM jsonb_object_keys(input)) <> 3',
   "'restricted_customers'",
   "'all_eligible'",
   'WITH normalized AS (',
-  "config.policy_snapshot -> 'shadowCheckoutAudience'",
+  "config.policy_snapshot -> 'checkoutRateControl'",
   ') IS NOT TRUE',
   'canonical_operations_shopify_checkout_policy_jsonb(',
   'policy_revision = config.policy_revision + 1',
   'row_version = config.row_version + 1',
-  'operations_shopify_configs_checkout_audience_valid',
-  ') IS NOT FALSE',
+  'operations_shopify_configs_rate_control_valid',
+  'validate_operations_shopify_checkout_rate_control_config()',
+  'protect_ops_shopify_cs_mut_authorization()',
+  "= 'restricted_customers'",
+  "= 'production'",
   'NOT VALID',
   'VALIDATE CONSTRAINT',
 ], '0293 backfill and malformed-policy fence')
 
 assert.equal(
   packageJson.scripts['test:shopify-checkout-audience-policy'],
-  'node --experimental-strip-types --test app_src/tests/integrations/shopify-checkout-audience-policy.test.ts app_src/tests/integrations/shopify-shadow-checkout-guard.test.ts app_src/tests/integrations/shopify-rate-warm.test.ts && node --experimental-test-module-mocks --experimental-strip-types --test app_src/tests/integrations/shopify-shadow-checkout-callback-boundary.test.ts && node scripts/test-shopify-checkout-audience-policy.mjs && node scripts/test-shopify-checkout-audience-persistence-postgres.mjs && node scripts/test-shopify-checkout-audience-health.mjs',
+  'node --experimental-strip-types --test app_src/tests/integrations/shopify-checkout-audience-policy.test.ts app_src/tests/integrations/shopify-checkout-rate-control.test.ts app_src/tests/integrations/shopify-shadow-checkout-guard.test.ts app_src/tests/integrations/shopify-rate-warm.test.ts && node --experimental-test-module-mocks --experimental-strip-types --test app_src/tests/integrations/shopify-shadow-checkout-callback-boundary.test.ts app_src/tests/integrations/shopify-single-carrier-callback.test.ts && node scripts/test-shopify-checkout-audience-policy.mjs && node scripts/test-shopify-checkout-audience-persistence-postgres.mjs && node scripts/test-shopify-checkout-audience-health.mjs',
   'Focused audience test command must cover policy, callback, persistence, migration, and health',
 )
 

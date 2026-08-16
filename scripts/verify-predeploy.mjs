@@ -46,9 +46,11 @@ const checkoutAudienceTest = String(
 )
 for (const requiredCommand of [
   'app_src/tests/integrations/shopify-checkout-audience-policy.test.ts',
+  'app_src/tests/integrations/shopify-checkout-rate-control.test.ts',
   'app_src/tests/integrations/shopify-shadow-checkout-guard.test.ts',
   'app_src/tests/integrations/shopify-rate-warm.test.ts',
   'app_src/tests/integrations/shopify-shadow-checkout-callback-boundary.test.ts',
+  'app_src/tests/integrations/shopify-single-carrier-callback.test.ts',
   'node scripts/test-shopify-checkout-audience-policy.mjs',
   'node scripts/test-shopify-checkout-audience-persistence-postgres.mjs',
   'node scripts/test-shopify-checkout-audience-health.mjs',

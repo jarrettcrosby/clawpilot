@@ -97,8 +97,9 @@ assert.ok(
 for (const required of [
   'readShopifyCarrierServiceRateRequest(input.request, {',
   'allowShadowSimulation: false',
-  'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-  'readActiveShopifyCustomerRatePolicyFromPostgres({',
+  'variantAllowlistRequired: false',
+  'configuredVariantIds: null',
+  'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
   'evaluateShopifyShadowCheckoutPrePolicy({',
   'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
   "'[shopify checkout rating] shadow guard denied'",
@@ -153,9 +154,9 @@ for (const required of [
   'createShopifyCheckoutReceiptKeys({',
   'stableCacheKey,',
   'shopifyCheckoutDestinationFingerprint(',
+  "account.checkoutRateControl.rateSource\n      === 'production'",
   'carrierSandboxRateDestinationFingerprint(destination)',
   'carrierWholeShipmentRateDestinationFingerprint({',
-  "account.activationState === 'active'",
   'carrierDestinationFingerprint: carrierDestinationHash',
   'readShopifyCheckoutContextFromPostgres({',
   'inventorySnapshotHash: context.inventorySnapshotHash',
@@ -165,12 +166,11 @@ for (const required of [
   'SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION',
   'snapshotVersion:',
   'packEvidenceHash: line.packEvidenceHash',
-  "version: 'shopify-checkout-execution-fence-v5'",
+  "version: 'shopify-checkout-execution-fence-v6'",
   'packLines: [...context.lines]',
   'receiptGlobalId: claim.receiptGlobalId',
   'expectedConfigRowVersion: account.configRowVersion',
-  'expectedActivationState: account.activationState',
-  'expectedActivationRevision: account.activationRevision',
+  'rateSource: account.checkoutRateControl.rateSource',
   'planShopifyCheckoutPackageCandidates(',
   'rateOptimizedCheckoutPlans({',
   'readShopifyCheckoutPlanRatePolicy(',
@@ -223,6 +223,11 @@ for (const required of [
     `callback is missing required contract: ${required}`,
   )
 }
+assert.equal(
+  callback.includes('SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS'),
+  false,
+  'Restricted checkout must not retain a hidden environment variant gate',
+)
 
 for (const required of [
   "normalizedStatus === 'active'",
@@ -411,7 +416,7 @@ const shadowGuard = authenticatedExecution.indexOf(
 assert.ok(
   shadowGuard >= 0
     && authenticatedExecution.indexOf(
-      'shadowCheckoutRequestGuard(account, request),',
+      'checkoutRateAudienceGuard(account, request),',
       shadowGuard,
     ) > shadowGuard
     && shadowGuard < authenticatedExecution.indexOf(
@@ -429,7 +434,7 @@ assert.ok(
     && shadowGuard < authenticatedExecution.indexOf(
       'rateOptimizedCheckoutPlans({',
     ),
-  'Shadow customer and variant allowlist must run before fingerprints, persistence, cartonization, or carrier calls',
+  'Checkout audience and exact customer policy must run before fingerprints, persistence, cartonization, or carrier calls',
 )
 assert.ok(
   authenticatedExecution.includes(
@@ -440,34 +445,40 @@ assert.ok(
       + '      })\n'
       + '      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)',
   ),
-  'a denied Shadow test request must log safe telemetry and return authenticated HTTP 200 empty rates',
+  'a denied checkout-audience request must log safe telemetry and return authenticated HTTP 200 empty rates',
 )
 const shadowGuardFunction = callback.slice(
-  callback.indexOf('async function shadowCheckoutRequestGuard('),
+  callback.indexOf('async function checkoutRateAudienceGuard('),
   callback.indexOf('function checkoutExecutionFenceHash('),
 )
 for (const required of [
-  "account.activationState !== 'shadow'",
+  'const { audience } = account.checkoutRateControl',
+  "audience === 'off'",
+  "account.environment === 'production'",
+  "account.checkoutRateControl.rateSource !== 'production'",
+  "audience === 'restricted_customers'",
   'evaluateShopifyShadowCheckoutPrePolicy({',
   'customerId: request.customer?.id',
-  'configuredVariantIds: configuredShopifyNumericIdentifierSet(',
+  'variantAllowlistRequired: false',
+  'configuredVariantIds: null',
   'items: request.items',
   'if (!prePolicy.ready)',
   'reasonCode: prePolicy.reasonCode',
+  "audience === 'all_eligible'",
   'shopifyCustomerGid: prePolicy.customerId',
   'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
 ]) {
   assert.ok(
     shadowGuardFunction.includes(required),
-    `Shadow callback targeting is missing fail-closed contract: ${required}`,
+    `checkout-audience targeting is missing fail-closed contract: ${required}`,
   )
 }
 assert.ok(
   shadowGuardFunction.indexOf('if (!prePolicy.ready)')
     < shadowGuardFunction.indexOf(
-      'readActiveShopifyCustomerRatePolicyFromPostgres({',
+      'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
     ),
-  'guest or customer-omitted Shadow callbacks must fail closed before policy lookup',
+  'guest or customer-omitted Restricted callbacks must fail closed before policy lookup',
 )
 for (const required of [
   "MissingCustomer: 'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER'",
@@ -548,7 +559,7 @@ for (const required of [
   'mapping.external_variant_id = requested.variant_gid',
   "mapping.mapping_purpose = 'shopify_checkout'",
   'state.provider_status_raw AS state_provider_status_raw',
-  'isShopifySandboxCheckoutChannelEligible({',
+  'isShopifyRatingCheckoutChannelEligible({',
   'accountEnvironment: account.environment',
   'row.pack_mapping_provider_lifecycle_state\n        !== row.state_normalized_status',
   "level.projection_state = 'projected'",

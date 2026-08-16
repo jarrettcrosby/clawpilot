@@ -35,19 +35,22 @@ import {
   type ShopifyCheckoutPlanRatePolicy,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
 import {
-  readShopifyCheckoutAudiencePolicy,
-} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+  shopifyCheckoutRateControlCanServe,
+  shopifyCheckoutRateControlEmptyReason,
+} from '@/lib/operations/shopifyCheckoutRateControl'
 import { shopifyCheckoutDestinationFingerprint } from '@/lib/integrations/commerceCredentialCrypto'
 import {
-  configuredShopifyNumericIdentifierSet,
-} from '@/lib/integrations/shopifyShadowCheckoutAllowlist'
-import {
-  readActiveShopifyCustomerRatePolicyFromPostgres,
+  readShopifyCheckoutCustomerRatePolicyFromPostgres,
+  type ShopifyCustomerRatePolicy,
 } from '@/lib/persistence/shopifyCustomerRatePolicies'
+import {
+  shopifyCustomerRatePolicyAllowsService,
+} from '@/lib/integrations/shopifyCustomerRatePolicy'
 import {
   claimShopifyCheckoutRateReceiptInPostgres,
   completeShopifyCheckoutRateReceiptInPostgres,
   failShopifyCheckoutRateReceiptInPostgres,
+  assertShopifyCheckoutRatingRuntimeReadyInPostgres,
   lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres,
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
@@ -84,7 +87,6 @@ import {
 import {
   applyShopifyShadowTestCharge,
   shopifyShadowTestChargePolicyFence,
-  type ShopifyShadowTestChargePolicy,
 } from '@/lib/integrations/shopifyShadowTestCharge'
 import {
   collapseShopifyCheckoutRateSourceOffers,
@@ -208,8 +210,7 @@ function persistedRequestFingerprint(protocolDigest: string) {
 function fencedCacheKey(input: {
   requestFingerprint: string
   configRowVersion: number
-  activationState: 'shadow' | 'active'
-  activationRevision: number
+  rateSource: 'sandbox' | 'production'
   inventorySnapshotHash: string
   executionFenceHash: string
 }) {
@@ -277,7 +278,7 @@ function checkoutAccountIsReady(
 function checkoutRuntimeCarrierEnvironment(
   account: ShopifyCheckoutRatingAccount,
 ): 'sandbox' | 'production' {
-  return account.activationState === 'shadow' ? 'sandbox' : 'production'
+  return account.checkoutRateControl.rateSource
 }
 
 function checkoutRuntimeCarrierBindings(
@@ -289,19 +290,50 @@ function checkoutRuntimeCarrierBindings(
   )
 }
 
-async function shadowCheckoutRequestGuard(
+function checkoutTestChargeLane(
+  account: ShopifyCheckoutRatingAccount,
+): 'shadow' | 'active' {
+  return account.checkoutRateControl.rateSource === 'sandbox'
+    && account.checkoutRateControl.audience === 'restricted_customers'
+    ? 'shadow'
+    : 'active'
+}
+
+function customerPolicyAllowsService(
+  policy: ShopifyCustomerRatePolicy | null,
+  carrierCode: 'ups' | 'fedex',
+  serviceLevelCode: string,
+) {
+  if (!policy) return true
+  return shopifyCustomerRatePolicyAllowsService(
+    policy,
+    stableShopifyCarrierServiceCode(carrierCode, serviceLevelCode),
+  )
+}
+
+function filterCheckoutProviderResultForCustomerPolicy(
+  result: CheckoutRateProviderResult,
+  policy: ShopifyCustomerRatePolicy | null,
+): CheckoutRateProviderResult {
+  const carrierCode = result.provider === 'ups_rest' ? 'ups' : 'fedex'
+  return {
+    ...result,
+    rates: result.rates.filter((rate) => customerPolicyAllowsService(
+      policy,
+      carrierCode,
+      rate.serviceCode,
+    )),
+  }
+}
+
+async function checkoutRateAudienceGuard(
   account: ShopifyCheckoutRatingAccount,
   request: ShopifyCarrierServiceRateRequest,
 ): Promise<ShopifyShadowCheckoutGuardDecision & {
-  customerPolicy: ShopifyShadowTestChargePolicy | null
+  customerPolicy: ShopifyCustomerRatePolicy | null
 }> {
-  if (account.activationState !== 'shadow') {
-    return { allowed: true, customerPolicy: null }
-  }
-  const audience = readShopifyCheckoutAudiencePolicy(
-    account.policySnapshot,
-  )
-  if (audience.mode === 'off') {
+  const { audience } = account.checkoutRateControl
+  if (audience === 'off') {
     return {
       allowed: false,
       reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
@@ -309,25 +341,20 @@ async function shadowCheckoutRequestGuard(
     }
   }
   if (
-    audience.mode === 'all_eligible'
-    && account.environment !== 'sandbox'
+    account.environment === 'production'
+    && account.checkoutRateControl.rateSource !== 'production'
   ) {
-    return {
-      allowed: false,
-      reasonCode:
-        ShopifyShadowCheckoutGuardDenialReason.AllEligibleSandboxRequired,
-      customerPolicy: null,
-    }
+    throw checkoutFailureError(
+      'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED',
+      'A production Shopify store can serve only production carrier rates',
+    )
   }
-  const customerRequired = audience.mode === 'restricted_customers'
+  const customerRequired = audience === 'restricted_customers'
   const prePolicy = evaluateShopifyShadowCheckoutPrePolicy({
     customerId: request.customer?.id,
     customerRequired,
-    variantAllowlistRequired:
-      audience.mode === 'restricted_customers',
-    configuredVariantIds: configuredShopifyNumericIdentifierSet(
-      'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-    ),
+    variantAllowlistRequired: false,
+    configuredVariantIds: null,
     items: request.items,
   })
   if (!prePolicy.ready) {
@@ -337,7 +364,7 @@ async function shadowCheckoutRequestGuard(
       customerPolicy: null,
     }
   }
-  if (audience.mode === 'all_eligible') {
+  if (audience === 'all_eligible') {
     return { allowed: true, customerPolicy: null }
   }
   if (!prePolicy.customerId) {
@@ -348,7 +375,7 @@ async function shadowCheckoutRequestGuard(
     }
   }
   const customerPolicy =
-    await readActiveShopifyCustomerRatePolicyFromPostgres({
+    await readShopifyCheckoutCustomerRatePolicyFromPostgres({
       organizationId: account.organizationId,
       accountGlobalId: account.accountGlobalId,
       shopifyCustomerGid: prePolicy.customerId,
@@ -362,22 +389,30 @@ async function shadowCheckoutRequestGuard(
 function checkoutExecutionFenceHash(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
-  customerPolicy: ShopifyShadowTestChargePolicy | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ) {
   const planRatePolicy = readShopifyCheckoutPlanRatePolicy(
     account.policySnapshot,
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v5',
+      version: 'shopify-checkout-execution-fence-v6',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
       ),
       policyRevision: account.policyRevision,
       policyHash: account.policyHash,
+      checkoutRateControl: account.checkoutRateControl,
+      restrictedCustomerPolicy:
+        account.checkoutRateControl.audience === 'restricted_customers'
+          ? shopifyShadowTestChargePolicyFence({
+              activationState: 'shadow',
+              policy: customerPolicy,
+            })
+          : null,
       shadowTestChargePolicy: shopifyShadowTestChargePolicyFence({
-        activationState: account.activationState,
+        activationState: checkoutTestChargeLane(account),
         policy: customerPolicy,
       }),
       planRatePolicy,
@@ -869,6 +904,7 @@ function responseFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ): TypedReceiptResponse | null {
   if (!receipt) return null
   if (receipt.status === 'failed') return null
@@ -1133,6 +1169,11 @@ function responseFromTypedReceipt(
         || offer.packagePlanHash !== receipt.packagePlanHash
         || offer.currency !== receipt.currency
         || offer.shopifyServiceCode !== stableCode
+        || !customerPolicyAllowsService(
+          customerPolicy,
+          carrierCode,
+          offer.serviceCode,
+        )
         || serviceCodes.has(stableCode)
       ) {
         throw new Error(
@@ -1178,8 +1219,14 @@ function resultFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ): CallbackResult {
-  const replay = responseFromTypedReceipt(account, context, receipt)
+  const replay = responseFromTypedReceipt(
+    account,
+    context,
+    receipt,
+    customerPolicy,
+  )
   return receipt?.status === 'succeeded' && replay
     ? authenticatedResult(replay.response, 200)
     : authenticatedResult(EMPTY_RATE_RESPONSE, 503)
@@ -1390,19 +1437,28 @@ export async function executeShopifyCarrierServiceCallback(input: {
     return { authenticated: false, response: EMPTY_RATE_RESPONSE }
   }
   try {
-    if (
-      callbackPolicyAccount.activationState === 'shadow'
-      && readShopifyCheckoutAudiencePolicy(
-        callbackPolicyAccount.policySnapshot,
-      ).mode === 'off'
-    ) {
+    const authenticatedEmptyReason = shopifyCheckoutRateControlEmptyReason({
+      control: callbackPolicyAccount.checkoutRateControl,
+      accountEnvironment: callbackPolicyAccount.environment,
+      activationState: callbackPolicyAccount.activationState,
+    })
+    if (authenticatedEmptyReason) {
       recordShadowCheckoutGuardDenial({
         accountGlobalId: callbackPolicyAccount.accountGlobalId,
-        reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
+        reasonCode: authenticatedEmptyReason as
+          ShopifyShadowCheckoutGuardDenialReason,
         checkpoint: 'account_authenticated',
       })
       cleanup()
       return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
+    }
+    if (!shopifyCheckoutRateControlCanServe({
+      control: callbackPolicyAccount.checkoutRateControl,
+      accountEnvironment: callbackPolicyAccount.environment,
+      activationState: callbackPolicyAccount.activationState,
+    })) {
+      cleanup()
+      return authenticatedResult(EMPTY_RATE_RESPONSE, 503)
     }
   } catch (error) {
     cleanup()
@@ -1458,7 +1514,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     checkpoint = 'request_parsed'
     attemptedStage = 'shadow_guard'
     const shadowGuard = await awaitCallbackWork(
-      shadowCheckoutRequestGuard(account, request),
+      checkoutRateAudienceGuard(account, request),
       workController.signal,
     )
     if (!shadowGuard.allowed) {
@@ -1503,7 +1559,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const destination = checkoutDestination(request)
     checkpoint = 'destination_valid'
     attemptedStage = 'carrier_destination_fingerprint'
-    const carrierDestinationHash = account.activationState === 'active'
+    const carrierDestinationHash = account.checkoutRateControl.rateSource
+      === 'production'
       ? carrierWholeShipmentRateDestinationFingerprint({
           ...destination,
           residential: null,
@@ -1528,8 +1585,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const stableCacheKey = fencedCacheKey({
       requestFingerprint,
       configRowVersion: account.configRowVersion,
-      activationState: account.activationState,
-      activationRevision: account.activationRevision,
+      rateSource: account.checkoutRateControl.rateSource,
       inventorySnapshotHash: context.inventorySnapshotHash,
       executionFenceHash,
     })
@@ -1558,6 +1614,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         cached,
+        shadowGuard.customerPolicy,
       )
     }
     requireCallbackTime(
@@ -1571,8 +1628,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         organizationId: account.organizationId,
         accountGlobalId: account.accountGlobalId,
         expectedConfigRowVersion: account.configRowVersion,
-        expectedActivationState: account.activationState,
-        expectedActivationRevision: account.activationRevision,
+        rateSource: account.checkoutRateControl.rateSource,
         requestFingerprint,
         destinationFingerprint: destinationHash,
         carrierDestinationFingerprint: carrierDestinationHash,
@@ -1642,6 +1698,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         completed,
+        shadowGuard.customerPolicy,
       )
     }
     if (claim.kind !== 'claimed') {
@@ -1649,6 +1706,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         claim.receipt,
+        shadowGuard.customerPolicy,
       )
     }
     claimed = {
@@ -1739,6 +1797,12 @@ export async function executeShopifyCarrierServiceCallback(input: {
         policy: planRatePolicy,
         signal: workController.signal,
         invoke: async (selection, carrierRequest) => {
+          await assertShopifyCheckoutRatingRuntimeReadyInPostgres({
+            organizationId: account.organizationId,
+            accountGlobalId: account.accountGlobalId,
+            expectedConfigRowVersion: account.configRowVersion,
+            rateSource: account.checkoutRateControl.rateSource,
+          })
           const remaining = Math.max(1, carrierDeadlineAt - Date.now())
           const binding = runtimeCarriers.find((carrier) => (
             carrier.provider === selection.provider
@@ -1756,7 +1820,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
             carrierAccountGlobalId: selection.carrierAccountGlobalId,
           })
           if (binding.environment === 'production') {
-            return rateShopifyProductionCheckoutShipment({
+            const result = await rateShopifyProductionCheckoutShipment({
               organizationId: account.organizationId,
               receiptGlobalId: claim.receiptGlobalId,
               binding: {
@@ -1777,6 +1841,10 @@ export async function executeShopifyCarrierServiceCallback(input: {
               timeoutMs: remaining,
               signal: carrierRequest.signal,
             })
+            return filterCheckoutProviderResultForCustomerPolicy(
+              result,
+              shadowGuard.customerPolicy,
+            )
           }
           const result = await testCarrierSandboxShipmentRate({
               organizationId: account.organizationId,
@@ -1791,7 +1859,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
               requireFailureEvidence: true,
               carrierSelectionKey,
             })
-          return {
+          return filterCheckoutProviderResultForCustomerPolicy({
               provider: selection.provider,
               carrierAccountGlobalId: selection.carrierAccountGlobalId,
               packageCount: carrierRequest.parcels.length,
@@ -1800,7 +1868,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
                 ...rate,
                 evidenceGlobalId: result.evidenceGlobalId,
               })),
-            } satisfies CheckoutRateProviderResult
+            } satisfies CheckoutRateProviderResult, shadowGuard.customerPolicy)
         },
       }),
       workController.signal,
@@ -1809,7 +1877,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const publicCheckoutOffers = (offers: CheckoutRateOffer[]) => (
       collapseShopifyCheckoutRateSourceOffers(
         applyShopifyShadowTestCharge({
-          activationState: account.activationState,
+          activationState: checkoutTestChargeLane(account),
           policy: shadowGuard.customerPolicy,
           offers,
         }),
@@ -2174,6 +2242,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
       account,
       context,
       completed,
+      shadowGuard.customerPolicy,
     )
     } catch (error) {
       const classifiedError = classifyCheckoutFailure(

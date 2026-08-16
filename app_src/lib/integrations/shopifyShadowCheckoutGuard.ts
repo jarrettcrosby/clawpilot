@@ -1,5 +1,9 @@
 export const ShopifyShadowCheckoutGuardDenialReason = {
   AudienceOff: 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF',
+  ActivationDisabled:
+    'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED',
+  ActivationFrozen:
+    'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN',
   AllEligibleSandboxRequired:
     'SHOPIFY_SHADOW_GUARD_ALL_ELIGIBLE_SANDBOX_REQUIRED',
   MissingCustomer: 'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER',

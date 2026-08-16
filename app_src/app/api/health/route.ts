@@ -185,6 +185,260 @@ const SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL = String.raw`
   )
 `
 
+// Exact structural attestation for 0299. The migration checksum pins every
+// backfill/rewrite, while function hashes and catalog checks detect runtime
+// drift after migration application.
+const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0299_operations_shopify_checkout_rate_control.sql'
+      AND checksum =
+        '09f634524cbe67e825f0675c5ca0a73290e94d57eb3229a82412f329986ae581'
+  )
+  AND (
+    SELECT count(installed.oid) = 29
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.signature,
+          installed_namespace.nspname,
+          language.lanname,
+          installed.prokind::text,
+          installed.provolatile::text,
+          installed.proparallel::text,
+          installed.proisstrict::text,
+          installed.prosecdef::text,
+          COALESCE(array_to_string(installed.proconfig, ','), ''),
+          trim(regexp_replace(
+            installed.prosrc, '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.signature
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '622a3970365026c6d9b8ed34de31737bd4b7b1cfd0ad8750e37b5db5a7e9b0c0'
+    FROM (VALUES
+      ('operations_shopify_checkout_rate_control_is_valid(jsonb)'),
+      ('operations_shopify_checkout_rate_control_response_is_valid(jsonb)'),
+      ('validate_operations_shopify_checkout_rate_control_config()'),
+      ('validate_operations_shopify_customer_rate_policy_write()'),
+      ('validate_operations_shopify_carrier_service_config()'),
+      ('protect_operations_commerce_external_effect_intent()'),
+      ('protect_ops_shopify_cs_mut_authorization()'),
+      ('protect_ops_shopify_cs_mut_attempt()'),
+      ('protect_ops_shopify_cs_mut_outcome()'),
+      ('protect_ops_shopify_cs_mut_resolution()'),
+      ('protect_ops_shopify_cs_name_update_authorization()'),
+      ('protect_ops_shopify_cs_config_mut_link()'),
+      ('operations_shopify_cs_name_has_exact_finalization_evidence(uuid,uuid,uuid,bigint,bigint,text,text,integer)'),
+      ('operations_shopify_carrier_configuration_allows_rating(jsonb,text)'),
+      ('operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'),
+      ('operations_shopify_carrier_service_config_is_ready(uuid,uuid)'),
+      ('operations_shopify_carrier_service_rating_environment_is_ready(uuid,uuid,text)'),
+      ('operations_shopify_carrier_service_rating_runtime_is_ready(uuid,uuid)'),
+      ('operations_shopify_checkout_rating_channel_is_eligible(text,text,text,text,boolean,boolean,integer)'),
+      ('validate_operations_commerce_variant_pack_mapping()'),
+      ('validate_operations_shopify_checkout_rate_control_receipt()'),
+      ('protect_operations_shopify_checkout_rate_control_receipt()'),
+      ('validate_operations_shopify_checkout_rate_receipt_insert()'),
+      ('protect_operations_shopify_checkout_rate_receipt()'),
+      ('operations_legacy_shopify_config_carrier_account_id(uuid,text,text)'),
+      ('derive_operations_legacy_shopify_carrier_selection_key()'),
+      ('validate_one_off_rate_selection_key()'),
+      ('protect_op_shopify_checkout_provider_attempt()'),
+      ('validate_operations_pack_rate_run_complete()')
+    ) AS required(signature)
+    LEFT JOIN pg_catalog.pg_proc installed
+      ON installed.oid = to_regprocedure(
+        'public.' || required.signature
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.pronamespace
+    LEFT JOIN pg_catalog.pg_language language
+      ON language.oid = installed.prolang
+  )
+  AND (
+    SELECT count(installed.oid) = 18
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.table_name,
+          table_namespace.nspname,
+          required.trigger_name,
+          installed.tgtype::text,
+          installed.tgenabled::text,
+          installed.tgisinternal::text,
+          procedure_namespace.nspname || '.' || procedure.proname
+            || '(' || pg_get_function_identity_arguments(procedure.oid)
+            || ')',
+          trim(regexp_replace(
+            pg_get_triggerdef(installed.oid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.table_name, required.trigger_name
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '84549b7f6f070ce2f5df23d89aaf818a0711e59016ca0c88ec9b4312816d04b9'
+    FROM (VALUES
+      ('operations_commerce_external_effect_intents', 'protect_operations_commerce_external_effect_intent_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_carrier_service_config_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_checkout_rate_control_config_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_carrier_service_config_ready'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'protect_ops_shopify_cs_mut_auth_write'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'protect_ops_shopify_cs_name_update_auth_write'),
+      ('operations_shopify_carrier_service_mutation_attempts', 'protect_ops_shopify_cs_mut_attempt_write'),
+      ('operations_shopify_carrier_service_mutation_attempts', 'protect_ops_shopify_cs_attempt_authorization_lock_write'),
+      ('operations_shopify_carrier_service_mutation_outcomes', 'protect_ops_shopify_cs_mut_outcome_write'),
+      ('operations_shopify_carrier_service_mutation_resolutions', 'protect_ops_shopify_cs_mut_resolution_write'),
+      ('operations_shopify_carrier_service_config_mutation_links', 'protect_ops_shopify_cs_config_mut_link_write'),
+      ('operations_shopify_customer_rate_policies', 'validate_operations_shopify_customer_rate_policy_write_trigger'),
+      ('operations_commerce_variant_pack_mappings', 'validate_operations_commerce_variant_pack_mapping'),
+      ('operations_shopify_checkout_rate_control_receipts', 'validate_operations_shopify_checkout_rate_control_receipt_write'),
+      ('operations_shopify_checkout_rate_control_receipts', 'protect_operations_shopify_checkout_rate_control_receipt_write'),
+      ('operations_shopify_checkout_rate_receipts', 'validate_operations_shopify_checkout_rate_receipt_insert'),
+      ('operations_shopify_checkout_rate_receipts', 'protect_operations_shopify_checkout_rate_receipt_write'),
+      ('operations_shopify_checkout_rate_receipt_provider_attempts', 'protect_op_shopify_checkout_provider_attempt_write')
+    ) AS required(table_name, trigger_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_trigger installed
+      ON installed.tgrelid = table_row.oid
+     AND installed.tgname = required.trigger_name
+    LEFT JOIN pg_catalog.pg_proc procedure
+      ON procedure.oid = installed.tgfoid
+    LEFT JOIN pg_catalog.pg_namespace procedure_namespace
+      ON procedure_namespace.oid = procedure.pronamespace
+  )
+  AND (
+    SELECT count(installed.oid) = 18
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.table_name,
+          table_namespace.nspname,
+          required.constraint_name,
+          installed.contype::text,
+          installed.convalidated::text,
+          installed.condeferrable::text,
+          installed.condeferred::text,
+          trim(regexp_replace(
+            pg_get_constraintdef(installed.oid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.table_name, required.constraint_name
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '16218feeb6f9a6804932f1e9a29e26bb7fd1c2f7c2d0b46956571a806ba31845'
+    FROM (VALUES
+      ('operations_shopify_carrier_service_configs', 'operations_shopify_configs_org_id_account_unique'),
+      ('operations_shopify_carrier_service_configs', 'operations_shopify_configs_rate_control_valid'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'ops_shopify_cs_mut_auth_activation_state_valid'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rat_resulting_policy_revision_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_con_expected_row_version_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_con_provider_write_count_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_contro_requested_control_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_re_prior_control_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_rec_request_hash_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_receipts_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_receipts_pkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_account_fkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_config_fkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_key_unique'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_response_valid'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_text_valid'),
+      ('operations_shopify_checkout_rate_receipts', 'operations_shopify_checkout_receipts_activation_state_valid'),
+      ('operations_shopify_checkout_rate_receipts', 'operations_shopify_checkout_receipts_rate_source_valid')
+    ) AS required(table_name, constraint_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_constraint installed
+      ON installed.conrelid = table_row.oid
+     AND installed.conname = required.constraint_name
+  )
+  AND (
+    SELECT count(*) = 17
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          table_row.relname,
+          table_namespace.nspname,
+          installed.attname,
+          installed.attnum::text,
+          format_type(installed.atttypid, installed.atttypmod),
+          installed.attnotnull::text,
+          installed.attidentity::text,
+          installed.attgenerated::text,
+          COALESCE(pg_get_expr(
+            installed_default.adbin, installed_default.adrelid
+          ), ''),
+          COALESCE(installed_collation.collname, '')
+        ), E'\n' ORDER BY table_row.relname, installed.attnum
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '7b85db01722082bf6ad5e1d55fddbfb6045f808a47c436e2055ea887b6f2bde4'
+    FROM pg_catalog.pg_attribute installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.attrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef installed_default
+      ON installed_default.adrelid = installed.attrelid
+     AND installed_default.adnum = installed.attnum
+    LEFT JOIN pg_catalog.pg_collation installed_collation
+      ON installed_collation.oid = installed.attcollation
+    WHERE installed.attnum > 0
+      AND NOT installed.attisdropped
+      AND (
+        table_row.oid = to_regclass(
+          'public.operations_shopify_checkout_rate_control_receipts'
+        )
+        OR (
+          table_row.oid = to_regclass(
+            'public.operations_shopify_checkout_rate_receipts'
+          )
+          AND installed.attname = 'rate_source'
+        )
+      )
+  )
+  AND (
+    SELECT count(*) = 3
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          table_row.relname,
+          table_namespace.nspname,
+          index_row.relname,
+          index_namespace.nspname,
+          installed.indisunique::text,
+          installed.indisprimary::text,
+          installed.indisvalid::text,
+          installed.indisready::text,
+          trim(regexp_replace(
+            pg_get_indexdef(installed.indexrelid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY table_row.relname, index_row.relname
+      ), 'UTF8'), 'sha256'), 'hex') =
+        'ab9cfb51412ec44ee6d15d734652036bf56c7a5ffe8e8df418653d9a3310632a'
+    FROM pg_catalog.pg_index installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.indrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    JOIN pg_catalog.pg_class index_row
+      ON index_row.oid = installed.indexrelid
+    JOIN pg_catalog.pg_namespace index_namespace
+      ON index_namespace.oid = index_row.relnamespace
+    WHERE table_row.oid = to_regclass(
+      'public.operations_shopify_checkout_rate_control_receipts'
+    )
+       OR index_row.relname =
+         'operations_shopify_configs_org_id_account_unique'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_carrier_service_configs config
+    WHERE operations_shopify_checkout_rate_control_is_valid(
+      config.policy_snapshot -> 'checkoutRateControl'
+    ) IS NOT TRUE
+  )
+`
+
 // Exact structural attestation for 0288. This is intentionally stricter than
 // checking schema_migrations: mapped refresh work must not run if a column,
 // constraint, foreign key, or rolling-deployment single-flight index drifts.
@@ -1961,6 +2215,7 @@ export async function GET() {
           operations_print_agent_cleanup_status_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
           shopify_checkout_audience_policy_applied: boolean
+          shopify_checkout_rate_control_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
           carrier_shipping_diagnostic_attempt_counts: Record<
             'sandbox' | 'production',
@@ -5237,6 +5492,9 @@ export async function GET() {
               (
                 ${SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL}
               ) AS shopify_checkout_audience_policy_applied,
+              (
+                ${SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL}
+              ) AS shopify_checkout_rate_control_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -5709,6 +5967,7 @@ export async function GET() {
             && row?.operations_print_agent_cleanup_status_applied
             && row?.shopify_carrier_configured_carriers_applied
             && row?.shopify_checkout_audience_policy_applied
+            && row?.shopify_checkout_rate_control_applied
             && row?.carrier_shipping_diagnostics_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
@@ -5850,6 +6109,11 @@ export async function GET() {
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shopifyCheckoutRateControl: {
+            status: row?.shopify_checkout_rate_control_applied
               ? 'ready'
               : 'migration-or-structure-pending',
           },
@@ -6168,6 +6432,7 @@ export async function GET() {
           || !row?.operations_print_agent_cleanup_status_applied
           || !row?.shopify_carrier_configured_carriers_applied
           || !row?.shopify_checkout_audience_policy_applied
+          || !row?.shopify_checkout_rate_control_applied
           || !row?.carrier_shipping_diagnostics_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied

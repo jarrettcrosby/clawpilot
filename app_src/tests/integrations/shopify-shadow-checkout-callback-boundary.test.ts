@@ -23,18 +23,44 @@ const callbackToken = 'a'.repeat(43)
 const allowedVariantId = '258644705304'
 const deniedVariantId = '258644705305'
 
-let configuredVariantIds: ReadonlySet<string> | null = new Set([
-  allowedVariantId,
-])
-let customerPolicy: { mode: string } | null = { mode: 'show_all' }
+type CustomerPolicyFixture = {
+  mode: 'show_all' | 'hide_all' | 'include_only' | 'exclude'
+  serviceCodes: string[]
+  policyHash: string
+  rowVersion: number
+  shadowTestChargeMode: 'carrier_rate'
+  shadowTestServiceCode: null
+  shadowTestSubsidyReason: null
+}
+const checkoutCustomerPolicy = (
+  mode: CustomerPolicyFixture['mode'],
+): CustomerPolicyFixture => ({
+  mode,
+  serviceCodes: [],
+  policyHash: 'a'.repeat(64),
+  rowVersion: 1,
+  shadowTestChargeMode: 'carrier_rate',
+  shadowTestServiceCode: null,
+  shadowTestSubsidyReason: null,
+})
+let customerPolicy: CustomerPolicyFixture | null =
+  checkoutCustomerPolicy('show_all')
 let checkoutAudienceMode:
   | 'off'
   | 'restricted_customers'
   | 'all_eligible' = 'restricted_customers'
+let checkoutRateSource: 'sandbox' | 'production' = 'sandbox'
+let activationState:
+  | 'disabled'
+  | 'shadow'
+  | 'read_only'
+  | 'active'
+  | 'frozen' = 'shadow'
 let accountEnvironment: 'sandbox' | 'production' = 'sandbox'
 let storeSyncDesiredState: 'running' | 'paused' = 'running'
 let policyLookupCount = 0
 let ratingAccountAvailable = true
+let flipToRestrictedLiveAfterPolicyLookup = false
 const downstreamCalls: string[] = []
 
 function unexpectedDownstreamCall(name: string) {
@@ -61,17 +87,27 @@ const account = {
   configRowVersion: 1,
   credentialGeneration: 1,
   registrationActivationRevision: 1,
-  activationState: 'shadow',
+  get activationState() {
+    return activationState
+  },
   activationRevision: 1,
   callbackTokenVersion: 1,
   policyRevision: 1,
   policyHash: 'policy-hash',
   get policySnapshot() {
     return {
-      shadowCheckoutAudience: {
-        version: 'shopify-checkout-audience-v1',
-        mode: checkoutAudienceMode,
+      checkoutRateControl: {
+        version: 'shopify-checkout-rate-control-v1',
+        audience: checkoutAudienceMode,
+        rateSource: checkoutRateSource,
       },
+    }
+  },
+  get checkoutRateControl() {
+    return {
+      version: 'shopify-checkout-rate-control-v1' as const,
+      audience: checkoutAudienceMode,
+      rateSource: checkoutRateSource,
     }
   },
   warehouseId: '33333333-3333-4333-8333-333333333333',
@@ -150,17 +186,9 @@ const account = {
   ],
 } as const
 
-mock.module('@/lib/integrations/shopifyShadowCheckoutAllowlist', {
-  namedExports: {
-    configuredShopifyNumericIdentifierSet() {
-      return configuredVariantIds
-    },
-  },
-})
-
 mock.module('@/lib/persistence/shopifyCustomerRatePolicies', {
   namedExports: {
-    async readActiveShopifyCustomerRatePolicyFromPostgres() {
+    async readShopifyCheckoutCustomerRatePolicyFromPostgres() {
       policyLookupCount += 1
       return customerPolicy
     },
@@ -172,17 +200,31 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
     SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION:
       'shopify-checkout-line-pack-evidence-v1',
     async lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres() {
-      return {
+      const policy = {
         organizationId: account.organizationId,
         accountGlobalId,
         environment: accountEnvironment,
         activationState: account.activationState,
         policySnapshot: account.policySnapshot,
+        checkoutRateControl: account.checkoutRateControl,
       }
+      if (flipToRestrictedLiveAfterPolicyLookup) {
+        checkoutAudienceMode = 'restricted_customers'
+        checkoutRateSource = 'production'
+      }
+      return policy
     },
     async lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres() {
-      return ratingAccountAvailable ? account : null
+      return ratingAccountAvailable
+        && !(
+          checkoutAudienceMode === 'restricted_customers'
+          && checkoutRateSource === 'production'
+        )
+        ? account
+        : null
     },
+    assertShopifyCheckoutRatingRuntimeReadyInPostgres:
+      unexpectedDownstreamCall('rating_runtime_readiness'),
     claimShopifyCheckoutRateReceiptInPostgres:
       unexpectedDownstreamCall('receipt_claim'),
     completeShopifyCheckoutRateReceiptInPostgres:
@@ -326,8 +368,7 @@ const scenarios = [
     name: 'checkout audience off',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
     audienceMode: 'off',
-    configured: new Set([allowedVariantId]),
-    policy: { mode: 'show_all' },
+    policy: checkoutCustomerPolicy('show_all'),
     request: callbackPayload({}),
     expectedPolicyLookups: 0,
   },
@@ -335,42 +376,18 @@ const scenarios = [
     name: 'missing customer identity',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.MissingCustomer,
     audienceMode: 'restricted_customers',
-    configured: new Set([allowedVariantId]),
-    policy: { mode: 'show_all' },
+    policy: checkoutCustomerPolicy('show_all'),
     request: callbackPayload({}),
-    expectedPolicyLookups: 0,
-  },
-  {
-    name: 'missing variant configuration',
-    reasonCode:
-      ShopifyShadowCheckoutGuardDenialReason.MissingVariantConfiguration,
-    audienceMode: 'restricted_customers',
-    configured: null,
-    policy: { mode: 'show_all' },
-    request: callbackPayload({ customerId: 207119551 }),
     expectedPolicyLookups: 0,
   },
   {
     name: 'no shippable items',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.NoShippableItems,
     audienceMode: 'restricted_customers',
-    configured: new Set([allowedVariantId]),
-    policy: { mode: 'show_all' },
+    policy: checkoutCustomerPolicy('show_all'),
     request: callbackPayload({
       customerId: 207119551,
       requiresShipping: false,
-    }),
-    expectedPolicyLookups: 0,
-  },
-  {
-    name: 'unallowlisted variant',
-    reasonCode: ShopifyShadowCheckoutGuardDenialReason.UnallowlistedVariant,
-    audienceMode: 'restricted_customers',
-    configured: new Set([allowedVariantId]),
-    policy: { mode: 'show_all' },
-    request: callbackPayload({
-      customerId: 207119551,
-      variantId: deniedVariantId,
     }),
     expectedPolicyLookups: 0,
   },
@@ -379,7 +396,6 @@ const scenarios = [
     reasonCode:
       ShopifyShadowCheckoutGuardDenialReason.PolicyAbsentOrIneligible,
     audienceMode: 'restricted_customers',
-    configured: new Set([allowedVariantId]),
     policy: null,
     request: callbackPayload({ customerId: 207119551 }),
     expectedPolicyLookups: 1,
@@ -388,8 +404,7 @@ const scenarios = [
     name: 'hide-all customer policy',
     reasonCode: ShopifyShadowCheckoutGuardDenialReason.HideAll,
     audienceMode: 'restricted_customers',
-    configured: new Set([allowedVariantId]),
-    policy: { mode: 'hide_all' },
+    policy: checkoutCustomerPolicy('hide_all'),
     request: callbackPayload({ customerId: 207119551 }),
     expectedPolicyLookups: 1,
   },
@@ -407,7 +422,6 @@ test('every Shadow guard denial is a privacy-safe zero-work callback boundary',
           accountEnvironment = 'sandbox'
           ratingAccountAvailable = true
           checkoutAudienceMode = scenario.audienceMode
-          configuredVariantIds = scenario.configured
           customerPolicy = scenario.policy
           policyLookupCount = 0
           downstreamCalls.length = 0
@@ -468,7 +482,7 @@ test('every Shadow guard denial is a privacy-safe zero-work callback boundary',
   },
 )
 
-test('Shadow audience Off stays an authenticated 200 kill switch when full readiness drifts',
+test('configured Off stays an authenticated 200 empty response when full readiness drifts',
   async () => {
     const warningCalls: unknown[][] = []
     const warn = mock.method(console, 'warn', (...args: unknown[]) => {
@@ -511,6 +525,117 @@ test('Shadow audience Off stays an authenticated 200 kill switch when full readi
   },
 )
 
+test('Disabled and Frozen are distinct authenticated empty-rate emergency overrides',
+  async () => {
+    for (const scenario of [
+      {
+        activationState: 'disabled' as const,
+        reasonCode: 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED',
+      },
+      {
+        activationState: 'frozen' as const,
+        reasonCode: 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN',
+      },
+    ]) {
+      const warningCalls: unknown[][] = []
+      const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+        warningCalls.push(args)
+      })
+      try {
+        activationState = scenario.activationState
+        checkoutAudienceMode = 'all_eligible'
+        checkoutRateSource = 'production'
+        accountEnvironment = 'production'
+        ratingAccountAvailable = false
+        policyLookupCount = 0
+        downstreamCalls.length = 0
+
+        const result = await executeShopifyCarrierServiceCallback({
+          accountGlobalId,
+          callbackToken,
+          request: callbackRequest(callbackPayload({})),
+        })
+
+        assert.deepEqual(result, {
+          authenticated: true,
+          httpStatus: 200,
+          response: { rates: [] },
+        })
+        assert.equal(policyLookupCount, 0)
+        assert.deepEqual(downstreamCalls, [])
+        assert.deepEqual(warningCalls, [[
+          '[shopify checkout rating] shadow guard denied',
+          {
+            accountGlobalId,
+            stage: 'shadow_guard',
+            checkpoint: 'account_authenticated',
+            reasonCode: scenario.reasonCode,
+          },
+        ]])
+      } finally {
+        warn.mock.restore()
+        activationState = 'shadow'
+        checkoutAudienceMode = 'restricted_customers'
+        checkoutRateSource = 'sandbox'
+        accountEnvironment = 'sandbox'
+        ratingAccountAvailable = true
+      }
+    }
+  },
+)
+
+test('a Restricted TEST policy saved while Frozen stays empty, then resumes in Read-only',
+  async () => {
+    const callbackError = mock.method(console, 'error', () => undefined)
+    try {
+      customerPolicy = checkoutCustomerPolicy('show_all')
+      checkoutAudienceMode = 'restricted_customers'
+      checkoutRateSource = 'sandbox'
+      accountEnvironment = 'sandbox'
+      ratingAccountAvailable = true
+      activationState = 'frozen'
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const frozen = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+      })
+      assert.deepEqual(frozen, {
+        authenticated: true,
+        httpStatus: 200,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+
+      activationState = 'read_only'
+      const resumed = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+      })
+      assert.equal(resumed.authenticated, true)
+      assert.equal(resumed.authenticated && resumed.httpStatus, 503)
+      assert.equal(
+        policyLookupCount,
+        1,
+        'Read-only must reuse the exact local policy instead of requiring a global mode rewrite',
+      )
+    } finally {
+      callbackError.mock.restore()
+      activationState = 'shadow'
+      customerPolicy = checkoutCustomerPolicy('show_all')
+      checkoutAudienceMode = 'restricted_customers'
+      checkoutRateSource = 'sandbox'
+      accountEnvironment = 'sandbox'
+      ratingAccountAvailable = true
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+    }
+  })
+
 test('an authenticated non-Off callback retains strict full readiness', async () => {
   try {
     accountEnvironment = 'sandbox'
@@ -537,17 +662,199 @@ test('an authenticated non-Off callback retains strict full readiness', async ()
   }
 })
 
-test('all-eligible audience on a production store fails before checkout work',
+test('Read-only and Active restricted audiences use local customer policy allow and deny decisions',
+  async () => {
+    const errorCalls: unknown[][] = []
+    const callbackError = mock.method(console, 'error', (...args: unknown[]) => {
+      errorCalls.push(args)
+    })
+    try {
+      for (const state of ['read_only', 'active'] as const) {
+        activationState = state
+        accountEnvironment = 'sandbox'
+        checkoutRateSource = 'sandbox'
+        checkoutAudienceMode = 'restricted_customers'
+        ratingAccountAvailable = true
+
+        customerPolicy = checkoutCustomerPolicy('show_all')
+        policyLookupCount = 0
+        downstreamCalls.length = 0
+        const allowed = await executeShopifyCarrierServiceCallback({
+          accountGlobalId,
+          callbackToken,
+          request: callbackRequest(callbackPayload({
+            customerId: 207119551,
+          })),
+        })
+        assert.equal(allowed.authenticated, true)
+        assert.equal(allowed.authenticated && allowed.httpStatus, 503)
+        assert.equal(policyLookupCount, 1)
+        assert.notEqual(
+          allowed.authenticated && allowed.httpStatus,
+          200,
+          `${state} local customer allow policy was treated as a denial`,
+        )
+
+        customerPolicy = null
+        errorCalls.length = 0
+        policyLookupCount = 0
+        downstreamCalls.length = 0
+        const denied = await executeShopifyCarrierServiceCallback({
+          accountGlobalId,
+          callbackToken,
+          request: callbackRequest(callbackPayload({
+            customerId: 207119551,
+          })),
+        })
+        assert.deepEqual(denied, {
+          authenticated: true,
+          httpStatus: 200,
+          response: { rates: [] },
+        })
+        assert.equal(policyLookupCount, 1)
+        assert.deepEqual(downstreamCalls, [])
+      }
+    } finally {
+      callbackError.mock.restore()
+      activationState = 'shadow'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
+      customerPolicy = checkoutCustomerPolicy('show_all')
+      ratingAccountAvailable = true
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+    }
+  })
+
+test('production Restricted stays desired but is authenticated empty before checkout work without provider enforcement',
   async () => {
     const warningCalls: unknown[][] = []
     const warn = mock.method(console, 'warn', (...args: unknown[]) => {
       warningCalls.push(args)
     })
     try {
+      activationState = 'read_only'
       accountEnvironment = 'production'
+      checkoutRateSource = 'production'
+      checkoutAudienceMode = 'restricted_customers'
+      ratingAccountAvailable = false
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 200,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+      assert.deepEqual(warningCalls, [[
+        '[shopify checkout rating] shadow guard denied',
+        {
+          accountGlobalId,
+          stage: 'shadow_guard',
+          checkpoint: 'account_authenticated',
+          reasonCode:
+            'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED',
+        },
+      ]])
+    } finally {
+      warn.mock.restore()
+      activationState = 'shadow'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
       ratingAccountAvailable = true
+    }
+  })
+
+test('sandbox store with Restricted LIVE source is also authenticated empty before checkout work',
+  async () => {
+    try {
+      activationState = 'read_only'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'production'
+      checkoutAudienceMode = 'restricted_customers'
+      ratingAccountAvailable = false
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 200,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+    } finally {
+      activationState = 'shadow'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
+      ratingAccountAvailable = true
+    }
+  })
+
+test('an All-eligible LIVE policy flipped to Restricted LIVE before full lookup cannot claim or rate',
+  async () => {
+    try {
+      activationState = 'read_only'
+      accountEnvironment = 'production'
+      checkoutRateSource = 'production'
       checkoutAudienceMode = 'all_eligible'
-      configuredVariantIds = null
+      ratingAccountAvailable = true
+      flipToRestrictedLiveAfterPolicyLookup = true
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({})),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 503,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(
+        downstreamCalls,
+        [],
+        'the authoritative full lookup must fence the changed control before receipt or carrier work',
+      )
+    } finally {
+      flipToRestrictedLiveAfterPolicyLookup = false
+      activationState = 'shadow'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
+      ratingAccountAvailable = true
+    }
+  })
+
+test('production store with desired TEST source is authenticated empty before checkout work',
+  async () => {
+    try {
+      activationState = 'read_only'
+      accountEnvironment = 'production'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'all_eligible'
+      ratingAccountAvailable = false
       policyLookupCount = 0
       downstreamCalls.length = 0
 
@@ -564,19 +871,47 @@ test('all-eligible audience on a production store fails before checkout work',
       })
       assert.equal(policyLookupCount, 0)
       assert.deepEqual(downstreamCalls, [])
-      assert.deepEqual(warningCalls, [[
-        '[shopify checkout rating] shadow guard denied',
-        {
-          accountGlobalId,
-          stage: 'shadow_guard',
-          checkpoint: 'request_parsed',
-          reasonCode:
-            'SHOPIFY_SHADOW_GUARD_ALL_ELIGIBLE_SANDBOX_REQUIRED',
-        },
-      ]])
+    } finally {
+      activationState = 'shadow'
+      accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
+      ratingAccountAvailable = true
+    }
+  })
+
+test('all-eligible audience on a production store fails before checkout work',
+  async () => {
+    const warningCalls: unknown[][] = []
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+      warningCalls.push(args)
+    })
+    try {
+      accountEnvironment = 'production'
+      checkoutRateSource = 'production'
+      ratingAccountAvailable = true
+      checkoutAudienceMode = 'all_eligible'
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({})),
+      })
+
+      assert.deepEqual(result, {
+        authenticated: true,
+        httpStatus: 503,
+        response: { rates: [] },
+      })
+      assert.equal(policyLookupCount, 0)
+      assert.deepEqual(downstreamCalls, [])
+      assert.deepEqual(warningCalls, [])
     } finally {
       warn.mock.restore()
       accountEnvironment = 'sandbox'
+      checkoutRateSource = 'sandbox'
       ratingAccountAvailable = true
       checkoutAudienceMode = 'restricted_customers'
     }
@@ -598,8 +933,7 @@ test('all-eligible audience bypasses customer-policy lookup but keeps later call
       process.env.APP_SESSION_SECRET = 'audience-callback-test-secret-32-bytes'
       accountEnvironment = 'sandbox'
       checkoutAudienceMode = 'all_eligible'
-      configuredVariantIds = null
-      customerPolicy = { mode: 'hide_all' }
+      customerPolicy = checkoutCustomerPolicy('hide_all')
       policyLookupCount = 0
       downstreamCalls.length = 0
 

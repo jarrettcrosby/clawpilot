@@ -6,7 +6,7 @@ import type {
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
 import {
-  isShopifySandboxCheckoutChannelEligible,
+  isShopifyRatingCheckoutChannelEligible,
 } from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import {
@@ -1478,7 +1478,7 @@ export function isHybridCartonizationFulfillmentChannelEligible(input: {
   )
   return activeChannel || (
     input.mappingPurpose === 'shopify_checkout'
-    && isShopifySandboxCheckoutChannelEligible({
+    && isShopifyRatingCheckoutChannelEligible({
       provider: input.provider,
       accountEnvironment: input.accountEnvironment,
       providerStatusRaw: input.providerStatusRaw,

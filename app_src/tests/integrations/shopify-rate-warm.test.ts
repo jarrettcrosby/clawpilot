@@ -18,8 +18,8 @@ import {
   readShopifyCheckoutRateWarmPolicy,
 } from '../../lib/operations/shopifyCheckoutRateWarmPolicy.ts'
 import {
-  readShopifyCheckoutAudiencePolicy,
-} from '../../lib/operations/shopifyCheckoutAudiencePolicy.ts'
+  readShopifyCheckoutRateControl,
+} from '../../lib/operations/shopifyCheckoutRateControl.ts'
 import {
   configuredShopifyNumericIdentifierSet,
 } from '../../lib/integrations/shopifyShadowCheckoutAllowlist.ts'
@@ -35,7 +35,7 @@ const PROXY_DEPENDENCIES = {
   },
   verifyProxy: verifyShopifyAppProxyRequest,
   readPolicy: readShopifyCheckoutRateWarmPolicy,
-  readAudiencePolicy: readShopifyCheckoutAudiencePolicy,
+  readRateControl: readShopifyCheckoutRateControl,
   isShadowCustomerAllowed: () => false,
 }
 
@@ -384,10 +384,11 @@ test('fails closed when customer pagination exceeds the bound', async () => {
 
 function tenant(input: {
   shopDomain?: string
-  activationState?: 'shadow' | 'active'
+  activationState?: ShopifyRateWarmTenant['activationState']
   environment?: 'sandbox' | 'production'
   policyEnabled?: boolean
   audienceMode?: 'off' | 'restricted_customers' | 'all_eligible'
+  rateSource?: 'sandbox' | 'production'
 } = {}): ShopifyRateWarmTenant {
   return {
     organizationId: '11111111-1111-4111-8111-111111111111',
@@ -397,9 +398,12 @@ function tenant(input: {
     environment: input.environment || 'sandbox',
     policyRevision: 7,
     policySnapshot: {
-      shadowCheckoutAudience: {
-        version: 'shopify-checkout-audience-v1',
-        mode: input.audienceMode || 'restricted_customers',
+      checkoutRateControl: {
+        version: 'shopify-checkout-rate-control-v1',
+        audience: input.audienceMode || 'restricted_customers',
+        rateSource: input.rateSource || (
+          input.environment === 'production' ? 'production' : 'sandbox'
+        ),
       },
       checkoutRateWarm: {
         version: 'shopify-checkout-rate-warm-v1',
@@ -426,7 +430,7 @@ test('returns exact hosted contract and only tenant-supported destinations', asy
       ...PROXY_DEPENDENCIES,
       async resolveTenant(shopDomain) {
         assert.equal(shopDomain, SHOP)
-        return tenant()
+        return tenant({ audienceMode: 'all_eligible' })
       },
       async requestAccessToken() {
         return {
@@ -466,6 +470,7 @@ test('returns exact hosted contract and only tenant-supported destinations', asy
     enabled: true,
     mode: 'hosted_ajax',
     policyRevision: 7,
+    rateSource: 'sandbox',
     cartFingerprint: CART_FINGERPRINT,
     concurrency: 3,
     debounceMs: 400,
@@ -525,15 +530,16 @@ test('disabled policy returns no destinations and never reads Shopify Admin', as
   assert.equal(addressesRead, false)
 })
 
-test('Shadow sandbox warms only a signed customer with an active policy', async () => {
+test('Restricted TEST warming uses the exact signed-customer policy in Read only', async () => {
   let tokenRequests = 0
   let addressReads = 0
   const dependencies = {
     ...PROXY_DEPENDENCIES,
     async resolveTenant() {
       return tenant({
-        activationState: 'shadow',
+        activationState: 'read_only',
         environment: 'sandbox',
+        rateSource: 'sandbox',
       })
     },
     async requestAccessToken() {
@@ -586,7 +592,7 @@ test('Shadow sandbox warms only a signed customer with an active policy', async 
   assert.equal(addressReads, 1)
 })
 
-test('Shadow audience Off disables warming before customer policy or Shopify Admin work',
+test('Configured Off disables warming before customer policy or Shopify Admin work',
   async () => {
     let customerPolicyReads = 0
     let tokenRequests = 0
@@ -631,7 +637,7 @@ test('Shadow audience Off disables warming before customer policy or Shopify Adm
   },
 )
 
-test('Shadow all-eligible sandbox warming skips customer policy but retains Shopify Admin reads',
+test('All-eligible TEST warming skips customer policy and works in Read only',
   async () => {
     let customerPolicyReads = 0
     let tokenRequests = 0
@@ -643,9 +649,10 @@ test('Shadow all-eligible sandbox warming skips customer policy but retains Shop
         ...PROXY_DEPENDENCIES,
         async resolveTenant() {
           return tenant({
-            activationState: 'shadow',
+            activationState: 'read_only',
             environment: 'sandbox',
             audienceMode: 'all_eligible',
+            rateSource: 'sandbox',
           })
         },
         async isShadowCustomerAllowed() {
@@ -683,7 +690,7 @@ test('Shadow all-eligible sandbox warming skips customer policy but retains Shop
   },
 )
 
-test('Shadow all-eligible warming fails closed for a production store connection',
+test('Production-store serving fails closed when the saved rate source is TEST',
   async () => {
     let customerPolicyReads = 0
     let tokenRequests = 0
@@ -697,6 +704,7 @@ test('Shadow all-eligible warming fails closed for a production store connection
             activationState: 'shadow',
             environment: 'production',
             audienceMode: 'all_eligible',
+            rateSource: 'sandbox',
           })
         },
         async isShadowCustomerAllowed() {
@@ -721,7 +729,53 @@ test('Shadow all-eligible warming fails closed for a production store connection
   },
 )
 
-test('Active warming preserves customer-neutral behavior regardless of Shadow audience',
+test('Restricted LIVE warming stops before policy and Shopify Admin reads',
+  async () => {
+    let customerPolicyReads = 0
+    let tokenRequests = 0
+    let addressReads = 0
+    const result = await loadShopifyRateWarmResponse({
+      parameters: signedParameters(),
+      nowSeconds: NOW,
+      dependencies: {
+        ...PROXY_DEPENDENCIES,
+        async resolveTenant() {
+          return tenant({
+            activationState: 'read_only',
+            environment: 'sandbox',
+            audienceMode: 'restricted_customers',
+            rateSource: 'production',
+          })
+        },
+        async isShadowCustomerAllowed() {
+          customerPolicyReads += 1
+          return true
+        },
+        async requestAccessToken() {
+          tokenRequests += 1
+          return {
+            accessToken: 'test-access-token',
+            grantedScopes: ['read_customers'],
+          }
+        },
+        async readCustomerRateDestinations() {
+          addressReads += 1
+          return {
+            destinations: [],
+            counts: { scanned: 0, eligible: 0, duplicate: 0, skipped: 0 },
+          }
+        },
+      },
+    })
+    assert.equal(result.enabled, false)
+    assert.equal(result.rateSource, 'production')
+    assert.equal(customerPolicyReads, 0)
+    assert.equal(tokenRequests, 0)
+    assert.equal(addressReads, 0)
+  },
+)
+
+test('All-eligible LIVE warming is explicit and independent of global activation mode',
   async () => {
     let customerPolicyReads = 0
     let tokenRequests = 0
@@ -732,9 +786,10 @@ test('Active warming preserves customer-neutral behavior regardless of Shadow au
         ...PROXY_DEPENDENCIES,
         async resolveTenant() {
           return tenant({
-            activationState: 'active',
+            activationState: 'read_only',
             environment: 'production',
-            audienceMode: 'off',
+            audienceMode: 'all_eligible',
+            rateSource: 'production',
           })
         },
         async isShadowCustomerAllowed() {
@@ -757,10 +812,43 @@ test('Active warming preserves customer-neutral behavior regardless of Shadow au
       },
     })
     assert.equal(result.enabled, true)
+    assert.equal(result.rateSource, 'production')
     assert.equal(customerPolicyReads, 0)
     assert.equal(tokenRequests, 1)
   },
 )
+
+test('Disabled and Frozen remain emergency empty-rate overrides', async () => {
+  for (const activationState of ['disabled', 'frozen'] as const) {
+    let tokenRequests = 0
+    const result = await loadShopifyRateWarmResponse({
+      parameters: signedParameters(),
+      nowSeconds: NOW,
+      dependencies: {
+        ...PROXY_DEPENDENCIES,
+        async resolveTenant() {
+          return tenant({
+            activationState,
+            environment: 'production',
+            audienceMode: 'all_eligible',
+            rateSource: 'production',
+          })
+        },
+        async requestAccessToken() {
+          tokenRequests += 1
+          return { accessToken: 'test', grantedScopes: ['read_customers'] }
+        },
+        async readCustomerRateDestinations() {
+          throw new Error('must not read')
+        },
+      },
+    })
+    assert.equal(result.enabled, false)
+    assert.equal(result.rateSource, 'production')
+    assert.deepEqual(result.destinations, [])
+    assert.equal(tokenRequests, 0)
+  }
+})
 
 test('refuses cross-tenant shop binding before token acquisition', async () => {
   let tokenRequested = false
