@@ -1270,7 +1270,7 @@ async function assertStructure(client) {
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_one_off_rate_selection_key()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%carrier_integration.environment = CASE receipt.activation_state%'
+           LIKE '%carrier_integration.environment = receipt.rate_source%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_one_off_rate_selection_key()'
          )), '[[:space:]]+', ' ', 'g')
@@ -1287,7 +1287,7 @@ async function assertStructure(client) {
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'protect_op_shopify_checkout_provider_attempt()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%carrier_integration.environment = CASE receipt.activation_state%'
+           LIKE '%carrier_integration.environment = receipt.rate_source%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'protect_op_shopify_checkout_provider_attempt()'
          )), '[[:space:]]+', ' ', 'g')
