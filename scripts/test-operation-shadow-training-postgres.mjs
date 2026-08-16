@@ -323,6 +323,135 @@ async function verifyActivationRunConcurrency(pool, fixture) {
   )
 }
 
+async function verifyCanonicalTrainingConcurrency(pool, fixture, facts) {
+  await pool.query(
+    `UPDATE operations_activation_scopes
+     SET state = 'read_only', revision = revision + 1,
+         updated_by = $2, updated_at = now()
+     WHERE organization_id = $1::uuid`,
+    [fixture.organizationId, actorEmail],
+  )
+
+  const runFirstClient = await pool.connect()
+  const blockedCanonicalClient = await pool.connect()
+  let runFirst
+  try {
+    await runFirstClient.query('BEGIN')
+    runFirst = await insertRun(runFirstClient, fixture, {
+      generation: 22,
+      idempotencyKey: 'order-training-concurrent-run-before-canonical',
+    })
+    await blockedCanonicalClient.query('BEGIN')
+    let canonicalSettled = false
+    const canonicalAttempt = rejected(
+      blockedCanonicalClient.query(
+        `INSERT INTO operations_fulfillment_plans (
+           organization_id, order_id, warehouse_id,
+           version_number, status, method, solver_status,
+           promised_delivery_at, explanation, created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 190, 'planned',
+           'manual_override', 'not_run', now() + interval '1 day',
+           '{}'::jsonb, $4
+         )`,
+        [
+          fixture.organizationId,
+          fixture.order.id,
+          facts.warehouse.id,
+          actorEmail,
+        ],
+      ).finally(() => {
+        canonicalSettled = true
+      }),
+      /OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED/u,
+      'A training authorization that wins serialization must quarantine canonical work',
+    )
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
+    assert.equal(
+      canonicalSettled,
+      false,
+      'Canonical work must wait for a concurrent training authorization',
+    )
+    await runFirstClient.query('COMMIT')
+    await canonicalAttempt
+    await blockedCanonicalClient.query('ROLLBACK')
+  } finally {
+    await runFirstClient.query('ROLLBACK').catch(() => undefined)
+    await blockedCanonicalClient.query('ROLLBACK').catch(() => undefined)
+    runFirstClient.release()
+    blockedCanonicalClient.release()
+  }
+  await resetRun(
+    pool,
+    fixture,
+    runFirst,
+    'Finish training-first canonical serialization proof',
+  )
+
+  const canonicalFirstClient = await pool.connect()
+  const blockedRunClient = await pool.connect()
+  let canonicalPlan
+  try {
+    await canonicalFirstClient.query('BEGIN')
+    canonicalPlan = (await canonicalFirstClient.query(
+      `INSERT INTO operations_fulfillment_plans (
+         organization_id, order_id, warehouse_id,
+         version_number, status, method, solver_status,
+         promised_delivery_at, explanation, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 191, 'planned',
+         'manual_override', 'not_run', now() + interval '1 day',
+         '{}'::jsonb, $4
+       ) RETURNING id::text`,
+      [
+        fixture.organizationId,
+        fixture.order.id,
+        facts.warehouse.id,
+        actorEmail,
+      ],
+    )).rows[0]
+    await blockedRunClient.query('BEGIN')
+    let runSettled = false
+    const runAttempt = rejected(
+      insertRun(blockedRunClient, fixture, {
+        generation: 23,
+        idempotencyKey: 'order-training-concurrent-canonical-before-run',
+      }).finally(() => {
+        runSettled = true
+      }),
+      /authorization requires an untouched imported connected-store order/u,
+      'Committed canonical work must make a later training authorization ineligible',
+    )
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
+    assert.equal(
+      runSettled,
+      false,
+      'Training authorization must wait for concurrent canonical work',
+    )
+    await canonicalFirstClient.query('COMMIT')
+    await runAttempt
+    await blockedRunClient.query('ROLLBACK')
+  } finally {
+    await canonicalFirstClient.query('ROLLBACK').catch(() => undefined)
+    await blockedRunClient.query('ROLLBACK').catch(() => undefined)
+    canonicalFirstClient.release()
+    blockedRunClient.release()
+  }
+  await withReplicaSession(pool, (client) => client.query(
+    `DELETE FROM operations_fulfillment_plans
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organizationId, canonicalPlan.id],
+  ))
+
+  await pool.query(
+    `UPDATE operations_activation_scopes
+     SET state = 'shadow', revision = revision + 1,
+         updated_by = $2, updated_at = now()
+     WHERE organization_id = $1::uuid`,
+    [fixture.organizationId, actorEmail],
+  )
+}
+
 async function createSealedEvidence(
   pool,
   fixture,
@@ -989,7 +1118,11 @@ async function verify(databaseUrl) {
     await resetRun(pool, shopify, sandboxRun, 'Finish environment eligibility')
     await resetRun(pool, faire, productionRun, 'Finish production eligibility')
 
-    const independentProfileTraining = shadowTrainingPersistence(pool)
+    const independentEvidenceByGlobalId = new Map()
+    const independentProfileTraining = shadowTrainingPersistence(
+      pool,
+      independentEvidenceByGlobalId,
+    )
     for (const [index, safetyState] of [
       'disabled',
       'shadow',
@@ -1004,7 +1137,7 @@ async function verify(databaseUrl) {
          WHERE organization_id = $1::uuid`,
         [ids.organization, safetyState, actorEmail],
       )
-      const modeRun = await independentProfileTraining
+      let modeRun = await independentProfileTraining
         .enableOperationsShadowTrainingInPostgres({
           organizationId: ids.organization,
           actorEmail,
@@ -1024,6 +1157,51 @@ async function verify(databaseUrl) {
         ['plan', 'reset'],
         `${safetyState} must expose the complete local training start boundary`,
       )
+      const modeEvidence = await createSealedEvidence(
+        pool,
+        shopify,
+        facts,
+        {
+          key: `profile-${safetyState}`,
+          runGlobalId: modeRun.globalId,
+          runRowVersion: modeRun.rowVersion,
+        },
+      )
+      independentEvidenceByGlobalId.set(
+        modeEvidence.global_id,
+        persistenceEvidence(shopify, facts, modeEvidence),
+      )
+      modeRun = await independentProfileTraining
+        .planOperationsShadowTrainingInPostgres({
+          organizationId: ids.organization,
+          actorEmail,
+          runGlobalId: modeRun.globalId,
+          cartonizationEvidenceGlobalId: modeEvidence.global_id,
+          expectedRowVersion: modeRun.rowVersion,
+          reason: `Plan exact local Order training in ${safetyState}`,
+          idempotencyKey: `order-training-plan-${index}-${safetyState}`,
+        })
+      for (const [method, expectedState, action] of [
+        ['releaseOperationsShadowTrainingInPostgres', 'released', 'release'],
+        ['confirmOperationsShadowTrainingPicksInPostgres', 'picked', 'pick'],
+        ['verifyOperationsShadowTrainingPackInPostgres', 'packed', 'pack'],
+        ['completeOperationsShadowTrainingInPostgres', 'completed', 'complete'],
+      ]) {
+        modeRun = await independentProfileTraining[method]({
+          organizationId: ids.organization,
+          actorEmail,
+          runGlobalId: modeRun.globalId,
+          expectedRowVersion: modeRun.rowVersion,
+          reason: `${action} exact local Order training in ${safetyState}`,
+          idempotencyKey:
+            `order-training-${action}-${index}-${safetyState}`,
+        })
+        assert.equal(
+          modeRun.state,
+          expectedState,
+          `${safetyState} must complete the ${action} training boundary`,
+        )
+      }
       const resetModeRun = await independentProfileTraining
         .resetOperationsShadowTrainingInPostgres({
           organizationId: ids.organization,
@@ -1043,6 +1221,7 @@ async function verify(databaseUrl) {
       [ids.organization, actorEmail],
     )
     await verifyActivationRunConcurrency(pool, shopify)
+    await verifyCanonicalTrainingConcurrency(pool, shopify, facts)
 
     const planRun = await insertRun(pool, shopify, {
       generation: 30,

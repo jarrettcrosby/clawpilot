@@ -74,6 +74,9 @@ for (const fragment of [
   "'disabled', 'shadow', 'read_only', 'active', 'frozen'",
   'activation.revision = NEW.authorization_activation_revision',
   'Order training requires an exact current safety profile',
+  'pg_advisory_xact_lock(',
+  "'operations:activation:' || NEW.organization_id::text",
+  'CREATE OR REPLACE FUNCTION guard_shadow_commerce_canonical_write()',
   "IF TG_OP = 'DELETE'",
   'OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED',
 ]) {

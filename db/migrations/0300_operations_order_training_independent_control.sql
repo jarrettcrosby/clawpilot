@@ -13,6 +13,12 @@ DECLARE
   evidence_binding_valid boolean;
 BEGIN
   IF TG_OP = 'INSERT' THEN
+    PERFORM pg_advisory_xact_lock(
+      hashtextextended(
+        'operations:activation:' || NEW.organization_id::text,
+        0
+      )
+    );
     PERFORM 1
     FROM operations_activation_scopes activation
     WHERE activation.organization_id = NEW.organization_id
@@ -145,6 +151,85 @@ BEGIN
        ) THEN
       RAISE EXCEPTION 'Order training evidence must match the exact enabled run version';
     END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+-- Serialize every canonical write with exact-order training authorization.
+-- Whichever transaction acquires the organization authority first wins:
+-- canonical work makes a later training authorization ineligible, while a
+-- committed training run quarantines later canonical work for that order.
+CREATE OR REPLACE FUNCTION guard_shadow_commerce_canonical_write()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  activation_state text;
+  order_provider text;
+  account_type text;
+  canonical_identity_changed boolean := TG_OP = 'INSERT';
+BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'operations:activation:' || NEW.organization_id::text,
+      0
+    )
+  );
+
+  IF TG_TABLE_NAME = 'operations_fulfillment_plans'
+     AND EXISTS (
+       SELECT 1
+       FROM operations_cartonization_rate_evidence evidence
+       WHERE evidence.organization_id = NEW.organization_id
+         AND evidence.id = NULLIF(
+           to_jsonb(NEW)->>'cartonization_evidence_id',
+           ''
+         )::uuid
+         AND evidence.plan_snapshot ? 'shadowTraining'
+     ) THEN
+    RAISE EXCEPTION 'OPERATIONS_SHADOW_TRAINING_EVIDENCE_CANONICAL_FORBIDDEN'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    canonical_identity_changed :=
+      NEW.order_id IS DISTINCT FROM OLD.order_id;
+  END IF;
+
+  IF canonical_identity_changed AND EXISTS (
+    SELECT 1
+    FROM operations_shadow_training_runs training_run
+    WHERE training_run.organization_id = NEW.organization_id
+      AND training_run.source_order_id = NEW.order_id
+      AND training_run.state <> 'reset'
+  ) THEN
+    RAISE EXCEPTION 'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND NEW.order_id IS NOT DISTINCT FROM OLD.order_id THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT activation.state, source_order.source_provider,
+         account.integration_type
+    INTO activation_state, order_provider, account_type
+  FROM operations_orders source_order
+  JOIN operations_integration_accounts account
+    ON account.organization_id = source_order.organization_id
+   AND account.id = source_order.integration_account_id
+  JOIN operations_activation_scopes activation
+    ON activation.organization_id = source_order.organization_id
+  WHERE source_order.organization_id = NEW.organization_id
+    AND source_order.id = NEW.order_id;
+
+  IF activation_state = 'shadow'
+     AND order_provider IN ('shopify', 'faire')
+     AND account_type = 'commerce' THEN
+    RAISE EXCEPTION 'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED'
+      USING ERRCODE = 'P0001';
   END IF;
   RETURN NEW;
 END;

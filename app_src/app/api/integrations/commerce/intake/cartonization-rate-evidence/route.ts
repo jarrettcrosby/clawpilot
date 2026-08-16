@@ -944,7 +944,7 @@ export async function POST(req: NextRequest) {
       request.evidenceMode === 'operational'
       && plan.geometryFallbackLines.length > 0
     ) {
-      if (read.activationState !== 'shadow') {
+      if (!request.shadowTraining && read.activationState !== 'shadow') {
         throw new RateEvidenceRequestError(
           'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow mode',
           422,

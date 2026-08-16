@@ -1064,7 +1064,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'validate_operations_shadow_training_run_identity()',
         'plpgsql', 'v',
-        '0464f9df69afe0e49bae8a800839b911037dc56ba50d6faf156418eb8b285d45'
+        '0c8485310e1dade3adfd8b38128b7ea288975456f2ff796fa9160a5757881dad'
       ),
       (
         'protect_operations_shadow_training_package()',
@@ -1089,7 +1089,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'guard_shadow_commerce_canonical_write()',
         'plpgsql', 'v',
-        'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3'
+        'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310'
       ),
       (
         'guard_shadow_training_activation_change()',
@@ -1254,6 +1254,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
               required_trigger.initially_deferred
         AND installed_trigger.tgfoid =
               to_regprocedure(required_trigger.function_signature)
+        AND installed_trigger.tgqual IS NULL
         AND ARRAY(
           SELECT installed_update_column.attname
           FROM unnest(installed_trigger.tgattr::smallint[])
