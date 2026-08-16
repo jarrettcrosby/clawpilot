@@ -1,0 +1,102 @@
+name: Print Gateway CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - "clients/print-gateway/**"
+      - "scripts/run-local-print-agent.mjs"
+      - "scripts/lib/local-print-device.mjs"
+      - "scripts/lib/submit-raw-print.mjs"
+      - "scripts/lib/print-agent-pairing-credential.mjs"
+      - "app_src/app/api/health/route.ts"
+      - "app_src/app/api/operations/print-agent/jobs/route.ts"
+      - "app_src/app/api/operations/print-agent/pair/route.ts"
+      - "app_src/app/api/operations/print-agent/cleanup-status/**"
+      - "app_src/lib/operations/printing.ts"
+      - "app_src/lib/persistence/operationPrintDelivery.ts"
+      - "db/migrations/*operations_print*.sql"
+      - "scripts/test-operations-print-delivery.mjs"
+      - "scripts/test-operation-print-agent-pairing.mjs"
+      - "scripts/test-operation-print-agent-cleanup-status.mjs"
+      - "scripts/test-operation-print-agent-runtime.mjs"
+      - "scripts/test-local-print-agent.mjs"
+      - "scripts/verify-predeploy.mjs"
+      - "clients/print-gateway/native/windows/clawpilot-print-lock.cpp"
+      - ".github/workflows/print-gateway-*.yml"
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - "clients/print-gateway/**"
+      - "scripts/run-local-print-agent.mjs"
+      - "scripts/lib/local-print-device.mjs"
+      - "scripts/lib/submit-raw-print.mjs"
+      - "scripts/lib/print-agent-pairing-credential.mjs"
+      - "app_src/app/api/health/route.ts"
+      - "app_src/app/api/operations/print-agent/jobs/route.ts"
+      - "app_src/app/api/operations/print-agent/pair/route.ts"
+      - "app_src/app/api/operations/print-agent/cleanup-status/**"
+      - "app_src/lib/operations/printing.ts"
+      - "app_src/lib/persistence/operationPrintDelivery.ts"
+      - "db/migrations/*operations_print*.sql"
+      - "scripts/test-operations-print-delivery.mjs"
+      - "scripts/test-operation-print-agent-pairing.mjs"
+      - "scripts/test-operation-print-agent-cleanup-status.mjs"
+      - "scripts/test-operation-print-agent-runtime.mjs"
+      - "scripts/test-local-print-agent.mjs"
+      - "scripts/verify-predeploy.mjs"
+      - "clients/print-gateway/native/windows/clawpilot-print-lock.cpp"
+      - ".github/workflows/print-gateway-*.yml"
+
+concurrency:
+  group: print-gateway-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - run: npm --prefix app_src ci --ignore-scripts
+      - run: npm --prefix clients/print-gateway test
+      - run: node scripts/test-local-print-device.mjs
+      - run: node scripts/test-operation-print-agent-pairing.mjs
+      - run: node scripts/test-operation-print-agent-cleanup-status.mjs
+      - run: node scripts/test-operations-print-delivery.mjs --contracts-only
+
+  native-unpacked-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - run: npm --prefix clients/print-gateway run build:dir
+      - run: npm --prefix clients/print-gateway run smoke:packaged
+      - name: Confirm CI did not create a customer installer
+        shell: bash
+        run: |
+          if find clients/print-gateway/dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.exe' \) | grep -q .; then
+            echo "Unsigned CI must not emit a customer installer" >&2
+            exit 1
+          fi

@@ -1,8 +1,10 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { existsSync, promises as fs } from 'node:fs'
+import { isIP } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const DEVICE_KEY_PATTERN = /^[a-f0-9]{64}$/
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000
@@ -19,12 +21,33 @@ export function normalizedLocalPrinterEndpoint(host, port) {
     || normalizedHost.length > 253
     || /[\u0000-\u0020\u007f/\\]/.test(normalizedHost)
   ) {
-    throw new Error('The local printer hostname or IP address is invalid')
+    throw new Error('The local printer LAN IP address is invalid')
   }
+  assertPrivateLanPrinterAddress(normalizedHost)
   if (!Number.isSafeInteger(normalizedPort) || normalizedPort < 1 || normalizedPort > 65_535) {
     throw new Error('The local printer port is invalid')
   }
   return `${normalizedHost}:${normalizedPort}`
+}
+
+export function assertPrivateLanPrinterAddress(value, {
+  allowLoopback = process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1'
+    && process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK === '1',
+} = {}) {
+  const address = String(value || '').trim().toLowerCase()
+  if (isIP(address) !== 4 || !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(address)) {
+    throw new Error('The printer must use a literal private LAN IPv4 address')
+  }
+  const [first, second] = address.split('.').map(Number)
+  const privateAddress = first === 10
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 168)
+    || (first === 169 && second === 254)
+  const loopback = first === 127
+  if (!privateAddress && !(allowLoopback && loopback)) {
+    throw new Error('The printer IP must be private LAN space (10/8, 172.16/12, 192.168/16, or 169.254/16)')
+  }
+  return address
 }
 
 export async function readOrCreateLocalDeviceKey(keyPath) {
@@ -66,17 +89,47 @@ function endpointLockName(host, port) {
     .digest('hex')
 }
 
-function kernelLockInvocation(lockPath, timeoutSeconds, command, args) {
-  if (process.platform === 'darwin' && existsSync('/usr/bin/lockf')) {
+export function localPrinterLockInvocation({
+  platform = process.platform,
+  lockPath,
+  timeoutSeconds,
+  command,
+  args,
+  windowsHelperPath = process.env.CLAWPILOT_WINDOWS_PRINT_LOCK_HELPER || path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'clawpilot-print-lock.exe',
+  ),
+  fileExists = existsSync,
+}) {
+  if (platform === 'darwin' && existsSync('/usr/bin/lockf')) {
     return {
       command: '/usr/bin/lockf',
       args: ['-t', String(timeoutSeconds), lockPath, command, ...args],
     }
   }
-  if (process.platform === 'linux' && existsSync('/usr/bin/flock')) {
+  if (platform === 'linux' && existsSync('/usr/bin/flock')) {
     return {
       command: '/usr/bin/flock',
       args: ['-E', '75', '-w', String(timeoutSeconds), lockPath, command, ...args],
+    }
+  }
+  if (platform === 'win32') {
+    if (!fileExists(windowsHelperPath)) {
+      throw new Error('The Windows print-endpoint lock helper is missing')
+    }
+    const mutexName = `ClawPilotPrintEndpoint_${path.win32.basename(lockPath, '.lock')}`
+    return {
+      command: windowsHelperPath,
+      args: [
+        '--mutex-name',
+        mutexName,
+        '--timeout-ms',
+        String(timeoutSeconds * 1_000),
+        '--command',
+        command,
+        '--',
+        ...args,
+      ],
     }
   }
   throw new Error('A supported kernel file-lock utility is required for local printing')
@@ -100,16 +153,29 @@ export async function runWithLocalPrinterKernelLock(input) {
 
   await fs.mkdir(directory, { recursive: true, mode: 0o700 })
   const lockPath = path.join(directory, `${endpointLockName(input.host, input.port)}.lock`)
-  const invocation = kernelLockInvocation(
+  const invocation = localPrinterLockInvocation({
     lockPath,
-    Math.max(1, Math.ceil(timeoutMs / 1_000)),
+    timeoutSeconds: Math.max(1, Math.ceil(timeoutMs / 1_000)),
     command,
-    input.args,
-  )
+    args: input.args,
+  })
   return new Promise((resolvePromise, reject) => {
     const child = spawn(invocation.command, invocation.args, {
       env: {
         PATH: process.env.PATH || '/usr/bin:/bin',
+        // The packaged worker is itself running under Electron's Node mode,
+        // but Electron removes this variable from its own environment. The
+        // trusted nested raw-delivery helper must always re-enter Node mode;
+        // otherwise the Electron binary launches a GUI app under lockf/flock
+        // and can hold the endpoint lock indefinitely without delivering.
+        ELECTRON_RUN_AS_NODE: '1',
+        ...(process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1'
+          && process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK === '1'
+          ? {
+            CLAWPILOT_GATEWAY_TEST_MODE: '1',
+            CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK: '1',
+          }
+          : {}),
         ...(input.env || {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],

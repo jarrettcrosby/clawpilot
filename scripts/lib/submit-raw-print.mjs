@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import net from 'node:net'
 import { pathToFileURL } from 'node:url'
+import { normalizedLocalPrinterEndpoint } from './local-print-device.mjs'
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value || fallback)
@@ -40,8 +41,47 @@ export async function submitRaw(
   host,
   port,
   timeoutMs = 10_000,
-  { createConnection = net.createConnection } = {},
+  {
+    createConnection = net.createConnection,
+    claimExpiresAt = null,
+    claimMonotonicDeadlineNs = null,
+    now = Date.now,
+    monotonicNowNs = process.hrtime.bigint,
+  } = {},
 ) {
+  const assertLeaseRemaining = (minimumMs) => {
+    const hasWallDeadline = claimExpiresAt !== null
+      && claimExpiresAt !== undefined
+      && claimExpiresAt !== ''
+    const hasMonotonicDeadline = claimMonotonicDeadlineNs !== null
+      && claimMonotonicDeadlineNs !== undefined
+      && claimMonotonicDeadlineNs !== ''
+    if (!hasWallDeadline && !hasMonotonicDeadline) return
+    let wallLeaseSafe = true
+    let monotonicLeaseSafe = true
+    if (hasWallDeadline) {
+      const expiresAt = Date.parse(String(claimExpiresAt))
+      wallLeaseSafe = Number.isFinite(expiresAt) && expiresAt - now() >= minimumMs
+    }
+    if (hasMonotonicDeadline) {
+      let deadline
+      try {
+        deadline = BigInt(String(claimMonotonicDeadlineNs))
+      } catch {
+        monotonicLeaseSafe = false
+      }
+      if (deadline !== undefined) {
+        monotonicLeaseSafe = deadline - monotonicNowNs()
+          >= BigInt(minimumMs) * 1_000_000n
+      }
+    }
+    if (!wallLeaseSafe || !monotonicLeaseSafe) {
+      const error = new Error('The authoritative print claim expires too soon for raw delivery')
+      error.code = 'PRINT_CLAIM_LEASE_TOO_SHORT'
+      throw error
+    }
+  }
+  assertLeaseRemaining(timeoutMs + 2_000)
   return new Promise((resolvePromise, reject) => {
     const socket = createConnection({ host, port })
     let acceptedBytes = 0
@@ -61,6 +101,12 @@ export async function submitRaw(
     }
     socket.setTimeout(timeoutMs)
     socket.once('connect', () => {
+      try {
+        assertLeaseRemaining(2_000)
+      } catch (error) {
+        finish(error)
+        return
+      }
       // Crossing this fence means socket.write was invoked. Even when its
       // callback later reports an error (or never arrives), the kernel or
       // printer may already have received bytes, so automatic retry is unsafe.
@@ -85,9 +131,19 @@ async function main() {
   const host = String(process.env.CLAWPILOT_PRINTER_HOST || '').trim()
   if (!host) throw new Error('The local printer endpoint is unavailable')
   const port = positiveInteger(process.env.CLAWPILOT_PRINTER_PORT, 9_100)
+  const claimExpiresAt = String(
+    process.env.CLAWPILOT_PRINT_CLAIM_EXPIRES_AT || '',
+  ).trim() || null
+  const claimMonotonicDeadlineNs = String(
+    process.env.CLAWPILOT_PRINT_CLAIM_MONOTONIC_DEADLINE_NS || '',
+  ).trim() || null
+  normalizedLocalPrinterEndpoint(host, port)
   const payload = await stdinBytes()
   try {
-    const result = await submitRaw(payload, host, port)
+    const result = await submitRaw(payload, host, port, 10_000, {
+      claimExpiresAt,
+      claimMonotonicDeadlineNs,
+    })
     process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`)
   } catch (error) {
     const disposition = rawPrintFailureDisposition(error)
@@ -95,7 +151,7 @@ async function main() {
       ok: false,
       acceptedBytes: disposition.acceptedBytes,
       deliveryStarted: disposition.deliveryStarted,
-      code: disposition.code,
+      code: String(error?.code || disposition.code),
     })}\n`)
     process.exitCode = 1
   }
