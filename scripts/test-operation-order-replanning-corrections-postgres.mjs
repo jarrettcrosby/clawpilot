@@ -63,6 +63,9 @@ function persistenceFor(pool) {
     '@/lib/operations/pickManagement': {},
     '@/lib/persistence/crm': {},
     '@/lib/persistence/cartonizationRateEvidence': {},
+    '@/lib/persistence/commerceStoreSync': {
+      readCommerceStoreSyncControlsFromPostgres: async () => [],
+    },
     '@/lib/persistence/operationPrintDelivery': {},
     '@/lib/persistence/operationShadowFulfillmentPreparation': {
       readShadowFulfillmentPreparation: async () => null,

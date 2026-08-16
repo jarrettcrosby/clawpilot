@@ -991,7 +991,6 @@ test('Paused Store sync does not gate authenticated CarrierService callback eval
       storeSyncDesiredState = 'paused'
       accountEnvironment = 'sandbox'
       checkoutAudienceMode = 'restricted_customers'
-      configuredVariantIds = new Set([allowedVariantId])
       customerPolicy = { mode: 'show_all' }
       policyLookupCount = 0
       downstreamCalls.length = 0
