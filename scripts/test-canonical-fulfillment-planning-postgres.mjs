@@ -3272,6 +3272,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
             async assertCommerceOrderRevisionExecutionCurrent() {},
             CommerceOrderRevisionGateError: class extends Error {},
           },
+          '@/lib/persistence/commerceStoreSync': {
+            readCommerceStoreSyncControlsFromPostgres: async () => [],
+          },
           '@/lib/persistence/crm': {
             stageCrmRecordWithClient: async () => {
               throw new Error(

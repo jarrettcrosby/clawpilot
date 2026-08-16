@@ -965,6 +965,9 @@ async function verifyShipmentCompletion(databaseUrl) {
     const shopifyCheckoutAudiencePolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
     )
+    const shopifyCheckoutRateControl = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -976,6 +979,8 @@ async function verifyShipmentCompletion(databaseUrl) {
             shopifyCheckoutRateWarmPolicy,
           '@/lib/operations/shopifyCheckoutAudiencePolicy':
             shopifyCheckoutAudiencePolicy,
+          '@/lib/operations/shopifyCheckoutRateControl':
+            shopifyCheckoutRateControl,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -997,6 +1002,9 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/commerceOrderRevisions': {
           async assertCommerceOrderRevisionExecutionCurrent() {},
           CommerceOrderRevisionGateError: class extends Error {},
+        },
+        '@/lib/persistence/commerceStoreSync': {
+          readCommerceStoreSyncControlsFromPostgres: async () => [],
         },
         '@/lib/integrations/carrierCheckoutRate': {
           rateCheckoutShipment: async () => {

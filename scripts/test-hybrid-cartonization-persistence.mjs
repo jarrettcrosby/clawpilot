@@ -92,31 +92,44 @@ vm.runInNewContext(output, {
       specifier ===
       '@/lib/integrations/shopifyCheckoutChannelEligibility'
     ) {
+      const isShopifySandboxCheckoutChannelEligible = (input) => {
+        const normalizedStatus = String(
+          input.normalizedStatus || '',
+        ).trim().toLowerCase()
+        const providerStatusRaw = String(
+          input.providerStatusRaw || '',
+        ).trim().toLowerCase()
+        const lifecycleEligible = (
+          normalizedStatus === 'active'
+          && providerStatusRaw === 'active'
+          && input.providerActive === true
+        ) || (
+          normalizedStatus === 'unlisted'
+          && providerStatusRaw === 'unlisted'
+          && input.providerActive === false
+        )
+        return (
+          String(input.provider || '').trim().toLowerCase() === 'shopify'
+          && String(input.accountEnvironment || '')
+            .trim().toLowerCase() === 'sandbox'
+          && lifecycleEligible
+          && input.requiresShipping === true
+          && Number.isSafeInteger(input.weightGrams)
+          && Number(input.weightGrams) > 0
+        )
+      }
       return {
-        isShopifySandboxCheckoutChannelEligible(input) {
-          const normalizedStatus = String(
-            input.normalizedStatus || '',
+        isShopifySandboxCheckoutChannelEligible,
+        isShopifyRatingCheckoutChannelEligible(input) {
+          const environment = String(
+            input.accountEnvironment || '',
           ).trim().toLowerCase()
-          const providerStatusRaw = String(
-            input.providerStatusRaw || '',
-          ).trim().toLowerCase()
-          const lifecycleEligible = (
-            normalizedStatus === 'active'
-            && providerStatusRaw === 'active'
-            && input.providerActive === true
-          ) || (
-            normalizedStatus === 'unlisted'
-            && providerStatusRaw === 'unlisted'
-            && input.providerActive === false
-          )
           return (
-            String(input.provider || '').trim().toLowerCase() === 'shopify'
-            && String(input.accountEnvironment || '')
-              .trim().toLowerCase() === 'sandbox'
-            && lifecycleEligible
-            && input.requiresShipping === true
-            && Number.isSafeInteger(input.weightGrams)
-            && Number(input.weightGrams) > 0
+            (environment === 'sandbox' || environment === 'production')
+            && isShopifySandboxCheckoutChannelEligible({
+              ...input,
+              accountEnvironment: 'sandbox',
+            })
           )
         },
       }
@@ -825,8 +838,23 @@ assert.deepEqual(
   },
   'Fulfillment evidence must retain truthful sandbox UNLISTED lifecycle facts',
 )
+const productionUnlistedFulfillment = applyCurrentFulfillmentPackLineage(
+  [{ ...fulfillmentCandidate, account_environment: 'production' }],
+  [{
+    ...currentFulfillmentRow,
+    channel_provider_status_raw: 'UNLISTED',
+    channel_normalized_status: 'unlisted',
+    channel_provider_active: false,
+  }],
+)[0]
+assert.doesNotThrow(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [productionUnlistedFulfillment],
+  ),
+  'A truthful production Shopify UNLISTED checkout mapping remains eligible for rating',
+)
 for (const [label, candidatePatch, currentPatch] of [
-  ['production environment', { account_environment: 'production' }, {}],
   ['mock environment', { account_environment: 'mock' }, {}],
   ['raw lifecycle mismatch', {}, { channel_provider_status_raw: 'ACTIVE' }],
   ['provider-active mismatch', {}, { channel_provider_active: true }],
