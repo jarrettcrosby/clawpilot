@@ -1267,6 +1267,13 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CommerceStoreSyncPersistenceError extends Error {
+    constructor(code, message, status = 400) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   class CarrierIntegrationRequestError extends Error {
     constructor(message, status = 409, code = 'CARRIER_REQUEST_INVALID') {
       super(message)
@@ -1340,6 +1347,12 @@ async function verifyRouteBehavior() {
         ),
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/persistence/commerceStoreSync': {
+        CommerceStoreSyncPersistenceError,
+        updateCommerceStoreSyncControlInPostgres: async () => {
+          throw new Error('Store sync updates are covered by their focused route contract')
+        },
+      },
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
       },
@@ -3787,6 +3800,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const commerceOrderRevisionEvidence = loadTypeScriptModule(
       'app_src/lib/integrations/commerceOrderRevisionEvidence.ts',
     )
+    const commerceStoreSyncPolicy = loadTypeScriptModule(
+      'app_src/lib/operations/commerceStoreSync.ts',
+    )
     const commerceOrderRevisions = loadTypeScriptModule(
       'app_src/lib/persistence/commerceOrderRevisions.ts',
       {
@@ -3794,6 +3810,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/integrations/commerceOrderRevisionEvidence':
             commerceOrderRevisionEvidence,
+          '@/lib/operations/commerceStoreSync': commerceStoreSyncPolicy,
+          '@/lib/persistence/commerceStoreSync': {
+            assertCommerceStoreSyncProviderReadLeaseCurrentWithClient:
+              async () => {},
+          },
           '@/lib/integrations/commerceCredentialCrypto': {
             commerceOrderRevisionEvidenceKeyAvailable: () => false,
             commerceOrderRevisionProtectedContentFingerprint: () => {
@@ -3902,6 +3923,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const shopifyCheckoutAudiencePolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
     )
+    const shopifyCheckoutRateControl = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -3913,6 +3937,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
             shopifyCheckoutRateWarmPolicy,
           '@/lib/operations/shopifyCheckoutAudiencePolicy':
             shopifyCheckoutAudiencePolicy,
+          '@/lib/operations/shopifyCheckoutRateControl':
+            shopifyCheckoutRateControl,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -4018,6 +4044,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
           },
         },
         '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisions,
+        '@/lib/persistence/commerceStoreSync': {
+          readCommerceStoreSyncControlsFromPostgres: async () => [],
+        },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
