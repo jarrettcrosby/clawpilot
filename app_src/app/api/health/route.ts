@@ -1943,6 +1943,7 @@ export async function GET() {
           operations_print_agent_pairing_grants_applied: boolean
           operations_print_agent_pairing_recovery_applied: boolean
           operations_print_outcome_uncertain_fence_applied: boolean
+          operations_print_agent_cleanup_status_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
           shopify_checkout_audience_policy_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
@@ -4453,6 +4454,66 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0297_operations_print_agent_cleanup_status.sql'
+                  AND checksum =
+                    'e599a45aa200f6ed387003d6dff92cfe396136ffd4462a5c7cb93af7333d8e3e'
+              )
+              AND to_regclass(
+                'operations_print_agent_cleanup_credentials'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_print_agent_cleanup_receipts'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'retain_operations_print_agent_cleanup_credential()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_print_agent_cleanup_evidence()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger cleanup_retention_trigger
+                WHERE cleanup_retention_trigger.tgrelid = to_regclass(
+                  'operations_print_agents'
+                )
+                  AND cleanup_retention_trigger.tgname =
+                    'retain_operations_print_agent_cleanup_credential_write'
+                  AND cleanup_retention_trigger.tgfoid = to_regprocedure(
+                    'retain_operations_print_agent_cleanup_credential()'
+                  )
+                  AND cleanup_retention_trigger.tgenabled = 'O'
+                  AND NOT cleanup_retention_trigger.tgisinternal
+                  AND cleanup_retention_trigger.tgtype = 17
+              )
+              AND (
+                SELECT count(*) = 2
+                FROM pg_trigger cleanup_guard
+                WHERE cleanup_guard.tgname = ANY (ARRAY[
+                  'protect_operations_print_agent_cleanup_credential_write',
+                  'protect_operations_print_agent_cleanup_receipt_write'
+                ])
+                  AND cleanup_guard.tgfoid = to_regprocedure(
+                    'protect_operations_print_agent_cleanup_evidence()'
+                  )
+                  AND cleanup_guard.tgenabled = 'O'
+                  AND NOT cleanup_guard.tgisinternal
+                  AND cleanup_guard.tgtype = 27
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_print_delivery_attempts uncertain
+                JOIN operations_print_delivery_attempts requeued
+                  ON requeued.organization_id = uncertain.organization_id
+                 AND requeued.print_job_id = uncertain.print_job_id
+                 AND requeued.sequence_number > uncertain.sequence_number
+                 AND requeued.state = 'queued'
+                WHERE uncertain.state = 'failed'
+                  AND uncertain.error_code = 'PRINT_OUTCOME_UNCERTAIN'
+              ) AS operations_print_agent_cleanup_status_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
               AND EXISTS (
@@ -5436,6 +5497,7 @@ export async function GET() {
             && row?.operations_print_agent_pairing_grants_applied
             && row?.operations_print_agent_pairing_recovery_applied
             && row?.operations_print_outcome_uncertain_fence_applied
+            && row?.operations_print_agent_cleanup_status_applied
             && row?.shopify_carrier_configured_carriers_applied
             && row?.shopify_checkout_audience_policy_applied
             && row?.carrier_shipping_diagnostics_applied
@@ -5562,6 +5624,14 @@ export async function GET() {
             deliveryOutcomeFence: row?.operations_print_outcome_uncertain_fence_applied
               ? 'ready'
               : 'migration-or-structure-pending',
+          },
+          printAgentCleanupStatus: {
+            status: row?.operations_print_agent_cleanup_status_applied
+              ? 'ready'
+              : 'migration-structure-or-ledger-pending',
+            redactedEvidence: Boolean(
+              row?.operations_print_agent_cleanup_status_applied,
+            ),
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
@@ -5880,6 +5950,7 @@ export async function GET() {
           || !row?.operations_print_agent_pairing_grants_applied
           || !row?.operations_print_agent_pairing_recovery_applied
           || !row?.operations_print_outcome_uncertain_fence_applied
+          || !row?.operations_print_agent_cleanup_status_applied
           || !row?.shopify_carrier_configured_carriers_applied
           || !row?.shopify_checkout_audience_policy_applied
           || !row?.carrier_shipping_diagnostics_applied

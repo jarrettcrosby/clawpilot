@@ -238,6 +238,61 @@ type LockedPrintJobRow = {
   claim_expires_at: TimestampValue | null
 }
 
+export type OperationsPrintAgentCleanupEntry = {
+  jobGlobalId: string
+  claimToken: string
+  documentGlobalId: string
+  contentSha256: string
+}
+
+export type OperationsPrintAgentCleanupResolution =
+  | 'delivered'
+  | 'failed_zero_byte_confirmed'
+  | 'outcome_uncertain_terminal'
+  | 'in_flight'
+  | 'unresolved'
+
+export type OperationsPrintAgentCleanupReasonCode =
+  | 'SERVER_DELIVERY_CONFIRMED'
+  | 'SERVER_ZERO_BYTE_FAILURE_CONFIRMED'
+  | 'SERVER_OUTCOME_UNCERTAIN_TERMINAL'
+  | 'SERVER_CLAIM_IN_FLIGHT'
+  | 'SERVER_CLAIM_UNRESOLVED'
+
+export type OperationsPrintAgentCleanupResult = {
+  resolution: OperationsPrintAgentCleanupResolution
+  removalSafe: boolean
+  reasonCode: OperationsPrintAgentCleanupReasonCode
+}
+
+export type OperationsPrintAgentCleanupContext = {
+  id: string
+  globalId: string
+  organizationId: string
+  warehouseId: string
+}
+
+type CleanupLockedJobRow = {
+  id: string
+  global_id: string
+  status: OperationsPrintJobListItem['status']
+  printer_id: string
+  claimed_by_print_agent_id: string | null
+  current_claim_attempt_id: string | null
+  artifact_global_id: string
+  content_sha256: string
+}
+
+type CleanupClaimEvidenceRow = {
+  claim_token: string
+  print_job_id: string
+  print_agent_id: string
+  claim_expired: boolean
+  terminal_state: 'delivered' | 'failed' | 'cancelled' | null
+  terminal_error_code: string | null
+  unsafe_uncertain_requeue: boolean
+}
+
 type LatestPrintAttemptOutcome = {
   state: OperationsPrintAttemptListItem['state']
   actor_type: OperationsPrintAttemptListItem['actorType']
@@ -2777,6 +2832,437 @@ export async function authenticateOperationsPrintAgentInPostgres(
     supportedMedia: agent.supported_media,
     supportedDocumentTypes: agent.supported_document_types,
   }
+}
+
+export async function authenticateOperationsPrintAgentForCleanupInPostgres(
+  credential: string,
+): Promise<OperationsPrintAgentCleanupContext | null> {
+  const parsed = parseAgentCredential(credential)
+  if (!parsed) return null
+  const result = await query<{
+    id: string
+    global_id: string
+    organization_id: string
+    warehouse_id: string
+    secret_hash: string
+    retained_secret_hashes: string[]
+  }>(
+    `SELECT
+       agent.id::text,
+       agent.global_id,
+       agent.organization_id::text,
+       agent.warehouse_id::text,
+       agent.secret_hash,
+       ARRAY(
+         SELECT retained.secret_hash
+         FROM operations_print_agent_cleanup_credentials retained
+         WHERE retained.organization_id = agent.organization_id
+           AND retained.print_agent_id = agent.id
+         ORDER BY retained.credential_version
+       ) AS retained_secret_hashes
+     FROM operations_print_agents agent
+     WHERE agent.id = $1::uuid
+       AND agent.status IN ('active', 'revoked')
+     LIMIT 1`,
+    [parsed.agentId],
+  )
+  const agent = result.rows[0]
+  if (!agent) return null
+  const providedHash = hashOperationsPrintAgentSecret(
+    parsed.agentId,
+    parsed.secret,
+  )
+  const accepted = secureHashEqual(agent.secret_hash, providedHash)
+    || (agent.retained_secret_hashes || []).some((retained) => (
+      secureHashEqual(retained, providedHash)
+    ))
+  if (!accepted) return null
+  return {
+    id: agent.id,
+    globalId: agent.global_id,
+    organizationId: agent.organization_id,
+    warehouseId: agent.warehouse_id,
+  }
+}
+
+const ZERO_BYTE_FAILURE_CODES = new Set([
+  'LOCAL_PRINTER_BUSY',
+  'PRINTER_UNAVAILABLE',
+  'PRINT_ARTIFACT_INVALID',
+  'PRINT_CLAIM_LEASE_TOO_SHORT',
+])
+
+function cleanupEvidenceMismatch(): never {
+  throw new OperationsRequestError(
+    'OPERATIONS_PRINT_AGENT_CLEANUP_EVIDENCE_MISMATCH',
+    'Print-agent cleanup evidence could not be verified',
+    409,
+  )
+}
+
+const CLEANUP_RESULT_CONTRACT = {
+  delivered: {
+    resolution: 'delivered',
+    removalSafe: true,
+    reasonCode: 'SERVER_DELIVERY_CONFIRMED',
+  },
+  failed_zero_byte_confirmed: {
+    resolution: 'failed_zero_byte_confirmed',
+    removalSafe: true,
+    reasonCode: 'SERVER_ZERO_BYTE_FAILURE_CONFIRMED',
+  },
+  outcome_uncertain_terminal: {
+    resolution: 'outcome_uncertain_terminal',
+    removalSafe: true,
+    reasonCode: 'SERVER_OUTCOME_UNCERTAIN_TERMINAL',
+  },
+  in_flight: {
+    resolution: 'in_flight',
+    removalSafe: false,
+    reasonCode: 'SERVER_CLAIM_IN_FLIGHT',
+  },
+  unresolved: {
+    resolution: 'unresolved',
+    removalSafe: false,
+    reasonCode: 'SERVER_CLAIM_UNRESOLVED',
+  },
+} as const satisfies Record<
+  OperationsPrintAgentCleanupResolution,
+  OperationsPrintAgentCleanupResult
+>
+
+function cleanupResult(
+  resolution: OperationsPrintAgentCleanupResolution,
+): OperationsPrintAgentCleanupResult {
+  return { ...CLEANUP_RESULT_CONTRACT[resolution] }
+}
+
+function parseCleanupReceiptEntries(value: string) {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    parsed = null
+  }
+  if (!Array.isArray(parsed)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CLEANUP_RECEIPT_INVALID',
+      'Stored print-agent cleanup evidence failed integrity validation',
+      500,
+    )
+  }
+  const entries: OperationsPrintAgentCleanupResult[] = []
+  for (const candidate of parsed) {
+    if (
+      !candidate
+      || typeof candidate !== 'object'
+      || Array.isArray(candidate)
+      || Object.keys(candidate).join(',')
+        !== 'resolution,removalSafe,reasonCode'
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CLEANUP_RECEIPT_INVALID',
+        'Stored print-agent cleanup evidence failed integrity validation',
+        500,
+      )
+    }
+    const entry = candidate as Record<string, unknown>
+    const expected = CLEANUP_RESULT_CONTRACT[
+      entry.resolution as OperationsPrintAgentCleanupResolution
+    ]
+    if (
+      !expected
+      || entry.removalSafe !== expected.removalSafe
+      || entry.reasonCode !== expected.reasonCode
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_AGENT_CLEANUP_RECEIPT_INVALID',
+        'Stored print-agent cleanup evidence failed integrity validation',
+        500,
+      )
+    }
+    entries.push(cleanupResult(expected.resolution))
+  }
+  return entries
+}
+
+export async function resolveOperationsPrintAgentCleanupStatusInPostgres(input: {
+  agent: OperationsPrintAgentCleanupContext
+  entries: OperationsPrintAgentCleanupEntry[]
+  idempotencyKey: string
+}): Promise<OperationsPrintAgentCleanupResult[]> {
+  const callerKey = requiredIdempotencyKey(input.idempotencyKey)
+  if (!Array.isArray(input.entries) || input.entries.length < 1 || input.entries.length > 128) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CLEANUP_REQUEST_INVALID',
+      'Print-agent cleanup entries are invalid',
+    )
+  }
+  const normalizedEntries = input.entries.map((entry) => ({
+    jobGlobalId: String(entry.jobGlobalId || '').trim().toLowerCase(),
+    claimToken: String(entry.claimToken || '').trim().toLowerCase(),
+    documentGlobalId: String(entry.documentGlobalId || '').trim().toLowerCase(),
+    contentSha256: String(entry.contentSha256 || '').trim().toLowerCase(),
+  }))
+  if (normalizedEntries.some((entry) => (
+    !JOB_GLOBAL_ID.test(entry.jobGlobalId)
+    || !UUID.test(entry.claimToken)
+    || !ARTIFACT_GLOBAL_ID.test(entry.documentGlobalId)
+    || !SHA256.test(entry.contentSha256)
+  ))) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CLEANUP_REQUEST_INVALID',
+      'Print-agent cleanup entries are invalid',
+    )
+  }
+  const identities = normalizedEntries.map((entry) => (
+    `${entry.jobGlobalId}:${entry.claimToken}`
+  ))
+  if (new Set(identities).size !== identities.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_AGENT_CLEANUP_REQUEST_INVALID',
+      'Print-agent cleanup entries must be unique',
+    )
+  }
+  const requestFingerprint = fingerprint({
+    action: 'print-agent-cleanup-status',
+    entries: normalizedEntries,
+  })
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-agent-cleanup:${input.agent.organizationId}:${input.agent.id}:${callerKey}`,
+    )
+    const receipt = await client.query<{
+      request_fingerprint: string
+      response_entries_json: string
+    }>(
+      `SELECT request_fingerprint, response_entries_json
+       FROM operations_print_agent_cleanup_receipts
+       WHERE organization_id = $1::uuid
+         AND print_agent_id = $2::uuid
+         AND idempotency_key = $3
+       LIMIT 1`,
+      [input.agent.organizationId, input.agent.id, callerKey],
+    )
+    if (receipt.rows[0]) {
+      if (receipt.rows[0].request_fingerprint !== requestFingerprint) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
+          'Idempotency-Key was already used for a different cleanup request',
+          409,
+        )
+      }
+      const replay = parseCleanupReceiptEntries(
+        receipt.rows[0].response_entries_json,
+      )
+      if (replay.length !== normalizedEntries.length) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_AGENT_CLEANUP_RECEIPT_INVALID',
+          'Stored print-agent cleanup evidence failed integrity validation',
+          500,
+        )
+      }
+      return replay
+    }
+
+    const jobGlobalIds = [...new Set(normalizedEntries.map((entry) => entry.jobGlobalId))]
+    const jobs = await client.query<CleanupLockedJobRow>(
+      `SELECT
+         job.id::text,
+         job.global_id,
+         job.status,
+         job.printer_id::text,
+         job.claimed_by_print_agent_id::text,
+         job.current_claim_attempt_id::text,
+         artifact.global_id AS artifact_global_id,
+         artifact.content_sha256
+       FROM operations_print_jobs job
+       JOIN operations_print_artifacts artifact
+         ON artifact.organization_id = job.organization_id
+        AND artifact.id = job.artifact_id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = ANY($2::text[])
+       ORDER BY job.id
+       FOR UPDATE OF job`,
+      [input.agent.organizationId, jobGlobalIds],
+    )
+    if (jobs.rows.length !== jobGlobalIds.length) cleanupEvidenceMismatch()
+    const jobByGlobalId = new Map(jobs.rows.map((job) => [job.global_id, job]))
+    for (const requested of normalizedEntries) {
+      const job = jobByGlobalId.get(requested.jobGlobalId)
+      if (
+        !job
+        || job.artifact_global_id !== requested.documentGlobalId
+        || job.content_sha256 !== requested.contentSha256
+      ) cleanupEvidenceMismatch()
+    }
+
+    const claimTokens = normalizedEntries.map((entry) => entry.claimToken)
+    const claims = await client.query<CleanupClaimEvidenceRow>(
+      `SELECT
+         claim.id::text AS claim_token,
+         claim.print_job_id::text,
+         claim.print_agent_id::text,
+         claim.claim_expires_at <= clock_timestamp() AS claim_expired,
+         terminal.state AS terminal_state,
+         terminal.error_code AS terminal_error_code,
+         CASE
+           WHEN terminal.state = 'failed'
+            AND terminal.error_code = 'PRINT_OUTCOME_UNCERTAIN'
+           THEN EXISTS (
+             SELECT 1
+             FROM operations_print_delivery_attempts later
+             WHERE later.organization_id = claim.organization_id
+               AND later.print_job_id = claim.print_job_id
+               AND later.sequence_number > terminal.sequence_number
+               AND later.state = 'queued'
+           )
+           ELSE false
+         END AS unsafe_uncertain_requeue
+       FROM operations_print_delivery_attempts claim
+       LEFT JOIN LATERAL (
+         SELECT result.state, result.error_code, result.sequence_number
+         FROM operations_print_delivery_attempts result
+         WHERE result.organization_id = claim.organization_id
+           AND result.print_job_id = claim.print_job_id
+           AND result.claim_attempt_id = claim.id
+           AND result.state IN ('delivered', 'failed', 'cancelled')
+         ORDER BY result.sequence_number DESC
+         LIMIT 1
+       ) terminal ON true
+       WHERE claim.organization_id = $1::uuid
+         AND claim.id = ANY($2::uuid[])
+         AND claim.state = 'claimed'`,
+      [input.agent.organizationId, claimTokens],
+    )
+    if (claims.rows.length !== claimTokens.length) cleanupEvidenceMismatch()
+    const claimByToken = new Map(claims.rows.map((claim) => [claim.claim_token, claim]))
+    for (const requested of normalizedEntries) {
+      const job = jobByGlobalId.get(requested.jobGlobalId)
+      const claim = claimByToken.get(requested.claimToken)
+      if (
+        !job
+        || !claim
+        || claim.print_job_id !== job.id
+        || claim.print_agent_id !== input.agent.id
+      ) cleanupEvidenceMismatch()
+    }
+
+    const resolved: OperationsPrintAgentCleanupResult[] = []
+    for (const requested of normalizedEntries) {
+      const job = jobByGlobalId.get(requested.jobGlobalId) as CleanupLockedJobRow
+      const claim = claimByToken.get(requested.claimToken) as CleanupClaimEvidenceRow
+      if (claim.terminal_state === 'delivered') {
+        resolved.push(cleanupResult('delivered'))
+        continue
+      }
+      if (
+        claim.terminal_state === 'failed'
+        && claim.terminal_error_code === 'PRINT_OUTCOME_UNCERTAIN'
+      ) {
+        resolved.push(claim.unsafe_uncertain_requeue
+          ? cleanupResult('unresolved')
+          : cleanupResult('outcome_uncertain_terminal'))
+        continue
+      }
+      if (
+        claim.terminal_state === 'failed'
+        && ZERO_BYTE_FAILURE_CODES.has(String(claim.terminal_error_code || ''))
+      ) {
+        resolved.push(cleanupResult('failed_zero_byte_confirmed'))
+        continue
+      }
+      const exactCurrentClaim = job.status === 'claimed'
+        && job.claimed_by_print_agent_id === input.agent.id
+        && job.current_claim_attempt_id === requested.claimToken
+      if (exactCurrentClaim && !claim.claim_expired) {
+        resolved.push(cleanupResult('in_flight'))
+        continue
+      }
+      if (exactCurrentClaim && claim.claim_expired) {
+        const transitionFingerprint = fingerprint({
+          action: 'cleanup-expired-print-claim-outcome-uncertain',
+          jobGlobalId: requested.jobGlobalId,
+          claimToken: requested.claimToken,
+          documentGlobalId: requested.documentGlobalId,
+          contentSha256: requested.contentSha256,
+        })
+        await client.query(
+          `INSERT INTO operations_print_delivery_attempts (
+             organization_id,
+             print_job_id,
+             printer_id,
+             state,
+             actor_type,
+             claim_attempt_id,
+             idempotency_key,
+             request_fingerprint,
+             error_code,
+             error_message
+           ) VALUES (
+             $1::uuid,
+             $2::uuid,
+             $3::uuid,
+             'failed',
+             'system',
+             $4::uuid,
+             $5,
+             $6,
+             'PRINT_OUTCOME_UNCERTAIN',
+             'Expired local print claim had no confirmed result; automatic retry is blocked'
+           )`,
+          [
+            input.agent.organizationId,
+            job.id,
+            job.printer_id,
+            requested.claimToken,
+            `print-agent:cleanup-expired:${requested.claimToken}`,
+            transitionFingerprint,
+          ],
+        )
+        await recordAuditEvent({
+          eventType: 'operations.print_job.failed',
+          aggregateType: 'operations.print_job',
+          aggregateId: requested.jobGlobalId,
+          eventKey: `operations:print-job:cleanup-outcome-uncertain:${requested.claimToken}`,
+          organizationId: input.agent.organizationId,
+          isSystem: true,
+          payload: {
+            printJobGlobalId: requested.jobGlobalId,
+            printAgentGlobalId: input.agent.globalId,
+            claimToken: requested.claimToken,
+            documentGlobalId: requested.documentGlobalId,
+            contentSha256: requested.contentSha256,
+            errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+            automaticRetryBlocked: true,
+          },
+        }, client)
+        resolved.push(cleanupResult('outcome_uncertain_terminal'))
+        continue
+      }
+      resolved.push(cleanupResult('unresolved'))
+    }
+
+    const responseEntriesJson = JSON.stringify(resolved)
+    await client.query(
+      `INSERT INTO operations_print_agent_cleanup_receipts (
+         organization_id,
+         print_agent_id,
+         idempotency_key,
+         request_fingerprint,
+         response_entries_json
+       ) VALUES ($1::uuid, $2::uuid, $3, $4, $5)`,
+      [
+        input.agent.organizationId,
+        input.agent.id,
+        callerKey,
+        requestFingerprint,
+        responseEntriesJson,
+      ],
+    )
+    return resolved
+  })
 }
 
 type PrintSourceLinkage = {
