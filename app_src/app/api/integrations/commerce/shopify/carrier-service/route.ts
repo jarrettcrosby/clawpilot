@@ -52,6 +52,9 @@ import {
   readCommerceIntegrationsStateFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  readCommerceStoreSyncControlsFromPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   readShopifyCustomerRatePolicySummaryFromPostgres,
 } from '@/lib/persistence/shopifyCustomerRatePolicies'
 import {
@@ -645,6 +648,7 @@ async function setupState(input: {
     reference,
     mutationAuthorizations,
     customerPolicySummary,
+    storeSyncControls,
   ] = await Promise.all([
     readShopifyCarrierServiceConfigFromPostgres({
       organizationId: input.organizationId,
@@ -663,7 +667,18 @@ async function setupState(input: {
       organizationId: input.organizationId,
       accountGlobalId: input.accountGlobalId,
     }),
+    readCommerceStoreSyncControlsFromPostgres(input.organizationId),
   ])
+  const storeSync = storeSyncControls.find(
+    (control) => control.accountGlobalId === input.accountGlobalId,
+  )
+  if (!storeSync) {
+    fail(
+      'COMMERCE_STORE_SYNC_CONTROL_MISSING',
+      'This Shopify connection has no Store sync control; migration health must be repaired',
+      409,
+    )
+  }
   let publicCallbackUrl: string | null = null
   if (config && input.canActivate) {
     const token = shopifyCarrierServiceCallbackToken({
@@ -798,6 +813,7 @@ async function setupState(input: {
   )
   return {
     account,
+    storeSync,
     config: publicConfig,
     namePreference,
     shadowSimulation: simulation

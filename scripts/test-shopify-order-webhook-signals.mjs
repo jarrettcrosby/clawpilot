@@ -66,6 +66,7 @@ const migration = read(
 
 const workerCalls = []
 let workerReadShouldFail = false
+let workerStoreSyncPaused = false
 const worker = loadTypeScriptModule(
   'app_src/lib/shopifyOrderWebhookWorker.ts',
   {
@@ -91,6 +92,16 @@ const worker = loadTypeScriptModule(
       },
     },
     '@/lib/persistence/shopifyOrderWebhookSignals': {
+      async assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
+        input,
+      ) {
+        workerCalls.push(['assert-current', input])
+        if (workerStoreSyncPaused) {
+          throw Object.assign(new Error('Store sync paused'), {
+            code: 'SHOPIFY_ORDER_WEBHOOK_PROVIDER_READ_FENCE_CHANGED',
+          })
+        }
+      },
       async claimShopifyOrderWebhookTargetsInPostgres(input) {
         workerCalls.push(['claim', input])
         return [{
@@ -149,6 +160,22 @@ assert.equal(workerFailure.succeeded, 0)
 assert.equal(workerFailure.failed, 1)
 assert.equal(workerFailure.providerWrites, 0)
 assert.equal(workerCalls.filter(([kind]) => kind === 'fail').length, 1)
+
+const readsBeforePause = workerCalls.filter(([kind]) => kind === 'read').length
+workerStoreSyncPaused = true
+const workerPaused = await worker.processShopifyOrderWebhookSignals({
+  workerId: 'order-webhook-test',
+  limit: 1,
+})
+workerStoreSyncPaused = false
+assert.equal(workerPaused.claimed, 1)
+assert.equal(workerPaused.succeeded, 0)
+assert.equal(workerPaused.failed, 1)
+assert.equal(
+  workerCalls.filter(([kind]) => kind === 'read').length,
+  readsBeforePause,
+  'a pause after claim must stop the Shopify provider read',
+)
 
 let providerData = {
   webhookSubscriptions: {

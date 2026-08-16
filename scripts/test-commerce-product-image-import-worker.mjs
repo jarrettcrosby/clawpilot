@@ -78,6 +78,7 @@ const worker = loadTypeScriptModule(
         selectCommerceProviderImageSource: unused,
       },
       '@/lib/persistence/commerceProductImageImports': {
+        assertCommerceProductImageImportClaimCurrentInPostgres: unused,
         claimCommerceProductImageImportJobsInPostgres: unused,
         completeCommerceProductImageImportJobInPostgres: unused,
         failCommerceProductImageImportJobInPostgres: unused,
@@ -200,6 +201,7 @@ function fixture(input = {}) {
   const state = {
     resolve: [],
     claims: [],
+    currentChecks: [],
     reads: [],
     selections: [],
     fetches: [],
@@ -221,6 +223,10 @@ function fixture(input = {}) {
     async claim(args) {
       state.claims.push(args)
       return claims.length ? [claims.shift()] : []
+    },
+    async assertCurrent(args) {
+      state.currentChecks.push(args)
+      if (input.currentError) throw input.currentError
     },
     async readSources(args) {
       state.reads.push(args)
@@ -357,6 +363,33 @@ test('stale provider source is a permanent persisted failure', async () => {
   assert.ok(!JSON.stringify(result).includes(SOURCE_SECRET))
   assert.equal(run.state.heartbeats.map((entry) => entry.phase).join(','), 'starting,completed')
 })
+
+test('Store sync pause after claim stops image provider reads and retries safely',
+  async () => {
+    const run = fixture({
+      currentError: codedError(
+        'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+        409,
+        'Store sync paused before provider I/O',
+      ),
+    })
+    const result = await worker.processCommerceProductImageImports(
+      { workerId: 'image-worker-paused' },
+      run.dependencies,
+    )
+
+    assert.equal(run.state.currentChecks.length, 1)
+    assert.equal(run.state.reads.length, 0)
+    assert.equal(run.state.fetches.length, 0)
+    assert.equal(run.state.failures.length, 1)
+    assert.equal(run.state.failures[0].retryable, true)
+    assert.equal(result.retried, 1)
+    assert.equal(
+      result.errorCodes.COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED,
+      1,
+    )
+  },
+)
 
 test('mapping drift returns a claimed image to visible waiting-mapping work', async () => {
   const run = fixture({

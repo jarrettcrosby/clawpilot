@@ -11,12 +11,14 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 
 const CATALOG_SYNC_POLICY_VERSION = 'commerce-product-intake-policy-v1'
 const CATALOG_RECONCILIATION_INTERVAL = '6 hours'
 const CATALOG_SYNC_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce.catalog.worker.heartbeat'
 const CATALOG_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const PRODUCT_READABLE_CONNECTION_SQL = `(
   (
     account.provider = 'shopify'
@@ -320,7 +322,7 @@ export async function applyCommerceCatalogSyncPolicyWithClient(
        AND account.commerce_credential_generation = $4
        AND credential.credential_version = $4
        AND credential.verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${STORE_SYNC_RUNNING_SQL}
        AND ${PRODUCT_READABLE_CONNECTION_SQL}
        AND NOT EXISTS (
          SELECT 1
@@ -494,7 +496,7 @@ export async function ensureAutomaticCommerceCatalogIntakeWithClient(
            SELECT 1
            FROM operations_activation_scopes activation
            WHERE activation.organization_id = account.organization_id
-             AND activation.state IN ('shadow', 'active')
+             AND ${STORE_SYNC_RUNNING_SQL}
          ) AS product_target_ready
        FROM operations_integration_accounts account
        JOIN operations_commerce_credentials credential
@@ -740,7 +742,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
                  = job.credential_version
                AND credential.credential_version = job.credential_version
                AND credential.verification_status = 'verified'
-               AND activation.state IN ('shadow', 'active')
+               AND ${STORE_SYNC_RUNNING_SQL}
                AND ${PRODUCT_READABLE_CONNECTION_SQL}
            )
          )`,
@@ -782,7 +784,7 @@ export async function queueAutomaticCommerceCatalogSyncsInPostgres() {
          AND credential.credential_version
            = account.commerce_credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND ${PRODUCT_READABLE_CONNECTION_SQL}
          AND COALESCE(policy.updated_by, policy.created_by) IS NOT NULL
          AND NOT EXISTS (
@@ -893,7 +895,7 @@ export async function claimCommerceCatalogSyncJobsInPostgres(input: {
              = job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND ${PRODUCT_READABLE_CONNECTION_SQL}
          ORDER BY job.available_at, job.created_at, job.id
          FOR UPDATE OF job SKIP LOCKED
@@ -1001,7 +1003,7 @@ async function currentJobFence(
        AND account.commerce_credential_generation = queued.credential_version
        AND credential.credential_version = queued.credential_version
        AND credential.verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${STORE_SYNC_RUNNING_SQL}
        AND ${PRODUCT_READABLE_CONNECTION_SQL}
      FOR UPDATE OF queued`,
     [

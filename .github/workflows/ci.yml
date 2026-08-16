@@ -52,5 +52,8 @@ jobs:
       - name: Tests
         run: npm run test
 
+      - name: Store sync PostgreSQL acceptance
+        run: npm run test:commerce-store-sync
+
       - name: Predeploy verification
         run: npm run verify:predeploy

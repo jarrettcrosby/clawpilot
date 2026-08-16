@@ -147,6 +147,13 @@ function loadPersistence(pool) {
           },
         }
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return {
+          commerceStoreSyncRunningSql(alias) {
+            return `operations_commerce_store_sync_is_running(${alias}.organization_id, ${alias}.id)`
+          },
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') return postgres
       return requireFromApp(specifier)
     },
@@ -245,6 +252,13 @@ function loadInventoryPersistence(pool) {
           },
         }
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return {
+          commerceStoreSyncRunningSql(alias) {
+            return `operations_commerce_store_sync_is_running(${alias}.organization_id, ${alias}.id)`
+          },
+        }
+      }
       if (specifier === '@/lib/integrations/shopifyInventory') {
         return {
           SHOPIFY_INVENTORY_ADAPTER_VERSION:
@@ -278,6 +292,7 @@ const ids = {
   legacySuccessJob: '28800000-0000-4000-8000-000000000051',
   legacySuccessLock: '28800000-0000-4000-8000-000000000052',
 }
+const actorEmail = null
 
 async function seedPreMigration(client) {
   await client.query('SET session_replication_role = replica')
@@ -781,6 +796,40 @@ async function exercise(pool) {
          )
        RETURNS boolean LANGUAGE sql STABLE AS 'SELECT true'`,
     )
+    for (const file of files.slice(migrationIndex + 1)) {
+      await applyMigration(client, file)
+    }
+    await client.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'running', explicit_choice = true,
+           revision = revision + 1,
+           reason = 'Inventory acceptance remains Running in Read only',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $3::uuid`,
+      [ids.organization, actorEmail, ids.account],
+    )
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'read_only', revision = revision + 1,
+           reason = 'Inventory Store sync independence acceptance',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid`,
+      [ids.organization, actorEmail],
+    )
+    const inventoryReadiness = await client.query(
+      `SELECT
+         operations_commerce_store_sync_is_running($1::uuid, $2::uuid)
+           AS store_sync_running,
+         operations_shopify_inventory_read_config_is_ready(
+           $1::uuid, $3::uuid
+         ) AS inventory_ready`,
+      [ids.organization, ids.account, ids.config],
+    )
+    assert.deepEqual(inventoryReadiness.rows[0], {
+      store_sync_running: true,
+      inventory_ready: true,
+    }, 'explicit Running + Read only must retain shadow-simulated inventory reads')
   } finally {
     client.release()
   }
@@ -1000,7 +1049,7 @@ async function exercise(pool) {
     secondEvidence.inventoryRunGlobalId,
   )
 
-  await pool.query(
+  const legacyJobInsert = await pool.query(
     `INSERT INTO operations_shopify_inventory_refresh_jobs (
        id, organization_id, integration_account_id,
        carrier_service_config_id, warehouse_id,
@@ -1008,22 +1057,30 @@ async function exercise(pool) {
        policy_revision, policy_hash, inventory_max_age_seconds,
        requested_dirty_version, status, attempt_count,
        locked_at, locked_by, lock_token, lease_expires_at, started_at
-     ) VALUES (
-       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-       1, 1, 7, 1, $6, 900, 1, 'processing', 1,
-       now(), 'rolling-legacy-worker', $7::uuid,
+     ) SELECT
+       $1::uuid, $2::uuid, $3::uuid, config.id, $5::uuid,
+       config.credential_generation, config.activation_revision,
+       config.row_version, config.policy_revision, config.policy_hash,
+       config.inventory_max_age_seconds, 1, 'processing', 1,
+       now(), 'rolling-legacy-worker', $6::uuid,
        now() + interval '20 minutes', now()
-     )`,
+     FROM operations_shopify_carrier_service_configs config
+     WHERE config.organization_id = $2::uuid
+       AND config.id = $4::uuid
+     RETURNING credential_generation, activation_revision,
+               config_row_version::text, policy_revision::text,
+               policy_hash, inventory_max_age_seconds`,
     [
       ids.legacySuccessJob,
       ids.organization,
       ids.account,
       ids.config,
       ids.warehouseOne,
-      'b'.repeat(64),
       ids.legacySuccessLock,
     ],
   )
+  assert.equal(legacyJobInsert.rowCount, 1)
+  const legacyJobFence = legacyJobInsert.rows[0]
   const legacySuccessClaim = {
     id: ids.legacySuccessJob,
     organizationId: ids.organization,
@@ -1036,18 +1093,77 @@ async function exercise(pool) {
     providerLocationId: null,
     inventoryLocationId: null,
     inventoryPoolId: null,
-    credentialGeneration: 1,
-    activationRevision: 1,
-    configRowVersion: 7,
-    policyRevision: 1,
-    policyHash: 'b'.repeat(64),
-    inventoryMaxAgeSeconds: 900,
+    credentialGeneration: Number(legacyJobFence.credential_generation),
+    activationRevision: Number(legacyJobFence.activation_revision),
+    configRowVersion: Number(legacyJobFence.config_row_version),
+    policyRevision: Number(legacyJobFence.policy_revision),
+    policyHash: legacyJobFence.policy_hash,
+    inventoryMaxAgeSeconds: Number(
+      legacyJobFence.inventory_max_age_seconds,
+    ),
     requestedDirtyVersion: 1,
     attemptCount: 1,
     maxAttempts: 8,
     lockToken: ids.legacySuccessLock,
     startedAt: new Date().toISOString(),
   }
+  const legacyFenceState = await pool.query(
+    `SELECT job.status, job.cancel_requested,
+            job.lock_token::text AS lock_token,
+            job.lease_expires_at > clock_timestamp() AS lease_is_live,
+            job.credential_generation = config.credential_generation
+              AS credential_matches,
+            job.activation_revision = config.activation_revision
+              AS config_activation_matches,
+            job.config_row_version = config.row_version
+              AS config_row_matches,
+            job.policy_revision = config.policy_revision
+              AS policy_revision_matches,
+            job.policy_hash = config.policy_hash AS policy_hash_matches,
+            job.inventory_max_age_seconds = config.inventory_max_age_seconds
+              AS max_age_matches,
+            account.status AS account_status,
+            account.commerce_credential_generation::text
+              AS account_credential_generation,
+            credential.verification_status,
+            config.registration_state,
+            operations_commerce_store_sync_effective_reason(
+              job.organization_id, job.integration_account_id
+            ) AS store_sync_reason,
+            operations_shopify_inventory_read_config_is_ready(
+              config.organization_id, config.id
+            ) AS inventory_ready
+     FROM operations_shopify_inventory_refresh_jobs job
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = job.organization_id
+      AND config.id = job.carrier_service_config_id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = job.organization_id
+      AND account.id = job.integration_account_id
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = job.organization_id
+      AND credential.integration_account_id = job.integration_account_id
+     WHERE job.id = $1::uuid`,
+    [ids.legacySuccessJob],
+  )
+  assert.deepEqual(legacyFenceState.rows[0], {
+    status: 'processing',
+    cancel_requested: false,
+    lock_token: ids.legacySuccessLock,
+    lease_is_live: true,
+    credential_matches: true,
+    config_activation_matches: true,
+    config_row_matches: true,
+    policy_revision_matches: true,
+    policy_hash_matches: true,
+    max_age_matches: true,
+    account_status: 'active',
+    account_credential_generation: '1',
+    verification_status: 'verified',
+    registration_state: 'shadow_simulated',
+    store_sync_reason: 'STORE_SYNC_EXPLICIT_RUNNING',
+    inventory_ready: true,
+  }, 'legacy inventory evidence must retain every exact non-mode fence')
   const legacyEvidence = await applyInventoryEvidence(
     pool,
     inventoryPersistence,

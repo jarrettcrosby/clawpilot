@@ -559,6 +559,29 @@ async function exercise(databaseUrl) {
         '@/lib/persistence/commerceIntegrations': {
           readCommerceIntegrationsStateFromPostgres: integrationState,
         },
+        '@/lib/persistence/commerceStoreSync': {
+          readCommerceStoreSyncControlsFromPostgres: async () => [
+            SANDBOX_ACCOUNT_GLOBAL_ID,
+            PRODUCTION_ACCOUNT_GLOBAL_ID,
+          ].map((accountGlobalId) => ({
+            accountGlobalId,
+            provider: 'shopify',
+            environment: accountGlobalId === SANDBOX_ACCOUNT_GLOBAL_ID
+              ? 'sandbox'
+              : 'production',
+            displayName: accountGlobalId,
+            accountStatus: 'active',
+            desiredState: 'running',
+            effectiveState: 'running',
+            effectiveReason: 'STORE_SYNC_EXPLICIT_RUNNING',
+            effectiveReasonLabel:
+              'Running by an explicit Store sync choice.',
+            explicitChoice: true,
+            revision: 1,
+            reason: 'Checkout audience fixture',
+            updatedAt: '2026-08-15T12:00:00.000Z',
+          })),
+        },
         '@/lib/persistence/shopifyCustomerRatePolicies': {
           readShopifyCustomerRatePolicySummaryFromPostgres:
             async () => customerSummary,

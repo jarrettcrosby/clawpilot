@@ -89,6 +89,19 @@ if (
   fail('test:operations must run test:operation-shadow-training')
 }
 
+if (
+  String(rootPackage?.scripts?.['test:commerce-store-sync'] || '')
+    !== 'node scripts/test-commerce-store-sync-ui.mjs && node scripts/test-commerce-store-sync-controls-postgres.mjs'
+) {
+  fail(
+    'test:commerce-store-sync must run the disposable PostgreSQL acceptance',
+  )
+}
+const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
+  fail('CI must run the Store sync disposable PostgreSQL acceptance')
+}
+
 const orderReplanningCorrectionsTest = String(
   rootPackage?.scripts?.['test:operation-order-replanning-corrections'] || '',
 )
@@ -192,6 +205,11 @@ if (releaseRecordPosition < healthGatePosition) {
 }
 
 for (const requiredPath of [
+  'db/migrations/0298_operations_commerce_store_sync_controls.sql',
+  'app_src/lib/operations/commerceStoreSync.ts',
+  'app_src/lib/persistence/commerceStoreSync.ts',
+  'scripts/test-commerce-store-sync-controls-postgres.mjs',
+  'scripts/test-commerce-store-sync-ui.mjs',
   'db/migrations/0274_operations_commerce_order_revision_apply.sql',
   'db/migrations/0275_operations_one_off_carrier_selection.sql',
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',

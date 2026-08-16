@@ -51,6 +51,12 @@ type ProductImageAsset = {
 
 type ProductImageState = {
   imageImportAvailable: boolean
+  storeSync: Array<{
+    accountGlobalId: string
+    effectiveState: 'running' | 'paused'
+    effectiveReason: string
+    effectiveReasonLabel: string
+  }>
   product: {
     id: string
     referenceCode: string
@@ -268,9 +274,11 @@ function assetState(payload: ProductImagePayload): ProductImageState | null {
     typeof payload.imageImportAvailable !== 'boolean'
     || !payload.product
     || !Array.isArray(payload.assets)
+    || !Array.isArray(payload.storeSync)
   ) return null
   return {
     imageImportAvailable: payload.imageImportAvailable,
+    storeSync: payload.storeSync,
     product: payload.product,
     assets: payload.assets,
   }
@@ -594,6 +602,12 @@ export default function ProductImagePanel({
   const selectedFaireChannelEvidence = faireChannels.find(
     (channel) => channel.globalId === selectedFaireChannel,
   ) || null
+  const selectedFaireStoreSync = state?.storeSync.find(
+    (control) => control.accountGlobalId
+      === selectedFaireChannelEvidence?.integrationAccountGlobalId,
+  ) || null
+  const selectedFaireStoreSyncRunning =
+    selectedFaireStoreSync?.effectiveState === 'running'
   const selectedFaireAssetEvidence = state?.assets.find(
     (asset) => asset.id === selectedFaireAsset,
   ) || null
@@ -910,6 +924,13 @@ export default function ProductImagePanel({
     if (state?.imageImportAvailable !== true) {
       setError(
         'Faire Product image import is unavailable while commerce reconciliation is disabled.',
+      )
+      return
+    }
+    if (!selectedFaireStoreSyncRunning) {
+      setError(
+        selectedFaireStoreSync?.effectiveReasonLabel
+          || 'Store sync is Paused for the selected Faire connection.',
       )
       return
     }
@@ -1450,6 +1471,16 @@ export default function ProductImagePanel({
               </Alert>
             ) : null}
 
+            {selectedFaireChannelEvidence
+            && !selectedFaireStoreSyncRunning ? (
+              <Alert severity="warning">
+                {selectedFaireStoreSync?.effectiveReasonLabel
+                  || 'Store sync is Paused for the selected Faire connection.'}
+                {' '}Existing mirrored images remain available; set Store sync
+                to Running before making a new Faire provider read.
+              </Alert>
+            ) : null}
+
             <TextField
               select
               fullWidth
@@ -1490,6 +1521,7 @@ export default function ProductImagePanel({
               disabled={
                 refreshingFaire
                 || state?.imageImportAvailable !== true
+                || !selectedFaireStoreSyncRunning
                 || !selectedFaireChannelEvidence
                 || !selectedFaireChannelEvidence.providerSku
               }

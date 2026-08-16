@@ -177,6 +177,10 @@ async function readTargetWithClient(
        AND account.integration_type = 'commerce'
        AND account.provider = 'faire'
        AND account.status = 'active'
+       AND operations_commerce_store_sync_is_running(
+         account.organization_id,
+         account.id
+       )
        AND credential.verification_status = 'verified'
        AND credential.external_account_id = account.external_account_id
        AND credential.credential_version =

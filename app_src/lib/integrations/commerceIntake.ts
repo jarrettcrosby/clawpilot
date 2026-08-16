@@ -2031,6 +2031,11 @@ async function withAutomaticCustomerResolution(
         organizationId: input.runtime.organizationId,
         integrationAccountGlobalId: input.runtime.globalId,
         actorEmail: input.actorEmail,
+        automaticStoreSync: {
+          source: 'commerce_intake_customer_resolution',
+          runGlobalId,
+          candidateGlobalId: target.candidateGlobalId,
+        },
         identity: {
           provider: target.provider,
           externalCustomerId: target.externalCustomerId,
@@ -2064,6 +2069,10 @@ async function withAutomaticCustomerResolution(
         ]),
         candidateGlobalId: target.candidateGlobalId,
         candidateRowVersion: target.candidateRowVersion,
+        automatic: {
+          source: 'commerce_intake_customer_resolution',
+          runGlobalId,
+        },
         customer: {
           mode: 'existing',
           customerGlobalId: resolution.customer.globalId,

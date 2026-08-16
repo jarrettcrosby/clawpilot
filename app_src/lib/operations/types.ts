@@ -928,6 +928,7 @@ export type OperationsWorkspace = {
     reason: string | null
     updatedAt: string
   }
+  storeSync: import('@/lib/operations/commerceStoreSync').CommerceStoreSyncControl[]
   summary: OperationsSummary
   orders: OperationsOrderListItem[]
   exceptions: OperationsExceptionListItem[]

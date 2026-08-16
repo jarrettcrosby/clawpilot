@@ -575,16 +575,38 @@ const workerClaims = [
     canonicalOrderGlobalId: 'gor7654321',
     externalOrderId: 'bo_order_revision_failed',
   },
+  {
+    ...revisionClaim,
+    targetId: '77777777-7777-4777-8777-777777777777',
+    canonicalOrderId: '88888888-8888-4888-8888-888888888888',
+    canonicalOrderGlobalId: 'gor7654322',
+    externalOrderId: 'bo_order_revision_store_sync_paused',
+  },
 ]
 const captureCalls = []
 const failCalls = []
+const providerReadClaims = []
+const storeSyncAssertions = []
 let claimedInput = null
+class CommerceOrderRevisionStoreSyncPausedError extends Error {
+  constructor() {
+    super('Store sync paused before Faire revision provider read')
+    this.name = 'CommerceOrderRevisionStoreSyncPausedError'
+    this.code = 'COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED'
+  }
+}
 const workerModule = loadTypeScriptModule(
   'app_src/lib/commerceFaireOrderRevisionWorker.ts',
   {
     '@/lib/integrations/faireOrderRevision': {
       FaireOrderRevisionError: module.FaireOrderRevisionError,
       async inspectFaireCanonicalOrderRevision(claim) {
+        providerReadClaims.push(claim.externalOrderId)
+        assert.notEqual(
+          claim,
+          workerClaims[2],
+          'A Paused account must send zero Faire revision provider reads',
+        )
         if (claim === workerClaims[1]) {
           throw new module.FaireOrderRevisionError(
             'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',
@@ -609,9 +631,16 @@ const workerModule = loadTypeScriptModule(
       },
     },
     '@/lib/persistence/commerceOrderRevisions': {
+      CommerceOrderRevisionStoreSyncPausedError,
       async claimCommerceOrderRevisionTargetsInPostgres(input) {
         claimedInput = input
         return workerClaims
+      },
+      async assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim) {
+        storeSyncAssertions.push(claim.externalOrderId)
+        if (claim === workerClaims[2]) {
+          throw new CommerceOrderRevisionStoreSyncPausedError()
+        }
       },
       async captureCommerceOrderRevisionObservationInPostgres(input) {
         captureCalls.push(input)
@@ -626,35 +655,50 @@ const workerModule = loadTypeScriptModule(
 )
 const workerResult = await workerModule.processFaireOrderRevisions({
   workerId: revisionClaim.workerId,
-  limit: 2,
+  limit: 3,
 })
 assert.equal(claimedInput.provider, 'faire')
 assert.equal(claimedInput.workerId, revisionClaim.workerId)
-assert.equal(claimedInput.limit, 2)
-assert.equal(workerResult.claimed, 2)
+assert.equal(claimedInput.limit, 3)
+assert.equal(workerResult.claimed, 3)
 assert.equal(workerResult.captured, 1)
 assert.equal(workerResult.changed, 1)
-assert.equal(workerResult.failed, 1)
+assert.equal(workerResult.failed, 2)
 assert.equal(workerResult.providerReadsPerCapture, 2)
 assert.equal(workerResult.providerWrites, 0)
 assert.equal(workerResult.canonicalOrderWrites, 0)
 assert.equal(workerResult.managerDispositionRequired, 1)
 assert.deepEqual(
   { ...workerResult.failureCodes },
-  { FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED: 1 },
+  {
+    FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED: 1,
+    COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED: 1,
+  },
 )
+assert.deepEqual(storeSyncAssertions, workerClaims.map(
+  (claim) => claim.externalOrderId,
+))
+assert.deepEqual(providerReadClaims, workerClaims.slice(0, 2).map(
+  (claim) => claim.externalOrderId,
+))
 assert.equal(captureCalls.length, 1)
 assert.equal(captureCalls[0].sourceHash, 'a'.repeat(64))
 assert.equal(captureCalls[0].providerReads, 2)
 assert.equal(captureCalls[0].providerWrites, 0)
-assert.equal(failCalls.length, 1)
+assert.equal(failCalls.length, 2)
 assert.equal(
   failCalls[0].errorCode,
   'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',
 )
+assert.equal(
+  failCalls[1].errorCode,
+  'COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED',
+)
 
 const workerSource = read('app_src/lib/commerceFaireOrderRevisionWorker.ts')
 assert.match(workerSource, /claimCommerceOrderRevisionTargetsInPostgres/u)
+assert.match(workerSource, /assertCommerceOrderRevisionStoreSyncRunningInPostgres/u)
+assert.match(workerSource, /CommerceOrderRevisionStoreSyncPausedError/u)
 assert.match(workerSource, /captureCommerceOrderRevisionObservationInPostgres/u)
 assert.match(workerSource, /failCommerceOrderRevisionTargetInPostgres/u)
 assert.match(workerSource, /canonicalOrderWrites: 0 as const/u)

@@ -9,6 +9,7 @@ import {
 } from '@/lib/crm/productImageAssets'
 import {
   acquireTransactionAdvisoryLock,
+  query,
   withTransaction,
 } from '@/lib/persistence/postgres'
 import {
@@ -128,6 +129,7 @@ export type CommerceProductImageImportQueueHealth = {
   claimedCount: number
   deadCount: number
   historicalDeadCount: number
+  pausedRetainedCount: number
   staleLeaseCount: number
   overdueCount: number
   lastTerminalProgressAt: string | null
@@ -836,6 +838,30 @@ async function jobFencesAreCurrent(
     [organizationId, jobId],
   )
   return result.rows[0]?.current === true
+}
+
+async function lockCommerceProductImageStoreSyncRunning(
+  client: PoolClient,
+  job: Pick<JobRow, 'organization_id' | 'integration_account_id'>,
+) {
+  const result = await client.query<{ running: boolean }>(
+    `SELECT operations_commerce_store_sync_is_running(
+       account.organization_id,
+       account.id
+     ) AS running
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_store_sync_controls control
+       ON control.organization_id = account.organization_id
+      AND control.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider IN ('shopify', 'faire')
+     LIMIT 1
+     FOR UPDATE OF account, control`,
+    [job.organization_id, job.integration_account_id],
+  )
+  return result.rows[0]?.running === true
 }
 
 async function cancelJob(
@@ -1657,7 +1683,6 @@ async function electCurrentProviderImagePrimary(
            FROM operations_activation_scopes activation
            WHERE activation.organization_id = binding.organization_id
              AND activation.data_pipeline_id = binding.pipeline_id
-             AND activation.state IN ('shadow', 'active')
              AND activation.revision = binding.activation_revision
          )
        ORDER BY
@@ -2614,6 +2639,10 @@ export async function resolveWaitingCommerceProductImageImportJobsInPostgres(inp
        FROM operations_commerce_product_image_import_jobs
        WHERE ($1::uuid IS NULL OR organization_id = $1::uuid)
          AND state = 'waiting_mapping'
+         AND operations_commerce_store_sync_is_running(
+           organization_id,
+           integration_account_id
+         )
        ORDER BY created_at, id
        LIMIT $2
        FOR UPDATE SKIP LOCKED`,
@@ -2621,6 +2650,9 @@ export async function resolveWaitingCommerceProductImageImportJobsInPostgres(inp
     )
     const resolved = []
     for (const job of candidates.rows) {
+      if (!await lockCommerceProductImageStoreSyncRunning(client, job)) {
+        continue
+      }
       const observation = await selectObservation(client, job.observation_id)
       const current = await bindWaitingJob(client, job, observation, updatedBy)
       resolved.push({
@@ -2915,6 +2947,75 @@ export async function claimCommerceProductImageImportJobsInPostgres(input: {
     )
     return claimFromRows(claimed.rows)
   })
+}
+
+/**
+ * Revalidates the exact image-import lease and its Store sync/data fences at
+ * the last local boundary before any provider source or image fetch.
+ */
+export async function assertCommerceProductImageImportClaimCurrentInPostgres(
+  input: {
+    organizationId: string
+    jobId: string
+    leaseToken: string
+    workerId: string
+  },
+) {
+  const organizationId = requiredTrimmed(
+    input.organizationId,
+    'Organization ID',
+    64,
+  )
+  const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
+  const leaseToken = requiredTrimmed(input.leaseToken, 'Lease token', 64)
+  const workerId = requiredTrimmed(input.workerId, 'Worker ID', 100)
+  const current = await query<{
+    lease_current: boolean
+    store_sync_running: boolean
+    fences_current: boolean
+  }>(
+    `SELECT
+       job.state = 'claimed'
+         AND job.lease_token = $3::uuid
+         AND job.claimed_by = $4
+         AND job.lease_expires_at > statement_timestamp()
+           AS lease_current,
+       operations_commerce_store_sync_is_running(
+         job.organization_id,
+         job.integration_account_id
+       ) AS store_sync_running,
+       operations_commerce_product_image_job_fences_are_current(
+         job.organization_id,
+         job.id
+       ) AS fences_current
+     FROM operations_commerce_product_image_import_jobs job
+     WHERE job.organization_id = $1::uuid
+       AND job.id = $2::uuid
+     LIMIT 1`,
+    [organizationId, jobId, leaseToken, workerId],
+  )
+  const row = current.rows[0]
+  if (!row?.lease_current) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_LEASE_LOST',
+      'Commerce product image import lease is no longer current',
+      409,
+    )
+  }
+  if (!row.store_sync_running) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+      'Store sync paused before the commerce product image provider read',
+      409,
+    )
+  }
+  if (!row.fences_current) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_FENCE_STALE',
+      'Commerce product image import fences changed before provider I/O',
+      409,
+    )
+  }
 }
 
 export async function failCommerceProductImageImportJobInPostgres(input: {
@@ -3619,18 +3720,42 @@ Promise<CommerceProductImageImportQueueHealth> {
       claimed_count: string
       dead_count: string
       historical_dead_count: string
+      paused_retained_count: string
       stale_lease_count: string
       overdue_count: string
       last_terminal_progress_at: Date | string | null
     }>(
       `SELECT
-         count(*) FILTER (WHERE state = 'waiting_mapping')::text
+         count(*) FILTER (
+           WHERE state = 'waiting_mapping'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
+         )::text
            AS waiting_mapping_count,
-         count(*) FILTER (WHERE state = 'queued')::text AS queued_count,
-         count(*) FILTER (WHERE state = 'retry')::text AS retry_count,
-         count(*) FILTER (WHERE state = 'claimed')::text AS claimed_count,
+         count(*) FILTER (
+           WHERE state = 'queued'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
+         )::text AS queued_count,
+         count(*) FILTER (
+           WHERE state = 'retry'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
+         )::text AS retry_count,
+         count(*) FILTER (
+           WHERE state = 'claimed'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
+         )::text AS claimed_count,
          count(*) FILTER (
            WHERE job.state = 'dead'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
              AND NOT EXISTS (
                SELECT 1
                FROM operations_commerce_product_image_import_jobs newer
@@ -3650,11 +3775,23 @@ Promise<CommerceProductImageImportQueueHealth> {
              )
          )::text AS historical_dead_count,
          count(*) FILTER (
+           WHERE NOT operations_commerce_store_sync_is_running(
+             job.organization_id, job.integration_account_id
+           )
+             AND state IN ('waiting_mapping', 'queued', 'retry', 'claimed')
+         )::text AS paused_retained_count,
+         count(*) FILTER (
            WHERE state = 'claimed'
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
              AND lease_expires_at <= statement_timestamp()
          )::text AS stale_lease_count,
          count(*) FILTER (
            WHERE state IN ('queued', 'retry')
+             AND operations_commerce_store_sync_is_running(
+               job.organization_id, job.integration_account_id
+             )
              AND available_at <=
                    statement_timestamp() - interval '5 minutes'
          )::text AS overdue_count,
@@ -3692,6 +3829,10 @@ Promise<CommerceProductImageImportQueueHealth> {
       historicalDeadCount: nonnegativeInteger(
         row.historical_dead_count,
         'historical dead count',
+      ),
+      pausedRetainedCount: nonnegativeInteger(
+        row.paused_retained_count,
+        'paused retained count',
       ),
       staleLeaseCount: nonnegativeInteger(
         row.stale_lease_count,

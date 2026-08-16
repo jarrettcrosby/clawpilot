@@ -4,8 +4,10 @@ import {
   ShopifyOrderRevisionError,
 } from '@/lib/integrations/shopifyOrderRevision'
 import {
+  assertCommerceOrderRevisionStoreSyncRunningInPostgres,
   captureCommerceOrderRevisionObservationInPostgres,
   claimCommerceOrderRevisionTargetsInPostgres,
+  CommerceOrderRevisionStoreSyncPausedError,
   failCommerceOrderRevisionTargetInPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
 
@@ -14,6 +16,9 @@ function safeErrorCode(error: unknown) {
     error instanceof ShopifyOrderRevisionError
     && /^[A-Z][A-Z0-9_]{2,127}$/u.test(error.code)
   ) return error.code
+  if (error instanceof CommerceOrderRevisionStoreSyncPausedError) {
+    return error.code
+  }
   return 'SHOPIFY_ORDER_REVISION_FAILED'
 }
 
@@ -37,6 +42,7 @@ export async function processShopifyOrderRevisions(input: {
   const failureCodes: Record<string, number> = {}
   for (const claim of claims) {
     try {
+      await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)
       const evidence = await inspectShopifyCanonicalOrderRevision(claim)
       const result = await captureCommerceOrderRevisionObservationInPostgres({
         claim,

@@ -77,6 +77,14 @@ import {
   millimetersToDisplayLength,
   type MeasurementSystem,
 } from '@/lib/measurements'
+import {
+  COMMERCE_STORE_SYNC_EFFECTIVE_REASON_LABELS,
+  commerceStoreSyncControlMatchesCommand,
+  type CommerceStoreSyncControl,
+  type CommerceStoreSyncDesiredState,
+  type CommerceStoreSyncEffectiveReason,
+  type CommerceStoreSyncPendingCommand,
+} from '@/lib/operations/commerceStoreSync'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CandidateState =
@@ -358,6 +366,14 @@ type CommerceIntake = {
       | 'frozen'
     activationRevision?: number | null
     operatorCommandsAllowed?: boolean
+    storeSync?: {
+      desiredState: 'running' | 'paused'
+      effectiveState: 'running' | 'paused'
+      effectiveReason: string
+      explicitChoice: boolean
+      revision: number | null
+      reason: string | null
+    }
     providerWritesAllowed?: boolean
     syncCursorAdvanceAllowed?: boolean
     productIntake?: ProductIntakePolicy
@@ -1372,6 +1388,9 @@ export default function CommerceIntakeWorkflow({
     Record<string, string>
   >({})
   const retryKeys = useRef(new Map<string, string>())
+  const pendingStoreSyncCommand = useRef<
+    CommerceStoreSyncPendingCommand | null
+  >(null)
   const csvInputRef = useRef<HTMLInputElement | null>(null)
 
   const loadIntake = useCallback(async (signal?: AbortSignal) => {
@@ -1385,6 +1404,7 @@ export default function CommerceIntakeWorkflow({
     )
     const payload = await readPayload(response)
     setIntake(payload.intake || null)
+    return payload.intake || null
   }, [accountGlobalId])
 
   useEffect(() => {
@@ -1661,6 +1681,96 @@ export default function CommerceIntakeWorkflow({
     }
   }
 
+  async function updateStoreSync(
+    desiredState: CommerceStoreSyncDesiredState,
+  ) {
+    const control = intake?.policy?.storeSync
+    if (
+      pendingAction
+      || !canActivate
+      || !control
+      || control.revision === null
+      || (desiredState === control.desiredState && control.explicitChoice)
+    ) return
+    const retainedCommand = pendingStoreSyncCommand.current
+    if (retainedCommand && retainedCommand.desiredState !== desiredState) {
+      setError(
+        'A prior Store sync response is uncertain. Retry that exact change or reload before issuing a different change.',
+      )
+      return
+    }
+    const command: CommerceStoreSyncPendingCommand = retainedCommand || {
+      accountGlobalId,
+      desiredState,
+      expectedDesiredState: control.desiredState,
+      expectedRevision: control.revision,
+      reason: desiredState === control.desiredState
+        ? `Confirmed ${desiredState} as an independent Store sync choice in ${providerLabel(provider)} import settings`
+        : `Changed Store sync from ${control.desiredState} to ${desiredState} in ${providerLabel(provider)} import settings`,
+      idempotencyKey: `store-sync:${crypto.randomUUID()}`,
+    }
+    pendingStoreSyncCommand.current = command
+    setPendingAction('store-sync')
+    setError('')
+    setErrorCode('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'update-commerce-store-sync',
+          accountGlobalId: command.accountGlobalId,
+          desiredState: command.desiredState,
+          expectedDesiredState: command.expectedDesiredState,
+          expectedRevision: command.expectedRevision,
+          reason: command.reason,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as {
+        error?: string
+        result?: { control?: CommerceStoreSyncControl }
+      }
+      if (!response.ok || !payload.result?.control) {
+        throw new Error(payload.error || 'Store sync could not be updated')
+      }
+      if (!commerceStoreSyncControlMatchesCommand(
+        payload.result.control,
+        command,
+      )) {
+        throw new Error('Store sync returned a response for a different command')
+      }
+      pendingStoreSyncCommand.current = null
+      await loadIntake()
+      setNotice(
+        `Store sync is ${payload.result.control.effectiveState}. ${payload.result.control.effectiveReasonLabel}`,
+      )
+    } catch (caught) {
+      const refreshed = await loadIntake().catch(() => null)
+      const refreshedControl = refreshed?.policy?.storeSync
+      if (
+        refreshedControl?.desiredState === command.desiredState
+        && refreshedControl.explicitChoice === true
+        && refreshedControl.revision === command.expectedRevision + 1
+      ) {
+        pendingStoreSyncCommand.current = null
+        setError('')
+        setNotice(
+          `Store sync is ${refreshedControl.effectiveState}. ${refreshedControl.effectiveReason}`,
+        )
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,
+        )
+      }
+    } finally {
+      setPendingAction('')
+    }
+  }
+
   async function initializeShadowActivation() {
     if (pendingAction) return
     if (
@@ -1725,6 +1835,14 @@ export default function CommerceIntakeWorkflow({
     || (latestPagination?.resource === 'products' ? latestPagination : null)
   const operatorCommandsAllowed =
     intake?.policy?.operatorCommandsAllowed === true
+  const providerMirrorAllowed =
+    intake?.policy?.storeSync?.effectiveState === 'running'
+  const providerMirrorReason = intake?.policy?.storeSync?.effectiveReason
+    || 'STORE_SYNC_CONTROL_MISSING'
+  const providerMirrorReasonLabel =
+    COMMERCE_STORE_SYNC_EFFECTIVE_REASON_LABELS[
+      providerMirrorReason as CommerceStoreSyncEffectiveReason
+    ] || providerMirrorReason
   const normalizedExactFaireOrderId = exactFaireOrderId.trim()
   const exactFaireOrderIdValid = (
     normalizedExactFaireOrderId.length > 0
@@ -2409,7 +2527,7 @@ export default function CommerceIntakeWorkflow({
   async function retryOrderMoneyRejectionGroup(group: RejectionGroup) {
     if (
       pendingAction
-      || !operatorCommandsAllowed
+      || !providerMirrorAllowed
       || group.resourceType !== 'order'
       || group.code !== 'COMMERCE_ORDER_MONEY_INCOMPLETE'
     ) return
@@ -2564,7 +2682,7 @@ export default function CommerceIntakeWorkflow({
     if (
       pendingAction
       || enabled === automaticProductCreationEnabled
-      || (enabled && (!operatorCommandsAllowed || !connectionReady))
+      || (enabled && (!providerMirrorAllowed || !connectionReady))
     ) return
     await postCommand(
       'set-product-intake-policy',
@@ -2586,7 +2704,7 @@ export default function CommerceIntakeWorkflow({
     const resetUnmatchedAction = productIntakePolicy?.unmatchedAction
     if (
       pendingAction
-      || !operatorCommandsAllowed
+      || !providerMirrorAllowed
       || !connectionReady
       || (
         resetUnmatchedAction !== 'review'
@@ -3680,6 +3798,73 @@ export default function CommerceIntakeWorkflow({
                 Open import workspace
               </Button>
             </Stack>
+            {intake?.policy?.storeSync ? (
+              <Stack
+                data-testid="commerce-intake-store-sync-editor"
+                direction={{ xs: 'column', sm: 'row' }}
+                alignItems={{ xs: 'stretch', sm: 'center' }}
+                justifyContent="space-between"
+                gap={1}
+                sx={{
+                  border: '1px solid',
+                  borderColor: 'divider',
+                  borderRadius: 1.5,
+                  p: 1.25,
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="body2" fontWeight={700}>
+                    Store sync · Desired{' '}
+                    {humanize(intake.policy.storeSync.desiredState)} · Effective{' '}
+                    {humanize(intake.policy.storeSync.effectiveState)}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                    {providerMirrorReason}: {providerMirrorReasonLabel}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                    {intake.policy.storeSync.explicitChoice
+                      ? 'Independent Store sync choice'
+                      : 'Legacy-derived default; confirm it to make Store sync independent'}
+                  </Typography>
+                </Box>
+                <Stack gap={0.75} sx={{ minWidth: { xs: '100%', sm: 190 } }}>
+                  <TextField
+                    select
+                    size="small"
+                    label="Desired Store sync"
+                    value={intake.policy.storeSync.desiredState}
+                    onChange={(event) => void updateStoreSync(
+                      event.target.value as CommerceStoreSyncDesiredState,
+                    )}
+                    disabled={!canActivate || Boolean(pendingAction)}
+                    inputProps={{
+                      'aria-label': `${displayName} desired Store sync`,
+                    }}
+                    sx={{ minWidth: { xs: '100%', sm: 190 } }}
+                  >
+                    <MenuItem value="running">Running</MenuItem>
+                    <MenuItem value="paused">Paused</MenuItem>
+                  </TextField>
+                  {!intake.policy.storeSync.explicitChoice ? (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={!canActivate || Boolean(pendingAction)}
+                      onClick={() => void updateStoreSync(
+                        intake.policy?.storeSync?.desiredState || 'paused',
+                      )}
+                    >
+                      Make independent
+                    </Button>
+                  ) : null}
+                  {!canActivate ? (
+                    <Typography variant="caption" color="text.secondary">
+                      View only · an Operations administrator can change Store sync.
+                    </Typography>
+                  ) : null}
+                </Stack>
+              </Stack>
+            ) : null}
             <Stack direction="row" gap={0.75} flexWrap="wrap">
               <Chip
                 size="small"
@@ -4075,7 +4260,7 @@ export default function CommerceIntakeWorkflow({
                           variant="contained"
                           disabled={
                             Boolean(pendingAction)
-                            || !operatorCommandsAllowed
+                            || !providerMirrorAllowed
                           }
                           onClick={() => void postCommand(
                             'reset-order-reconciliation',
@@ -4121,6 +4306,15 @@ export default function CommerceIntakeWorkflow({
               </Stack>
             </CardContent>
           </Card>
+          {!providerMirrorAllowed ? (
+            <Alert severity="warning">
+              New provider catalog, order, image, and inventory mirroring is
+              Paused for this connection ({providerMirrorReason}). Existing
+              mirrored data remains available. An Operations administrator can
+              set Desired Store sync to Running in this connection workspace
+              before starting or retrying provider reads.
+            </Alert>
+          ) : null}
           {!operatorCommandsAllowed ? (
             <Alert
               severity="warning"
@@ -4348,7 +4542,7 @@ export default function CommerceIntakeWorkflow({
                           color="warning"
                           disabled={
                             Boolean(pendingAction)
-                            || !operatorCommandsAllowed
+                            || !providerMirrorAllowed
                           }
                           onClick={() => {
                             void postCommand(
@@ -4372,7 +4566,7 @@ export default function CommerceIntakeWorkflow({
                           : <CloudDownloadRounded />}
                         disabled={
                           Boolean(pendingAction)
-                          || !operatorCommandsAllowed
+                          || !providerMirrorAllowed
                         }
                         onClick={() => {
                           void postCommand(
@@ -4624,7 +4818,7 @@ export default function CommerceIntakeWorkflow({
                                 startIcon={<RefreshRounded />}
                                 disabled={
                                   Boolean(pendingAction)
-                                  || !operatorCommandsAllowed
+                                  || !providerMirrorAllowed
                                 }
                                 onClick={() => {
                                   void retryOrderMoneyRejectionGroup(group)
@@ -4722,7 +4916,7 @@ export default function CommerceIntakeWorkflow({
                             startIcon={<RefreshRounded />}
                             disabled={
                               Boolean(pendingAction)
-                              || !operatorCommandsAllowed
+                              || !providerMirrorAllowed
                             }
                             onClick={() => {
                               void postCommand(
@@ -5009,7 +5203,7 @@ export default function CommerceIntakeWorkflow({
                         || (
                           !automaticProductCreationEnabled
                           && (
-                            !operatorCommandsAllowed
+                            !providerMirrorAllowed
                             || !connectionReady
                           )
                         )
@@ -5117,7 +5311,7 @@ export default function CommerceIntakeWorkflow({
                       )}
                       disabled={
                         Boolean(pendingAction)
-                        || !operatorCommandsAllowed
+                        || !providerMirrorAllowed
                         || !connectionReady
                       }
                       onClick={() => {
@@ -5133,8 +5327,8 @@ export default function CommerceIntakeWorkflow({
                     <Typography variant="caption" color="text.secondary">
                       {!connectionReady
                         ? `Reconnect and verify ${providerLabel(provider)} first. Repairing the connection does not itself restart this terminal sweep.`
-                        : !operatorCommandsAllowed
-                          ? 'Set Operations to Shadow or Active first. Repairing eligibility does not itself restart this terminal sweep.'
+                        : !providerMirrorAllowed
+                          ? `Set Store sync to Running first (${providerMirrorReason}). Repairing eligibility does not itself restart this terminal sweep.`
                           : 'This confirmed action advances the policy fence, queues a new root read, and retains the terminal job as evidence.'}
                     </Typography>
                   </Stack>
@@ -5184,11 +5378,11 @@ export default function CommerceIntakeWorkflow({
                   </Stack>
                 ) : null}
                 {!automaticProductCreationEnabled
-                && (!operatorCommandsAllowed || !connectionReady) ? (
+                && (!providerMirrorAllowed || !connectionReady) ? (
                   <Typography variant="caption" color="text.secondary">
                     {!connectionReady
                       ? `Reconnect and verify ${providerLabel(provider)} before catalog sync can resume.`
-                      : 'Configure the Operations product target in Shadow or Active before resumed catalog sync can run.'}
+                      : `Set Store sync to Running before resumed catalog sync can run (${providerMirrorReason}).`}
                     {' '}If the policy is already on, turning it off remains
                     available even when the connection or Operations is later
                     restricted.
@@ -6137,7 +6331,7 @@ export default function CommerceIntakeWorkflow({
                       startIcon={<CloudDownloadRounded />}
                       disabled={
                         Boolean(pendingAction)
-                        || !operatorCommandsAllowed
+                        || !providerMirrorAllowed
                         || !exactFaireOrderIdValid
                       }
                       onClick={() => {
@@ -6196,6 +6390,8 @@ export default function CommerceIntakeWorkflow({
                 const candidateLocked = Boolean(unavailableReason)
                   || !operatorCommandsAllowed
                 const refreshLocked = (
+                  !providerMirrorAllowed
+                  ||
                   !Number.isInteger(candidate.rowVersion)
                   || candidate.state === 'promoted'
                   || candidate.state === 'expired'

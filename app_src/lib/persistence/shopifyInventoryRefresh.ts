@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -14,6 +15,7 @@ const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
 )
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const INVENTORY_READABLE_CONNECTION_SQL = `(
   COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
     ?| ARRAY['read_inventory', 'write_inventory']
@@ -564,7 +566,6 @@ function currentFenceSql(jobAlias = 'job') {
      AND mapping.inventory_pool_id = ${jobAlias}.inventory_pool_id
     JOIN operations_activation_scopes activation
       ON activation.organization_id = ${jobAlias}.organization_id
-     AND activation.revision = ${jobAlias}.activation_revision
      AND (
        ${jobAlias}.location_mapping_id IS NULL
        OR mapping.id IS NOT NULL
@@ -581,13 +582,8 @@ function currentFenceSql(jobAlias = 'job') {
                ${jobAlias}.integration_account_id
        )
      )
-     AND (
-       (config.registration_state = 'registered'
-         AND activation.state IN ('shadow', 'active'))
-       OR
-       (config.registration_state = 'shadow_simulated'
-         AND activation.state = 'shadow')
-     )
+     AND ${STORE_SYNC_RUNNING_SQL}
+     AND config.registration_state IN ('registered', 'shadow_simulated')
   `
 }
 
@@ -659,16 +655,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
              AND credential.credential_version =
                  job.credential_generation
              AND credential.verification_status = 'verified'
-             AND activation.revision = job.activation_revision
-             AND (
-               (config.registration_state = 'registered'
-                 AND activation.state IN ('shadow', 'active'))
-               OR
-               (config.registration_state = 'shadow_simulated'
-                 AND activation.state = 'shadow')
+             AND ${STORE_SYNC_RUNNING_SQL}
+             AND config.registration_state IN (
+               'registered', 'shadow_simulated'
              )
              AND ${INVENTORY_READABLE_CONNECTION_SQL}
-             AND operations_shopify_carrier_service_config_is_ready(
+             AND operations_shopify_inventory_read_config_is_ready(
                config.organization_id, config.id
              )
              AND (
@@ -726,16 +718,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                config.credential_generation
            AND credential.credential_version = config.credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.revision = config.activation_revision
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
            )
            AND ${INVENTORY_READABLE_CONNECTION_SQL}
-           AND operations_shopify_carrier_service_config_is_ready(
+           AND operations_shopify_inventory_read_config_is_ready(
              config.organization_id, config.id
            )
        )
@@ -922,16 +910,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                config.credential_generation
            AND credential.credential_version = config.credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.revision = config.activation_revision
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
            )
            AND ${INVENTORY_READABLE_CONNECTION_SQL}
-           AND operations_shopify_carrier_service_config_is_ready(
+           AND operations_shopify_inventory_read_config_is_ready(
              config.organization_id, config.id
            )
        )
@@ -1135,7 +1119,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
              AND job.available_at <= now()
              AND job.cancel_requested = false
              AND ${INVENTORY_READABLE_CONNECTION_SQL}
-             AND operations_shopify_carrier_service_config_is_ready(
+             AND operations_shopify_inventory_read_config_is_ready(
                config.organization_id, config.id
              )
              AND NOT EXISTS (
@@ -1256,7 +1240,7 @@ async function currentJobFence(
        AND job.lease_expires_at > now()
        AND job.cancel_requested = false
        AND ${INVENTORY_READABLE_CONNECTION_SQL}
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_inventory_read_config_is_ready(
          config.organization_id, config.id
        )
      FOR UPDATE OF job`,
@@ -1753,7 +1737,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = config.organization_id
-       WHERE operations_shopify_carrier_service_config_is_ready(
+       WHERE operations_shopify_inventory_read_config_is_ready(
            config.organization_id, config.id
          )
          AND config.registration_state IN (
@@ -1767,13 +1751,9 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
          AND credential.credential_version =
              config.credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.revision = config.activation_revision
-         AND (
-           (config.registration_state = 'registered'
-             AND activation.state IN ('shadow', 'active'))
-           OR
-           (config.registration_state = 'shadow_simulated'
-             AND activation.state = 'shadow')
+         AND ${STORE_SYNC_RUNNING_SQL}
+         AND config.registration_state IN (
+           'registered', 'shadow_simulated'
          )
          AND ${INVENTORY_READABLE_CONNECTION_SQL}
      ),

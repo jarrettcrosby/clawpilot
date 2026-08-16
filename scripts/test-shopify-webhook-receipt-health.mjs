@@ -106,6 +106,34 @@ async function createFixture(client) {
       organization_id uuid PRIMARY KEY,
       state text NOT NULL
     );
+    CREATE TABLE operations_commerce_store_sync_controls (
+      organization_id uuid NOT NULL,
+      integration_account_id uuid NOT NULL,
+      desired_state text NOT NULL,
+      explicit_choice boolean NOT NULL,
+      PRIMARY KEY (organization_id, integration_account_id)
+    );
+    CREATE FUNCTION operations_commerce_store_sync_is_running(
+      requested_organization_id uuid,
+      requested_integration_account_id uuid
+    ) RETURNS boolean LANGUAGE sql STABLE AS $$
+      SELECT EXISTS (
+        SELECT 1
+        FROM operations_integration_accounts account
+        JOIN operations_commerce_store_sync_controls control
+          ON control.organization_id = account.organization_id
+         AND control.integration_account_id = account.id
+        JOIN operations_activation_scopes activation
+          ON activation.organization_id = account.organization_id
+        WHERE account.organization_id = requested_organization_id
+          AND account.id = requested_integration_account_id
+          AND account.integration_type = 'commerce'
+          AND account.provider IN ('shopify', 'faire')
+          AND account.status = 'active'
+          AND control.desired_state = 'running'
+          AND activation.state NOT IN ('disabled', 'frozen')
+      )
+    $$;
     CREATE TABLE operations_commerce_webhook_receipts (
       id uuid PRIMARY KEY,
       organization_id uuid NOT NULL,
@@ -126,6 +154,7 @@ async function seedFixture(client) {
   const organizationId = '11111111-1111-4111-8111-111111111111'
   const otherOrganizationId = '33333333-3333-4333-8333-333333333333'
   const otherAccountId = '44444444-4444-4444-8444-444444444444'
+  const faireAccountId = '55555555-5555-4555-8555-555555555555'
   const accountIds = [
     '22222222-2222-4222-8222-222222222221',
     '22222222-2222-4222-8222-222222222222',
@@ -134,7 +163,7 @@ async function seedFixture(client) {
   ]
   await client.query(
     `INSERT INTO operations_activation_scopes (organization_id, state)
-     VALUES ($1::uuid, 'shadow'), ($2::uuid, 'shadow')`,
+     VALUES ($1::uuid, 'read_only'), ($2::uuid, 'shadow')`,
     [organizationId, otherOrganizationId],
   )
   await client.query(
@@ -159,7 +188,28 @@ async function seedFixture(client) {
     [
       organizationId,
       ...accountIds,
-      randomUUID(),
+      faireAccountId,
+      otherOrganizationId,
+      otherAccountId,
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_store_sync_controls (
+       organization_id, integration_account_id,
+       desired_state, explicit_choice
+     ) VALUES
+       ($1::uuid, $2::uuid, 'running', true),
+       ($1::uuid, $3::uuid, 'running', true),
+       ($1::uuid, $4::uuid, 'paused', true),
+       ($1::uuid, $5::uuid, 'running', true),
+       ($1::uuid, $6::uuid, 'running', true),
+       ($7::uuid, $8::uuid, 'running', true)`,
+    [
+      organizationId,
+      ...accountIds,
+      // Faire stays outside Shopify receipt health but still receives the
+      // same fail-closed per-account control shape.
+      faireAccountId,
       otherOrganizationId,
       otherAccountId,
     ],
@@ -177,7 +227,7 @@ async function seedFixture(client) {
         'shopify_client_credentials', 'verified', 'verified',
         'owner@example.com'),
        ($1::uuid, $4::uuid, 1, 'gid://shopify/Shop/3',
-        'shopify_client_credentials', 'verified', 'unverified',
+        'shopify_client_credentials', 'verified', 'verified',
         'owner@example.com'),
        ($5::uuid, $6::uuid, 1, 'gid://shopify/Shop/5',
         'shopify_client_credentials', 'verified', 'verified',

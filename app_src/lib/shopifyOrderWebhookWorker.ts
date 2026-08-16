@@ -3,6 +3,7 @@ import {
 } from '@/lib/integrations/commerceOrderHistory'
 import {
   appendShopifyOrderWebhookExactReadInPostgres,
+  assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres,
   claimShopifyOrderWebhookTargetsInPostgres,
   failShopifyOrderWebhookExactReadInPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
@@ -47,6 +48,9 @@ export async function processShopifyOrderWebhookSignals(input: {
   let failurePersistenceErrors = 0
   for (const claim of claims) {
     try {
+      await assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
+        claim,
+      )
       const read = await readExactShopifyOrderHistoryObservation({
         organizationId: claim.organizationId,
         accountGlobalId: claim.accountGlobalId,

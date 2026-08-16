@@ -7,6 +7,7 @@ import {
   type CommerceProviderImageSource,
 } from '@/lib/integrations/commerceProviderImageSource'
 import {
+  assertCommerceProductImageImportClaimCurrentInPostgres,
   claimCommerceProductImageImportJobsInPostgres,
   completeCommerceProductImageImportJobInPostgres,
   failCommerceProductImageImportJobInPostgres,
@@ -37,6 +38,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   'COMMERCE_PROVIDER_IMAGE_TIMEOUT',
   'COMMERCE_PROVIDER_IMAGE_ABORTED',
   'COMMERCE_PROVIDER_IMAGE_STATUS_INVALID',
+  'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
 ])
 
 const PERMANENT_ERROR_CODES = new Set([
@@ -111,6 +113,7 @@ export type CommerceProductImageImportWorkerResult = {
 type WorkerDependencies = {
   resolveWaiting: typeof resolveWaitingCommerceProductImageImportJobsInPostgres
   claim: typeof claimCommerceProductImageImportJobsInPostgres
+  assertCurrent: typeof assertCommerceProductImageImportClaimCurrentInPostgres
   readSources: typeof readCurrentCommerceProviderImageSources
   selectSource: typeof selectCommerceProviderImageSource
   fetchImage: typeof fetchCommerceProviderImage
@@ -122,6 +125,7 @@ type WorkerDependencies = {
 const defaultDependencies: WorkerDependencies = {
   resolveWaiting: resolveWaitingCommerceProductImageImportJobsInPostgres,
   claim: claimCommerceProductImageImportJobsInPostgres,
+  assertCurrent: assertCommerceProductImageImportClaimCurrentInPostgres,
   readSources: readCurrentCommerceProviderImageSources,
   selectSource: selectCommerceProviderImageSource,
   fetchImage: fetchCommerceProviderImage,
@@ -243,6 +247,12 @@ async function processBoundedCommerceProductImageImports(
     result.claimed += 1
 
     try {
+      await dependencies.assertCurrent({
+        organizationId: claim.organizationId,
+        jobId: claim.jobId,
+        leaseToken: claim.leaseToken,
+        workerId: input.workerId,
+      })
       const readKey = sourceReadKey(claim)
       let sources = sourceReads.get(readKey)
       if (!sources) {
@@ -260,6 +270,12 @@ async function processBoundedCommerceProductImageImports(
         sources,
         providerImageId: claim.providerImageId,
         locatorSha256: claim.locatorSha256,
+      })
+      await dependencies.assertCurrent({
+        organizationId: claim.organizationId,
+        jobId: claim.jobId,
+        leaseToken: claim.leaseToken,
+        workerId: input.workerId,
       })
       const image = await dependencies.fetchImage({ url: selected.url })
       result.fetched += 1

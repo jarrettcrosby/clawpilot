@@ -4,6 +4,7 @@ import {
   shopifyOrderWebhookSubscriptionEvidenceReady,
   type ShopifyOrderWebhookSignalEvidence,
 } from '@/lib/integrations/shopifyOrderWebhook'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -18,6 +19,8 @@ import {
   normalizeCommerceOrderObservationInput,
   type CommerceOrderObservationInput,
 } from '@/lib/persistence/commerceOrderSync'
+
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 export class ShopifyOrderWebhookSignalPersistenceError extends Error {
   constructor(
@@ -699,7 +702,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
                         = 'windowed_history_and_core_order_signals_plus_poll'
                   AND authority.provider_write_mode = 'disabled'
                   AND authority.provider_write_count = 0
-                  AND activation.state IN ('shadow', 'active')
+                  AND ${STORE_SYNC_RUNNING_SQL}
                   AND signal.integration_account_id
                         = target.integration_account_id
                   AND signal.external_order_id = target.external_order_id
@@ -847,7 +850,7 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
           AND authority.provider_write_count = 0
          JOIN operations_activation_scopes activation
            ON activation.organization_id = target.organization_id
-          AND activation.state IN ('shadow', 'active')
+          AND ${STORE_SYNC_RUNNING_SQL}
          WHERE target.dirty_version > target.reconciled_version
            AND target.attempt_count < 12
            AND target.available_at <= clock_timestamp()
@@ -911,6 +914,57 @@ export async function claimShopifyOrderWebhookTargetsInPostgres(input: {
       attemptCount: row.attempt_count,
     }))
   })
+}
+
+/** Revalidate the exact claimed target and Store sync fence before Shopify I/O. */
+export async function assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
+  claim: ShopifyOrderWebhookTargetClaim,
+) {
+  const result = await query<{ current: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM operations_shopify_order_webhook_targets target
+       JOIN operations_integration_accounts account
+         ON account.organization_id = target.organization_id
+        AND account.id = target.integration_account_id
+        AND account.global_id = $4
+        AND account.integration_type = 'commerce'
+        AND account.provider = 'shopify'
+        AND account.commerce_credential_generation = $5
+       WHERE target.organization_id = $1::uuid
+         AND target.id = $2::uuid
+         AND target.integration_account_id = $3::uuid
+         AND target.credential_generation = $5
+         AND target.policy_revision = $6
+         AND target.external_order_id = $7
+         AND target.claim_state = 'processing'
+         AND target.claimed_dirty_version = $8
+         AND target.claimed_signal_global_id = $9
+         AND target.claimed_provider_updated_at = $10::timestamptz
+         AND target.lock_token = $11::uuid
+         AND target.lease_expires_at > clock_timestamp()
+         AND ${STORE_SYNC_RUNNING_SQL}
+     ) AS current`,
+    [
+      claim.organizationId,
+      claim.id,
+      claim.integrationAccountId,
+      claim.accountGlobalId,
+      claim.credentialGeneration,
+      claim.policyRevision,
+      claim.externalOrderId,
+      claim.capturedDirtyVersion,
+      claim.signalGlobalId,
+      claim.claimedProviderUpdatedAt,
+      claim.lockToken,
+    ],
+  )
+  if (result.rows[0]?.current !== true) {
+    conflict(
+      'SHOPIFY_ORDER_WEBHOOK_PROVIDER_READ_FENCE_CHANGED',
+      'Store sync paused or the exact webhook read lease changed before Shopify I/O',
+    )
+  }
 }
 
 async function assertPreservedSensitiveEvidence(
@@ -1276,7 +1330,7 @@ export async function appendShopifyOrderWebhookExactReadInPostgres(input: {
         AND policy.provider_event_processor_state = 'available'
        JOIN operations_activation_scopes activation
          ON activation.organization_id = target.organization_id
-        AND activation.state IN ('shadow', 'active')
+        AND ${STORE_SYNC_RUNNING_SQL}
        WHERE target.organization_id = $1::uuid
          AND target.id = $2::uuid
          AND target.integration_account_id = $3::uuid
@@ -1512,6 +1566,7 @@ export async function readShopifyOrderWebhookSignalHealthFromPostgres() {
     failed: number
     dead: number
     overdue_dirty: number
+    paused_retained_dirty: number
     last_signaled_at: Date | string | null
     last_succeeded_at: Date | string | null
     last_failed_at: Date | string | null
@@ -1520,27 +1575,45 @@ export async function readShopifyOrderWebhookSignalHealthFromPostgres() {
     `SELECT
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND claim_state = 'pending'
        )::integer AS pending_dirty,
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND claim_state = 'processing'
        )::integer AS processing,
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND claim_state = 'processing'
            AND lease_expires_at <= clock_timestamp()
        )::integer AS stale_processing,
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND claim_state = 'failed'
        )::integer AS failed,
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND claim_state = 'dead'
        )::integer AS dead,
        count(*) FILTER (
          WHERE dirty_version > reconciled_version
+           AND operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
            AND available_at <= clock_timestamp()
            AND (
              claim_state IN ('pending', 'failed')
@@ -1550,6 +1623,12 @@ export async function readShopifyOrderWebhookSignalHealthFromPostgres() {
              )
            )
        )::integer AS overdue_dirty,
+       count(*) FILTER (
+         WHERE dirty_version > reconciled_version
+           AND NOT operations_commerce_store_sync_is_running(
+             target.organization_id, target.integration_account_id
+           )
+       )::integer AS paused_retained_dirty,
        max(last_signaled_at) AS last_signaled_at,
        max(last_reconciled_at) AS last_succeeded_at,
        max(updated_at) FILTER (
@@ -1561,7 +1640,7 @@ export async function readShopifyOrderWebhookSignalHealthFromPostgres() {
            WHERE claim_state IN ('failed', 'dead')
          )
        ) AS last_processed_at
-     FROM operations_shopify_order_webhook_targets`,
+     FROM operations_shopify_order_webhook_targets target`,
   )
   const row = result.rows[0]
   const iso = (value: Date | string | null | undefined) => value
@@ -1574,6 +1653,7 @@ export async function readShopifyOrderWebhookSignalHealthFromPostgres() {
     failed: Number(row?.failed || 0),
     dead: Number(row?.dead || 0),
     overdueDirty: Number(row?.overdue_dirty || 0),
+    pausedRetainedDirty: Number(row?.paused_retained_dirty || 0),
     lastSignaledAt: iso(row?.last_signaled_at),
     lastSucceededAt: iso(row?.last_succeeded_at),
     lastFailedAt: iso(row?.last_failed_at),

@@ -2067,6 +2067,7 @@ export async function GET() {
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
+          operations_commerce_store_sync_controls_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -4520,6 +4521,211 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0298_operations_commerce_store_sync_controls.sql'
+                  AND checksum =
+                    'e76fb50ebf7188746f26a21a8cc9d0191fd6b4b43ce15d7729715a615e4a26d2'
+              )
+              AND to_regclass(
+                'operations_commerce_store_sync_controls'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_store_sync_change_receipts'
+              ) IS NOT NULL
+              AND (
+                SELECT string_agg(
+                  column_name || ':' || data_type || ':' || is_nullable || ':'
+                    || (column_default IS NOT NULL)::text,
+                  ',' ORDER BY ordinal_position
+                ) =
+                  'organization_id:uuid:NO:false,integration_account_id:uuid:NO:false,desired_state:text:NO:false,explicit_choice:boolean:NO:true,revision:bigint:NO:true,reason:text:NO:false,created_by:text:YES:false,updated_by:text:YES:false,created_at:timestamp with time zone:NO:true,updated_at:timestamp with time zone:NO:true'
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name =
+                    'operations_commerce_store_sync_controls'
+              )
+              AND (
+                SELECT string_agg(
+                  column_name || ':' || data_type || ':' || is_nullable || ':'
+                    || (column_default IS NOT NULL)::text,
+                  ',' ORDER BY ordinal_position
+                ) =
+                  'id:uuid:NO:true,organization_id:uuid:NO:false,integration_account_id:uuid:NO:false,idempotency_key:text:NO:false,request_hash:text:NO:false,previous_desired_state:text:NO:false,desired_state:text:NO:false,resulting_revision:bigint:NO:false,reason:text:NO:false,actor_email:text:NO:false,response_json:text:NO:false,created_at:timestamp with time zone:NO:true'
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name =
+                    'operations_commerce_store_sync_change_receipts'
+              )
+              AND (
+                SELECT count(*) = 5
+                  AND count(*) FILTER (WHERE contype = 'p') = 1
+                  AND count(*) FILTER (WHERE contype = 'f') = 1
+                  AND count(*) FILTER (WHERE contype = 'c') = 3
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND convalidated
+              )
+              AND (
+                SELECT count(*) = 11
+                  AND count(*) FILTER (WHERE contype = 'p') = 1
+                  AND count(*) FILTER (WHERE contype = 'f') = 1
+                  AND count(*) FILTER (WHERE contype = 'u') = 1
+                  AND count(*) FILTER (WHERE contype = 'c') = 8
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_controls_account_fkey'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_controls'
+                  )
+                  AND confrelid = to_regclass(
+                    'operations_integration_accounts'
+                  )
+                  AND contype = 'f'
+                  AND confdeltype = 'r'
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_receipts_account_fkey'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_change_receipts'
+                  )
+                  AND confrelid = to_regclass(
+                    'operations_commerce_store_sync_controls'
+                  )
+                  AND contype = 'f'
+                  AND confdeltype = 'r'
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_receipts_idempotency_unique'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_change_receipts'
+                  )
+                  AND contype = 'u'
+                  AND convalidated
+              )
+              AND (
+                SELECT count(*) = 1
+                FROM pg_index
+                WHERE indrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND indisvalid AND indisready AND indisunique
+              )
+              AND (
+                SELECT count(*) = 2
+                FROM pg_index
+                WHERE indrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND indisvalid AND indisready AND indisunique
+              )
+              AND to_regprocedure(
+                'operations_commerce_store_sync_effective_reason(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_commerce_store_sync_is_running(uuid,uuid)'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'seed_operations_commerce_store_sync_control()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'validate_operations_commerce_store_sync_identity()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_commerce_store_sync_receipt()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'operations_shopify_inventory_read_config_is_ready(uuid,uuid)'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_integration_accounts'
+                )
+                  AND installed_trigger.tgname =
+                    'seed_operations_commerce_store_sync_control_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'seed_operations_commerce_store_sync_control()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 5
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND installed_trigger.tgname =
+                    'validate_operations_commerce_store_sync_identity_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'validate_operations_commerce_store_sync_identity()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 23
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND installed_trigger.tgname =
+                    'protect_operations_commerce_store_sync_receipt_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'protect_operations_commerce_store_sync_receipt()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 27
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_integration_accounts account
+                LEFT JOIN operations_commerce_store_sync_controls control
+                  ON control.organization_id = account.organization_id
+                 AND control.integration_account_id = account.id
+                WHERE account.integration_type = 'commerce'
+                  AND account.provider IN ('shopify', 'faire')
+                  AND control.integration_account_id IS NULL
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_commerce_store_sync_controls control
+                LEFT JOIN operations_integration_accounts account
+                  ON account.organization_id = control.organization_id
+                 AND account.id = control.integration_account_id
+                 AND account.integration_type = 'commerce'
+                 AND account.provider IN ('shopify', 'faire')
+                WHERE account.id IS NULL
+                   OR operations_commerce_store_sync_effective_reason(
+                        control.organization_id,
+                        control.integration_account_id
+                      ) IS NULL
+              ) AS operations_commerce_store_sync_controls_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
               AND EXISTS (
@@ -5611,6 +5817,7 @@ export async function GET() {
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
+            && row?.operations_commerce_store_sync_controls_applied
             && row?.migration_checksums_present
           ),
           carrierShippingDiagnostics: {
@@ -5638,6 +5845,11 @@ export async function GET() {
             redactedEvidence: Boolean(
               row?.operations_print_agent_cleanup_status_applied,
             ),
+          },
+          commerceStoreSync: {
+            status: row?.operations_commerce_store_sync_controls_applied
+              ? 'ready'
+              : 'migration-structure-or-coverage-pending',
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
@@ -6064,6 +6276,7 @@ export async function GET() {
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied
+          || !row?.operations_commerce_store_sync_controls_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -6487,7 +6700,10 @@ export async function GET() {
                               AND policy.policy_version
                                 = 'commerce-product-intake-policy-v1'
                               AND policy.revision = job.policy_revision
-                              AND activation.state IN ('shadow', 'active')
+                              AND operations_commerce_store_sync_is_running(
+                                account.organization_id,
+                                account.id
+                              )
                               AND (
                                 (
                                   account.provider = 'shopify'
@@ -6552,7 +6768,10 @@ export async function GET() {
                      AND credential.verification_status = 'verified'
                      AND policy.policy_version
                        = 'commerce-product-intake-policy-v1'
-                     AND activation.state IN ('shadow', 'active')
+                     AND operations_commerce_store_sync_is_running(
+                       account.organization_id,
+                       account.id
+                     )
                      AND COALESCE(
                        account.configuration->'grantedScopes',
                        '[]'::jsonb
@@ -6604,7 +6823,10 @@ export async function GET() {
                       AND credential.verification_status = 'verified'
                       AND policy.policy_version
                         = 'commerce-product-intake-policy-v1'
-                      AND activation.state IN ('shadow', 'active')
+                      AND operations_commerce_store_sync_is_running(
+                        account.organization_id,
+                        account.id
+                      )
                       AND (
                         (
                           account.provider = 'shopify'

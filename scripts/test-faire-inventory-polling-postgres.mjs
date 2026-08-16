@@ -77,6 +77,11 @@ function loadTypeScriptModule(path, mocks = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })

@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -84,6 +84,14 @@ import type {
   OperationsShipmentCommandResult,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import type {
+  CommerceStoreSyncDesiredState,
+  CommerceStoreSyncPendingCommand,
+  CommerceStoreSyncUpdateResult,
+} from '@/lib/operations/commerceStoreSync'
+import {
+  commerceStoreSyncControlMatchesCommand,
+} from '@/lib/operations/commerceStoreSync'
 import {
   type OneOffCarrierGroupCommandResult,
   type OneOffPackedRateRefresh,
@@ -180,6 +188,7 @@ type OperationsPayload = {
     | OperationsShipmentCommandResult
     | OperationsCommerceFulfillmentRetryResult
     | ProviderOrderCancellationResult
+    | CommerceStoreSyncUpdateResult
 }
 
 type PackagingMaterialsPayload = {
@@ -295,27 +304,27 @@ const ACTIVATION_OPTIONS: Array<{
   {
     value: 'disabled',
     label: 'Disabled',
-    description: 'Stops Operations; only health and migration checks remain.',
+    description: 'Emergency override for automatic commerce mirroring and activation-gated connected-order execution. Existing evidence remains viewable.',
   },
   {
     value: 'shadow',
     label: 'Shadow',
-    description: 'Validates workflows and stores read evidence with no provider writes.',
+    description: 'Legacy execution-safety profile. Explicit Store sync choices remain independent.',
   },
   {
     value: 'read_only',
     label: 'Read only',
-    description: 'Allows viewing, health checks, reconciliation, evidence export, and explicitly confirmed zero-provider-write corrections.',
+    description: 'Allows viewing, health checks, reconciliation, evidence export, and explicitly confirmed zero-provider-write corrections; Store sync remains independently controlled.',
   },
   {
     value: 'active',
     label: 'Active',
-    description: 'Allows approved commands and provider actions. Select Shadow first.',
+    description: 'Allows approved legacy execution commands. Store sync is controlled separately after an explicit choice.',
   },
   {
     value: 'frozen',
     label: 'Frozen',
-    description: 'Keeps evidence viewable while stopping new consequential work.',
+    description: 'Emergency override for automatic commerce mirroring and activation-gated connected-order execution. Existing evidence remains viewable.',
   },
 ]
 
@@ -2548,6 +2557,10 @@ export default function OperationsSection({
   const [guideOpen, setGuideOpen] = useState(false)
   const [oneOffShipmentOpen, setOneOffShipmentOpen] = useState(false)
   const [updatingActivation, setUpdatingActivation] = useState(false)
+  const [updatingStoreSyncAccount, setUpdatingStoreSyncAccount] = useState('')
+  const pendingStoreSyncCommands = useRef(
+    new Map<string, CommerceStoreSyncPendingCommand>(),
+  )
   const [commerceActiveOpen, setCommerceActiveOpen] = useState(false)
   const [commerceActivePending, setCommerceActivePending] = useState<
     '' | 'loading' | 'preparing' | 'activating'
@@ -2733,9 +2746,11 @@ export default function OperationsSection({
       setCommerceFulfillmentRecoveryEnabled(
         payload.runtime?.commerceFulfillmentRecoveryEnabled === true,
       )
+      return payload.operations
     } catch (caught) {
-      if (caught instanceof DOMException && caught.name === 'AbortError') return
+      if (caught instanceof DOMException && caught.name === 'AbortError') return null
       setError(caught instanceof Error ? caught.message : 'Operations data is unavailable')
+      return null
     } finally {
       if (!signal?.aborted) setLoading(false)
     }
@@ -4680,6 +4695,99 @@ export default function OperationsSection({
     void updateActivation(state)
   }
 
+  const updateStoreSync = async (
+    accountGlobalId: string,
+    desiredState: CommerceStoreSyncDesiredState,
+  ) => {
+    const control = workspace?.storeSync.find(
+      (candidate) => candidate.accountGlobalId === accountGlobalId,
+    )
+    if (
+      !workspace
+      || !control
+      || (desiredState === control.desiredState && control.explicitChoice)
+    ) return
+    const retainedCommand = pendingStoreSyncCommands.current.get(
+      accountGlobalId,
+    )
+    if (retainedCommand && retainedCommand.desiredState !== desiredState) {
+      setError(
+        'A prior Store sync response is uncertain. Retry that exact change or reload before issuing a different change.',
+      )
+      return
+    }
+    const command: CommerceStoreSyncPendingCommand = retainedCommand || {
+      accountGlobalId,
+      desiredState,
+      expectedDesiredState: control.desiredState,
+      expectedRevision: control.revision,
+      reason: desiredState === control.desiredState
+        ? `Confirmed ${desiredState} as an independent Store sync choice in the Operations workbench`
+        : `Changed Store sync from ${control.desiredState} to ${desiredState} in the Operations workbench`,
+      idempotencyKey: `store-sync:${crypto.randomUUID()}`,
+    }
+    pendingStoreSyncCommands.current.set(accountGlobalId, command)
+    setUpdatingStoreSyncAccount(accountGlobalId)
+    setError('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'update-commerce-store-sync',
+          accountGlobalId: command.accountGlobalId,
+          desiredState: command.desiredState,
+          expectedDesiredState: command.expectedDesiredState,
+          expectedRevision: command.expectedRevision,
+          reason: command.reason,
+        }),
+      })
+      const payload = await response.json() as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('control' in payload.result)
+      ) {
+        throw new Error(payload.error || 'Store sync could not be updated')
+      }
+      if (!commerceStoreSyncControlMatchesCommand(
+        payload.result.control,
+        command,
+      )) {
+        throw new Error('Store sync returned a response for a different command')
+      }
+      pendingStoreSyncCommands.current.delete(accountGlobalId)
+      setNotice(
+        `${payload.result.control.displayName} Store sync is ${payload.result.control.effectiveState}. ${payload.result.control.effectiveReasonLabel}`,
+      )
+      await loadWorkspace(selectedGlobalId)
+    } catch (caught) {
+      const refreshed = await loadWorkspace(selectedGlobalId)
+      const reconciled = refreshed?.storeSync.find(
+        (candidate) => candidate.accountGlobalId === accountGlobalId,
+      )
+      if (reconciled && commerceStoreSyncControlMatchesCommand(
+        reconciled,
+        command,
+      )) {
+        pendingStoreSyncCommands.current.delete(accountGlobalId)
+        setNotice(
+          `${reconciled.displayName} Store sync is ${reconciled.effectiveState}. ${reconciled.effectiveReasonLabel}`,
+        )
+        setError('')
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,
+        )
+      }
+    } finally {
+      setUpdatingStoreSyncAccount('')
+    }
+  }
+
   const openCreatedOneOffShipment = async (result: {
     orderGlobalId: string
     packageCount: number
@@ -4842,83 +4950,202 @@ export default function OperationsSection({
                 Create one-off shipment
               </Button>
             )}
-            {workspace?.capabilities.canActivate && (
-              <TextField
-                select
-                size="small"
-                value={workspace.activation.state}
-                onChange={(event) => requestActivationChange(
-                  event.target.value as OperationsActivationState,
-                )}
-                disabled={updatingActivation}
-                inputProps={{ 'aria-label': 'Operations activation mode' }}
-                SelectProps={{
-                  renderValue: (selected) => ACTIVATION_OPTIONS.find(
-                    (option) => option.value === selected,
-                  )?.label || displayStatus(String(selected)),
-                  MenuProps: {
-                    variant: 'menu',
-                    anchorOrigin: { vertical: 'bottom', horizontal: 'right' },
-                    transformOrigin: { vertical: 'top', horizontal: 'right' },
-                    marginThreshold: 12,
-                    disablePortal: false,
-                    PaperProps: {
-                      sx: {
-                        mt: 0.75,
-                        width: 'min(340px, calc(100vw - 24px))',
-                        maxHeight: 'min(360px, calc(100dvh - 24px))',
-                        overflowY: 'auto',
-                        overscrollBehavior: 'contain',
-                      },
-                    },
-                    MenuListProps: {
-                      'aria-label': 'Operations activation statuses',
-                      sx: { p: 0.5 },
-                    },
-                  },
-                }}
-                sx={{ ...controlSx, minWidth: 118 }}
-              >
-                {ACTIVATION_OPTIONS.map((option) => (
-                  <MenuItem
-                    key={option.value}
-                    value={option.value}
-                    disabled={
-                      option.value === 'active'
-                      && workspace.activation.state !== 'shadow'
-                      && workspace.activation.state !== 'active'
-                    }
-                    sx={{
-                      minHeight: 58,
-                      alignItems: 'flex-start',
-                      borderRadius: 1,
-                      px: 1.25,
-                      py: 1,
-                      whiteSpace: 'normal',
-                    }}
-                  >
-                    <Box sx={{ minWidth: 0 }}>
-                      <Typography variant="body2" fontWeight={700}>
-                        {option.label}
-                      </Typography>
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{ display: 'block', lineHeight: 1.35 }}
-                      >
-                        {option.description}
-                      </Typography>
-                    </Box>
-                  </MenuItem>
-                ))}
-              </TextField>
-            )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
             {mainWorkspaceView && (
               <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
             )}
           </Stack>
         </Stack>
+
+        {mainWorkspaceView && workspace && workspace.storeSync.length > 0 && (
+          <Stack
+            data-testid="commerce-store-sync-summary"
+            spacing={1}
+            sx={{ mt: 2 }}
+          >
+            <Typography variant="overline" color="text.secondary">
+              Store sync · new provider catalog, order, image, and inventory
+              mirroring; existing mirrored data remains available
+            </Typography>
+            {workspace.storeSync.map((control) => (
+              <Stack
+                key={control.accountGlobalId}
+                data-testid={`commerce-store-sync-${control.accountGlobalId}`}
+                direction={{ xs: 'column', sm: 'row' }}
+                alignItems={{ xs: 'stretch', sm: 'center' }}
+                justifyContent="space-between"
+                gap={1}
+                sx={{
+                  border: '1px solid rgba(255,255,255,0.09)',
+                  borderRadius: 1.5,
+                  px: 1.5,
+                  py: 1.25,
+                  minWidth: 0,
+                }}
+              >
+                <Box sx={{ minWidth: 0 }}>
+                  <Stack direction="row" gap={0.75} alignItems="center" flexWrap="wrap">
+                    <Typography variant="body2" fontWeight={700}>
+                      {control.displayName}
+                    </Typography>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={`${displayStatus(control.provider)} · ${displayStatus(control.environment)}`}
+                    />
+                  </Stack>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ display: 'block', mt: 0.25 }}
+                  >
+                    Desired: {displayStatus(control.desiredState)} · Effective: {displayStatus(control.effectiveState)}
+                    {' · '}{control.explicitChoice ? 'Independent choice' : 'Legacy-derived default'}
+                  </Typography>
+                  <Typography
+                    variant="caption"
+                    color={control.effectiveState === 'running' ? 'success.light' : 'warning.light'}
+                    sx={{ display: 'block' }}
+                  >
+                    {control.effectiveReason}: {control.effectiveReasonLabel}
+                  </Typography>
+                </Box>
+                <Stack gap={0.75} sx={{ minWidth: { xs: '100%', sm: 180 } }}>
+                  <TextField
+                    select
+                    size="small"
+                    label="Desired Store sync"
+                    value={control.desiredState}
+                    onChange={(event) => void updateStoreSync(
+                      control.accountGlobalId,
+                      event.target.value as CommerceStoreSyncDesiredState,
+                    )}
+                    disabled={
+                      !workspace.capabilities.canActivate
+                      || updatingStoreSyncAccount === control.accountGlobalId
+                    }
+                    inputProps={{
+                      'aria-label': `${control.displayName} desired Store sync`,
+                    }}
+                    sx={{ ...controlSx, minWidth: { xs: '100%', sm: 180 } }}
+                  >
+                    <MenuItem value="running">Running</MenuItem>
+                    <MenuItem value="paused">Paused</MenuItem>
+                  </TextField>
+                  {!control.explicitChoice && (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      disabled={
+                        !workspace.capabilities.canActivate
+                        || updatingStoreSyncAccount === control.accountGlobalId
+                      }
+                      onClick={() => void updateStoreSync(
+                        control.accountGlobalId,
+                        control.desiredState,
+                      )}
+                    >
+                      Make independent
+                    </Button>
+                  )}
+                </Stack>
+              </Stack>
+            ))}
+          </Stack>
+        )}
+
+        {mainWorkspaceView && workspace?.capabilities.canActivate && (
+          <Stack
+            data-testid="operations-advanced-safety"
+            direction={{ xs: 'column', sm: 'row' }}
+            alignItems={{ xs: 'stretch', sm: 'center' }}
+            justifyContent="space-between"
+            gap={1}
+            sx={{ mt: 1.5 }}
+          >
+            <Box>
+              <Typography variant="caption" fontWeight={700}>
+                Advanced safety · legacy execution profile
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                Disabled and Frozen override automatic commerce mirroring and
+                activation-gated connected-order execution. Shadow, Read only,
+                and Active no longer determine Store sync after an independent
+                choice; existing mirrored data and local evidence remain viewable.
+              </Typography>
+            </Box>
+            <TextField
+              select
+              size="small"
+              label="Advanced safety"
+              value={workspace.activation.state}
+              onChange={(event) => requestActivationChange(
+                event.target.value as OperationsActivationState,
+              )}
+              disabled={updatingActivation}
+              inputProps={{ 'aria-label': 'Advanced Operations safety mode' }}
+              SelectProps={{
+                renderValue: (selected) => ACTIVATION_OPTIONS.find(
+                  (option) => option.value === selected,
+                )?.label || displayStatus(String(selected)),
+                MenuProps: {
+                  variant: 'menu',
+                  anchorOrigin: { vertical: 'bottom', horizontal: 'right' },
+                  transformOrigin: { vertical: 'top', horizontal: 'right' },
+                  marginThreshold: 12,
+                  disablePortal: false,
+                  PaperProps: {
+                    sx: {
+                      mt: 0.75,
+                      width: 'min(340px, calc(100vw - 24px))',
+                      maxHeight: 'min(360px, calc(100dvh - 24px))',
+                      overflowY: 'auto',
+                      overscrollBehavior: 'contain',
+                    },
+                  },
+                  MenuListProps: {
+                    'aria-label': 'Advanced Operations safety statuses',
+                    sx: { p: 0.5 },
+                  },
+                },
+              }}
+              sx={{ ...controlSx, minWidth: { xs: '100%', sm: 180 } }}
+            >
+              {ACTIVATION_OPTIONS.map((option) => (
+                <MenuItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={
+                    option.value === 'active'
+                    && workspace.activation.state !== 'shadow'
+                    && workspace.activation.state !== 'active'
+                  }
+                  sx={{
+                    minHeight: 58,
+                    alignItems: 'flex-start',
+                    borderRadius: 1,
+                    px: 1.25,
+                    py: 1,
+                    whiteSpace: 'normal',
+                  }}
+                >
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="body2" fontWeight={700}>
+                      {option.label}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      color="text.secondary"
+                      sx={{ display: 'block', lineHeight: 1.35 }}
+                    >
+                      {option.description}
+                    </Typography>
+                  </Box>
+                </MenuItem>
+              ))}
+            </TextField>
+          </Stack>
+        )}
 
         {mainWorkspaceView && summary && (
           <Box sx={{ display: 'flex', flexWrap: 'wrap', columnGap: { xs: 2, sm: 3.5 }, rowGap: 0.25, mt: 2 }}>
@@ -5103,11 +5330,15 @@ export default function OperationsSection({
         ) : view === 'imports' ? (
           <CommerceImportsPanel onOpenOrder={openPickingOrder} />
         ) : view === 'receiving' ? (
-          <ReceivingPanel workspace={workspace} onRefresh={() => loadWorkspace()} />
+          <ReceivingPanel workspace={workspace} onRefresh={async () => {
+            await loadWorkspace()
+          }} />
         ) : view === 'warehouses' ? (
           <WarehouseSetupPanel
             workspace={workspace}
-            onRefresh={() => loadWorkspace()}
+            onRefresh={async () => {
+              await loadWorkspace()
+            }}
             onNavigate={(next) => setView(next)}
           />
         ) : view === 'packaging-materials' ? (
@@ -5307,7 +5538,9 @@ export default function OperationsSection({
         onReviewOneOffGroupPurchase={openOneOffGroupPurchase}
         onVoidOneOffGroup={openOneOffGroupVoid}
         onOrderRevisionBusyChange={setOrderRevisionBusy}
-        onOrderRevisionChanged={() => loadWorkspace(detail?.globalId || selectedGlobalId)}
+        onOrderRevisionChanged={async () => {
+          await loadWorkspace(detail?.globalId || selectedGlobalId)
+        }}
         onReviewOrderRevisionRecovery={reviewOrderRevisionRecovery}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}

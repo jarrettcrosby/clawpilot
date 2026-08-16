@@ -4,8 +4,10 @@ import {
   inspectFaireCanonicalOrderRevision,
 } from '@/lib/integrations/faireOrderRevision'
 import {
+  assertCommerceOrderRevisionStoreSyncRunningInPostgres,
   captureCommerceOrderRevisionObservationInPostgres,
   claimCommerceOrderRevisionTargetsInPostgres,
+  CommerceOrderRevisionStoreSyncPausedError,
   failCommerceOrderRevisionTargetInPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
 
@@ -14,6 +16,9 @@ function safeErrorCode(error: unknown) {
     error instanceof FaireOrderRevisionError
     && /^[A-Z][A-Z0-9_]{2,127}$/u.test(error.code)
   ) return error.code
+  if (error instanceof CommerceOrderRevisionStoreSyncPausedError) {
+    return error.code
+  }
   return 'FAIRE_ORDER_REVISION_FAILED'
 }
 
@@ -45,6 +50,7 @@ export async function processFaireOrderRevisions(input: {
   const failureCodes: Record<string, number> = {}
   for (const claim of claims) {
     try {
+      await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)
       const evidence = await inspectFaireCanonicalOrderRevision(claim)
       const result = await captureCommerceOrderRevisionObservationInPostgres({
         claim,

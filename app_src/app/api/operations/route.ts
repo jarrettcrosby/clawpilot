@@ -18,6 +18,10 @@ import { OperationsShadowTrainingError } from '@/lib/operations/shadowTraining'
 import { canRequestOperationsPickHandoff } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  CommerceStoreSyncPersistenceError,
+  updateCommerceStoreSyncControlInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
   consumeCommerceActiveTransitionAuthorizationInPostgres,
@@ -977,6 +981,9 @@ function errorResponse(error: unknown) {
     return json({ ok: false, error: 'Select an active organization first', code: error.message }, 409)
   }
   if (error instanceof OperationsRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof CommerceStoreSyncPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof OperationsShadowTrainingError) {
@@ -2559,6 +2566,65 @@ export async function POST(req: NextRequest) {
           1,
           2_147_483_647,
         ),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'update-commerce-store-sync') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may change Store sync',
+          code: 'COMMERCE_STORE_SYNC_MANAGE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'accountGlobalId',
+          'desiredState',
+          'expectedDesiredState',
+          'expectedRevision',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Store sync command',
+      )
+      const desiredState = textValue(
+        body.desiredState,
+        'Store sync state',
+        20,
+      )
+      const expectedDesiredState = textValue(
+        body.expectedDesiredState,
+        'Expected Store sync state',
+        20,
+      )
+      if (!['running', 'paused'].includes(desiredState)
+          || !['running', 'paused'].includes(expectedDesiredState)) {
+        requestError(
+          'COMMERCE_STORE_SYNC_STATE_INVALID',
+          'Store sync state is invalid',
+        )
+      }
+      const result = await updateCommerceStoreSyncControlInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        accountGlobalId: globalIdValue(
+          body.accountGlobalId,
+          'Commerce connection',
+          INTEGRATION_ACCOUNT_GLOBAL_ID,
+        ),
+        desiredState: desiredState as 'running' | 'paused',
+        expectedDesiredState: expectedDesiredState as 'running' | 'paused',
+        expectedRevision: integerValue(
+          body.expectedRevision,
+          'Expected Store sync revision',
+          1,
+          2_147_483_647,
+        ),
+        reason: textValue(body.reason, 'Store sync reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
     }

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -24,6 +24,14 @@ import ShopifyCustomerRatePolicyPanel
 import {
   CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
 } from '@/lib/integrations/carrierCheckoutRate'
+import type {
+  CommerceStoreSyncControl,
+  CommerceStoreSyncDesiredState,
+  CommerceStoreSyncPendingCommand,
+} from '@/lib/operations/commerceStoreSync'
+import {
+  commerceStoreSyncControlMatchesCommand,
+} from '@/lib/operations/commerceStoreSync'
 
 type Provider = 'ups_rest' | 'fedex_rest'
 type PlanRateObjective =
@@ -131,6 +139,7 @@ type SetupPayload = {
 }
 
 type ShopifyCarrierServiceSetup = {
+  storeSync: CommerceStoreSyncControl
   account: {
     globalId: string
     configGlobalId: string
@@ -461,6 +470,9 @@ export default function ShopifyCarrierServiceSetupPanel({
   const [confirmNameAlignment, setConfirmNameAlignment] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [confirmRecovery, setConfirmRecovery] = useState(false)
+  const pendingStoreSyncCommand = useRef<
+    CommerceStoreSyncPendingCommand | null
+  >(null)
 
   const applySetup = useCallback((next: ShopifyCarrierServiceSetup) => {
     setSetup(next)
@@ -513,12 +525,14 @@ export default function ShopifyCarrierServiceSetupPanel({
         throw new Error(payload.error || 'Checkout-rating setup is unavailable')
       }
       applySetup(payload.setup)
+      return payload.setup
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
           : 'Checkout-rating setup is unavailable',
       )
+      return null
     } finally {
       setLoading(false)
     }
@@ -565,6 +579,93 @@ export default function ShopifyCarrierServiceSetupPanel({
           ? caught.message
           : 'Checkout-rating action failed',
       )
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const updateStoreSync = async (
+    desiredState: CommerceStoreSyncDesiredState,
+  ) => {
+    if (
+      !setup
+      || (
+        desiredState === setup.storeSync.desiredState
+        && setup.storeSync.explicitChoice
+      )
+    ) return
+    const retainedCommand = pendingStoreSyncCommand.current
+    if (retainedCommand && retainedCommand.desiredState !== desiredState) {
+      setError(
+        'A prior Store sync response is uncertain. Retry that exact change or reload before issuing a different change.',
+      )
+      return
+    }
+    const command: CommerceStoreSyncPendingCommand = retainedCommand || {
+      accountGlobalId,
+      desiredState,
+      expectedDesiredState: setup.storeSync.desiredState,
+      expectedRevision: setup.storeSync.revision,
+      reason: desiredState === setup.storeSync.desiredState
+        ? `Confirmed ${desiredState} as an independent Store sync choice in Shopify setup`
+        : `Changed Store sync from ${setup.storeSync.desiredState} to ${desiredState} in Shopify setup`,
+      idempotencyKey: `store-sync:${crypto.randomUUID()}`,
+    }
+    pendingStoreSyncCommand.current = command
+    setBusy('store-sync')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'update-commerce-store-sync',
+          accountGlobalId: command.accountGlobalId,
+          desiredState: command.desiredState,
+          expectedDesiredState: command.expectedDesiredState,
+          expectedRevision: command.expectedRevision,
+          reason: command.reason,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        result?: { control?: CommerceStoreSyncControl }
+      }
+      if (!response.ok || !payload.result?.control) {
+        throw new Error(payload.error || 'Store sync could not be updated')
+      }
+      if (!commerceStoreSyncControlMatchesCommand(
+        payload.result.control,
+        command,
+      )) {
+        throw new Error('Store sync returned a response for a different command')
+      }
+      pendingStoreSyncCommand.current = null
+      setNotice(
+        `Store sync is ${payload.result.control.effectiveState}. ${payload.result.control.effectiveReasonLabel}`,
+      )
+      await load()
+    } catch (caught) {
+      const refreshed = await load()
+      if (refreshed && commerceStoreSyncControlMatchesCommand(
+        refreshed.storeSync,
+        command,
+      )) {
+        pendingStoreSyncCommand.current = null
+        setNotice(
+          `Store sync is ${refreshed.storeSync.effectiveState}. ${refreshed.storeSync.effectiveReasonLabel}`,
+        )
+        setError('')
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,
+        )
+      }
     } finally {
       setBusy('')
     }
@@ -2130,10 +2231,6 @@ export default function ShopifyCarrierServiceSetupPanel({
   ]
 
   const operatingActivation = setup?.reference.activation.state || 'missing'
-  const storeMirrorRunning = (
-    operatingActivation === 'shadow'
-    || operatingActivation === 'active'
-  )
   const checkoutRateSummary = operatingActivation === 'active'
     ? callbackServingReady
       ? 'All eligible · LIVE carrier-rate sources'
@@ -2226,8 +2323,11 @@ export default function ShopifyCarrierServiceSetupPanel({
                   Current operating profile
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  These controls are shown separately even while the legacy
-                  Operations safety mode remains the underlying master fence.
+                  Store sync is independently controlled here. Checkout rating
+                  and order execution still use the effective legacy fences
+                  shown below. Pausing stops new provider catalog, order,
+                  image, and inventory mirroring; existing mirrored data
+                  remains available.
                 </Typography>
               </Box>
               <Chip
@@ -2248,16 +2348,55 @@ export default function ShopifyCarrierServiceSetupPanel({
                   Store sync
                 </Typography>
                 <Typography variant="body2" fontWeight={700}>
-                  {storeMirrorRunning ? 'Running' : 'Paused'} ·{' '}
+                  Desired {setup.storeSync.desiredState === 'running'
+                    ? 'Running'
+                    : 'Paused'} · Effective{' '}
+                  {setup.storeSync.effectiveState === 'running'
+                    ? 'Running'
+                    : 'Paused'} ·{' '}
                   {setup.account.environment === 'sandbox'
                     ? 'sandbox store'
                     : 'production store'}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {storeMirrorRunning
-                    ? `Running because Advanced safety is ${operatingActivation}.`
-                    : 'This release still derives sync from Advanced safety.'}
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {setup.storeSync.effectiveReason}:{' '}
+                  {setup.storeSync.effectiveReasonLabel}
                 </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {setup.storeSync.explicitChoice
+                    ? 'Independent Store sync choice'
+                    : 'Legacy-derived default; confirm it to make Store sync independent'}
+                </Typography>
+                <TextField
+                  select
+                  size="small"
+                  label="Desired Store sync"
+                  value={setup.storeSync.desiredState}
+                  onChange={(event) => void updateStoreSync(
+                    event.target.value as CommerceStoreSyncDesiredState,
+                  )}
+                  disabled={!setup.canActivate || Boolean(busy)}
+                  inputProps={{
+                    'aria-label': `${displayName} desired Store sync`,
+                  }}
+                  sx={{ mt: 1, minWidth: { xs: '100%', sm: 170 } }}
+                >
+                  <MenuItem value="running">Running</MenuItem>
+                  <MenuItem value="paused">Paused</MenuItem>
+                </TextField>
+                {!setup.storeSync.explicitChoice && (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={!setup.canActivate || Boolean(busy)}
+                    onClick={() => void updateStoreSync(
+                      setup.storeSync.desiredState,
+                    )}
+                    sx={{ mt: 1, width: { xs: '100%', sm: 'auto' } }}
+                  >
+                    Make independent
+                  </Button>
+                )}
               </Box>
               <Box>
                 <Typography variant="caption" color="text.secondary">

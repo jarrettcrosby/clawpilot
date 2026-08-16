@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -17,6 +18,7 @@ const FAIRE_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
 )
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 // This is only a scheduler/configuration hint. Faire's inventory endpoint is
 // the authority for whether the current credential can actually read inventory.
@@ -198,7 +200,7 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
                  job.credential_version
              AND credential.credential_version = job.credential_version
              AND credential.verification_status = 'verified'
-             AND activation.state IN ('shadow', 'active')
+             AND ${STORE_SYNC_RUNNING_SQL}
              AND activation.revision = job.activation_revision
              AND ${REQUESTED_READ_ACCOUNT_SQL}
          )`,
@@ -222,7 +224,7 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
            AND credential.credential_version =
                account.commerce_credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND ${REQUESTED_READ_ACCOUNT_SQL}
            AND EXISTS (
              SELECT 1
@@ -334,7 +336,7 @@ export async function claimFaireInventoryPollJobsInPostgres(input: {
                job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND activation.revision = job.activation_revision
            AND ${REQUESTED_READ_ACCOUNT_SQL}
          ORDER BY job.available_at, job.created_at, job.id
@@ -462,7 +464,7 @@ export async function readFaireInventoryPollSelectorsInPostgres(input: {
        AND account.commerce_credential_generation = job.credential_version
        AND credential.credential_version = job.credential_version
        AND credential.verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${STORE_SYNC_RUNNING_SQL}
        AND activation.revision = job.activation_revision
        AND ${REQUESTED_READ_ACCOUNT_SQL}
        AND channel_state.product_id IS NOT NULL
@@ -551,7 +553,7 @@ async function lockCurrentJob(
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
        FOR UPDATE OF job`,
@@ -599,7 +601,7 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
        FOR SHARE OF job, account, credential, activation`,
@@ -986,7 +988,7 @@ export async function recoverFaireInventoryPollInPostgres(input: {
            AND account.commerce_credential_generation = job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND activation.revision = job.activation_revision
            AND ${REQUESTED_READ_ACCOUNT_SQL}
          FOR UPDATE OF job`,
@@ -1158,7 +1160,6 @@ export async function readFaireInventoryPollStateFromPostgres(input: {
        WHERE job.organization_id = account.organization_id
          AND job.integration_account_id = account.id
          AND job.credential_version = account.commerce_credential_generation
-         AND job.activation_revision = activation.revision
        ORDER BY job.created_at DESC, job.id DESC
        LIMIT 1
      ) latest_job ON true
@@ -1175,7 +1176,6 @@ export async function readFaireInventoryPollStateFromPostgres(input: {
          AND current_observation.integration_account_id = account.id
          AND current_observation.credential_version =
              account.commerce_credential_generation
-         AND observation_job.activation_revision = activation.revision
      ) observation ON true
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
@@ -1316,7 +1316,7 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          AND credential.credential_version =
              account.commerce_credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
      ), variants AS (
        SELECT count(*)::text AS eligible_variants
        FROM operations_product_channel_states state
@@ -1361,7 +1361,6 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          ON account.organization_id = observation.organization_id
         AND account.id = observation.integration_account_id
         AND account.credential_version = observation.credential_version
-        AND account.activation_revision = observation_job.activation_revision
        ORDER BY observation.organization_id,
                 observation.integration_account_id,
                 observation.external_variant_id,
@@ -1407,8 +1406,6 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          AND current_account.id = current_job.integration_account_id
          AND current_account.credential_version =
              current_job.credential_version
-         AND current_account.activation_revision =
-             current_job.activation_revision
         WHERE current_job.status = 'succeeded') AS latest_success_at,
        (SELECT max(observed_at) FROM latest_observations)
          AS latest_observation_at,

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   executeShopifyFulfillmentWriteback,
@@ -1333,6 +1334,11 @@ export async function resolveCommerceCustomerInPostgres(input: {
   integrationAccountGlobalId: string
   actorEmail: string
   identity: CommerceCustomerIdentity
+  automaticStoreSync?: {
+    source: 'commerce_intake_customer_resolution'
+    runGlobalId: string
+    candidateGlobalId: string
+  }
 }): Promise<CommerceCustomerResolution> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
@@ -1368,6 +1374,35 @@ export async function resolveCommerceCustomerInPostgres(input: {
         'Select an active commerce integration for this provider',
         404,
       )
+    }
+    if (input.automaticStoreSync) {
+      const automaticAuthority = await client.query<{ running: boolean }>(
+        `SELECT operations_commerce_store_sync_is_running(
+           account.organization_id,
+           account.id
+         ) AS running
+         FROM operations_integration_accounts account
+         JOIN operations_commerce_store_sync_controls control
+           ON control.organization_id = account.organization_id
+          AND control.integration_account_id = account.id
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = account.organization_id
+         WHERE account.organization_id = $1::uuid
+           AND account.id = $2::uuid
+           AND account.global_id = $3
+           AND account.integration_type = 'commerce'
+           AND account.provider = $4
+         LIMIT 1
+         FOR UPDATE OF account, control, activation`,
+        [organizationId, integration.id, integrationAccountGlobalId, provider],
+      )
+      if (automaticAuthority.rows[0]?.running !== true) {
+        throw new OperationsRequestError(
+          'COMMERCE_STORE_SYNC_PAUSED',
+          'Store sync is Paused for this automatic commerce customer resolution',
+          409,
+        )
+      }
     }
     const pipeline = await resolvePipeline(client, organizationId)
     const mapped = await client.query<CustomerIdentityRow>(
@@ -4014,7 +4049,10 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const activation = await withTransaction((client) => resolveActivation(client, organizationId))
+  const [activation, storeSync] = await Promise.all([
+    withTransaction((client) => resolveActivation(client, organizationId)),
+    readCommerceStoreSyncControlsFromPostgres(organizationId),
+  ])
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid', 'orders.archived_at IS NULL']
   const exceptionValues: unknown[] = [organizationId]
@@ -4542,6 +4580,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       reason: activation.reason,
       updatedAt: activation.updated_at.toISOString(),
     },
+    storeSync,
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),

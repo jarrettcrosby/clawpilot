@@ -19,6 +19,7 @@ import {
   commerceReadAccountSql,
   commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -47,8 +48,13 @@ const GLOBAL_APPLICATION_ID = /^gcoa(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{2,127}$/u
 const READABLE_ACCOUNT_SQL = commerceReadAccountSql('account')
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 export type CommerceOrderRevisionProvider = 'shopify' | 'faire'
+
+export class CommerceOrderRevisionStoreSyncPausedError extends Error {
+  readonly code = 'COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED'
+}
 export type CommerceOrderRevisionMaterialState =
   | 'current'
   | 'review_required'
@@ -478,6 +484,7 @@ export async function claimCommerceOrderRevisionTargetsInPostgres(input: {
            AND account.integration_type = 'commerce'
            AND account.external_account_id IS NOT NULL
            AND ${READABLE_ACCOUNT_SQL}
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND credential.verification_status = 'verified'
            AND credential.credential_version = account.commerce_credential_generation
            AND credential.external_account_id = account.external_account_id
@@ -525,6 +532,53 @@ export async function claimCommerceOrderRevisionTargetsInPostgres(input: {
     )
     return claimed.rows.map(normalizedClaim)
   })
+}
+
+/**
+ * Revalidates the exact lease and account-scoped Store sync fence immediately
+ * before a revision adapter is allowed to issue its first provider read.
+ */
+export async function assertCommerceOrderRevisionStoreSyncRunningInPostgres(
+  claim: CommerceOrderRevisionClaim,
+) {
+  validateClaim(claim)
+  const current = await query<{ permitted: boolean }>(
+    `SELECT COALESCE(
+       target.claim_state = 'processing'
+       AND target.locked_by = $3
+       AND target.lock_token = $4::uuid
+       AND target.locked_until > now()
+       AND account.global_id = $5
+       AND account.provider = $6
+       AND account.integration_type = 'commerce'
+       AND account.commerce_credential_generation = $7
+       AND ${STORE_SYNC_RUNNING_SQL},
+       false
+     ) AS permitted
+     FROM operations_commerce_order_revision_targets target
+     JOIN operations_integration_accounts account
+       ON account.organization_id = target.organization_id
+      AND account.id = target.integration_account_id
+     WHERE target.id = $1::uuid
+       AND target.organization_id = $2::uuid
+       AND target.integration_account_id = $8::uuid
+     LIMIT 1`,
+    [
+      claim.targetId,
+      claim.organizationId,
+      claim.workerId,
+      claim.leaseToken,
+      claim.accountGlobalId,
+      claim.provider,
+      claim.credentialVersion,
+      claim.integrationAccountId,
+    ],
+  )
+  if (current.rows[0]?.permitted !== true) {
+    throw new CommerceOrderRevisionStoreSyncPausedError(
+      'Store sync paused or the exact revision-read lease changed before provider I/O',
+    )
+  }
 }
 
 export async function prepareManagerCommerceOrderRevisionRefreshInPostgres(
@@ -1086,6 +1140,7 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
          AND target.locked_until > now()
          AND credential.verification_status = 'verified'
          AND credential.credential_version = account.commerce_credential_generation
+         AND ${STORE_SYNC_RUNNING_SQL}
        FOR UPDATE OF target, account, credential`,
       [
         input.claim.targetId,
@@ -3637,8 +3692,13 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
     count: string
     overdue_count: string
     stale_count: string
+    store_sync_running: boolean
   }>(
-    `SELECT provider, claim_state, material_state,
+    `SELECT target.provider, target.claim_state, target.material_state,
+            operations_commerce_store_sync_is_running(
+              target.organization_id,
+              target.integration_account_id
+            ) AS store_sync_running,
             count(*)::text AS count,
             count(*) FILTER (
               WHERE target.next_check_at < now() - interval '${REVISION_OVERDUE_GRACE}'
@@ -3653,8 +3713,9 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
        ON order_row.organization_id = target.organization_id
       AND order_row.id = target.order_id
      WHERE order_row.status NOT IN ('shipped', 'cancelled')
-     GROUP BY provider, claim_state, material_state
-     ORDER BY provider, claim_state, material_state`,
+     GROUP BY target.provider, target.claim_state, target.material_state,
+              target.organization_id, target.integration_account_id
+     ORDER BY target.provider, target.claim_state, target.material_state`,
   ), query<{
     referenced_key_ids: string[]
     unpurged_protected_read_count: number
@@ -3698,19 +3759,27 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
     count: Number(row.count),
     overdue: Number(row.overdue_count),
     stale: Number(row.stale_count),
+    storeSyncRunning: row.store_sync_running,
   }))
   const summary = targets.reduce((current, row) => ({
-    active: current.active + row.count,
-    failed: current.failed + (row.claimState === 'failed' ? row.count : 0),
+    active: current.active + (row.storeSyncRunning ? row.count : 0),
+    retainedPaused:
+      current.retainedPaused + (row.storeSyncRunning ? 0 : row.count),
+    failed: current.failed + (
+      row.storeSyncRunning && row.claimState === 'failed' ? row.count : 0
+    ),
     deadLetter:
-      current.deadLetter + (row.claimState === 'dead_letter' ? row.count : 0),
+      current.deadLetter + (
+        row.storeSyncRunning && row.claimState === 'dead_letter' ? row.count : 0
+      ),
     materialReviewRequired:
       current.materialReviewRequired
-      + (row.materialState !== 'current' ? row.count : 0),
-    overdue: current.overdue + row.overdue,
-    stale: current.stale + row.stale,
+      + (row.storeSyncRunning && row.materialState !== 'current' ? row.count : 0),
+    overdue: current.overdue + (row.storeSyncRunning ? row.overdue : 0),
+    stale: current.stale + (row.storeSyncRunning ? row.stale : 0),
   }), {
     active: 0,
+    retainedPaused: 0,
     failed: 0,
     deadLetter: 0,
     materialReviewRequired: 0,

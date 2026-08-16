@@ -2623,21 +2623,39 @@ async function verifyImports(pool) {
     state: 'waiting_mapping',
     attemptCount: 1,
   })
+  const frozenResolverBefore = await pool.query(
+    `SELECT state, wait_reason, attempt_count, updated_at::text
+     FROM operations_commerce_product_image_import_jobs
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [gamma.organizationId, frozenReceipt.jobId],
+  )
   const whileFrozen = await imageImports
     .resolveWaitingCommerceProductImageImportJobsInPostgres({
       organizationId: gamma.organizationId,
       updatedBy: 'activation-freeze-resolver',
       limit: 10,
     })
-  assert.deepEqual(Array.from(whileFrozen, (job) => ({
-    jobId: job.jobId,
-    state: job.state,
-    waitReason: job.waitReason,
-  })), [{
-    jobId: frozenReceipt.jobId,
-    state: 'waiting_mapping',
-    waitReason: 'mapping_changed',
-  }])
+  assert.deepEqual(Array.from(whileFrozen), [])
+  const whileStillFrozen = await imageImports
+    .resolveWaitingCommerceProductImageImportJobsInPostgres({
+      organizationId: gamma.organizationId,
+      updatedBy: 'activation-freeze-resolver-second-cycle',
+      limit: 10,
+    })
+  assert.deepEqual(Array.from(whileStillFrozen), [])
+  const frozenResolverAfter = await pool.query(
+    `SELECT state, wait_reason, attempt_count, updated_at::text
+     FROM operations_commerce_product_image_import_jobs
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [gamma.organizationId, frozenReceipt.jobId],
+  )
+  assert.deepEqual(
+    frozenResolverAfter.rows[0],
+    frozenResolverBefore.rows[0],
+    'repeated paused resolver cycles must not churn durable image job state',
+  )
   await pool.query(
     `UPDATE operations_activation_scopes
      SET state = 'shadow',

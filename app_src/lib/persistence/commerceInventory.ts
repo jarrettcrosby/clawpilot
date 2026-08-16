@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   SHOPIFY_INVENTORY_ADAPTER_VERSION,
   type ShopifyInventoryLocation,
@@ -23,6 +24,7 @@ const INVENTORY_POOL_NAME = 'Shopify Available-to-Promise'
 const INVENTORY_LOT_CODE = 'SHOPIFY_ATP'
 const SYNC_ACTION = 'inventory.levels.read'
 const SHOPIFY_LOCATION_ROUTING_LOCK = 'shopify-inventory-location-routing'
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const WAREHOUSE_FACILITY_TYPES = new Set([
   'distribution_center',
   'store',
@@ -62,6 +64,46 @@ export class CommerceInventoryPersistenceError extends Error {
     super(message)
     this.name = 'CommerceInventoryPersistenceError'
   }
+}
+
+async function lockShopifyInventoryStoreSyncRunning(
+  client: PoolClient,
+  runtime: Pick<
+    CommerceRuntimeCredentialRecord,
+    'organizationId' | 'integrationAccountId'
+  >,
+) {
+  const result = await client.query<{ effective_reason: string }>(
+    `SELECT operations_commerce_store_sync_effective_reason(
+       account.organization_id,
+       account.id
+     ) AS effective_reason
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_store_sync_controls control
+       ON control.organization_id = account.organization_id
+      AND control.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = account.organization_id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider = 'shopify'
+       AND operations_commerce_store_sync_is_running(
+         account.organization_id,
+         account.id
+       )
+     LIMIT 1
+     FOR UPDATE OF account, control, activation`,
+    [runtime.organizationId, runtime.integrationAccountId],
+  )
+  if (!result.rows[0]) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_STORE_SYNC_PAUSED',
+      'Store sync is Paused for this Shopify connection',
+      409,
+    )
+  }
+  return result.rows[0]
 }
 
 type TargetRow = QueryResultRow & {
@@ -779,6 +821,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
         leaseToken: null,
       }
     }
+    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
     if (latest?.state === 'prepared') {
       if (latest.captured) {
         const leaseToken = await capturedAttemptLease(latest)
@@ -1173,6 +1216,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         }),
       }
     }
+    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
     const lease = await client.query(
       `SELECT id
        FROM operations_commerce_provider_attempts
@@ -1378,6 +1422,10 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
        AND state = 'prepared'
        AND lease_token = $5::uuid
        AND lease_expires_at > clock_timestamp()
+       AND operations_commerce_store_sync_is_running(
+         organization_id,
+         integration_account_id
+       )
      RETURNING id`,
     [
       input.runtime.organizationId,
@@ -1485,6 +1533,31 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          'clawpilot.shopify_inventory_sync', 'on', true
        )`,
     )
+    const replay = await client.query<{ global_id: string }>(
+      `SELECT global_id
+       FROM operations_commerce_inventory_sync_runs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND idempotency_key = $3
+         AND provider_attempt_id = $4::uuid
+         AND warehouse_id = $5::uuid
+         AND status = 'succeeded'
+       LIMIT 1`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.idempotencyKey,
+        input.attempt.id,
+        input.target.warehouse.id,
+      ],
+    )
+    if (replay.rows[0]) {
+      return {
+        runGlobalId: replay.rows[0].global_id,
+        replayed: true,
+      }
+    }
+    await lockShopifyInventoryStoreSyncRunning(client, input.runtime)
     if (input.expectedRefreshFence) {
       const expected = input.expectedRefreshFence
       const refreshFence = await client.query(
@@ -1531,7 +1604,6 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           AND credential.verification_status = 'verified'
          JOIN operations_activation_scopes activation
            ON activation.organization_id = job.organization_id
-          AND activation.revision = job.activation_revision
          WHERE job.organization_id = $1::uuid
            AND job.integration_account_id = $2::uuid
            AND job.id = $3::uuid
@@ -1563,14 +1635,11 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
                AND mapping.inventory_import_enabled = true
              )
            )
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
            )
-           AND operations_shopify_carrier_service_config_is_ready(
+           AND operations_shopify_inventory_read_config_is_ready(
              config.organization_id,
              config.id
            )
@@ -1603,30 +1672,6 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           'The automatic Shopify inventory refresh authority changed before projection',
           409,
         )
-      }
-    }
-    const replay = await client.query<{ global_id: string }>(
-      `SELECT global_id
-       FROM operations_commerce_inventory_sync_runs
-       WHERE organization_id = $1::uuid
-         AND integration_account_id = $2::uuid
-         AND idempotency_key = $3
-         AND provider_attempt_id = $4::uuid
-         AND warehouse_id = $5::uuid
-         AND status = 'succeeded'
-       LIMIT 1`,
-      [
-        input.runtime.organizationId,
-        input.runtime.integrationAccountId,
-        input.idempotencyKey,
-        input.attempt.id,
-        input.target.warehouse.id,
-      ],
-    )
-    if (replay.rows[0]) {
-      return {
-        runGlobalId: replay.rows[0].global_id,
-        replayed: true,
       }
     }
     const captureFence = await client.query<{

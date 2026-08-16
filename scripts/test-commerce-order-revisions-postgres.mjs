@@ -227,6 +227,11 @@ export function loadTypeScriptModule(path, mocks = {}) {
       if (specifier === '@/lib/persistence/config') {
         return { isHostedRuntime: () => false }
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       return requireFromApp(specifier)
     },
   }, { filename: path })

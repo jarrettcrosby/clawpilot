@@ -1294,7 +1294,10 @@ async function verify(databaseUrl) {
     assert.equal(frozenShopifyOrders.actualReadiness.state, 'unavailable')
     assert.equal(frozenShopifyOrders.actualReadiness.evidence.activationState, 'frozen')
     assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
-      'COMMERCE_AUTHORITY_ACTIVATION_INELIGIBLE',
+      'COMMERCE_AUTHORITY_STORE_SYNC_PAUSED',
+    ))
+    assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
+      'OPERATIONS_FROZEN_OVERRIDE',
     ))
     await pool.query(
       `UPDATE operations_activation_scopes

@@ -32,6 +32,7 @@ let checkoutAudienceMode:
   | 'restricted_customers'
   | 'all_eligible' = 'restricted_customers'
 let accountEnvironment: 'sandbox' | 'production' = 'sandbox'
+let storeSyncDesiredState: 'running' | 'paused' = 'running'
 let policyLookupCount = 0
 let ratingAccountAvailable = true
 const downstreamCalls: string[] = []
@@ -53,6 +54,9 @@ const account = {
   },
   externalAccountId: 'pro-bakery-bites.myshopify.com',
   registrationState: 'registered',
+  get storeSyncDesiredState() {
+    return storeSyncDesiredState
+  },
   configGlobalId: 'gscf0000001',
   configRowVersion: 1,
   credentialGeneration: 1,
@@ -637,6 +641,54 @@ test('all-eligible audience bypasses customer-policy lookup but keeps later call
       }
       accountEnvironment = 'sandbox'
       checkoutAudienceMode = 'restricted_customers'
+    }
+  },
+)
+
+test('Paused Store sync does not gate authenticated CarrierService callback evaluation',
+  async () => {
+    const warningCalls: unknown[][] = []
+    const warn = mock.method(console, 'warn', (...args: unknown[]) => {
+      warningCalls.push(args)
+    })
+    const priorSessionSecret = process.env.APP_SESSION_SECRET
+    try {
+      process.env.APP_SESSION_SECRET = 'paused-sync-callback-test-secret-32-bytes'
+      storeSyncDesiredState = 'paused'
+      accountEnvironment = 'sandbox'
+      checkoutAudienceMode = 'restricted_customers'
+      configuredVariantIds = new Set([allowedVariantId])
+      customerPolicy = { mode: 'show_all' }
+      policyLookupCount = 0
+      downstreamCalls.length = 0
+
+      const result = await executeShopifyCarrierServiceCallback({
+        accountGlobalId,
+        callbackToken,
+        request: callbackRequest(callbackPayload({ customerId: 207119551 })),
+      })
+
+      assert.equal(result.authenticated, true)
+      assert.notEqual(result.httpStatus, 200)
+      assert.equal(policyLookupCount, 1)
+      assert.deepEqual(downstreamCalls, [
+        'cartonization_product_gid',
+        'cartonization_variant_gid',
+        'carrier_destination_fingerprint',
+        'cartonization_context',
+      ])
+      assert.equal(
+        (warningCalls[0]?.[1] as Record<string, unknown>)?.stage,
+        'checkout_context',
+      )
+    } finally {
+      warn.mock.restore()
+      storeSyncDesiredState = 'running'
+      if (priorSessionSecret === undefined) {
+        delete process.env.APP_SESSION_SECRET
+      } else {
+        process.env.APP_SESSION_SECRET = priorSessionSecret
+      }
     }
   },
 )

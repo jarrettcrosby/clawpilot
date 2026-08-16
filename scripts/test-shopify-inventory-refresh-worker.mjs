@@ -59,6 +59,11 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -142,9 +147,8 @@ includes(persistence, [
   'completeShopifyInventoryRefreshJobInPostgres',
   'failShopifyInventoryRefreshJobInPostgres',
   'FOR UPDATE OF job SKIP LOCKED',
-  'operations_shopify_carrier_service_config_is_ready',
+  'operations_shopify_inventory_read_config_is_ready',
   'credential.verification_status =',
-  'activation.revision =',
   'config.row_version = job.config_row_version',
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
   "actor: 'system'",

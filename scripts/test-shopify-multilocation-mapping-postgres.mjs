@@ -169,6 +169,13 @@ function loadPersistence(pool) {
       if (specifier === '@/lib/operations/shopifyInventoryProjection') {
         return projection
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return {
+          commerceStoreSyncRunningSql(alias) {
+            return `operations_commerce_store_sync_is_running(${alias}.organization_id, ${alias}.id)`
+          },
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') return postgres
       if (specifier.startsWith('@/')) return {}
       return requireFromApp(specifier)
@@ -530,7 +537,7 @@ async function seed(client) {
     await client.query(
       `INSERT INTO operations_activation_scopes (
          organization_id, data_pipeline_id, state, revision, updated_by
-       ) VALUES ($1::uuid, $2::uuid, 'shadow', 1, $3)`,
+       ) VALUES ($1::uuid, $2::uuid, 'read_only', 1, $3)`,
       [ids.organization, ids.pipeline, actorEmail],
     )
     await client.query(
@@ -556,6 +563,17 @@ async function seed(client) {
          'gid://shopify/Shop/2890002', 1
        )`,
       [ids.accountTwo, runtimeTwo.globalId, ids.organization],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_store_sync_controls (
+         organization_id, integration_account_id, desired_state,
+         explicit_choice, revision, reason, created_by, updated_by
+       ) VALUES
+       ($1::uuid, $2::uuid, 'running', true, 1,
+        'Shopify mapping fixture Running', $4, $4),
+       ($1::uuid, $3::uuid, 'running', true, 1,
+        'Second Shopify mapping fixture Running', $4, $4)`,
+      [ids.organization, ids.account, ids.accountTwo, actorEmail],
     )
     await client.query(
       `INSERT INTO operations_commerce_credentials (

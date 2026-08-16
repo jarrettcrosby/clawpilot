@@ -57,6 +57,11 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }

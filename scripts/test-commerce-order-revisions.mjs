@@ -57,6 +57,7 @@ assert.match(migration, /provider_write_count integer NOT NULL CHECK \(provider_
 
 for (const exportedContract of [
   'claimCommerceOrderRevisionTargetsInPostgres',
+  'assertCommerceOrderRevisionStoreSyncRunningInPostgres',
   'captureCommerceOrderRevisionObservationInPostgres',
   'failCommerceOrderRevisionTargetInPostgres',
   'assertCommerceOrderRevisionExecutionCurrent',
@@ -64,10 +65,18 @@ for (const exportedContract of [
   'purgeExpiredCommerceOrderRevisionProtectedSnapshotsInPostgres',
   'cancelUnstartedCommerceOrderFromProviderRevisionInPostgres',
   'CommerceOrderRevisionDispositionError',
+  'CommerceOrderRevisionStoreSyncPausedError',
 ]) {
   assert.match(persistence, new RegExp(`export (?:async )?(?:function|class) ${exportedContract}`))
 }
 assert.match(persistence, /FOR UPDATE OF target SKIP LOCKED/u)
+assert.ok(
+  worker.indexOf('await assertCommerceOrderRevisionStoreSyncRunningInPostgres(claim)')
+    < worker.indexOf('await inspectShopifyCanonicalOrderRevision(claim)'),
+  'Shopify revision work must recheck exact Store sync before provider I/O',
+)
+assert.match(worker, /error instanceof CommerceOrderRevisionStoreSyncPausedError/u)
+assert.match(persistence, /COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED/u)
 assert.match(persistence, /claim_state = 'processing'/u)
 assert.match(persistence, /lock_token = gen_random_uuid\(\)/u)
 assert.match(persistence, /target\.lock_token = \$4::uuid/u)
