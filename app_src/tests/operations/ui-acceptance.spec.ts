@@ -222,6 +222,21 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
       reason: 'Acceptance validation',
       updatedAt: '2026-07-22T18:00:00.000Z',
     },
+    storeSync: [{
+      accountGlobalId: 'gia9286799',
+      provider: 'shopify',
+      environment: 'sandbox',
+      displayName: 'Pro Bakery Bites',
+      accountStatus: 'active',
+      desiredState: 'running',
+      effectiveState: 'running',
+      effectiveReason: 'STORE_SYNC_EXPLICIT_RUNNING',
+      effectiveReasonLabel: 'Running by an explicit Store sync choice.',
+      explicitChoice: true,
+      revision: 2,
+      reason: 'Acceptance validation',
+      updatedAt: '2026-07-22T18:00:00.000Z',
+    }],
     summary: {
       openOrders: 1,
       exceptions: exceptionStatus === 'open' || exceptionStatus === 'acknowledged' ? 1 : 0,
@@ -465,6 +480,68 @@ async function installImportedOrderPreparationRoutes(page: Page) {
   }
   let planned = false
 
+  await page.route((url) => url.pathname === '/api/operations/training', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        training: {
+          eligible: true,
+          eligibilityCode: null,
+          run: null,
+        },
+      },
+    })
+  })
+  await page.route((url) => url.pathname === '/api/operations/order-revisions', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: 'gor7654321',
+          orderRowVersion: planned ? 1 : 0,
+          orderStatus: planned ? 'planned' : 'imported',
+          state: null,
+        },
+      },
+    })
+  })
+  await page.route(
+    (url) => url.pathname === '/api/integrations/commerce/intake/planning-assignment',
+    async (route) => {
+      expect(route.request().postDataJSON()).toMatchObject({
+        action: 'inspect',
+        accountGlobalId: 'gia9286799',
+        candidateGlobalId: 'gcoc35vrs9qjtmee',
+        expectedCandidateRowVersion: 10,
+      })
+      await route.fulfill({
+        json: {
+          ok: true,
+          assignment: {
+            version: 'shopify-order-planning-assignment-v1',
+            status: 'ready',
+            accountGlobalId: 'gia9286799',
+            candidateGlobalId: 'gcoc35vrs9qjtmee',
+            candidateRowVersion: 10,
+            assignments: [],
+            selectedWarehouse: {
+              globalId: 'gwh5366613',
+              name: 'Ag-Alchemy',
+              mappingGlobalId: 'gwlm7654321',
+              mappingRowVersion: 1,
+              shopifyLocationId: 'gid://shopify/Location/123456789',
+              shopifyLocationName: 'Ag-Alchemy',
+            },
+            providerReads: 1,
+            providerWrites: 0,
+          },
+        },
+      })
+    },
+  )
+
   await page.route((url) => url.pathname === '/api/operations/packaging-materials', async (route) => {
     await route.fulfill({
       json: {
@@ -607,6 +684,14 @@ async function installImportedOrderPreparationRoutes(page: Page) {
         ok: true,
         operations: {
           ...workspace(),
+          capabilities: {
+            ...workspace().capabilities,
+            canActivate: false,
+          },
+          activation: {
+            ...workspace().activation,
+            state: 'read_only',
+          },
           summary: { ...workspace().summary, openOrders: 1 },
           orders: [current],
           selectedOrder: current,
@@ -1089,39 +1174,27 @@ test('operations tabs support touch navigation without portrait or landscape ove
   await expect.poll(async () => scroller.evaluate((element) => getComputedStyle(element).touchAction)).toBe('pan-x')
 
   const initialScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
-  const rightBox = await right.boundingBox()
-  if (!rightBox) throw new Error('Operations tabs right scroll control has no layout box')
-  await page.touchscreen.tap(rightBox.x + rightBox.width / 2, rightBox.y + rightBox.height / 2)
+  await right.tap()
   await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(initialScrollLeft)
   await expect(left).toBeEnabled()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
 
   const rightwardScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
-  const leftBox = await left.boundingBox()
-  if (!leftBox) throw new Error('Operations tabs left scroll control has no layout box')
-  await page.touchscreen.tap(leftBox.x + leftBox.width / 2, leftBox.y + leftBox.height / 2)
+  await left.tap()
   await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeLessThan(rightwardScrollLeft)
 
-  const nextRightBox = await right.boundingBox()
-  if (!nextRightBox) throw new Error('Operations tabs right scroll control has no layout box')
-  await page.touchscreen.tap(
-    nextRightBox.x + nextRightBox.width / 2,
-    nextRightBox.y + nextRightBox.height / 2,
-  )
+  await right.tap()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
 
-  const printingBox = await printing.boundingBox()
-  if (!printingBox) throw new Error('Printing tab has no layout box')
-  await page.touchscreen.tap(
-    printingBox.x + printingBox.width / 2,
-    printingBox.y + printingBox.height / 2,
-  )
+  await printing.tap()
   await expect(printing).toHaveAttribute('aria-selected', 'true')
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
   await page.setViewportSize({ width: 844, height: 390 })
-  await expect(page.getByRole('button', { name: /Scroll operations tabs (left|right)/ })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Scroll operations tabs (left|right)/ })).toHaveCount(2)
+  await expect(left).toBeEnabled()
+  await expect(right).toBeDisabled()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
@@ -1206,7 +1279,9 @@ test('pack and rate replay runs, persists, and reloads two-pass package evidence
   await expect(
     page.getByText('Customer checkout shipping charge').first(),
   ).toBeVisible()
-  await expect(page.getByText('Pre-label carrier estimate')).toBeVisible()
+  await expect(
+    page.getByText('Pre-label carrier estimate', { exact: true }).first(),
+  ).toBeVisible()
   await expect(page.getByText(
     /selected for 2 packages, but recorded label finalization has not proven every package used it/,
   )).toBeVisible()
@@ -1238,7 +1313,7 @@ test('Faire replay shows only the marketplace estimate before post-intake rating
     page.getByRole('heading', { name: 'Marketplace checkout estimate' }),
   ).toBeVisible()
   await expect(
-    page.getByText('Captured marketplace estimate', { exact: true }),
+    page.getByText('Captured checkout shipping charge', { exact: true }),
   ).toBeVisible()
   await expect(page.getByText('$18.95').first()).toBeVisible()
   await expect(page.getByText('ClawPilot checkout packages and rates')).toBeVisible()
@@ -1257,5 +1332,5 @@ test('Faire replay shows only the marketplace estimate before post-intake rating
       name: 'Marketplace estimate vs post-intake fulfillment',
     }),
   ).toBeVisible()
-  await expect(page.getByText(/no checkout carrier-cost or package-plan baseline/)).toBeVisible()
+  await expect(page.getByText(/no checkout carrier-estimate or package-plan baseline/)).toBeVisible()
 })

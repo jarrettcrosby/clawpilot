@@ -1428,6 +1428,7 @@ function OrderDetailDrawer({
               {order.packages.length ? (
                 <Stack spacing={1.5}>
                   {order.packages.map((item) => {
+                    const contents = item.contents || []
                     const artifact = printArtifacts.find(
                       (candidate) => (
                         candidate.documentKind === 'pack_work_instruction'
@@ -1447,7 +1448,7 @@ function OrderDetailDrawer({
                       canExecute
                       && order.status === 'packed'
                       && ['packed', 'labeled'].includes(item.status)
-                      && item.contents.length > 0
+                      && contents.length > 0
                     )
                     const generating = generatingPackingSlipPackageId === item.globalId
                     const printing = artifact
@@ -1503,9 +1504,9 @@ function OrderDetailDrawer({
                           <Typography variant="caption" color="text.secondary">
                             Exact contents
                           </Typography>
-                          {item.contents.length > 0 ? (
+                          {contents.length > 0 ? (
                             <Stack divider={<Divider flexItem />}>
-                              {item.contents.map((content) => (
+                              {contents.map((content) => (
                                 <Box
                                   key={content.globalId}
                                   sx={{
@@ -3677,7 +3678,7 @@ export default function OperationsSection({
           sandboxE2eAuthorizationGlobalId:
             detail.sandboxCommerceE2eAuthorization?.authorizationGlobalId,
           expectedNotificationPolicyRevision:
-            detail.fulfillmentNotificationPolicy.mode === 'clawpilot_explicit'
+            detail.fulfillmentNotificationPolicy?.mode === 'clawpilot_explicit'
               ? detail.fulfillmentNotificationPolicy.revision
               : undefined,
           customerNotificationOverride:
@@ -6527,14 +6528,15 @@ export default function OperationsSection({
                     : 'Shopify customer notification is forcibly disabled for this test and cannot be overridden.'}
                 </Alert>
               )}
-              {detail?.fulfillmentNotificationPolicy.mode === 'provider_managed' ? (
+              {detail?.fulfillmentNotificationPolicy?.mode === 'provider_managed' ? (
                 <Alert severity="info">
                   Faire may send a processing email when a NEW order is accepted, and submitting
                   shipment tracking triggers Faire&apos;s shipment email. Use a controlled recipient
                   for test orders. ClawPilot will attempt the separate fulfillment export, but
                   does not expose a retailer-notification override.
                 </Alert>
-              ) : detail?.fulfillmentNotificationPolicy.mode === 'unavailable' ? (
+              ) : !detail?.fulfillmentNotificationPolicy
+                || detail.fulfillmentNotificationPolicy.mode === 'unavailable' ? (
                 <Alert severity="info">
                   This commerce provider does not expose a ClawPilot customer-notification
                   policy. Shipment confirmation remains fail-closed and will not request a
