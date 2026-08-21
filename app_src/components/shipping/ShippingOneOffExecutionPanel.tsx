@@ -16,11 +16,15 @@ import {
 } from '@mui/material'
 
 import type {
+  OneOffShippingPackCommandResult,
   OneOffCarrierGroupCommandResult,
   OneOffPackedRateRefresh,
   OneOffShipmentExecutionState,
 } from '@/lib/operations/oneOffShipments'
-import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipmentConstants'
+import {
+  ONE_OFF_LIVE_POSTAGE_CONFIRMATION,
+  ONE_OFF_PACK_CONFIRMATION,
+} from '@/lib/operations/oneOffShipmentConstants'
 import {
   readShippingOneOffRetainedCommand,
   shippingOneOffResponseIsDefinitiveClientRejection,
@@ -34,11 +38,21 @@ type ExecutionPayload = {
   error?: string
   code?: string
   state?: OneOffShipmentExecutionState
-  result?: OneOffPackedRateRefresh | OneOffCarrierGroupCommandResult
+  result?: OneOffShippingPackCommandResult
+    | OneOffPackedRateRefresh
+    | OneOffCarrierGroupCommandResult
 }
 
 type CommandAction = ShippingOneOffCommandAction
 type RetainedCommand = ShippingOneOffRetainedCommand
+type PackBody = {
+  action: 'confirm-pack'
+  orderGlobalId: string
+  expectedRowVersion: number
+  expectedReviewSnapshotHash: string
+  confirmation: typeof ONE_OFF_PACK_CONFIRMATION
+  reason: string
+}
 type RefreshBody = {
   action: 'refresh-packed-rates'
   orderGlobalId: string
@@ -101,7 +115,7 @@ function retainCommand(
 function newCommand(
   action: CommandAction,
   orderGlobalId: string,
-  body: RefreshBody | PurchaseBody | VoidBody,
+  body: PackBody | RefreshBody | PurchaseBody | VoidBody,
 ): RetainedCommand {
   return {
     key: `shipping-one-off-${action}:${orderGlobalId}:${crypto.randomUUID()}`,
@@ -159,6 +173,23 @@ function refreshIsDurable(
     && body?.action === 'refresh-packed-rates'
     && body.orderGlobalId === state.orderGlobalId
     && state.packedRate?.requestIdempotencyKey === command.key,
+  )
+}
+
+function packIsDurable(
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+) {
+  const body = parsedCommandBody<PackBody>(command)
+  return Boolean(
+    state
+    && command
+    && body?.action === 'confirm-pack'
+    && body.orderGlobalId === state.orderGlobalId
+    && state.orderStatus === 'packed'
+    && state.packReview.receipt?.requestIdempotencyKey === command.key
+    && state.packReview.receipt.reviewSnapshotHash
+      === body.expectedReviewSnapshotHash,
   )
 }
 
@@ -221,21 +252,31 @@ export default function ShippingOneOffExecutionPanel({
 }) {
   const [state, setState] = useState<OneOffShipmentExecutionState | null>(null)
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState<'refresh' | 'purchase' | 'void' | ''>('')
+  const [busy, setBusy] = useState<'pack' | 'refresh' | 'purchase' | 'void' | ''>('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [selectedOfferGlobalId, setSelectedOfferGlobalId] = useState('')
   const [purchaseReason, setPurchaseReason] = useState(
     'Create labels for the reviewed current rate and exact packed one-off parcels',
   )
+  const [packReason, setPackReason] = useState(
+    'Physically reviewed every item and confirmed the exact package contents',
+  )
+  const [packConfirmed, setPackConfirmed] = useState(false)
   const [voidReason, setVoidReason] = useState(
     'Cancel the exact complete one-off carrier shipment before shipment confirmation',
   )
   const [liveConfirmed, setLiveConfirmed] = useState(false)
+  const [packCommand, setPackCommand] = useState<RetainedCommand | null>(null)
   const [refreshCommand, setRefreshCommand] = useState<RetainedCommand | null>(null)
   const [purchaseCommand, setPurchaseCommand] = useState<RetainedCommand | null>(null)
   const [voidCommand, setVoidCommand] = useState<RetainedCommand | null>(null)
   const [clock, setClock] = useState(() => Date.now())
+
+  const clearPackCommand = useCallback(() => {
+    setPackCommand(null)
+    retainCommand('pack', orderGlobalId, null)
+  }, [orderGlobalId])
 
   const clearRefreshCommand = useCallback(() => {
     setRefreshCommand(null)
@@ -285,7 +326,9 @@ export default function ShippingOneOffExecutionPanel({
     setError('')
     setNotice('')
     setSelectedOfferGlobalId('')
+    setPackConfirmed(false)
     setLiveConfirmed(false)
+    setPackCommand(readRetainedCommand('pack', orderGlobalId))
     setRefreshCommand(readRetainedCommand('packed-rate', orderGlobalId))
     setPurchaseCommand(readRetainedCommand('purchase', orderGlobalId))
     setVoidCommand(readRetainedCommand('void', orderGlobalId))
@@ -293,13 +336,16 @@ export default function ShippingOneOffExecutionPanel({
   }, [loadState, orderGlobalId])
 
   useEffect(() => {
+    if (packIsDurable(state, packCommand)) clearPackCommand()
     if (refreshIsDurable(state, refreshCommand)) clearRefreshCommand()
     if (purchaseIsDurable(state, purchaseCommand)) clearPurchaseCommand()
     if (voidIsDurable(state, voidCommand)) clearVoidCommand()
   }, [
+    clearPackCommand,
     clearPurchaseCommand,
     clearRefreshCommand,
     clearVoidCommand,
+    packCommand,
     purchaseCommand,
     refreshCommand,
     state,
@@ -358,12 +404,115 @@ export default function ShippingOneOffExecutionPanel({
     && expiresAt > clock,
   )
 
+  const confirmPack = async () => {
+    if (
+      !state
+      || busy
+      || !state.packReview.required
+      || (!packCommand && !state.packReview.evidenceHash)
+      || (!packCommand && !packConfirmed)
+      || (!packCommand && packReason.trim().length < 10)
+      || refreshCommand
+      || purchaseCommand
+      || voidCommand
+    ) return
+    const command = packCommand || newCommand('pack', orderGlobalId, {
+      action: 'confirm-pack',
+      orderGlobalId,
+      expectedRowVersion: state.rowVersion,
+      expectedReviewSnapshotHash: state.packReview.evidenceHash!,
+      confirmation: ONE_OFF_PACK_CONFIRMATION,
+      reason: packReason.trim(),
+    })
+    setPackCommand(command)
+    if (!retainCommand('pack', orderGlobalId, command)) {
+      setPackCommand(null)
+      setError('Browser retry storage is unavailable. No pack confirmation was sent.')
+      return
+    }
+    setBusy('pack')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/one-off-shipments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.key,
+        },
+        body: command.body,
+      })
+      const { malformed, payload } = await readPayload(response)
+      const validResult = Boolean(
+        response.ok
+        && payload.ok
+        && payload.result
+        && 'reviewSnapshotHash' in payload.result
+        && payload.result.orderGlobalId === orderGlobalId,
+      )
+      if (!validResult) {
+        if (definitiveClientRejection(response, malformed)) {
+          const durable = await loadState()
+          if (!durable) {
+            throw new Error('The rejected pack confirmation could not be reconciled to durable status')
+          }
+          if (packIsDurable(durable, command)) {
+            clearPackCommand()
+            setPackConfirmed(false)
+            setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
+            await onUpdated()
+            return
+          }
+          clearPackCommand()
+          setError(
+            `${payloadMessage(payload, 'The physical pack confirmation was rejected')} `
+            + 'Refresh and physically review the exact current evidence before trying again.',
+          )
+          return
+        }
+        throw new Error(payloadMessage(payload, 'The exact physical pack confirmation did not complete'))
+      }
+      const result = payload.result as OneOffShippingPackCommandResult
+      const durable = await loadState()
+      if (
+        !packIsDurable(durable, command)
+        || durable?.packReview.receipt?.reviewSnapshotHash
+          !== result.reviewSnapshotHash
+      ) {
+        throw new Error('The pack response is not yet bound to the exact durable review receipt')
+      }
+      clearPackCommand()
+      setPackConfirmed(false)
+      setNotice(
+        `${result.packageCount} ${result.packageCount === 1 ? 'parcel is' : 'parcels are'} `
+        + 'packed with reservations retained and zero carrier or label writes.',
+      )
+      await onUpdated()
+    } catch (caught) {
+      const durable = await loadState()
+      if (packIsDurable(durable, command)) {
+        clearPackCommand()
+        setPackConfirmed(false)
+        setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
+        await onUpdated()
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'The exact physical pack confirmation did not complete'}. `
+          + 'Check status or retry the retained byte-identical request; do not create a new confirmation.',
+        )
+      }
+    } finally {
+      setBusy('')
+    }
+  }
+
   const refreshRates = async () => {
     if (
       !state
       || busy
       || !liveAllowed
       || unresolved
+      || packCommand
       || purchaseCommand
       || voidCommand
     ) return
@@ -452,7 +601,7 @@ export default function ShippingOneOffExecutionPanel({
       !state
       || busy
       || !liveAllowed
-      || Boolean(refreshCommand || voidCommand)
+      || Boolean(packCommand || refreshCommand || voidCommand)
       || (!purchaseCommand && !packedRateCurrent)
       || (!purchaseCommand && !state.packedRate)
       || (!purchaseCommand && !selectedOfferGlobalId)
@@ -557,7 +706,7 @@ export default function ShippingOneOffExecutionPanel({
       || (!group?.active && !retryingUnresolvedVoid)
       || busy
       || !liveAllowed
-      || Boolean(refreshCommand || purchaseCommand)
+      || Boolean(packCommand || refreshCommand || purchaseCommand)
       || (!voidCommand && voidReason.trim().length < 10)
     ) return
     const command = voidCommand || newCommand('void', orderGlobalId, {
@@ -661,7 +810,7 @@ export default function ShippingOneOffExecutionPanel({
         <Chip
           size="small"
           variant="outlined"
-          label={`${state?.packageCount || 0} packed parcel${state?.packageCount === 1 ? '' : 's'}`}
+          label={`${state?.packageCount || 0} ${state?.orderStatus === 'planned' ? 'planned' : 'packed'} parcel${state?.packageCount === 1 ? '' : 's'}`}
         />
         <Button
           size="small"
@@ -685,13 +834,102 @@ export default function ShippingOneOffExecutionPanel({
           Carrier outcome is unresolved. Check status and use only the retained exact request; a new provider request is fenced.
         </Alert>
       )}
-      {(refreshCommand || purchaseCommand || voidCommand) && (
+      {(packCommand || refreshCommand || purchaseCommand || voidCommand) && (
         <Alert severity="info" data-testid="shipping-retained-exact-request">
           An ambiguous request retains its byte-identical body and Idempotency-Key. Editing fields does not change that retry; a definitive 4xx rejection clears it and requires fresh review.
         </Alert>
       )}
+      {state?.packReview.receipt && (
+        <Alert severity="success">
+          Physical pack confirmed {new Date(state.packReview.receipt.packedAt).toLocaleString()} from immutable review evidence. Inventory reservations remain retained until shipment confirmation.
+        </Alert>
+      )}
 
-      {group && (group.active || retryingUnresolvedVoid) ? (
+      {state?.orderStatus === 'planned' ? (
+        <Stack spacing={1.5} data-testid="shipping-one-off-pack-review">
+          <Alert severity="info">
+            Physically review every item and assigned parcel below. Confirming pack retains the exact inventory reservations and makes zero carrier, postage, label, shipment, or inventory writes.
+          </Alert>
+          {state.packReview.blocker && (
+            <Alert severity="warning">{state.packReview.blocker}</Alert>
+          )}
+          <Box>
+            <Typography fontWeight={750}>Items to pack</Typography>
+            {state.packReview.lines.map((line) => (
+              <Typography key={line.lineKey} variant="body2">
+                {line.quantity} × {line.name}
+                {line.sku ? ` · ${line.sku}` : ''}
+                {` · ${line.kind === 'new' ? 'new Product' : line.kind === 'existing' ? 'existing inventory' : 'ad-hoc item'}`}
+              </Typography>
+            ))}
+          </Box>
+          <Box>
+            <Typography fontWeight={750}>Exact parcels</Typography>
+            {state.packReview.packages.map((oneOffPackage) => (
+              <Box key={oneOffPackage.globalId} sx={{ mt: 0.75 }}>
+                <Typography variant="body2" fontWeight={650}>
+                  Parcel {oneOffPackage.packageNumber} · {oneOffPackage.description}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {oneOffPackage.dimensionsMm.length} × {oneOffPackage.dimensionsMm.width} × {oneOffPackage.dimensionsMm.height} mm · {oneOffPackage.grossWeightGrams} g
+                </Typography>
+                {oneOffPackage.contents.map((content) => {
+                  const line = state.packReview.lines.find(
+                    (candidate) => candidate.lineKey === content.lineKey,
+                  )
+                  return (
+                    <Typography key={content.lineKey} variant="body2" sx={{ pl: 1.5 }}>
+                      {content.quantity} × {line?.name || content.lineKey}
+                    </Typography>
+                  )
+                })}
+              </Box>
+            ))}
+          </Box>
+          <Chip
+            size="small"
+            variant="outlined"
+            label={`${state.packReview.reservations.length} exact active inventory reservation${state.packReview.reservations.length === 1 ? '' : 's'} retained`}
+            sx={{ alignSelf: 'flex-start' }}
+          />
+          <TextField
+            size="small"
+            label="Physical pack reason"
+            value={packReason}
+            disabled={Boolean(packCommand)}
+            onChange={(event) => setPackReason(event.target.value)}
+            inputProps={{ maxLength: 500 }}
+          />
+          <FormControlLabel
+            control={(
+              <Checkbox
+                checked={packConfirmed}
+                disabled={Boolean(packCommand) || Boolean(state.packReview.blocker)}
+                onChange={(event) => setPackConfirmed(event.target.checked)}
+              />
+            )}
+            label="I physically verified every exact item is in its assigned parcel."
+          />
+          <Button
+            variant="contained"
+            disabled={
+              Boolean(busy)
+              || Boolean(state.packReview.blocker)
+              || !state.packReview.evidenceHash
+              || Boolean(refreshCommand || purchaseCommand || voidCommand)
+              || (!packCommand && !packConfirmed)
+              || (!packCommand && packReason.trim().length < 10)
+            }
+            onClick={() => { void confirmPack() }}
+          >
+            {busy === 'pack'
+              ? 'Confirming exact physical pack…'
+              : packCommand
+                ? 'Retry exact pack confirmation'
+                : 'Confirm physical pack'}
+          </Button>
+        </Stack>
+      ) : group && (group.active || retryingUnresolvedVoid) ? (
         <Stack spacing={1.25}>
           <Alert severity={group.active ? 'success' : 'warning'}>
             {group.active
@@ -720,7 +958,7 @@ export default function ShippingOneOffExecutionPanel({
             disabled={
               Boolean(busy)
               || !liveAllowed
-              || Boolean(refreshCommand || purchaseCommand)
+              || Boolean(packCommand || refreshCommand || purchaseCommand)
               || (!voidCommand && voidReason.trim().length < 10)
             }
             onClick={() => { void voidLabels() }}
@@ -742,7 +980,7 @@ export default function ShippingOneOffExecutionPanel({
               Boolean(busy)
               || !state
               || !liveAllowed
-              || Boolean(purchaseCommand || voidCommand)
+              || Boolean(packCommand || purchaseCommand || voidCommand)
               || unresolved
             }
             onClick={() => { void refreshRates() }}
@@ -797,7 +1035,7 @@ export default function ShippingOneOffExecutionPanel({
             disabled={
               Boolean(busy)
               || !liveAllowed
-              || Boolean(refreshCommand || voidCommand)
+              || Boolean(packCommand || refreshCommand || voidCommand)
               || (!purchaseCommand && !packedRateCurrent)
               || (unresolved && !retryingUnresolvedPurchase)
               || (!purchaseCommand && !selectedOfferGlobalId)

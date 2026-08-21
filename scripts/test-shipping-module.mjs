@@ -93,17 +93,20 @@ assertIncludes(shippingSection, [
   '<OneOffShipmentDialog',
   '<LtlFreightClassAssessmentPanel',
   '<ShippingOneOffExecutionPanel',
+  'standaloneOneOffPackEligible',
   'standaloneOneOffExecutionEligible',
-  'Standalone postage',
+  'One-off pack and postage',
   'canCreateShipments={Boolean(workspace?.capabilities.canCreate)}',
 ], 'Shipping module')
 assertIncludes(shippingExecutionPanel, [
+  "action: 'confirm-pack'",
   "action: 'refresh-packed-rates'",
   "action: 'purchase-group'",
   "action: 'void-group'",
   'Check status',
   'Create TEST labels',
   'Purchase LIVE postage',
+  'Confirm physical pack',
   'definitiveClientRejection',
   'command.body',
 ], 'Standalone Shipping postage controls')

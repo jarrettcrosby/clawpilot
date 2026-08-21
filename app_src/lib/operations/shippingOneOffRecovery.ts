@@ -1,4 +1,4 @@
-export type ShippingOneOffCommandAction = 'packed-rate' | 'purchase' | 'void'
+export type ShippingOneOffCommandAction = 'pack' | 'packed-rate' | 'purchase' | 'void'
 
 export type ShippingOneOffRetainedCommand = {
   key: string
@@ -8,6 +8,7 @@ export type ShippingOneOffRetainedCommand = {
 type CommandStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 
 function expectedBodyAction(action: ShippingOneOffCommandAction) {
+  if (action === 'pack') return 'confirm-pack'
   if (action === 'packed-rate') return 'refresh-packed-rates'
   if (action === 'purchase') return 'purchase-group'
   return 'void-group'

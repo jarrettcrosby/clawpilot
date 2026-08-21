@@ -22,6 +22,7 @@ type ShippingRecordRow = QueryResultRow & {
   tracking_numbers: string[]
   handling_unit_count: string
   execution_mode: 'test' | 'live' | null
+  standalone_one_off_pack_eligible: boolean
   standalone_one_off_execution_eligible: boolean
   occurred_at: Date
 }
@@ -43,6 +44,7 @@ function record(row: ShippingRecordRow): ShippingRecord {
     trackingNumbers: row.tracking_numbers,
     handlingUnitCount: Number(row.handling_unit_count),
     executionMode: row.execution_mode,
+    standaloneOneOffPackEligible: row.standalone_one_off_pack_eligible,
     standaloneOneOffExecutionEligible:
       row.standalone_one_off_execution_eligible,
     occurredAt: row.occurred_at.toISOString(),
@@ -65,6 +67,34 @@ export async function readShippingWorkspaceFromPostgres(input: {
               source_order.order_type,
               COALESCE(customer.name, source_order.ship_to->>'name') AS customer_name,
               quote.execution_mode,
+              (
+                source_order.source_provider = 'clawpilot_native'
+                AND source_order.order_type = 'one_off'
+                AND source_order.status = 'planned'
+                AND plan.status = 'planned'
+                AND quote.execution_mode IS NOT NULL
+                AND NOT operations_one_off_lines_are_pure_ad_hoc(
+                  quote.lines_snapshot
+                )
+                AND operations_one_off_plan_execution_is_exact(
+                  source_order.organization_id,
+                  plan.id,
+                  quote.execution_mode
+                )
+                AND EXISTS (
+                  SELECT 1
+                  FROM operations_packages package_state
+                  WHERE package_state.organization_id = source_order.organization_id
+                    AND package_state.plan_id = plan.id
+                )
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM operations_packages package_state
+                  WHERE package_state.organization_id = source_order.organization_id
+                    AND package_state.plan_id = plan.id
+                    AND package_state.status <> 'planned'
+                )
+              ) AS standalone_one_off_pack_eligible,
               (
                 source_order.source_provider = 'clawpilot_native'
                 AND source_order.order_type = 'one_off'
@@ -104,7 +134,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
          ON customer.pipeline_id = source_order.pipeline_id
         AND customer.id = source_order.customer_id
        JOIN LATERAL (
-         SELECT candidate.id, candidate.one_off_quote_id
+         SELECT candidate.id, candidate.one_off_quote_id, candidate.status
          FROM operations_fulfillment_plans candidate
          WHERE candidate.organization_id = source_order.organization_id
            AND candidate.order_id = source_order.id
@@ -161,6 +191,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
             COALESCE(parcel.tracking_numbers, ARRAY[]::text[]) AS tracking_numbers,
             COALESCE(parcel.shipment_count, shipping_order.package_count) AS handling_unit_count,
             shipping_order.execution_mode,
+            shipping_order.standalone_one_off_pack_eligible,
             shipping_order.standalone_one_off_execution_eligible,
             COALESCE(parcel.occurred_at, shipping_order.updated_at) AS occurred_at
      FROM shipping_orders shipping_order
@@ -194,6 +225,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
             handling_plan.handling_unit_count::text,
             CASE tender.environment
               WHEN 'sandbox' THEN 'test' ELSE 'live' END AS execution_mode,
+            false AS standalone_one_off_pack_eligible,
             false AS standalone_one_off_execution_eligible,
             COALESCE(tender.completed_at, tender.requested_at) AS occurred_at
      FROM operations_freight_tender_attempts tender

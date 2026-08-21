@@ -20,6 +20,9 @@ import {
 } from '@/lib/persistence/operationOneOffShipping'
 import { requireRequestUser } from '@/lib/requestUser'
 import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipments'
+import {
+  packShippingOneOffShipmentInPostgres,
+} from '@/lib/persistence/shippingOneOffPack'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -217,6 +220,31 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKey(req),
         quoteGlobalId,
         selectedOfferGlobalId: String(body.selectedOfferGlobalId || ''),
+        reason: String(body.reason || ''),
+      })
+      return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'confirm-pack') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion',
+        'expectedReviewSnapshotHash', 'confirmation', 'reason',
+      ].includes(key))
+      if (unsupported) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Shipping pack confirmation command is invalid',
+        )
+      }
+      const result = await packShippingOneOffShipmentInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId: String(body.orderGlobalId || ''),
+        expectedRowVersion: Number(body.expectedRowVersion),
+        expectedReviewSnapshotHash: String(
+          body.expectedReviewSnapshotHash || '',
+        ),
+        confirmation: String(body.confirmation || ''),
         reason: String(body.reason || ''),
       })
       return json({ ok: true, result }, result.replayed ? 200 : 201)

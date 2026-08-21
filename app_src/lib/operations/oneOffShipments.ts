@@ -8,6 +8,7 @@ export type OneOffRateEnvironment = 'sandbox' | 'production'
 export type OneOffExecutionMode = 'test' | 'live'
 export {
   ONE_OFF_LIVE_POSTAGE_CONFIRMATION,
+  ONE_OFF_PACK_CONFIRMATION,
   ONE_OFF_MAX_SYNCHRONOUS_PACKAGES,
 } from '@/lib/operations/oneOffShipmentConstants'
 
@@ -162,12 +163,75 @@ export type OneOffCarrierGroupCommandResult = {
   replayed: boolean
 }
 
+export type OneOffShippingPackReview = {
+  state: 'review_required' | 'packed'
+  required: boolean
+  evidenceHash: string | null
+  blocker: string | null
+  lines: Array<{
+    lineKey: string
+    kind: 'existing' | 'new' | 'ad_hoc'
+    name: string
+    sku: string | null
+    productGlobalId: string | null
+    quantity: number
+  }>
+  packages: Array<{
+    globalId: string
+    packageNumber: number
+    description: string
+    status: 'planned' | 'packed' | 'labeled' | 'shipped'
+    dimensionsMm: Millimeters
+    grossWeightGrams: number
+    contents: Array<{
+      lineKey: string
+      quantity: number
+    }>
+  }>
+  reservations: Array<{
+    globalId: string
+    lineKey: string
+    productGlobalId: string
+    positionGlobalId: string
+    positionRowVersion: number
+    quantity: number
+    status: 'active' | 'released' | 'consumed'
+  }>
+  receipt: null | {
+    requestIdempotencyKey: string
+    reviewSnapshotHash: string
+    packageCount: number
+    reservationCount: number
+    packedAt: string
+  }
+}
+
+export type OneOffShippingPackCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  fulfillmentPlanGlobalId: string
+  reviewSnapshotHash: string
+  packageCount: number
+  reservationCount: number
+  packedAt: string
+  effects: {
+    providerWrites: 0
+    labelWrites: 0
+    shipmentWrites: 0
+    inventoryWrites: 0
+  }
+  replayed: boolean
+}
+
 export type OneOffShipmentExecutionState = {
   orderGlobalId: string
+  orderStatus: 'planned' | 'packed'
   rowVersion: number
   executionMode: OneOffExecutionMode
   environment: OneOffRateEnvironment
   packageCount: number
+  packReview: OneOffShippingPackReview
   planning: {
     quoteGlobalId: string
     offerGlobalId: string

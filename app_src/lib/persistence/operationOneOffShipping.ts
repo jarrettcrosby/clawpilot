@@ -43,6 +43,9 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  readShippingOneOffPackReviewFromPostgres,
+} from '@/lib/persistence/shippingOneOffPack'
 
 type JsonObject = Record<string, unknown>
 type Provider = 'ups_rest' | 'fedex_rest'
@@ -617,6 +620,10 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
   const organizationId = requiredOrganizationId(input.organizationId)
   const orderGlobalId = requiredId(input.orderGlobalId, 'Order', ORDER_GLOBAL_ID)
   const context = await readGroupContext(organizationId, orderGlobalId, null, false)
+  const packReview = await readShippingOneOffPackReviewFromPostgres({
+    organizationId,
+    orderGlobalId,
+  })
   const packages = await readPackedPackages(
     organizationId,
     context.plan_id,
@@ -811,10 +818,12 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     : null
   return {
     orderGlobalId,
+    orderStatus: context.order_status === 'planned' ? 'planned' : 'packed',
     rowVersion: numberValue(context.row_version),
     executionMode: context.execution_mode,
     environment: context.environment,
     packageCount: packages.length,
+    packReview,
     planning: {
       quoteGlobalId: context.planning_quote_global_id,
       offerGlobalId: context.planning_offer_global_id,

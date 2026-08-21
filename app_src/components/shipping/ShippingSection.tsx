@@ -81,12 +81,22 @@ function formatDate(value: string) {
 }
 
 function recordStage(record: ShippingRecord) {
-  if (record.kind === 'shipment_plan') return 'Planned'
+  if (record.kind === 'shipment_plan' && record.status === 'planned') {
+    return record.standaloneOneOffPackEligible ? 'Pack review' : 'Planned'
+  }
+  if (record.kind === 'shipment_plan' && record.status === 'packed') {
+    return 'Postage ready'
+  }
+  if (record.kind === 'shipment_plan') return display(record.status)
   if (record.kind === 'ltl_tender') return 'Tendered'
   return display(record.status)
 }
 
 function recordStageColor(record: ShippingRecord) {
+  if (record.kind === 'shipment_plan' && record.status === 'planned') {
+    return record.standaloneOneOffPackEligible ? 'warning' as const : 'info' as const
+  }
+  if (record.kind === 'shipment_plan' && record.status === 'packed') return 'success' as const
   if (record.kind === 'shipment_plan') return 'info' as const
   if (record.status === 'delivered') return 'success' as const
   if (record.status === 'exception') return 'error' as const
@@ -301,12 +311,14 @@ function RecordDialog({
                 <Typography key={tracking}>{tracking}</Typography>
               )) : <Typography>None — this is a plan, not a carrier-confirmed shipment.</Typography>}
             </Box>
-            {record.standaloneOneOffExecutionEligible && canCreateShipments ? (
+            {(record.standaloneOneOffPackEligible
+              || record.standaloneOneOffExecutionEligible)
+              && canCreateShipments ? (
               <>
                 <Divider />
                 <Box>
                   <Typography fontWeight={750} sx={{ mb: 1 }}>
-                    Standalone postage
+                    One-off pack and postage
                   </Typography>
                   <ShippingOneOffExecutionPanel
                     orderGlobalId={record.orderGlobalId}
@@ -315,13 +327,14 @@ function RecordDialog({
                   />
                 </Box>
               </>
-            ) : record.standaloneOneOffExecutionEligible ? (
+            ) : (record.standaloneOneOffPackEligible
+              || record.standaloneOneOffExecutionEligible) ? (
               <Alert severity="info">
-                Create shipments permission is required to refresh rates, create labels, or cancel this standalone shipment.
+                Create shipments permission is required to confirm physical pack, refresh rates, create labels, or cancel this standalone shipment.
               </Alert>
             ) : record.kind === 'shipment_plan' && record.executionMode ? (
               <Alert severity="info">
-                Existing inventory and newly created products retain their canonical reservation and physical-control evidence. Complete their pick and pack in Operations; the resulting packed shipment can then use exact carrier postage controls.
+                This plan is not currently eligible for the exact Shipping pack or postage transition. Refresh after resolving its displayed status.
               </Alert>
             ) : null}
           </Stack>
@@ -383,7 +396,7 @@ export default function ShippingSection({
   const onCreated = (result: OneOffShipmentCreateResult) => {
     setNotice(result.orderStatus === 'packed'
       ? `Parcel shipment ${result.orderGlobalId} is packed and ready for a current postage quote. No postage, label, or tracking number was created yet.`
-      : `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. No postage, label, or tracking number was created during planning.`)
+      : `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. Open it in Shipments to physically review and confirm pack; no postage, label, or tracking number was created during planning.`)
     setMode('parcel')
     void loadWorkspace()
   }
@@ -450,7 +463,7 @@ export default function ShippingSection({
                   Create parcel shipment
                 </Button>
                 <Alert severity="info">
-                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products keep physical pick-and-pack in Operations, then return here for rates, labels, and cancellation once packed.
+                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products retain exact reservations, then can be physically reviewed, packed, rerated, labeled, and cancelled entirely in Shipping without Operations activation.
                 </Alert>
               </Stack>
             ) : (

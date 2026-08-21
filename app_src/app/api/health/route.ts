@@ -74,6 +74,9 @@ import {
   SHIPPING_INDEPENDENCE_HEALTH_SQL,
 } from '@/lib/persistence/shippingIndependenceHealth'
 import {
+  SHIPPING_ONE_OFF_PACK_HEALTH_SQL,
+} from '@/lib/persistence/shippingOneOffPackHealth'
+import {
   reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 import {
@@ -2491,6 +2494,7 @@ export async function GET() {
           operations_shopify_location_administration_applied: boolean
           operations_shadow_training_applied: boolean
           shipping_independence_applied: boolean
+          shipping_one_off_pack_applied: boolean
           operations_order_replanning_corrections_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
           operations_shopify_catalog_webhook_refresh_applied: boolean
@@ -3230,6 +3234,9 @@ export async function GET() {
               (
                 ${SHIPPING_INDEPENDENCE_HEALTH_SQL}
               ) AS shipping_independence_applied,
+              (
+                ${SHIPPING_ONE_OFF_PACK_HEALTH_SQL}
+              ) AS shipping_one_off_pack_applied,
               (
                 ${OPERATIONS_ORDER_REPLANNING_CORRECTIONS_HEALTH_SQL}
               ) AS operations_order_replanning_corrections_applied,
@@ -6245,6 +6252,7 @@ export async function GET() {
             && row?.operations_shopify_location_administration_applied
             && row?.operations_shadow_training_applied
             && row?.shipping_independence_applied
+            && row?.shipping_one_off_pack_applied
             && row?.operations_order_replanning_corrections_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
@@ -6366,6 +6374,11 @@ export async function GET() {
           },
           shippingIndependence: {
             status: row?.shipping_independence_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shippingOneOffPack: {
+            status: row?.shipping_one_off_pack_applied
               ? 'ready'
               : 'migration-or-structure-pending',
           },
@@ -6731,6 +6744,7 @@ export async function GET() {
           || !row?.operations_shopify_location_administration_applied
           || !row?.operations_shadow_training_applied
           || !row?.shipping_independence_applied
+          || !row?.shipping_one_off_pack_applied
           || !row?.operations_order_replanning_corrections_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
           || !row?.operations_shopify_catalog_webhook_refresh_applied

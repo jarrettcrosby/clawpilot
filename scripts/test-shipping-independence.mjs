@@ -146,6 +146,15 @@ const oneOffRouteModule = runTypeScript(
     '@/lib/persistence/oneOffShipments': {
       OneOffShipmentPersistenceError: TestPersistenceError,
     },
+    '@/lib/operations/oneOffShipments': {
+      ONE_OFF_LIVE_POSTAGE_CONFIRMATION:
+        'AUTHORIZE THIS LIVE POSTAGE PURCHASE',
+    },
+    '@/lib/persistence/shippingOneOffPack': {
+      packShippingOneOffShipmentInPostgres: async () => {
+        throw new Error('Unexpected pack call in void permission contract')
+      },
+    },
     '@/lib/persistence/operationOneOffShipping': {
       readOneOffCarrierGroupExecutionModeInPostgres: async () => routeExecutionMode,
       voidOperationsOneOffCarrierGroupInPostgres: async (input) => {
@@ -163,9 +172,6 @@ const oneOffRouteModule = runTypeScript(
       requireRequestUser: async () => ({
         email: 'shipping-create-only@example.test',
       }),
-    },
-    '@/lib/operations/oneOffShipments': {
-      ONE_OFF_LIVE_POSTAGE_CONFIRMATION: 'AUTHORIZE THIS LIVE POSTAGE PURCHASE',
     },
   },
 )
@@ -311,18 +317,39 @@ for (const fragment of [
 }
 for (const fragment of [
   '<ShippingOneOffExecutionPanel',
+  'standaloneOneOffPackEligible',
   'standaloneOneOffExecutionEligible',
   'canCreateShipments={Boolean(workspace?.capabilities.canCreate)}',
-  'Create shipments permission is required to refresh rates',
+  'Create shipments permission is required to confirm physical pack, refresh rates, create labels, or cancel',
   'one-time ad-hoc item can be rated, labeled, and cancelled here',
-  'Existing inventory and deliberately created products keep physical pick-and-pack in Operations',
-  'then return here for rates, labels, and cancellation once packed',
+  'physically reviewed, packed, rerated, labeled, and cancelled entirely in Shipping without Operations activation',
 ]) {
   assert.ok(shippingUi.includes(fragment), `Standalone Shipping UI is missing ${fragment}`)
 }
+const standalonePackStart = shippingProjection.indexOf(
+  'source_order.source_provider =',
+)
+const standalonePackEnd = shippingProjection.indexOf(
+  ') AS standalone_one_off_pack_eligible',
+  standalonePackStart,
+)
+const standalonePackEligibility = shippingProjection.slice(
+  standalonePackStart,
+  standalonePackEnd,
+)
+assert.match(standalonePackEligibility, /source_order\.status = 'planned'/)
+assert.match(standalonePackEligibility, /plan\.status = 'planned'/)
+assert.match(standalonePackEligibility, /package_state\.status <> 'planned'/)
+assert.match(standalonePackEligibility, /operations_one_off_plan_execution_is_exact/)
 const standaloneEligibility = shippingProjection.slice(
-  shippingProjection.indexOf('source_order.source_provider ='),
-  shippingProjection.indexOf(') AS standalone_one_off_execution_eligible'),
+  shippingProjection.indexOf(
+    'source_order.source_provider =',
+    standalonePackEnd,
+  ),
+  shippingProjection.indexOf(
+    ') AS standalone_one_off_execution_eligible',
+    standalonePackEnd,
+  ),
 )
 assert.match(standaloneEligibility, /source_order\.status = 'packed'/)
 assert.match(standaloneEligibility, /quote\.execution_mode IS NOT NULL/)
@@ -343,7 +370,7 @@ assert.match(
     ),
   ),
   /CASE WHEN \$8::boolean THEN 'packed' ELSE 'planned'[\s\S]*pureAdHoc[\s\S]*SET status = CASE WHEN \$5::boolean THEN 'packed' ELSE 'planned'[\s\S]*pureAdHoc/,
-  'Only pure ad-hoc creation may auto-pack; inventory and new-product lines retain Operations pick/pack',
+  'Only pure ad-hoc creation may auto-pack; inventory and new-product lines retain physical pack confirmation',
 )
 for (const fragment of [
   "action: 'refresh-packed-rates'",
