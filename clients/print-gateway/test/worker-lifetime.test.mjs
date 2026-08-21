@@ -323,6 +323,7 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     })
   })
   const rawChunks = []
+  let rawByteLength = 0
   let releasePrinter
   const printerRelease = new Promise((resolvePromise) => { releasePrinter = resolvePromise })
   let rawConnectionStarted = false
@@ -330,7 +331,10 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     socket.pause()
     rawConnectionStarted = true
     void printerRelease.then(() => socket.resume())
-    socket.on('data', (chunk) => rawChunks.push(chunk))
+    socket.on('data', (chunk) => {
+      rawChunks.push(chunk)
+      rawByteLength += chunk.byteLength
+    })
   })
   api.listen(0, '127.0.0.1')
   printer.listen(0, '127.0.0.1')
@@ -379,6 +383,10 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     releasePrinter()
     await quiesced
     await waitFor(() => acknowledgements === 1, 'In-flight delivery did not ACK before exit')
+    await waitFor(
+      () => rawByteLength === Buffer.byteLength(zpl),
+      'The printer fixture did not consume the complete in-flight raw payload',
+    )
     assert.equal(Buffer.concat(rawChunks).equals(Buffer.from(zpl)), true)
     assert.equal(claims, 1)
     assert.equal(acknowledgements, 1)
