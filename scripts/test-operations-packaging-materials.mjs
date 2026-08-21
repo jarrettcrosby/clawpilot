@@ -200,6 +200,8 @@ assert.deepEqual(
     },
     dimensionBasis: 'unspecified',
     dimensionEvidenceType: 'customer_confirmed',
+    dimensionEvidenceReference: 'Customer supplied partial dimensions',
+    dimensionConfirmedAt: '2026-08-21T12:00:00.000Z',
     tareWeightGrams: null,
     maxWeightGrams: null,
     unitCostMinor: null,
@@ -214,6 +216,54 @@ assert.deepEqual(
     'warehouse_stock',
   ],
 )
+const providerEvidenceReadiness = {
+  status: 'active',
+  innerDimensionsMm: {
+    length: 1727,
+    width: 356,
+    height: 102,
+  },
+  dimensionBasis: 'inner',
+  dimensionEvidenceType: 'provider',
+  dimensionEvidenceReference: 'https://supplier.example.test/snowboard-carton',
+  dimensionConfirmedAt: '2026-08-21T12:00:00.000Z',
+  tareWeightGrams: 1606,
+  maxWeightGrams: 13608,
+  unitCostMinor: 1131,
+  stock: [{
+    warehouseStatus: 'active',
+    isAvailable: true,
+    onHandQuantity: 100,
+  }],
+}
+assert.equal(
+  packagingMaterialReadiness(providerEvidenceReadiness)
+    .eligibleForCartonization,
+  true,
+  'Timestamped provider evidence must be eligible for cartonization',
+)
+for (const incompleteProviderEvidence of [
+  {
+    ...providerEvidenceReadiness,
+    dimensionEvidenceReference: null,
+  },
+  {
+    ...providerEvidenceReadiness,
+    dimensionConfirmedAt: null,
+  },
+  {
+    ...providerEvidenceReadiness,
+    dimensionConfirmedAt: 'not-a-timestamp',
+  },
+]) {
+  const readiness = packagingMaterialReadiness(incompleteProviderEvidence)
+  assert.equal(readiness.eligibleForCartonization, false)
+  assert.deepEqual(
+    Array.from(readiness.missing),
+    ['dimension_evidence'],
+    'Provider evidence without a retained reference and valid timestamp must fail closed',
+  )
+}
 assert.equal(packagingMaterialReadiness({
   status: 'active',
   unitCostMinor: 35,
@@ -327,7 +377,9 @@ for (const fragment of [
   "warehouse.status = 'active'",
   'dimension_evidence_reference',
   'dimension_confirmed_at',
+  "WHEN $15 <> 'unknown'",
   'dimension_evidence_reference IS DISTINCT FROM $16',
+  'evidence_ready',
   'THEN $22',
   'input.material.dimensionBasis',
   'input.material.source',
@@ -464,6 +516,26 @@ for (const fragment of [
 }
 
 const operationsSection = read('app_src/components/operations/OperationsSection.tsx')
+const operationalMaterialBlocker = operationsSection.slice(
+  operationsSection.indexOf('function operationalPlanningMaterialBlockers('),
+  operationsSection.indexOf('\nfunction metric(', operationsSection.indexOf(
+    'function operationalPlanningMaterialBlockers(',
+  )),
+)
+for (const fragment of [
+  'material.innerDimensionsMm',
+  "material.dimensionBasis !== 'inner'",
+  "material.dimensionEvidenceType === 'unknown'",
+  '!material.dimensionEvidenceReference?.trim()',
+  '!material.dimensionConfirmedAt',
+  'Date.parse(material.dimensionConfirmedAt)',
+  "blockers.push('factual inner evidence missing')",
+]) {
+  assert.ok(
+    operationalMaterialBlocker.includes(fragment),
+    `Order planning material selection must fail closed on ${fragment}`,
+  )
+}
 const navigation = read('app_src/components/Navigation.tsx')
 const home = read('app_src/app/HomeClient.tsx')
 for (const source of [operationsSection, navigation, home]) {

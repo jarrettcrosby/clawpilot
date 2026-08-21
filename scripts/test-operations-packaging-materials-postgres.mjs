@@ -201,6 +201,182 @@ async function verify(databaseUrl) {
       'Each intentional starter recreation must retain its own audit event',
     )
 
+    const providerMaterial = {
+      code: `PROVIDER-${suffix}`,
+      name: 'Provider-evidenced packaging acceptance',
+      materialType: 'carton',
+      innerLengthMm: 1727,
+      innerWidthMm: 356,
+      innerHeightMm: 102,
+      ratedOuterLengthMm: 1730,
+      ratedOuterWidthMm: 368,
+      ratedOuterHeightMm: 114,
+      ratedOuterDimensionEvidenceType: 'provider',
+      ratedOuterDimensionEvidenceReference:
+        'https://supplier.example.test/snowboard-carton/outer',
+      dimensionBasis: 'inner',
+      dimensionEvidenceType: 'provider',
+      dimensionEvidenceReference:
+        'https://supplier.example.test/snowboard-carton/inner',
+      tareWeightGrams: 1606,
+      maxWeightGrams: 13608,
+      unitCostMinor: 1131,
+      currency: 'USD',
+      status: 'draft',
+      source: 'manual',
+    }
+    const createdProvider = await persistence.savePackagingMaterialInPostgres({
+      organizationId,
+      actorEmail,
+      material: providerMaterial,
+    })
+    const createdProviderRow = await pool.query(
+      `SELECT status, row_version::integer,
+              dimension_evidence_type, dimension_evidence_reference,
+              dimension_confirmed_at, dimension_confirmed_by
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdProvider.globalId],
+    )
+    assert.equal(createdProviderRow.rows[0].status, 'draft')
+    assert.equal(createdProviderRow.rows[0].dimension_evidence_type, 'provider')
+    assert.equal(
+      createdProviderRow.rows[0].dimension_evidence_reference,
+      providerMaterial.dimensionEvidenceReference,
+    )
+    assert.ok(
+      createdProviderRow.rows[0].dimension_confirmed_at instanceof Date,
+      'Provider evidence creation must retain its confirmation timestamp',
+    )
+    assert.equal(
+      createdProviderRow.rows[0].dimension_confirmed_by,
+      actorEmail,
+      'Provider evidence creation must retain its confirming actor',
+    )
+    await persistence.savePackagingMaterialStockInPostgres({
+      organizationId,
+      actorEmail,
+      stock: {
+        materialGlobalId: createdProvider.globalId,
+        warehouseId,
+        isAvailable: true,
+        onHandQuantity: 100,
+        reorderPointQuantity: 20,
+        reorderToQuantity: 100,
+      },
+    })
+
+    await pool.query(
+      `UPDATE operations_packaging_materials
+       SET dimension_confirmed_at = NULL,
+           dimension_confirmed_by = NULL
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdProvider.globalId],
+    )
+    const corruptedWorkspace = await persistence
+      .readPackagingMaterialsWorkspaceFromPostgres({
+        organizationId,
+        canView: true,
+        canManage: true,
+      })
+    const corruptedProvider = corruptedWorkspace.materials.find(
+      (material) => material.globalId === createdProvider.globalId,
+    )
+    assert.ok(corruptedProvider)
+    assert.equal(corruptedProvider.dimensionConfirmedAt, null)
+    assert.equal(corruptedProvider.readiness.eligibleForCartonization, false)
+    assert.deepEqual(
+      Array.from(corruptedProvider.readiness.missing),
+      ['dimension_evidence'],
+      'A provider row with a missing retained timestamp must not appear optimizer-ready',
+    )
+
+    const forceNullFunction = `force_null_dimension_confirmation_${suffix}`
+    const forceNullTrigger = `force_null_dimension_confirmation_${suffix}`
+    await pool.query(
+      `CREATE FUNCTION ${forceNullFunction}()
+       RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN
+         IF NEW.code = '${providerMaterial.code}' THEN
+           NEW.dimension_confirmed_at := NULL;
+           NEW.dimension_confirmed_by := NULL;
+         END IF;
+         RETURN NEW;
+       END;
+       $$`,
+    )
+    await pool.query(
+      `CREATE TRIGGER ${forceNullTrigger}
+       BEFORE UPDATE ON operations_packaging_materials
+       FOR EACH ROW EXECUTE FUNCTION ${forceNullFunction}()`,
+    )
+    await rejected(
+      persistence.savePackagingMaterialInPostgres({
+        organizationId,
+        actorEmail,
+        material: {
+          ...providerMaterial,
+          globalId: createdProvider.globalId,
+          expectedRowVersion: createdProvider.rowVersion,
+          name: 'Provider evidence activation must roll back',
+          status: 'active',
+        },
+      }),
+      'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
+    )
+    const rejectedProviderRow = await pool.query(
+      `SELECT name, status, row_version::integer, dimension_confirmed_at
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdProvider.globalId],
+    )
+    assert.equal(rejectedProviderRow.rows[0].name, providerMaterial.name)
+    assert.equal(rejectedProviderRow.rows[0].status, 'draft')
+    assert.equal(
+      rejectedProviderRow.rows[0].row_version,
+      createdProvider.rowVersion,
+      'Failed provider activation must roll back every material mutation',
+    )
+    assert.equal(rejectedProviderRow.rows[0].dimension_confirmed_at, null)
+    await pool.query(
+      `DROP TRIGGER ${forceNullTrigger}
+       ON operations_packaging_materials`,
+    )
+    await pool.query(`DROP FUNCTION ${forceNullFunction}()`)
+
+    const activatedProvider = await persistence.savePackagingMaterialInPostgres({
+      organizationId,
+      actorEmail,
+      material: {
+        ...providerMaterial,
+        globalId: createdProvider.globalId,
+        expectedRowVersion: createdProvider.rowVersion,
+        name: 'Provider-evidenced active packaging acceptance',
+        status: 'active',
+      },
+    })
+    assert.equal(activatedProvider.status, 'active')
+    assert.equal(
+      activatedProvider.rowVersion,
+      createdProvider.rowVersion + 1,
+    )
+    const providerWorkspace = await persistence
+      .readPackagingMaterialsWorkspaceFromPostgres({
+        organizationId,
+        canView: true,
+        canManage: true,
+      })
+    const eligibleProvider = providerWorkspace.materials.find(
+      (material) => material.globalId === createdProvider.globalId,
+    )
+    assert.ok(eligibleProvider)
+    assert.equal(eligibleProvider.status, 'active')
+    assert.equal(eligibleProvider.dimensionEvidenceType, 'provider')
+    assert.ok(eligibleProvider.dimensionConfirmedAt)
+    assert.equal(eligibleProvider.dimensionConfirmedBy, actorEmail)
+    assert.equal(eligibleProvider.readiness.eligibleForCartonization, true)
+    assert.deepEqual(Array.from(eligibleProvider.readiness.missing), [])
+
     const editableMaterial = {
       code: `EDIT-${suffix}`,
       name: 'Editable packaging acceptance',

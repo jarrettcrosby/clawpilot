@@ -634,8 +634,21 @@ function operationalPlanningMaterialBlockers(
   requireStock = true,
 ) {
   const blockers: string[] = []
+  const inner = material.innerDimensionsMm
   const ratedOuter = material.ratedOuterDimensionsMm
   if (material.status !== 'active') blockers.push('not active')
+  if (!inner.length || !inner.width || !inner.height) {
+    blockers.push('usable inner dimensions missing')
+  }
+  if (
+    material.dimensionBasis !== 'inner'
+    || material.dimensionEvidenceType === 'unknown'
+    || !material.dimensionEvidenceReference?.trim()
+    || !material.dimensionConfirmedAt
+    || !Number.isFinite(Date.parse(material.dimensionConfirmedAt))
+  ) {
+    blockers.push('factual inner evidence missing')
+  }
   if (!ratedOuter.length || !ratedOuter.width || !ratedOuter.height) {
     blockers.push('rated exterior dimensions missing')
   }
@@ -645,6 +658,7 @@ function operationalPlanningMaterialBlockers(
     )
     || !material.ratedOuterDimensionEvidenceReference
     || !material.ratedOuterDimensionConfirmedAt
+    || !Number.isFinite(Date.parse(material.ratedOuterDimensionConfirmedAt))
   ) {
     blockers.push('factual exterior evidence missing')
   }
