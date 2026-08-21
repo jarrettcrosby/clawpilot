@@ -1,8 +1,14 @@
-export type ShippingOneOffCommandAction = 'pack' | 'packed-rate' | 'purchase' | 'void'
+export type ShippingOneOffCommandAction =
+  | 'pack'
+  | 'packed-rate'
+  | 'purchase'
+  | 'void'
+  | 'print'
 
 export type ShippingOneOffRetainedCommand = {
   key: string
   body: string
+  responseBindingRequired?: true
 }
 
 type CommandStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -11,6 +17,7 @@ function expectedBodyAction(action: ShippingOneOffCommandAction) {
   if (action === 'pack') return 'confirm-pack'
   if (action === 'packed-rate') return 'refresh-packed-rates'
   if (action === 'purchase') return 'purchase-group'
+  if (action === 'print') return 'recover-label-print'
   return 'void-group'
 }
 
@@ -25,6 +32,7 @@ export function readShippingOneOffRetainedCommand(
     const parsed = JSON.parse(storage.getItem(storageKey) || 'null') as {
       key?: unknown
       body?: unknown
+      responseBindingRequired?: unknown
     } | null
     if (
       parsed
@@ -41,7 +49,13 @@ export function readShippingOneOffRetainedCommand(
         && body.action === expectedBodyAction(action)
         && body.orderGlobalId === orderGlobalId
       ) {
-        return { key: parsed.key, body: parsed.body }
+        return {
+          key: parsed.key,
+          body: parsed.body,
+          ...(parsed.responseBindingRequired === true
+            ? { responseBindingRequired: true as const }
+            : {}),
+        }
       }
     }
     storage.removeItem(storageKey)
@@ -59,6 +73,40 @@ export function writeShippingOneOffRetainedCommand(
   if (!storage) return false
   try {
     if (command) storage.setItem(storageKey, JSON.stringify(command))
+    else storage.removeItem(storageKey)
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function shippingOneOffRetainedCommandsMatch(
+  left: ShippingOneOffRetainedCommand | null,
+  right: ShippingOneOffRetainedCommand | null,
+) {
+  if (left === null || right === null) return left === right
+  return typeof left.key === 'string'
+    && typeof left.body === 'string'
+    && typeof right.key === 'string'
+    && typeof right.body === 'string'
+    && left.key === right.key
+    && left.body === right.body
+}
+
+export function replaceShippingOneOffRetainedCommandIfExact(
+  storage: CommandStorage | null,
+  storageKey: string,
+  expected: ShippingOneOffRetainedCommand | null,
+  replacement: ShippingOneOffRetainedCommand | null,
+) {
+  if (!storage) return false
+  try {
+    const raw = storage.getItem(storageKey)
+    const current = raw === null
+      ? null
+      : JSON.parse(raw) as ShippingOneOffRetainedCommand | null
+    if (!shippingOneOffRetainedCommandsMatch(current, expected)) return false
+    if (replacement) storage.setItem(storageKey, JSON.stringify(replacement))
     else storage.removeItem(storageKey)
     return true
   } catch {

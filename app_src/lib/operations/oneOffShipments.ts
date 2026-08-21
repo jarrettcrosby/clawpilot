@@ -279,10 +279,48 @@ export type OneOffShipmentExecutionState = {
       trackingNumber: string
       status: 'created' | 'voided'
       printJobGlobalId: string | null
-      printStatus: 'queued' | 'printed' | 'failed' | 'rerouted' | null
+      printStatus: 'queued' | 'printing' | 'printed' | 'failed' | 'rerouted' | null
+      printJobStatus: 'queued' | 'claimed' | 'delivered' | 'failed'
+        | 'cancelled' | 'printed' | 'rerouted' | null
+      printArtifactGlobalId: string | null
+      printContentSha256: string | null
+      printByteLength: number | null
+      printAttempts: number | null
+      printMaxAttempts: number | null
+      printLatestAttemptSequenceNumber: number | null
+      printLatestErrorCode: string | null
+      printJobRequestIdempotencyKey: string | null
+      printLastOperatorRetryIdempotencyKey: string | null
+      printOperatorRetryIdempotencyKeys: string[]
+      printReprintOfJobGlobalId: string | null
+      printOutcomeUncertain: boolean
+      printRecoveryAction: 'enqueue' | 'retry' | 'new_print' | null
       printWarning: string | null
     }>
   }
+}
+
+export type OneOffShippingPrintRecoveryResult = {
+  orderGlobalId: string
+  packageGlobalId: string
+  labelGlobalId: string
+  action: 'enqueue' | 'retry' | 'new_print'
+  printJobGlobalId: string
+  sourcePrintJobGlobalId: string | null
+  printJobStatus: 'queued' | 'claimed' | 'delivered' | 'failed'
+    | 'cancelled' | 'printed' | 'rerouted'
+  printStatus: 'queued' | 'printing' | 'printed' | 'failed' | 'rerouted'
+  printArtifactGlobalId: string
+  printContentSha256: string
+  printByteLength: number
+  printAttempts: number
+  printMaxAttempts: number
+  effects: {
+    carrierWrites: 0
+    providerWrites: 0
+    labelWrites: 0
+  }
+  replayed: boolean
 }
 
 export type OneOffShipmentQuote = {

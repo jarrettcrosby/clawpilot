@@ -487,7 +487,7 @@ const purchaseUi = shippingExecutionUi.slice(
 )
 assert.match(
   purchaseUi,
-  /definitiveClientRejection\(response, malformed\)[\s\S]*const durable = await loadState\(\)[\s\S]*purchaseIsDurable\(durable, command\)[\s\S]*clearPurchaseCommand\(\)[\s\S]*The rejected request was not retained/,
+  /definitiveClientRejection\(response, malformed\)[\s\S]*const durable = await loadState\(\)[\s\S]*purchaseIsDurable\(durable, command\)[\s\S]*clearPurchaseCommand\(command\)[\s\S]*The rejected request was not retained/,
   'Deterministic purchase conflicts must reconcile durable state before clearing',
 )
 assert.match(
@@ -497,8 +497,8 @@ assert.match(
 )
 for (const [start, end, retainedCall] of [
   ['const refreshRates = async', 'const purchaseLabels = async', "retainCommand('packed-rate'"],
-  ['const purchaseLabels = async', 'const voidLabels = async', "retainCommand('purchase'"],
-  ['const voidLabels = async', 'if (loading && !state)', "retainCommand('void'"],
+  ['const purchaseLabels = async', 'const recoverLabelPrint = async', "retainCommand('purchase'"],
+  ['const voidLabels = async', 'if (!currentState)', "retainCommand('void'"],
 ]) {
   const action = shippingExecutionUi.slice(
     shippingExecutionUi.indexOf(start),

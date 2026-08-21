@@ -357,6 +357,7 @@ export type EnqueueOperationsPrintJobInput = {
   organizationId: string
   actorEmail: string
   idempotencyKey: string
+  idempotencyContext?: Record<string, unknown>
   warehouseId: string
   preferredPrinterGlobalId?: string | null
   maxAttempts?: number
@@ -2885,12 +2886,23 @@ export async function authenticateOperationsPrintAgentForCleanupInPostgres(
   }
 }
 
-const ZERO_BYTE_FAILURE_CODES = new Set([
+export const OPERATIONS_ZERO_BYTE_PRINT_FAILURE_CODES = [
   'LOCAL_PRINTER_BUSY',
   'PRINTER_UNAVAILABLE',
   'PRINT_ARTIFACT_INVALID',
   'PRINT_CLAIM_LEASE_TOO_SHORT',
-])
+  'PRINT_DELIVERY_STOPPED',
+] as const
+
+const ZERO_BYTE_FAILURE_CODES = new Set<string>(
+  OPERATIONS_ZERO_BYTE_PRINT_FAILURE_CODES,
+)
+
+export function operationsPrintFailureProvesZeroBytes(
+  errorCode: string | null | undefined,
+) {
+  return ZERO_BYTE_FAILURE_CODES.has(String(errorCode || ''))
+}
 
 function cleanupEvidenceMismatch(): never {
   throw new OperationsRequestError(
@@ -3168,7 +3180,7 @@ export async function resolveOperationsPrintAgentCleanupStatusInPostgres(input: 
       }
       if (
         claim.terminal_state === 'failed'
-        && ZERO_BYTE_FAILURE_CODES.has(String(claim.terminal_error_code || ''))
+        && operationsPrintFailureProvesZeroBytes(claim.terminal_error_code)
       ) {
         resolved.push(cleanupResult('failed_zero_byte_confirmed'))
         continue
@@ -4101,6 +4113,7 @@ async function assertPackingSlipArtifactCanBeEnqueued(input: {
 
 export async function enqueueOperationsPrintJobInPostgres(
   input: EnqueueOperationsPrintJobInput,
+  transactionClient: PoolClient | null = null,
 ) {
   const organizationId = requiredOrganizationId(input.organizationId)
   const actorEmail = requiredActor(input.actorEmail)
@@ -4124,9 +4137,12 @@ export async function enqueueOperationsPrintJobInPostgres(
     preferredPrinterGlobalId: input.preferredPrinterGlobalId || null,
     maxAttempts,
     document: input.document,
+    ...(input.idempotencyContext
+      ? { idempotencyContext: input.idempotencyContext }
+      : {}),
   })
 
-  return withTransaction(async (client) => {
+  const execute = async (client: PoolClient) => {
     await acquireTransactionAdvisoryLock(
       client,
       `operations:print-job:${organizationId}:${idempotencyKey}`,
@@ -4292,7 +4308,10 @@ export async function enqueueOperationsPrintJobInPostgres(
       },
     }, client)
     return oneJob(organizationId, job.global_id, client)
-  })
+  }
+  return transactionClient
+    ? execute(transactionClient)
+    : withTransaction(execute)
 }
 
 const LOCKED_PRINT_JOB_SELECT = `
@@ -4705,6 +4724,7 @@ async function scheduleRetry(input: {
   preferFallback: boolean
   actorEmail: string | null
   actorType: 'user' | 'system'
+  requestFingerprint?: string
 }) {
   if (input.job.attempts >= input.job.max_attempts) {
     return { queued: false, target: null as OperationsPrinterProfile | null }
@@ -4740,7 +4760,7 @@ async function scheduleRetry(input: {
     actorEmail: input.actorEmail,
     actorType: input.actorType,
     idempotencyKey: input.idempotencyKey,
-    requestFingerprint: fingerprint({
+    requestFingerprint: input.requestFingerprint || fingerprint({
       state: 'queued',
       jobGlobalId: input.job.global_id,
       targetPrinterGlobalId: target.globalId,
@@ -5804,7 +5824,8 @@ export async function retryOperationsPrintJobInPostgres(input: {
   actorEmail: string
   idempotencyKey: string
   reason: string
-}) {
+  idempotencyContext?: Record<string, unknown>
+}, transactionClient: PoolClient | null = null) {
   const organizationId = requiredOrganizationId(input.organizationId)
   const actorEmail = requiredActor(input.actorEmail)
   const callerKey = requiredIdempotencyKey(input.idempotencyKey)
@@ -5814,8 +5835,11 @@ export async function retryOperationsPrintJobInPostgres(input: {
     action: 'retry-print-job',
     jobGlobalId: input.jobGlobalId,
     reason,
+    ...(input.idempotencyContext
+      ? { idempotencyContext: input.idempotencyContext }
+      : {}),
   })
-  return withTransaction(async (client) => {
+  const execute = async (client: PoolClient) => {
     await acquireTransactionAdvisoryLock(
       client,
       `operations:print-attempt:${organizationId}:${idempotencyKey}`,
@@ -5870,6 +5894,7 @@ export async function retryOperationsPrintJobInPostgres(input: {
       preferFallback: job.printer_id === job.requested_printer_id,
       actorEmail,
       actorType: 'user',
+      requestFingerprint,
     })
     if (!retry.queued) {
       throw new OperationsRequestError(
@@ -5897,7 +5922,10 @@ export async function retryOperationsPrintJobInPostgres(input: {
       },
     }, client)
     return oneJob(organizationId, job.global_id, client)
-  })
+  }
+  return transactionClient
+    ? execute(transactionClient)
+    : withTransaction(execute)
 }
 
 export async function cancelOperationsPrintJobInPostgres(input: {
@@ -5988,7 +6016,10 @@ export async function reprintOperationsPrintJobInPostgres(input: {
   actorEmail: string
   idempotencyKey: string
   reason: string
-}) {
+  idempotencyContext?: Record<string, unknown>
+}, transactionClient: PoolClient | null = null, authorization: (
+  'controlled' | 'certain_exhausted_only'
+) = 'controlled') {
   const organizationId = requiredOrganizationId(input.organizationId)
   const actorEmail = requiredActor(input.actorEmail)
   const callerKey = requiredIdempotencyKey(input.idempotencyKey)
@@ -5998,8 +6029,11 @@ export async function reprintOperationsPrintJobInPostgres(input: {
     action: 'reprint-print-job',
     jobGlobalId: input.jobGlobalId,
     reason,
+    ...(input.idempotencyContext
+      ? { idempotencyContext: input.idempotencyContext }
+      : {}),
   })
-  return withTransaction(async (client) => {
+  const execute = async (client: PoolClient) => {
     await acquireTransactionAdvisoryLock(
       client,
       `operations:print-reprint:${organizationId}:${callerKey}`,
@@ -6012,6 +6046,12 @@ export async function reprintOperationsPrintJobInPostgres(input: {
     )
     const uncertainOutcomeRecovery = original.status === 'failed'
       && isUncertainLocalAgentOutcome(latestOutcome)
+    const certainExhaustedFailureRecovery = original.status === 'failed'
+      && latestOutcome?.state === 'failed'
+      && latestOutcome.physical_output_verified === false
+      && !uncertainOutcomeRecovery
+      && operationsPrintFailureProvesZeroBytes(latestOutcome.error_code)
+      && original.attempts >= original.max_attempts
     if (original.rate_test_label_id) {
       await assertRateTestLabelPrintCapability(
         client,
@@ -6040,10 +6080,15 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       }
       return oneJob(organizationId, replay.rows[0].global_id, client)
     }
-    if (original.status !== 'delivered' && !uncertainOutcomeRecovery) {
+    const authorized = authorization === 'certain_exhausted_only'
+      ? certainExhaustedFailureRecovery
+      : original.status === 'delivered' || uncertainOutcomeRecovery
+    if (!authorized) {
       throw new OperationsRequestError(
         'OPERATIONS_PRINT_REPRINT_INVALID',
-        'Only acknowledged print jobs or exact local-agent delivery-uncertain outcomes can authorize a new print',
+        authorization === 'certain_exhausted_only'
+          ? 'Shipping can authorize a new print only after an exact retry-safe failure exhausts its bounded attempts'
+          : 'Only acknowledged print jobs or exact local-agent delivery-uncertain outcomes can authorize a new print',
         409,
       )
     }
@@ -6122,7 +6167,11 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         route.printer.id,
         route.requestedPrinter.id,
         route.fallbackPrinter?.id || null,
-        `${uncertainOutcomeRecovery ? 'Audited new print after uncertain outcome' : 'Audited reprint'} of ${original.global_id}: ${route.reason}`,
+        `${certainExhaustedFailureRecovery
+          ? 'Shipping new print after exhausted retry-safe failure'
+          : uncertainOutcomeRecovery
+            ? 'Audited new print after uncertain outcome'
+            : 'Audited reprint'} of ${original.global_id}: ${route.reason}`,
         original.max_attempts,
         requestFingerprint,
         actorEmail,
@@ -6147,7 +6196,9 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       }),
       detail: uncertainOutcomeRecovery
         ? `New print authorized after uncertain outcome: ${reason}`
-        : `Reprint authorized: ${reason}`,
+        : certainExhaustedFailureRecovery
+          ? `New print authorized after exhausted retry-safe failure: ${reason}`
+          : `Reprint authorized: ${reason}`,
     })
     await recordAuditEvent({
       actor: actorEmail,
@@ -6162,6 +6213,7 @@ export async function reprintOperationsPrintJobInPostgres(input: {
         reprintOfJobGlobalId: original.global_id,
         reason,
         uncertainOutcomeRecovery,
+        certainExhaustedFailureRecovery,
         sourceStatus: original.status,
         sourceErrorCode: latestOutcome?.error_code || null,
         requestedPrinterGlobalId: route.requestedPrinter.globalId,
@@ -6173,5 +6225,8 @@ export async function reprintOperationsPrintJobInPostgres(input: {
       },
     }, client)
     return oneJob(organizationId, reprint.global_id, client)
-  })
+  }
+  return transactionClient
+    ? execute(transactionClient)
+    : withTransaction(execute)
 }

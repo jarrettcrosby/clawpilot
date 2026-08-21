@@ -17,6 +17,7 @@ import {
 
 import type {
   OneOffShippingPackCommandResult,
+  OneOffShippingPrintRecoveryResult,
   OneOffCarrierGroupCommandResult,
   OneOffPackedRateRefresh,
   OneOffShipmentExecutionState,
@@ -27,10 +28,11 @@ import {
 } from '@/lib/operations/oneOffShipmentConstants'
 import {
   readShippingOneOffRetainedCommand,
+  replaceShippingOneOffRetainedCommandIfExact,
   shippingOneOffResponseIsDefinitiveClientRejection,
+  shippingOneOffRetainedCommandsMatch,
   type ShippingOneOffCommandAction,
   type ShippingOneOffRetainedCommand,
-  writeShippingOneOffRetainedCommand,
 } from '@/lib/operations/shippingOneOffRecovery'
 
 type ExecutionPayload = {
@@ -39,12 +41,48 @@ type ExecutionPayload = {
   code?: string
   state?: OneOffShipmentExecutionState
   result?: OneOffShippingPackCommandResult
+    | OneOffShippingPrintRecoveryResult
     | OneOffPackedRateRefresh
     | OneOffCarrierGroupCommandResult
 }
 
+export type ExecutionOrderFence = {
+  orderGlobalId: string
+  generation: number
+}
+
+export function executionOrderFenceIsCurrent(
+  request: ExecutionOrderFence,
+  current: ExecutionOrderFence,
+) {
+  return request.orderGlobalId === current.orderGlobalId
+    && request.generation === current.generation
+}
+
+export function mountedExecutionOrderFenceIsCurrent(
+  mounted: boolean,
+  request: ExecutionOrderFence,
+  current: ExecutionOrderFence,
+) {
+  return mounted && executionOrderFenceIsCurrent(request, current)
+}
+
+export function executionStateLoadIsCurrent(
+  mounted: boolean,
+  request: ExecutionOrderFence,
+  current: ExecutionOrderFence,
+  requestEpoch: number,
+  currentEpoch: number,
+) {
+  return mountedExecutionOrderFenceIsCurrent(mounted, request, current)
+    && requestEpoch === currentEpoch
+}
+
 type CommandAction = ShippingOneOffCommandAction
 type RetainedCommand = ShippingOneOffRetainedCommand
+type ExecutionLabel = NonNullable<
+  OneOffShipmentExecutionState['carrierGroup']
+>['labels'][number]
 type PackBody = {
   action: 'confirm-pack'
   orderGlobalId: string
@@ -71,6 +109,23 @@ type VoidBody = {
   action: 'void-group'
   orderGlobalId: string
   expectedRowVersion: number
+  reason: string
+}
+type PrintBody = {
+  action: 'recover-label-print'
+  expectedRecoveryAction: 'enqueue' | 'retry' | 'new_print'
+  orderGlobalId: string
+  expectedRowVersion: number
+  packageGlobalId: string
+  labelGlobalId: string
+  expectedPrintJobGlobalId: string | null
+  expectedPrintJobStatus: 'queued' | 'claimed' | 'delivered' | 'failed'
+    | 'cancelled' | 'printed' | 'rerouted' | null
+  expectedPrintArtifactGlobalId: string | null
+  expectedPrintAttempts: number | null
+  expectedPrintMaxAttempts: number | null
+  expectedLatestAttemptSequenceNumber: number | null
+  expectedLatestErrorCode: string | null
   reason: string
 }
 
@@ -121,14 +176,16 @@ function readRetainedCommand(
 function retainCommand(
   action: CommandAction,
   orderGlobalId: string,
-  command: RetainedCommand | null,
+  expected: RetainedCommand | null,
+  replacement: RetainedCommand | null,
 ) {
   const storageKey = retainedCommandName(action, orderGlobalId)
   try {
-    return writeShippingOneOffRetainedCommand(
+    return replaceShippingOneOffRetainedCommandIfExact(
       window.sessionStorage,
       storageKey,
-      command,
+      expected,
+      replacement,
     )
   } catch {
     return false
@@ -138,7 +195,7 @@ function retainCommand(
 function newCommand(
   action: CommandAction,
   orderGlobalId: string,
-  body: PackBody | RefreshBody | PurchaseBody | VoidBody,
+  body: PackBody | RefreshBody | PurchaseBody | VoidBody | PrintBody,
 ): RetainedCommand {
   return {
     key: `shipping-one-off-${action}:${orderGlobalId}:${crypto.randomUUID()}`,
@@ -156,6 +213,131 @@ function parsedCommandBody<T>(command: RetainedCommand | null): T | null {
 }
 
 export type RetainedPackReceiptDisposition = 'pending' | 'exact' | 'superseded'
+export type RetainedPrintRecoveryDisposition = 'pending' | 'exact' | 'superseded'
+
+export function retainedPrintRecoveryDisposition(
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+  currentOrderGlobalId: string,
+): RetainedPrintRecoveryDisposition {
+  const body = parsedCommandBody<PrintBody>(command)
+  if (
+    !state
+    || !command
+    || state.orderGlobalId !== currentOrderGlobalId
+    || body?.action !== 'recover-label-print'
+    || !['enqueue', 'retry', 'new_print'].includes(
+      body.expectedRecoveryAction,
+    )
+    || body.orderGlobalId !== currentOrderGlobalId
+    || !body.packageGlobalId
+    || !body.labelGlobalId
+    || !body.reason
+    || (
+      body.expectedPrintJobGlobalId === null
+      && (
+        body.expectedRecoveryAction !== 'enqueue'
+        || body.expectedPrintJobStatus !== null
+        || body.expectedPrintArtifactGlobalId !== null
+        || body.expectedPrintAttempts !== null
+        || body.expectedPrintMaxAttempts !== null
+        || body.expectedLatestAttemptSequenceNumber !== null
+        || body.expectedLatestErrorCode !== null
+      )
+    )
+    || (
+      body.expectedPrintJobGlobalId !== null
+      && (
+        body.expectedRecoveryAction === 'enqueue'
+        || body.expectedPrintJobStatus === null
+        || body.expectedPrintArtifactGlobalId === null
+        || !Number.isSafeInteger(body.expectedPrintAttempts)
+        || !Number.isSafeInteger(body.expectedPrintMaxAttempts)
+        || !Number.isSafeInteger(body.expectedLatestAttemptSequenceNumber)
+        || (
+          body.expectedLatestErrorCode !== null
+          && typeof body.expectedLatestErrorCode !== 'string'
+        )
+      )
+    )
+  ) return 'pending'
+  const group = state.carrierGroup
+  const label = group?.labels.find((candidate) => (
+    candidate.labelGlobalId === body.labelGlobalId
+    && candidate.packageGlobalId === body.packageGlobalId
+  ))
+  if (!group || !label) return 'pending'
+  if (!group.active || label.status !== 'created') return 'superseded'
+  if (body.expectedPrintJobGlobalId === null) {
+    if (!label.printJobGlobalId) return 'pending'
+    return label.printJobRequestIdempotencyKey === command.key
+      && label.printReprintOfJobGlobalId === null
+      ? 'exact'
+      : 'superseded'
+  }
+  if (
+    label.printReprintOfJobGlobalId === body.expectedPrintJobGlobalId
+  ) {
+    return body.expectedRecoveryAction === 'new_print'
+      && label.printJobRequestIdempotencyKey
+      === `print-user:reprint:${command.key}`
+      ? 'exact'
+      : 'superseded'
+  }
+  if (label.printJobGlobalId !== body.expectedPrintJobGlobalId) {
+    return label.printJobGlobalId ? 'superseded' : 'pending'
+  }
+  if (
+    body.expectedRecoveryAction === 'retry'
+    && label.printOperatorRetryIdempotencyKeys.includes(
+      `print-user:retry:${command.key}`,
+    )
+  ) return 'exact'
+  return label.printJobStatus !== body.expectedPrintJobStatus
+    ? 'superseded'
+    : 'pending'
+}
+
+export function printRecoveryResponseMatchesDurableState(
+  result: unknown,
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+  currentOrderGlobalId: string,
+): result is OneOffShippingPrintRecoveryResult {
+  if (
+    retainedPrintRecoveryDisposition(state, command, currentOrderGlobalId)
+      !== 'exact'
+    || !result
+    || typeof result !== 'object'
+  ) return false
+  const body = parsedCommandBody<PrintBody>(command)
+  const group = state?.carrierGroup
+  const label = group?.labels.find((candidate) => (
+    candidate.labelGlobalId === body?.labelGlobalId
+    && candidate.packageGlobalId === body?.packageGlobalId
+  ))
+  if (!body || !group?.active || !label || label.status !== 'created') {
+    return false
+  }
+  const candidate = result as Partial<OneOffShippingPrintRecoveryResult>
+  const expectedAction = body.expectedRecoveryAction
+  const expectedSourcePrintJobGlobalId = expectedAction === 'enqueue'
+    ? null
+    : body.expectedPrintJobGlobalId
+  return candidate.orderGlobalId === currentOrderGlobalId
+    && candidate.packageGlobalId === body.packageGlobalId
+    && candidate.labelGlobalId === body.labelGlobalId
+    && candidate.action === expectedAction
+    && candidate.printJobGlobalId === label.printJobGlobalId
+    && candidate.sourcePrintJobGlobalId === expectedSourcePrintJobGlobalId
+    && candidate.printArtifactGlobalId === label.printArtifactGlobalId
+    && candidate.printContentSha256 === label.printContentSha256
+    && candidate.printByteLength === label.printByteLength
+    && candidate.printMaxAttempts === label.printMaxAttempts
+    && candidate.effects?.carrierWrites === 0
+    && candidate.effects?.providerWrites === 0
+    && candidate.effects?.labelWrites === 0
+}
 
 export function retainedPackReceiptDisposition(
   state: OneOffShipmentExecutionState | null,
@@ -302,7 +484,9 @@ export default function ShippingOneOffExecutionPanel({
 }) {
   const [state, setState] = useState<OneOffShipmentExecutionState | null>(null)
   const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState<'pack' | 'refresh' | 'purchase' | 'void' | ''>('')
+  const [busy, setBusy] = useState<
+    'pack' | 'refresh' | 'purchase' | 'void' | 'print' | ''
+  >('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [selectedOfferGlobalId, setSelectedOfferGlobalId] = useState('')
@@ -317,40 +501,98 @@ export default function ShippingOneOffExecutionPanel({
   const [voidReason, setVoidReason] = useState(
     'Cancel the exact complete one-off carrier shipment before shipment confirmation',
   )
+  const [printReason, setPrintReason] = useState(
+    'Recover this exact existing label on the current approved Shipping printer route',
+  )
   const [liveConfirmed, setLiveConfirmed] = useState(false)
   const [packCommand, setPackCommand] = useState<RetainedCommand | null>(null)
   const [refreshCommand, setRefreshCommand] = useState<RetainedCommand | null>(null)
   const [purchaseCommand, setPurchaseCommand] = useState<RetainedCommand | null>(null)
   const [voidCommand, setVoidCommand] = useState<RetainedCommand | null>(null)
+  const [printCommand, setPrintCommand] = useState<RetainedCommand | null>(null)
   const [clock, setClock] = useState(() => Date.now())
   const packEvidenceHashRef = useRef<string | null>(null)
+  const componentMountedRef = useRef(false)
+  const loadStateEpochRef = useRef(0)
+  const executionOrderFenceRef = useRef<ExecutionOrderFence>({
+    orderGlobalId,
+    generation: 0,
+  })
+  if (executionOrderFenceRef.current.orderGlobalId !== orderGlobalId) {
+    executionOrderFenceRef.current = {
+      orderGlobalId,
+      generation: executionOrderFenceRef.current.generation + 1,
+    }
+  }
+  const executionOrderFence = executionOrderFenceRef.current
+  useEffect(() => {
+    componentMountedRef.current = true
+    return () => {
+      componentMountedRef.current = false
+      loadStateEpochRef.current += 1
+    }
+  }, [])
+  const requestFenceIsCurrent = useCallback((request: ExecutionOrderFence) => (
+    mountedExecutionOrderFenceIsCurrent(
+      componentMountedRef.current,
+      request,
+      executionOrderFenceRef.current,
+    )
+  ), [])
 
-  const clearPackCommand = useCallback(() => {
-    setPackCommand(null)
-    retainCommand('pack', orderGlobalId, null)
+  const clearPackCommand = useCallback((expected: RetainedCommand) => {
+    if (!retainCommand('pack', orderGlobalId, expected, null)) return
+    setPackCommand((current) => (
+      shippingOneOffRetainedCommandsMatch(current, expected) ? null : current
+    ))
   }, [orderGlobalId])
 
-  const clearRefreshCommand = useCallback(() => {
-    setRefreshCommand(null)
-    retainCommand('packed-rate', orderGlobalId, null)
+  const clearRefreshCommand = useCallback((expected: RetainedCommand) => {
+    if (!retainCommand('packed-rate', orderGlobalId, expected, null)) return
+    setRefreshCommand((current) => (
+      shippingOneOffRetainedCommandsMatch(current, expected) ? null : current
+    ))
   }, [orderGlobalId])
-  const clearPurchaseCommand = useCallback(() => {
-    setPurchaseCommand(null)
-    retainCommand('purchase', orderGlobalId, null)
+  const clearPurchaseCommand = useCallback((expected: RetainedCommand) => {
+    if (!retainCommand('purchase', orderGlobalId, expected, null)) return
+    setPurchaseCommand((current) => (
+      shippingOneOffRetainedCommandsMatch(current, expected) ? null : current
+    ))
   }, [orderGlobalId])
-  const clearVoidCommand = useCallback(() => {
-    setVoidCommand(null)
-    retainCommand('void', orderGlobalId, null)
+  const clearVoidCommand = useCallback((expected: RetainedCommand) => {
+    if (!retainCommand('void', orderGlobalId, expected, null)) return
+    setVoidCommand((current) => (
+      shippingOneOffRetainedCommandsMatch(current, expected) ? null : current
+    ))
+  }, [orderGlobalId])
+  const clearPrintCommand = useCallback((expected: RetainedCommand) => {
+    if (!retainCommand('print', orderGlobalId, expected, null)) return
+    setPrintCommand((current) => (
+      shippingOneOffRetainedCommandsMatch(current, expected) ? null : current
+    ))
   }, [orderGlobalId])
 
   const loadState = useCallback(async () => {
+    const requestFence = executionOrderFence
+    const requestEpoch = loadStateEpochRef.current + 1
+    loadStateEpochRef.current = requestEpoch
+    const requestIsCurrent = () => executionStateLoadIsCurrent(
+      componentMountedRef.current,
+      requestFence,
+      executionOrderFenceRef.current,
+      requestEpoch,
+      loadStateEpochRef.current,
+    )
+    if (!requestIsCurrent()) return null
     setLoading(true)
     try {
       const response = await fetch(
         `/api/operations/one-off-shipments?orderGlobalId=${encodeURIComponent(orderGlobalId)}`,
         { cache: 'no-store' },
       )
+      if (!requestIsCurrent()) return null
       const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return null
       if (
         malformed
         || !response.ok
@@ -373,17 +615,19 @@ export default function ShippingOneOffExecutionPanel({
       setClock(Date.now())
       return payload.state
     } catch (caught) {
+      if (!requestIsCurrent()) return null
       setError(caught instanceof Error
         ? caught.message
         : 'One-off postage status is unavailable')
       return null
     } finally {
-      setLoading(false)
+      if (requestIsCurrent()) setLoading(false)
     }
-  }, [orderGlobalId])
+  }, [executionOrderFence, orderGlobalId])
 
   useEffect(() => {
     setState(null)
+    setBusy('')
     setError('')
     setNotice('')
     setSelectedOfferGlobalId('')
@@ -394,6 +638,7 @@ export default function ShippingOneOffExecutionPanel({
     setRefreshCommand(readRetainedCommand('packed-rate', orderGlobalId))
     setPurchaseCommand(readRetainedCommand('purchase', orderGlobalId))
     setVoidCommand(readRetainedCommand('void', orderGlobalId))
+    setPrintCommand(readRetainedCommand('print', orderGlobalId))
     void loadState()
   }, [loadState, orderGlobalId])
 
@@ -405,7 +650,7 @@ export default function ShippingOneOffExecutionPanel({
       orderGlobalId,
     )
     if (packDisposition !== 'pending') {
-      clearPackCommand()
+      if (packCommand) clearPackCommand(packCommand)
       if (packDisposition === 'superseded') {
         setNotice(
           'Another immutable physical pack receipt completed this order. '
@@ -413,27 +658,53 @@ export default function ShippingOneOffExecutionPanel({
         )
       }
     }
-    if (refreshIsDurable(state, refreshCommand)) clearRefreshCommand()
-    if (purchaseIsDurable(state, purchaseCommand)) clearPurchaseCommand()
-    if (voidIsDurable(state, voidCommand)) clearVoidCommand()
+    if (refreshCommand && refreshIsDurable(state, refreshCommand)) {
+      clearRefreshCommand(refreshCommand)
+    }
+    if (purchaseCommand && purchaseIsDurable(state, purchaseCommand)) {
+      clearPurchaseCommand(purchaseCommand)
+    }
+    if (voidCommand && voidIsDurable(state, voidCommand)) {
+      clearVoidCommand(voidCommand)
+    }
+    const printDisposition = retainedPrintRecoveryDisposition(
+      state,
+      printCommand,
+      orderGlobalId,
+    )
+    if (
+      printDisposition !== 'pending'
+      && !(
+        printDisposition === 'exact'
+        && printCommand?.responseBindingRequired
+      )
+    ) {
+      if (printCommand) clearPrintCommand(printCommand)
+      setNotice(printDisposition === 'exact'
+        ? 'The exact label print recovery is durably queued; current status is shown below.'
+        : 'Another authoritative label or print transition superseded the retained request. Current status is shown below.')
+    }
   }, [
     clearPackCommand,
     clearPurchaseCommand,
     clearRefreshCommand,
     clearVoidCommand,
+    clearPrintCommand,
     orderGlobalId,
     packCommand,
     purchaseCommand,
+    printCommand,
     refreshCommand,
     state,
     voidCommand,
   ])
 
+  const currentState = state?.orderGlobalId === orderGlobalId ? state : null
   const sortedOffers = useMemo(() => (
-    [...(state?.packedRate?.offers || [])].sort((left, right) => (
+    [...(currentState?.packedRate?.offers || [])].sort((left, right) => (
       left.amountMinor - right.amountMinor
     ))
-  ), [state?.packedRate?.offers])
+  ), [currentState?.packedRate?.offers])
 
   useEffect(() => {
     if (!sortedOffers.length) {
@@ -448,8 +719,8 @@ export default function ShippingOneOffExecutionPanel({
     }
   }, [selectedOfferGlobalId, sortedOffers])
 
-  const expiresAt = state?.packedRate
-    ? new Date(state.packedRate.expiresAt).getTime()
+  const expiresAt = currentState?.packedRate
+    ? new Date(currentState.packedRate.expiresAt).getTime()
     : 0
   useEffect(() => {
     if (!expiresAt || expiresAt <= clock) return
@@ -460,8 +731,9 @@ export default function ShippingOneOffExecutionPanel({
     return () => window.clearTimeout(timer)
   }, [clock, expiresAt])
 
-  const group = state?.carrierGroup || null
-  const live = state?.executionMode === 'live'
+  const group = currentState?.carrierGroup || null
+  const retainedPrintBody = parsedCommandBody<PrintBody>(printCommand)
+  const live = currentState?.executionMode === 'live'
   const liveAllowed = !live || canPurchaseLivePostage
   const unresolved = group?.unresolved === true
   const retryingUnresolvedPurchase = Boolean(
@@ -475,20 +747,24 @@ export default function ShippingOneOffExecutionPanel({
     && (group.voidState === 'prepared' || group.voidState === 'unknown'),
   )
   const packedRateCurrent = Boolean(
-    state?.packedRate
-    && !state.packedRate.consumed
-    && state.packedRate.status !== 'failed'
+    currentState?.packedRate
+    && !currentState.packedRate.consumed
+    && currentState.packedRate.status !== 'failed'
     && expiresAt > clock,
   )
-  const packEvidenceHash = state?.packReview.evidenceHash || null
+  const packEvidenceHash = currentState?.packReview.evidenceHash || null
   const packConfirmed = packEvidenceIsAcknowledged(
     packConfirmedEvidenceHash,
     packEvidenceHash,
   )
 
   const confirmPack = async () => {
+    const requestFence = executionOrderFence
+    const requestIsCurrent = () => requestFenceIsCurrent(requestFence)
     if (
-      !state
+      !requestIsCurrent()
+      || !state
+      || state.orderGlobalId !== orderGlobalId
       || busy
       || !state.packReview.required
       || (!packCommand && !state.packReview.evidenceHash)
@@ -497,6 +773,7 @@ export default function ShippingOneOffExecutionPanel({
       || refreshCommand
       || purchaseCommand
       || voidCommand
+      || printCommand
     ) return
     const command = packCommand || newCommand('pack', orderGlobalId, {
       action: 'confirm-pack',
@@ -506,12 +783,11 @@ export default function ShippingOneOffExecutionPanel({
       confirmation: ONE_OFF_PACK_CONFIRMATION,
       reason: packReason.trim(),
     })
-    setPackCommand(command)
-    if (!retainCommand('pack', orderGlobalId, command)) {
-      setPackCommand(null)
+    if (!retainCommand('pack', orderGlobalId, packCommand, command)) {
       setError('Browser retry storage is unavailable. No pack confirmation was sent.')
       return
     }
+    setPackCommand(command)
     setBusy('pack')
     setError('')
     setNotice('')
@@ -524,7 +800,9 @@ export default function ShippingOneOffExecutionPanel({
         },
         body: command.body,
       })
+      if (!requestIsCurrent()) return
       const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return
       const validResult = Boolean(
         response.ok
         && payload.ok
@@ -535,13 +813,15 @@ export default function ShippingOneOffExecutionPanel({
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
           const durable = await loadState()
+          if (!requestIsCurrent()) return
           if (!durable) {
             throw new Error('The rejected pack confirmation could not be reconciled to durable status')
           }
           if (packIsDurable(durable, command, orderGlobalId)) {
-            clearPackCommand()
+            clearPackCommand(command)
             setPackConfirmedEvidenceHash(null)
             setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
+            if (!requestIsCurrent()) return
             await onUpdated()
             return
           }
@@ -552,16 +832,17 @@ export default function ShippingOneOffExecutionPanel({
               orderGlobalId,
             ) === 'superseded'
           ) {
-            clearPackCommand()
+            clearPackCommand(command)
             setError('')
             setNotice(
               'Another immutable physical pack receipt completed this order. '
               + 'The older retained request was retired without replay; postage controls are ready.',
             )
+            if (!requestIsCurrent()) return
             await onUpdated()
             return
           }
-          clearPackCommand()
+          clearPackCommand(command)
           setError(
             `${payloadMessage(payload, 'The physical pack confirmation was rejected')} `
             + 'Refresh and physically review the exact current evidence before trying again.',
@@ -572,6 +853,7 @@ export default function ShippingOneOffExecutionPanel({
       }
       const result = payload.result as OneOffShippingPackCommandResult
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (
         !packIsDurable(durable, command, orderGlobalId)
         || durable?.packReview.receipt?.reviewSnapshotHash
@@ -579,19 +861,23 @@ export default function ShippingOneOffExecutionPanel({
       ) {
         throw new Error('The pack response is not yet bound to the exact durable review receipt')
       }
-      clearPackCommand()
+      clearPackCommand(command)
       setPackConfirmedEvidenceHash(null)
       setNotice(
         `${result.packageCount} ${result.packageCount === 1 ? 'parcel is' : 'parcels are'} `
         + 'packed with reservations retained and zero carrier or label writes.',
       )
+      if (!requestIsCurrent()) return
       await onUpdated()
     } catch (caught) {
+      if (!requestIsCurrent()) return
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (packIsDurable(durable, command, orderGlobalId)) {
-        clearPackCommand()
+        clearPackCommand(command)
         setPackConfirmedEvidenceHash(null)
         setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
+        if (!requestIsCurrent()) return
         await onUpdated()
       } else if (
         retainedPackReceiptDisposition(
@@ -600,12 +886,13 @@ export default function ShippingOneOffExecutionPanel({
           orderGlobalId,
         ) === 'superseded'
       ) {
-        clearPackCommand()
+        clearPackCommand(command)
         setError('')
         setNotice(
           'Another immutable physical pack receipt completed this order. '
           + 'The older retained request was retired without replay; postage controls are ready.',
         )
+        if (!requestIsCurrent()) return
         await onUpdated()
       } else {
         setError(
@@ -614,31 +901,37 @@ export default function ShippingOneOffExecutionPanel({
         )
       }
     } finally {
-      setBusy('')
+      if (requestIsCurrent()) setBusy('')
     }
   }
 
   const refreshRates = async () => {
+    const requestFence = executionOrderFence
+    const requestIsCurrent = () => requestFenceIsCurrent(requestFence)
     if (
-      !state
+      !requestIsCurrent()
+      || !state
+      || state.orderGlobalId !== orderGlobalId
       || busy
       || !liveAllowed
       || unresolved
       || packCommand
       || purchaseCommand
       || voidCommand
+      || printCommand
     ) return
     const command = refreshCommand || newCommand('packed-rate', orderGlobalId, {
       action: 'refresh-packed-rates',
       orderGlobalId,
       expectedRowVersion: state.rowVersion,
     })
-    setRefreshCommand(command)
-    if (!retainCommand('packed-rate', orderGlobalId, command)) {
-      setRefreshCommand(null)
+    if (!retainCommand(
+      'packed-rate', orderGlobalId, refreshCommand, command,
+    )) {
       setError('Browser retry storage is unavailable. No carrier rate request was sent.')
       return
     }
+    setRefreshCommand(command)
     setBusy('refresh')
     setError('')
     setNotice('')
@@ -651,7 +944,9 @@ export default function ShippingOneOffExecutionPanel({
         },
         body: command.body,
       })
+      if (!requestIsCurrent()) return
       const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return
       const validResult = Boolean(
         response.ok
         && payload.ok
@@ -662,15 +957,16 @@ export default function ShippingOneOffExecutionPanel({
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
           const durable = await loadState()
+          if (!requestIsCurrent()) return
           if (!durable) {
             throw new Error('The rejected packed-rate request could not be reconciled to durable status')
           }
           if (refreshIsDurable(durable, command)) {
-            clearRefreshCommand()
+            clearRefreshCommand(command)
             setNotice('The prior exact packed-rate request succeeded; durable rates are current.')
             return
           }
-          clearRefreshCommand()
+          clearRefreshCommand(command)
           setError(
             `${payloadMessage(payload, 'Current packed rates were rejected')} `
             + 'The rejected request was not retained; review the current status before trying again.',
@@ -681,21 +977,24 @@ export default function ShippingOneOffExecutionPanel({
       }
       const result = payload.result as OneOffPackedRateRefresh
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (
         !refreshIsDurable(durable, command)
         || durable?.packedRate?.quoteGlobalId !== result.quote.globalId
       ) {
         throw new Error('The packed-rate response is not yet bound to the exact durable request')
       }
-      clearRefreshCommand()
+      clearRefreshCommand(command)
       setNotice(
         `${result.quote.offers.length} current ${result.executionMode.toUpperCase()} `
         + `${result.quote.offers.length === 1 ? 'rate is' : 'rates are'} ready.`,
       )
     } catch (caught) {
+      if (!requestIsCurrent()) return
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (refreshIsDurable(durable, command)) {
-        clearRefreshCommand()
+        clearRefreshCommand(command)
         setNotice('The prior exact packed-rate request succeeded; durable rates are current.')
       } else {
         setError(
@@ -704,16 +1003,20 @@ export default function ShippingOneOffExecutionPanel({
         )
       }
     } finally {
-      setBusy('')
+      if (requestIsCurrent()) setBusy('')
     }
   }
 
   const purchaseLabels = async () => {
+    const requestFence = executionOrderFence
+    const requestIsCurrent = () => requestFenceIsCurrent(requestFence)
     if (
-      !state
+      !requestIsCurrent()
+      || !state
+      || state.orderGlobalId !== orderGlobalId
       || busy
       || !liveAllowed
-      || Boolean(packCommand || refreshCommand || voidCommand)
+      || Boolean(packCommand || refreshCommand || voidCommand || printCommand)
       || (!purchaseCommand && !packedRateCurrent)
       || (!purchaseCommand && !state.packedRate)
       || (!purchaseCommand && !selectedOfferGlobalId)
@@ -729,12 +1032,13 @@ export default function ShippingOneOffExecutionPanel({
       reason: purchaseReason.trim(),
       ...(live ? { confirmation: ONE_OFF_LIVE_POSTAGE_CONFIRMATION } : {}),
     })
-    setPurchaseCommand(command)
-    if (!retainCommand('purchase', orderGlobalId, command)) {
-      setPurchaseCommand(null)
+    if (!retainCommand(
+      'purchase', orderGlobalId, purchaseCommand, command,
+    )) {
       setError('Browser retry storage is unavailable. No carrier label request was sent.')
       return
     }
+    setPurchaseCommand(command)
     setBusy('purchase')
     setError('')
     setNotice('')
@@ -747,7 +1051,9 @@ export default function ShippingOneOffExecutionPanel({
         },
         body: command.body,
       })
+      if (!requestIsCurrent()) return
       const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return
       const validResult = Boolean(
         response.ok
         && payload.ok
@@ -759,17 +1065,19 @@ export default function ShippingOneOffExecutionPanel({
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
           const durable = await loadState()
+          if (!requestIsCurrent()) return
           if (!durable) {
             throw new Error('The rejected label request could not be reconciled to durable status')
           }
           if (purchaseIsDurable(durable, command)) {
-            clearPurchaseCommand()
+            clearPurchaseCommand(command)
             setLiveConfirmed(false)
             setNotice('The prior exact label request succeeded; its durable labels are shown below.')
+            if (!requestIsCurrent()) return
             await onUpdated()
             return
           }
-          clearPurchaseCommand()
+          clearPurchaseCommand(command)
           setError(
             `${payloadMessage(payload, 'The carrier label request was rejected')} `
             + 'The rejected request was not retained; review the current quote and status before trying again.',
@@ -780,26 +1088,31 @@ export default function ShippingOneOffExecutionPanel({
       }
       const result = payload.result as OneOffCarrierGroupCommandResult
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (
         !purchaseIsDurable(durable, command)
         || durable?.carrierGroup?.createAttemptGlobalId !== result.groupAttemptGlobalId
       ) {
         throw new Error('The label response is not yet bound to the exact order, quote, offer, and request key')
       }
-      clearPurchaseCommand()
+      clearPurchaseCommand(command)
       setLiveConfirmed(false)
       setNotice(
         `${result.executionMode.toUpperCase()} carrier group `
         + `${result.groupAttemptGlobalId} returned ${result.labels.length} `
         + `${result.labels.length === 1 ? 'label' : 'labels'}.`,
       )
+      if (!requestIsCurrent()) return
       await onUpdated()
     } catch (caught) {
+      if (!requestIsCurrent()) return
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (purchaseIsDurable(durable, command)) {
-        clearPurchaseCommand()
+        clearPurchaseCommand(command)
         setLiveConfirmed(false)
         setNotice('The prior exact label request succeeded; its durable labels are shown below.')
+        if (!requestIsCurrent()) return
         await onUpdated()
       } else {
         setError(
@@ -808,17 +1121,201 @@ export default function ShippingOneOffExecutionPanel({
         )
       }
     } finally {
-      setBusy('')
+      if (requestIsCurrent()) setBusy('')
+    }
+  }
+
+  const recoverLabelPrint = async (selectedLabel: ExecutionLabel) => {
+    const requestFence = executionOrderFence
+    const requestIsCurrent = () => requestFenceIsCurrent(requestFence)
+    const retainedBody = parsedCommandBody<PrintBody>(printCommand)
+    const label = printCommand
+      ? group?.labels.find((candidate) => (
+        candidate.labelGlobalId === retainedBody?.labelGlobalId
+        && candidate.packageGlobalId === retainedBody?.packageGlobalId
+      )) || null
+      : selectedLabel
+    if (
+      !requestIsCurrent()
+      || !state
+      || state.orderGlobalId !== orderGlobalId
+      || (printCommand && retainedBody?.orderGlobalId !== orderGlobalId)
+      || !group?.active
+      || !label
+      || label.status !== 'created'
+      || busy
+      || packCommand
+      || refreshCommand
+      || purchaseCommand
+      || voidCommand
+      || (!printCommand && !label.printRecoveryAction)
+      || (!printCommand && printReason.trim().length < 10)
+    ) return
+    const command = printCommand || newCommand('print', orderGlobalId, {
+      action: 'recover-label-print',
+      expectedRecoveryAction: label.printRecoveryAction!,
+      orderGlobalId,
+      expectedRowVersion: state.rowVersion,
+      packageGlobalId: label.packageGlobalId,
+      labelGlobalId: label.labelGlobalId,
+      expectedPrintJobGlobalId: label.printJobGlobalId,
+      expectedPrintJobStatus: label.printJobStatus,
+      expectedPrintArtifactGlobalId: label.printArtifactGlobalId,
+      expectedPrintAttempts: label.printAttempts,
+      expectedPrintMaxAttempts: label.printMaxAttempts,
+      expectedLatestAttemptSequenceNumber:
+        label.printLatestAttemptSequenceNumber,
+      expectedLatestErrorCode: label.printLatestErrorCode,
+      reason: printReason.trim(),
+    })
+    if (!retainCommand('print', orderGlobalId, printCommand, command)) {
+      setError('Browser retry storage is unavailable. No label print recovery was sent.')
+      return
+    }
+    setPrintCommand(command)
+    setBusy('print')
+    setError('')
+    setNotice('')
+    const retainUntilResponseIsBound = () => {
+      if (!requestIsCurrent()) return
+      const guardedCommand: RetainedCommand = {
+        ...command,
+        responseBindingRequired: true,
+      }
+      if (retainCommand('print', orderGlobalId, command, guardedCommand)) {
+        setPrintCommand((current) => (
+          shippingOneOffRetainedCommandsMatch(current, command)
+            ? guardedCommand
+            : current
+        ))
+      }
+    }
+    try {
+      const response = await fetch('/api/operations/one-off-shipments', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.key,
+        },
+        body: command.body,
+      })
+      if (!requestIsCurrent()) return
+      const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return
+      const validResult = Boolean(
+        response.ok
+        && payload.ok
+        && payload.result
+        && typeof payload.result === 'object'
+        && payload.result.orderGlobalId === orderGlobalId,
+      )
+      if (!validResult) {
+        if (definitiveClientRejection(response, malformed)) {
+          const durable = await loadState()
+          if (!requestIsCurrent()) return
+          if (!durable) {
+            throw new Error('The rejected print recovery could not be reconciled to durable status')
+          }
+          const disposition = retainedPrintRecoveryDisposition(
+            durable,
+            command,
+            orderGlobalId,
+          )
+          if (disposition !== 'pending') {
+            clearPrintCommand(command)
+            setNotice(disposition === 'exact'
+              ? 'The prior exact label print recovery succeeded; current status is shown below.'
+              : 'Another authoritative label or print transition superseded the retained request; current status is shown below.')
+            if (!requestIsCurrent()) return
+            await onUpdated()
+            return
+          }
+          clearPrintCommand(command)
+          setError(
+            `${payloadMessage(payload, 'Label print recovery was rejected')} `
+            + 'Refresh the exact label and print status before deciding whether another physical print is safe.',
+          )
+          return
+        }
+        if (response.ok) {
+          retainUntilResponseIsBound()
+          setError(
+            'The successful print response was malformed and was not bound to the exact durable label. '
+            + 'The retained byte-identical request was preserved for safe reconciliation.',
+          )
+          return
+        }
+        throw new Error(payloadMessage(payload, 'The exact label print recovery did not complete'))
+      }
+      const result = payload.result
+      // A successful response is not authoritative until it is bound back to
+      // the exact durable job and immutable artifact. Persist that guard before
+      // loadState publishes newer state so the reconciliation effect cannot
+      // clear these byte-identical retry bytes in between the GET and binding.
+      retainUntilResponseIsBound()
+      const durable = await loadState()
+      if (!requestIsCurrent()) return
+      if (!printRecoveryResponseMatchesDurableState(
+        result,
+        durable,
+        command,
+        orderGlobalId,
+      )) {
+        setError(
+          'The successful print response does not match the exact durable job, artifact, label, action, or zero-write evidence. '
+          + 'The retained byte-identical request was preserved for safe reconciliation.',
+        )
+        return
+      }
+      clearPrintCommand(command)
+      setNotice(
+        result.action === 'enqueue'
+          ? 'The existing immutable label is queued with zero carrier, provider, or label writes.'
+          : result.action === 'retry'
+            ? 'The exact retry-safe failed print job is queued again; no carrier label was purchased.'
+            : 'A new print with immutable lineage is queued after the exact retry-safe job exhausted its attempts.',
+      )
+      if (!requestIsCurrent()) return
+      await onUpdated()
+    } catch (caught) {
+      if (!requestIsCurrent()) return
+      const durable = await loadState()
+      if (!requestIsCurrent()) return
+      const disposition = retainedPrintRecoveryDisposition(
+        durable,
+        command,
+        orderGlobalId,
+      )
+      if (disposition !== 'pending') {
+        clearPrintCommand(command)
+        setError('')
+        setNotice(disposition === 'exact'
+          ? 'The prior exact label print recovery succeeded; current status is shown below.'
+          : 'Another authoritative label or print transition superseded the retained request; current status is shown below.')
+        if (!requestIsCurrent()) return
+        await onUpdated()
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'The exact label print recovery did not complete'}. `
+          + 'Check status or retry the retained byte-identical request; do not authorize another physical print.',
+        )
+      }
+    } finally {
+      if (requestIsCurrent()) setBusy('')
     }
   }
 
   const voidLabels = async () => {
+    const requestFence = executionOrderFence
+    const requestIsCurrent = () => requestFenceIsCurrent(requestFence)
     if (
-      !state
+      !requestIsCurrent()
+      || !state
+      || state.orderGlobalId !== orderGlobalId
       || (!group?.active && !retryingUnresolvedVoid)
       || busy
       || !liveAllowed
-      || Boolean(packCommand || refreshCommand || purchaseCommand)
+      || Boolean(packCommand || refreshCommand || purchaseCommand || printCommand)
       || (!voidCommand && voidReason.trim().length < 10)
     ) return
     const command = voidCommand || newCommand('void', orderGlobalId, {
@@ -827,12 +1324,11 @@ export default function ShippingOneOffExecutionPanel({
       expectedRowVersion: state.rowVersion,
       reason: voidReason.trim(),
     })
-    setVoidCommand(command)
-    if (!retainCommand('void', orderGlobalId, command)) {
-      setVoidCommand(null)
+    if (!retainCommand('void', orderGlobalId, voidCommand, command)) {
       setError('Browser retry storage is unavailable. No carrier cancellation was sent.')
       return
     }
+    setVoidCommand(command)
     setBusy('void')
     setError('')
     setNotice('')
@@ -845,7 +1341,9 @@ export default function ShippingOneOffExecutionPanel({
         },
         body: command.body,
       })
+      if (!requestIsCurrent()) return
       const { malformed, payload } = await readPayload(response)
+      if (!requestIsCurrent()) return
       const validResult = Boolean(
         response.ok
         && payload.ok
@@ -857,16 +1355,18 @@ export default function ShippingOneOffExecutionPanel({
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
           const durable = await loadState()
+          if (!requestIsCurrent()) return
           if (!durable) {
             throw new Error('The rejected cancellation could not be reconciled to durable status')
           }
           if (voidIsDurable(durable, command)) {
-            clearVoidCommand()
+            clearVoidCommand(command)
             setNotice('The prior exact cancellation succeeded; durable status is current.')
+            if (!requestIsCurrent()) return
             await onUpdated()
             return
           }
-          clearVoidCommand()
+          clearVoidCommand(command)
           setError(
             `${payloadMessage(payload, 'The carrier cancellation was rejected')} `
             + 'The rejected request was not retained; review the current group before trying again.',
@@ -877,24 +1377,29 @@ export default function ShippingOneOffExecutionPanel({
       }
       const result = payload.result as OneOffCarrierGroupCommandResult
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (
         !voidIsDurable(durable, command)
         || durable?.carrierGroup?.voidAttemptGlobalId !== result.groupAttemptGlobalId
       ) {
         throw new Error('The cancellation response is not yet bound to the exact carrier group and request key')
       }
-      clearVoidCommand()
+      clearVoidCommand(command)
       setNotice(
         result.action === 'close_sample'
           ? 'The complete TEST sample label group was closed locally with zero provider writes.'
           : 'The complete carrier label group was voided.',
       )
+      if (!requestIsCurrent()) return
       await onUpdated()
     } catch (caught) {
+      if (!requestIsCurrent()) return
       const durable = await loadState()
+      if (!requestIsCurrent()) return
       if (voidIsDurable(durable, command)) {
-        clearVoidCommand()
+        clearVoidCommand(command)
         setNotice('The prior exact cancellation succeeded; durable status is current.')
+        if (!requestIsCurrent()) return
         await onUpdated()
       } else {
         setError(
@@ -903,12 +1408,18 @@ export default function ShippingOneOffExecutionPanel({
         )
       }
     } finally {
-      setBusy('')
+      if (requestIsCurrent()) setBusy('')
     }
   }
 
-  if (loading && !state) {
-    return <Typography color="text.secondary">Loading exact postage status…</Typography>
+  if (!currentState) {
+    return (
+      <Typography color={loading ? 'text.secondary' : 'error'}>
+        {loading
+          ? 'Loading exact postage status…'
+          : error || 'Exact one-off postage status is unavailable.'}
+      </Typography>
+    )
   }
 
   return (
@@ -927,8 +1438,12 @@ export default function ShippingOneOffExecutionPanel({
         <Button
           size="small"
           startIcon={<RefreshRounded />}
-          disabled={Boolean(busy)}
-          onClick={() => { setError(''); void loadState() }}
+          disabled={Boolean(busy) || loading}
+          onClick={() => {
+            if (!requestFenceIsCurrent(executionOrderFence)) return
+            setError('')
+            void loadState()
+          }}
         >
           Check status
         </Button>
@@ -946,7 +1461,8 @@ export default function ShippingOneOffExecutionPanel({
           Carrier outcome is unresolved. Check status and use only the retained exact request; a new provider request is fenced.
         </Alert>
       )}
-      {(packCommand || refreshCommand || purchaseCommand || voidCommand) && (
+      {(packCommand || refreshCommand || purchaseCommand || voidCommand
+        || printCommand) && (
         <Alert severity="info" data-testid="shipping-retained-exact-request">
           An ambiguous request retains its byte-identical body and Idempotency-Key. Editing fields does not change that retry; a definitive 4xx rejection clears it and requires fresh review.
         </Alert>
@@ -1030,7 +1546,8 @@ export default function ShippingOneOffExecutionPanel({
               Boolean(busy)
               || Boolean(state.packReview.blocker)
               || !state.packReview.evidenceHash
-              || Boolean(refreshCommand || purchaseCommand || voidCommand)
+              || Boolean(refreshCommand || purchaseCommand || voidCommand
+                || printCommand)
               || (!packCommand && !packConfirmed)
               || (!packCommand && packReason.trim().length < 10)
             }
@@ -1050,14 +1567,101 @@ export default function ShippingOneOffExecutionPanel({
               ? `${group.labels.length} active ${group.labels.length === 1 ? 'label' : 'labels'} · master tracking ${group.masterTrackingNumber}`
               : 'The exact cancellation has an unresolved durable outcome.'}
           </Alert>
-          <Box>
-            {group.labels.map((label) => (
-              <Typography key={label.labelGlobalId} variant="body2">
-                Parcel {label.packageNumber}: {label.trackingNumber}
-                {label.printWarning ? ` · ${label.printWarning}` : ''}
-              </Typography>
-            ))}
-          </Box>
+          {(group.labels.some((label) => Boolean(label.printRecoveryAction))
+            || printCommand) && (
+            <TextField
+              size="small"
+              label="Label print recovery reason"
+              value={printReason}
+              disabled={Boolean(printCommand)}
+              onChange={(event) => setPrintReason(event.target.value)}
+              inputProps={{ maxLength: 500 }}
+              helperText="Required for an exact retry or deliberate new print. This never purchases another carrier label."
+            />
+          )}
+          <Stack spacing={1} data-testid="shipping-one-off-label-print-status">
+            {group.labels.map((label) => {
+              const retainedForLabel = Boolean(
+                printCommand
+                && retainedPrintBody?.orderGlobalId === orderGlobalId
+                && retainedPrintBody?.labelGlobalId === label.labelGlobalId
+                && retainedPrintBody.packageGlobalId === label.packageGlobalId,
+              )
+              const action = retainedForLabel
+                ? retainedPrintBody?.expectedRecoveryAction || null
+                : label.printRecoveryAction
+              return (
+                <Box
+                  key={label.labelGlobalId}
+                  sx={{ border: 1, borderColor: 'divider', borderRadius: 1, p: 1 }}
+                >
+                  <Stack
+                    direction="row"
+                    gap={0.75}
+                    flexWrap="wrap"
+                    useFlexGap
+                    alignItems="center"
+                  >
+                    <Typography variant="body2" fontWeight={650}>
+                      Parcel {label.packageNumber}: {label.trackingNumber}
+                    </Typography>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      color={label.printStatus === 'failed'
+                        ? 'warning'
+                        : label.printStatus === 'printed'
+                          ? 'success'
+                          : 'default'}
+                      label={label.printStatus
+                        ? `Print ${label.printStatus}`
+                        : 'Print not queued'}
+                    />
+                  </Stack>
+                  {label.printWarning && (
+                    <Typography variant="caption" color="text.secondary">
+                      {label.printWarning}
+                    </Typography>
+                  )}
+                  {label.printOutcomeUncertain && (
+                    <Alert severity="warning" sx={{ mt: 0.75 }}>
+                      Physical output is uncertain. Shipping blocks retry and new print; inspect the printer and use the stronger controlled printer authority if another copy is deliberately required.
+                    </Alert>
+                  )}
+                  {label.printStatus === 'printed' && (
+                    <Alert severity="info" sx={{ mt: 0.75 }}>
+                      The local print path acknowledged delivery. Shipping will not automatically print this label again.
+                    </Alert>
+                  )}
+                  {action && !label.printOutcomeUncertain && (
+                    <Button
+                      size="small"
+                      variant="outlined"
+                      sx={{ mt: 0.75 }}
+                      disabled={
+                        Boolean(busy)
+                        || Boolean(packCommand || refreshCommand
+                          || purchaseCommand || voidCommand)
+                        || Boolean(printCommand && !retainedForLabel)
+                        || (!printCommand && printReason.trim().length < 10)
+                      }
+                      onClick={() => { void recoverLabelPrint(label) }}
+                    >
+                      {busy === 'print' && retainedForLabel
+                        ? 'Checking exact print recovery…'
+                        : retainedForLabel
+                          ? 'Retry exact retained print recovery'
+                          : action === 'enqueue'
+                            ? 'Queue existing label'
+                            : action === 'retry'
+                              ? 'Retry exact failed print job'
+                              : 'Authorize new print after exhausted failure'}
+                    </Button>
+                  )}
+                </Box>
+              )
+            })}
+          </Stack>
           <TextField
             size="small"
             label="Cancellation reason"
@@ -1072,7 +1676,8 @@ export default function ShippingOneOffExecutionPanel({
             disabled={
               Boolean(busy)
               || !liveAllowed
-              || Boolean(packCommand || refreshCommand || purchaseCommand)
+              || Boolean(packCommand || refreshCommand || purchaseCommand
+                || printCommand)
               || (!voidCommand && voidReason.trim().length < 10)
             }
             onClick={() => { void voidLabels() }}
@@ -1094,7 +1699,8 @@ export default function ShippingOneOffExecutionPanel({
               Boolean(busy)
               || !state
               || !liveAllowed
-              || Boolean(packCommand || purchaseCommand || voidCommand)
+              || Boolean(packCommand || purchaseCommand || voidCommand
+                || printCommand)
               || unresolved
             }
             onClick={() => { void refreshRates() }}
@@ -1149,7 +1755,8 @@ export default function ShippingOneOffExecutionPanel({
             disabled={
               Boolean(busy)
               || !liveAllowed
-              || Boolean(packCommand || refreshCommand || voidCommand)
+              || Boolean(packCommand || refreshCommand || voidCommand
+                || printCommand)
               || (!purchaseCommand && !packedRateCurrent)
               || (unresolved && !retryingUnresolvedPurchase)
               || (!purchaseCommand && !selectedOfferGlobalId)

@@ -146,6 +146,7 @@ function loadTypeScript(path, mocks) {
 
 let auditWrites = 0
 let beforeTransactionCommit = null
+let nextTransactionStarted = null
 const postgres = {
   query(text, values = []) {
     return pool.query(text, values)
@@ -160,11 +161,16 @@ const postgres = {
     const client = await pool.connect()
     try {
       await client.query('BEGIN')
+      const startedHook = nextTransactionStarted
+      if (startedHook) {
+        nextTransactionStarted = null
+        await startedHook(client)
+      }
       const result = await work(client)
       const hook = beforeTransactionCommit
       if (hook) {
         beforeTransactionCommit = null
-        await hook()
+        await hook(client)
       }
       await client.query('COMMIT')
       return result
@@ -176,6 +182,169 @@ const postgres = {
     }
   },
 }
+
+function captureNextTransactionBackendPid() {
+  assert.equal(
+    nextTransactionStarted,
+    null,
+    'Only one transaction PID capture may be armed at a time',
+  )
+  let resolvePid
+  let rejectPid
+  const pidPromise = new Promise((resolvePromise, rejectPromise) => {
+    resolvePid = resolvePromise
+    rejectPid = rejectPromise
+  })
+  nextTransactionStarted = async (client) => {
+    try {
+      const result = await client.query(
+        'SELECT pg_backend_pid()::integer AS pid',
+      )
+      resolvePid(result.rows[0].pid)
+    } catch (error) {
+      rejectPid(error)
+      throw error
+    }
+  }
+  return Promise.race([
+    pidPromise,
+    new Promise((_, rejectPromise) => {
+      setTimeout(
+        () => rejectPromise(new Error('Timed out capturing contender backend PID')),
+        5_000,
+      )
+    }),
+  ])
+}
+
+async function backendPid(client) {
+  const result = await client.query('SELECT pg_backend_pid()::integer AS pid')
+  return result.rows[0].pid
+}
+
+async function waitForBackendLock({
+  contenderPid,
+  ownerPid,
+  expectedLockType,
+  message,
+}) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await pool.query(
+      `SELECT wait_event_type,
+              wait_event,
+              pg_blocking_pids(pid) AS blocking_pids
+       FROM pg_stat_activity
+       WHERE pid = $1::integer`,
+      [contenderPid],
+    )
+    const row = activity.rows[0]
+    if (row?.wait_event_type === 'Lock') {
+      const waitingLocks = await pool.query(
+        `SELECT locktype, mode, relation::regclass::text AS relation_name
+         FROM pg_locks
+         WHERE pid = $1::integer
+           AND NOT granted
+         ORDER BY locktype, mode`,
+        [contenderPid],
+      )
+      assert.ok(
+        row.blocking_pids.map(Number).includes(Number(ownerPid)),
+        `${message}: contender must name the exact owner as its blocker`,
+      )
+      assert.ok(
+        waitingLocks.rows.some((lock) => lock.locktype === expectedLockType),
+        `${message}: expected ungranted ${expectedLockType} lock, saw ${JSON.stringify(waitingLocks.rows)}`,
+      )
+      return {
+        waitEvent: row.wait_event,
+        waitingLocks: waitingLocks.rows,
+      }
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+  }
+  throw new Error(`${message}: contender never entered an observable lock wait`)
+}
+
+function printProfileAdapter() {
+  return {
+    async listOperationsPrinterProfilesInPostgres(organizationId, client) {
+      const result = await client.query(
+        `SELECT printer.id::text,
+                printer.global_id,
+                printer.warehouse_id::text,
+                warehouse.global_id AS warehouse_global_id,
+                warehouse.name AS warehouse_name,
+                printer.code,
+                printer.name,
+                printer.station_type,
+                printer.printer_type,
+                printer.connection_mode,
+                printer.supported_formats,
+                printer.supported_media,
+                printer.supported_document_types,
+                printer.default_document_types,
+                fallback.global_id AS fallback_printer_global_id,
+                fallback.name AS fallback_printer_name,
+                agent.global_id AS local_print_agent_global_id,
+                agent.name AS local_print_agent_name,
+                agent.status AS local_print_agent_status,
+                agent.last_seen_at AS local_print_agent_last_seen_at,
+                printer.priority,
+                printer.status,
+                printer.row_version,
+                printer.last_seen_at,
+                printer.updated_at
+         FROM operations_printers printer
+         JOIN operations_warehouses warehouse
+           ON warehouse.organization_id = printer.organization_id
+          AND warehouse.id = printer.warehouse_id
+         LEFT JOIN operations_printers fallback
+           ON fallback.organization_id = printer.organization_id
+          AND fallback.id = printer.fallback_printer_id
+         LEFT JOIN operations_print_agents agent
+           ON agent.organization_id = printer.organization_id
+          AND agent.warehouse_id = printer.warehouse_id
+          AND agent.id = printer.local_print_agent_id
+         WHERE printer.organization_id = $1::uuid
+         ORDER BY printer.priority, printer.name`,
+        [organizationId],
+      )
+      return result.rows.map((row) => ({
+        id: row.id,
+        globalId: row.global_id,
+        warehouseId: row.warehouse_id,
+        warehouseGlobalId: row.warehouse_global_id,
+        warehouseName: row.warehouse_name,
+        code: row.code,
+        name: row.name,
+        stationType: row.station_type,
+        printerType: row.printer_type,
+        connectionMode: row.connection_mode,
+        supportedFormats: row.supported_formats,
+        supportedMedia: row.supported_media,
+        supportedDocumentTypes: row.supported_document_types,
+        defaultDocumentTypes: row.default_document_types,
+        fallbackPrinterGlobalId: row.fallback_printer_global_id,
+        fallbackPrinterName: row.fallback_printer_name,
+        localPrintAgentGlobalId: row.local_print_agent_global_id,
+        localPrintAgentName: row.local_print_agent_name,
+        localPrintAgentStatus: row.local_print_agent_status,
+        localPrintAgentLastSeenAt: row.local_print_agent_last_seen_at
+          ? new Date(row.local_print_agent_last_seen_at).toISOString()
+          : null,
+        priority: row.priority,
+        status: row.status,
+        rowVersion: row.row_version,
+        lastSeenAt: row.last_seen_at
+          ? new Date(row.last_seen_at).toISOString()
+          : null,
+        updatedAt: new Date(row.updated_at).toISOString(),
+      }))
+    },
+  }
+}
+
 const persistence = loadTypeScript(
   'app_src/lib/persistence/shippingOneOffPack.ts',
   {
@@ -190,6 +359,74 @@ const persistence = loadTypeScript(
       OneOffShipmentPersistenceError: TestPersistenceError,
     },
     '@/lib/persistence/postgres': postgres,
+  },
+)
+const printing = loadTypeScript('app_src/lib/operations/printing.ts', {})
+const carrierManagedDelegation = loadTypeScript(
+  'app_src/lib/integrations/carrierManagedDelegation.ts',
+  {},
+)
+const requestErrorAdapter = {
+  OperationsRequestError: TestPersistenceError,
+}
+const printPersistence = loadTypeScript(
+  'app_src/lib/persistence/operationPrintDelivery.ts',
+  {
+    '@/lib/auditWriter': {
+      recordAuditEvent: async () => { auditWrites += 1 },
+    },
+    '@/lib/integrations/carrierManagedDelegation': carrierManagedDelegation,
+    '@/lib/operations/printing': printing,
+    '@/lib/persistence/operations': requestErrorAdapter,
+    '@/lib/persistence/operationPrinting': printProfileAdapter(),
+    '@/lib/persistence/postgres': postgres,
+  },
+)
+let carrierProviderWrites = 0
+const rejectCarrierWrite = () => {
+  carrierProviderWrites += 1
+  throw new Error('Shipping print recovery attempted a carrier/provider write')
+}
+const executionPersistence = loadTypeScript(
+  'app_src/lib/persistence/operationOneOffShipping.ts',
+  {
+    '@/lib/auditWriter': {
+      recordAuditEvent: async () => { auditWrites += 1 },
+    },
+    '@/lib/integrations/carrierIntegrations': {
+      resolveCarrierOneOffVoidRuntime: rejectCarrierWrite,
+      resolveCarrierProductionShippingRuntime: rejectCarrierWrite,
+      resolveCarrierSandboxShippingRuntime: rejectCarrierWrite,
+    },
+    '@/lib/integrations/carrierOneOffGroupShipment': {
+      carrierOneOffGroupLifecycleMode: () => 'carrier_void',
+      executeCarrierOneOffGroupShipment: rejectCarrierWrite,
+      executeCarrierOneOffGroupVoid: rejectCarrierWrite,
+      prepareCarrierOneOffGroupRequest: rejectCarrierWrite,
+      prepareCarrierOneOffGroupVoidRequest: rejectCarrierWrite,
+    },
+    '@/lib/operations/oneOffShipments': {
+      oneOffProviderLabel: (provider) => provider === 'fedex_rest'
+        ? 'FedEx'
+        : provider === 'wwex_speedship'
+          ? 'Worldwide Express'
+          : 'UPS',
+      oneOffShipmentHash,
+    },
+    '@/lib/operations/packageCatalog': {
+      defaultCanonicalPackageProfile: () => ({
+        catalogEntryId: 'box',
+        contractVersion: 'operations.package_catalog.v1',
+      }),
+    },
+    '@/lib/persistence/operationPrintDelivery': printPersistence,
+    '@/lib/operations/printing': printing,
+    '@/lib/persistence/oneOffShipments': {
+      OneOffShipmentPersistenceError: TestPersistenceError,
+      quoteOneOffShipmentInPostgres: rejectCarrierWrite,
+    },
+    '@/lib/persistence/postgres': postgres,
+    '@/lib/persistence/shippingOneOffPack': persistence,
   },
 )
 
@@ -869,6 +1106,333 @@ async function seedFixture(client, item, { unresolvedGroup = false } = {}) {
         'Unresolved carrier fixture blocks physical pack', actorEmail,
       ],
     )
+  }
+}
+
+async function seedActivePrintRecoveryGroup(client, item) {
+  const groupId = randomUUID()
+  const labelId = randomUUID()
+  const labelPayload = '^XA^FO20,20^FDPRINT RECOVERY^FS^XZ'
+  const labelContentSha256 = createHash('sha256')
+    .update(labelPayload, 'utf8')
+    .digest('hex')
+  const labelByteLength = Buffer.byteLength(labelPayload, 'utf8')
+  const trackingNumber = `1ZPRINT${String(item.index).padStart(8, '0')}`
+  const groupFixtureKey = `shipping-print-group-fixture-${item.index}`
+  const providerLabelId = `shipping-print-provider-label-${item.index}`
+  await client.query(
+    `UPDATE operations_packages
+     SET status = 'labeled'
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [ids.organization, item.package],
+  )
+  await client.query(
+    `INSERT INTO operations_one_off_carrier_group_attempts (
+       id, organization_id, order_id, plan_id,
+       planning_quote_id, planning_offer_id,
+       purchase_quote_id, purchase_offer_id, carrier_rate_id,
+       integration_account_id, carrier_account_id,
+       action, state, environment, provider, service_code, package_count,
+       selected_amount_minor, currency, adapter_version, idempotency_key,
+       request_hash, redacted_request, redacted_response,
+       master_tracking_number, provider_shipment_id, provider_reference,
+       reason, actor_email, completed_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       $5::uuid, $6::uuid, $5::uuid, $6::uuid, $7::uuid,
+       $8::uuid, $9::uuid,
+       'create', 'succeeded', 'sandbox', 'ups_rest', '03', 1,
+       1200, 'USD', 'shipping-print-recovery-fixture-v1', $10,
+       $11, $12::jsonb, $13::jsonb,
+       $15, $16, $16,
+       'Seed exact immutable label for Shipping print recovery', $14, now()
+     )`,
+    [
+      groupId,
+      ids.organization,
+      item.order,
+      item.plan,
+      item.quote,
+      item.offer,
+      item.rate,
+      ids.carrierIntegration,
+      ids.carrierAccount,
+      groupFixtureKey,
+      createHash('sha256').update(groupFixtureKey).digest('hex'),
+      JSON.stringify({ fixture: 'shipping-print-recovery' }),
+      JSON.stringify({ fixture: 'shipping-print-recovery', succeeded: true }),
+      actorEmail,
+      trackingNumber,
+      `shipping-print-provider-fixture-${item.index}`,
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_one_off_carrier_group_members (
+       organization_id, carrier_group_attempt_id, order_id, plan_id,
+       package_id, package_number, quote_package_key,
+       length_mm, width_mm, height_mm, weight_grams,
+       allocated_selected_cost_minor, parcel_snapshot_hash
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       $5::uuid, 1, $6, 300, 220, 140, $7,
+       1200, $8
+     )`,
+    [
+      ids.organization,
+      groupId,
+      item.order,
+      item.plan,
+      item.package,
+      `package-${item.index}`,
+      1000 + item.index,
+      createHash('sha256').update('shipping-print-parcel').digest('hex'),
+    ],
+  )
+  const label = await client.query(
+    `INSERT INTO operations_labels (
+       id, organization_id, package_id, carrier_rate_id,
+       carrier, service_code, tracking_number, format, label_payload,
+       provider_label_id, idempotency_key, status,
+       integration_account_id, carrier_account_id, environment,
+       request_hash, redacted_provider_evidence,
+       one_off_carrier_group_attempt_id
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'UPS', '03', $11, 'ZPL', $5,
+       $12, $13,
+       'created', $6::uuid, $7::uuid, 'sandbox', $8, $9::jsonb, $10::uuid
+     )
+     RETURNING global_id`,
+    [
+      labelId,
+      ids.organization,
+      item.package,
+      item.rate,
+      labelPayload,
+      ids.carrierIntegration,
+      ids.carrierAccount,
+      createHash('sha256').update(
+        `shipping-print-label-${item.index}`,
+      ).digest('hex'),
+      JSON.stringify({
+        provider: 'ups_rest',
+        packageNumber: 1,
+        labelContentSha256,
+        labelByteLength,
+      }),
+      groupId,
+      trackingNumber,
+      providerLabelId,
+      `shipping-print-label-fixture-${item.index}`,
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_one_off_carrier_group_results (
+       organization_id, carrier_group_attempt_id, package_id,
+       package_number, label_id, tracking_number,
+       provider_package_reference, redacted_provider_evidence
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 1, $4::uuid,
+       $5, $6, $7::jsonb
+     )`,
+    [
+      ids.organization,
+      groupId,
+      item.package,
+      labelId,
+      trackingNumber,
+      providerLabelId,
+      JSON.stringify({
+        provider: 'ups_rest',
+        packageNumber: 1,
+        contentSha256: labelContentSha256,
+        byteLength: labelByteLength,
+      }),
+    ],
+  )
+  return {
+    groupId,
+    labelId,
+    labelGlobalId: label.rows[0].global_id,
+  }
+}
+
+async function installShippingPrintRoute(client) {
+  const agent = await client.query(
+    `INSERT INTO operations_print_agents (
+       organization_id, warehouse_id, name, secret_hash,
+       request_fingerprint, idempotency_key, status, enrolled_by,
+       last_seen_at, supported_formats, supported_media,
+       supported_document_types
+     ) VALUES (
+       $1::uuid, $2::uuid, 'Shipping recovery test agent', $3,
+       $4, 'shipping-print-agent-fixture', 'active', $5, now(),
+       ARRAY['ZPL']::text[], ARRAY['label_4x6']::text[],
+       ARRAY['shipping_label']::text[]
+     )
+     RETURNING id::text, global_id`,
+    [
+      ids.organization,
+      ids.warehouse,
+      createHash('sha256').update('shipping-print-secret').digest('hex'),
+      createHash('sha256').update('shipping-print-agent').digest('hex'),
+      actorEmail,
+    ],
+  )
+  const printer = await client.query(
+    `INSERT INTO operations_printers (
+       organization_id, warehouse_id, code, name, station_type,
+       supports_zpl, priority, status, created_by,
+       printer_type, connection_mode, supported_formats, supported_media,
+       supported_document_types, default_document_types,
+       local_print_agent_id
+     ) VALUES (
+       $1::uuid, $2::uuid, 'SHIP-RECOVERY', 'Shipping recovery printer',
+       'shipping', true, 1, 'online', $3,
+       'thermal', 'local_agent', ARRAY['ZPL']::text[],
+       ARRAY['label_4x6']::text[], ARRAY['shipping_label']::text[],
+       ARRAY['shipping_label']::text[], $4::uuid
+     )
+     RETURNING id::text, global_id`,
+    [ids.organization, ids.warehouse, actorEmail, agent.rows[0].id],
+  )
+  return {
+    agentId: agent.rows[0].id,
+    agentGlobalId: agent.rows[0].global_id,
+    printerId: printer.rows[0].id,
+    printerGlobalId: printer.rows[0].global_id,
+  }
+}
+
+async function forcePrintOutcome(jobGlobalId, route, input) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('SET LOCAL session_replication_role = replica')
+    const job = await client.query(
+      `SELECT job.id::text, job.printer_id::text,
+              COALESCE(max(attempt.sequence_number), 0)::integer AS sequence
+       FROM operations_print_jobs job
+       LEFT JOIN operations_print_delivery_attempts attempt
+         ON attempt.organization_id = job.organization_id
+        AND attempt.print_job_id = job.id
+       WHERE job.organization_id = $1::uuid AND job.global_id = $2
+       GROUP BY job.id, job.printer_id`,
+      [ids.organization, jobGlobalId],
+    )
+    assert.equal(job.rowCount, 1)
+    const row = job.rows[0]
+    const sequence = row.sequence + 1
+    if (input.status === 'delivered') {
+      await client.query(
+        `INSERT INTO operations_print_delivery_attempts (
+           organization_id, print_job_id, printer_id,
+           attempt_number, sequence_number, state, actor_type,
+           print_agent_id, idempotency_key, request_fingerprint,
+           detail, device_job_reference, delivery_evidence,
+           physical_output_verified
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid,
+           $4, $5, 'delivered', 'local_print_agent',
+           $6::uuid, $7, $8,
+           'Certain local printer acknowledgement',
+           'local-device.legacy.v1.redacted',
+           'local_agent_acknowledgement', false
+         )`,
+        [
+          ids.organization,
+          row.id,
+          row.printer_id,
+          input.attempts,
+          sequence,
+          route.agentId,
+          `shipping-print-delivered-${randomUUID()}`,
+          createHash('sha256').update(`delivered-${randomUUID()}`).digest('hex'),
+        ],
+      )
+      await client.query(
+        `UPDATE operations_print_jobs
+         SET status = 'delivered', attempts = $3, max_attempts = $4,
+             delivered_at = now(), last_error = NULL,
+             claimed_by_print_agent_id = NULL,
+             current_claim_attempt_id = NULL, claim_expires_at = NULL
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [ids.organization, row.id, input.attempts, input.maxAttempts],
+      )
+    } else {
+      const errorCode = input.uncertain
+        ? 'PRINT_OUTCOME_UNCERTAIN'
+        : input.errorCode || 'PRINTER_UNAVAILABLE'
+      await client.query(
+        `INSERT INTO operations_print_delivery_attempts (
+           organization_id, print_job_id, printer_id,
+           attempt_number, sequence_number, state, actor_type,
+           idempotency_key, request_fingerprint,
+           detail, error_code, error_message, physical_output_verified
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid,
+           $4, $5, 'failed', 'system', $6, $7,
+           'Certain zero-output Shipping recovery fixture', $8, $9, false
+         )`,
+        [
+          ids.organization,
+          row.id,
+          row.printer_id,
+          input.attempts,
+          sequence,
+          `shipping-print-failed-${randomUUID()}`,
+          createHash('sha256').update(`failed-${randomUUID()}`).digest('hex'),
+          errorCode,
+          input.uncertain
+            ? 'The physical output outcome is deliberately uncertain'
+            : 'The printer did not accept any physical output',
+        ],
+      )
+      await client.query(
+        `UPDATE operations_print_jobs
+         SET status = 'failed', attempts = $3, max_attempts = $4,
+             delivered_at = NULL, last_error = $5,
+             claimed_by_print_agent_id = NULL,
+             current_claim_attempt_id = NULL, claim_expires_at = NULL
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          ids.organization,
+          row.id,
+          input.attempts,
+          input.maxAttempts,
+          errorCode,
+        ],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+function printRecoveryInput(state, label, key, reason) {
+  return {
+    organizationId: ids.organization,
+    actorEmail,
+    idempotencyKey: key,
+    orderGlobalId: state.orderGlobalId,
+    expectedRowVersion: state.rowVersion,
+    packageGlobalId: label.packageGlobalId,
+    labelGlobalId: label.labelGlobalId,
+    expectedRecoveryAction: label.printRecoveryAction
+      || (label.printJobGlobalId ? 'retry' : 'enqueue'),
+    expectedPrintJobGlobalId: label.printJobGlobalId,
+    expectedPrintJobStatus: label.printJobStatus,
+    expectedPrintArtifactGlobalId: label.printArtifactGlobalId,
+    expectedPrintAttempts: label.printAttempts,
+    expectedPrintMaxAttempts: label.printMaxAttempts,
+    expectedLatestAttemptSequenceNumber:
+      label.printLatestAttemptSequenceNumber,
+    expectedLatestErrorCode: label.printLatestErrorCode,
+    reason,
   }
 }
 
@@ -1760,6 +2324,789 @@ try {
     carrier_groups: 1,
   })
   assert.equal(auditWrites, 3)
+
+  const printSeed = await pool.connect()
+  let printFixture
+  let printLockFixture
+  let printReprintFixture
+  const printReprintItem = [idempotencyRaceA, idempotencyRaceB].find(
+    (item) => item.orderGlobalId === idempotencyWinner,
+  )
+  assert.ok(printReprintItem)
+  try {
+    await printSeed.query('BEGIN')
+    await printSeed.query('SET LOCAL session_replication_role = replica')
+    printFixture = await seedActivePrintRecoveryGroup(printSeed, existing)
+    printLockFixture = await seedActivePrintRecoveryGroup(
+      printSeed,
+      createdProduct,
+    )
+    printReprintFixture = await seedActivePrintRecoveryGroup(
+      printSeed,
+      printReprintItem,
+    )
+    await printSeed.query('COMMIT')
+  } catch (error) {
+    await printSeed.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    printSeed.release()
+  }
+  const forbiddenPrintWritesBefore = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_labels) AS labels,
+       (SELECT count(*)::integer FROM operations_label_attempts)
+         AS label_attempts,
+       (SELECT count(*)::integer FROM operations_shipments) AS shipments,
+       (SELECT count(*)::integer
+          FROM operations_one_off_carrier_group_attempts) AS carrier_groups,
+       (SELECT count(*)::integer
+          FROM operations_one_off_carrier_group_results) AS carrier_results,
+       (SELECT count(*)::integer
+          FROM operations_carrier_rate_requests) AS carrier_requests,
+       (SELECT jsonb_agg(jsonb_build_object(
+          'globalId', label.global_id,
+          'status', label.status,
+          'payloadHash', encode(digest(
+            convert_to(label.label_payload, 'UTF8'), 'sha256'
+          ), 'hex'),
+          'requestHash', label.request_hash,
+          'providerEvidence', label.redacted_provider_evidence
+        ) ORDER BY label.global_id)
+        FROM operations_labels label) AS label_evidence`,
+  )
+  const initialPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  assert.equal(initialPrintState.orderStatus, 'packed')
+  assert.equal(initialPrintState.carrierGroup.active, true)
+  const initialPrintLabel = initialPrintState.carrierGroup.labels[0]
+  assert.equal(initialPrintLabel.labelGlobalId, printFixture.labelGlobalId)
+  assert.equal(initialPrintLabel.printJobGlobalId, null)
+  assert.equal(initialPrintLabel.printStatus, null)
+  assert.equal(initialPrintLabel.printRecoveryAction, 'enqueue')
+  const enqueueKey = 'shipping-print-no-printer-then-retry'
+  const enqueueInput = printRecoveryInput(
+    initialPrintState,
+    initialPrintLabel,
+    enqueueKey,
+    'Queue this exact immutable label after the printer route is available',
+  )
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      enqueueInput,
+    ),
+    'OPERATIONS_PRINT_ROUTE_UNAVAILABLE',
+    'No printer must reject Shipping recovery without creating print evidence',
+  )
+  const noPrinterEvidence = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_print_artifacts artifact
+        WHERE artifact.organization_id = $1::uuid
+          AND artifact.source_label_id = $2::uuid) AS artifacts,
+       (SELECT count(*)::integer
+        FROM operations_print_jobs job
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS jobs,
+       (SELECT count(*)::integer
+        FROM operations_print_delivery_attempts attempt
+        JOIN operations_print_jobs job
+          ON job.organization_id = attempt.organization_id
+         AND job.id = attempt.print_job_id
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS attempts`,
+    [ids.organization, printFixture.labelId],
+  )
+  assert.deepEqual(noPrinterEvidence.rows[0], {
+    artifacts: 0,
+    jobs: 0,
+    attempts: 0,
+  })
+
+  const printRoute = await installShippingPrintRoute(pool)
+  const printLockState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: createdProduct.orderGlobalId,
+    })
+  const printLockLabel = printLockState.carrierGroup.labels[0]
+  const printLockShippingInput = printRecoveryInput(
+    printLockState,
+    printLockLabel,
+    'shipping-print-label-lock-race',
+    'Serialize this Shipping enqueue against a generic label enqueue',
+  )
+  let shippingBehindGenericEnqueue = null
+  beforeTransactionCommit = async (ownerClient) => {
+    const ownerPid = await backendPid(ownerClient)
+    const contenderPidPromise = captureNextTransactionBackendPid()
+    let settled = false
+    shippingBehindGenericEnqueue = executionPersistence
+      .recoverOperationsOneOffLabelPrintInPostgres(printLockShippingInput)
+      .then(
+        (result) => { settled = true; return { result, error: null } },
+        (error) => { settled = true; return { result: null, error } },
+      )
+    const contenderPid = await contenderPidPromise
+    await waitForBackendLock({
+      contenderPid,
+      ownerPid,
+      expectedLockType: 'advisory',
+      message: 'Shipping behind generic enqueue print-label fence',
+    })
+    assert.equal(
+      settled,
+      false,
+      'Shipping must wait at the shared print-label fence while generic enqueue owns it',
+    )
+  }
+  const genericLockOriginal = await printPersistence
+    .enqueueOperationsPrintJobInPostgres({
+      organizationId: ids.organization,
+      actorEmail,
+      idempotencyKey: 'generic-print-label-lock-race',
+      warehouseId: ids.warehouse,
+      document: {
+        type: 'shipping_label',
+        sourceLabelGlobalId: printLockFixture.labelGlobalId,
+        media: 'label_4x6',
+      },
+    })
+  const shippingBehindGenericEnqueueOutcome =
+    await shippingBehindGenericEnqueue
+  assert.ok(shippingBehindGenericEnqueueOutcome.error)
+  assert.notEqual(shippingBehindGenericEnqueueOutcome.error.code, '40P01')
+  assert.notEqual(shippingBehindGenericEnqueueOutcome.error.code, '40001')
+  const labelLockRaceCount = await pool.query(
+    `SELECT count(*)::integer AS jobs
+     FROM operations_print_jobs
+     WHERE organization_id = $1::uuid AND label_id = $2::uuid`,
+    [ids.organization, printLockFixture.labelId],
+  )
+  assert.equal(labelLockRaceCount.rows[0].jobs, 1)
+
+  const printReprintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: printReprintItem.orderGlobalId,
+    })
+  const printReprintLabel = printReprintState.carrierGroup.labels[0]
+  const printReprintShippingInput = printRecoveryInput(
+    printReprintState,
+    printReprintLabel,
+    'shipping-print-generic-reprint-lock',
+    'Queue the original before proving generic reprint lock compatibility',
+  )
+  let genericBehindShippingEnqueue = null
+  beforeTransactionCommit = async (ownerClient) => {
+    const ownerPid = await backendPid(ownerClient)
+    const contenderPidPromise = captureNextTransactionBackendPid()
+    let settled = false
+    genericBehindShippingEnqueue = printPersistence
+      .enqueueOperationsPrintJobInPostgres({
+        organizationId: ids.organization,
+        actorEmail,
+        idempotencyKey: 'generic-behind-shipping-label-lock',
+        warehouseId: ids.warehouse,
+        document: {
+          type: 'shipping_label',
+          sourceLabelGlobalId: printReprintFixture.labelGlobalId,
+          media: 'label_4x6',
+        },
+      })
+      .then(
+        (result) => { settled = true; return { result, error: null } },
+        (error) => { settled = true; return { result: null, error } },
+      )
+    const contenderPid = await contenderPidPromise
+    await waitForBackendLock({
+      contenderPid,
+      ownerPid,
+      expectedLockType: 'advisory',
+      message: 'Generic enqueue behind Shipping print-label fence',
+    })
+    assert.equal(
+      settled,
+      false,
+      'Generic enqueue must wait while Shipping owns the shared print-label fence',
+    )
+  }
+  const printReprintOriginal = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(printReprintShippingInput)
+  const genericBehindShippingEnqueueOutcome =
+    await genericBehindShippingEnqueue
+  assert.ok(genericBehindShippingEnqueueOutcome.error)
+  assert.notEqual(genericBehindShippingEnqueueOutcome.error.code, '40P01')
+  assert.notEqual(genericBehindShippingEnqueueOutcome.error.code, '40001')
+
+  await forcePrintOutcome(genericLockOriginal.globalId, printRoute, {
+    status: 'failed', attempts: 1, maxAttempts: 3, uncertain: false,
+  })
+  const printLockFailedState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: createdProduct.orderGlobalId,
+    })
+  const printLockRetryInput = printRecoveryInput(
+    printLockFailedState,
+    printLockFailedState.carrierGroup.labels[0],
+    'shipping-retry-behind-generic-reprint',
+    'Bind an exact Shipping retry before generic reprint lock proof',
+  )
+  await executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+    printLockRetryInput,
+  )
+  await forcePrintOutcome(genericLockOriginal.globalId, printRoute, {
+    status: 'delivered', attempts: 2, maxAttempts: 3,
+  })
+  let shippingBehindGenericReprint = null
+  beforeTransactionCommit = async (ownerClient) => {
+    const ownerPid = await backendPid(ownerClient)
+    const contenderPidPromise = captureNextTransactionBackendPid()
+    let settled = false
+    shippingBehindGenericReprint = executionPersistence
+      .recoverOperationsOneOffLabelPrintInPostgres(printLockRetryInput)
+      .then(
+        (result) => { settled = true; return { result, error: null } },
+        (error) => { settled = true; return { result: null, error } },
+      )
+    const contenderPid = await contenderPidPromise
+    await waitForBackendLock({
+      contenderPid,
+      ownerPid,
+      expectedLockType: 'transactionid',
+      message: 'Shipping retry replay behind generic reprint job lock',
+    })
+    assert.equal(
+      settled,
+      false,
+      'Shipping must wait on the generic writer job while compatible label SHARE locks avoid a cycle',
+    )
+  }
+  await printPersistence.reprintOperationsPrintJobInPostgres({
+    organizationId: ids.organization,
+    actorEmail,
+    idempotencyKey: 'generic-first-reprint-lock-proof',
+    jobGlobalId: genericLockOriginal.globalId,
+    reason: 'Controlled generic-first reprint after acknowledged output',
+  })
+  const shippingBehindGenericReprintOutcome =
+    await shippingBehindGenericReprint
+  assert.equal(shippingBehindGenericReprintOutcome.error, null)
+  assert.equal(shippingBehindGenericReprintOutcome.result.action, 'retry')
+
+  await forcePrintOutcome(printReprintOriginal.printJobGlobalId, printRoute, {
+    status: 'delivered', attempts: 1, maxAttempts: 3,
+  })
+  let genericBehindShippingReprint = null
+  beforeTransactionCommit = async (ownerClient) => {
+    const ownerPid = await backendPid(ownerClient)
+    const contenderPidPromise = captureNextTransactionBackendPid()
+    let settled = false
+    genericBehindShippingReprint = printPersistence
+      .reprintOperationsPrintJobInPostgres({
+        organizationId: ids.organization,
+        actorEmail,
+        idempotencyKey: 'generic-behind-shipping-reprint-lock-proof',
+        jobGlobalId: printReprintOriginal.printJobGlobalId,
+        reason: 'Controlled reprint waiting behind exact Shipping replay',
+      })
+      .then(
+        (result) => { settled = true; return { result, error: null } },
+        (error) => { settled = true; return { result: null, error } },
+      )
+    const contenderPid = await contenderPidPromise
+    await waitForBackendLock({
+      contenderPid,
+      ownerPid,
+      expectedLockType: 'transactionid',
+      message: 'Generic reprint behind Shipping job lock',
+    })
+    assert.equal(
+      settled,
+      false,
+      'Generic reprint must wait on the job tuple held by Shipping replay',
+    )
+  }
+  const shippingFirstReprintReplay = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(printReprintShippingInput)
+  assert.equal(shippingFirstReprintReplay.action, 'enqueue')
+  const genericBehindShippingReprintOutcome =
+    await genericBehindShippingReprint
+  assert.equal(genericBehindShippingReprintOutcome.error, null)
+
+  const enqueueResults = await Promise.all([
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      enqueueInput,
+    ),
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      enqueueInput,
+    ),
+  ])
+  assert.deepEqual(
+    enqueueResults.map((result) => result.replayed).sort(),
+    [false, true],
+  )
+  assert.equal(enqueueResults[0].action, 'enqueue')
+  assert.equal(
+    enqueueResults[0].printJobGlobalId,
+    enqueueResults[1].printJobGlobalId,
+  )
+  assert.equal(enqueueResults[0].sourcePrintJobGlobalId, null)
+  assert.deepEqual(JSON.parse(JSON.stringify(enqueueResults[0].effects)), {
+    carrierWrites: 0,
+    providerWrites: 0,
+    labelWrites: 0,
+  })
+  const queuedEvidence = await pool.query(
+    `SELECT count(DISTINCT artifact.id)::integer AS artifacts,
+            count(DISTINCT job.id)::integer AS jobs,
+            count(DISTINCT attempt.id)::integer AS attempts
+     FROM operations_print_jobs job
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = job.organization_id
+      AND artifact.id = job.artifact_id
+     JOIN operations_print_delivery_attempts attempt
+       ON attempt.organization_id = job.organization_id
+      AND attempt.print_job_id = job.id
+     WHERE job.organization_id = $1::uuid
+       AND job.label_id = $2::uuid`,
+    [ids.organization, printFixture.labelId],
+  )
+  assert.deepEqual(queuedEvidence.rows[0], {
+    artifacts: 1,
+    jobs: 1,
+    attempts: 1,
+  })
+  const queuedPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const queuedPrintLabel = queuedPrintState.carrierGroup.labels[0]
+  assert.equal(queuedPrintLabel.printJobGlobalId, enqueueResults[0].printJobGlobalId)
+  assert.equal(queuedPrintLabel.printStatus, 'queued')
+  assert.equal(queuedPrintLabel.printRecoveryAction, null)
+  assert.equal(queuedPrintLabel.printArtifactGlobalId, enqueueResults[0].printArtifactGlobalId)
+
+  await forcePrintOutcome(enqueueResults[0].printJobGlobalId, printRoute, {
+    status: 'failed', attempts: 1, maxAttempts: 3, uncertain: false,
+  })
+  const failedPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const failedPrintLabel = failedPrintState.carrierGroup.labels[0]
+  assert.equal(failedPrintLabel.printStatus, 'failed')
+  assert.equal(failedPrintLabel.printOutcomeUncertain, false)
+  assert.equal(failedPrintLabel.printRecoveryAction, 'retry')
+  const retryKey = 'shipping-print-safe-failed-retry'
+  const retryInput = printRecoveryInput(
+    failedPrintState,
+    failedPrintLabel,
+    retryKey,
+    'Retry the exact certain zero-output failed print job',
+  )
+  const retryResults = await Promise.all([
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      retryInput,
+    ),
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      retryInput,
+    ),
+  ])
+  assert.deepEqual(
+    retryResults.map((result) => result.replayed).sort(),
+    [false, true],
+  )
+  assert.ok(retryResults.every((result) => (
+    result.action === 'retry'
+    && result.printJobGlobalId === enqueueResults[0].printJobGlobalId
+    && result.sourcePrintJobGlobalId === enqueueResults[0].printJobGlobalId
+  )))
+  const retryAttemptCount = await pool.query(
+    `SELECT count(*)::integer AS attempts
+     FROM operations_print_delivery_attempts attempt
+     JOIN operations_print_jobs job
+       ON job.organization_id = attempt.organization_id
+      AND job.id = attempt.print_job_id
+     WHERE job.organization_id = $1::uuid
+       AND job.global_id = $2
+       AND attempt.idempotency_key = $3`,
+    [
+      ids.organization,
+      enqueueResults[0].printJobGlobalId,
+      `print-user:retry:${retryKey}`,
+    ],
+  )
+  assert.equal(retryAttemptCount.rows[0].attempts, 1)
+
+  await forcePrintOutcome(enqueueResults[0].printJobGlobalId, printRoute, {
+    status: 'failed', attempts: 2, maxAttempts: 3, uncertain: false,
+  })
+  const secondRetryState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const secondRetryLabel = secondRetryState.carrierGroup.labels[0]
+  assert.equal(secondRetryLabel.printRecoveryAction, 'retry')
+  const secondRetryInput = printRecoveryInput(
+    secondRetryState,
+    secondRetryLabel,
+    'shipping-print-safe-failed-retry-k2',
+    'Queue a second exact retry before the bounded attempts exhaust',
+  )
+  const secondRetryResult = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(secondRetryInput)
+  assert.equal(secondRetryResult.action, 'retry')
+  assert.equal(secondRetryResult.replayed, false)
+
+  await forcePrintOutcome(enqueueResults[0].printJobGlobalId, printRoute, {
+    status: 'failed', attempts: 3, maxAttempts: 3, uncertain: false,
+    errorCode: 'ARBITRARY_FAILED_CODE',
+  })
+  const arbitraryFailureState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const arbitraryFailureLabel = arbitraryFailureState.carrierGroup.labels[0]
+  assert.equal(arbitraryFailureLabel.printStatus, 'failed')
+  assert.equal(
+    arbitraryFailureLabel.printRecoveryAction,
+    null,
+    'An arbitrary failure code is not proof that zero bytes reached the printer',
+  )
+  const arbitraryRecoveryCountsBefore = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_print_jobs
+        WHERE organization_id = $1::uuid AND label_id = $2::uuid) AS jobs,
+       (SELECT count(*)::integer
+        FROM operations_print_delivery_attempts attempt
+        JOIN operations_print_jobs job
+          ON job.organization_id = attempt.organization_id
+         AND job.id = attempt.print_job_id
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS attempts`,
+    [ids.organization, printFixture.labelId],
+  )
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      {
+        ...printRecoveryInput(
+          arbitraryFailureState,
+          arbitraryFailureLabel,
+          'shipping-print-arbitrary-failure-refusal',
+          'Do not retry without exact zero-byte delivery evidence',
+        ),
+        expectedRecoveryAction: 'new_print',
+      },
+    ),
+    'OPERATIONS_ONE_OFF_PRINT_RECOVERY_UNAVAILABLE',
+    'Arbitrary failure evidence must not authorize retry or a new print',
+  )
+  const arbitraryRecoveryCountsAfter = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_print_jobs
+        WHERE organization_id = $1::uuid AND label_id = $2::uuid) AS jobs,
+       (SELECT count(*)::integer
+        FROM operations_print_delivery_attempts attempt
+        JOIN operations_print_jobs job
+          ON job.organization_id = attempt.organization_id
+         AND job.id = attempt.print_job_id
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS attempts`,
+    [ids.organization, printFixture.labelId],
+  )
+  assert.deepEqual(
+    arbitraryRecoveryCountsAfter.rows[0],
+    arbitraryRecoveryCountsBefore.rows[0],
+  )
+  await forcePrintOutcome(enqueueResults[0].printJobGlobalId, printRoute, {
+    status: 'failed', attempts: 3, maxAttempts: 3, uncertain: false,
+    errorCode: 'PRINT_DELIVERY_STOPPED',
+  })
+  const exhaustedPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const exhaustedPrintLabel = exhaustedPrintState.carrierGroup.labels[0]
+  assert.equal(exhaustedPrintLabel.printStatus, 'failed')
+  assert.equal(exhaustedPrintLabel.printAttempts, 3)
+  assert.equal(exhaustedPrintLabel.printMaxAttempts, 3)
+  assert.equal(exhaustedPrintLabel.printRecoveryAction, 'new_print')
+  const newPrintKey = 'shipping-print-exhausted-new-print'
+  const newPrintInput = printRecoveryInput(
+    exhaustedPrintState,
+    exhaustedPrintLabel,
+    newPrintKey,
+    'Authorize a deliberate new print after certain exhausted failure',
+  )
+  const newPrintResults = await Promise.all([
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      newPrintInput,
+    ),
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      newPrintInput,
+    ),
+  ])
+  assert.deepEqual(
+    newPrintResults.map((result) => result.replayed).sort(),
+    [false, true],
+  )
+  assert.ok(newPrintResults.every((result) => (
+    result.action === 'new_print'
+    && result.sourcePrintJobGlobalId === enqueueResults[0].printJobGlobalId
+    && result.printJobGlobalId === newPrintResults[0].printJobGlobalId
+    && result.printArtifactGlobalId === enqueueResults[0].printArtifactGlobalId
+  )))
+  const printLineage = await pool.query(
+    `SELECT count(*)::integer AS jobs,
+            count(*) FILTER (
+              WHERE original.global_id = $3
+                AND job.artifact_id = original.artifact_id
+            )::integer AS exact_reprints
+     FROM operations_print_jobs job
+     LEFT JOIN operations_print_jobs original
+       ON original.organization_id = job.organization_id
+      AND original.id = job.reprint_of_job_id
+     WHERE job.organization_id = $1::uuid
+       AND job.label_id = $2::uuid`,
+    [
+      ids.organization,
+      printFixture.labelId,
+      enqueueResults[0].printJobGlobalId,
+    ],
+  )
+  assert.deepEqual(printLineage.rows[0], { jobs: 2, exact_reprints: 1 })
+  const reprintQueuedState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const reprintQueuedLabel = reprintQueuedState.carrierGroup.labels[0]
+  assert.equal(reprintQueuedLabel.printJobGlobalId, newPrintResults[0].printJobGlobalId)
+  assert.equal(reprintQueuedLabel.printStatus, 'queued')
+  assert.equal(
+    reprintQueuedLabel.printReprintOfJobGlobalId,
+    enqueueResults[0].printJobGlobalId,
+  )
+
+  await forcePrintOutcome(newPrintResults[0].printJobGlobalId, printRoute, {
+    status: 'delivered', attempts: 1, maxAttempts: 3,
+  })
+  const deliveredPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const deliveredPrintLabel = deliveredPrintState.carrierGroup.labels[0]
+  assert.equal(deliveredPrintLabel.printStatus, 'printed')
+  assert.equal(deliveredPrintLabel.printRecoveryAction, null)
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      printRecoveryInput(
+        deliveredPrintState,
+        deliveredPrintLabel,
+        'shipping-print-delivered-refusal',
+        'Refuse another Shipping print after certain acknowledgement',
+      ),
+    ),
+    'OPERATIONS_ONE_OFF_PRINT_ALREADY_ACKNOWLEDGED',
+    'Shipping must not reprint an acknowledged physical output',
+  )
+
+  await forcePrintOutcome(newPrintResults[0].printJobGlobalId, printRoute, {
+    status: 'failed', attempts: 2, maxAttempts: 3, uncertain: true,
+  })
+  const uncertainPrintState = await executionPersistence
+    .readOneOffShipmentExecutionStateFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: existing.orderGlobalId,
+    })
+  const uncertainPrintLabel = uncertainPrintState.carrierGroup.labels[0]
+  assert.equal(uncertainPrintLabel.printStatus, 'failed')
+  assert.equal(uncertainPrintLabel.printOutcomeUncertain, true)
+  assert.equal(uncertainPrintLabel.printRecoveryAction, null)
+  const uncertainInput = printRecoveryInput(
+    uncertainPrintState,
+    uncertainPrintLabel,
+    'shipping-print-uncertain-refusal',
+    'Refuse a duplicate because physical output may have occurred',
+  )
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      uncertainInput,
+    ),
+    'OPERATIONS_ONE_OFF_PRINT_OUTCOME_UNCERTAIN',
+    'Shipping must not resend an outcome-uncertain physical output',
+  )
+  const historicalReplayCountsBefore = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_print_jobs job
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS jobs,
+       (SELECT count(*)::integer
+        FROM operations_print_delivery_attempts attempt
+        JOIN operations_print_jobs job
+          ON job.organization_id = attempt.organization_id
+         AND job.id = attempt.print_job_id
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS attempts`,
+    [ids.organization, printFixture.labelId],
+  )
+  const historicalEnqueueReplay = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(enqueueInput)
+  assert.equal(historicalEnqueueReplay.action, 'enqueue')
+  assert.equal(historicalEnqueueReplay.replayed, true)
+  assert.equal(
+    historicalEnqueueReplay.printJobGlobalId,
+    enqueueResults[0].printJobGlobalId,
+    'Historical enqueue K must resolve its original job after later reprint state',
+  )
+  const historicalRetryReplay = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(retryInput)
+  assert.equal(historicalRetryReplay.action, 'retry')
+  assert.equal(historicalRetryReplay.replayed, true)
+  assert.equal(
+    historicalRetryReplay.printJobGlobalId,
+    enqueueResults[0].printJobGlobalId,
+    'Retry K1 must remain a retry replay after K2 and exhaustion',
+  )
+  const historicalNewPrintReplay = await executionPersistence
+    .recoverOperationsOneOffLabelPrintInPostgres(newPrintInput)
+  assert.equal(historicalNewPrintReplay.action, 'new_print')
+  assert.equal(historicalNewPrintReplay.replayed, true)
+  assert.equal(
+    historicalNewPrintReplay.printJobGlobalId,
+    newPrintResults[0].printJobGlobalId,
+    'New-print K must resolve its original lineage job after later transitions',
+  )
+  const historicalReplayCountsAfter = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_print_jobs job
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS jobs,
+       (SELECT count(*)::integer
+        FROM operations_print_delivery_attempts attempt
+        JOIN operations_print_jobs job
+          ON job.organization_id = attempt.organization_id
+         AND job.id = attempt.print_job_id
+        WHERE job.organization_id = $1::uuid
+          AND job.label_id = $2::uuid) AS attempts`,
+    [ids.organization, printFixture.labelId],
+  )
+  assert.deepEqual(
+    historicalReplayCountsAfter.rows[0],
+    historicalReplayCountsBefore.rows[0],
+    'Historical enqueue, retry, and new-print replay must create zero effects',
+  )
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres({
+      ...uncertainInput,
+      idempotencyKey: enqueueKey,
+      expectedRecoveryAction: 'retry',
+    }),
+    'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+    'A workflow key bound to enqueue must never switch to retry',
+  )
+  const sameKeyCrossNamespace = await Promise.allSettled([
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres(
+      enqueueInput,
+    ),
+    executionPersistence.recoverOperationsOneOffLabelPrintInPostgres({
+      ...uncertainInput,
+      idempotencyKey: enqueueKey,
+      expectedRecoveryAction: 'retry',
+    }),
+  ])
+  assert.equal(
+    sameKeyCrossNamespace.filter(
+      (outcome) => outcome.status === 'fulfilled',
+    ).length,
+    1,
+  )
+  const crossNamespaceFailure = sameKeyCrossNamespace.find(
+    (outcome) => outcome.status === 'rejected',
+  )
+  assert.equal(
+    crossNamespaceFailure.reason.code,
+    'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+  )
+  assert.notEqual(crossNamespaceFailure.reason.code, '40P01')
+  assert.notEqual(crossNamespaceFailure.reason.code, '40001')
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres({
+      ...uncertainInput,
+      organizationId: ids.otherOrganization,
+      idempotencyKey: 'shipping-print-cross-org-refusal',
+    }),
+    'OPERATIONS_ONE_OFF_GROUP_CONTEXT_UNAVAILABLE',
+    'Cross-organization Shipping print recovery must not resolve the order',
+  )
+  for (const [label, changes] of [
+    ['stale order row version', {
+      expectedRowVersion: uncertainInput.expectedRowVersion + 1,
+    }],
+    ['package drift', { packageGlobalId: 'gpa9400998' }],
+    ['label drift', { labelGlobalId: 'glb9400998' }],
+    ['artifact drift', { expectedPrintArtifactGlobalId: 'gpf9400998' }],
+  ]) {
+    await expectCode(
+      () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres({
+        ...uncertainInput,
+        ...changes,
+        idempotencyKey: `shipping-print-${label.replaceAll(' ', '-')}`,
+      }),
+      'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+      `${label} must reject before any print mutation`,
+    )
+  }
+  await expectCode(
+    () => executionPersistence.recoverOperationsOneOffLabelPrintInPostgres({
+      ...uncertainInput,
+      orderGlobalId: 'gor9400099',
+      expectedRowVersion: 0,
+      idempotencyKey: 'shipping-print-imported-order-refusal',
+    }),
+    'OPERATIONS_ONE_OFF_GROUP_CONTEXT_UNAVAILABLE',
+    'Imported orders must not enter Shipping print recovery',
+  )
+  const forbiddenPrintWritesAfter = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer FROM operations_labels) AS labels,
+       (SELECT count(*)::integer FROM operations_label_attempts)
+         AS label_attempts,
+       (SELECT count(*)::integer FROM operations_shipments) AS shipments,
+       (SELECT count(*)::integer
+          FROM operations_one_off_carrier_group_attempts) AS carrier_groups,
+       (SELECT count(*)::integer
+          FROM operations_one_off_carrier_group_results) AS carrier_results,
+       (SELECT count(*)::integer
+          FROM operations_carrier_rate_requests) AS carrier_requests,
+       (SELECT jsonb_agg(jsonb_build_object(
+          'globalId', label.global_id,
+          'status', label.status,
+          'payloadHash', encode(digest(
+            convert_to(label.label_payload, 'UTF8'), 'sha256'
+          ), 'hex'),
+          'requestHash', label.request_hash,
+          'providerEvidence', label.redacted_provider_evidence
+        ) ORDER BY label.global_id)
+        FROM operations_labels label) AS label_evidence`,
+  )
+  assert.deepEqual(
+    forbiddenPrintWritesAfter.rows[0],
+    forbiddenPrintWritesBefore.rows[0],
+    'Shipping print recovery must produce zero carrier/provider/label/shipment writes',
+  )
+  assert.equal(carrierProviderWrites, 0)
 
   await expectCode(
     () => pool.query(

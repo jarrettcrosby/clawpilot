@@ -15,6 +15,7 @@ import {
   createOperationsOneOffCarrierGroupInPostgres,
   readOneOffCarrierGroupExecutionModeInPostgres,
   readOneOffShipmentExecutionStateFromPostgres,
+  recoverOperationsOneOffLabelPrintInPostgres,
   refreshOperationsOneOffPackedRatesInPostgres,
   voidOperationsOneOffCarrierGroupInPostgres,
 } from '@/lib/persistence/operationOneOffShipping'
@@ -325,6 +326,69 @@ export async function POST(req: NextRequest) {
           || body.preferredPrinterGlobalId === undefined
           ? null
           : String(body.preferredPrinterGlobalId),
+      })
+      return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'recover-label-print') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion',
+        'packageGlobalId', 'labelGlobalId', 'expectedPrintJobGlobalId',
+        'expectedPrintJobStatus', 'expectedPrintArtifactGlobalId',
+        'expectedRecoveryAction', 'expectedPrintAttempts',
+        'expectedPrintMaxAttempts', 'expectedLatestAttemptSequenceNumber',
+        'expectedLatestErrorCode', 'reason',
+      ].includes(key))
+      const expectedPrintJobStatus = body.expectedPrintJobStatus
+      const expectedRecoveryAction = body.expectedRecoveryAction
+      if (
+        unsupported
+        || !['enqueue', 'retry', 'new_print'].includes(
+          expectedRecoveryAction as string,
+        )
+        || ![
+          null, 'queued', 'claimed', 'delivered', 'failed', 'cancelled',
+          'printed', 'rerouted',
+        ].includes(expectedPrintJobStatus as null | string)
+      ) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Shipping label print-recovery command is invalid',
+        )
+      }
+      const result = await recoverOperationsOneOffLabelPrintInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId: String(body.orderGlobalId || ''),
+        expectedRowVersion: Number(body.expectedRowVersion),
+        packageGlobalId: String(body.packageGlobalId || ''),
+        labelGlobalId: String(body.labelGlobalId || ''),
+        expectedRecoveryAction: expectedRecoveryAction as
+          | 'enqueue' | 'retry' | 'new_print',
+        expectedPrintJobGlobalId: body.expectedPrintJobGlobalId === null
+          ? null
+          : String(body.expectedPrintJobGlobalId || ''),
+        expectedPrintJobStatus: expectedPrintJobStatus as
+          | 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled'
+          | 'printed' | 'rerouted' | null,
+        expectedPrintArtifactGlobalId:
+          body.expectedPrintArtifactGlobalId === null
+            ? null
+            : String(body.expectedPrintArtifactGlobalId || ''),
+        expectedPrintAttempts: body.expectedPrintAttempts === null
+          ? null
+          : Number(body.expectedPrintAttempts),
+        expectedPrintMaxAttempts: body.expectedPrintMaxAttempts === null
+          ? null
+          : Number(body.expectedPrintMaxAttempts),
+        expectedLatestAttemptSequenceNumber:
+          body.expectedLatestAttemptSequenceNumber === null
+            ? null
+            : Number(body.expectedLatestAttemptSequenceNumber),
+        expectedLatestErrorCode: body.expectedLatestErrorCode === null
+          ? null
+          : String(body.expectedLatestErrorCode || ''),
+        reason: String(body.reason || ''),
       })
       return json({ ok: true, result }, result.replayed ? 200 : 201)
     }
