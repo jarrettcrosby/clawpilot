@@ -6,6 +6,7 @@ import type {
   OperationsRegressionRun,
   OperationsRegressionWalkthrough,
 } from '@/lib/operations/regressionReplay'
+import { SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 
 test.use({ hasTouch: true })
 
@@ -333,6 +334,14 @@ async function installOperationsRoutes(page: Page) {
 }
 
 async function installImportedOrderPreparationRoutes(page: Page) {
+  const authorizationIssuedAt = Date.now()
+  const canonicalAuthorization = {
+    authorizationGlobalId: 'gsea7654321',
+    authorizedAt: new Date(authorizationIssuedAt).toISOString(),
+    expiresAt: new Date(authorizationIssuedAt + 120 * 60 * 1000).toISOString(),
+    authorityKind: 'shopify_test_store_canonical' as const,
+    fulfillmentConfirmedAt: null,
+  }
   const importedOrder = {
     ...selectedOrder,
     globalId: 'gor7654321',
@@ -479,6 +488,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
     }],
   }
   let planned = false
+  let authorized = false
 
   await page.route((url) => url.pathname === '/api/operations/training', async (route) => {
     await route.fulfill({
@@ -634,6 +644,37 @@ async function installImportedOrderPreparationRoutes(page: Page) {
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
     if (route.request().method() === 'POST') {
       const request = route.request().postDataJSON()
+      if (request.action === 'authorize-shopify-test-store-canonical-e2e') {
+        expect(route.request().headers()['idempotency-key'])
+          .toMatch(/^shopify-test-store-authorize:/)
+        expect(request).toEqual({
+          action: 'authorize-shopify-test-store-canonical-e2e',
+          orderGlobalId: 'gor7654321',
+          expectedRowVersion: 0,
+          confirmationStatement:
+            SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
+          reason:
+            'Authorized end-to-end validation for Shopify test order #6600',
+          lifetimeMinutes: 120,
+        })
+        authorized = true
+        return route.fulfill({
+          status: 201,
+          json: {
+            ok: true,
+            result: {
+              ...canonicalAuthorization,
+              orderGlobalId: 'gor7654321',
+              externalOrderId: 'gid://shopify/Order/6600',
+              state: 'active',
+              reason: request.reason,
+              authorizedBy: 'manager@example.com',
+              consumedAt: null,
+              consumedBy: null,
+            },
+          },
+        })
+      }
       expect(request).toMatchObject({
         action: 'plan-order',
         orderGlobalId: 'gor7654321',
@@ -677,17 +718,21 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             blockedReason: null,
           }],
           planningPreparation: null,
+          sandboxCommerceE2eAuthorization: authorized
+            ? canonicalAuthorization
+            : null,
         }
-      : importedOrder
+      : {
+          ...importedOrder,
+          sandboxCommerceE2eAuthorization: authorized
+            ? canonicalAuthorization
+            : null,
+        }
     return route.fulfill({
       json: {
         ok: true,
         operations: {
           ...workspace(),
-          capabilities: {
-            ...workspace().capabilities,
-            canActivate: false,
-          },
           activation: {
             ...workspace().activation,
             state: 'read_only',
@@ -1132,7 +1177,22 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await gotoApp(page, '/#operations')
 
   await page.getByRole('row', { name: /#6600/ }).click()
-  await page.getByRole('button', { name: 'Prepare order' }).click()
+  const prepareOrder = page.getByRole('button', { name: 'Prepare order' })
+  const authorizeOrder = page.getByTestId(
+    'authorize-shopify-test-store-canonical-e2e',
+  )
+  await expect(authorizeOrder).toBeVisible()
+  await expect(prepareOrder).toHaveCount(0)
+  await authorizeOrder.click()
+  await expect(
+    page.getByRole('heading', { name: 'Authorize verified Shopify test order' }),
+  ).toBeVisible()
+  await page.getByTestId('shopify-test-store-authorization-statement')
+    .fill(SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION)
+  await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
+  await expect(page.getByTestId('sandbox-commerce-e2e-authorization-active'))
+    .toContainText('gsea7654321')
+  await prepareOrder.click()
   await expect(
     page.getByRole('heading', { name: 'Prepare and plan imported order' }),
   ).toBeVisible()

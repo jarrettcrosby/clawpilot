@@ -69,6 +69,7 @@ const healthContract = read(
 )
 const postgresSource = read('app_src/lib/persistence/postgres.ts')
 const operationsRouteSource = read('app_src/app/api/operations/route.ts')
+const printGatewayWorkflow = read('.github/workflows/print-gateway-ci.yml')
 const recovery = loadTypeScript(
   'app_src/lib/operations/shippingOneOffRecovery.ts',
 )
@@ -76,6 +77,21 @@ const postgresModule = loadTypeScript(
   'app_src/lib/persistence/postgres.ts',
   { pg: { Pool: class {} } },
 )
+
+for (const watchedPath of [
+  'app_src/app/api/operations/one-off-shipments/route.ts',
+  'app_src/components/shipping/**',
+  'app_src/lib/operations/shippingOneOffRecovery.ts',
+  'app_src/lib/persistence/operationOneOffShipping.ts',
+  'db/migrations/*shipping*.sql',
+  'scripts/test-shipping-one-off-pack*.mjs',
+]) {
+  assert.equal(
+    printGatewayWorkflow.split(`- "${watchedPath}"`).length - 1,
+    2,
+    `Print Gateway pull-request and push filters must both watch ${watchedPath}`,
+  )
+}
 
 const panelModule = loadTypeScript(
   'app_src/components/shipping/ShippingOneOffExecutionPanel.tsx',
