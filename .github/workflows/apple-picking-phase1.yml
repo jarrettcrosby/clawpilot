@@ -37,6 +37,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: app_src/package-lock.json
+      - name: Install server contract dependencies
+        run: npm --prefix app_src ci --ignore-scripts
       - name: Install pinned XcodeGen
         run: |
           curl --fail --location --silent --show-error \

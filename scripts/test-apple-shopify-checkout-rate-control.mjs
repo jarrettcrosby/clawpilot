@@ -560,6 +560,16 @@ assert.match(
 )
 
 const workflow = read('.github/workflows/apple-picking-phase1.yml')
+const dependencyInstall = workflow.indexOf(
+  'run: npm --prefix app_src ci --ignore-scripts',
+)
+const sourceContractRun = workflow.indexOf(
+  'node scripts/test-apple-shopify-checkout-rate-control.mjs',
+)
+assert.ok(
+  dependencyInstall >= 0 && sourceContractRun > dependencyInstall,
+  'Apple CI must install app_src dependencies before the TypeScript-backed source contract',
+)
 assert.match(
   workflow,
   /node scripts\/test-apple-shopify-checkout-rate-control\.mjs/,
