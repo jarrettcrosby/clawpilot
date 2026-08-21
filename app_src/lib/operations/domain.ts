@@ -56,6 +56,7 @@ export function availableOperationsOrderActions(input: {
   unresolvedLabelAttemptCount?: number
   existingShipmentCount?: number
   sandboxE2eAuthorized?: boolean
+  sandboxE2eAuthorityKind?: 'legacy_packed' | 'shopify_test_store_canonical' | null
   sandboxE2eFulfillmentConfirmed?: boolean
   nativeOneOffGroupReady?: boolean
   nativeOneOffGroupBlockedReason?: string | null
@@ -63,7 +64,7 @@ export function availableOperationsOrderActions(input: {
   replanningCorrection?: OperationsOrderActionAvailability | null
 }): OperationsOrderActionAvailability[] {
   const canonicalReadOnlyAuthorized = input.activationState === 'read_only'
-    && input.sandboxE2eAuthorized === true
+    && input.sandboxE2eAuthorityKind === 'shopify_test_store_canonical'
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
     releaseBlockedReason = 'Operations execute permission is required.'

@@ -3852,6 +3852,8 @@ async function readOrderDetail(
       unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
       existingShipmentCount: Number(row.existing_shipment_count),
       sandboxE2eAuthorized: Boolean(sandboxCommerceE2eAuthorization),
+      sandboxE2eAuthorityKind:
+        sandboxCommerceE2eAuthorization?.authorityKind || null,
       sandboxE2eFulfillmentConfirmed: Boolean(
         sandboxCommerceE2eAuthorization?.fulfillmentConfirmedAt,
       ),
@@ -20301,6 +20303,16 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           canonicalShopifyTestAuthorizationValidated = true
         }
         sandboxE2eAuthorizationValidated = true
+      }
+      if (
+        activation.state === 'read_only'
+        && !canonicalShopifyTestAuthorizationValidated
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+          'Read only shipment confirmation requires the exact current Shopify test-store authorization and second fulfillment confirmation',
+          403,
+        )
       }
       if (order.source_provider === 'shopify') {
         if (!order.integration_account_id) {

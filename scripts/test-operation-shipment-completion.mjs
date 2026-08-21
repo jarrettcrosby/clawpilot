@@ -1183,6 +1183,152 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
       },
     })
+    let carrierLabelProviderCalls = 0
+    let carrierLabelEvidenceCalls = 0
+    let carrierLabelPrintCalls = 0
+    class FocusedCarrierIntegrationRequestError extends Error {
+      constructor(message, status = 409, code = 'CARRIER_INTEGRATION_INVALID') {
+        super(message)
+        this.status = status
+        this.code = code
+      }
+    }
+    class FocusedCarrierSandboxLabelError extends Error {
+      constructor(
+        message,
+        status = 409,
+        code = 'CARRIER_SANDBOX_LABEL_INVALID',
+        uncertain = false,
+        redactedResponse = null,
+      ) {
+        super(message)
+        this.status = status
+        this.code = code
+        this.uncertain = uncertain
+        this.redactedResponse = redactedResponse
+      }
+    }
+    const shippingPersistence = loadTypeScriptModule(
+      'app_src/lib/persistence/operationShipping.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierIntegrations': {
+            CarrierIntegrationRequestError:
+              FocusedCarrierIntegrationRequestError,
+            resolveCarrierSandboxShippingRuntime: async (input) => {
+              const runtime = await pool.query(
+                `SELECT integration.id::text AS integration_account_id,
+                        integration.global_id AS integration_global_id,
+                        carrier_account.id::text AS carrier_account_id,
+                        carrier_account.global_id AS carrier_account_global_id,
+                        carrier_account.display_name,
+                        carrier_account.account_number_last_four
+                 FROM operations_integration_accounts integration
+                 JOIN operations_carrier_accounts carrier_account
+                   ON carrier_account.organization_id = integration.organization_id
+                  AND carrier_account.integration_account_id = integration.id
+                 WHERE integration.organization_id = $1::uuid
+                   AND integration.provider = $2
+                   AND integration.integration_type = 'carrier'
+                   AND integration.environment = 'sandbox'
+                   AND integration.status = 'active'
+                   AND carrier_account.status = 'active'
+                   AND ($3::text IS NULL OR carrier_account.global_id = $3)
+                 LIMIT 2`,
+                [
+                  input.organizationId,
+                  input.provider,
+                  input.carrierAccountGlobalId || null,
+                ],
+              )
+              assert.equal(
+                runtime.rowCount,
+                1,
+                'Focused carrier runtime must resolve exactly one account',
+              )
+              const row = runtime.rows[0]
+              return {
+                organizationId: input.organizationId,
+                provider: input.provider,
+                integrationAccountId: row.integration_account_id,
+                integrationGlobalId: row.integration_global_id,
+                carrierAccountId: row.carrier_account_id,
+                carrierAccountGlobalId: row.carrier_account_global_id,
+                carrierAccountDisplayName: row.display_name,
+                accountNumberLastFour: row.account_number_last_four,
+                credentialVersion: 1,
+                billingRelationship: 'shipper',
+                billingSelectionSnapshot: { relationship: 'shipper' },
+              }
+            },
+          },
+          '@/lib/integrations/carrierSandboxLabel': {
+            CARRIER_SANDBOX_LABEL_ADAPTER_VERSION:
+              'focused-legacy-read-only-guard-v1',
+            CarrierSandboxLabelError: FocusedCarrierSandboxLabelError,
+            carrierSandboxLabelRequestEvidence: () => {
+              carrierLabelEvidenceCalls += 1
+              return {
+                requestHash: 'a'.repeat(64),
+                redactedRequest: { focusedAcceptance: true },
+              }
+            },
+            carrierSandboxVoidRequestEvidence: () => ({
+              requestHash: 'b'.repeat(64),
+              redactedRequest: { focusedAcceptance: true },
+            }),
+            createCarrierSandboxLabel: async () => {
+              carrierLabelProviderCalls += 1
+              return {
+                trackingNumber:
+                  `FOCUSED${randomUUID().replaceAll('-', '').slice(0, 18)}`,
+                format: 'PDF',
+                labelPayload: Buffer.from(
+                  '%PDF-1.4 focused legacy Active label',
+                ).toString('base64'),
+                providerLabelId: `focused-provider-${randomUUID()}`,
+                evidence: {
+                  redactedRequest: { focusedAcceptance: true },
+                  redactedResponse: { focusedAcceptance: true },
+                  providerReference: `focused-provider-${randomUUID()}`,
+                },
+              }
+            },
+            voidCarrierSandboxLabel: async () => {
+              carrierLabelProviderCalls += 1
+              throw new Error(
+                'Legacy Read only authority reached the carrier provider',
+              )
+            },
+          },
+          '@/lib/integrations/carrierSandboxRate': {
+            CARRIER_SANDBOX_RATE_FIXTURE: {
+              origin: {},
+              destination: {},
+            },
+          },
+          '@/lib/persistence/commerceOrderRevisions': {
+            async assertCommerceOrderRevisionExecutionCurrent() {},
+            CommerceOrderRevisionGateError: class extends Error {},
+          },
+          '@/lib/persistence/operationPrintDelivery': {
+            enqueueOperationsPrintJobInPostgres: async () => {
+              carrierLabelPrintCalls += 1
+              return { globalId: 'gpj0000001' }
+            },
+          },
+          '@/lib/persistence/operations': {
+            OperationsRequestError: persistence.OperationsRequestError,
+          },
+          '@/lib/persistence/sandboxCommerceE2eAuthorization':
+            sandboxAuthorization,
+          '@/lib/persistence/shopifyTestStoreCanonicalE2e':
+            shopifyTestStorePersistence,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const commerceFulfillmentRecovery = loadTypeScriptModule(
       'app_src/lib/persistence/commerceFulfillmentRecovery.ts',
       {
@@ -1201,6 +1347,11 @@ async function verifyShipmentCompletion(databaseUrl) {
       typeof persistence.generateOperationsPackagePackingSlipInPostgres,
       'function',
       'generateOperationsPackagePackingSlipInPostgres must be exported',
+    )
+    assert.equal(
+      typeof shippingPersistence.createOperationsSandboxLabelInPostgres,
+      'function',
+      'createOperationsSandboxLabelInPostgres must be exported',
     )
 
     const createFixture = async (scenario, { unitsPerPackage = 2 } = {}) => {
@@ -1228,6 +1379,418 @@ async function verifyShipmentCompletion(databaseUrl) {
       ))
       return fixture
     }
+
+    const createLegacyReadOnlyAuthorizationFixture = async (provider) => {
+      const scenario = `legacy-${provider}-read-only-authority`
+      const fixture = await createFixture(scenario, { unitsPerPackage: 1 })
+      const order = await advanceOrderToPacked(
+        persistence,
+        fixture,
+        scenario,
+      )
+      const packagingClaim = await addPackagingClaim(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+      )
+      const setup = await pool.connect()
+      let result
+      try {
+        await setup.query('BEGIN')
+        await setup.query('SET LOCAL session_replication_role = replica')
+        const context = await setup.query(
+          `SELECT source_order.id::text AS order_id,
+                  source_order.integration_account_id::text AS account_id,
+                  plan.id::text AS plan_id
+           FROM operations_orders source_order
+           JOIN operations_fulfillment_plans plan
+             ON plan.organization_id = source_order.organization_id
+            AND plan.order_id = source_order.id
+           WHERE source_order.organization_id = $1::uuid
+             AND source_order.global_id = $2`,
+          [fixture.organizationId, order.planned.orderGlobalId],
+        )
+        assert.equal(context.rowCount, 1)
+        const carrierIntegration = await setup.query(
+          `INSERT INTO operations_integration_accounts (
+             organization_id, provider, integration_type, environment,
+             display_name, status, configuration, created_by, updated_by
+           ) VALUES (
+             $1::uuid, 'ups_rest', 'carrier', 'sandbox',
+             'Focused legacy guard UPS', 'active', '{}'::jsonb, $2, $2
+           ) RETURNING id::text, global_id`,
+          [fixture.organizationId, fixture.email],
+        )
+        assert.equal(carrierIntegration.rowCount, 1)
+        const carrierAccount = await setup.query(
+          `INSERT INTO operations_carrier_accounts (
+             organization_id, integration_account_id, display_name,
+             sender_name,
+             account_number_ciphertext, account_number_iv,
+             account_number_tag, account_number_last_four,
+             account_number_fingerprint, registered_address,
+             registered_address_fingerprint, address_verification,
+             status, created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, 'Focused legacy guard shipper',
+             'Focused legacy guard shipper',
+             'focused-ciphertext', 'focused-iv', 'focused-tag', '0001',
+             repeat('1', 64),
+             jsonb_build_object(
+               'line1', '1 Focused Way', 'city', 'Delaware',
+               'region', 'OH', 'postalCode', '43015',
+               'countryCode', 'US'
+             ),
+             repeat('2', 64), 'operator_attested',
+             'active', $3, $3
+           ) RETURNING id::text, global_id`,
+          [
+            fixture.organizationId,
+            carrierIntegration.rows[0].id,
+            fixture.email,
+          ],
+        )
+        assert.equal(carrierAccount.rowCount, 1)
+        const externalAccountId = provider === 'shopify'
+          ? `gid://shopify/Shop/${Date.now()}${provider.length}`
+          : `b_legacy_read_only_${randomUUID().replaceAll('-', '')}`
+        const externalOrderId = provider === 'shopify'
+          ? `gid://shopify/Order/${Date.now()}${provider.length}`
+          : `bo_legacy_read_only_${randomUUID().replaceAll('-', '')}`
+        await setup.query(
+          `UPDATE operations_integration_accounts
+           SET provider = $3, integration_type = 'commerce',
+               environment = 'sandbox', status = 'active',
+               external_account_id = $4,
+               updated_by = $5, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            fixture.organizationId,
+            context.rows[0].account_id,
+            provider,
+            externalAccountId,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `UPDATE operations_orders
+           SET source_provider = $3, external_order_id = $4,
+               updated_by = $5, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            fixture.organizationId,
+            context.rows[0].order_id,
+            provider,
+            externalOrderId,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `UPDATE operations_carrier_rates
+           SET selected = false
+           WHERE organization_id = $1::uuid AND plan_id = $2::uuid`,
+          [fixture.organizationId, context.rows[0].plan_id],
+        )
+        const selectedRate = await setup.query(
+          `UPDATE operations_carrier_rates
+           SET selected = true
+           WHERE organization_id = $1::uuid AND plan_id = $2::uuid
+             AND carrier = 'UPS' AND service_code = 'GROUND'
+           RETURNING id::text, global_id`,
+          [fixture.organizationId, context.rows[0].plan_id],
+        )
+        assert.equal(selectedRate.rowCount, 1)
+        const activation = await setup.query(
+          `UPDATE operations_activation_scopes
+           SET state = 'read_only', revision = revision + 1,
+               reason = 'Reject legacy authority in Read only execution',
+               updated_by = $2, updated_at = now()
+           WHERE organization_id = $1::uuid
+           RETURNING state`,
+          [fixture.organizationId, fixture.email],
+        )
+        assert.equal(activation.rows[0]?.state, 'read_only')
+        const authorization = await setup.query(
+          `INSERT INTO operations_sandbox_commerce_e2e_authorizations (
+             organization_id, order_id, external_order_id,
+             confirmation_statement_version, confirmation_hash, reason,
+             authorized_by, expires_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3,
+             'sandbox-commerce-e2e-v1', repeat('e', 64),
+             'Legacy authority must not unlock Read only execution',
+             $4, now() + interval '30 minutes'
+           ) RETURNING id::text, global_id, state, consumed_at, consumed_by`,
+          [
+            fixture.organizationId,
+            context.rows[0].order_id,
+            externalOrderId,
+            fixture.email,
+          ],
+        )
+        assert.equal(authorization.rowCount, 1)
+        const packageContext = await setup.query(
+          `SELECT package.global_id AS package_global_id,
+                  rate.global_id AS carrier_rate_global_id
+           FROM operations_packages package
+           JOIN operations_carrier_rates rate
+             ON rate.organization_id = package.organization_id
+            AND rate.plan_id = package.plan_id
+            AND rate.selected = true
+           WHERE package.organization_id = $1::uuid
+             AND package.plan_id = $2::uuid`,
+          [fixture.organizationId, context.rows[0].plan_id],
+        )
+        assert.equal(packageContext.rowCount, 1)
+        result = {
+          fixture,
+          order,
+          packagingClaim,
+          authorization: authorization.rows[0],
+          packageGlobalId: packageContext.rows[0].package_global_id,
+          carrierRateGlobalId:
+            packageContext.rows[0].carrier_rate_global_id,
+          carrierAccountGlobalId: carrierAccount.rows[0].global_id,
+        }
+        await setup.query('COMMIT')
+      } catch (error) {
+        await setup.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        setup.release()
+      }
+      return result
+    }
+
+    const assertLegacyReadOnlyAuthorityRejected = async (provider) => {
+      const target = await createLegacyReadOnlyAuthorizationFixture(provider)
+      const originalRequireSandboxAuthorization =
+        sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization
+      if (provider === 'faire') {
+        sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization =
+          async (client, input) => {
+            const authorization = await client.query(
+              `SELECT sandbox_auth.id::text,
+                      sandbox_auth.organization_id::text,
+                      sandbox_auth.order_id::text,
+                      sandbox_auth.authorized_by,
+                      sandbox_auth.confirmation_statement_version
+               FROM operations_sandbox_commerce_e2e_authorizations sandbox_auth
+               JOIN operations_orders source_order
+                 ON source_order.organization_id = sandbox_auth.organization_id
+                AND source_order.id = sandbox_auth.order_id
+               WHERE sandbox_auth.organization_id = $1::uuid
+                 AND sandbox_auth.global_id = $2
+                 AND source_order.global_id = $3
+                 AND sandbox_auth.authorized_by = $4
+                 AND sandbox_auth.state = 'active'
+                 AND sandbox_auth.expires_at > now()
+                 AND sandbox_auth.external_order_id = source_order.external_order_id
+                 AND source_order.source_provider = 'faire'
+               FOR UPDATE OF sandbox_auth`,
+              [
+                input.organizationId,
+                input.authorizationGlobalId,
+                input.orderGlobalId,
+                input.actorEmail,
+              ],
+            )
+            assert.equal(
+              authorization.rowCount,
+              1,
+              'Focused Faire legacy authority must remain exact and active',
+            )
+            return authorization.rows[0]
+          }
+      }
+      try {
+        const labelMutationBaseline = await pool.query(
+          `SELECT
+             (SELECT count(*)::int FROM operations_labels
+              WHERE organization_id = $1::uuid) AS labels,
+             (SELECT count(*)::int FROM operations_label_attempts
+              WHERE organization_id = $1::uuid) AS attempts`,
+          [target.fixture.organizationId],
+        )
+        const labelProviderBaseline = carrierLabelProviderCalls
+        const labelEvidenceBaseline = carrierLabelEvidenceCalls
+        await expectRejected(
+          () => shippingPersistence.createOperationsSandboxLabelInPostgres({
+            organizationId: target.fixture.organizationId,
+            actorEmail: target.fixture.email,
+            orderGlobalId: target.order.planned.orderGlobalId,
+            packageGlobalId: target.packageGlobalId,
+            carrierRateGlobalId: target.carrierRateGlobalId,
+            carrierAccountGlobalId: target.carrierAccountGlobalId,
+            sandboxE2eAuthorizationGlobalId:
+              target.authorization.global_id,
+            expectedRowVersion: target.order.packed.rowVersion,
+            reason: `Reject legacy ${provider} label authority in Read only`,
+            idempotencyKey:
+              `legacy-${provider}-read-only-label-${randomUUID()}`,
+          }),
+          (error) => error?.code === 'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
+          `Legacy ${provider} authority must not call a carrier label provider in Read only`,
+        )
+        assert.equal(carrierLabelProviderCalls, labelProviderBaseline)
+        assert.equal(
+          carrierLabelEvidenceCalls,
+          labelEvidenceBaseline,
+          'Legacy Read only authority must fail before preparing carrier evidence',
+        )
+        const labelMutationAfter = await pool.query(
+          `SELECT
+             (SELECT count(*)::int FROM operations_labels
+              WHERE organization_id = $1::uuid) AS labels,
+             (SELECT count(*)::int FROM operations_label_attempts
+              WHERE organization_id = $1::uuid) AS attempts`,
+          [target.fixture.organizationId],
+        )
+        assert.deepEqual(
+          labelMutationAfter.rows[0],
+          labelMutationBaseline.rows[0],
+          `Legacy ${provider} Read only label rejection must write no label or carrier attempt`,
+        )
+        const activeTransition = await pool.connect()
+        try {
+          await activeTransition.query('BEGIN')
+          await activeTransition.query(
+            'SET LOCAL session_replication_role = replica',
+          )
+          await activeTransition.query(
+            `UPDATE operations_activation_scopes
+             SET state = 'active', revision = revision + 1,
+                 reason = 'Retain legacy sandbox E2E behavior in Active',
+                 updated_by = $2, updated_at = now()
+             WHERE organization_id = $1::uuid`,
+            [target.fixture.organizationId, target.fixture.email],
+          )
+          await activeTransition.query('COMMIT')
+        } catch (error) {
+          await activeTransition.query('ROLLBACK').catch(() => undefined)
+          throw error
+        } finally {
+          activeTransition.release()
+        }
+        const activeProviderBaseline = carrierLabelProviderCalls
+        const activeEvidenceBaseline = carrierLabelEvidenceCalls
+        const activePrintBaseline = carrierLabelPrintCalls
+        const activeLabel = await shippingPersistence
+          .createOperationsSandboxLabelInPostgres({
+            organizationId: target.fixture.organizationId,
+            actorEmail: target.fixture.email,
+            orderGlobalId: target.order.planned.orderGlobalId,
+            packageGlobalId: target.packageGlobalId,
+            carrierRateGlobalId: target.carrierRateGlobalId,
+            carrierAccountGlobalId: target.carrierAccountGlobalId,
+            sandboxE2eAuthorizationGlobalId:
+              target.authorization.global_id,
+            expectedRowVersion: target.order.packed.rowVersion,
+            reason:
+              `Retain legacy ${provider} sandbox label execution in Active`,
+            idempotencyKey:
+              `legacy-${provider}-active-label-${randomUUID()}`,
+          })
+        assert.equal(activeLabel.labelStatus, 'created')
+        assert.equal(activeLabel.orderStatus, 'packed')
+        assert.equal(carrierLabelProviderCalls, activeProviderBaseline + 1)
+        assert.equal(carrierLabelEvidenceCalls, activeEvidenceBaseline + 1)
+        assert.equal(carrierLabelPrintCalls, activePrintBaseline + 1)
+        const readOnlyTransition = await pool.connect()
+        try {
+          await readOnlyTransition.query('BEGIN')
+          await readOnlyTransition.query(
+            'SET LOCAL session_replication_role = replica',
+          )
+          await readOnlyTransition.query(
+            `UPDATE operations_activation_scopes
+             SET state = 'read_only', revision = revision + 1,
+                 reason = 'Reject legacy authority in Read only shipment',
+                 updated_by = $2, updated_at = now()
+             WHERE organization_id = $1::uuid`,
+            [target.fixture.organizationId, target.fixture.email],
+          )
+          await readOnlyTransition.query('COMMIT')
+        } catch (error) {
+          await readOnlyTransition.query('ROLLBACK').catch(() => undefined)
+          throw error
+        } finally {
+          readOnlyTransition.release()
+        }
+        const shipmentEvidenceBefore = await orderEvidence(
+          pool,
+          target.fixture,
+          target.order.planned.orderGlobalId,
+        )
+        const packagingEvidenceBefore = await packagingClaimEvidence(
+          pool,
+          target.fixture,
+          target.packagingClaim,
+        )
+        const shopifyPreparationBaseline = shopifyFulfillmentPreparationCalls
+        const shopifyExecutionBaseline = shopifyFulfillmentExecutionCalls
+        const fairePreparationBaseline = faireFulfillmentPreparationCalls
+        const faireExecutionBaseline = faireFulfillmentExecutionCalls
+        await expectRejected(
+          () => persistence.confirmOperationsOrderShipmentFromPostgres({
+            organizationId: target.fixture.organizationId,
+            actorEmail: target.fixture.email,
+            orderGlobalId: target.order.planned.orderGlobalId,
+            expectedRowVersion: activeLabel.rowVersion,
+            reason:
+              `Reject legacy ${provider} shipment authority in Read only`,
+            idempotencyKey:
+              `legacy-${provider}-read-only-shipment-${randomUUID()}`,
+            sandboxE2eAuthorizationGlobalId:
+              target.authorization.global_id,
+            expectedNotificationPolicyRevision:
+              provider === 'shopify' ? 0 : null,
+          }),
+          (error) => error?.code
+            === 'OPERATIONS_SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+          `Legacy ${provider} authority must not confirm a shipment in Read only`,
+        )
+        assert.deepEqual(
+          await orderEvidence(
+            pool,
+            target.fixture,
+            target.order.planned.orderGlobalId,
+          ),
+          shipmentEvidenceBefore,
+          `Legacy ${provider} Read only rejection must write no shipment, inventory, or export`,
+        )
+        assert.deepEqual(
+          await packagingClaimEvidence(
+            pool,
+            target.fixture,
+            target.packagingClaim,
+          ),
+          packagingEvidenceBefore,
+          `Legacy ${provider} Read only rejection must not consume packaging inventory`,
+        )
+        assert.equal(shopifyFulfillmentPreparationCalls, shopifyPreparationBaseline)
+        assert.equal(shopifyFulfillmentExecutionCalls, shopifyExecutionBaseline)
+        assert.equal(faireFulfillmentPreparationCalls, fairePreparationBaseline)
+        assert.equal(faireFulfillmentExecutionCalls, faireExecutionBaseline)
+        const retainedAuthorization = await pool.query(
+          `SELECT state, consumed_at, consumed_by
+           FROM operations_sandbox_commerce_e2e_authorizations
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [target.fixture.organizationId, target.authorization.id],
+        )
+        assert.deepEqual(
+          retainedAuthorization.rows[0],
+          { state: 'active', consumed_at: null, consumed_by: null },
+          `Legacy ${provider} Read only rejection must not consume authorization`,
+        )
+      } finally {
+        sandboxAuthorization.requireActiveSandboxCommerceE2eAuthorization =
+          originalRequireSandboxAuthorization
+      }
+    }
+
+    await assertLegacyReadOnlyAuthorityRejected('shopify')
+    await assertLegacyReadOnlyAuthorityRejected('faire')
 
     const createShopifyShipmentFixture = async (
       scenario,

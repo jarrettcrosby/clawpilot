@@ -299,6 +299,7 @@ function actionInput(overrides = {}) {
     unresolvedLabelAttemptCount: 0,
     existingShipmentCount: 0,
     sandboxE2eAuthorized: true,
+    sandboxE2eAuthorityKind: 'shopify_test_store_canonical',
     sandboxE2eFulfillmentConfirmed: false,
     ...overrides,
   }
@@ -336,9 +337,23 @@ assert.equal(
     plannedPackageCount: 1,
     packedPackageCount: 0,
     sandboxE2eAuthorized: false,
+    sandboxE2eAuthorityKind: null,
   }), 'verify_pack').enabled,
   false,
   'An unrelated Read-only order must remain blocked',
+)
+assert.equal(
+  action(actionInput({
+    status: 'picking',
+    waveStatus: 'completed',
+    packageCount: 1,
+    plannedPackageCount: 1,
+    packedPackageCount: 0,
+    sandboxE2eAuthorized: true,
+    sandboxE2eAuthorityKind: 'legacy_packed',
+  }), 'verify_pack').enabled,
+  false,
+  'A legacy sandbox authorization must not unlock Read-only warehouse work',
 )
 assert.equal(
   action(actionInput({

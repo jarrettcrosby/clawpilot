@@ -480,12 +480,13 @@ function assertCreateContext(
   context: ShippingContext,
   expectedRowVersion: number,
   authorizedSandboxE2e = false,
+  canonicalReadOnlyAuthorized = false,
 ) {
   if (
     context.order.activation_state !== 'active'
     && !(
       context.order.activation_state === 'read_only'
-      && authorizedSandboxE2e
+      && canonicalReadOnlyAuthorized
     )
   ) {
     throw new OperationsRequestError(
@@ -910,6 +911,7 @@ async function prepareAttempt(input: {
         input.organizationId,
         context.order.id,
       )
+      let canonicalReadOnlyAuthorized = false
       if (input.sandboxE2eAuthorizationGlobalId) {
         const authority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId: input.organizationId,
@@ -930,12 +932,14 @@ async function prepareAttempt(input: {
             expectedOrderRowVersion: input.expectedRowVersion,
             expectedOrderStatus: 'packed',
           })
+          canonicalReadOnlyAuthorized = true
         }
       }
       assertCreateContext(
         context,
         input.expectedRowVersion,
         Boolean(input.sandboxE2eAuthorizationGlobalId),
+        canonicalReadOnlyAuthorized,
       )
     } else {
       assertVoidContext(context, input.expectedRowVersion)
