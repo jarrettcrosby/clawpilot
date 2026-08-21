@@ -92,6 +92,8 @@ type DraftLine = {
   physicalUnitsOnHandConfirmed: boolean
 }
 
+type ShipmentContentsMode = DraftLine['kind']
+
 type DraftPackage = {
   packageKey: string
   catalogEntryId: PackageCatalogEntryId | null
@@ -196,12 +198,12 @@ function nextQuoteIdempotencyKey() {
   return `operations-one-off-quote:${crypto.randomUUID()}`
 }
 
-function initialLine(): DraftLine {
+function initialLine(kind: ShipmentContentsMode = 'existing'): DraftLine {
   return {
     lineKey: nextKey('line'),
-    kind: 'existing',
+    kind,
     productGlobalId: '',
-    name: '',
+    name: kind === 'ad_hoc' ? 'Documents / paperwork' : '',
     sku: '',
     quantity: '1',
     unitPriceMinor: '0',
@@ -333,6 +335,7 @@ export default function OneOffShipmentDialog({
   const [city, setCity] = useState('')
   const [region, setRegion] = useState('')
   const [postalCode, setPostalCode] = useState('')
+  const [contentsMode, setContentsMode] = useState<ShipmentContentsMode>('existing')
   const [lines, setLines] = useState<DraftLine[]>(() => [initialLine()])
   const [packages, setPackages] = useState<DraftPackage[]>([])
   const [quote, setQuote] = useState<OneOffShipmentQuote | null>(null)
@@ -351,10 +354,9 @@ export default function OneOffShipmentDialog({
       left.amountMinor - right.amountMinor
     ))
   ), [quote])
-  const pureAdHoc = lines.length > 0 && lines.every((line) => line.kind === 'ad_hoc')
-  const canStartPaperworkShipment = lines.length === 1
-    && lines[0].kind === 'existing'
-    && !lines[0].productGlobalId
+  const pureAdHoc = contentsMode === 'ad_hoc'
+    && lines.length > 0
+    && lines.every((line) => line.kind === 'ad_hoc')
 
   const lowestPurchasableOfferGlobalId = useMemo(() => (
     sortedQuoteOffers.find((offer) => (
@@ -733,7 +735,7 @@ export default function OneOffShipmentDialog({
 
   const addLine = () => {
     if (lines.length >= MAX_LINES) return
-    const line = initialLine()
+    const line = initialLine(contentsMode)
     setLines((current) => [...current, line])
     setPackages((current) => current.map((parcel, index) => ({
       ...parcel,
@@ -745,17 +747,15 @@ export default function OneOffShipmentDialog({
     resetQuote()
   }
 
-  const startPaperworkShipment = () => {
-    const line = {
-      ...lines[0],
-      kind: 'ad_hoc' as const,
-      productGlobalId: '',
-      name: lines[0].name.trim() || 'Documents / paperwork',
-      physicalUnitsOnHandConfirmed: false,
-    }
+  const selectContentsMode = (mode: ShipmentContentsMode) => {
+    const line = initialLine(mode)
     setLines([line])
-    directRecipientSelected.current = true
-    setCustomerGlobalId('')
+    setPackages([initialPackage([line])])
+    setContentsMode(mode)
+    directRecipientSelected.current = mode === 'ad_hoc'
+    setCustomerGlobalId(mode === 'ad_hoc'
+      ? ''
+      : workspace?.customers[0]?.globalId || '')
     resetQuote()
   }
 
@@ -868,14 +868,16 @@ export default function OneOffShipmentDialog({
         if (line.kind === 'new' && usedSkus.has(normalizedSku)) return 'Each new product SKU must be unique in this shipment.'
         if (line.kind === 'new') usedSkus.add(normalizedSku)
         if (nonNegativeInteger(line.unitPriceMinor) === null) return `Line ${index + 1} needs a valid unit value.`
-        if (!canonicalWeightFromDisplay(line.unitWeight, draftMeasurementSystem)
-          || !canonicalLengthFromDisplay(line.length, draftMeasurementSystem)
-          || !canonicalLengthFromDisplay(line.width, draftMeasurementSystem)
-          || !canonicalLengthFromDisplay(line.height, draftMeasurementSystem)) {
-          return `${line.kind === 'new' ? 'New product' : 'Ad-hoc item'} line ${index + 1} needs factual unit weight and dimensions.`
-        }
-        if (line.kind === 'new' && !line.physicalUnitsOnHandConfirmed) {
-          return `Confirm that physical units exist for new product line ${index + 1}.`
+        if (line.kind === 'new') {
+          if (!canonicalWeightFromDisplay(line.unitWeight, draftMeasurementSystem)
+            || !canonicalLengthFromDisplay(line.length, draftMeasurementSystem)
+            || !canonicalLengthFromDisplay(line.width, draftMeasurementSystem)
+            || !canonicalLengthFromDisplay(line.height, draftMeasurementSystem)) {
+            return `New product line ${index + 1} needs factual unit weight and dimensions.`
+          }
+          if (!line.physicalUnitsOnHandConfirmed) {
+            return `Confirm that physical units exist for new product line ${index + 1}.`
+          }
         }
       }
     }
@@ -1018,6 +1020,17 @@ export default function OneOffShipmentDialog({
         sku: line.sku.trim(),
         quantity: positiveInteger(line.quantity) || 0,
         unitPriceMinor: nonNegativeInteger(line.unitPriceMinor) || 0,
+      }
+      if (line.kind === 'ad_hoc') return {
+        ...item,
+        kind: 'ad_hoc' as const,
+        sku: item.sku || null,
+        unitWeightGrams: null,
+        unitDimensionsMm: null,
+      }
+      return {
+        ...item,
+        kind: 'new' as const,
         unitWeightGrams: canonicalWeightFromDisplay(
           line.unitWeight,
           draftMeasurementSystem,
@@ -1036,14 +1049,8 @@ export default function OneOffShipmentDialog({
             draftMeasurementSystem,
           ) || 0,
         },
+        physicalUnitsOnHandConfirmed: true as const,
       }
-      return line.kind === 'ad_hoc'
-        ? { ...item, kind: 'ad_hoc' as const, sku: item.sku || null }
-        : {
-            ...item,
-            kind: 'new' as const,
-            physicalUnitsOnHandConfirmed: true as const,
-          }
     }),
     packages: packages.map((parcel) => ({
       packageKey: parcel.packageKey,
@@ -1159,7 +1166,11 @@ export default function OneOffShipmentDialog({
 
   const createAndPlan = async (event: FormEvent) => {
     event.preventDefault()
-    if (!quote || !selectedOfferGlobalId || reason.trim().length < 10) return
+    if (
+      !quote
+      || !selectedOfferGlobalId
+      || (!pureAdHoc && reason.trim().length < 10)
+    ) return
     const selectedOffer = quote.offers.find((offer) => (
       offer.globalId === selectedOfferGlobalId
     ))
@@ -1172,7 +1183,7 @@ export default function OneOffShipmentDialog({
     const fingerprint = JSON.stringify({
       quoteGlobalId: quote.globalId,
       selectedOfferGlobalId,
-      reason: reason.trim(),
+      reason: pureAdHoc ? null : reason.trim(),
     })
     const attempt = resolveOneOffShipmentCreateAttempt({
       current: createAttempt,
@@ -1193,7 +1204,7 @@ export default function OneOffShipmentDialog({
           action: 'create-and-plan',
           quoteGlobalId: quote.globalId,
           selectedOfferGlobalId,
-          reason: reason.trim(),
+          ...(pureAdHoc ? {} : { reason: reason.trim() }),
         }),
       })
       const payload = await response.json().catch(() => ({})) as CreatePayload
@@ -1215,6 +1226,7 @@ export default function OneOffShipmentDialog({
       setRegion('')
       setPostalCode('')
       directRecipientSelected.current = false
+      setContentsMode('existing')
       setLines([firstLine])
       setPackages([initialPackage([firstLine])])
       setQuote(null)
@@ -1266,7 +1278,7 @@ export default function OneOffShipmentDialog({
       variant="contained"
       disabled={busy === 'create'
         || selectedRateOffer?.executionCapability !== 'direct_purchase_later'
-        || reason.trim().length < 10}
+        || (!pureAdHoc && reason.trim().length < 10)}
       startIcon={busy === 'create' ? <CircularProgress size={16} /> : <Inventory2Rounded />}
     >
       {busy === 'create' ? 'Creating planned order' : 'Create and plan shipment'}
@@ -1401,6 +1413,61 @@ export default function OneOffShipmentDialog({
                       </MenuItem>
                     ))}
                   </TextField>
+                  <Typography variant="overline" color="text.secondary">
+                    What are you shipping?
+                  </Typography>
+                  <RadioGroup
+                    data-testid="one-off-contents-mode"
+                    value={contentsMode}
+                    onChange={(event) => selectContentsMode(
+                      event.target.value as ShipmentContentsMode,
+                    )}
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' },
+                      gap: 1,
+                    }}
+                  >
+                    <FormControlLabel
+                      value="existing"
+                      control={<Radio />}
+                      label={(
+                        <Box>
+                          <Typography fontWeight={700}>Existing inventory</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Ship products already stocked in ClawPilot.
+                          </Typography>
+                        </Box>
+                      )}
+                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                    />
+                    <FormControlLabel
+                      value="new"
+                      control={<Radio />}
+                      label={(
+                        <Box>
+                          <Typography fontWeight={700}>New product</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Create a product from physical units on hand.
+                          </Typography>
+                        </Box>
+                      )}
+                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                    />
+                    <FormControlLabel
+                      value="ad_hoc"
+                      control={<Radio />}
+                      label={(
+                        <Box>
+                          <Typography fontWeight={700}>Documents or other contents</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            Send paperwork or non-inventory items without creating a product.
+                          </Typography>
+                        </Box>
+                      )}
+                      sx={{ m: 0, p: 1.25, border: '1px solid rgba(255,255,255,0.12)', borderRadius: 2 }}
+                    />
+                  </RadioGroup>
                   <Typography variant="overline" color="text.secondary">Order information</Typography>
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 2 }}>
                     <TextField
@@ -1512,27 +1579,19 @@ export default function OneOffShipmentDialog({
                     </TextField>
                   </Box>
 
-                  {canStartPaperworkShipment && (
-                    <Alert
-                      severity="info"
-                      action={(
-                        <Button color="inherit" onClick={startPaperworkShipment}>
-                          Use documents-only
-                        </Button>
-                      )}
-                    >
-                      Sending vendor paperwork or other contents that are not inventory?
-                    </Alert>
-                  )}
-
                   <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
                     <Box>
-                      <Typography variant="overline" color="text.secondary">Units</Typography>
+                      <Typography variant="overline" color="text.secondary">
+                        {pureAdHoc ? 'Contents' : 'Units'}
+                      </Typography>
                       <Typography variant="body2" color="text.secondary">
-                        {lines.length} of {MAX_LINES} lines · {draftMeasurementSystem === 'imperial' ? 'Imperial' : 'Metric'} ({units.weight}, {units.length})
+                        {lines.length} of {MAX_LINES} lines
+                        {!pureAdHoc && ` · ${draftMeasurementSystem === 'imperial' ? 'Imperial' : 'Metric'} (${units.weight}, ${units.length})`}
                       </Typography>
                     </Box>
-                    <Button startIcon={<AddRounded />} onClick={addLine} disabled={lines.length >= MAX_LINES}>Add unit line</Button>
+                    <Button startIcon={<AddRounded />} onClick={addLine} disabled={lines.length >= MAX_LINES}>
+                      {pureAdHoc ? 'Add contents line' : 'Add unit line'}
+                    </Button>
                   </Stack>
 
                   {lines.map((line, index) => (
@@ -1543,27 +1602,6 @@ export default function OneOffShipmentDialog({
                           <span><IconButton sx={iconActionSx} size="small" aria-label={`Remove line ${index + 1}`} disabled={lines.length === 1} onClick={() => removeLine(line.lineKey)}><DeleteOutlineRounded /></IconButton></span>
                         </Tooltip>
                       </Stack>
-                      <TextField
-                        select
-                        fullWidth
-                        label="Unit source"
-                        value={line.kind}
-                        onChange={(event) => updateLine(line.lineKey, {
-                          kind: event.target.value as DraftLine['kind'],
-                          productGlobalId: '',
-                          physicalUnitsOnHandConfirmed: false,
-                        })}
-                        sx={{ mb: 2 }}
-                      >
-                        <MenuItem value="existing">Existing product and inventory</MenuItem>
-                        <MenuItem value="new">Create a new product from physical units</MenuItem>
-                        <MenuItem value="ad_hoc">One-off shipment</MenuItem>
-                      </TextField>
-                      {line.kind === 'ad_hoc' && (
-                        <Typography variant="body2" color="text.secondary" sx={{ mt: -1, mb: 2 }}>
-                          For paperwork, samples, vendor materials, or other contents that do not belong in Products or inventory.
-                        </Typography>
-                      )}
                       {line.kind === 'existing' ? (
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 150px' }, gap: 2 }}>
                           <FormControl fullWidth required>
@@ -1595,25 +1633,29 @@ export default function OneOffShipmentDialog({
                       ) : (
                         <Stack spacing={2}>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 180px 130px' }, gap: 2 }}>
-                            <TextField required label={line.kind === 'ad_hoc' ? 'Item name' : 'Product name'} value={line.name} onChange={(event) => updateLine(line.lineKey, { name: event.target.value })} />
-                            <TextField required={line.kind === 'new'} label={line.kind === 'ad_hoc' ? 'Item reference (optional)' : 'SKU'} value={line.sku} onChange={(event) => updateLine(line.lineKey, { sku: event.target.value })} inputProps={{ maxLength: line.kind === 'ad_hoc' ? 80 : 25 }} />
+                            <TextField required label={line.kind === 'ad_hoc' ? 'Contents description' : 'Product name'} value={line.name} onChange={(event) => updateLine(line.lineKey, { name: event.target.value })} />
+                            <TextField required={line.kind === 'new'} label={line.kind === 'ad_hoc' ? 'Reference (optional)' : 'SKU'} value={line.sku} onChange={(event) => updateLine(line.lineKey, { sku: event.target.value })} inputProps={{ maxLength: line.kind === 'ad_hoc' ? 80 : 25 }} />
                             <TextField required label="Quantity" type="number" value={line.quantity} onChange={(event) => updateLine(line.lineKey, { quantity: event.target.value })} inputProps={{ min: 1, step: 1 }} />
                           </Box>
-                          <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2 }}>
+                          <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: line.kind === 'ad_hoc' ? '1fr' : 'repeat(5, 1fr)' }, gap: 2 }}>
                             <TextField required label="Unit value (cents)" type="number" value={line.unitPriceMinor} onChange={(event) => updateLine(line.lineKey, { unitPriceMinor: event.target.value })} inputProps={{ min: 0, step: 1 }} />
-                            <TextField required label={`Unit weight (${units.weight})`} type="number" value={line.unitWeight} onChange={(event) => updateLine(line.lineKey, { unitWeight: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
-                            <TextField required label={`Length (${units.length})`} type="number" value={line.length} onChange={(event) => updateLine(line.lineKey, { length: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
-                            <TextField required label={`Width (${units.length})`} type="number" value={line.width} onChange={(event) => updateLine(line.lineKey, { width: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
-                            <TextField required label={`Height (${units.length})`} type="number" value={line.height} onChange={(event) => updateLine(line.lineKey, { height: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                            {line.kind === 'new' && (
+                              <>
+                                <TextField required label={`Unit weight (${units.weight})`} type="number" value={line.unitWeight} onChange={(event) => updateLine(line.lineKey, { unitWeight: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                                <TextField required label={`Length (${units.length})`} type="number" value={line.length} onChange={(event) => updateLine(line.lineKey, { length: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                                <TextField required label={`Width (${units.length})`} type="number" value={line.width} onChange={(event) => updateLine(line.lineKey, { width: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                                <TextField required label={`Height (${units.length})`} type="number" value={line.height} onChange={(event) => updateLine(line.lineKey, { height: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                              </>
+                            )}
                           </Box>
                           {line.kind === 'new' ? <FormControlLabel
                             sx={{ alignItems: 'flex-start' }}
                             control={<Checkbox checked={line.physicalUnitsOnHandConfirmed} onChange={(event) => updateLine(line.lineKey, { physicalUnitsOnHandConfirmed: event.target.checked })} />}
                             label="I confirm these are real physical units at the selected warehouse and location. Create this SKU in Products and establish only the stated quantity as inventory when I finalize the shipment."
                           /> : (
-                            <Alert severity="info">
-                              These contents are saved only as an immutable shipment snapshot. They will not create a Product, receipt, inventory position, or reservation.
-                            </Alert>
+                            <Typography variant="body2" color="text.secondary">
+                              Enter the packed parcel dimensions and gross weight on the next step. These contents stay outside Products and inventory.
+                            </Typography>
                           )}
                         </Stack>
                       )}
@@ -1863,16 +1905,18 @@ export default function OneOffShipmentDialog({
                   {lowestPurchasableOfferGlobalId ? (
                     <>
                       <Typography variant="overline" color="text.secondary">Final confirmation</Typography>
-                      <TextField
-                        required
-                        multiline
-                        minRows={3}
-                        label="Planning reason"
-                        value={reason}
-                        onChange={(event) => setReason(event.target.value)}
-                        inputProps={{ maxLength: 500 }}
-                        helperText={`${reason.trim().length}/500 · Recorded in the immutable audit history`}
-                      />
+                      {!pureAdHoc && (
+                        <TextField
+                          required
+                          multiline
+                          minRows={3}
+                          label="Planning reason"
+                          value={reason}
+                          onChange={(event) => setReason(event.target.value)}
+                          inputProps={{ maxLength: 500 }}
+                          helperText={`${reason.trim().length}/500 · Recorded in the immutable audit history`}
+                        />
+                      )}
                       <Alert
                         severity="warning"
                         icon={pureAdHoc ? <LocalShippingRounded /> : <Inventory2Rounded />}

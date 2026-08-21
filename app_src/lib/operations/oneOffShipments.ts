@@ -63,8 +63,11 @@ export type OneOffAdHocLine = {
   sku: string | null
   quantity: number
   unitPriceMinor: number
-  unitWeightGrams: number
-  unitDimensionsMm: Millimeters
+  // Productless contents use the sealed parcel as their physical carrier
+  // evidence. Unit facts remain optional because paperwork does not have a
+  // meaningful per-item weight or bounding box.
+  unitWeightGrams: number | null
+  unitDimensionsMm: Millimeters | null
 }
 
 export type OneOffShipmentLineInput =

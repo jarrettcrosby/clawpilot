@@ -259,6 +259,28 @@ function line(value: unknown, index: number): OneOffShipmentLineInput {
         `Line ${index + 1} item reference is invalid`,
       )
     }
+    const unitWeightGrams = source.unitWeightGrams === null
+      || source.unitWeightGrams === undefined
+      ? null
+      : integer(
+          source.unitWeightGrams,
+          `Line ${index + 1} unit weight`,
+          1,
+          100_000_000,
+        )
+    const unitDimensionsMm = source.unitDimensionsMm === null
+      || source.unitDimensionsMm === undefined
+      ? null
+      : dimensions(
+          source.unitDimensionsMm,
+          `Line ${index + 1} unit dimensions`,
+        )
+    if ((unitWeightGrams === null) !== (unitDimensionsMm === null)) {
+      requestError(
+        'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+        `Line ${index + 1} unit weight and dimensions must both be supplied or both be omitted`,
+      )
+    }
     return {
       kind,
       lineKey: text(source.lineKey, `Line ${index + 1} key`, 80),
@@ -271,16 +293,8 @@ function line(value: unknown, index: number): OneOffShipmentLineInput {
         0,
         Number.MAX_SAFE_INTEGER,
       ),
-      unitWeightGrams: integer(
-        source.unitWeightGrams,
-        `Line ${index + 1} unit weight`,
-        1,
-        100_000_000,
-      ),
-      unitDimensionsMm: dimensions(
-        source.unitDimensionsMm,
-        `Line ${index + 1} unit dimensions`,
-      ),
+      unitWeightGrams,
+      unitDimensionsMm,
     }
   }
   if (kind !== 'new') {
@@ -517,6 +531,19 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
   }
   const lines = source.lines.map(line)
   const pureAdHoc = lines.every((entry) => entry.kind === 'ad_hoc')
+  if (
+    !pureAdHoc
+    && lines.some((entry) => (
+      entry.kind === 'ad_hoc'
+      && (entry.unitWeightGrams === null || entry.unitDimensionsMm === null)
+    ))
+  ) {
+    requestError(
+      'OPERATIONS_ONE_OFF_AD_HOC_PHYSICAL_FACTS_REQUIRED',
+      'Productless lines mixed with inventory-backed lines require factual unit weight and dimensions',
+      409,
+    )
+  }
   const packages = source.packages.map(parcel)
   for (const [packageIndex, shipmentPackage] of packages.entries()) {
     for (const selection of selectedCarriers) {
@@ -1458,8 +1485,8 @@ type ResolvedLineSnapshot = {
   productName: string
   sku: string
   unitPriceMinor: number
-  unitWeightGrams: number
-  unitDimensionsMm: Millimeters
+  unitWeightGrams: number | null
+  unitDimensionsMm: Millimeters | null
   productSourceHash?: string
   packageProfileGlobalId?: string
   packageProfileRowVersion?: number
@@ -1944,7 +1971,8 @@ async function resolveQuoteScope(
   const lineByKey = new Map(linesSnapshot.map((item) => [item.lineKey, item]))
   for (const shipmentPackage of quote.packages) {
     const allocatedUnitWeight = shipmentPackage.allocations.reduce((sum, allocation) => (
-      sum + lineByKey.get(allocation.lineKey)!.unitWeightGrams * allocation.quantity
+      sum + (lineByKey.get(allocation.lineKey)!.unitWeightGrams || 0)
+        * allocation.quantity
     ), 0)
     if (shipmentPackage.grossWeightGrams < allocatedUnitWeight) {
       requestError(
@@ -3795,6 +3823,8 @@ async function createNewProductsAndReceipt(
     if (
       shipmentLine.physicalUnitsOnHandConfirmed !== true
       || !shipmentLine.productSourceKey
+      || shipmentLine.unitWeightGrams === null
+      || shipmentLine.unitDimensionsMm === null
     ) {
       requestError(
         'OPERATIONS_ONE_OFF_PHYSICAL_UNITS_REQUIRED',
@@ -4165,6 +4195,13 @@ async function lockExistingProductForCreate(
       409,
     )
   }
+  if (line.unitWeightGrams === null || line.unitDimensionsMm === null) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED',
+      `${line.productName} no longer has complete package measurements`,
+      409,
+    )
+  }
   return {
     product: {
       id: currentProduct.id,
@@ -4185,7 +4222,7 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
   idempotencyKey: string
   quoteGlobalId: string
   selectedOfferGlobalId: string
-  reason: string
+  reason?: string
 }): Promise<OneOffShipmentCreateResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const idempotencyKey = requireIdempotencyKey(input.idempotencyKey)
@@ -4195,11 +4232,13 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
     'One-off shipment offer',
     OFFER_GLOBAL_ID,
   )
-  const reason = text(input.reason, 'Planning reason', 500, 3)
   const selectedOfferCapability = await query<{
     provider: OneOffCarrierProvider
+    pure_ad_hoc: boolean
   }>(
-    `SELECT offer.provider
+    `SELECT offer.provider,
+            operations_one_off_lines_are_pure_ad_hoc(quote.lines_snapshot)
+              AS pure_ad_hoc
      FROM operations_one_off_shipment_quotes quote
      JOIN operations_one_off_shipment_quote_offers offer
        ON offer.organization_id = quote.organization_id
@@ -4210,6 +4249,10 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
      LIMIT 1`,
     [organizationId, quoteGlobalId, selectedOfferGlobalId],
   )
+  const requestedReason = String(input.reason || '').trim()
+  const reason = selectedOfferCapability.rows[0]?.pure_ad_hoc && !requestedReason
+    ? 'Created from the selected one-off parcel rate'
+    : text(requestedReason, 'Planning reason', 500, 3)
   if (selectedOfferCapability.rows[0]?.provider === 'wwex_speedship') {
     requestError(
       'OPERATIONS_ONE_OFF_RATE_ONLY_OFFER',
@@ -4652,7 +4695,9 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
               shipmentLine.quantity,
               shipmentLine.unitPriceMinor,
               shipmentLine.unitWeightGrams,
-              JSON.stringify(shipmentLine.unitDimensionsMm),
+              shipmentLine.unitDimensionsMm
+                ? JSON.stringify(shipmentLine.unitDimensionsMm)
+                : null,
               JSON.stringify(itemSnapshot),
               oneOffShipmentHash(itemSnapshot),
               input.actorEmail,

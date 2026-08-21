@@ -205,6 +205,7 @@ const route = read('app_src/app/api/operations/one-off-shipments/route.ts')
 const persistence = read('app_src/lib/persistence/oneOffShipments.ts')
 const execution = read('app_src/lib/persistence/operationOneOffShipping.ts')
 const migration = read('db/migrations/0301_shipping_independent_one_off_items.sql')
+const documentsMigration = read('db/migrations/0313_shipping_one_off_documents_minimal_fields.sql')
 const health = read('app_src/app/api/health/route.ts')
 const healthContract = read('app_src/lib/persistence/shippingIndependenceHealth.ts')
 const ui = read('app_src/components/operations/OneOffShipmentDialog.tsx')
@@ -359,12 +360,14 @@ assert.match(
   /key === 'viewShipping' && !enabled[\s\S]*next\.purchaseLivePostage = false/,
 )
 for (const fragment of [
-  'One-off shipment',
-  'For paperwork, samples, vendor materials, or other contents that do not belong in Products or inventory.',
-  'Use documents-only',
+  'What are you shipping?',
+  'Existing inventory',
+  'New product',
+  'Documents or other contents',
+  'one-off-contents-mode',
   'No CRM customer · direct recipient',
   'no CRM customer is created',
-  'will not create a Product, receipt, inventory position, or reservation',
+  'stay outside Products and inventory',
   'without creating or reserving inventory',
   'useMeasurementSystem()',
   'canonicalWeightFromDisplay(',
@@ -395,6 +398,28 @@ const quoteMeasurementBlock = ui.slice(
   ui.indexOf('const buildQuoteInput ='),
   ui.indexOf('const continueToParcels ='),
 )
+const adHocQuoteInput = quoteMeasurementBlock.slice(
+  quoteMeasurementBlock.indexOf("if (line.kind === 'ad_hoc')"),
+  quoteMeasurementBlock.indexOf("kind: 'new' as const"),
+)
+assert.match(adHocQuoteInput, /unitWeightGrams: null/)
+assert.match(adHocQuoteInput, /unitDimensionsMm: null/)
+assert.doesNotMatch(adHocQuoteInput, /canonicalWeightFromDisplay|canonicalLengthFromDisplay/)
+assert.match(
+  ui,
+  /!pureAdHoc && \([\s\S]*label="Planning reason"/,
+  'Documents-only creation must not show a planning-reason essay',
+)
+assert.match(
+  ui,
+  /\.\.\.\(pureAdHoc \? \{\} : \{ reason: reason\.trim\(\) \}\)/,
+  'Documents-only creation must not send a fabricated operator reason',
+)
+assert.match(
+  persistence,
+  /operations_one_off_lines_are_pure_ad_hoc\(quote\.lines_snapshot\)[\s\S]*Created from the selected one-off parcel rate/,
+  'Persistence must derive a stable audit description for documents-only creation',
+)
 assert.match(
   quoteMeasurementBlock,
   /unitWeightGrams: canonicalWeightFromDisplay\([\s\S]*unitDimensionsMm:[\s\S]*dimensionsMm:[\s\S]*grossWeightGrams: canonicalWeightFromDisplay\(/,
@@ -420,8 +445,25 @@ for (const fragment of [
 }
 assert.match(
   ui,
-  /directRecipientSelected\.current && !current[\s\S]*\? ''[\s\S]*startPaperworkShipment[\s\S]*directRecipientSelected\.current = true[\s\S]*setCustomerGlobalId\(''\)/,
+  /directRecipientSelected\.current && !current[\s\S]*\? ''[\s\S]*selectContentsMode[\s\S]*directRecipientSelected\.current = mode === 'ad_hoc'[\s\S]*\? ''/,
   'Documents-only drafts must preserve the explicit direct-recipient selection across reopen',
+)
+for (const fragment of [
+  'ALTER COLUMN unit_weight_grams DROP NOT NULL',
+  'ALTER COLUMN unit_dimensions_mm DROP NOT NULL',
+  'operations_one_off_ad_hoc_lines_physical_facts_valid',
+  "NULLIF(snapshot->'unitDimensionsMm', 'null'::jsonb)",
+  'IS NOT DISTINCT FROM NEW.unit_weight_grams',
+]) {
+  assert.ok(
+    documentsMigration.includes(fragment),
+    `0313 minimal paperwork evidence is missing ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  documentsMigration,
+  /ALTER TABLE operations_order_lines|ALTER TABLE crm_products|DROP COLUMN/,
+  'Minimal paperwork fields must not weaken product or canonical order lines',
 )
 for (const fragment of [
   '<ShippingOneOffExecutionPanel',
@@ -630,6 +672,8 @@ assert.match(health, /shipping_independence_applied/)
 for (const fragment of [
   '0301_shipping_independent_one_off_items.sql',
   '21d58421f998e503f16c1f4ebc4c95dee9c986c0e5049a2dedb18df686058f53',
+  '0313_shipping_one_off_documents_minimal_fields.sql',
+  'b3b801e2469fc4bf596256a12514ac910173154b97c48d04103cfee4b8170df2',
   "installed_namespace.nspname = 'public'",
   'installed_function.prosrc',
   'installed_trigger.tgfoid',

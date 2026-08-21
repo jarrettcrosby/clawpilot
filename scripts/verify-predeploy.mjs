@@ -281,6 +281,7 @@ for (const requiredPath of [
   'db/migrations/0290_operations_shadow_training_runs.sql',
   'db/migrations/0300_operations_order_training_independent_control.sql',
   'db/migrations/0301_shipping_independent_one_off_items.sql',
+  'db/migrations/0313_shipping_one_off_documents_minimal_fields.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
   'app_src/components/shipping/ShippingSection.tsx',
   'app_src/components/shipping/ShippingOneOffExecutionPanel.tsx',

@@ -174,7 +174,7 @@ async function exerciseHealthTamperEvidence(client) {
   assert.equal(
     await shippingIndependenceIsHealthy(client),
     true,
-    'Fresh 0301 catalog must satisfy exact Shipping health',
+    'Fresh 0301/0313 catalog must satisfy exact Shipping health',
   )
 
   await assertHealthRejectsTamper(client, 'pure-ad-hoc helper replacement', async () => {
@@ -198,6 +198,17 @@ async function exerciseHealthTamperEvidence(client) {
     await client.query(
       `ALTER TABLE public.operations_one_off_ad_hoc_order_lines
        DISABLE TRIGGER protect_operations_one_off_ad_hoc_line_write`,
+    )
+  })
+  await assertHealthRejectsTamper(client, 'ad-hoc physical facts CHECK(true)', async () => {
+    await client.query(
+      `ALTER TABLE public.operations_one_off_ad_hoc_order_lines
+       DROP CONSTRAINT operations_one_off_ad_hoc_lines_physical_facts_valid`,
+    )
+    await client.query(
+      `ALTER TABLE public.operations_one_off_ad_hoc_order_lines
+       ADD CONSTRAINT operations_one_off_ad_hoc_lines_physical_facts_valid
+       CHECK (true)`,
     )
   })
   await assertHealthRejectsTamper(client, 'direct-recipient WHEN(false) trigger', async () => {
@@ -458,21 +469,21 @@ async function exerciseAdHocEvidence(client) {
     kind: 'ad_hoc',
     lineKey: 'direct-line-1',
     quantity: 2,
-    productName: 'One-time sample',
+    productName: 'Documents / paperwork',
     sku: '',
     unitPriceMinor: 2500,
-    unitWeightGrams: 450,
-    unitDimensionsMm: { length: 220, width: 140, height: 80 },
+    unitWeightGrams: null,
+    unitDimensionsMm: null,
   }
   const itemSnapshot = {
     kind: 'ad_hoc',
     lineKey: 'direct-line-1',
-    name: 'One-time sample',
+    name: 'Documents / paperwork',
     sku: null,
     quantity: 2,
     unitPriceMinor: 2500,
-    unitWeightGrams: 450,
-    unitDimensionsMm: { length: 220, width: 140, height: 80 },
+    unitWeightGrams: null,
+    unitDimensionsMm: null,
   }
   const packages = [{
     packageKey: 'direct-package-1',
@@ -618,18 +629,43 @@ async function exerciseAdHocEvidence(client) {
   )
   await client.query('SET LOCAL session_replication_role = origin')
 
+  await client.query('SAVEPOINT incomplete_physical_facts_check')
+  await client.query('SET LOCAL session_replication_role = replica')
+  await assert.rejects(
+    client.query(
+      `INSERT INTO operations_one_off_ad_hoc_order_lines (
+         organization_id, quote_id, order_id, line_key, description,
+         item_reference, quantity, unit_price_minor, unit_weight_grams,
+         unit_dimensions_mm, item_snapshot, item_snapshot_hash, created_by
+       ) VALUES (
+         $1, $2, $3, 'direct-line-invalid', 'Invalid split facts', NULL,
+         1, 0, 450, NULL,
+         jsonb_build_object(
+           'kind', 'ad_hoc', 'lineKey', 'direct-line-invalid',
+           'name', 'Invalid split facts', 'sku', NULL, 'quantity', 1,
+           'unitPriceMinor', 0, 'unitWeightGrams', 450,
+           'unitDimensionsMm', NULL
+         ), $4, $5
+       )`,
+      [ids.organization, ids.quote, ids.order, 'd'.repeat(64), actor],
+    ),
+    /operations_one_off_ad_hoc_lines_physical_facts_valid/,
+    'Database evidence must reject an incomplete item-physical pair',
+  )
+  await client.query('ROLLBACK TO SAVEPOINT incomplete_physical_facts_check')
+  await client.query('SET LOCAL session_replication_role = origin')
+
   const line = await client.query(
     `INSERT INTO operations_one_off_ad_hoc_order_lines (
        organization_id, quote_id, order_id, line_key, description,
        item_reference, quantity, unit_price_minor, unit_weight_grams,
        unit_dimensions_mm, item_snapshot, item_snapshot_hash, created_by
      ) VALUES (
-       $1, $2, $3, 'direct-line-1', 'One-time sample', NULL,
-       2, 2500, 450, $4::jsonb, $5::jsonb, $6, $7
+       $1, $2, $3, 'direct-line-1', 'Documents / paperwork', NULL,
+       2, 2500, NULL, NULL, $4::jsonb, $5, $6
      ) RETURNING id::text`,
     [ids.organization, ids.quote, ids.order,
-      JSON.stringify(itemSnapshot.unitDimensionsMm), JSON.stringify(itemSnapshot),
-      'c'.repeat(64), actor],
+      JSON.stringify(itemSnapshot), 'c'.repeat(64), actor],
   )
   await client.query(
     `INSERT INTO operations_one_off_ad_hoc_package_contents (
@@ -719,6 +755,16 @@ try {
          WHERE attrelid = 'operations_orders'::regclass
            AND attname = 'customer_id' AND NOT attisdropped
        ) AS order_customer_nullable,
+       NOT (
+         SELECT attnotnull FROM pg_attribute
+         WHERE attrelid = 'operations_one_off_ad_hoc_order_lines'::regclass
+           AND attname = 'unit_weight_grams' AND NOT attisdropped
+       ) AS ad_hoc_unit_weight_nullable,
+       NOT (
+         SELECT attnotnull FROM pg_attribute
+         WHERE attrelid = 'operations_one_off_ad_hoc_order_lines'::regclass
+           AND attname = 'unit_dimensions_mm' AND NOT attisdropped
+       ) AS ad_hoc_unit_dimensions_nullable,
        operations_one_off_lines_are_pure_ad_hoc(
          '[{"kind":"ad_hoc","lineKey":"one"}]'::jsonb
        ) AS pure_ad_hoc,
@@ -732,6 +778,8 @@ try {
     ad_hoc_contents: true,
     quote_customer_nullable: true,
     order_customer_nullable: true,
+    ad_hoc_unit_weight_nullable: true,
+    ad_hoc_unit_dimensions_nullable: true,
     pure_ad_hoc: true,
     inventory_backed_not_ad_hoc: true,
   })
@@ -766,12 +814,21 @@ try {
          WHERE tgrelid = 'operations_one_off_ad_hoc_package_contents'::regclass
            AND tgname = 'validate_operations_one_off_ad_hoc_content_set_deferred'
            AND NOT tgisinternal
-       ) AS exact_package_set`,
+       ) AS exact_package_set,
+       EXISTS (
+         SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'operations_one_off_ad_hoc_order_lines'::regclass
+           AND conname = 'operations_one_off_ad_hoc_lines_physical_facts_valid'
+           AND convalidated
+           AND pg_get_constraintdef(oid) ILIKE '%unit_weight_grams IS NULL%'
+           AND pg_get_constraintdef(oid) ILIKE '%unit_dimensions_mm IS NULL%'
+       ) AS exact_optional_physical_pair`,
   )
   assert.deepEqual(safeguards.rows[0], {
     cross_org_line_fence: true,
     immutable_line: true,
     exact_package_set: true,
+    exact_optional_physical_pair: true,
   })
   await exerciseHealthTamperEvidence(client)
   await exercisePermissionBackfill(client)
