@@ -70,6 +70,10 @@ const healthContract = read(
 const postgresSource = read('app_src/lib/persistence/postgres.ts')
 const operationsRouteSource = read('app_src/app/api/operations/route.ts')
 const printGatewayWorkflow = read('.github/workflows/print-gateway-ci.yml')
+const shippingPostgresHarnesses = [
+  read('scripts/test-shipping-independence-postgres.mjs'),
+  read('scripts/test-shipping-one-off-pack-postgres.mjs'),
+]
 const recovery = loadTypeScript(
   'app_src/lib/operations/shippingOneOffRecovery.ts',
 )
@@ -90,6 +94,22 @@ for (const watchedPath of [
     printGatewayWorkflow.split(`- "${watchedPath}"`).length - 1,
     2,
     `Print Gateway pull-request and push filters must both watch ${watchedPath}`,
+  )
+}
+
+for (const harness of shippingPostgresHarnesses) {
+  assert.ok(
+    harness.includes('SELECT pg_postmaster_start_time()::text AS postmaster_start'),
+    'Shipping PostgreSQL readiness must probe the mapped TCP database',
+  )
+  assert.ok(
+    harness.includes('consecutiveMatches >= 2'),
+    'Shipping PostgreSQL readiness must survive the temporary init postmaster transition',
+  )
+  assert.doesNotMatch(
+    harness,
+    /pg_isready/,
+    'In-container pg_isready can accept the temporary Unix-socket init postmaster',
   )
 }
 

@@ -21,6 +21,44 @@ const ts = requireFromApp('typescript')
 const CONFIRMATION =
   'I CONFIRM THESE EXACT ITEMS ARE PHYSICALLY IN THESE PACKAGES'
 
+async function waitForStablePostgres(databaseUrl) {
+  const deadline = Date.now() + 60_000
+  let previousPostmasterStart = null
+  let consecutiveMatches = 0
+  let lastError = null
+  while (Date.now() < deadline) {
+    const probe = new Pool({
+      connectionString: databaseUrl,
+      max: 1,
+      connectionTimeoutMillis: 1_000,
+      query_timeout: 1_000,
+    })
+    try {
+      const result = await probe.query(
+        'SELECT pg_postmaster_start_time()::text AS postmaster_start',
+      )
+      const postmasterStart = String(result.rows[0]?.postmaster_start || '')
+      consecutiveMatches = postmasterStart === previousPostmasterStart
+        ? consecutiveMatches + 1
+        : 1
+      previousPostmasterStart = postmasterStart
+      if (postmasterStart && consecutiveMatches >= 2) return
+    } catch (error) {
+      lastError = error
+      previousPostmasterStart = null
+      consecutiveMatches = 0
+    } finally {
+      await probe.end().catch(() => undefined)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  throw new Error(
+    `Disposable PostgreSQL TCP endpoint did not become stable: ${
+      lastError instanceof Error ? lastError.message : 'unknown readiness error'
+    }`,
+  )
+}
+
 let databaseUrl = String(process.env.CLAWPILOT_SHIPPING_PACK_DATABASE_URL || '').trim()
 if (!databaseUrl) {
   execFileSync('docker', ['info'], { stdio: 'ignore', timeout: 30_000 })
@@ -39,18 +77,7 @@ if (!databaseUrl) {
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
     assert.ok(port > 0, `Unable to resolve disposable PostgreSQL port: ${portOutput}`)
     databaseUrl = `postgresql://postgres:clawpilot_shipping_pack@127.0.0.1:${port}/clawpilot_shipping_pack`
-    const deadline = Date.now() + 60_000
-    while (true) {
-      const ready = spawnSync('docker', [
-        'exec', container, 'pg_isready', '-U', 'postgres',
-        '-d', 'clawpilot_shipping_pack',
-      ], { stdio: 'ignore' })
-      if (ready.status === 0) break
-      if (Date.now() >= deadline) {
-        throw new Error('Disposable PostgreSQL did not become ready')
-      }
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 500))
-    }
+    await waitForStablePostgres(databaseUrl)
     execFileSync('node', ['scripts/db-migrate.mjs'], {
       cwd: root,
       env: { ...process.env, DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
