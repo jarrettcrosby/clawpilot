@@ -1,7 +1,7 @@
 import { recordAuditEvent } from '@/lib/auditWriter'
 import type { PoolClient } from 'pg'
 import {
-  shopifyOrderWebhookSubscriptionEvidenceReady,
+  shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery,
   type ShopifyOrderWebhookSignalEvidence,
 } from '@/lib/integrations/shopifyOrderWebhook'
 import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
@@ -180,6 +180,7 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
   sourceDomain: string
   providerApiVersion: string | null
   providerTriggeredAt: string | null
+  expectedCallbackUri: string
   evidence: ShopifyOrderWebhookSignalEvidence
 }): Promise<ShopifyOrderWebhookSignalResult> {
   return withTransaction(async (client) => {
@@ -334,13 +335,22 @@ export async function recordShopifyOrderWebhookSignalInPostgres(input: {
         'Shopify order webhook credential or policy lineage is not current',
       )
     }
+    const runtimeSubscriptionEvidence = input.runtime.configuration
+      .orderWebhookSubscriptions
+    const fallbackCallbackUri = runtimeSubscriptionEvidence
+      && typeof runtimeSubscriptionEvidence === 'object'
+      && !Array.isArray(runtimeSubscriptionEvidence)
+      && typeof (runtimeSubscriptionEvidence as Record<string, unknown>)
+        .desiredUri === 'string'
+      ? String((runtimeSubscriptionEvidence as Record<string, unknown>).desiredUri)
+      : ''
     const subscriptionReady =
-      shopifyOrderWebhookSubscriptionEvidenceReady(
+      shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
         current.order_webhook_subscriptions,
         {
           accountGlobalId: current.account_global_id,
           credentialGeneration: current.credential_version,
-          now: current.checked_at,
+          desiredUri: input.expectedCallbackUri || fallbackCallbackUri,
         },
       )
     if (!subscriptionReady) {

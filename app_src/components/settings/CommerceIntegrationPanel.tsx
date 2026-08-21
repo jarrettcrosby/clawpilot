@@ -62,6 +62,11 @@ import { SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES }
   from '@/lib/integrations/commerceCapabilities'
 import { resolveCommerceSetupPermissionGuidance }
   from '@/lib/integrations/commerceSetupGuidance'
+import {
+  clearShopifyOrderWebhookRecoveryDraft,
+  loadShopifyOrderWebhookRecoveryDraft,
+  saveShopifyOrderWebhookRecoveryDraft,
+} from '@/lib/integrations/shopifyOrderWebhookRecovery'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -601,6 +606,54 @@ function webhookSubscriptionReadiness(
   }
 }
 
+function orderWebhookSubscriptionReadiness(account: CommerceAccount) {
+  const value = account.configuration.orderWebhookSubscriptions
+  const desiredTopics = [
+    'orders/create',
+    'orders/updated',
+    'orders/edited',
+    'orders/cancelled',
+    'orders/paid',
+    'orders/fulfilled',
+    'orders/partially_fulfilled',
+  ]
+  const desiredFields = ['admin_graphql_api_id', 'updated_at']
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      desiredTopics,
+      desiredFields,
+      observed: false,
+      observedCount: 0,
+      matchingCount: 0,
+      missingTopics: desiredTopics,
+      conflictingTopics: [] as string[],
+      effective: false,
+      observedAt: null as string | null,
+    }
+  }
+  const state = value as Record<string, unknown>
+  const observedAt = typeof state.observedAt === 'string'
+    ? state.observedAt
+    : null
+  const observedTime = observedAt ? Date.parse(observedAt) : Number.NaN
+  const currentEvidence = Number.isFinite(observedTime)
+    && observedTime >= Date.now() - 24 * 60 * 60 * 1_000
+  const bindingCurrent = state.accountGlobalId === account.globalId
+    && state.credentialGeneration === account.credentialVersion
+    && state.desiredUri === account.webhookUrl
+  return {
+    desiredTopics,
+    desiredFields,
+    observed: true,
+    observedCount: Number(state.observedCount || 0),
+    matchingCount: Number(state.matchingCount || 0),
+    missingTopics: valueStrings(state.missingTopics),
+    conflictingTopics: valueStrings(state.conflictingTopics),
+    effective: state.ready === true && bindingCurrent && currentEvidence,
+    observedAt,
+  }
+}
+
 export default function CommerceIntegrationPanel({
   onNavigate,
 }: {
@@ -624,6 +677,10 @@ export default function CommerceIntegrationPanel({
       confirmed: boolean
     }>
   >({})
+  const [orderWebhookDrafts, setOrderWebhookDrafts] = useState<Record<
+    string,
+    { confirmation: string; idempotencyKey: string | null }
+  >>({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [revealedCredential, setRevealedCredential] =
@@ -751,10 +808,34 @@ export default function CommerceIntegrationPanel({
     }
   }, [revealedCredential])
 
+  useEffect(() => {
+    if (!integrations.organizationId || typeof window === 'undefined') return
+    setOrderWebhookDrafts((current) => {
+      const next = { ...current }
+      let changed = false
+      for (const account of integrations.accounts) {
+        if (account.provider !== 'shopify' || next[account.globalId]) continue
+        const recovered = loadShopifyOrderWebhookRecoveryDraft(
+          window.sessionStorage,
+          {
+            organizationId: integrations.organizationId,
+            accountGlobalId: account.globalId,
+          },
+        )
+        if (recovered) {
+          next[account.globalId] = recovered
+          changed = true
+        }
+      }
+      return changed ? next : current
+    })
+  }, [integrations.accounts, integrations.organizationId])
+
   async function action(
     key: string,
     body: Record<string, unknown>,
     successMessage: string,
+    additionalHeaders: Record<string, string> = {},
   ) {
     setPendingAction(key)
     setError('')
@@ -762,7 +843,10 @@ export default function CommerceIntegrationPanel({
     try {
       const payload = await requestCommerce({
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...additionalHeaders,
+        },
         body: JSON.stringify(body),
       })
       applyPayload(payload)
@@ -1059,6 +1143,58 @@ export default function CommerceIntegrationPanel({
       },
       `${account.displayName} catalog webhook subscriptions registered and verified.`,
     )
+  }
+
+  async function reconcileOrderWebhooks(account: CommerceAccount) {
+    if (!canRevealCredentials || pendingAction) return
+    const expected = `RECONCILE 7 ORDER WEBHOOKS FOR ${account.globalId}`
+    const draft = orderWebhookDrafts[account.globalId]
+      || { confirmation: '', idempotencyKey: null }
+    if (draft.confirmation !== expected) {
+      setError(`Type exactly: ${expected}`)
+      return
+    }
+    const stableKey = draft.idempotencyKey || crypto.randomUUID()
+    const storedForRecovery = saveShopifyOrderWebhookRecoveryDraft(
+      window.sessionStorage,
+      {
+        organizationId: integrations.organizationId,
+        accountGlobalId: account.globalId,
+        confirmation: draft.confirmation,
+        idempotencyKey: stableKey,
+      },
+    )
+    if (!storedForRecovery) {
+      setError(
+        'ClawPilot could not store the safe retry key for this tab; order webhooks were not changed.',
+      )
+      return
+    }
+    setOrderWebhookDrafts((current) => ({
+      ...current,
+      [account.globalId]: { ...draft, idempotencyKey: stableKey },
+    }))
+    const saved = await action(
+      `reconcile-order-webhooks:${account.globalId}`,
+      {
+        action: 'reconcile-shopify-order-webhooks',
+        accountGlobalId: account.globalId,
+        confirmation: draft.confirmation,
+      },
+      `${account.displayName} order webhooks are registered with the minimized two-field JSON profile.`,
+      { 'Idempotency-Key': stableKey },
+    )
+    if (saved) {
+      clearShopifyOrderWebhookRecoveryDraft(window.sessionStorage, {
+        organizationId: integrations.organizationId,
+        accountGlobalId: account.globalId,
+      })
+      setOrderWebhookDrafts((current) => {
+        const next = { ...current }
+        delete next[account.globalId]
+        return next
+      })
+    }
   }
 
   async function revealCredential(account: CommerceAccount) {
@@ -2401,6 +2537,16 @@ export default function CommerceIntegrationPanel({
                 webhookSubscriptionGroups
                   .filter((group) => !group.ready)
                   .map((group) => group.label)
+              const orderWebhookReadiness = account.provider === 'shopify'
+                ? orderWebhookSubscriptionReadiness(account)
+                : null
+              const orderWebhookConfirmation = account.provider === 'shopify'
+                ? `RECONCILE 7 ORDER WEBHOOKS FOR ${account.globalId}`
+                : ''
+              const orderWebhookDraft = orderWebhookDrafts[account.globalId]
+                || { confirmation: '', idempotencyKey: null }
+              const orderWebhookPending = pendingAction
+                === `reconcile-order-webhooks:${account.globalId}`
               const webhookReceiptHealth =
                 account.evidence.webhookReceiptHealth
               const preview = shopifyPreviews[account.globalId]
@@ -2818,9 +2964,9 @@ export default function CommerceIntegrationPanel({
                             required event subscription points to this exact
                             URL. One valid signed delivery separately verifies
                             the stored app secret; neither check writes to
-                            Shopify. Run Test connection at least every 24 hours
-                            until automated subscription rediscovery is
-                            available; readiness fails closed when that evidence expires.
+                            Shopify. Test connection refreshes the 24-hour
+                            operational status, but an older exact discovery
+                            alone does not block a valid signed order event.
                           </Typography>
                           <Stack spacing={1} sx={{ mb: 1 }}>
                             {webhookSubscriptionGroups.map((group) => (
@@ -2841,6 +2987,126 @@ export default function CommerceIntegrationPanel({
                               </Alert>
                             ))}
                           </Stack>
+                          {orderWebhookReadiness ? (
+                            <Box
+                              sx={{
+                                border: 1,
+                                borderColor: orderWebhookReadiness.effective
+                                  ? 'success.main'
+                                  : 'warning.main',
+                                borderRadius: 2,
+                                p: 1.5,
+                                mb: 1,
+                              }}
+                            >
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Order event subscriptions
+                              </Typography>
+                              <Stack spacing={0.75} sx={{ mt: 1 }}>
+                                <Alert severity="info">
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Desired · seven minimized JSON topics
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    Fields: {orderWebhookReadiness.desiredFields.join(', ')}
+                                  </Typography>
+                                  <Typography variant="caption" display="block">
+                                    {orderWebhookReadiness.desiredTopics.join(', ')}
+                                  </Typography>
+                                </Alert>
+                                <Alert severity={
+                                  orderWebhookReadiness.observed ? 'info' : 'warning'
+                                }>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Current · {orderWebhookReadiness.observed
+                                      ? `${orderWebhookReadiness.matchingCount} of 7 exact`
+                                      : 'not discovered'}
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    {orderWebhookReadiness.observed
+                                      ? `${orderWebhookReadiness.observedCount} observed · ${orderWebhookReadiness.missingTopics.length} missing · ${orderWebhookReadiness.conflictingTopics.length} conflicting`
+                                      : 'Test the connection or run the single reconciliation action below.'}
+                                  </Typography>
+                                </Alert>
+                                <Alert severity={
+                                  orderWebhookReadiness.effective
+                                    ? 'success'
+                                    : 'warning'
+                                }>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Effective · {orderWebhookReadiness.effective
+                                      ? 'ready'
+                                      : 'not ready'}
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    {orderWebhookReadiness.effective
+                                      ? 'All seven topics match this account, credential generation, callback URL, JSON format, and two-field profile with current discovery evidence.'
+                                      : 'Operational status needs refresh or the topic, credential generation, callback URL, or two-field profile has drifted. Only exact binding/profile drift blocks signed delivery; age alone does not.'}
+                                  </Typography>
+                                </Alert>
+                              </Stack>
+                              <TextField
+                                fullWidth
+                                size="small"
+                                label="Typed order webhook confirmation"
+                                value={orderWebhookDraft.confirmation}
+                                disabled={
+                                  !canRevealCredentials
+                                  || orderWebhookPending
+                                  || orderWebhookDraft.idempotencyKey !== null
+                                }
+                                onChange={(event) => {
+                                  setOrderWebhookDrafts((current) => ({
+                                    ...current,
+                                    [account.globalId]: {
+                                      confirmation: event.target.value,
+                                      idempotencyKey: null,
+                                    },
+                                  }))
+                                }}
+                                helperText={orderWebhookDraft.idempotencyKey
+                                  ? 'Safe retry is retained for this tab. Ambiguous outcomes stay read-only; a deterministic rejection may resume only the discovered residual plan. The key clears after bound success.'
+                                  : `Type exactly: ${orderWebhookConfirmation}`}
+                                inputProps={{
+                                  autoComplete: 'off',
+                                  spellCheck: false,
+                                  maxLength: 96,
+                                }}
+                                sx={{ mt: 1 }}
+                              />
+                              <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                spacing={1}
+                                alignItems={{ sm: 'center' }}
+                                sx={{ mt: 1 }}
+                              >
+                                <Button
+                                  variant="contained"
+                                  disabled={
+                                    !canRevealCredentials
+                                    || pendingAction !== ''
+                                    || orderWebhookDraft.confirmation
+                                      !== orderWebhookConfirmation
+                                  }
+                                  startIcon={orderWebhookPending
+                                    ? <CircularProgress size={16} />
+                                    : <SyncRounded />}
+                                  onClick={() => {
+                                    void reconcileOrderWebhooks(account)
+                                  }}
+                                >
+                                  {orderWebhookPending
+                                    ? 'Reconciling order webhooks'
+                                    : 'Reconcile order webhooks'}
+                                </Button>
+                                <Typography variant="caption" color="text.secondary">
+                                  Creates missing or updates one mismatched required
+                                  subscription. It never deletes subscriptions or
+                                  touches other topics.
+                                </Typography>
+                              </Stack>
+                            </Box>
+                          ) : null}
                           <Accordion disableGutters sx={{ mb: 1 }}>
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>

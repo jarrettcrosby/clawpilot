@@ -371,6 +371,47 @@ for (const invalid of [
     },
   ), false)
 }
+const olderThan24Hours = {
+  ...storedReady,
+  observedAt: '2026-08-11T17:00:00.000Z',
+}
+assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceReady(
+  olderThan24Hours,
+  {
+    accountGlobalId: 'gia0009301',
+    credentialGeneration: 1,
+    desiredUri: callback,
+    now: '2026-08-13T17:01:00Z',
+  },
+), false, 'operational readiness retains the 24-hour freshness signal')
+assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
+  olderThan24Hours,
+  {
+    accountGlobalId: 'gia0009301',
+    credentialGeneration: 1,
+    desiredUri: callback,
+  },
+), true, 'an exact signed delivery is not rejected only because discovery is old')
+for (const drifted of [
+  { ...olderThan24Hours, credentialGeneration: 2 },
+  {
+    ...olderThan24Hours,
+    desiredUri: callback.replace('clawpilot.example', 'drift.example'),
+  },
+  {
+    ...olderThan24Hours,
+    requiredIncludeFields: ['admin_graphql_api_id'],
+  },
+]) {
+  assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
+    drifted,
+    {
+      accountGlobalId: 'gia0009301',
+      credentialGeneration: 1,
+      desiredUri: callback,
+    },
+  ), false)
+}
 
 providerData = {
   webhookSubscriptions: {
@@ -488,7 +529,12 @@ assert.match(persistenceSource, /providerWrites: 0 as const/u)
 assert.match(persistenceSource, /commerceOrderSyncAccountLockKey/u)
 assert.match(
   persistenceSource,
-  /account\.configuration->'orderWebhookSubscriptions'[\s\S]+?shopifyOrderWebhookSubscriptionEvidenceReady\([\s\S]+?current\.order_webhook_subscriptions/u,
+  /account\.configuration->'orderWebhookSubscriptions'[\s\S]+?shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery\([\s\S]+?current\.order_webhook_subscriptions/u,
+)
+assert.ok(
+  serviceSource.indexOf('verifyShopifyWebhookHmac({')
+    < serviceSource.indexOf('recordShopifyOrderWebhookSignalInPostgres({'),
+  'HMAC verification must precede the age-independent structural delivery fence',
 )
 assert.match(
   persistenceSource,

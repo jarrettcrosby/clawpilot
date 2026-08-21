@@ -53,10 +53,15 @@ import {
 } from '@/lib/integrations/shopifyInventoryWebhook'
 import {
   discoverShopifyOrderWebhookSubscriptions,
+  decideShopifyOrderWebhookRecovery,
   isShopifyOrderSignalWebhookTopic,
+  reconcileShopifyOrderWebhookSubscriptions,
+  shopifyOrderWebhookReconciliationConfirmation,
+  shopifyOrderWebhookReconciliationRequestHash,
   shopifyOrderWebhookSignalEvidence,
   SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS,
   SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS,
+  ShopifyOrderWebhookDispatchError,
   ShopifyOrderWebhookError,
   type ShopifyOrderWebhookSubscriptionReadiness,
 } from '@/lib/integrations/shopifyOrderWebhook'
@@ -102,6 +107,14 @@ import {
   recordShopifyOrderWebhookSignalInPostgres,
   ShopifyOrderWebhookSignalPersistenceError,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
+import {
+  claimShopifyOrderWebhookReconciliationInPostgres,
+  finalizeShopifyOrderWebhookReconciliationInPostgres,
+  markStaleShopifyOrderWebhookAttemptUnknownInPostgres,
+  prepareShopifyOrderWebhookReconciliationInPostgres,
+  readShopifyOrderWebhookAttemptIdInPostgres,
+  ShopifyOrderWebhookReconciliationPersistenceError,
+} from '@/lib/persistence/shopifyOrderWebhookReconciliation'
 import { appPublicUrl } from '@/lib/publicUrl'
 
 const SHOPIFY_ADAPTER_VERSION = `shopify-graphql-${SHOPIFY_ADMIN_API_VERSION}-control-v1`
@@ -182,6 +195,13 @@ function sanitize(error: unknown): CommerceIntegrationRequestError {
     )
   }
   if (error instanceof ShopifyOrderWebhookSignalPersistenceError) {
+    return new CommerceIntegrationRequestError(
+      error.message,
+      error.status,
+      error.code,
+    )
+  }
+  if (error instanceof ShopifyOrderWebhookReconciliationPersistenceError) {
     return new CommerceIntegrationRequestError(
       error.message,
       error.status,
@@ -1684,6 +1704,377 @@ export function registerShopifyCatalogWebhookSubscriptions(input: {
   return registerShopifyWebhookSubscriptionGroup({ ...input, group: 'catalog' })
 }
 
+function orderWebhookResultSnapshot(input: {
+  readiness: ShopifyOrderWebhookSubscriptionReadiness
+  providerWrites: number | null
+  providerReferences: readonly string[]
+  recovery: 'provider_dispatch' | 'lost_response_read'
+}) {
+  return {
+    profile: 'seven_topic_minimized_order_signals_v1',
+    recovery: input.recovery,
+    desiredUri: input.readiness.desiredUri,
+    requiredTopics: input.readiness.requiredTopics,
+    requiredIncludeFields: input.readiness.requiredIncludeFields,
+    observedCount: input.readiness.subscriptions.length,
+    matchingCount: input.readiness.matchingTopics.length,
+    missingTopics: input.readiness.missingTopics,
+    conflictingTopics: input.readiness.conflictingTopics,
+    ready: input.readiness.ready,
+    providerWrites: input.providerWrites,
+    providerReferences: [...input.providerReferences],
+    deletionWrites: 0,
+  }
+}
+
+/**
+ * Explicit owner/admin reconciliation of only the seven payload-minimized
+ * Shopify order signal subscriptions. The durable command and immutable
+ * attempt are committed before the first provider mutation. Ambiguous
+ * responses can only be replayed through read-only discovery. A deterministic
+ * Shopify user-error boundary may append a residual attempt after discovery.
+ */
+export async function reconcileShopifyOrderWebhookSetup(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+  idempotencyKey: unknown
+  confirmation: unknown
+}) {
+  try {
+    const runtime = await storedRuntime(input)
+    if (runtime.provider !== 'shopify') {
+      throw new CommerceIntegrationRequestError(
+        'Order webhook reconciliation requires a Shopify sales channel',
+        400,
+        'SHOPIFY_ORDER_WEBHOOK_PROVIDER_REQUIRED',
+      )
+    }
+    if (runtime.status !== 'active' || runtime.verificationStatus !== 'verified') {
+      throw new CommerceIntegrationRequestError(
+        'Verify and enable the Shopify connection before reconciling order webhooks',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_VERIFICATION_REQUIRED',
+      )
+    }
+    const expectedConfirmation = shopifyOrderWebhookReconciliationConfirmation(
+      runtime.globalId,
+    )
+    if (input.confirmation !== expectedConfirmation) {
+      throw new CommerceIntegrationRequestError(
+        `Type exactly: ${expectedConfirmation}`,
+        400,
+        'SHOPIFY_ORDER_WEBHOOK_CONFIRMATION_REQUIRED',
+      )
+    }
+    const shopDomain = normalizeShopifyShopDomain(
+      runtime.configuration.shopDomain,
+    )
+    const desiredUri = webhookUrl(runtime.globalId)
+    const requestHash = shopifyOrderWebhookReconciliationRequestHash({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      integrationAccountId: runtime.integrationAccountId,
+      credentialGeneration: runtime.credentialVersion,
+      externalAccountId: runtime.externalAccountId,
+      shopDomain,
+      desiredUri,
+      actorEmail: input.actorEmail,
+    })
+    let command = await prepareShopifyOrderWebhookReconciliationInPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      integrationAccountId: runtime.integrationAccountId,
+      credentialGeneration: runtime.credentialVersion,
+      externalAccountId: runtime.externalAccountId,
+      shopDomain,
+      callbackUri: desiredUri,
+      idempotencyKey: input.idempotencyKey,
+      requestHash,
+      confirmationHash: createHash('sha256')
+        .update(expectedConfirmation)
+        .digest('hex'),
+      actorEmail: input.actorEmail,
+    })
+    if (command.status === 'succeeded' || command.status === 'reconciled') {
+      return readCommerceIntegrationsStateFromPostgres(runtime.organizationId)
+    }
+    if (command.status === 'failed') {
+      throw new CommerceIntegrationRequestError(
+        'This exact Shopify order webhook action already failed; inspect its audited outcome before using a new Idempotency-Key',
+        409,
+        command.errorCode || 'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_FAILED',
+      )
+    }
+    if (command.status === 'processing') {
+      if (!command.processingLeaseExpired) {
+        throw new CommerceIntegrationRequestError(
+          'Shopify order webhook reconciliation is already processing',
+          409,
+          'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_IN_PROGRESS',
+        )
+      }
+      await markStaleShopifyOrderWebhookAttemptUnknownInPostgres({
+        organizationId: runtime.organizationId,
+        commandId: command.commandId,
+        actorEmail: input.actorEmail,
+      })
+      command = { ...command, status: 'unknown' }
+    }
+
+    const stored = decryptStoredCredential(runtime)
+    if (stored.provider !== 'shopify') {
+      throw new Error('Stored commerce credential could not be decrypted')
+    }
+    const grant = await requestShopifyAccessToken({
+      shopDomain,
+      clientId: stored.clientId,
+      clientSecret: stored.clientSecret,
+    })
+    const providerCredential = {
+      shopDomain,
+      accessToken: grant.accessToken,
+    }
+    const probe = await probeShopifyConnection(providerCredential)
+    if (
+      probe.shopId !== runtime.externalAccountId
+      || probe.shopDomain !== shopDomain
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Shopify returned a different verified store identity or canonical domain',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_STORE_DRIFT',
+      )
+    }
+    if (
+      !grant.grantedScopes.includes('read_orders')
+      || !probe.grantedScopes.includes('read_orders')
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Shopify read_orders access is required for minimized order webhooks',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_SCOPE_REQUIRED',
+      )
+    }
+
+    const readiness = await discoverShopifyOrderWebhookSubscriptions(
+      providerCredential,
+      { desiredUri },
+    )
+    const recovery = decideShopifyOrderWebhookRecovery(
+      command.status === 'recoverable'
+        ? 'recoverable'
+        : command.status === 'unknown'
+          ? 'unknown'
+          : 'prepared',
+      readiness,
+    )
+    if (recovery.action === 'manual_review') {
+      throw new CommerceIntegrationRequestError(
+        'The prior Shopify mutation response is ambiguous and read-only discovery is not ready; ClawPilot will issue zero residual provider writes until manual review or exact readiness is observed',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_OUTCOME_UNKNOWN',
+      )
+    }
+    if (
+      (command.status === 'unknown' || command.status === 'recoverable')
+      && recovery.action === 'reconcile_read_only'
+    ) {
+      const attemptId = await readShopifyOrderWebhookAttemptIdInPostgres({
+        organizationId: runtime.organizationId,
+        commandId: command.commandId,
+      })
+      if (!attemptId) {
+        throw new CommerceIntegrationRequestError(
+          'The prior Shopify provider attempt could not be reconciled',
+          409,
+          'SHOPIFY_ORDER_WEBHOOK_ATTEMPT_MISSING',
+        )
+      }
+      await finalizeShopifyOrderWebhookReconciliationInPostgres({
+        organizationId: runtime.organizationId,
+        commandId: command.commandId,
+        attemptId,
+        actorEmail: input.actorEmail,
+        outcome: 'reconciled',
+        providerWriteCount: 0,
+        providerReferences: [],
+        completedMutations: [],
+        stoppedMutation: null,
+        stopClassification: null,
+        errorCode: null,
+        resultSnapshot: orderWebhookResultSnapshot({
+          readiness,
+          providerWrites: 0,
+          providerReferences: readiness.subscriptions.map(
+            (subscription) => subscription.providerId,
+          ),
+          recovery: 'lost_response_read',
+        }),
+        readiness,
+      })
+      return readCommerceIntegrationsStateFromPostgres(runtime.organizationId)
+    }
+    const plan = recovery.plan
+    const attempt = await claimShopifyOrderWebhookReconciliationInPostgres({
+      organizationId: runtime.organizationId,
+      commandId: command.commandId,
+      actorEmail: input.actorEmail,
+      currentCallbackUri: webhookUrl(runtime.globalId),
+      mutationPlan: plan,
+    })
+    const revalidated = await storedRuntime(input)
+    if (
+      revalidated.organizationId !== runtime.organizationId
+      || revalidated.integrationAccountId !== runtime.integrationAccountId
+      || revalidated.globalId !== runtime.globalId
+      || revalidated.credentialVersion !== runtime.credentialVersion
+      || revalidated.externalAccountId !== runtime.externalAccountId
+      || normalizeShopifyShopDomain(revalidated.configuration.shopDomain)
+        !== shopDomain
+      || webhookUrl(revalidated.globalId) !== desiredUri
+      || attempt.requestHash !== requestHash
+    ) {
+      await finalizeShopifyOrderWebhookReconciliationInPostgres({
+        organizationId: runtime.organizationId,
+        commandId: command.commandId,
+        attemptId: attempt.attemptId,
+        actorEmail: input.actorEmail,
+        outcome: 'failed',
+        providerWriteCount: 0,
+        providerReferences: [],
+        completedMutations: [],
+        stoppedMutation: null,
+        stopClassification: null,
+        errorCode: 'SHOPIFY_ORDER_WEBHOOK_BINDING_DRIFT',
+        resultSnapshot: {
+          profile: 'seven_topic_minimized_order_signals_v1',
+          providerWrites: 0,
+          deletionWrites: 0,
+          failure: 'binding_drift_before_provider',
+        },
+      })
+      throw new CommerceIntegrationRequestError(
+        'Shopify account, credential, domain, or callback changed before provider dispatch',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_BINDING_DRIFT',
+      )
+    }
+
+    let result: Awaited<ReturnType<
+      typeof reconcileShopifyOrderWebhookSubscriptions
+    >>
+    try {
+      result = await reconcileShopifyOrderWebhookSubscriptions(
+        providerCredential,
+        {
+          desiredUri,
+          expectedPlan: plan,
+          preparedReadiness: readiness,
+        },
+      )
+    } catch (error) {
+      const sanitized = sanitize(error)
+      const dispatch = error instanceof ShopifyOrderWebhookDispatchError
+        ? error
+        : null
+      const deterministic = dispatch?.stopClassification
+        === 'deterministic_rejection'
+      const completedMutations = dispatch?.completedMutations || []
+      const providerReferences = completedMutations.map(
+        (completion) => completion.providerId,
+      )
+      const outcome = plan.length === 0
+        ? 'failed'
+        : deterministic
+          ? 'recoverable'
+          : 'unknown'
+      await finalizeShopifyOrderWebhookReconciliationInPostgres({
+        organizationId: runtime.organizationId,
+        commandId: command.commandId,
+        attemptId: attempt.attemptId,
+        actorEmail: input.actorEmail,
+        outcome,
+        providerWriteCount: plan.length === 0
+          ? 0
+          : deterministic
+            ? completedMutations.length
+            : null,
+        providerReferences,
+        completedMutations,
+        stoppedMutation: plan.length === 0
+          ? null
+          : dispatch?.stoppedMutation || null,
+        stopClassification: plan.length === 0
+          ? null
+          : deterministic
+            ? 'deterministic_rejection'
+            : 'ambiguous',
+        errorCode: plan.length === 0
+          ? sanitized.code
+          : deterministic
+            ? sanitized.code
+            : 'SHOPIFY_ORDER_WEBHOOK_OUTCOME_UNKNOWN',
+        resultSnapshot: {
+          profile: 'seven_topic_minimized_order_signals_v1',
+          providerWrites: plan.length === 0
+            ? 0
+            : deterministic
+              ? completedMutations.length
+              : null,
+          completedMutations,
+          stoppedMutation: dispatch?.stoppedMutation || null,
+          stopClassification: plan.length === 0
+            ? null
+            : deterministic
+              ? 'deterministic_rejection'
+              : 'ambiguous',
+          deletionWrites: 0,
+          errorCode: sanitized.code,
+        },
+      })
+      if (deterministic) {
+        throw new CommerceIntegrationRequestError(
+          'Shopify deterministically rejected one order webhook after the recorded completed topics; retry this same Idempotency-Key to discover and dispatch only the residual plan',
+          sanitized.status,
+          sanitized.code,
+        )
+      }
+      if (plan.length > 0) {
+        throw new CommerceIntegrationRequestError(
+          'Shopify order webhook dispatch has an ambiguous outcome; retry only this same Idempotency-Key for read-only reconciliation, with zero residual writes until exact readiness is observed',
+          409,
+          'SHOPIFY_ORDER_WEBHOOK_OUTCOME_UNKNOWN',
+        )
+      }
+      throw sanitized
+    }
+    await finalizeShopifyOrderWebhookReconciliationInPostgres({
+      organizationId: runtime.organizationId,
+      commandId: command.commandId,
+      attemptId: attempt.attemptId,
+      actorEmail: input.actorEmail,
+      outcome: 'succeeded',
+      providerWriteCount: result.providerWrites,
+      providerReferences: result.providerReferences,
+      completedMutations: result.completedMutations,
+      stoppedMutation: null,
+      stopClassification: null,
+      errorCode: null,
+      resultSnapshot: orderWebhookResultSnapshot({
+        readiness: result.after,
+        providerWrites: result.providerWrites,
+        providerReferences: result.providerReferences,
+        recovery: 'provider_dispatch',
+      }),
+      readiness: result.after,
+    })
+    return readCommerceIntegrationsStateFromPostgres(runtime.organizationId)
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
 export async function setCommerceIntegrationEnabled(input: {
   organizationId: unknown
   accountGlobalId: unknown
@@ -1954,6 +2345,7 @@ export async function receiveShopifyWebhook(input: {
         sourceDomain,
         providerApiVersion,
         providerTriggeredAt,
+        expectedCallbackUri: webhookUrl(runtime.globalId),
         evidence: shopifyOrderWebhookSignalEvidence({
           topic,
           verifiedRawBody: input.rawBody,

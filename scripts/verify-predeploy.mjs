@@ -104,6 +104,29 @@ if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
   fail('CI must run the Store sync disposable PostgreSQL acceptance')
 }
 
+if (
+  String(rootPackage?.scripts?.['test:shopify-order-webhook-reconciliation'] || '')
+    !== 'node scripts/test-shopify-order-webhook-reconciliation.mjs && node scripts/test-shopify-order-webhook-reconciliation-postgres.mjs && node scripts/test-shopify-order-webhook-reconciliation-health.mjs'
+) {
+  fail(
+    'test:shopify-order-webhook-reconciliation must run domain, '
+    + 'disposable PostgreSQL, and health acceptance',
+  )
+}
+if (
+  !String(rootPackage?.scripts?.['test:commerce'] || '')
+    .includes('npm run test:shopify-order-webhook-reconciliation')
+) {
+  fail('test:commerce must run Shopify order webhook reconciliation acceptance')
+}
+if (
+  !ciWorkflow.includes(
+    'run: npm run test:shopify-order-webhook-reconciliation',
+  )
+) {
+  fail('CI must run Shopify order webhook reconciliation acceptance')
+}
+
 const orderReplanningCorrectionsTest = String(
   rootPackage?.scripts?.['test:operation-order-replanning-corrections'] || '',
 )
@@ -207,6 +230,13 @@ if (releaseRecordPosition < healthGatePosition) {
 }
 
 for (const requiredPath of [
+  'db/migrations/0303_operations_shopify_order_webhook_reconciliation.sql',
+  'app_src/lib/integrations/shopifyOrderWebhookRecovery.ts',
+  'app_src/lib/persistence/shopifyOrderWebhookReconciliation.ts',
+  'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
+  'scripts/test-shopify-order-webhook-reconciliation.mjs',
+  'scripts/test-shopify-order-webhook-reconciliation-postgres.mjs',
+  'scripts/test-shopify-order-webhook-reconciliation-health.mjs',
   'db/migrations/0298_operations_commerce_store_sync_controls.sql',
   'app_src/lib/operations/commerceStoreSync.ts',
   'app_src/lib/persistence/commerceStoreSync.ts',

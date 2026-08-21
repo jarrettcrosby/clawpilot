@@ -55,5 +55,8 @@ jobs:
       - name: Store sync PostgreSQL acceptance
         run: npm run test:commerce-store-sync
 
+      - name: Shopify order webhook reconciliation acceptance
+        run: npm run test:shopify-order-webhook-reconciliation
+
       - name: Predeploy verification
         run: npm run verify:predeploy

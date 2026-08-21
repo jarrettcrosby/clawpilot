@@ -44,6 +44,9 @@ import {
   readShopifyOrderWebhookSignalHealthFromPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
+  SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+} from '@/lib/persistence/shopifyOrderWebhookReconciliationHealth'
+import {
   readShopifyOrderManagementHealthFromPostgres,
 } from '@/lib/persistence/shopifyOrderManagement'
 import {
@@ -2336,6 +2339,7 @@ export async function GET() {
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
           operations_commerce_store_sync_controls_applied: boolean
+          operations_shopify_order_webhook_reconciliation_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -4981,6 +4985,9 @@ export async function GET() {
                         control.integration_account_id
                       ) IS NULL
               ) AS operations_commerce_store_sync_controls_applied,
+              (
+                ${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL}
+              ) AS operations_shopify_order_webhook_reconciliation_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -6082,6 +6089,7 @@ export async function GET() {
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
             && row?.operations_commerce_store_sync_controls_applied
+            && row?.operations_shopify_order_webhook_reconciliation_applied
             && row?.migration_checksums_present
           ),
           carrierShippingDiagnostics: {
@@ -6114,6 +6122,11 @@ export async function GET() {
             status: row?.operations_commerce_store_sync_controls_applied
               ? 'ready'
               : 'migration-structure-or-coverage-pending',
+          },
+          shopifyOrderWebhookReconciliation: {
+            status: row?.operations_shopify_order_webhook_reconciliation_applied
+              ? 'ready'
+              : 'migration-structure-or-checksum-pending',
           },
           shopifyCheckoutAudiencePolicy: {
             status: row?.shopify_checkout_audience_policy_applied
@@ -6553,6 +6566,7 @@ export async function GET() {
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied
           || !row?.operations_commerce_store_sync_controls_applied
+          || !row?.operations_shopify_order_webhook_reconciliation_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
