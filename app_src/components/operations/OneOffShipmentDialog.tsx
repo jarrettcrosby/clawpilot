@@ -3,6 +3,7 @@
 import {
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
 } from 'react'
@@ -56,6 +57,13 @@ import {
 } from '@/lib/operations/oneOffShipmentClientAttempts'
 import { ONE_OFF_MAX_SYNCHRONOUS_PACKAGES } from '@/lib/operations/oneOffShipmentConstants'
 import {
+  canonicalLengthFromDisplay,
+  canonicalWeightFromDisplay,
+  displayLengthFromMillimeters,
+  rebaseDisplayLength,
+  rebaseDisplayWeight,
+} from '@/lib/operations/oneOffShipmentMeasurements'
+import {
   PACKAGE_CATALOG_CONTRACT_VERSION,
   packageCatalogEntriesCompatibleWithProviders,
   packageCatalogEntry,
@@ -66,6 +74,8 @@ import {
   type PackageCatalogEntryId,
 } from '@/lib/operations/packageCatalog'
 import type { PackagingMaterial } from '@/lib/operations/packagingMaterials'
+import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import { measurementUnits } from '@/lib/measurements'
 
 type DraftLine = {
   lineKey: string
@@ -75,10 +85,10 @@ type DraftLine = {
   sku: string
   quantity: string
   unitPriceMinor: string
-  unitWeightGrams: string
-  lengthMm: string
-  widthMm: string
-  heightMm: string
+  unitWeight: string
+  length: string
+  width: string
+  height: string
   physicalUnitsOnHandConfirmed: boolean
 }
 
@@ -88,10 +98,10 @@ type DraftPackage = {
   packageKind: CanonicalPackageKind
   packagingMaterialGlobalId: string | null
   description: string
-  lengthMm: string
-  widthMm: string
-  heightMm: string
-  grossWeightGrams: string
+  length: string
+  width: string
+  height: string
+  grossWeight: string
   allocations: Record<string, string>
 }
 
@@ -195,10 +205,10 @@ function initialLine(): DraftLine {
     sku: '',
     quantity: '1',
     unitPriceMinor: '0',
-    unitWeightGrams: '',
-    lengthMm: '',
-    widthMm: '',
-    heightMm: '',
+    unitWeight: '',
+    length: '',
+    width: '',
+    height: '',
     physicalUnitsOnHandConfirmed: false,
   }
 }
@@ -210,10 +220,10 @@ function initialPackage(lines: DraftLine[]): DraftPackage {
     packageKind: 'box',
     packagingMaterialGlobalId: null,
     description: 'Carton / box',
-    lengthMm: '',
-    widthMm: '',
-    heightMm: '',
-    grossWeightGrams: '',
+    length: '',
+    width: '',
+    height: '',
+    grossWeight: '',
     allocations: Object.fromEntries(lines.map((line) => [line.lineKey, line.quantity])),
   }
 }
@@ -287,6 +297,11 @@ export default function OneOffShipmentDialog({
     : undefined
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('sm'))
+  const { measurementSystem } = useMeasurementSystem()
+  const [draftMeasurementSystem, setDraftMeasurementSystem] = useState(
+    measurementSystem,
+  )
+  const units = measurementUnits(draftMeasurementSystem)
   const [workspace, setWorkspace] = useState<OneOffShipmentWorkspace | null>(
     fixture?.workspace || null,
   )
@@ -302,6 +317,7 @@ export default function OneOffShipmentDialog({
   const [error, setError] = useState('')
   const [step, setStep] = useState(fixture?.initialStep || 0)
   const [customerGlobalId, setCustomerGlobalId] = useState('')
+  const directRecipientSelected = useRef(false)
   const [warehouseGlobalId, setWarehouseGlobalId] = useState('')
   const [inventoryPoolGlobalId, setInventoryPoolGlobalId] = useState('')
   const [receivingLocationGlobalId, setReceivingLocationGlobalId] = useState('')
@@ -336,6 +352,9 @@ export default function OneOffShipmentDialog({
     ))
   ), [quote])
   const pureAdHoc = lines.length > 0 && lines.every((line) => line.kind === 'ad_hoc')
+  const canStartPaperworkShipment = lines.length === 1
+    && lines[0].kind === 'existing'
+    && !lines[0].productGlobalId
 
   const lowestPurchasableOfferGlobalId = useMemo(() => (
     sortedQuoteOffers.find((offer) => (
@@ -473,6 +492,57 @@ export default function OneOffShipmentDialog({
     setCreateAttempt(null)
   }
 
+  useEffect(() => {
+    if (measurementSystem === draftMeasurementSystem) return
+    setLines((current) => current.map((line) => ({
+      ...line,
+      unitWeight: rebaseDisplayWeight(
+        line.unitWeight,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      length: rebaseDisplayLength(
+        line.length,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      width: rebaseDisplayLength(
+        line.width,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      height: rebaseDisplayLength(
+        line.height,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+    })))
+    setPackages((current) => current.map((parcel) => ({
+      ...parcel,
+      length: rebaseDisplayLength(
+        parcel.length,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      width: rebaseDisplayLength(
+        parcel.width,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      height: rebaseDisplayLength(
+        parcel.height,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+      grossWeight: rebaseDisplayWeight(
+        parcel.grossWeight,
+        draftMeasurementSystem,
+        measurementSystem,
+      ),
+    })))
+    setDraftMeasurementSystem(measurementSystem)
+  }, [draftMeasurementSystem, measurementSystem])
+
   const updateCarrierSelection = (nextRefs: string[]) => {
     const ordered = enabledCarriers
       .map(carrierSelectionRef)
@@ -540,7 +610,9 @@ export default function OneOffShipmentDialog({
       setWorkspace(nextWorkspace)
       setPackagingMaterials(fixture.packagingMaterials)
       setCustomerGlobalId((current) => (
-        nextWorkspace.customers.some((customer) => customer.globalId === current)
+        directRecipientSelected.current && !current
+          ? ''
+          : nextWorkspace.customers.some((customer) => customer.globalId === current)
           ? current
           : nextWorkspace.customers[0]?.globalId || ''
       ))
@@ -589,7 +661,9 @@ export default function OneOffShipmentDialog({
           )
         }
         setCustomerGlobalId((current) => (
-          nextWorkspace.customers.some((customer) => customer.globalId === current)
+          directRecipientSelected.current && !current
+            ? ''
+            : nextWorkspace.customers.some((customer) => customer.globalId === current)
             ? current
             : nextWorkspace.customers[0]?.globalId || ''
         ))
@@ -671,6 +745,20 @@ export default function OneOffShipmentDialog({
     resetQuote()
   }
 
+  const startPaperworkShipment = () => {
+    const line = {
+      ...lines[0],
+      kind: 'ad_hoc' as const,
+      productGlobalId: '',
+      name: lines[0].name.trim() || 'Documents / paperwork',
+      physicalUnitsOnHandConfirmed: false,
+    }
+    setLines([line])
+    directRecipientSelected.current = true
+    setCustomerGlobalId('')
+    resetQuote()
+  }
+
   const removeLine = (lineKey: string) => {
     if (lines.length === 1) return
     setLines((current) => current.filter((line) => line.lineKey !== lineKey))
@@ -697,15 +785,18 @@ export default function OneOffShipmentDialog({
       packageKind: option.packageKind,
       packagingMaterialGlobalId: option.packagingMaterialGlobalId,
       description: option.label,
-      lengthMm: option.defaultDimensionsMm.length === null
-        ? ''
-        : String(option.defaultDimensionsMm.length),
-      widthMm: option.defaultDimensionsMm.width === null
-        ? ''
-        : String(option.defaultDimensionsMm.width),
-      heightMm: option.defaultDimensionsMm.height === null
-        ? ''
-        : String(option.defaultDimensionsMm.height),
+      length: displayLengthFromMillimeters(
+        option.defaultDimensionsMm.length,
+        draftMeasurementSystem,
+      ),
+      width: displayLengthFromMillimeters(
+        option.defaultDimensionsMm.width,
+        draftMeasurementSystem,
+      ),
+      height: displayLengthFromMillimeters(
+        option.defaultDimensionsMm.height,
+        draftMeasurementSystem,
+      ),
     })
   }
 
@@ -777,10 +868,10 @@ export default function OneOffShipmentDialog({
         if (line.kind === 'new' && usedSkus.has(normalizedSku)) return 'Each new product SKU must be unique in this shipment.'
         if (line.kind === 'new') usedSkus.add(normalizedSku)
         if (nonNegativeInteger(line.unitPriceMinor) === null) return `Line ${index + 1} needs a valid unit value.`
-        if (!positiveInteger(line.unitWeightGrams)
-          || !positiveInteger(line.lengthMm)
-          || !positiveInteger(line.widthMm)
-          || !positiveInteger(line.heightMm)) {
+        if (!canonicalWeightFromDisplay(line.unitWeight, draftMeasurementSystem)
+          || !canonicalLengthFromDisplay(line.length, draftMeasurementSystem)
+          || !canonicalLengthFromDisplay(line.width, draftMeasurementSystem)
+          || !canonicalLengthFromDisplay(line.height, draftMeasurementSystem)) {
           return `${line.kind === 'new' ? 'New product' : 'Ad-hoc item'} line ${index + 1} needs factual unit weight and dimensions.`
         }
         if (line.kind === 'new' && !line.physicalUnitsOnHandConfirmed) {
@@ -854,13 +945,16 @@ export default function OneOffShipmentDialog({
         }
       }
       if (!parcel.description.trim()) return `Parcel ${index + 1} needs a description.`
-      if (!positiveInteger(parcel.lengthMm)
-        || !positiveInteger(parcel.widthMm)
-        || !positiveInteger(parcel.heightMm)
-        || !positiveInteger(parcel.grossWeightGrams)) {
+      if (!canonicalLengthFromDisplay(parcel.length, draftMeasurementSystem)
+        || !canonicalLengthFromDisplay(parcel.width, draftMeasurementSystem)
+        || !canonicalLengthFromDisplay(parcel.height, draftMeasurementSystem)
+        || !canonicalWeightFromDisplay(parcel.grossWeight, draftMeasurementSystem)) {
         return `Parcel ${index + 1} needs factual dimensions and gross weight.`
       }
-      const grossWeightGrams = positiveInteger(parcel.grossWeightGrams) || 0
+      const grossWeightGrams = canonicalWeightFromDisplay(
+        parcel.grossWeight,
+        draftMeasurementSystem,
+      ) || 0
       if (material?.tareWeightGrams && grossWeightGrams < material.tareWeightGrams) {
         return `Parcel ${index + 1} gross weight cannot be below the selected material tare weight.`
       }
@@ -924,11 +1018,23 @@ export default function OneOffShipmentDialog({
         sku: line.sku.trim(),
         quantity: positiveInteger(line.quantity) || 0,
         unitPriceMinor: nonNegativeInteger(line.unitPriceMinor) || 0,
-        unitWeightGrams: positiveInteger(line.unitWeightGrams) || 0,
+        unitWeightGrams: canonicalWeightFromDisplay(
+          line.unitWeight,
+          draftMeasurementSystem,
+        ) || 0,
         unitDimensionsMm: {
-          length: positiveInteger(line.lengthMm) || 0,
-          width: positiveInteger(line.widthMm) || 0,
-          height: positiveInteger(line.heightMm) || 0,
+          length: canonicalLengthFromDisplay(
+            line.length,
+            draftMeasurementSystem,
+          ) || 0,
+          width: canonicalLengthFromDisplay(
+            line.width,
+            draftMeasurementSystem,
+          ) || 0,
+          height: canonicalLengthFromDisplay(
+            line.height,
+            draftMeasurementSystem,
+          ) || 0,
         },
       }
       return line.kind === 'ad_hoc'
@@ -949,11 +1055,23 @@ export default function OneOffShipmentDialog({
       },
       description: parcel.description.trim(),
       dimensionsMm: {
-        length: positiveInteger(parcel.lengthMm) || 0,
-        width: positiveInteger(parcel.widthMm) || 0,
-        height: positiveInteger(parcel.heightMm) || 0,
+        length: canonicalLengthFromDisplay(
+          parcel.length,
+          draftMeasurementSystem,
+        ) || 0,
+        width: canonicalLengthFromDisplay(
+          parcel.width,
+          draftMeasurementSystem,
+        ) || 0,
+        height: canonicalLengthFromDisplay(
+          parcel.height,
+          draftMeasurementSystem,
+        ) || 0,
       },
-      grossWeightGrams: positiveInteger(parcel.grossWeightGrams) || 0,
+      grossWeightGrams: canonicalWeightFromDisplay(
+        parcel.grossWeight,
+        draftMeasurementSystem,
+      ) || 0,
       allocations: lines.flatMap((line) => {
         const quantity = nonNegativeInteger(parcel.allocations[line.lineKey] || '0') || 0
         return quantity > 0 ? [{ lineKey: line.lineKey, quantity }] : []
@@ -1096,6 +1214,7 @@ export default function OneOffShipmentDialog({
       setCity('')
       setRegion('')
       setPostalCode('')
+      directRecipientSelected.current = false
       setLines([firstLine])
       setPackages([initialPackage([firstLine])])
       setQuote(null)
@@ -1289,7 +1408,11 @@ export default function OneOffShipmentDialog({
                       required={!pureAdHoc}
                       label={pureAdHoc ? 'Customer (optional)' : 'Customer'}
                       value={customerGlobalId}
-                      onChange={(event) => { setCustomerGlobalId(event.target.value); resetQuote() }}
+                      onChange={(event) => {
+                        directRecipientSelected.current = event.target.value === ''
+                        setCustomerGlobalId(event.target.value)
+                        resetQuote()
+                      }}
                       helperText={pureAdHoc
                         ? 'Leave blank to use only the typed recipient snapshot; no CRM customer is created.'
                         : 'Required for inventory-backed products.'}
@@ -1389,10 +1512,25 @@ export default function OneOffShipmentDialog({
                     </TextField>
                   </Box>
 
+                  {canStartPaperworkShipment && (
+                    <Alert
+                      severity="info"
+                      action={(
+                        <Button color="inherit" onClick={startPaperworkShipment}>
+                          Use documents-only
+                        </Button>
+                      )}
+                    >
+                      Sending vendor paperwork or other contents that are not inventory?
+                    </Alert>
+                  )}
+
                   <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
                     <Box>
                       <Typography variant="overline" color="text.secondary">Units</Typography>
-                      <Typography variant="body2" color="text.secondary">{lines.length} of {MAX_LINES} lines</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {lines.length} of {MAX_LINES} lines · {draftMeasurementSystem === 'imperial' ? 'Imperial' : 'Metric'} ({units.weight}, {units.length})
+                      </Typography>
                     </Box>
                     <Button startIcon={<AddRounded />} onClick={addLine} disabled={lines.length >= MAX_LINES}>Add unit line</Button>
                   </Stack>
@@ -1419,7 +1557,7 @@ export default function OneOffShipmentDialog({
                       >
                         <MenuItem value="existing">Existing product and inventory</MenuItem>
                         <MenuItem value="new">Create a new product from physical units</MenuItem>
-                        <MenuItem value="ad_hoc">One-time ad-hoc item · do not add to Products</MenuItem>
+                        <MenuItem value="ad_hoc">Documents or one-time contents · no Product or inventory</MenuItem>
                       </TextField>
                       {line.kind === 'existing' ? (
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 150px' }, gap: 2 }}>
@@ -1458,10 +1596,10 @@ export default function OneOffShipmentDialog({
                           </Box>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2 }}>
                             <TextField required label="Unit value (cents)" type="number" value={line.unitPriceMinor} onChange={(event) => updateLine(line.lineKey, { unitPriceMinor: event.target.value })} inputProps={{ min: 0, step: 1 }} />
-                            <TextField required label="Unit weight (g)" type="number" value={line.unitWeightGrams} onChange={(event) => updateLine(line.lineKey, { unitWeightGrams: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                            <TextField required label="Length (mm)" type="number" value={line.lengthMm} onChange={(event) => updateLine(line.lineKey, { lengthMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                            <TextField required label="Width (mm)" type="number" value={line.widthMm} onChange={(event) => updateLine(line.lineKey, { widthMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                            <TextField required label="Height (mm)" type="number" value={line.heightMm} onChange={(event) => updateLine(line.lineKey, { heightMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
+                            <TextField required label={`Unit weight (${units.weight})`} type="number" value={line.unitWeight} onChange={(event) => updateLine(line.lineKey, { unitWeight: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                            <TextField required label={`Length (${units.length})`} type="number" value={line.length} onChange={(event) => updateLine(line.lineKey, { length: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                            <TextField required label={`Width (${units.length})`} type="number" value={line.width} onChange={(event) => updateLine(line.lineKey, { width: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                            <TextField required label={`Height (${units.length})`} type="number" value={line.height} onChange={(event) => updateLine(line.lineKey, { height: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
                           </Box>
                           {line.kind === 'new' ? <FormControlLabel
                             sx={{ alignItems: 'flex-start' }}
@@ -1469,7 +1607,7 @@ export default function OneOffShipmentDialog({
                             label="I confirm these are real physical units at the selected warehouse and location. Create this SKU in Products and establish only the stated quantity as inventory when I finalize the shipment."
                           /> : (
                             <Alert severity="info">
-                              This item is saved only as an immutable shipment snapshot. It will not create a Product, receipt, inventory position, or reservation.
+                              These contents are saved only as an immutable shipment snapshot. They will not create a Product, receipt, inventory position, or reservation.
                             </Alert>
                           )}
                         </Stack>
@@ -1619,10 +1757,10 @@ export default function OneOffShipmentDialog({
                           />
                         </Box>
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' }, gap: 2 }}>
-                          <TextField required label="Length (mm)" type="number" value={parcel.lengthMm} onChange={(event) => updatePackage(parcel.packageKey, { lengthMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                          <TextField required label="Width (mm)" type="number" value={parcel.widthMm} onChange={(event) => updatePackage(parcel.packageKey, { widthMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                          <TextField required label="Height (mm)" type="number" value={parcel.heightMm} onChange={(event) => updatePackage(parcel.packageKey, { heightMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
-                          <TextField required label="Gross weight (g)" type="number" value={parcel.grossWeightGrams} onChange={(event) => updatePackage(parcel.packageKey, { grossWeightGrams: event.target.value })} inputProps={{ min: 1, step: 1 }} />
+                          <TextField required label={`Length (${units.length})`} type="number" value={parcel.length} onChange={(event) => updatePackage(parcel.packageKey, { length: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                          <TextField required label={`Width (${units.length})`} type="number" value={parcel.width} onChange={(event) => updatePackage(parcel.packageKey, { width: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                          <TextField required label={`Height (${units.length})`} type="number" value={parcel.height} onChange={(event) => updatePackage(parcel.packageKey, { height: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
+                          <TextField required label={`Gross weight (${units.weight})`} type="number" value={parcel.grossWeight} onChange={(event) => updatePackage(parcel.packageKey, { grossWeight: event.target.value })} inputProps={{ min: 0.001, step: 'any' }} />
                         </Box>
                         <Divider />
                         <Typography variant="subtitle2">Unit allocations</Typography>
@@ -1730,8 +1868,13 @@ export default function OneOffShipmentDialog({
                         inputProps={{ maxLength: 500 }}
                         helperText={`${reason.trim().length}/500 · Recorded in the immutable audit history`}
                       />
-                      <Alert severity="warning" icon={<Inventory2Rounded />}>
-                        Creates the plan and reserves inventory. No postage is purchased now. After packing, ClawPilot rerates the same carrier selection and requires explicit purchase confirmation.
+                      <Alert
+                        severity="warning"
+                        icon={pureAdHoc ? <LocalShippingRounded /> : <Inventory2Rounded />}
+                      >
+                        {pureAdHoc
+                          ? 'Creates a shipment plan for the entered contents without creating or reserving inventory. No postage is purchased now. After packing, ClawPilot rerates the same carrier selection and requires explicit purchase confirmation.'
+                          : 'Creates the plan and reserves inventory. No postage is purchased now. After packing, ClawPilot rerates the same carrier selection and requires explicit purchase confirmation.'}
                       </Alert>
                     </>
                   ) : (
