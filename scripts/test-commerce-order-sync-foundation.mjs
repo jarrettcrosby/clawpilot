@@ -530,9 +530,11 @@ assert.equal(
   ).orderCursor,
   'opaque-provider-cursor',
 )
+const tamperedCursorCiphertext = Buffer.from(cursorOne.ciphertext)
+tamperedCursorCiphertext[0] ^= 1
 assert.throws(
   () => cryptoRuntime.decryptCommerceOrderSyncCursor(
-    { ...cursorOne, ciphertext: Buffer.from(cursorOne.ciphertext).fill(1, 0, 1) },
+    { ...cursorOne, ciphertext: tamperedCursorCiphertext },
     cursorContext.organizationId,
     cursorContext.accountGlobalId,
     cursorContext.provider,
