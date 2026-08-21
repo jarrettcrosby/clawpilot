@@ -39,6 +39,7 @@ const legacyWorkerCapabilities = Object.freeze({
   documentTypes: ['shipping_label'],
 })
 let activeWorkerCapabilities = workerCapabilities
+let stopping = false
 const ledgerPath = expandHome(
   process.env.CLAWPILOT_PRINT_AGENT_LEDGER
     || '~/.clawpilot/print-agent-ledger.json',
@@ -1023,6 +1024,10 @@ async function handleJob(config, ledger, job, deviceReference) {
 
 async function cycle(config, ledger, deviceReference) {
   await replayPendingResults(config, ledger)
+  if (stopping) {
+    log('worker_stop_before_claim')
+    return 0
+  }
   const claimId = `claim:${randomUUID()}`
   let response
   try {
@@ -1038,6 +1043,10 @@ async function cycle(config, ledger, deviceReference) {
       activeWorkerCapabilities !== workerCapabilities
       || error?.code !== 'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH'
     ) throw error
+    if (stopping) {
+      log('worker_stop_before_claim')
+      return 0
+    }
     activeWorkerCapabilities = legacyWorkerCapabilities
     response = await agentRequest(config, 'claim', {
       limit: 1,
@@ -1073,13 +1082,17 @@ async function main() {
     host: printerHost,
     port: printerPort,
   })
-  let stopping = false
-  process.once('SIGINT', () => { stopping = true })
-  process.once('SIGTERM', () => { stopping = true })
+  const requestStop = (signal) => {
+    if (stopping) return
+    stopping = true
+    log('worker_stop_requested', { signal })
+  }
+  process.once('SIGINT', () => requestStop('SIGINT'))
+  process.once('SIGTERM', () => requestStop('SIGTERM'))
   do {
     try {
       const count = await cycle(config, ledger, deviceReference)
-      if (once) return
+      if (once || stopping) return
       await new Promise((resolvePromise) => setTimeout(
         resolvePromise,
         count ? 50 : pollIntervalMs,
@@ -1087,6 +1100,7 @@ async function main() {
     } catch (error) {
       log('poll_failed', { message: error.message })
       if (once) throw error
+      if (stopping) return
       await new Promise((resolvePromise) => setTimeout(resolvePromise, pollIntervalMs))
     }
   } while (!stopping)

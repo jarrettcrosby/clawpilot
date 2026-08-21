@@ -379,7 +379,10 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     await waitFor(() => rawConnectionStarted, 'In-flight raw delivery never reached the printer')
     legacyPresent = true
     const quiesced = guard.checkNow()
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      'The in-flight worker did not latch its graceful stop signal',
+    )
     releasePrinter()
     await quiesced
     await waitFor(() => acknowledgements === 1, 'In-flight delivery did not ACK before exit')
@@ -394,6 +397,173 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     assert.equal(guard.snapshot().quiesced, true)
   } finally {
     releasePrinter()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy stop finishes pending ACK replay but starts no new claim or raw delivery', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-ack-replay-'))
+  const oldJobGlobalId = 'gpj0000062'
+  const oldClaimToken = '00000000-0000-4000-8000-000000000062'
+  const zpl = '^XA^FO20,20^FDMust not print after stop^FS^XZ'
+  const actions = []
+  let releasePendingAcknowledgement
+  const pendingAcknowledgementRelease = new Promise((resolvePromise) => {
+    releasePendingAcknowledgement = resolvePromise
+  })
+  let observePendingAcknowledgement
+  const pendingAcknowledgementObserved = new Promise((resolvePromise) => {
+    observePendingAcknowledgement = resolvePromise
+  })
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      actions.push(body.action)
+      if (
+        body.action === 'acknowledge'
+        && body.jobGlobalId === oldJobGlobalId
+      ) {
+        observePendingAcknowledgement()
+        await pendingAcknowledgementRelease
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
+      if (body.action === 'claim') {
+        const serverNow = new Date()
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          ok: true,
+          jobs: [{
+            globalId: 'gpj0000063',
+            claimToken: '00000000-0000-4000-8000-000000000063',
+            serverNow: serverNow.toISOString(),
+            claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+            printer: { globalId: 'gpr0000063' },
+            document: {
+              globalId: 'gpf0000063',
+              type: 'shipping_label',
+              format: 'ZPL',
+              encoding: 'utf8',
+              media: 'label_4x6',
+              inlinePayload: zpl,
+              byteLength: Buffer.byteLength(zpl),
+              contentSha256: createHash('sha256').update(zpl).digest('hex'),
+            },
+          }],
+        }))
+        return
+      }
+      response.writeHead(409, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+    })
+  })
+  let printerBytes = 0
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000064',
+    slug: 'instance-00000000-0000-4000-8000-000000000064',
+    displayName: 'Pending ACK migration fence',
+    serverAgentGlobalId: 'gpa_pending_ack_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  const instanceDirectory = manager.pathsFor(instance).instanceDirectory
+  mkdirSync(instanceDirectory, { recursive: true })
+  const pendingIdentifier = `acknowledge:${oldJobGlobalId}:${oldClaimToken}`
+  writeFileSync(path.join(instanceDirectory, 'claim-ledger.json'), `${JSON.stringify({
+    version: 1,
+    claims: {},
+    deliveries: {},
+    pendingResults: {
+      [pendingIdentifier]: {
+        version: 1,
+        action: 'acknowledge',
+        jobGlobalId: oldJobGlobalId,
+        claimToken: oldClaimToken,
+        claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+        idempotencyKey: `ack:${oldJobGlobalId}:${oldClaimToken}`,
+        payload: {
+          jobGlobalId: oldJobGlobalId,
+          claimToken: oldClaimToken,
+          deviceJobReference: `local-device.v1.${'A'.repeat(43)}`,
+        },
+        claimLedgerKey: null,
+        deliveryLedgerKey: null,
+        queuedAt: new Date().toISOString(),
+      },
+    },
+  }, null, 2)}\n`, { mode: 0o600 })
+  try {
+    manager.startEnabled()
+    await Promise.race([
+      pendingAcknowledgementObserved,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('Pending acknowledgement replay did not start')),
+        8_000,
+      )),
+    ])
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      'The ACK-replay worker did not latch its graceful stop signal',
+    )
+    releasePendingAcknowledgement()
+    await quiesced
+    assert.deepEqual(actions, ['acknowledge'])
+    assert.deepEqual(
+      JSON.parse(readFileSync(
+        path.join(instanceDirectory, 'claim-ledger.json'),
+        'utf8',
+      )).pendingResults,
+      {},
+    )
+    assert.equal(printerBytes, 0)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releasePendingAcknowledgement()
     manager.shutdown()
     api.close()
     printer.close()
