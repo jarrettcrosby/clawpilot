@@ -73,6 +73,42 @@ test('passes only the normalized customer identity to policy lookup', () => {
   )
 })
 
+test('all-eligible audience bypasses customer and legacy variant allowlists only', () => {
+  assert.deepEqual(
+    evaluateShopifyShadowCheckoutPrePolicy({
+      customerId: null,
+      customerRequired: false,
+      variantAllowlistRequired: false,
+      configuredVariantIds: null,
+      items: shippableItems,
+    }),
+    { ready: true, customerId: null },
+  )
+  assert.deepEqual(
+    evaluateShopifyShadowCheckoutPrePolicy({
+      customerId: null,
+      customerRequired: false,
+      variantAllowlistRequired: false,
+      configuredVariantIds: allowedVariantIds,
+      items: [{ requiresShipping: true, variantId: '1002' }],
+    }),
+    { ready: true, customerId: null },
+  )
+  assert.deepEqual(
+    evaluateShopifyShadowCheckoutPrePolicy({
+      customerId: null,
+      customerRequired: false,
+      variantAllowlistRequired: false,
+      configuredVariantIds: null,
+      items: [{ requiresShipping: false, variantId: '1002' }],
+    }),
+    {
+      ready: false,
+      reasonCode: ShopifyShadowCheckoutGuardDenialReason.NoShippableItems,
+    },
+  )
+})
+
 test('distinguishes absent or ineligible policy from hide-all policy', () => {
   assert.deepEqual(
     evaluateShopifyShadowCheckoutPolicy(null),

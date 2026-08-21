@@ -70,6 +70,7 @@ const claims = [{
   attemptCount: 1,
 }]
 const reads = []
+const revalidations = []
 const appends = []
 const failures = []
 const worker = loadTypeScriptModule(
@@ -102,6 +103,9 @@ const worker = loadTypeScriptModule(
         assert.equal(input.limit, 2)
         return claims
       },
+      async assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(claim) {
+        revalidations.push(claim.id)
+      },
       async appendShopifyOrderWebhookExactReadInPostgres(input) {
         appends.push(input)
         return {
@@ -117,6 +121,23 @@ const worker = loadTypeScriptModule(
         failures.push(input)
         return { status: 'failed', providerWrites: 0 }
       },
+      async parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres() {
+        return { parked: true }
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({
+          id: '00000000-0000-4000-8000-000000000298',
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          authorityKind: input.authorityKind,
+          readKind: input.readKind,
+          controlRevision: 1,
+          activationRevision: 1,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        })
+      },
     },
   },
 )
@@ -126,6 +147,7 @@ const result = await worker.processShopifyOrderWebhookSignals({
   limit: 2,
 })
 assert.equal(reads.length, 2)
+assert.deepEqual(revalidations, claims.map((claim) => claim.id))
 assert.equal(appends.length, 1)
 assert.equal(failures.length, 1)
 assert.equal(result.claimed, 2)

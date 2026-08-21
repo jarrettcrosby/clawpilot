@@ -25,6 +25,7 @@ const attestationSql = sqlMatch[1]
 
 const requiredStructure = [
   '0290_operations_shadow_training_runs.sql',
+  '0300_operations_order_training_independent_control.sql',
   'operations_shadow_training_runs',
   'operations_shadow_training_packages',
   'operations_shadow_training_pick_tasks',
@@ -39,13 +40,13 @@ const requiredStructure = [
   '340ca4ea1323121e8316f852e9240f21cc99fb23bf53eb312d923617347c3bce',
   '1ec65dc17177ce3d53776ebb035f175f0d7ba10900d2dc5de88bfb31aafd5ea0',
   '9a033b6182465d99682fc1ecee2dca0302ac95f726b1f2b3d1ef6c7bc932371a',
-  '4d0a836345d3bc310ad27d9ae4f74a25b0bc2bf246e10712b3e2427bd168cf93',
+  '0c8485310e1dade3adfd8b38128b7ea288975456f2ff796fa9160a5757881dad',
   '8425b26ae132be23ef0b835fc03b5ac35bf0b42b2728a098ff1184f62f4fa1fc',
   'c1fa92771860f78c76184fae9ffa538cb772d25efd0fadc23d2f72192f106e21',
   'e15f2304f2daa3d4ec1238374d052368f57c68bf6df030bbdd21735e245bf230',
   '786a373981688256f1f83b94208b405a2b6446d04a21678a2a76a4110005d14e',
-  'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3',
-  'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f',
+  'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310',
+  'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053',
   'operations_shadow_training_runs_one_open_order',
   "(state <> ''reset''::text)",
   'validate_operations_shadow_training_package_fact()',
@@ -79,6 +80,7 @@ const requiredStructure = [
   'installed_index.indisvalid',
   'installed_index.indisready',
   "installed_trigger.tgenabled = 'O'",
+  'installed_trigger.tgqual IS NULL',
   'installed_trigger.tgdeferrable',
   'installed_trigger.tginitdeferred',
   'installed_trigger.tgattr',
@@ -175,6 +177,21 @@ async function exercise(pool) {
       await attest(pool),
       false,
       'A missing 0290 migration record must fail health',
+    )
+  } finally {
+    await pool.query('ROLLBACK')
+  }
+
+  await pool.query('BEGIN')
+  try {
+    await pool.query(
+      `DELETE FROM schema_migrations
+       WHERE filename = '0300_operations_order_training_independent_control.sql'`,
+    )
+    assert.equal(
+      await attest(pool),
+      false,
+      'A missing 0300 independent-control migration record must fail health',
     )
   } finally {
     await pool.query('ROLLBACK')
@@ -303,6 +320,25 @@ async function exercise(pool) {
     } finally {
       await pool.query('ROLLBACK')
     }
+  }
+
+  await pool.query('BEGIN')
+  try {
+    await pool.query(
+      `DROP TRIGGER guard_shadow_commerce_canonical_plan_insert
+         ON operations_fulfillment_plans;
+       CREATE TRIGGER guard_shadow_commerce_canonical_plan_insert
+       BEFORE INSERT OR UPDATE ON operations_fulfillment_plans
+       FOR EACH ROW WHEN (false)
+       EXECUTE FUNCTION guard_shadow_commerce_canonical_write()`,
+    )
+    assert.equal(
+      await attest(pool),
+      false,
+      'A same-function canonical trigger disabled by WHEN(false) must fail health',
+    )
+  } finally {
+    await pool.query('ROLLBACK')
   }
 
   await pool.query('BEGIN')

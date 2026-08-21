@@ -54,6 +54,11 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       if (specifier === '@/lib/persistence/commerceIntake') {
         return {
           async markAutomaticFaireOrderPromotionAttentionInPostgres() {
@@ -851,7 +856,7 @@ includes(persistence, [
   "credential.auth_mode = 'faire_brand_token'",
   "? 'READ_ORDERS'",
   'ORDER_READ_ACCOUNT_SQL',
-  "activation.state IN ('shadow', 'active')",
+  "const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')",
   "reconciliation_status = 'running'",
   "reconciliation_status = 'succeeded'",
   "reconciliation_status = 'failed'",

@@ -483,6 +483,20 @@ function errorResponse(error: unknown) {
   ) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && 'status' in error
+    && error.code === 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+    && error.status === 409
+  ) {
+    return json({
+      ok: false,
+      error: 'Pack confirmation is using this exact evidence; retry after refreshing status',
+      code: error.code,
+    }, error.status)
+  }
   console.error('[commerce-order-revisions] request failed', {
     kind: error instanceof Error ? 'unexpected_error' : 'unexpected_value',
     code: 'COMMERCE_ORDER_REVISION_INTERNAL_ERROR',

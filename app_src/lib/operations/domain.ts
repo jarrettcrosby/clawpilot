@@ -56,15 +56,22 @@ export function availableOperationsOrderActions(input: {
   unresolvedLabelAttemptCount?: number
   existingShipmentCount?: number
   sandboxE2eAuthorized?: boolean
+  sandboxE2eAuthorityKind?: 'legacy_packed' | 'shopify_test_store_canonical' | null
+  sandboxE2eFulfillmentConfirmed?: boolean
   nativeOneOffGroupReady?: boolean
   nativeOneOffGroupBlockedReason?: string | null
   shopifyExternalFulfillmentReconciliationRequired?: boolean
   replanningCorrection?: OperationsOrderActionAvailability | null
 }): OperationsOrderActionAvailability[] {
+  const canonicalReadOnlyAuthorized = input.activationState === 'read_only'
+    && input.sandboxE2eAuthorityKind === 'shopify_test_store_canonical'
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
     releaseBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
+  } else if (
+    !['shadow', 'active'].includes(input.activationState)
+    && !canonicalReadOnlyAuthorized
+  ) {
     releaseBlockedReason = 'Set Operations to Shadow or Active before releasing warehouse work.'
   } else if (input.status !== 'planned') {
     releaseBlockedReason = input.status === 'released' || input.status === 'picking'
@@ -83,7 +90,10 @@ export function availableOperationsOrderActions(input: {
   let pickBlockedReason: string | null = null
   if (!input.canExecute) {
     pickBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
+  } else if (
+    !['shadow', 'active'].includes(input.activationState)
+    && !canonicalReadOnlyAuthorized
+  ) {
     pickBlockedReason = 'Set Operations to Shadow or Active before confirming warehouse work.'
   } else if (input.status !== 'released') {
     pickBlockedReason = input.status === 'picking'
@@ -104,7 +114,10 @@ export function availableOperationsOrderActions(input: {
     externalFulfillmentBlockedReason = 'Operations manage permission is required.'
   } else if (!input.canExecute) {
     externalFulfillmentBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
+  } else if (
+    !['shadow', 'active'].includes(input.activationState)
+    && !canonicalReadOnlyAuthorized
+  ) {
     externalFulfillmentBlockedReason = 'Set Operations to Shadow or Active before reconciling warehouse work.'
   } else if (input.sourceProvider !== 'shopify') {
     externalFulfillmentBlockedReason = 'External fulfillment reconciliation requires a Shopify order.'
@@ -125,7 +138,10 @@ export function availableOperationsOrderActions(input: {
   let packBlockedReason: string | null = null
   if (!input.canExecute) {
     packBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
+  } else if (
+    !['shadow', 'active'].includes(input.activationState)
+    && !canonicalReadOnlyAuthorized
+  ) {
     packBlockedReason = 'Set Operations to Shadow or Active before verifying packages.'
   } else if (input.status !== 'picking') {
     packBlockedReason = input.status === 'packed' || input.status === 'shipped'
@@ -151,6 +167,7 @@ export function availableOperationsOrderActions(input: {
   } else if (
     !isNativeOneOff
     && input.activationState !== 'active'
+    && !canonicalReadOnlyAuthorized
   ) {
     shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
   } else if (
@@ -194,6 +211,11 @@ export function availableOperationsOrderActions(input: {
       || 'Purchase one complete one-off carrier group before confirming shipment.'
   } else if ((input.unresolvedLabelAttemptCount || 0) > 0) {
     shipmentBlockedReason = 'Resolve the pending carrier label attempt before confirming shipment.'
+  } else if (
+    canonicalReadOnlyAuthorized
+    && input.sandboxE2eFulfillmentConfirmed !== true
+  ) {
+    shipmentBlockedReason = 'Confirm this exact Shopify test fulfillment before creating fulfillmentCreate.'
   } else if (isNativeOneOff) {
     // Exact TEST/LIVE environment, selected-rate authority, group membership,
     // result, and active-label coverage are verified by the durable group read.
@@ -285,6 +307,12 @@ export function availableOperationsOrderActions(input: {
   return actions
 }
 
+export function operationsOrderReplanningProfileAllowsCorrection(
+  activationState: OperationsActivationState,
+) {
+  return ['shadow', 'read_only', 'active'].includes(activationState)
+}
+
 export function operationsOrderReplanningActionAvailability(input: {
   activationState: OperationsActivationState
   canManage: boolean
@@ -309,9 +337,11 @@ export function operationsOrderReplanningActionAvailability(input: {
   } else if (!input.canExecute) {
     blockedCode = 'OPERATIONS_EXECUTE_REQUIRED'
     blockedReason = 'Operations execute permission is required.'
-  } else if (input.activationState !== 'active') {
-    blockedCode = 'OPERATIONS_REPLANNING_ACTIVE_REQUIRED'
-    blockedReason = 'Operational correction is available only in Operations Active.'
+  } else if (!operationsOrderReplanningProfileAllowsCorrection(
+    input.activationState,
+  )) {
+    blockedCode = 'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED'
+    blockedReason = 'Disabled and Frozen stop operational corrections. This zero-provider-write correction is available in Shadow, Read only, or Active.'
   } else if (!['shopify', 'faire'].includes(input.sourceProvider)) {
     blockedCode = 'OPERATIONS_REPLANNING_PROVIDER_INVALID'
     blockedReason = 'Only a connected Shopify or Faire order can be reopened for replanning.'

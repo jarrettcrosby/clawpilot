@@ -11,6 +11,8 @@ import {
   registerShopifyCatalogWebhookSubscriptions,
   registerShopifyInventoryWebhookSubscriptions,
   registerShopifyScopeWebhookSubscriptions,
+  recoverShopifyOrderWebhookCommandKey,
+  reconcileShopifyOrderWebhookSetup,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
   setShopifyFulfillmentNotificationPolicy,
@@ -49,6 +51,7 @@ export const revalidate = 0
 export const runtime = 'nodejs'
 
 const MAX_REQUEST_BYTES = 32 * 1024
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 
 function json(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -141,6 +144,28 @@ function requireCredentialViewer(actor: AppUser) {
       'COMMERCE_CREDENTIAL_REVEAL_FORBIDDEN',
     )
   }
+}
+
+function requireShopifyOrderWebhookReconciler(actor: AppUser) {
+  if (!canRevealCredential(actor)) {
+    throw new CommerceIntegrationRequestError(
+      'Organization owner or administrator access is required to reconcile Shopify order webhooks',
+      403,
+      'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_FORBIDDEN',
+    )
+  }
+}
+
+function requireIdempotencyKey(req: NextRequest) {
+  const value = req.headers.get('idempotency-key')
+  if (value === null || value !== value.trim() || !IDEMPOTENCY_KEY.test(value)) {
+    throw new CommerceIntegrationRequestError(
+      'A stable Idempotency-Key header is required',
+      400,
+      'SHOPIFY_ORDER_WEBHOOK_IDEMPOTENCY_KEY_REQUIRED',
+    )
+  }
+  return value
 }
 
 async function requestBody(req: NextRequest) {
@@ -438,6 +463,44 @@ export async function PATCH(req: NextRequest) {
         ok: true,
         canManage: true,
         canActivate: true,
+        integrations,
+        catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'recover-shopify-order-webhook-command') {
+      only(body, ['action', 'accountGlobalId', 'confirmation'])
+      requireShopifyOrderWebhookReconciler(actor)
+      const recoveryIdempotencyKey =
+        await recoverShopifyOrderWebhookCommandKey({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+          confirmation: body.confirmation,
+        })
+      return json({
+        ok: true,
+        recoveryIdempotencyKey,
+      })
+    }
+
+    if (action === 'reconcile-shopify-order-webhooks') {
+      only(body, ['action', 'accountGlobalId', 'confirmation'])
+      requireShopifyOrderWebhookReconciler(actor)
+      const integrations = await commerceMutationIntegrations(
+        () => reconcileShopifyOrderWebhookSetup({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+          idempotencyKey: requireIdempotencyKey(req),
+          confirmation: body.confirmation,
+        }),
+      )
+      return json({
+        ok: true,
+        canManage: true,
+        canActivate: operationsCapabilities(actor).canActivate,
+        canRevealCredentials: true,
         integrations,
         catalog: capabilityCatalog(),
       })

@@ -234,6 +234,47 @@ function verifySourceContracts() {
     ),
     'Predeploy must require the print-device privacy migration',
   )
+  const uncertainFence = compactSql(
+    read('db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql'),
+  )
+  for (const fragment of [
+    'prevent_operations_uncertain_print_retry()',
+    'FOR UPDATE',
+    "previous_error_code = 'PRINT_OUTCOME_UNCERTAIN'",
+    'prevent_operations_uncertain_print_retry_write',
+    "agent.status <> 'active'",
+    'printer.local_print_agent_id IS DISTINCT FROM agent.id',
+    "'PRINT_OUTCOME_UNCERTAIN'",
+    "'operations.print_job.outcome_uncertain'",
+    "'automaticRetryBlocked', true",
+  ]) assert.ok(
+    uncertainFence.includes(fragment),
+    `Missing uncertain-outcome database fence contract: ${fragment}`,
+  )
+  for (const fragment of [
+    '0296_operations_print_outcome_uncertain_retry_fence.sql',
+    'operations_print_outcome_uncertain_fence_applied',
+    "'prevent_operations_uncertain_print_retry()'",
+    'prevent_operations_uncertain_print_retry_write',
+    "uncertain_retry_guard.tgenabled = 'O'",
+    'uncertain_retry_guard.tgtype = 7',
+    'stranded_printer.local_print_agent_id',
+    '&& row?.operations_print_outcome_uncertain_fence_applied',
+    '|| !row?.operations_print_outcome_uncertain_fence_applied',
+  ]) assert.ok(
+    healthRoute.includes(fragment),
+    `Missing uncertain-outcome health attestation: ${fragment}`,
+  )
+  assert.ok(
+    (healthRoute.match(/operations_print_outcome_uncertain_fence_applied/g) || []).length >= 5,
+    'Uncertain-outcome fence must gate query typing, SQL, migrationsCurrent, status, and health errors',
+  )
+  assert.ok(
+    read('scripts/verify-predeploy.mjs').includes(
+      'db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql',
+    ),
+    'Predeploy must require the uncertain-outcome database fence',
+  )
   assert.ok(
     !/CREATE TABLE(?: IF NOT EXISTS)? operations_printer_profiles/i.test(migrationSource),
     'Migration must extend operations_printers rather than duplicate printer profiles',
@@ -289,7 +330,8 @@ function verifySourceContracts() {
     'OPERATIONS_PRINT_REPRINT_LABEL_INACTIVE',
     'request_fingerprint',
     'FOR UPDATE OF job SKIP LOCKED',
-    'LEASE_EXPIRED',
+    'lease_expired_outcome_uncertain',
+    'automatic retry is blocked',
     'physicalOutputVerified: false',
     'artifact.content_sha256 AS artifact_content_sha256',
     'COALESCE(source_label.environment, rate_test_label.environment)',
@@ -313,6 +355,7 @@ function verifySourceContracts() {
     'original.rate_test_label_id',
     'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
     'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
+    'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
     'artifact.format = ANY($5::text[])',
     'runtimeSupportedFormats',
     "type: 'packing_slip_artifact'",
@@ -344,6 +387,7 @@ function verifySourceContracts() {
     'Idempotency-Key',
     'Cache-Control',
     'runtimeCapabilities',
+    'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
   ]) {
     assert.ok(agentRoute.includes(fragment), `Missing print-agent route contract: ${fragment}`)
   }
@@ -370,6 +414,8 @@ function verifySourceContracts() {
     'Document integrity',
     'Lifecycle and lineage',
     'Delivery history',
+    'Authorize new print',
+    'Required duplicate-risk authorization reason',
   ]) {
     assert.ok(panel.includes(fragment), `Missing print-job detail contract: ${fragment}`)
   }

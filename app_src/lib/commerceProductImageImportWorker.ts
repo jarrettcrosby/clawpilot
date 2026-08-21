@@ -2,18 +2,23 @@ import {
   fetchCommerceProviderImage,
 } from '@/lib/integrations/commerceProviderImageFetch'
 import {
-  readCurrentCommerceProviderImageSources,
   selectCommerceProviderImageSource,
+  withCurrentCommerceProviderImageSources,
   type CommerceProviderImageSource,
 } from '@/lib/integrations/commerceProviderImageSource'
 import {
+  assertCommerceProductImageImportClaimCurrentInPostgres,
   claimCommerceProductImageImportJobsInPostgres,
   completeCommerceProductImageImportJobInPostgres,
   failCommerceProductImageImportJobInPostgres,
+  parkCommerceProductImageImportForStoreSyncPauseInPostgres,
   recordCommerceProductImageImportWorkerHeartbeatInPostgres,
   resolveWaitingCommerceProductImageImportJobsInPostgres,
   type CommerceProductImageImportClaim,
 } from '@/lib/persistence/commerceProductImageImports'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 const DEFAULT_JOB_LIMIT = 1
 const MAX_JOB_LIMIT = 5
@@ -29,6 +34,7 @@ const RETRYABLE_DATABASE_SQLSTATES = new Set([
 const RETRYABLE_ERROR_CODES = new Set([
   RETRYABLE_DATABASE_ERROR_CODE,
   'COMMERCE_PROVIDER_IMAGE_SOURCE_READ_FAILED',
+  'COMMERCE_PROVIDER_IMAGE_SOURCE_STORE_SYNC_PAUSED',
   'COMMERCE_PROVIDER_IMAGE_DNS_FAILED',
   'COMMERCE_PROVIDER_IMAGE_DNS_EMPTY',
   'COMMERCE_PROVIDER_IMAGE_REDIRECT_INVALID',
@@ -37,6 +43,9 @@ const RETRYABLE_ERROR_CODES = new Set([
   'COMMERCE_PROVIDER_IMAGE_TIMEOUT',
   'COMMERCE_PROVIDER_IMAGE_ABORTED',
   'COMMERCE_PROVIDER_IMAGE_STATUS_INVALID',
+  'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+  'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+  'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST',
 ])
 
 const PERMANENT_ERROR_CODES = new Set([
@@ -104,6 +113,7 @@ export type CommerceProductImageImportWorkerResult = {
   cancelled: number
   leaseLost: number
   failed: number
+  parked: number
   providerWrites: 0
   errorCodes: Record<string, number>
 }
@@ -111,22 +121,29 @@ export type CommerceProductImageImportWorkerResult = {
 type WorkerDependencies = {
   resolveWaiting: typeof resolveWaitingCommerceProductImageImportJobsInPostgres
   claim: typeof claimCommerceProductImageImportJobsInPostgres
-  readSources: typeof readCurrentCommerceProviderImageSources
+  assertCurrent: typeof assertCommerceProductImageImportClaimCurrentInPostgres
+  withProviderReadFence:
+    typeof withCommerceStoreSyncProviderReadFenceInPostgres
+  withSources: typeof withCurrentCommerceProviderImageSources
   selectSource: typeof selectCommerceProviderImageSource
   fetchImage: typeof fetchCommerceProviderImage
   complete: typeof completeCommerceProductImageImportJobInPostgres
   fail: typeof failCommerceProductImageImportJobInPostgres
+  park: typeof parkCommerceProductImageImportForStoreSyncPauseInPostgres
   heartbeat: typeof recordCommerceProductImageImportWorkerHeartbeatInPostgres
 }
 
 const defaultDependencies: WorkerDependencies = {
   resolveWaiting: resolveWaitingCommerceProductImageImportJobsInPostgres,
   claim: claimCommerceProductImageImportJobsInPostgres,
-  readSources: readCurrentCommerceProviderImageSources,
+  assertCurrent: assertCommerceProductImageImportClaimCurrentInPostgres,
+  withProviderReadFence: withCommerceStoreSyncProviderReadFenceInPostgres,
+  withSources: withCurrentCommerceProviderImageSources,
   selectSource: selectCommerceProviderImageSource,
   fetchImage: fetchCommerceProviderImage,
   complete: completeCommerceProductImageImportJobInPostgres,
   fail: failCommerceProductImageImportJobInPostgres,
+  park: parkCommerceProductImageImportForStoreSyncPauseInPostgres,
   heartbeat: recordCommerceProductImageImportWorkerHeartbeatInPostgres,
 }
 
@@ -192,6 +209,7 @@ function emptyResult(): CommerceProductImageImportWorkerResult {
     cancelled: 0,
     leaseLost: 0,
     failed: 0,
+    parked: 0,
     providerWrites: 0,
     errorCodes: Object.create(null) as Record<string, number>,
   }
@@ -206,6 +224,14 @@ function countError(
 
 function leaseWasLost(error: unknown) {
   return safeErrorCode(error) === 'COMMERCE_PRODUCT_IMAGE_LEASE_LOST'
+}
+
+function storeSyncReadPaused(error: unknown) {
+  const code = safeErrorCode(error)
+  return code === 'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED'
+    || code === 'COMMERCE_PROVIDER_IMAGE_SOURCE_STORE_SYNC_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
 }
 
 /**
@@ -243,40 +269,117 @@ async function processBoundedCommerceProductImageImports(
     result.claimed += 1
 
     try {
+      await dependencies.assertCurrent({
+        organizationId: claim.organizationId,
+        jobId: claim.jobId,
+        leaseToken: claim.leaseToken,
+        workerId: input.workerId,
+      })
       const readKey = sourceReadKey(claim)
       let sources = sourceReads.get(readKey)
+      let completion
       if (!sources) {
-        sources = await dependencies.readSources({
+        // One durable automatic-read lease owns both source discovery and the
+        // selected byte fetch. The public manual source seam owns its own
+        // lease, so the worker never nests transactions or pool connections.
+        completion = await dependencies.withSources({
           organizationId: claim.organizationId,
           accountGlobalId: claim.accountGlobalId,
           provider: claim.provider,
           credentialGeneration: claim.credentialGeneration,
           externalProductId: claim.externalProductId,
+          authorityKind: claim.providerReadAuthority,
+          intentKey: `${claim.jobId}:${claim.leaseToken}`,
+          acquiredBy: input.workerId,
+          consume: async (currentSources, providerReadLease) => {
+            sources = currentSources
+            sourceReads.set(readKey, currentSources)
+            result.providerReads += 1
+            const selected = dependencies.selectSource({
+              sources: currentSources,
+              providerImageId: claim.providerImageId,
+              locatorSha256: claim.locatorSha256,
+            })
+            await dependencies.assertCurrent({
+              organizationId: claim.organizationId,
+              jobId: claim.jobId,
+              leaseToken: claim.leaseToken,
+              workerId: input.workerId,
+            })
+            const image = await dependencies.fetchImage({ url: selected.url })
+            result.fetched += 1
+            return dependencies.complete({
+              organizationId: claim.organizationId,
+              jobId: claim.jobId,
+              leaseToken: claim.leaseToken,
+              actorEmail: claim.actorEmail,
+              providerReadLease,
+              bytes: image.bytes,
+              declaredMimeType: image.mediaType,
+              sourceByteLength: image.sourceByteLength,
+              sourceContentSha256: image.sourceContentSha256,
+              normalizationVersion: image.normalizationVersion,
+            })
+          },
         })
-        sourceReads.set(readKey, sources)
-        result.providerReads += 1
+      } else {
+        const selected = dependencies.selectSource({
+          sources,
+          providerImageId: claim.providerImageId,
+          locatorSha256: claim.locatorSha256,
+        })
+        completion = await dependencies.withProviderReadFence({
+          organizationId: claim.organizationId,
+          integrationAccountId: claim.integrationAccountId,
+          authorityKind: claim.providerReadAuthority,
+          readKind: 'product_image_import',
+          intentKey: `${claim.jobId}:${claim.leaseToken}`,
+          acquiredBy: input.workerId,
+          read: async (providerReadLease) => {
+            await dependencies.assertCurrent({
+              organizationId: claim.organizationId,
+              jobId: claim.jobId,
+              leaseToken: claim.leaseToken,
+              workerId: input.workerId,
+            })
+            const image = await dependencies.fetchImage({ url: selected.url })
+            result.fetched += 1
+            return dependencies.complete({
+              organizationId: claim.organizationId,
+              jobId: claim.jobId,
+              leaseToken: claim.leaseToken,
+              actorEmail: claim.actorEmail,
+              providerReadLease,
+              bytes: image.bytes,
+              declaredMimeType: image.mediaType,
+              sourceByteLength: image.sourceByteLength,
+              sourceContentSha256: image.sourceContentSha256,
+              normalizationVersion: image.normalizationVersion,
+            })
+          },
+        })
       }
-      const selected = dependencies.selectSource({
-        sources,
-        providerImageId: claim.providerImageId,
-        locatorSha256: claim.locatorSha256,
-      })
-      const image = await dependencies.fetchImage({ url: selected.url })
-      result.fetched += 1
-      await dependencies.complete({
-        organizationId: claim.organizationId,
-        jobId: claim.jobId,
-        leaseToken: claim.leaseToken,
-        actorEmail: claim.actorEmail,
-        bytes: image.bytes,
-        declaredMimeType: image.mediaType,
-        sourceByteLength: image.sourceByteLength,
-        sourceContentSha256: image.sourceContentSha256,
-        normalizationVersion: image.normalizationVersion,
-      })
+      void completion
       result.succeeded += 1
     } catch (error) {
       const code = safeErrorCode(error)
+      if (storeSyncReadPaused(error)) {
+        try {
+          const disposition = await dependencies.park({
+            organizationId: claim.organizationId,
+            jobId: claim.jobId,
+            leaseToken: claim.leaseToken,
+            workerId: input.workerId,
+          })
+          if (disposition.parked) result.parked += 1
+          else result.leaseLost += 1
+        } catch (parkError) {
+          result.leaseLost += 1
+          countError(result, safeErrorCode(parkError))
+        }
+        countError(result, code)
+        continue
+      }
       if (leaseWasLost(error)) {
         result.leaseLost += 1
         countError(result, code)

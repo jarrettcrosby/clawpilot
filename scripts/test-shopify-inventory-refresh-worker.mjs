@@ -59,6 +59,27 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '11111111-1111-4111-8111-111111111111',
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              intentFingerprintSha256: 'a'.repeat(64),
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: '2026-08-15T12:00:00.000Z',
+            })
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -142,9 +163,8 @@ includes(persistence, [
   'completeShopifyInventoryRefreshJobInPostgres',
   'failShopifyInventoryRefreshJobInPostgres',
   'FOR UPDATE OF job SKIP LOCKED',
-  'operations_shopify_carrier_service_config_is_ready',
+  'operations_shopify_inventory_read_config_is_ready',
   'credential.verification_status =',
-  'activation.revision =',
   'config.row_version = job.config_row_version',
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
   "actor: 'system'",
@@ -503,6 +523,11 @@ includes(inventoryPersistence, [
   "actor: input.actorEmail || 'system'",
   'isSystem: !input.actorEmail',
 ], 'Shopify inventory single-flight persistence')
+assert.match(
+  inventoryPersistence,
+  /AND job\.status = CASE[\s\S]*?WHEN \$14::uuid IS NULL THEN 'processing'[\s\S]*?ELSE 'mapped_processing'[\s\S]*?END/,
+  'The projection fence must accept both legacy processing and mapped processing jobs without weakening the mapping fence',
+)
 assert.match(
   inventoryPersistence,
   /const reservedLocally = await client\.query\([\s\S]*?reservation\.status = 'active'[\s\S]*?reservation\.reservation_authority = 'local_balance'[\s\S]*?SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT/,

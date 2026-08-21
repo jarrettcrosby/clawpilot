@@ -41,6 +41,33 @@ if (!existsSync(resolve(root, 'app_src/package.json'))) {
 }
 
 const rootPackage = readJson('package.json')
+const checkoutAudienceTest = String(
+  rootPackage?.scripts?.['test:shopify-checkout-audience-policy'] || '',
+)
+for (const requiredCommand of [
+  'app_src/tests/integrations/shopify-checkout-audience-policy.test.ts',
+  'app_src/tests/integrations/shopify-checkout-rate-control.test.ts',
+  'app_src/tests/integrations/shopify-shadow-checkout-guard.test.ts',
+  'app_src/tests/integrations/shopify-rate-warm.test.ts',
+  'app_src/tests/integrations/shopify-shadow-checkout-callback-boundary.test.ts',
+  'app_src/tests/integrations/shopify-single-carrier-callback.test.ts',
+  'node scripts/test-shopify-checkout-audience-policy.mjs',
+  'node scripts/test-shopify-checkout-audience-persistence-postgres.mjs',
+  'node scripts/test-shopify-checkout-audience-health.mjs',
+]) {
+  if (!checkoutAudienceTest.includes(requiredCommand)) {
+    fail(`test:shopify-checkout-audience-policy must run "${requiredCommand}"`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:shopify-customer-rate-policies'] || '')
+    .includes('npm run test:shopify-checkout-audience-policy')
+) {
+  fail(
+    'test:shopify-customer-rate-policies must run '
+    + 'test:shopify-checkout-audience-policy',
+  )
+}
 const shadowTrainingTest = String(
   rootPackage?.scripts?.['test:operation-shadow-training'] || '',
 )
@@ -62,6 +89,57 @@ if (
     .includes('npm run test:operation-shadow-training')
 ) {
   fail('test:operations must run test:operation-shadow-training')
+}
+
+if (
+  String(rootPackage?.scripts?.['test:commerce-store-sync'] || '')
+    !== 'node --experimental-strip-types --test app_src/tests/operations/commerce-store-sync-recovery.test.ts && node scripts/test-commerce-store-sync-ui.mjs && node scripts/test-commerce-store-sync-controls-postgres.mjs && node scripts/test-commerce-catalog-cursor-reconciliation-postgres.mjs'
+) {
+  fail(
+    'test:commerce-store-sync must run the disposable PostgreSQL acceptance',
+  )
+}
+const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
+  fail('CI must run the Store sync disposable PostgreSQL acceptance')
+}
+
+if (
+  String(rootPackage?.scripts?.['test:shipping-independence-postgres'] || '')
+    !== 'node scripts/test-shipping-independence-postgres.mjs && node scripts/test-shipping-one-off-pack-postgres.mjs'
+) {
+  fail(
+    'test:shipping-independence-postgres must run the Shipping scope and '
+    + 'one-off pack disposable PostgreSQL acceptances',
+  )
+}
+if (
+  !ciWorkflow.includes('run: npm run test:shipping-independence-postgres')
+) {
+  fail('CI must run the Shipping independence disposable PostgreSQL acceptance')
+}
+
+if (
+  String(rootPackage?.scripts?.['test:shopify-order-webhook-reconciliation'] || '')
+    !== 'node scripts/test-shopify-order-webhook-reconciliation.mjs && node scripts/test-shopify-order-webhook-reconciliation-postgres.mjs && node scripts/test-shopify-order-webhook-reconciliation-health.mjs'
+) {
+  fail(
+    'test:shopify-order-webhook-reconciliation must run domain, '
+    + 'disposable PostgreSQL, and health acceptance',
+  )
+}
+if (
+  !String(rootPackage?.scripts?.['test:commerce'] || '')
+    .includes('npm run test:shopify-order-webhook-reconciliation')
+) {
+  fail('test:commerce must run Shopify order webhook reconciliation acceptance')
+}
+if (
+  !ciWorkflow.includes(
+    'run: npm run test:shopify-order-webhook-reconciliation',
+  )
+) {
+  fail('CI must run Shopify order webhook reconciliation acceptance')
 }
 
 const orderReplanningCorrectionsTest = String(
@@ -167,6 +245,20 @@ if (releaseRecordPosition < healthGatePosition) {
 }
 
 for (const requiredPath of [
+  'db/migrations/0303_operations_shopify_order_webhook_reconciliation.sql',
+  'app_src/lib/integrations/shopifyOrderWebhookRecovery.ts',
+  'app_src/lib/persistence/shopifyOrderWebhookReconciliation.ts',
+  'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
+  'scripts/test-shopify-order-webhook-reconciliation.mjs',
+  'scripts/test-shopify-order-webhook-reconciliation-postgres.mjs',
+  'scripts/test-shopify-order-webhook-reconciliation-health.mjs',
+  'db/migrations/0298_operations_commerce_store_sync_controls.sql',
+  'app_src/lib/operations/commerceStoreSync.ts',
+  'app_src/lib/persistence/commerceStoreSync.ts',
+  'app_src/tests/operations/commerce-store-sync-recovery.test.ts',
+  'scripts/test-commerce-store-sync-controls-postgres.mjs',
+  'scripts/test-commerce-store-sync-ui.mjs',
+  'scripts/test-commerce-catalog-cursor-reconciliation-postgres.mjs',
   'db/migrations/0274_operations_commerce_order_revision_apply.sql',
   'db/migrations/0275_operations_one_off_carrier_selection.sql',
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',
@@ -178,17 +270,33 @@ for (const requiredPath of [
   'db/migrations/0284_operations_print_device_reference_privacy.sql',
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
   'db/migrations/0292_shopify_registered_rate_source_refresh.sql',
+  'db/migrations/0293_shopify_checkout_audience_policy.sql',
   'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
   'db/migrations/0287_operations_print_agent_pairing_grants.sql',
+  'db/migrations/0295_operations_print_agent_pairing_recovery_envelopes.sql',
+  'db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql',
+  'db/migrations/0297_operations_print_agent_cleanup_status.sql',
   'db/migrations/0288_operations_shopify_location_routing.sql',
   'db/migrations/0289_operations_shopify_location_administration.sql',
   'db/migrations/0290_operations_shadow_training_runs.sql',
+  'db/migrations/0300_operations_order_training_independent_control.sql',
+  'db/migrations/0301_shipping_independent_one_off_items.sql',
+  'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
+  'app_src/components/shipping/ShippingSection.tsx',
+  'app_src/components/shipping/ShippingOneOffExecutionPanel.tsx',
+  'app_src/lib/persistence/shippingIndependenceHealth.ts',
+  'app_src/lib/persistence/shippingOneOffPack.ts',
+  'app_src/lib/persistence/shippingOneOffPackHealth.ts',
+  'scripts/test-shipping-independence.mjs',
+  'scripts/test-shipping-independence-postgres.mjs',
+  'scripts/test-shipping-one-off-pack.mjs',
+  'scripts/test-shipping-one-off-pack-postgres.mjs',
+  'scripts/test-shipping-module.mjs',
   'db/migrations/0291_operations_order_replanning_corrections.sql',
   'app_src/app/api/operations/print-agent/pair/route.ts',
+  'app_src/app/api/operations/print-agent/cleanup-status/route.ts',
+  'scripts/test-operation-print-agent-cleanup-status.mjs',
   'app_src/app/api/operations/print-agents/route.ts',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
   'app_src/app/api/operations/order-revisions/route.ts',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',
@@ -203,7 +311,6 @@ for (const requiredPath of [
   'app_src/lib/integrations/shopifyOrderManagement.ts',
   'app_src/lib/integrations/shopifyOrderManagementRuntime.ts',
   'app_src/lib/integrations/carrierShippingDiagnosticRate.ts',
-  'scripts/build-macos-print-agent-download.mjs',
   'scripts/lib/deterministic-zip.mjs',
   'scripts/lib/macos-print-agent-credential.mjs',
   'scripts/manage-macos-print-agent.mjs',
@@ -244,7 +351,6 @@ for (const requiredPath of [
   'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',
   'scripts/test-operation-print-agent-pairing.mjs',
   'scripts/test-macos-print-agent-pairing-grant.mjs',
-  'scripts/test-macos-print-agent-download.mjs',
   'scripts/test-submit-raw-print.mjs',
   'scripts/test-shipping-ui-fixture.mjs',
   'scripts/test-apple-manager-pick-management.mjs',
@@ -543,6 +649,11 @@ for (const requiredPath of [
   'scripts/test-shopify-customer-rate-policies.mjs',
   'scripts/test-shopify-customer-rate-policy-ui.mjs',
   'scripts/test-shopify-customer-rate-policies-postgres.mjs',
+  'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+  'app_src/tests/integrations/shopify-checkout-audience-policy.test.ts',
+  'scripts/test-shopify-checkout-audience-policy.mjs',
+  'scripts/test-shopify-checkout-audience-persistence-postgres.mjs',
+  'scripts/test-shopify-checkout-audience-health.mjs',
   'app_src/lib/integrations/commercePackRuntime.ts',
   'app_src/lib/operations/hybridCartonization.ts',
   'app_src/tests/operations/hybrid-cartonization.test.mts',
@@ -555,6 +666,12 @@ for (const requiredPath of [
   'app_src/lib/operations/activeCarrierDispatchSnapshot.ts',
   'app_src/lib/operations/productionFulfillmentRerates.ts',
   'app_src/lib/operations/sandboxCommerceE2e.ts',
+  'app_src/lib/operations/shopifyTestStoreCanonicalE2e.ts',
+  'app_src/lib/integrations/shopifyTestStoreCanonicalE2e.ts',
+  'app_src/lib/persistence/shopifyTestStoreCanonicalE2e.ts',
+  'db/migrations/0302_operations_shopify_test_store_canonical_e2e.sql',
+  'scripts/test-shopify-test-store-canonical-e2e.mjs',
+  'scripts/test-shopify-test-store-canonical-e2e-health.mjs',
   'app_src/lib/integrations/carrierWholeShipmentRateFoundation.ts',
   'app_src/tests/operations/canonical-fulfillment-planning.test.mts',
   'app_src/tests/operations/active-carrier-dispatch-snapshot.test.mts',
@@ -743,9 +860,7 @@ for (const requiredPath of [
   'scripts/verify-mail-sender.mjs',
   'scripts/test-operation-printing.mjs',
   'scripts/test-operation-print-agent-runtime.mjs',
-  'scripts/pair-macos-print-agent.mjs',
-  'scripts/lib/macos-print-agent-pairing.mjs',
-  'scripts/test-macos-print-agent-pairing.mjs',
+  'scripts/test-print-agent-release-download.mjs',
   'scripts/calibrate-zebra-printer.mjs',
   'scripts/test-zebra-printer-calibration.mjs',
   'scripts/test-operation-shipment-completion.mjs',
@@ -805,6 +920,11 @@ for (const requiredPath of [
   'app_src/lib/quickBooksSyncWorker.ts',
   'app_src/lib/agents/repositoryRunnerConfig.ts',
   'app_src/lib/githubApp.ts',
+  'app_src/lib/operations/printAgentReleaseConfig.ts',
+  'app_src/lib/operations/printAgentRelease.mjs',
+  'app_src/lib/operations/printAgentReleaseService.ts',
+  'app_src/app/api/operations/print-agent/releases/route.ts',
+  'app_src/app/api/operations/print-agent/releases/download/route.ts',
   'app_src/lib/persistence/repositoryRuns.ts',
   'app_src/lib/repositoryRunWorker.ts',
   'scripts/test-repository-runner.mjs',
@@ -839,6 +959,24 @@ for (const requiredPath of [
   }
 }
 
+for (const forbiddenUnsignedPrintAgentArtifact of [
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
+]) {
+  if (existsSync(resolve(root, forbiddenUnsignedPrintAgentArtifact))) {
+    fail(`unsigned print-agent preview must not ship: ${forbiddenUnsignedPrintAgentArtifact}`)
+  }
+}
+
+const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
+if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download')) {
+  fail('application build must not regenerate the unsigned macOS print-agent preview')
+}
+
+run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
+run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e.mjs'])
+run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e-health.mjs'])
 run('npm', ['run', 'build'])
 
 if (!existsSync(resolve(root, 'app_src/.next/BUILD_ID'))) {

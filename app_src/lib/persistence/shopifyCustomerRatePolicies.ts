@@ -17,6 +17,10 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  readShopifyCheckoutRateControl,
+  type ShopifyCheckoutRateControl,
+} from '@/lib/operations/shopifyCheckoutRateControl'
 
 export { normalizeShopifyCustomerGid }
 
@@ -115,7 +119,9 @@ type PolicyRow = QueryResultRow & {
 
 type AccountContextRow = QueryResultRow & {
   integration_account_id: string
+  account_environment: 'mock' | 'sandbox' | 'production'
   activation_state: Exclude<ActivationState, 'missing'> | null
+  policy_snapshot: Record<string, unknown>
 }
 
 type CountRow = QueryResultRow & {
@@ -124,6 +130,7 @@ type CountRow = QueryResultRow & {
   simulated_count: string
   until_turned_off_simulated_count: string
   shadow_allowed_count: string
+  checkout_eligible_count: string
   expired_simulated_count: string
   blocked_count: string
   enforced_count: string
@@ -394,6 +401,7 @@ function policyHash(
 
 function enforcement(
   activationState: ActivationState,
+  checkoutRateControl: ShopifyCheckoutRateControl,
 ): ShopifyCustomerRatePolicyEnforcement {
   const shadow = activationState === 'shadow'
   return {
@@ -403,20 +411,31 @@ function enforcement(
       : activationState === 'active'
         ? 'active_blocked'
         : 'inactive_blocked',
-    defaultPolicy: activationState === 'active' ? 'show_all' : 'hide_all',
+    defaultPolicy: checkoutRateControl.audience === 'all_eligible'
+      ? 'show_all'
+      : 'hide_all',
     providerWriteAvailable: false,
     providerWritesPerformed: 0,
   }
 }
 
-function assertMutationActivation(activationState: ActivationState) {
-  if (!['shadow', 'active'].includes(activationState)) {
+function assertLocalPolicyMutationAllowed(activationState: ActivationState) {
+  if (activationState === 'missing') {
     throw new ShopifyCustomerRatePolicyPersistenceError(
-      'SHOPIFY_CUSTOMER_POLICY_ACTIVATION_REQUIRED',
-      'Shopify customer rate policy changes require Operations Shadow or Active',
+      'SHOPIFY_CUSTOMER_POLICY_ACTIVATION_MISSING',
+      'Operations safety state is unavailable for this customer policy',
       409,
     )
   }
+}
+
+function checkoutPolicyUsesProofLane(
+  control: ShopifyCheckoutRateControl,
+  accountEnvironment: 'mock' | 'sandbox' | 'production',
+) {
+  return control.audience === 'restricted_customers'
+    && control.rateSource === 'sandbox'
+    && accountEnvironment !== 'production'
 }
 
 async function accountContext(
@@ -429,10 +448,15 @@ async function accountContext(
   const result = await run<AccountContextRow>(
     `SELECT
        account.id::text AS integration_account_id,
-       activation.state AS activation_state
+       account.environment AS account_environment,
+       activation.state AS activation_state,
+       config.policy_snapshot
      FROM operations_integration_accounts account
      LEFT JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = account.organization_id
+      AND config.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
@@ -450,7 +474,15 @@ async function accountContext(
   }
   return {
     integrationAccountId: row.integration_account_id,
+    accountEnvironment: row.account_environment,
     activationState: row.activation_state || 'missing' as ActivationState,
+    checkoutRateControl: readShopifyCheckoutRateControl(
+      row.policy_snapshot,
+      {
+        activationState: row.activation_state || 'disabled',
+        accountEnvironment: row.account_environment,
+      },
+    ),
   }
 }
 
@@ -565,7 +597,10 @@ export async function listShopifyCustomerRatePoliciesFromPostgres(input: {
       total,
       totalPages: total === 0 ? 0 : Math.ceil(total / pageSize),
     },
-    enforcement: enforcement(context.activationState),
+    enforcement: enforcement(
+      context.activationState,
+      context.checkoutRateControl,
+    ),
   }
 }
 
@@ -644,7 +679,7 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
       organizationId,
       accountGlobalId,
     })
-    assertMutationActivation(context.activationState)
+    assertLocalPolicyMutationAllowed(context.activationState)
     const current = await currentPolicy(client, {
       organizationId,
       integrationAccountId: context.integrationAccountId,
@@ -655,27 +690,30 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
       requireForCurrent: current?.status !== 'removed',
     })
 
-    const shadow = context.activationState === 'shadow'
-    if (shadow && current && !shadowLifetimeIsExplicit) {
+    const testLane = checkoutPolicyUsesProofLane(
+      context.checkoutRateControl,
+      context.accountEnvironment,
+    )
+    if (testLane && current && !shadowLifetimeIsExplicit) {
       throw new ShopifyCustomerRatePolicyPersistenceError(
         'SHOPIFY_SHADOW_POLICY_LIFETIME_REQUIRED',
-        'Choose timed or until turned off when updating an existing Shadow customer policy',
+        'Choose timed or until turned off when updating an existing TEST customer policy',
       )
     }
     if (
-      !shadow
+      !testLane
       && normalizedPolicy.shadowTestChargeMode !== 'carrier_rate'
     ) {
       throw new ShopifyCustomerRatePolicyPersistenceError(
-        'SHOPIFY_SHADOW_TEST_SUBSIDY_REQUIRES_SHADOW',
-        'A zero checkout test charge is available only in Operations Shadow',
+        'SHOPIFY_CHECKOUT_TEST_SUBSIDY_REQUIRES_TEST_SOURCE',
+        'A zero checkout test charge requires the Restricted TEST rate source',
         409,
       )
     }
-    const shadowLifetimeMode = shadow
+    const shadowLifetimeMode = testLane
       ? requestedShadowLifetime.shadowLifetimeMode
       : null
-    const shadowDurationMinutes = shadow
+    const shadowDurationMinutes = testLane
       ? requestedShadowLifetime.shadowDurationMinutes
       : null
     const hash = policyHash(
@@ -683,13 +721,13 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
       shadowLifetimeMode,
       shadowDurationMinutes,
     )
-    const status: ShopifyCustomerRatePolicyStatus = shadow
+    const status: ShopifyCustomerRatePolicyStatus = testLane
       ? 'simulated'
       : 'blocked'
-    const providerState: ShopifyCustomerRatePolicyProviderState = shadow
+    const providerState: ShopifyCustomerRatePolicyProviderState = testLane
       ? 'not_written'
       : 'write_blocked'
-    const lastErrorCode = shadow
+    const lastErrorCode = testLane
       ? null
       : ACTIVE_PROVIDER_WRITE_BLOCKED
     let writeSucceeded = false
@@ -805,7 +843,10 @@ export async function upsertShopifyCustomerRatePolicyInPostgres(input: {
     }
     return {
       policy: policy(stored),
-      enforcement: enforcement(context.activationState),
+      enforcement: enforcement(
+        context.activationState,
+        context.checkoutRateControl,
+      ),
     }
   })
 }
@@ -836,7 +877,7 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
       organizationId,
       accountGlobalId,
     })
-    assertMutationActivation(context.activationState)
+    assertLocalPolicyMutationAllowed(context.activationState)
     const current = await currentPolicy(client, {
       organizationId,
       integrationAccountId: context.integrationAccountId,
@@ -856,14 +897,20 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
         removed: true,
         customerGid,
         policy: policy(current),
-        enforcement: enforcement(context.activationState),
+        enforcement: enforcement(
+          context.activationState,
+          context.checkoutRateControl,
+        ),
       }
     }
-    const shadow = context.activationState === 'shadow'
-    const providerState: ShopifyCustomerRatePolicyProviderState = shadow
+    const testLane = checkoutPolicyUsesProofLane(
+      context.checkoutRateControl,
+      context.accountEnvironment,
+    )
+    const providerState: ShopifyCustomerRatePolicyProviderState = testLane
       ? 'not_written'
       : 'write_blocked'
-    const lastErrorCode = shadow
+    const lastErrorCode = testLane
       ? null
       : ACTIVE_PROVIDER_DELETE_BLOCKED
     const currentPolicyValue = policy(current)
@@ -876,8 +923,8 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
         shadowTestServiceCode: null,
         shadowTestSubsidyReason: null,
       },
-      shadow ? currentPolicyValue.shadowLifetimeMode : null,
-      shadow ? currentPolicyValue.shadowDurationMinutes : null,
+      testLane ? currentPolicyValue.shadowLifetimeMode : null,
+      testLane ? currentPolicyValue.shadowDurationMinutes : null,
     )
     const result = await client.query<PolicyRow>(
       `UPDATE operations_shopify_customer_rate_policies
@@ -945,7 +992,10 @@ export async function removeShopifyCustomerRatePolicyInPostgres(input: {
       removed: true,
       customerGid,
       policy: policy(removed),
-      enforcement: enforcement(context.activationState),
+      enforcement: enforcement(
+        context.activationState,
+        context.checkoutRateControl,
+      ),
     }
   })
 }
@@ -989,6 +1039,57 @@ export async function readActiveShopifyCustomerRatePolicyFromPostgres(input: {
            activation.state = 'active'
            AND policy.status = 'enforced'
            AND policy.provider_state = 'applied'
+         )
+       )
+     LIMIT 1`,
+    [organizationId, accountGlobalId, customerGid],
+  )
+  return result.rows[0] ? policy(result.rows[0]) : null
+}
+
+/**
+ * Read the exact local customer policy used by checkout rating.
+ *
+ * Checkout rating is a local read-only decision, but it must match the exact
+ * current account control. Only a bounded simulated policy on a non-production
+ * Shopify store can authorize the Restricted proof lane. A blocked desired
+ * LIVE policy never authorizes a callback.
+ */
+export async function readShopifyCheckoutCustomerRatePolicyFromPostgres(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  shopifyCustomerGid: unknown
+}): Promise<ShopifyCustomerRatePolicy | null> {
+  const organizationId = normalizedOrganizationId(input.organizationId)
+  const accountGlobalId = normalizedAccountGlobalId(input.accountGlobalId)
+  const customerGid = normalizeShopifyCustomerGid(input.shopifyCustomerGid)
+  const result = await query<PolicyRow>(
+    `${POLICY_SELECT}
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = policy.organization_id
+      AND config.integration_account_id = policy.integration_account_id
+     WHERE policy.organization_id = $1::uuid
+       AND account.global_id = $2
+       AND policy.shopify_customer_gid = $3
+       AND account.integration_type = 'commerce'
+       AND account.provider = 'shopify'
+       AND account.environment <> 'production'
+       AND config.policy_snapshot #>> '{checkoutRateControl,audience}'
+         = 'restricted_customers'
+       AND config.policy_snapshot #>> '{checkoutRateControl,rateSource}'
+         = 'sandbox'
+       AND policy.status = 'simulated'
+       AND policy.provider_state = 'not_written'
+       AND (
+         (
+           policy.shadow_lifetime_mode = 'timed'
+           AND policy.shadow_duration_minutes BETWEEN 15 AND 240
+           AND policy.shadow_expires_at > now()
+         )
+         OR (
+           policy.shadow_lifetime_mode = 'until_turned_off'
+           AND policy.shadow_duration_minutes IS NULL
+           AND policy.shadow_expires_at IS NULL
          )
        )
      LIMIT 1`,
@@ -1052,6 +1153,24 @@ export async function readShopifyCustomerRatePolicySummaryFromPostgres(input: {
            AND mode <> 'hide_all'
        )::text AS shadow_allowed_count,
        count(*) FILTER (
+         WHERE $3::boolean
+           AND mode <> 'hide_all'
+           AND status = 'simulated'
+           AND provider_state = 'not_written'
+           AND (
+             (
+               shadow_lifetime_mode = 'timed'
+               AND shadow_duration_minutes BETWEEN 15 AND 240
+               AND shadow_expires_at > now()
+             )
+             OR (
+               shadow_lifetime_mode = 'until_turned_off'
+               AND shadow_duration_minutes IS NULL
+               AND shadow_expires_at IS NULL
+             )
+           )
+       )::text AS checkout_eligible_count,
+       count(*) FILTER (
          WHERE status = 'simulated'
            AND NOT (
              (
@@ -1077,7 +1196,14 @@ export async function readShopifyCustomerRatePolicySummaryFromPostgres(input: {
      FROM operations_shopify_customer_rate_policies
      WHERE organization_id = $1::uuid
        AND integration_account_id = $2::uuid`,
-    [organizationId, context.integrationAccountId],
+    [
+      organizationId,
+      context.integrationAccountId,
+      checkoutPolicyUsesProofLane(
+        context.checkoutRateControl,
+        context.accountEnvironment,
+      ),
+    ],
   )
   const row = result.rows[0]
   return {
@@ -1088,12 +1214,16 @@ export async function readShopifyCustomerRatePolicySummaryFromPostgres(input: {
       row?.until_turned_off_simulated_count,
     ),
     shadowAllowedCount: safeCount(row?.shadow_allowed_count),
+    checkoutEligibleCount: safeCount(row?.checkout_eligible_count),
     expiredSimulatedCount: safeCount(row?.expired_simulated_count),
     blockedCount: safeCount(row?.blocked_count),
     enforcedCount: safeCount(row?.enforced_count),
     errorCount: safeCount(row?.error_count),
     earliestShadowExpiresAt: iso(row?.earliest_shadow_expires_at || null),
-    enforcement: enforcement(context.activationState),
+    enforcement: enforcement(
+      context.activationState,
+      context.checkoutRateControl,
+    ),
   }
 }
 

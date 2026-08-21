@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  isShopifyRatingCheckoutChannelEligible,
   isShopifySandboxCheckoutChannelEligible,
   type ShopifyCheckoutChannelEligibilityInput,
 } from '../../lib/integrations/shopifyCheckoutChannelEligibility.ts'
@@ -72,6 +73,23 @@ test('fails production, other providers, and non-sellable lifecycle states', () 
       false,
     )
   }
+})
+
+test('rating-only checkout evidence accepts exact production lifecycle without widening the legacy sandbox predicate', () => {
+  for (const evidence of [activeEvidence, unlistedEvidence]) {
+    assert.equal(isShopifyRatingCheckoutChannelEligible({
+      ...evidence,
+      accountEnvironment: 'production',
+    }), true)
+    assert.equal(isShopifySandboxCheckoutChannelEligible({
+      ...evidence,
+      accountEnvironment: 'production',
+    }), false)
+  }
+  assert.equal(isShopifyRatingCheckoutChannelEligible({
+    ...activeEvidence,
+    accountEnvironment: 'mock',
+  }), false)
 })
 
 test('requires shipping and a positive integer provider weight', () => {

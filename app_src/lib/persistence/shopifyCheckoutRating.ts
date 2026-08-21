@@ -9,6 +9,16 @@ import {
   normalizeShopifyCheckoutRateWarmPolicy,
   type ShopifyCheckoutRateWarmPolicy,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
+import {
+  normalizeShopifyCheckoutAudiencePolicy,
+  type ShopifyCheckoutAudiencePolicy,
+} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+import {
+  normalizeShopifyCheckoutRateControl,
+  readShopifyCheckoutRateControl,
+  type ShopifyCheckoutRateControl,
+  type ShopifyCheckoutRateSource,
+} from '@/lib/operations/shopifyCheckoutRateControl'
 import type {
   CarrierAccountAddress,
 } from '@/lib/integrations/carrierCredentialCrypto'
@@ -140,6 +150,105 @@ export type ShopifyCarrierServiceRateWarmPolicyWriteInput = {
   actorEmail: string
 }
 
+export type ShopifyCarrierServiceAudiencePolicyWriteInput = {
+  organizationId: string
+  accountGlobalId: string
+  expectedRowVersion: number
+  shadowCheckoutAudience: ShopifyCheckoutAudiencePolicy
+  actorEmail: string
+}
+
+export type ShopifyCarrierServiceRateControlWriteInput = {
+  organizationId: string
+  accountGlobalId: string
+  expectedConfigGlobalId: string
+  expectedRowVersion: number
+  expectedPolicyRevision: number
+  checkoutRateControl: ShopifyCheckoutRateControl
+  idempotencyKey: string
+  reason: string
+  actorEmail: string
+}
+
+export const SHOPIFY_CHECKOUT_RATE_CONTROL_COMMAND_RESULT_VERSION =
+  'shopify-checkout-rate-control-command-result-v1' as const
+
+export type ShopifyCarrierServiceRateControlCommandResult = {
+  version: typeof SHOPIFY_CHECKOUT_RATE_CONTROL_COMMAND_RESULT_VERSION
+  accountGlobalId: string
+  configGlobalId: string
+  idempotencyKey: string
+  requestHash: string
+  checkoutRateControl: ShopifyCheckoutRateControl
+  rowVersion: number
+  policyRevision: number
+  providerWrites: 0
+}
+
+export function normalizeShopifyCarrierServiceRateControlCommandResult(
+  value: unknown,
+): ShopifyCarrierServiceRateControlCommandResult {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_RESULT_CORRUPT',
+      'Checkout-rate control command result is invalid',
+      500,
+    )
+  }
+  const candidate = value as Record<string, unknown>
+  if (
+    Object.keys(candidate).sort().join('\n') !== [
+      'accountGlobalId',
+      'checkoutRateControl',
+      'configGlobalId',
+      'idempotencyKey',
+      'policyRevision',
+      'providerWrites',
+      'requestHash',
+      'rowVersion',
+      'version',
+    ].join('\n')
+    || candidate.version
+      !== SHOPIFY_CHECKOUT_RATE_CONTROL_COMMAND_RESULT_VERSION
+    || typeof candidate.accountGlobalId !== 'string'
+    || !ACCOUNT_GLOBAL_ID.test(candidate.accountGlobalId)
+    || typeof candidate.configGlobalId !== 'string'
+    || !CONFIG_GLOBAL_ID.test(candidate.configGlobalId)
+    || typeof candidate.idempotencyKey !== 'string'
+    || candidate.idempotencyKey.length < 8
+    || candidate.idempotencyKey.length > 200
+    || !/^[A-Za-z0-9._:-]+$/.test(candidate.idempotencyKey)
+    || typeof candidate.requestHash !== 'string'
+    || !SHA256.test(candidate.requestHash)
+    || typeof candidate.rowVersion !== 'number'
+    || !Number.isSafeInteger(candidate.rowVersion)
+    || candidate.rowVersion < 0
+    || typeof candidate.policyRevision !== 'number'
+    || !Number.isSafeInteger(candidate.policyRevision)
+    || candidate.policyRevision < 1
+    || candidate.providerWrites !== 0
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_RESULT_CORRUPT',
+      'Checkout-rate control command result is invalid',
+      500,
+    )
+  }
+  return {
+    version: SHOPIFY_CHECKOUT_RATE_CONTROL_COMMAND_RESULT_VERSION,
+    accountGlobalId: candidate.accountGlobalId,
+    configGlobalId: candidate.configGlobalId,
+    idempotencyKey: candidate.idempotencyKey,
+    requestHash: candidate.requestHash,
+    checkoutRateControl: normalizeShopifyCheckoutRateControl(
+      candidate.checkoutRateControl,
+    ),
+    rowVersion: Number(candidate.rowVersion),
+    policyRevision: Number(candidate.policyRevision),
+    providerWrites: 0,
+  }
+}
+
 export type ShopifyCarrierServiceConfig = {
   id: string
   globalId: string
@@ -168,10 +277,22 @@ export type ShopifyCarrierServiceConfig = {
   lastErrorCode: string | null
   rowVersion: number
   ready: boolean
+  ratingRuntimeReady: boolean
   materials: ShopifyCheckoutRatingMaterial[]
   carriers: ShopifyCheckoutRatingCarrierBinding[]
   createdAt: string
   updatedAt: string
+}
+
+export type ShopifyCarrierServiceRateControlLastChange = {
+  configGlobalId: string
+  idempotencyKey: string
+  requestHash: string
+  actorEmail: string
+  requestedControl: ShopifyCheckoutRateControl
+  resultingRowVersion: number
+  resultingPolicyRevision: number
+  reason: string
 }
 
 export type ShopifyCheckoutRatingMaterial = {
@@ -224,12 +345,13 @@ export type ShopifyCheckoutRatingAccount = {
   configRowVersion: number
   credentialGeneration: number
   registrationActivationRevision: number
-  activationState: 'shadow' | 'active'
+  activationState: 'shadow' | 'read_only' | 'active'
   activationRevision: number
   callbackTokenVersion: number
   policyRevision: number
   policyHash: string
   policySnapshot: Record<string, unknown>
+  checkoutRateControl: ShopifyCheckoutRateControl
   warehouseId: string
   warehouseGlobalId: string
   warehouseName: string
@@ -241,6 +363,15 @@ export type ShopifyCheckoutRatingAccount = {
   algorithmVersion: string
   materials: ShopifyCheckoutRatingMaterial[]
   carriers: ShopifyCheckoutRatingCarrierBinding[]
+}
+
+export type ShopifyCarrierServiceCallbackPolicyAccount = {
+  organizationId: string
+  accountGlobalId: string
+  environment: 'mock' | 'sandbox' | 'production'
+  activationState: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+  policySnapshot: Record<string, unknown>
+  checkoutRateControl: ShopifyCheckoutRateControl
 }
 
 export type ShopifyCheckoutReceiptLineSnapshotV1 = {
@@ -275,8 +406,7 @@ export type ShopifyCheckoutReceiptClaimInput = {
   organizationId: string
   accountGlobalId: string
   expectedConfigRowVersion: number
-  expectedActivationState: 'shadow' | 'active'
-  expectedActivationRevision: number
+  rateSource: ShopifyCheckoutRateSource
   requestFingerprint: string
   destinationFingerprint: string
   carrierDestinationFingerprint: string
@@ -495,8 +625,9 @@ export type ShopifyCheckoutRateReceipt = {
   configGlobalId: string
   configRowVersion: number
   credentialGeneration: number
-  activationState: 'shadow' | 'active'
+  activationState: 'shadow' | 'read_only' | 'active'
   activationRevision: number
+  rateSource: ShopifyCheckoutRateSource
   policyRevision: number
   policyHash: string
   warehouseId: string
@@ -639,6 +770,7 @@ type ConfigRow = QueryResultRow & {
   last_error_code: string | null
   row_version: string | number
   ready: boolean
+  rating_runtime_ready: boolean
   created_at: TimestampValue
   updated_at: TimestampValue
 }
@@ -692,7 +824,7 @@ type CallbackAccountRow = QueryResultRow & {
   config_row_version: string | number
   credential_generation: number
   registration_activation_revision: number
-  activation_state: 'shadow' | 'active'
+  activation_state: 'shadow' | 'read_only' | 'active'
   activation_revision: number
   callback_token_version: number
   policy_revision: string | number
@@ -719,8 +851,9 @@ type ReceiptRow = QueryResultRow & {
   config_global_id: string
   config_row_version: string | number
   credential_generation: number
-  activation_state: 'shadow' | 'active'
+  activation_state: 'shadow' | 'read_only' | 'active'
   activation_revision: number
+  rate_source: ShopifyCheckoutRateSource
   policy_revision: string | number
   policy_hash: string
   warehouse_id: string
@@ -758,6 +891,7 @@ type ReceiptRow = QueryResultRow & {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SHA256 = /^[a-f0-9]{64}$/
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CONFIG_GLOBAL_ID = /^gscf(?:[0-9]{7}|[0-9a-v]{12})$/
 const RECEIPT_GLOBAL_ID = /^gsqr(?:[0-9]{7}|[0-9a-v]{12})$/
 const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
 const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -1853,24 +1987,19 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
     SHA256,
     'Inventory snapshot hash',
   )
-  if (!['shadow', 'active'].includes(input.expectedActivationState)) {
-    fail(
-      'SHOPIFY_CHECKOUT_ACTIVATION_STATE_INVALID',
-      'Expected activation state must be Shadow or Active',
-    )
-  }
   const expectedConfigRowVersion = integer(
     input.expectedConfigRowVersion,
     'Expected configuration row version',
     0,
     Number.MAX_SAFE_INTEGER,
   )
-  const expectedActivationRevision = integer(
-    input.expectedActivationRevision,
-    'Expected activation revision',
-    1,
-    Number.MAX_SAFE_INTEGER,
-  )
+  const rateSource = input.rateSource
+  if (!['sandbox', 'production'].includes(rateSource)) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_SOURCE_INVALID',
+      'Checkout rate source must be sandbox or production',
+    )
+  }
   const lineQuantityFingerprint =
     shopifyCheckoutLineQuantityFingerprint(lines)
   const requestEvidenceHash = shopifyCheckoutRatingHash({
@@ -1880,8 +2009,7 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
     lineQuantityFingerprint,
     inventorySnapshotHash,
     expectedConfigRowVersion,
-    expectedActivationState: input.expectedActivationState,
-    expectedActivationRevision,
+    rateSource,
     request: input.redactedRequestSnapshot,
     lines,
   })
@@ -1921,8 +2049,7 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
     carrierDestinationFingerprint,
     inventorySnapshotHash,
     expectedConfigRowVersion,
-    expectedActivationState: input.expectedActivationState,
-    expectedActivationRevision,
+    rateSource,
     requestEvidenceHash,
     lineQuantityFingerprint,
     currency,
@@ -2103,6 +2230,9 @@ const CONFIG_SELECT = `SELECT
         )
       )
     ) AS ready,
+    operations_shopify_carrier_service_rating_runtime_is_ready(
+      config.organization_id, config.id
+    ) AS rating_runtime_ready,
     config.created_at,
     config.updated_at
   FROM operations_shopify_carrier_service_configs config
@@ -2244,8 +2374,11 @@ function checkoutReceiptClaimConfig(row: ConfigRow) {
     policyHash: row.policy_hash,
     inventoryMaxAgeSeconds: row.inventory_max_age_seconds,
     algorithmVersion: row.algorithm_version,
+    policySnapshot: row.policy_snapshot,
+    accountEnvironment: row.account_environment,
     rowVersion: Number(row.row_version),
     ready: row.ready,
+    ratingRuntimeReady: row.rating_runtime_ready,
   }
 }
 
@@ -2288,6 +2421,7 @@ async function readConfigWithClient(
     lastErrorCode: row.last_error_code,
     rowVersion: Number(row.row_version),
     ready: row.ready,
+    ratingRuntimeReady: row.rating_runtime_ready,
     materials: children.materials,
     carriers: children.carriers,
     createdAt: iso(row.created_at) as string,
@@ -2311,6 +2445,81 @@ export async function readShopifyCarrierServiceConfigFromPostgres(input: {
       'Shopify account Global ID',
     ),
   })
+}
+
+/**
+ * Projects the most recent immutable 0299 command receipt for presentation.
+ * The receipt remains the authority for the reason; configuration rows do not
+ * duplicate mutable "last reason" state.
+ */
+export async function readShopifyCarrierServiceRateControlLastChangeFromPostgres(
+  input: {
+    organizationId: string
+    accountGlobalId: string
+  },
+): Promise<ShopifyCarrierServiceRateControlLastChange | null> {
+  const organizationId = matchValue(
+    input.organizationId,
+    UUID,
+    'Organization ID',
+  )
+  const accountGlobalId = matchValue(
+    input.accountGlobalId,
+    ACCOUNT_GLOBAL_ID,
+    'Shopify account Global ID',
+  )
+  const result = await query<{
+    config_global_id: string
+    idempotency_key: string
+    request_hash: string
+    actor_email: string
+    requested_control: unknown
+    resulting_row_version: string
+    resulting_policy_revision: string
+    reason: string
+  }>(
+    `SELECT
+       config.global_id AS config_global_id,
+       receipt.idempotency_key,
+       receipt.request_hash,
+       receipt.actor_email,
+       receipt.requested_control,
+       receipt.resulting_row_version::text,
+       receipt.resulting_policy_revision::text,
+       receipt.reason
+     FROM operations_shopify_checkout_rate_control_receipts receipt
+     JOIN operations_integration_accounts account
+       ON account.organization_id = receipt.organization_id
+      AND account.id = receipt.integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider = 'shopify'
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = receipt.organization_id
+      AND config.id = receipt.config_id
+      AND config.integration_account_id = receipt.integration_account_id
+     WHERE receipt.organization_id = $1::uuid
+       AND account.global_id = $2
+     ORDER BY receipt.resulting_policy_revision DESC,
+              receipt.created_at DESC,
+              receipt.id DESC
+     LIMIT 1`,
+    [organizationId, accountGlobalId],
+  )
+  const row = result.rows[0]
+  return row
+    ? {
+        configGlobalId: row.config_global_id,
+        idempotencyKey: row.idempotency_key,
+        requestHash: row.request_hash,
+        actorEmail: row.actor_email,
+        requestedControl: normalizeShopifyCheckoutRateControl(
+          row.requested_control,
+        ),
+        resultingRowVersion: Number(row.resulting_row_version),
+        resultingPolicyRevision: Number(row.resulting_policy_revision),
+        reason: row.reason,
+      }
+    : null
 }
 
 function checkoutBrandNameOverride(value: unknown) {
@@ -2508,634 +2717,6 @@ export async function updateShopifyCarrierServiceBrandNameOverrideInPostgres(
   })
 }
 
-/**
- * Serialize an Operations activation change against every CarrierService
- * config writer before the activation row is locked. Callers must already
- * hold the organization-scoped commerce-active advisory lock.
- */
-export async function lockShopifyCarrierServiceConfigWritersForActivationWithClient(
-  client: PoolClient,
-  organizationId: string,
-) {
-  const scopedOrganizationId = matchValue(
-    organizationId,
-    UUID,
-    'Organization ID',
-  )
-  const identities = await client.query<{
-    id: string
-    account_global_id: string
-  }>(
-    `SELECT config.id::text, account.global_id AS account_global_id
-     FROM operations_shopify_carrier_service_configs config
-     JOIN operations_integration_accounts account
-       ON account.organization_id = config.organization_id
-      AND account.id = config.integration_account_id
-     WHERE config.organization_id = $1::uuid
-     ORDER BY config.global_id`,
-    [scopedOrganizationId],
-  )
-  for (const identity of identities.rows) {
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-authorization:'
-        + scopedOrganizationId + ':' + identity.id,
-    )
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-config:'
-        + scopedOrganizationId + ':' + identity.account_global_id,
-    )
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-config-mutation:'
-        + scopedOrganizationId + ':' + identity.account_global_id,
-    )
-  }
-}
-
-/**
- * Rebind registered checkout callbacks when an owner/admin deliberately
- * enters Shadow. Shadow remains provider-write guarded, while the callback
- * continues to fail closed unless every canonical readiness fact survives.
- */
-export async function rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
-  client: PoolClient,
-  rawInput: {
-    organizationId: string
-    targetActivationRevision: number
-    actorEmail: string
-  },
-) {
-  const input = {
-    organizationId: matchValue(
-      rawInput.organizationId,
-      UUID,
-      'Organization ID',
-    ),
-    targetActivationRevision: integer(
-      rawInput.targetActivationRevision,
-      'Shadow Operations revision',
-      1,
-      Number.MAX_SAFE_INTEGER,
-    ),
-    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
-  }
-  const rows = await client.query<{
-    id: string
-    global_id: string
-    account_global_id: string
-    service_gid: string | null
-    credential_generation: number
-    activation_revision: number
-    callback_token_version: number
-    row_version: string
-    unsafe_authorization_exists: boolean
-  }>(
-    `SELECT
-       config.id::text,
-       config.global_id,
-       account.global_id AS account_global_id,
-       config.service_gid,
-       config.credential_generation,
-       config.activation_revision,
-       config.callback_token_version,
-       config.row_version::text,
-       EXISTS (
-         SELECT 1
-         FROM operations_shopify_carrier_service_mutation_authorizations
-           authorized_mutation
-         LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
-           ON attempt.organization_id = authorized_mutation.organization_id
-          AND attempt.authorization_id = authorized_mutation.id
-         LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
-           ON outcome.organization_id = attempt.organization_id
-          AND outcome.attempt_id = attempt.id
-         LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
-           resolution
-           ON resolution.organization_id = attempt.organization_id
-          AND resolution.attempt_id = attempt.id
-         WHERE authorized_mutation.organization_id = config.organization_id
-           AND authorized_mutation.config_id = config.id
-           AND authorized_mutation.config_row_version = config.row_version
-           AND (
-             (
-               outcome.outcome = 'failed'
-               AND outcome.provider_write_count = 0
-             )
-             OR resolution.disposition = 'confirmed_not_applied'
-             OR (
-               attempt.id IS NULL
-               AND authorized_mutation.expires_at <= now()
-             )
-           ) IS NOT TRUE
-       ) AS unsafe_authorization_exists
-     FROM operations_shopify_carrier_service_configs config
-     JOIN operations_integration_accounts account
-       ON account.organization_id = config.organization_id
-      AND account.id = config.integration_account_id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = config.organization_id
-      AND activation.state = 'shadow'
-      AND activation.revision = $2
-     WHERE config.organization_id = $1::uuid
-       AND config.registration_state = 'registered'
-     ORDER BY config.global_id
-     FOR UPDATE OF config, account`,
-    [input.organizationId, input.targetActivationRevision],
-  )
-  const applied: Array<{
-    configGlobalId: string
-    accountGlobalId: string
-    serviceGid: string
-    fromActivationRevision: number
-    activationRevision: number
-    fromRowVersion: number
-    rowVersion: number
-    callbackTokenVersion: number
-  }> = []
-  for (const row of rows.rows) {
-    if (
-      !row.service_gid
-      || !SHOPIFY_SERVICE_GID.test(row.service_gid)
-      || row.unsafe_authorization_exists
-    ) {
-      fail(
-        row.unsafe_authorization_exists
-          ? 'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_MUTATION_UNRESOLVED'
-          : 'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_NOT_ELIGIBLE',
-        row.unsafe_authorization_exists
-          ? 'Resolve the current Shopify CarrierService provider mutation before entering Shadow'
-          : 'A registered Shopify CarrierService is not eligible for the exact Shadow activation revision',
-        409,
-      )
-    }
-    const priorRowVersion = Number(row.row_version)
-    const updated = await client.query<{
-      activation_revision: number
-      row_version: string
-    }>(
-      `UPDATE operations_shopify_carrier_service_configs config
-       SET activation_revision = $3,
-           row_version = config.row_version + 1,
-           updated_by = $4,
-           updated_at = now()
-       WHERE config.organization_id = $1::uuid
-         AND config.id = $2::uuid
-         AND config.registration_state = 'registered'
-         AND config.service_gid = $5
-         AND config.credential_generation = $6
-         AND config.activation_revision = $7
-         AND config.callback_token_version = $8
-         AND config.row_version = $9::bigint
-       RETURNING
-         config.activation_revision,
-         config.row_version::text`,
-      [
-        input.organizationId,
-        row.id,
-        input.targetActivationRevision,
-        input.actorEmail,
-        row.service_gid,
-        row.credential_generation,
-        row.activation_revision,
-        row.callback_token_version,
-        priorRowVersion,
-      ],
-    )
-    // The readiness function is STABLE and reads the config table. Evaluating
-    // it inside the UPDATE RETURNING list uses that command's snapshot and can
-    // still observe the pre-rebind activation revision. Run it as the next SQL
-    // command so PostgreSQL advances the command counter and sees this update.
-    const readiness = await client.query<{ callback_ready: boolean }>(
-      `SELECT operations_shopify_carrier_service_config_is_ready(
-         $1::uuid,
-         $2::uuid
-       ) AS callback_ready`,
-      [input.organizationId, row.id],
-    )
-    if (
-      updated.rows[0]?.activation_revision
-        !== input.targetActivationRevision
-      || Number(updated.rows[0]?.row_version) !== priorRowVersion + 1
-      || readiness.rows[0]?.callback_ready !== true
-    ) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_READINESS_FAILED',
-        'The registered Shopify CarrierService did not remain callback-ready when Operations entered Shadow',
-        409,
-      )
-    }
-    const rebound = {
-      configGlobalId: row.global_id,
-      accountGlobalId: row.account_global_id,
-      serviceGid: row.service_gid,
-      fromActivationRevision: row.activation_revision,
-      activationRevision: input.targetActivationRevision,
-      fromRowVersion: priorRowVersion,
-      rowVersion: priorRowVersion + 1,
-      callbackTokenVersion: row.callback_token_version,
-    }
-    applied.push(rebound)
-    await recordAuditEvent({
-      actor: input.actorEmail,
-      eventType:
-        'operations.shopify_carrier_service.activation_revision_rebound',
-      aggregateType: 'operations.shopify_carrier_service_config',
-      aggregateId: rebound.configGlobalId,
-      subject: rebound.accountGlobalId,
-      organizationId: input.organizationId,
-      eventKey:
-        'operations:shopify-carrier-service:' + rebound.configGlobalId
-        + ':shadow-revision:' + rebound.activationRevision,
-      payload: {
-        accountGlobalId: rebound.accountGlobalId,
-        serviceGid: rebound.serviceGid,
-        activationState: 'shadow',
-        fromActivationRevision: rebound.fromActivationRevision,
-        activationRevision: rebound.activationRevision,
-        fromRowVersion: rebound.fromRowVersion,
-        rowVersion: rebound.rowVersion,
-        callbackTokenVersionRetained: rebound.callbackTokenVersion,
-        providerWrites: 0,
-        callbackTokenRotations: 0,
-      },
-    }, client)
-  }
-  return applied
-}
-
-/**
- * Repair only the local activation-revision fence for a registered Shopify
- * CarrierService after an exact, immutable Shadow-to-Active transition. No
- * Shopify request or callback-token rotation occurs in this transaction.
- */
-export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(
-  rawInput: {
-    organizationId: string
-    accountGlobalId: string
-    expectedRowVersion: number
-    expectedActivationRevision: number
-    actorEmail: string
-  },
-) {
-  const input = {
-    organizationId: matchValue(
-      rawInput.organizationId,
-      UUID,
-      'Organization ID',
-    ),
-    accountGlobalId: matchValue(
-      rawInput.accountGlobalId,
-      ACCOUNT_GLOBAL_ID,
-      'Shopify account Global ID',
-    ),
-    expectedRowVersion: integer(
-      rawInput.expectedRowVersion,
-      'Configuration row version',
-      0,
-      Number.MAX_SAFE_INTEGER,
-    ),
-    expectedActivationRevision: integer(
-      rawInput.expectedActivationRevision,
-      'Active Operations revision',
-      1,
-      Number.MAX_SAFE_INTEGER,
-    ),
-    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
-  }
-  return withTransaction(async (client) => {
-    await acquireTransactionAdvisoryLock(
-      client,
-      'commerce-active-transition:' + input.organizationId,
-    )
-    const membership = await client.query<{
-      role: string
-      status: string
-    }>(
-      `SELECT membership.role, membership.status
-       FROM app_user_organization_memberships membership
-       WHERE membership.organization_id = $1::uuid
-         AND membership.user_email = $2
-       FOR SHARE`,
-      [input.organizationId, input.actorEmail],
-    )
-    if (
-      membership.rows[0]?.status !== 'active'
-      || !['owner', 'admin'].includes(membership.rows[0]?.role)
-    ) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_AUTHORIZATION_REQUIRED',
-        'Refreshing Active checkout authority requires an active owner or administrator',
-        403,
-      )
-    }
-    const identity = await client.query<{ id: string }>(
-      `SELECT config.id::text
-       FROM operations_shopify_carrier_service_configs config
-       JOIN operations_integration_accounts account
-         ON account.organization_id = config.organization_id
-        AND account.id = config.integration_account_id
-       WHERE config.organization_id = $1::uuid
-         AND account.global_id = $2
-         AND account.integration_type = 'commerce'
-         AND account.provider = 'shopify'`,
-      [input.organizationId, input.accountGlobalId],
-    )
-    if (!identity.rows[0]) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_CONFIG_NOT_FOUND',
-        'Registered Shopify CarrierService configuration was not found',
-        404,
-      )
-    }
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-authorization:'
-        + input.organizationId + ':' + identity.rows[0].id,
-    )
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-config:'
-        + input.organizationId + ':' + input.accountGlobalId,
-    )
-    await acquireTransactionAdvisoryLock(
-      client,
-      'shopify-carrier-service-config-mutation:'
-        + input.organizationId + ':' + input.accountGlobalId,
-    )
-    const facts = await client.query<{
-      config_id: string
-      config_global_id: string
-      integration_account_id: string
-      registration_state: ShopifyCarrierServiceRegistrationState
-      service_gid: string | null
-      credential_generation: number
-      config_activation_revision: number
-      callback_token_version: number
-      row_version: string
-      account_environment: string
-      account_status: string
-      account_credential_generation: number
-      credential_version: number | null
-      verification_status: string | null
-      activation_state: string
-      activation_revision: number
-      callback_ready: boolean
-    }>(
-      `SELECT
-         config.id::text AS config_id,
-         config.global_id AS config_global_id,
-         config.integration_account_id::text,
-         config.registration_state,
-         config.service_gid,
-         config.credential_generation,
-         config.activation_revision AS config_activation_revision,
-         config.callback_token_version,
-         config.row_version::text,
-         account.environment AS account_environment,
-         account.status AS account_status,
-         account.commerce_credential_generation
-           AS account_credential_generation,
-         credential.credential_version,
-         credential.verification_status,
-         activation.state AS activation_state,
-         activation.revision AS activation_revision,
-         operations_shopify_carrier_service_config_is_ready(
-           config.organization_id,
-           config.id
-         ) AS callback_ready
-       FROM operations_shopify_carrier_service_configs config
-       JOIN operations_integration_accounts account
-         ON account.organization_id = config.organization_id
-        AND account.id = config.integration_account_id
-       JOIN operations_commerce_credentials credential
-         ON credential.organization_id = account.organization_id
-        AND credential.integration_account_id = account.id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = config.organization_id
-       WHERE config.organization_id = $1::uuid
-         AND account.global_id = $2
-         AND account.integration_type = 'commerce'
-         AND account.provider = 'shopify'
-       FOR UPDATE OF config, account, credential, activation`,
-      [input.organizationId, input.accountGlobalId],
-    )
-    const current = facts.rows[0]
-    if (!current) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_CONFIG_NOT_FOUND',
-        'Registered Shopify CarrierService configuration was not found',
-        404,
-      )
-    }
-    if (Number(current.row_version) !== input.expectedRowVersion) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_VERSION_CONFLICT',
-        'CarrierService configuration changed. Refresh and try again.',
-        409,
-      )
-    }
-    if (
-      current.activation_state !== 'active'
-      || current.activation_revision !== input.expectedActivationRevision
-    ) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_ACTIVATION_DRIFT',
-        'Operations Active authority changed. Refresh and review the current state.',
-        409,
-      )
-    }
-    if (
-      current.registration_state !== 'registered'
-      || !current.service_gid
-      || !SHOPIFY_SERVICE_GID.test(current.service_gid)
-      || current.account_environment !== 'sandbox'
-      || current.account_status !== 'active'
-      || current.verification_status !== 'verified'
-      || current.credential_generation
-        !== current.account_credential_generation
-      || current.credential_generation !== current.credential_version
-    ) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_NOT_ELIGIBLE',
-        'The exact registered and verified Shopify CarrierService is not eligible for a local authority repair',
-        409,
-      )
-    }
-    if (
-      current.config_activation_revision === current.activation_revision
-    ) {
-      if (current.callback_ready !== true) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_READINESS_FAILED',
-          'The Shopify CarrierService has another callback-readiness error',
-          409,
-        )
-      }
-      return readConfigWithClient(client, input)
-    }
-    const sourceTransition = await client.query<{
-      global_id: string
-    }>(
-      `SELECT transition.global_id
-       FROM operations_commerce_active_transitions transition
-       JOIN operations_commerce_active_transition_preparations prepared
-         ON prepared.organization_id = transition.organization_id
-        AND prepared.id = transition.preparation_id
-       CROSS JOIN LATERAL jsonb_array_elements(prepared.cohort)
-         AS cohort(member)
-       WHERE transition.organization_id = $1::uuid
-         AND transition.from_activation_state = 'shadow'
-         AND transition.to_activation_state = 'active'
-         AND transition.from_activation_revision = $2
-         AND transition.to_activation_revision = $3
-         AND (cohort.member->>'accountId')::uuid = $4::uuid
-         AND cohort.member->>'accountGlobalId' = $5
-         AND cohort.member->>'provider' = 'shopify'
-         AND (cohort.member->>'credentialGeneration')::integer = $6
-         AND cohort.member->'writeCapabilities'
-           ? 'shipping_rate_callbacks'
-         AND operations_commerce_active_capability_claim_is_current(
-           transition.organization_id,
-           transition.id,
-           $5,
-           'shipping_rate_callbacks'
-         )
-       ORDER BY transition.activated_at DESC
-       LIMIT 1`,
-      [
-        input.organizationId,
-        current.config_activation_revision,
-        current.activation_revision,
-        current.integration_account_id,
-        input.accountGlobalId,
-        current.credential_generation,
-      ],
-    )
-    const transition = sourceTransition.rows[0]
-    if (!transition) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_TRANSITION_REQUIRED',
-        'No exact current Active transition authorizes this Shopify callback revision repair',
-        409,
-      )
-    }
-    const unsafeAuthorization = await client.query<{ global_id: string }>(
-      `SELECT authorized_mutation.global_id
-       FROM operations_shopify_carrier_service_mutation_authorizations
-         authorized_mutation
-       LEFT JOIN operations_shopify_carrier_service_mutation_attempts attempt
-         ON attempt.organization_id = authorized_mutation.organization_id
-        AND attempt.authorization_id = authorized_mutation.id
-       LEFT JOIN operations_shopify_carrier_service_mutation_outcomes outcome
-         ON outcome.organization_id = attempt.organization_id
-        AND outcome.attempt_id = attempt.id
-       LEFT JOIN operations_shopify_carrier_service_mutation_resolutions
-         resolution
-         ON resolution.organization_id = attempt.organization_id
-        AND resolution.attempt_id = attempt.id
-       WHERE authorized_mutation.organization_id = $1::uuid
-         AND authorized_mutation.config_id = $2::uuid
-         AND authorized_mutation.config_row_version = $3::bigint
-         AND (
-           (
-             outcome.outcome = 'failed'
-             AND outcome.provider_write_count = 0
-           )
-           OR resolution.disposition = 'confirmed_not_applied'
-           OR (
-             attempt.id IS NULL
-             AND authorized_mutation.expires_at <= now()
-           )
-         ) IS NOT TRUE
-       LIMIT 1`,
-      [input.organizationId, current.config_id, current.row_version],
-    )
-    if (unsafeAuthorization.rows[0]) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_MUTATION_UNRESOLVED',
-        'Resolve the current Shopify CarrierService provider mutation before repairing Active callback authority',
-        409,
-      )
-    }
-    const updated = await client.query<{
-      activation_revision: number
-      row_version: string
-    }>(
-      `UPDATE operations_shopify_carrier_service_configs
-       SET activation_revision = $3,
-           row_version = row_version + 1,
-           updated_by = $4,
-           updated_at = now()
-       WHERE organization_id = $1::uuid
-         AND id = $2::uuid
-         AND registration_state = 'registered'
-         AND service_gid = $5
-         AND credential_generation = $6
-         AND activation_revision = $7
-         AND callback_token_version = $8
-         AND row_version = $9::bigint
-       RETURNING activation_revision, row_version::text`,
-      [
-        input.organizationId,
-        current.config_id,
-        current.activation_revision,
-        input.actorEmail,
-        current.service_gid,
-        current.credential_generation,
-        current.config_activation_revision,
-        current.callback_token_version,
-        input.expectedRowVersion,
-      ],
-    )
-    if (
-      updated.rows[0]?.activation_revision !== current.activation_revision
-      || Number(updated.rows[0]?.row_version) !== input.expectedRowVersion + 1
-    ) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_VERSION_CONFLICT',
-        'CarrierService configuration changed during Active authority repair',
-        409,
-      )
-    }
-    const rebound = await readConfigWithClient(client, input)
-    if (!rebound?.ready) {
-      fail(
-        'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_READINESS_FAILED',
-        'The Shopify CarrierService did not become callback-ready after its local authority repair',
-        409,
-      )
-    }
-    await recordAuditEvent({
-      actor: input.actorEmail,
-      eventType:
-        'operations.shopify_carrier_service.activation_revision_rebound',
-      aggregateType: 'operations.shopify_carrier_service_config',
-      aggregateId: current.config_global_id,
-      subject: input.accountGlobalId,
-      organizationId: input.organizationId,
-      eventKey:
-        'operations:shopify-carrier-service:' + current.config_global_id
-        + ':active-revision:' + current.activation_revision,
-      payload: {
-        transitionGlobalId: transition.global_id,
-        accountGlobalId: input.accountGlobalId,
-        serviceGid: current.service_gid,
-        fromActivationRevision: current.config_activation_revision,
-        activationRevision: current.activation_revision,
-        fromRowVersion: input.expectedRowVersion,
-        rowVersion: rebound.rowVersion,
-        callbackTokenVersionRetained: current.callback_token_version,
-        providerWrites: 0,
-        callbackTokenRotations: 0,
-        repair: true,
-      },
-    }, client)
-    return rebound
-  })
-}
-
 export async function upsertShopifyCarrierServiceConfigInPostgres(
   rawInput: ShopifyCarrierServiceConfigWriteInput,
 ) {
@@ -3192,18 +2773,13 @@ export async function upsertShopifyCarrierServiceConfigInPostgres(
       || account.credential_version !== input.credentialGeneration
       || account.verification_status !== 'verified'
       || account.activation_revision !== input.activationRevision
-      || !['shadow', 'active'].includes(account.activation_state)
+      || ![
+        'disabled', 'shadow', 'read_only', 'active', 'frozen',
+      ].includes(account.activation_state)
     ) {
       fail(
         'SHOPIFY_CHECKOUT_CONFIG_FENCE_STALE',
         'Shopify credential or Operations activation changed',
-        409,
-      )
-    }
-    if (account.account_environment !== 'sandbox') {
-      fail(
-        'SHOPIFY_CHECKOUT_SANDBOX_REQUIRED',
-        'This development CarrierService callback supports sandbox Shopify accounts only',
         409,
       )
     }
@@ -3630,7 +3206,10 @@ export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres
       service_gid: string | null
       activation_revision: number
       current_activation_revision: number
-      activation_state: 'shadow' | 'active'
+      activation_state:
+        | 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+      policy_snapshot: Record<string, unknown>
+      account_environment: 'mock' | 'sandbox' | 'production'
       warehouse_global_id: string
     }>(
       `SELECT
@@ -3642,6 +3221,8 @@ export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres
          config.activation_revision,
          activation.revision AS current_activation_revision,
          activation.state AS activation_state,
+         config.policy_snapshot,
+         account.environment AS account_environment,
          warehouse.global_id AS warehouse_global_id
        FROM operations_shopify_carrier_service_configs config
        JOIN operations_integration_accounts account
@@ -3690,15 +3271,6 @@ export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres
       fail(
         'SHOPIFY_CHECKOUT_REGISTERED_BINDING_UPDATE_REQUIRED',
         'Only an exactly registered Shopify CarrierService can rotate carrier accounts without a provider mutation',
-        409,
-      )
-    }
-    if (
-      current.activation_revision !== current.current_activation_revision
-    ) {
-      fail(
-        'SHOPIFY_CHECKOUT_CONFIG_FENCE_STALE',
-        'Operations activation changed before the carrier-account rotation',
         409,
       )
     }
@@ -3924,12 +3496,16 @@ export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres
         }))),
       ],
     )
-    const applicableEnvironment = current.activation_state === 'active'
-      ? 'production'
-      : 'sandbox'
+    const applicableEnvironment = readShopifyCheckoutRateControl(
+      current.policy_snapshot,
+      {
+        activationState: current.activation_state,
+        accountEnvironment: current.account_environment,
+      },
+    ).rateSource
     const applicableReadiness = await client.query<{ ready: boolean }>(
       `SELECT
-         operations_shopify_carrier_service_config_environment_is_ready(
+         operations_shopify_carrier_service_rating_environment_is_ready(
            $1::uuid, $2::uuid, $3
          ) AS ready`,
       [input.organizationId, current.id, applicableEnvironment],
@@ -3937,9 +3513,7 @@ export async function updateRegisteredShopifyCarrierServiceRateSourcesInPostgres
     if (applicableReadiness.rows[0]?.ready !== true) {
       fail(
         'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_NOT_READY',
-        current.activation_state === 'active'
-          ? 'Keep one through eight verified LIVE rating accounts ready for the current Active callback before saving carrier bindings'
-          : 'Keep one through eight verified TEST rating accounts ready for the current Shadow callback before saving carrier bindings',
+        `Keep one through eight verified ${applicableEnvironment === 'production' ? 'LIVE' : 'TEST'} rating accounts ready for the saved checkout source before saving carrier bindings`,
         409,
       )
     }
@@ -4117,15 +3691,13 @@ export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(
       )
     }
     if (
-      current.activation_state !== 'shadow'
-      || current.account_environment !== 'sandbox'
-      || current.account_status !== 'active'
+      current.account_status !== 'active'
       || current.verification_status !== 'verified'
       || current.credential_version !== current.credential_generation
     ) {
       fail(
-        'SHOPIFY_CHECKOUT_POLICY_SHADOW_REQUIRED',
-        'A verified sandbox Shopify account in Operations Shadow is required',
+        'SHOPIFY_CHECKOUT_POLICY_CONNECTION_REQUIRED',
+        'A current verified Shopify connection is required',
         409,
       )
     }
@@ -4200,10 +3772,10 @@ export async function updateShopifyCarrierServicePlanRatePolicyInPostgres(
 }
 
 /**
- * Updates only the customer-neutral tenant rate-warming policy. Enabling is
- * constrained below to a verified sandbox account while Operations is in
- * Shadow; the storefront app proxy separately restricts reads to an exact
- * Shopify Customer GID with a simulated Checkout audience policy.
+ * Updates only the desired customer-neutral tenant rate-warming policy.
+ * Runtime effectiveness is fenced independently by checkoutRateControl,
+ * callback readiness, the customer policy for restricted audiences, and the
+ * Disabled/Frozen emergency overrides.
  */
 export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
   rawInput: ShopifyCarrierServiceRateWarmPolicyWriteInput,
@@ -4300,18 +3872,22 @@ export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
       )
     }
     if (
-      current.activation_state !== 'shadow'
-      || current.account_environment !== 'sandbox'
-      || current.account_status !== 'active'
+      current.account_status !== 'active'
       || current.verification_status !== 'verified'
       || current.credential_version !== current.credential_generation
     ) {
       fail(
-        'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
-        'A verified sandbox Shopify account in Operations Shadow is required',
+        'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_CONNECTION_REQUIRED',
+        'A current verified Shopify connection is required',
         409,
       )
     }
+    readShopifyCheckoutRateControl(current.policy_snapshot, {
+      activationState: current.activation_state as
+        | 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen',
+      accountEnvironment: current.account_environment as
+        | 'mock' | 'sandbox' | 'production',
+    })
     const policySnapshot = {
       ...current.policy_snapshot,
       checkoutRateWarm: input.checkoutRateWarm,
@@ -4380,6 +3956,526 @@ export async function updateShopifyCarrierServiceRateWarmPolicyInPostgres(
       },
     }, client)
     return readConfigWithClient(client, input)
+  })
+}
+
+/**
+ * Updates only the Shadow checkout audience. This changes no Shopify
+ * resource, callback URL, carrier binding, warehouse, or package material.
+ * All-eligible Shadow checkout publishing is intentionally limited to a
+ * verified sandbox store connection so sandbox carrier rates cannot be
+ * exposed to customers of a production store by accident.
+ */
+export async function updateShopifyCarrierServiceAudiencePolicyInPostgres(
+  rawInput: ShopifyCarrierServiceAudiencePolicyWriteInput,
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    shadowCheckoutAudience: normalizeShopifyCheckoutAudiencePolicy(
+      rawInput.shadowCheckoutAudience,
+    ),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-config:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const currentResult = await client.query<{
+      id: string
+      global_id: string
+      row_version: string
+      policy_revision: string
+      policy_hash: string
+      policy_snapshot: Record<string, unknown>
+      registration_state: ShopifyCarrierServiceRegistrationState
+      service_gid: string | null
+      callback_token_version: number
+      activation_state: string
+      account_environment: string
+      account_status: string
+      credential_generation: number
+      credential_version: number | null
+      verification_status: string | null
+    }>(
+      `SELECT
+         config.id::text,
+         config.global_id,
+         config.row_version::text,
+         config.policy_revision::text,
+         config.policy_hash,
+         config.policy_snapshot,
+         config.registration_state,
+         config.service_gid,
+         config.callback_token_version,
+         activation.state AS activation_state,
+         account.environment AS account_environment,
+         account.status AS account_status,
+         account.commerce_credential_generation AS credential_generation,
+         credential.credential_version,
+         credential.verification_status
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = config.organization_id
+       LEFT JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       FOR UPDATE OF config, account, activation`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+        'Save the Shopify checkout-rating configuration first',
+        404,
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.activation_state !== 'shadow'
+      || current.account_status !== 'active'
+      || current.verification_status !== 'verified'
+      || current.credential_version !== current.credential_generation
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_AUDIENCE_SHADOW_REQUIRED',
+        'A verified Shopify connection in Operations Shadow is required',
+        409,
+      )
+    }
+    if (
+      input.shadowCheckoutAudience.mode === 'all_eligible'
+      && current.account_environment !== 'sandbox'
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_AUDIENCE_SANDBOX_REQUIRED',
+        'All eligible Shadow checkouts require a sandbox Shopify store connection',
+        409,
+      )
+    }
+    const policySnapshot = {
+      ...current.policy_snapshot,
+      shadowCheckoutAudience: input.shadowCheckoutAudience,
+    }
+    assertShopifyCheckoutCustomerNeutralEvidence(
+      policySnapshot,
+      'CarrierService policy snapshot',
+    )
+    const policyHash = shopifyCheckoutRatingHash(policySnapshot)
+    const updated = await client.query<{
+      row_version: string
+      policy_revision: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_revision = policy_revision + 1,
+           policy_hash = $3,
+           policy_snapshot = $4::jsonb,
+           row_version = row_version + 1,
+           updated_by = $5,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $6
+       RETURNING row_version::text, policy_revision::text`,
+      [
+        input.organizationId,
+        current.id,
+        policyHash,
+        JSON.stringify(policySnapshot),
+        input.actorEmail,
+        input.expectedRowVersion,
+      ],
+    )
+    if (!updated.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.checkout_audience_updated',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: current.global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${current.global_id}:`
+        + `checkout-audience:${updated.rows[0].policy_revision}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        priorPolicyRevision: Number(current.policy_revision),
+        policyRevision: Number(updated.rows[0].policy_revision),
+        priorPolicyHash: current.policy_hash,
+        policyHash,
+        mode: input.shadowCheckoutAudience.mode,
+        registrationState: current.registration_state,
+        providerRegistrationRetained: true,
+        serviceGidRetained: current.service_gid,
+        callbackTokenVersionRetained: current.callback_token_version,
+        callbackTokenHashRetained: true,
+        providerWrites: 0,
+        rowVersion: Number(updated.rows[0].row_version),
+      },
+    }, client)
+    return readConfigWithClient(client, input)
+  })
+}
+
+/**
+ * Changes only the account-level checkout audience and carrier-rate source.
+ * This command is independent of Shadow/Active, performs no provider write,
+ * and is replayed by an immutable request-hash receipt. Disabled/Frozen are
+ * runtime overrides, not configuration-editing requirements.
+ */
+export async function updateShopifyCarrierServiceRateControlInPostgres(
+  rawInput: ShopifyCarrierServiceRateControlWriteInput,
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedConfigGlobalId: matchValue(
+      rawInput.expectedConfigGlobalId,
+      CONFIG_GLOBAL_ID,
+      'Shopify CarrierService config Global ID',
+    ),
+    expectedRowVersion: integer(
+      rawInput.expectedRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    expectedPolicyRevision: integer(
+      rawInput.expectedPolicyRevision,
+      'Configuration policy revision',
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    checkoutRateControl: normalizeShopifyCheckoutRateControl(
+      rawInput.checkoutRateControl,
+    ),
+    idempotencyKey: textValue(
+      rawInput.idempotencyKey,
+      'Idempotency key',
+      200,
+    ),
+    reason: textValue(rawInput.reason, 'Change reason', 500),
+    actorEmail: textValue(rawInput.actorEmail, 'Actor email', 320),
+  }
+  if (
+    input.idempotencyKey.length < 8
+    || !/^[A-Za-z0-9._:-]+$/.test(input.idempotencyKey)
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_INVALID',
+      'Idempotency-Key must be 8-200 URL-safe characters',
+    )
+  }
+  if (input.reason.length < 3) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_REASON_REQUIRED',
+      'A change reason of at least 3 characters is required',
+    )
+  }
+  const requestHash = shopifyCheckoutRatingHash({
+    version: 'shopify-checkout-rate-control-command-v2',
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    expectedConfigGlobalId: input.expectedConfigGlobalId,
+    expectedRowVersion: input.expectedRowVersion,
+    expectedPolicyRevision: input.expectedPolicyRevision,
+    checkoutRateControl: input.checkoutRateControl,
+    reason: input.reason,
+    actorEmail: input.actorEmail,
+  })
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-carrier-service-config:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const currentResult = await client.query<{
+      id: string
+      global_id: string
+      integration_account_id: string
+      row_version: string
+      policy_revision: string
+      policy_hash: string
+      policy_snapshot: Record<string, unknown>
+      registration_state: ShopifyCarrierServiceRegistrationState
+      service_gid: string | null
+      callback_token_version: number
+      activation_state:
+        | 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+      account_environment: 'mock' | 'sandbox' | 'production'
+      account_status: string
+      credential_generation: number
+      credential_version: number | null
+      verification_status: string | null
+    }>(
+      `SELECT
+         config.id::text,
+         config.global_id,
+         config.integration_account_id::text,
+         config.row_version::text,
+         config.policy_revision::text,
+         config.policy_hash,
+         config.policy_snapshot,
+         config.registration_state,
+         config.service_gid,
+         config.callback_token_version,
+         activation.state AS activation_state,
+         account.environment AS account_environment,
+         account.status AS account_status,
+         account.commerce_credential_generation AS credential_generation,
+         credential.credential_version,
+         credential.verification_status
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = config.organization_id
+       LEFT JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       FOR UPDATE OF config, account, activation`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const current = currentResult.rows[0]
+    if (!current) {
+      fail(
+        'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+        'Save the Shopify checkout-rating configuration first',
+        404,
+      )
+    }
+    const replay = await client.query<{
+      request_hash: string
+      response_json: unknown
+    }>(
+      `SELECT request_hash, response_json
+       FROM operations_shopify_checkout_rate_control_receipts
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND idempotency_key = $3
+       FOR SHARE`,
+      [
+        input.organizationId,
+        current.integration_account_id,
+        input.idempotencyKey,
+      ],
+    )
+    if (replay.rows[0]) {
+      if (replay.rows[0].request_hash !== requestHash) {
+        fail(
+          'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_CONFLICT',
+          'Idempotency-Key was already used for a different control change',
+          409,
+        )
+      }
+      return normalizeShopifyCarrierServiceRateControlCommandResult(
+        replay.rows[0].response_json,
+      )
+    }
+    if (current.global_id !== input.expectedConfigGlobalId) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_IDENTITY_CONFLICT',
+        'CarrierService configuration identity changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (Number(current.policy_revision) !== input.expectedPolicyRevision) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_POLICY_REVISION_CONFLICT',
+        'CarrierService policy changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (
+      current.account_status !== 'active'
+      || current.verification_status !== 'verified'
+      || current.credential_version !== current.credential_generation
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_RATE_CONTROL_CONNECTION_REQUIRED',
+        'A current verified Shopify connection is required',
+        409,
+      )
+    }
+    const priorControl = readShopifyCheckoutRateControl(
+      current.policy_snapshot,
+      {
+        activationState: current.activation_state,
+        accountEnvironment: current.account_environment,
+      },
+    )
+    const policySnapshot = {
+      ...current.policy_snapshot,
+      checkoutRateControl: input.checkoutRateControl,
+      // Rolling compatibility for older setup readers only. Runtime callback
+      // code uses checkoutRateControl exclusively after migration 0299.
+      shadowCheckoutAudience: {
+        version: 'shopify-checkout-audience-v1',
+        mode: input.checkoutRateControl.audience,
+      },
+    }
+    assertShopifyCheckoutCustomerNeutralEvidence(
+      policySnapshot,
+      'CarrierService policy snapshot',
+    )
+    const policyHash = shopifyCheckoutRatingHash(policySnapshot)
+    const updated = await client.query<{
+      row_version: string
+      policy_revision: string
+    }>(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_revision = policy_revision + 1,
+           policy_hash = $3,
+           policy_snapshot = $4::jsonb,
+           row_version = row_version + 1,
+           updated_by = $5,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $6
+         AND global_id = $7
+         AND policy_revision = $8
+       RETURNING row_version::text, policy_revision::text`,
+      [
+        input.organizationId,
+        current.id,
+        policyHash,
+        JSON.stringify(policySnapshot),
+        input.actorEmail,
+        input.expectedRowVersion,
+        input.expectedConfigGlobalId,
+        input.expectedPolicyRevision,
+      ],
+    )
+    if (!updated.rows[0]) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
+        'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    const response: ShopifyCarrierServiceRateControlCommandResult = {
+      version: SHOPIFY_CHECKOUT_RATE_CONTROL_COMMAND_RESULT_VERSION,
+      accountGlobalId: input.accountGlobalId,
+      configGlobalId: current.global_id,
+      idempotencyKey: input.idempotencyKey,
+      requestHash,
+      checkoutRateControl: input.checkoutRateControl,
+      rowVersion: Number(updated.rows[0].row_version),
+      policyRevision: Number(updated.rows[0].policy_revision),
+      providerWrites: 0,
+    }
+    const receipt = await client.query<{ id: string }>(
+      `INSERT INTO operations_shopify_checkout_rate_control_receipts (
+         organization_id, integration_account_id, config_id,
+         idempotency_key, request_hash, expected_row_version,
+         prior_control, requested_control, resulting_row_version,
+         resulting_policy_revision, response_json, reason, actor_email
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6,
+         $7::jsonb, $8::jsonb, $9, $10, $11::jsonb, $12, $13
+       )
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        current.integration_account_id,
+        current.id,
+        input.idempotencyKey,
+        requestHash,
+        input.expectedRowVersion,
+        JSON.stringify(priorControl),
+        JSON.stringify(input.checkoutRateControl),
+        Number(updated.rows[0].row_version),
+        Number(updated.rows[0].policy_revision),
+        JSON.stringify(response),
+        input.reason,
+        input.actorEmail,
+      ],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.shopify_carrier_service.checkout_rate_control_updated',
+      aggregateType: 'operations.shopify_carrier_service_config',
+      aggregateId: current.global_id,
+      subject: input.accountGlobalId,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:shopify-carrier-service:${current.global_id}:`
+        + `checkout-rate-control:${receipt.rows[0].id}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        priorPolicyRevision: Number(current.policy_revision),
+        policyRevision: Number(updated.rows[0].policy_revision),
+        priorPolicyHash: current.policy_hash,
+        policyHash,
+        priorControl,
+        checkoutRateControl: input.checkoutRateControl,
+        reason: input.reason,
+        registrationState: current.registration_state,
+        providerRegistrationRetained: true,
+        serviceGidRetained: current.service_gid,
+        callbackTokenVersionRetained: current.callback_token_version,
+        providerWrites: 0,
+        rowVersion: Number(updated.rows[0].row_version),
+      },
+    }, client)
+    return response
   })
 }
 
@@ -4493,8 +4589,7 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
     if (
       ['shadow_simulated', 'registered'].includes(input.registrationState)
       && (
-        current.accountEnvironment !== 'sandbox'
-        || current.carriers.length < 1
+        current.carriers.length < 1
         || current.carriers.length
           > MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS
         || new Set(current.carriers.map(
@@ -4550,9 +4645,9 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
         409,
       )
     }
-    const expectedCarrierEnvironment = currentActivation.state === 'active'
-      ? 'production'
-      : 'sandbox'
+    const expectedCarrierEnvironment = normalizeShopifyCheckoutRateControl(
+      current.policySnapshot.checkoutRateControl,
+    ).rateSource
     if (
       ['shadow_simulated', 'registered'].includes(input.registrationState)
       && current.carriers.filter(
@@ -4561,7 +4656,7 @@ export async function finalizeShopifyCarrierServiceRegistrationInPostgres(
     ) {
       fail(
         'SHOPIFY_CHECKOUT_CARRIER_ENVIRONMENT_INVALID',
-        `Operations ${currentActivation.state} requires at least one explicitly selected ${expectedCarrierEnvironment} carrier rating account`,
+        `The saved checkout source requires at least one explicitly selected ${expectedCarrierEnvironment} carrier rating account`,
         409,
       )
     }
@@ -4702,7 +4797,7 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
        ON activation.organization_id = config.organization_id
      WHERE account.global_id = $1
        AND config.callback_token_hash = $2
-       AND account.environment = 'sandbox'
+       AND account.environment IN ('sandbox', 'production')
        AND COALESCE(
          NULLIF(
            regexp_replace(
@@ -4745,7 +4840,7 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
            AND config.registration_state = 'shadow_simulated'
          )
        )
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_carrier_service_rating_runtime_is_ready(
          config.organization_id, config.id
        )
      LIMIT 1`,
@@ -4783,6 +4878,13 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
     policyRevision: Number(row.policy_revision),
     policyHash: row.policy_hash,
     policySnapshot: row.policy_snapshot,
+    checkoutRateControl: readShopifyCheckoutRateControl(
+      row.policy_snapshot,
+      {
+        activationState: row.activation_state,
+        accountEnvironment: row.environment,
+      },
+    ),
     warehouseId: row.warehouse_id,
     warehouseGlobalId: row.warehouse_global_id,
     warehouseName: row.warehouse_name,
@@ -4798,6 +4900,147 @@ export async function lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres(
   }
 }
 
+/**
+ * Authenticates the opaque callback token and reads only the policy fields
+ * needed by the Shadow audience kill switch. This intentionally does not use
+ * the full callback-readiness predicate: an audience set to Off must continue
+ * returning a successful empty-rate response while a warehouse, material,
+ * carrier, registration, or activation-revision readiness fence is repaired.
+ * All non-Off rating still goes through the separate strict account lookup.
+ */
+export async function lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres(
+  rawInput: {
+    accountGlobalId: string
+    callbackTokenHash: string
+  },
+): Promise<ShopifyCarrierServiceCallbackPolicyAccount | null> {
+  const input = {
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    callbackTokenHash: matchValue(
+      rawInput.callbackTokenHash,
+      SHA256,
+      'Callback token hash',
+    ),
+  }
+  const result = await query<{
+    organization_id: string
+    account_global_id: string
+    account_environment: 'mock' | 'sandbox' | 'production'
+    activation_state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
+    policy_snapshot: Record<string, unknown>
+  }>(
+    `SELECT
+       config.organization_id::text,
+       account.global_id AS account_global_id,
+       account.environment AS account_environment,
+       activation.state AS activation_state,
+       config.policy_snapshot
+     FROM operations_shopify_carrier_service_configs config
+     JOIN operations_integration_accounts account
+       ON account.organization_id = config.organization_id
+      AND account.id = config.integration_account_id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = config.organization_id
+     WHERE account.global_id = $1
+       AND config.callback_token_hash = $2
+       AND account.integration_type = 'commerce'
+       AND account.provider = 'shopify'
+     LIMIT 1`,
+    [input.accountGlobalId, input.callbackTokenHash],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const checkoutRateControl = readShopifyCheckoutRateControl(
+    row.policy_snapshot,
+    {
+      activationState: row.activation_state,
+      accountEnvironment: row.account_environment,
+    },
+  )
+  return {
+    organizationId: row.organization_id,
+    accountGlobalId: row.account_global_id,
+    environment: row.account_environment,
+    activationState: row.activation_state,
+    policySnapshot: row.policy_snapshot,
+    checkoutRateControl,
+  }
+}
+
+/**
+ * Rechecks the exact saved rating lane immediately before any downstream
+ * carrier request. A Disabled/Frozen emergency switch, Off audience, config
+ * revision, credential, origin, stock, or carrier-capability drift fails
+ * before a provider can be called.
+ */
+export async function assertShopifyCheckoutRatingRuntimeReadyInPostgres(
+  rawInput: {
+    organizationId: string
+    accountGlobalId: string
+    expectedConfigRowVersion: number
+    rateSource: ShopifyCheckoutRateSource
+  },
+) {
+  const input = {
+    organizationId: matchValue(
+      rawInput.organizationId,
+      UUID,
+      'Organization ID',
+    ),
+    accountGlobalId: matchValue(
+      rawInput.accountGlobalId,
+      ACCOUNT_GLOBAL_ID,
+      'Shopify account Global ID',
+    ),
+    expectedConfigRowVersion: integer(
+      rawInput.expectedConfigRowVersion,
+      'Configuration row version',
+      0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    rateSource: rawInput.rateSource,
+  }
+  if (!['sandbox', 'production'].includes(input.rateSource)) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_SOURCE_INVALID',
+      'Checkout rate source must be sandbox or production',
+    )
+  }
+  const result = await query<{ ready: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM operations_shopify_carrier_service_configs config
+       JOIN operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       WHERE config.organization_id = $1::uuid
+         AND account.global_id = $2
+         AND config.row_version = $3
+         AND config.policy_snapshot #>> '{checkoutRateControl,rateSource}' = $4
+         AND operations_shopify_carrier_service_rating_runtime_is_ready(
+           config.organization_id, config.id
+         )
+     ) AS ready`,
+    [
+      input.organizationId,
+      input.accountGlobalId,
+      input.expectedConfigRowVersion,
+      input.rateSource,
+    ],
+  )
+  if (result.rows[0]?.ready !== true) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATING_RUNTIME_NOT_READY',
+      'Checkout rating was paused or changed before the carrier request',
+      409,
+    )
+  }
+}
+
 const RECEIPT_SELECT = `SELECT
     receipt.id::text,
     receipt.global_id,
@@ -4810,6 +5053,7 @@ const RECEIPT_SELECT = `SELECT
     receipt.credential_generation,
     receipt.activation_state,
     receipt.activation_revision,
+    receipt.rate_source,
     receipt.policy_revision::text,
     receipt.policy_hash,
     receipt.warehouse_id::text,
@@ -5191,6 +5435,7 @@ async function receiptFromRow(
     credentialGeneration: row.credential_generation,
     activationState: row.activation_state,
     activationRevision: row.activation_revision,
+    rateSource: row.rate_source,
     policyRevision: Number(row.policy_revision),
     policyHash: row.policy_hash,
     warehouseId: row.warehouse_id,
@@ -5332,10 +5577,8 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
       : null
     if (
       !config
-      || !config.ready
-      || !['shadow_simulated', 'registered'].includes(
-        config.registrationState,
-      )
+      || !config.ratingRuntimeReady
+      || config.registrationState !== 'registered'
     ) {
       fail(
         'SHOPIFY_CHECKOUT_CONFIG_NOT_READY',
@@ -5350,14 +5593,28 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         409,
       )
     }
+    const checkoutRateControl = readShopifyCheckoutRateControl(
+      config.policySnapshot,
+      {
+        activationState: 'read_only',
+        accountEnvironment: config.accountEnvironment,
+      },
+    )
+    if (checkoutRateControl.rateSource !== input.rateSource) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONTEXT_STALE',
+        'Checkout carrier rate source changed before checkout claim',
+        409,
+      )
+    }
     const activationResult = await client.query<{
-      state: 'shadow' | 'active'
+      state: 'shadow' | 'read_only' | 'active'
       revision: number
     }>(
       `SELECT state, revision
        FROM operations_activation_scopes
        WHERE organization_id = $1::uuid
-         AND state IN ('shadow', 'active')
+         AND state IN ('shadow', 'read_only', 'active')
        FOR SHARE`,
       [input.organizationId],
     )
@@ -5365,17 +5622,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
     if (!activation) {
       fail(
         'SHOPIFY_CHECKOUT_ACTIVATION_NOT_READY',
-        'Operations must be in Shadow or Active for checkout rating',
-        409,
-      )
-    }
-    if (
-      activation.state !== input.expectedActivationState
-      || activation.revision !== input.expectedActivationRevision
-    ) {
-      fail(
-        'SHOPIFY_CHECKOUT_CONTEXT_STALE',
-        'Operations activation changed before checkout claim',
+        'Checkout rating is paused by the Operations emergency state',
         409,
       )
     }
@@ -5394,13 +5641,12 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          AND receipt.config_row_version = $6
          AND receipt.inventory_snapshot_hash = $7
          AND receipt.inventory_snapshot_at >= now() - make_interval(secs => $8)
-         AND receipt.activation_revision = $9
-         AND receipt.activation_state = $10
-         AND receipt.inventory_refresh_version = $12::bigint
+         AND receipt.rate_source = $9
+         AND receipt.inventory_refresh_version = $11::bigint
          AND (
-           receipt.idempotency_key = $11
-           OR left(receipt.idempotency_key, length($11) + 9)
-             = $11 || ':attempt:'
+           receipt.idempotency_key = $10
+           OR left(receipt.idempotency_key, length($10) + 9)
+             = $10 || ':attempt:'
          )
          AND receipt.status IN ('succeeded', 'failed')
          AND receipt.expires_at > now()
@@ -5416,8 +5662,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         config.rowVersion,
         input.inventorySnapshotHash,
         config.inventoryMaxAgeSeconds,
-        activation.revision,
-        activation.state,
+        input.rateSource,
         input.cacheKey,
         inventoryRefreshVersion,
       ],
@@ -5447,8 +5692,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         || Number(existing.rows[0].config_row_version)
           !== config.rowVersion
         || existing.rows[0].policy_hash !== config.policyHash
-        || existing.rows[0].activation_revision !== activation.revision
-        || existing.rows[0].activation_state !== activation.state
+        || existing.rows[0].rate_source !== input.rateSource
         || Number(existing.rows[0].inventory_refresh_version)
           !== inventoryRefreshVersion
       ) {
@@ -5525,13 +5769,12 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          AND receipt.config_id = $5::uuid
          AND receipt.config_row_version = $6
          AND receipt.inventory_snapshot_hash = $7
-         AND receipt.activation_revision = $8
-         AND receipt.activation_state = $9
-         AND receipt.inventory_refresh_version = $11::bigint
+         AND receipt.rate_source = $8
+         AND receipt.inventory_refresh_version = $10::bigint
          AND (
-           receipt.idempotency_key = $10
-           OR left(receipt.idempotency_key, length($10) + 9)
-             = $10 || ':attempt:'
+           receipt.idempotency_key = $9
+           OR left(receipt.idempotency_key, length($9) + 9)
+             = $9 || ':attempt:'
          )
          AND receipt.status = 'processing'
        ORDER BY receipt.created_at DESC, receipt.id DESC
@@ -5545,8 +5788,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         config.id,
         config.rowVersion,
         input.inventorySnapshotHash,
-        activation.revision,
-        activation.state,
+        input.rateSource,
         input.cacheKey,
         inventoryRefreshVersion,
       ],
@@ -5612,7 +5854,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
       `INSERT INTO operations_shopify_checkout_rate_receipts (
          organization_id, integration_account_id, config_id,
          config_row_version, credential_generation, activation_revision,
-         activation_state, policy_revision, policy_hash,
+         activation_state, rate_source, policy_revision, policy_hash,
          warehouse_id, algorithm_version,
          request_fingerprint, destination_fingerprint,
          line_quantity_fingerprint, request_evidence_hash,
@@ -5622,11 +5864,11 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
          inventory_snapshot_at, carrier_destination_fingerprint,
          inventory_refresh_version
        ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9,
-         $10::uuid, $11, $12, $13, $14, $15, $16::jsonb, $17, $18,
-         'processing', $19::uuid,
-         now() + make_interval(secs => $20), $21, $22, $23,
-         $24::timestamptz, $25, $26::bigint
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
+         $11::uuid, $12, $13, $14, $15, $16, $17::jsonb, $18, $19,
+         'processing', $20::uuid,
+         now() + make_interval(secs => $21), $22, $23, $24,
+         $25::timestamptz, $26, $27::bigint
        )
        RETURNING id::text, global_id`,
       [
@@ -5637,6 +5879,7 @@ async function claimShopifyCheckoutRateReceiptOnceInPostgres(
         config.credentialGeneration,
         activation.revision,
         activation.state,
+        input.rateSource,
         config.policyRevision,
         config.policyHash,
         config.warehouseId,
@@ -6267,12 +6510,10 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
          AND receipt.lease_expires_at > now()
          AND receipt.config_row_version = config.row_version
          AND receipt.policy_hash = config.policy_hash
-         AND receipt.activation_revision = activation.revision
-         AND receipt.activation_state = activation.state
          AND receipt.inventory_snapshot_at >= now() - make_interval(
            secs => config.inventory_max_age_seconds
          )
-         AND operations_shopify_carrier_service_config_is_ready(
+         AND operations_shopify_carrier_service_rating_runtime_is_ready(
            config.organization_id, config.id
          )
        FOR UPDATE OF receipt`,
@@ -6608,12 +6849,10 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
          AND activation.organization_id = receipt.organization_id
          AND receipt.config_row_version = config.row_version
          AND receipt.policy_hash = config.policy_hash
-         AND receipt.activation_revision = activation.revision
-         AND receipt.activation_state = activation.state
          AND receipt.inventory_snapshot_at >= now() - make_interval(
            secs => config.inventory_max_age_seconds
          )
-         AND operations_shopify_carrier_service_config_is_ready(
+         AND operations_shopify_carrier_service_rating_runtime_is_ready(
            config.organization_id, config.id
          )
        RETURNING receipt.global_id`,
@@ -6841,10 +7080,8 @@ export async function readCachedShopifyCheckoutRateReceiptInPostgres(
        AND receipt.config_id = current_config.id
        AND receipt.config_row_version = current_config.row_version
        AND receipt.policy_hash = current_config.policy_hash
-       AND receipt.activation_revision = current_activation.revision
-       AND receipt.activation_state = current_activation.state
        AND receipt.inventory_refresh_version = $6::bigint
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_carrier_service_rating_runtime_is_ready(
          current_config.organization_id, current_config.id
        )
      ORDER BY receipt.completed_at DESC, receipt.id

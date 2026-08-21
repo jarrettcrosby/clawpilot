@@ -57,6 +57,11 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
       return nodeRequire(specifier)
     },
   }
@@ -193,7 +198,7 @@ includes(receiptFunction, [
   'credential.external_account_id = account.external_account_id',
   "credential.auth_mode = 'shopify_client_credentials'",
   "credential.webhook_verification_status = 'verified'",
-  "activation.state IN ('shadow', 'active')",
+  'operations_commerce_store_sync_is_running(',
   'ORDER BY receipt.received_at, receipt.id',
   'runtime.credentialVersion !== candidate.credential_version',
   "current.webhook_verification_status !== 'verified'",
@@ -201,14 +206,14 @@ includes(receiptFunction, [
 ], 'Atomic Shopify delete image reconciliation')
 assert.match(
   receiptFunction,
-  /If the catalog worker is disabled while activation alone resumes,[\s\S]*?immutable receipt intentionally remains held/,
-  'Worker-disabled activation resume must document the durable safe-hold state',
+  /If the catalog worker is disabled while Store sync alone resumes,[\s\S]*?immutable receipt intentionally remains held/,
+  'Worker-disabled Store sync resume must document the durable safe-hold state',
 )
 
 const receiptTrace = []
 let replayExistingReceipt = false
 let existingReceiptState = 'succeeded'
-let activationState = 'shadow'
+let storeSyncRunning = true
 let receiptIntakeEnabled = true
 let heldReplayCandidatesEnabled = false
 let replayDecryptionMode = 'valid'
@@ -308,7 +313,10 @@ const receiptPersistenceModule = loadTypeScriptModule(
               sql,
               /credential\.webhook_verification_status = 'verified'/,
             )
-            assert.match(sql, /activation\.state IN \('shadow', 'active'\)/)
+            assert.match(
+              sql,
+              /operations_commerce_store_sync_is_running\(account\.organization_id, account\.id\)/,
+            )
             assert.match(sql, /ORDER BY receipt\.received_at, receipt\.id/)
             return {
               rowCount: 1,
@@ -413,13 +421,12 @@ const receiptPersistenceModule = loadTypeScriptModule(
                   }],
                 }
               }
-              if (
-                sql.includes('FROM operations_activation_scopes')
-                && sql.includes('FOR SHARE')
-              ) {
+              if (sql.includes(
+                'SELECT operations_commerce_store_sync_is_running(',
+              )) {
                 return {
                   rowCount: 1,
-                  rows: [{ state: activationState }],
+                  rows: [{ running: storeSyncRunning }],
                 }
               }
               if (
@@ -576,6 +583,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(firstImageDelete)), {
   observedAt: durableReceiptObservedAt,
   providerUpdatedAt: exactDeletion.providerUpdatedAt,
   actorEmail: 'owner@example.com',
+  providerReadAuthority: 'automatic',
 })
 
 replayExistingReceipt = false
@@ -747,15 +755,20 @@ assert.equal(
 )
 
 let workerDisabledHeldReceipt = null
-for (const pausedActivation of ['read_only', 'frozen', 'disabled']) {
+for (const pausedContext of [
+  'explicit-paused-shadow',
+  'explicit-paused-read-only',
+  'disabled-override',
+  'frozen-override',
+]) {
   replayExistingReceipt = false
-  activationState = pausedActivation
+  storeSyncRunning = false
   receiptIntakeEnabled = true
   const traceBeforeHeld = receiptTrace.length
   const heldReceipt = await receiptPersistenceModule
     .recordShopifyWebhookReceiptInPostgres({
       ...receiptInput,
-      providerEventId: `event-held-${pausedActivation}-123456789`,
+      providerEventId: `event-held-${pausedContext}-123456789`,
     })
   assert.equal(heldReceipt.duplicate, false)
   assert.equal(heldReceipt.productDeletionHeld, true)
@@ -768,25 +781,25 @@ for (const pausedActivation of ['read_only', 'frozen', 'disabled']) {
   assert.equal(
     heldTrace.some((entry) => entry.kind === 'image_delete'),
     false,
-    `Activation ${pausedActivation} must not mutate image bindings`,
+    `Store sync context ${pausedContext} must not mutate image bindings`,
   )
   assert.equal(
     heldTrace.some((entry) => entry.kind === 'catalog_signal'),
     false,
-    `Activation ${pausedActivation} must not advance the dirty watermark`,
+    `Store sync context ${pausedContext} must not advance the dirty watermark`,
   )
 }
 
 const traceAtWorkerDisabledResume = receiptTrace.length
-activationState = 'active'
+storeSyncRunning = true
 assert.equal(workerDisabledHeldReceipt?.productDeletionHeld, true)
 assert.equal(
   receiptTrace.length,
   traceAtWorkerDisabledResume,
-  'Activation resume alone cannot consume the held receipt when the catalog worker is disabled',
+  'Store sync resume alone cannot consume the held receipt when the catalog worker is disabled',
 )
 
-activationState = 'shadow'
+storeSyncRunning = true
 receiptIntakeEnabled = false
 replayExistingReceipt = false
 const traceBeforeIntakePause = receiptTrace.length
@@ -803,7 +816,7 @@ assert.equal(
 )
 
 receiptIntakeEnabled = true
-activationState = 'active'
+storeSyncRunning = true
 replayExistingReceipt = true
 existingReceiptState = 'held'
 const traceBeforeHeldReplay = receiptTrace.length

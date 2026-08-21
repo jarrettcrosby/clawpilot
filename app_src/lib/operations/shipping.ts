@@ -21,6 +21,8 @@ export type ShippingRecord = {
   trackingNumbers: string[]
   handlingUnitCount: number
   executionMode: 'test' | 'live' | null
+  standaloneOneOffPackEligible: boolean
+  standaloneOneOffExecutionEligible: boolean
   occurredAt: string
 }
 
@@ -29,7 +31,7 @@ export type ShippingWorkspace = {
   capabilities: {
     canView: boolean
     canCreate: boolean
-    canActivate: boolean
+    canPurchaseLivePostage: boolean
   }
   records: ShippingRecord[]
   pickupAvailability: {

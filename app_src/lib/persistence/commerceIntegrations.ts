@@ -8,6 +8,7 @@ import {
   SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   faireFulfillmentWriteReadiness,
   type FaireFulfillmentWriteReadiness,
@@ -1893,33 +1894,28 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         'Shopify inventory webhook target evidence is incomplete',
       )
     }
-    const activationState = isProductDeletion
+    const productDeletionStoreSyncRunning = isProductDeletion
       ? (
           await client.query<{
-            state:
-              | 'disabled'
-              | 'shadow'
-              | 'read_only'
-              | 'active'
-              | 'frozen'
+            running: boolean
           }>(
-            `SELECT state
-             FROM operations_activation_scopes
-             WHERE organization_id = $1::uuid
-             FOR SHARE`,
-            [input.runtime.organizationId],
+            `SELECT operations_commerce_store_sync_is_running(
+               $1::uuid,
+               $2::uuid
+             ) AS running`,
+            [
+              input.runtime.organizationId,
+              input.runtime.integrationAccountId,
+            ],
           )
-        ).rows[0]?.state || null
-      : null
+        ).rows[0]?.running === true
+      : false
     const productDeletionCanReconcile = Boolean(
       input.productDeletion
       && current.receipt_intake_enabled
       && current.status === 'active'
       && current.actor_email
-      && (
-        activationState === 'shadow'
-        || activationState === 'active'
-      ),
+      && productDeletionStoreSyncRunning,
     )
     const reconcileProductDeletion = async (
       receivedAt: string | Date,
@@ -1946,6 +1942,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         observedAt: receivedAt,
         providerUpdatedAt: input.productDeletion.providerUpdatedAt,
         actorEmail: current.actor_email,
+        providerReadAuthority: 'automatic',
       }, client)
     }
     const existing = await client.query<{
@@ -2448,9 +2445,9 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
 
 /**
  * Replays signed product deletions that were durably held while receipt intake
- * or Operations activation was paused. The encrypted receipt is the source of
+ * or Store sync was paused. The encrypted receipt is the source of
  * truth; no caller supplies a plaintext product identity or locator.
- * If the catalog worker is disabled while activation alone resumes, the
+ * If the catalog worker is disabled while Store sync alone resumes, the
  * immutable receipt intentionally remains held until this replay entry point,
  * receipt-intake re-enable, or an authenticated duplicate delivery runs.
  */
@@ -2522,7 +2519,7 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
        AND credential.auth_mode = 'shopify_client_credentials'
        AND credential.verification_status = 'verified'
        AND credential.webhook_verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${commerceStoreSyncRunningSql('account')}
        AND COALESCE(
          account.updated_by,
          account.created_by,

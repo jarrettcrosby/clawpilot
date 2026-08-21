@@ -88,6 +88,28 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '00000000-0000-4000-8000-000000000298',
+              organizationId: input.organizationId,
+              integrationAccountId: input.integrationAccountId,
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            })
+          },
+        }
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -211,7 +233,7 @@ includes(catalogSyncPersistenceSource, [
   "existing?.unmatched_action || 'auto_create'",
   'review policy only controls unmatched-product creation',
   'COMMERCE_CATALOG_SYNC_FENCE_CHANGED',
-  "activation.state IN ('shadow', 'active')",
+  "const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')",
   'FOR UPDATE OF job SKIP LOCKED',
   "const CATALOG_SYNC_LEASE = '10 minutes'",
   'attempt_count = 0',
@@ -652,7 +674,7 @@ includes(read('app_src/app/api/health/route.ts'), [
   '= job.credential_version',
   "policy.policy_version\n                                = 'commerce-product-intake-policy-v1'",
   'policy.revision = job.policy_revision',
-  "activation.state IN ('shadow', 'active')",
+  'operations_commerce_store_sync_is_running(',
   'unreconciled_shopify_signals',
   'overdue_shopify_refreshes_without_active_job',
   'Commerce catalog queue has terminal failed jobs.',
@@ -2350,7 +2372,8 @@ includes(workflowSource, [
   'Choose product decision',
   'automatic identity across Shopify and Faire',
   'automation never guesses that two source records are',
-  'Catalog reads continue in',
+  'This saved choice is independent of whether automatic',
+  'While Store sync is Paused, no automatic catalog',
   'retain unmatched products',
   "'COMMERCE_PRODUCT_INTAKE_POLICY_REVISION_CONFLICT'",
   'payload.command?.productIntake',

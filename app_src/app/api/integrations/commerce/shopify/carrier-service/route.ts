@@ -17,9 +17,6 @@ import {
   shopifyStoreEntityCarrierServiceName,
 } from '@/lib/integrations/shopifyCarrierServiceBranding'
 import {
-  hasValidShopifyShadowVariantAllowlist,
-} from '@/lib/integrations/shopifyShadowCheckoutAllowlist'
-import {
   CommerceIntegrationRequestError,
   testCommerceConnection,
 } from '@/lib/integrations/commerceIntegrations'
@@ -35,6 +32,19 @@ import {
   ShopifyCheckoutRateWarmPolicyError,
 } from '@/lib/operations/shopifyCheckoutRateWarmPolicy'
 import {
+  normalizeShopifyCheckoutAudiencePolicy,
+  readShopifyCheckoutAudiencePolicy,
+  ShopifyCheckoutAudiencePolicyError,
+} from '@/lib/operations/shopifyCheckoutAudiencePolicy'
+import {
+  normalizeShopifyCheckoutRateControl,
+  readShopifyCheckoutRateControl,
+  shopifyCheckoutRateControlEmptyReason,
+  SHOPIFY_CHECKOUT_RATE_EFFECTIVE_REASON,
+  SHOPIFY_CHECKOUT_RATE_CONTROL_VERSION,
+  ShopifyCheckoutRateControlError,
+} from '@/lib/operations/shopifyCheckoutRateControl'
+import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
@@ -47,16 +57,20 @@ import {
   readCommerceIntegrationsStateFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  readCommerceStoreSyncControlsFromPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   readShopifyCustomerRatePolicySummaryFromPostgres,
 } from '@/lib/persistence/shopifyCustomerRatePolicies'
 import {
   finalizeShopifyCarrierServiceRegistrationInPostgres,
   readShopifyCarrierServiceConfigFromPostgres,
-  repairShopifyCarrierServiceActiveRevisionBindingInPostgres,
+  readShopifyCarrierServiceRateControlLastChangeFromPostgres,
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
   updateRegisteredShopifyCarrierServiceRateSourcesInPostgres,
+  updateShopifyCarrierServiceRateControlInPostgres,
   updateShopifyCarrierServicePlanRatePolicyInPostgres,
   updateShopifyCarrierServiceRateWarmPolicyInPostgres,
   upsertShopifyCarrierServiceConfigInPostgres,
@@ -93,6 +107,7 @@ export const maxDuration = 60
 
 const MAX_REQUEST_BYTES = 32 * 1024
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CONFIG_GLOBAL_ID = /^gscf(?:[0-9]{7}|[0-9a-v]{12})$/
 const MUTATION_AUTHORIZATION_GLOBAL_ID = /^gsca(?:[0-9]{7}|[0-9a-v]{12})$/
 const CONFIRMATION_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -139,6 +154,18 @@ function errorResponse(error: unknown) {
     )
   }
   if (error instanceof ShopifyCheckoutRateWarmPolicyError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      400,
+    )
+  }
+  if (error instanceof ShopifyCheckoutAudiencePolicyError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      400,
+    )
+  }
+  if (error instanceof ShopifyCheckoutRateControlError) {
     return json(
       { ok: false, error: error.message, code: error.code },
       400,
@@ -223,15 +250,36 @@ async function requestBody(req: NextRequest) {
   }
 }
 
+function strictString(value: unknown, label: string) {
+  if (typeof value !== 'string' || value.trim() !== value) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
+      `${label} is invalid`,
+    )
+  }
+  return value
+}
+
 function accountGlobalId(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (!ACCOUNT_GLOBAL_ID.test(normalized)) {
+  const exact = strictString(value, 'Shopify connection')
+  if (!ACCOUNT_GLOBAL_ID.test(exact)) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_ACCOUNT_INVALID',
       'A valid Shopify connection is required',
     )
   }
-  return normalizeCommerceAccountGlobalId(normalized)
+  return normalizeCommerceAccountGlobalId(exact)
+}
+
+function configGlobalId(value: unknown) {
+  const exact = strictString(value, 'Shopify CarrierService config Global ID')
+  if (!CONFIG_GLOBAL_ID.test(exact)) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
+      'Shopify CarrierService config Global ID is invalid',
+    )
+  }
+  return exact
 }
 
 function integer(
@@ -240,18 +288,18 @@ function integer(
   minimum: number,
   maximum: number,
 ) {
-  const parsed = Number(value)
   if (
-    !Number.isSafeInteger(parsed)
-    || parsed < minimum
-    || parsed > maximum
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < minimum
+    || value > maximum
   ) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
       `${label} is invalid`,
     )
   }
-  return parsed
+  return value
 }
 
 function record(value: unknown, label: string) {
@@ -262,6 +310,32 @@ function record(value: unknown, label: string) {
     )
   }
   return value as Record<string, unknown>
+}
+
+function requireExactBodyFields(
+  body: Record<string, unknown>,
+  expected: readonly string[],
+) {
+  const actual = Object.keys(body).sort()
+  const required = [...expected].sort()
+  if (actual.join('\n') !== required.join('\n')) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_REQUEST_INVALID',
+      'Checkout-rate control request fields are invalid',
+    )
+  }
+}
+
+function rateControlIdempotencyKey(req: NextRequest) {
+  const key = String(req.headers.get('idempotency-key') || '').trim()
+  if (key.length < 8 || key.length > 200
+      || !/^[A-Za-z0-9._:-]+$/.test(key)) {
+    fail(
+      'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_INVALID',
+      'A stable Idempotency-Key header of 8-200 URL-safe characters is required',
+    )
+  }
+  return key
 }
 
 function array(value: unknown, label: string) {
@@ -363,6 +437,8 @@ function publicMutationAuthorization(
 
 function publicCarrierServiceConfig(
   config: ShopifyCarrierServiceConfig | null,
+  activationState:
+    | 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen',
 ) {
   if (!config) return null
   return {
@@ -387,6 +463,16 @@ function publicCarrierServiceConfig(
     checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(
       config.policySnapshot,
     ),
+    shadowCheckoutAudience: readShopifyCheckoutAudiencePolicy(
+      config.policySnapshot,
+    ),
+    checkoutRateControl: readShopifyCheckoutRateControl(
+      config.policySnapshot,
+      {
+        activationState,
+        accountEnvironment: config.accountEnvironment,
+      },
+    ),
     inventoryMaxAgeSeconds: config.inventoryMaxAgeSeconds,
     quoteTtlSeconds: config.quoteTtlSeconds,
     orderReconciliationWindowSeconds:
@@ -395,6 +481,7 @@ function publicCarrierServiceConfig(
     lastErrorCode: config.lastErrorCode,
     rowVersion: config.rowVersion,
     ready: config.ready,
+    ratingRuntimeReady: config.ratingRuntimeReady,
     materials: config.materials.map((material) => ({
       selectionSequence: material.selectionSequence,
       materialGlobalId: material.materialGlobalId,
@@ -609,6 +696,7 @@ function carrierServiceMutation(input: {
 async function setupState(input: {
   organizationId: string
   accountGlobalId: string
+  actorEmail: string
   canActivate: boolean
   canManage: boolean
 }) {
@@ -630,6 +718,8 @@ async function setupState(input: {
     reference,
     mutationAuthorizations,
     customerPolicySummary,
+    storeSyncControls,
+    checkoutRateLastChange,
   ] = await Promise.all([
     readShopifyCarrierServiceConfigFromPostgres({
       organizationId: input.organizationId,
@@ -648,7 +738,22 @@ async function setupState(input: {
       organizationId: input.organizationId,
       accountGlobalId: input.accountGlobalId,
     }),
+    readCommerceStoreSyncControlsFromPostgres(input.organizationId),
+    readShopifyCarrierServiceRateControlLastChangeFromPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    }),
   ])
+  const storeSync = storeSyncControls.find(
+    (control) => control.accountGlobalId === input.accountGlobalId,
+  )
+  if (!storeSync) {
+    fail(
+      'COMMERCE_STORE_SYNC_CONTROL_MISSING',
+      'This Shopify connection has no Store sync control; migration health must be repaired',
+      409,
+    )
+  }
   let publicCallbackUrl: string | null = null
   if (config && input.canActivate) {
     const token = shopifyCarrierServiceCallbackToken({
@@ -659,7 +764,13 @@ async function setupState(input: {
     })
     publicCallbackUrl = callbackUrl(input.accountGlobalId, token)
   }
-  const publicConfig = publicCarrierServiceConfig(config)
+  const runtimeActivationState = reference.activation.state === 'missing'
+    ? 'disabled'
+    : reference.activation.state
+  const publicConfig = publicCarrierServiceConfig(
+    config,
+    runtimeActivationState,
+  )
   const namePreference = storeEntityNamePreference({
     providerStoreEntityName: account.configuration.accountName,
     providerVerifiedAt: account.configuration.lastVerifiedAt,
@@ -748,26 +859,56 @@ async function setupState(input: {
         : null,
     }
   }
-  const shadowSandboxAccountReady = (
-    reference.activation.state === 'shadow'
-    && account.environment === 'sandbox'
-    && account.status === 'active'
+  const checkoutAccountReady = (
+    account.status === 'active'
     && account.verificationStatus === 'verified'
   )
-  const shadowCheckoutIsolationBlockers = [
-    ...(customerPolicySummary.shadowAllowedCount < 1
-      ? ['at least one unexpired allow policy in Checkout audience']
+  const shadowCheckoutAudienceMode =
+    publicConfig?.checkoutRateControl.audience || 'restricted_customers'
+  const checkoutRateEmptyReason = publicConfig
+    ? shopifyCheckoutRateControlEmptyReason({
+        control: publicConfig.checkoutRateControl,
+        accountEnvironment: account.environment,
+        activationState: runtimeActivationState,
+      })
+    : null
+  const checkoutRateEffectiveReason = checkoutRateEmptyReason
+    || (publicConfig?.ratingRuntimeReady
+      ? SHOPIFY_CHECKOUT_RATE_EFFECTIVE_REASON.Serving
+      : SHOPIFY_CHECKOUT_RATE_EFFECTIVE_REASON.RuntimeNotReady)
+  const callbackRegistrationReady = Boolean(
+    publicConfig?.registrationState === 'registered'
+    && publicConfig.serviceGid
+    && publicConfig.ratingRuntimeReady === true
+  )
+  const callbackServingReady = callbackRegistrationReady
+    && checkoutRateEmptyReason === null
+  const checkoutRateWarmBlockers = [
+    ...(!callbackRegistrationReady
+      ? ['registered callback-ready CarrierService']
       : []),
-    ...(!hasValidShopifyShadowVariantAllowlist()
-      ? ['SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS']
+    ...(shadowCheckoutAudienceMode === 'off'
+      ? ['checkout audience is Off']
+      : []),
+    ...(shadowCheckoutAudienceMode === 'restricted_customers'
+      && customerPolicySummary.checkoutEligibleCount < 1
+      ? ['at least one eligible local customer policy in Checkout audience']
+      : []),
+    ...(checkoutRateEmptyReason
+      === SHOPIFY_CHECKOUT_RATE_EFFECTIVE_REASON
+        .RestrictedLiveEnforcementRequired
+      ? ['verified customer-specific provider enforcement for Restricted LIVE']
       : []),
   ]
-  const shadowSandboxRateWarmReady = (
-    shadowSandboxAccountReady
-    && shadowCheckoutIsolationBlockers.length === 0
+  const checkoutRateWarmEffective = (
+    checkoutAccountReady
+    && callbackServingReady
+    && checkoutRateWarmBlockers.length === 0
   )
   return {
     account,
+    actorEmail: input.actorEmail.trim().toLowerCase(),
+    storeSync,
     config: publicConfig,
     namePreference,
     shadowSimulation: simulation
@@ -788,26 +929,63 @@ async function setupState(input: {
     callbackUrl: publicCallbackUrl,
     canActivate: input.canActivate,
     canManage: input.canManage,
+    checkoutRateLastChange,
+    checkoutRateOperatingProfile: {
+      desiredAudience:
+        publicConfig?.checkoutRateControl.audience || null,
+      desiredRateSource:
+        publicConfig?.checkoutRateControl.rateSource || null,
+      effectiveState: !publicConfig
+        ? 'not_configured'
+        : checkoutRateEmptyReason
+          ? 'empty'
+          : publicConfig.ratingRuntimeReady
+            ? 'serving'
+            : 'not_ready',
+      effectiveReason: checkoutRateEffectiveReason,
+      serving: Boolean(
+        publicConfig
+        && !checkoutRateEmptyReason
+        && publicConfig.ratingRuntimeReady,
+      ),
+      emergencyOverride: reference.activation.state === 'disabled'
+        || reference.activation.state === 'frozen',
+    },
     checkoutAudience: {
-      state: reference.activation.state === 'shadow'
-        ? customerPolicySummary.shadowAllowedCount > 0
-          ? 'shadow_binary_ready'
-          : 'shadow_customer_required'
-        : reference.activation.state === 'active'
-          ? 'active_default_ready_provider_overrides_blocked'
-          : 'inactive',
-      defaultPolicy: customerPolicySummary.enforcement.defaultPolicy,
+      state: shadowCheckoutAudienceMode === 'off'
+        ? 'shadow_off'
+        : shadowCheckoutAudienceMode === 'all_eligible'
+          ? checkoutAccountReady && callbackServingReady
+            ? 'shadow_all_eligible_ready'
+            : 'shadow_all_eligible_unavailable'
+          : customerPolicySummary.checkoutEligibleCount > 0
+            && checkoutAccountReady
+            && callbackServingReady
+            ? 'shadow_restricted_ready'
+            : 'shadow_customer_required',
+      mode: shadowCheckoutAudienceMode,
+      defaultPolicy: shadowCheckoutAudienceMode === 'all_eligible'
+        ? 'show_all'
+        : 'hide_all',
       policyCount: customerPolicySummary.policyCount,
       unexpiredShadowPolicyCount: customerPolicySummary.simulatedCount,
       shadowAllowedCustomerCount: customerPolicySummary.shadowAllowedCount,
+      eligibleCustomerCount: customerPolicySummary.checkoutEligibleCount,
       expiredShadowPolicyCount:
         customerPolicySummary.expiredSimulatedCount,
       blockedPolicyCount: customerPolicySummary.blockedCount,
       enforcedPolicyCount: customerPolicySummary.enforcedCount,
       earliestShadowExpiresAt:
         customerPolicySummary.earliestShadowExpiresAt,
-      shadowBinaryTestReady: reference.activation.state === 'shadow'
-        && customerPolicySummary.shadowAllowedCount > 0,
+      shadowBinaryTestReady: checkoutAccountReady
+        && callbackServingReady
+        && (
+          shadowCheckoutAudienceMode === 'all_eligible'
+          || (
+            shadowCheckoutAudienceMode === 'restricted_customers'
+            && customerPolicySummary.checkoutEligibleCount > 0
+          )
+        ),
       providerEnforcementState: customerPolicySummary.enforcement.state,
       providerEnforcementAvailable:
         customerPolicySummary.enforcement.providerWriteAvailable,
@@ -818,16 +996,18 @@ async function setupState(input: {
     },
     rateWarmReadiness: {
       deliveryCustomizationDurable: false,
-      activationAllowed: shadowSandboxRateWarmReady,
-      reason: shadowSandboxRateWarmReady
-        ? `Bounded Shadow cache preparation is available only for the isolated allowlisted test-variant proof${
-          customerPolicySummary.earliestShadowExpiresAt
-            ? ` until ${customerPolicySummary.earliestShadowExpiresAt}`
-            : ''
-        }. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; this is not deterministic customer enforcement.`
-        : !shadowSandboxAccountReady
-          ? 'Use a verified sandbox Shopify account in Operations Shadow to enable allowlisted saved-address cache preparation.'
-          : `Configure ${shadowCheckoutIsolationBlockers.join(', ')} before enabling saved-address cache preparation.`,
+      activationAllowed: checkoutRateWarmEffective,
+      reason: checkoutRateWarmEffective
+        ? shadowCheckoutAudienceMode === 'all_eligible'
+          ? `Bounded saved-address cache preparation is available without a customer allow policy. Exact product mapping, inventory, packaging, and the saved ${publicConfig?.checkoutRateControl.rateSource === 'production' ? 'LIVE' : 'TEST'} carrier lane still fail closed.`
+          : `Bounded cache preparation is available only for an allowed customer${
+            customerPolicySummary.earliestShadowExpiresAt
+              ? ` until ${customerPolicySummary.earliestShadowExpiresAt}`
+              : ''
+          }. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; this is not deterministic customer enforcement.`
+        : !checkoutAccountReady
+          ? 'Use a verified Shopify connection to configure saved-address cache preparation.'
+          : `Cache preparation is currently dormant: configure ${checkoutRateWarmBlockers.join(', ')}.`,
     },
     boundaries: {
       checkoutCustomerFieldsPersisted: false,
@@ -873,12 +1053,34 @@ function requireActivator(canActivate: boolean) {
   }
 }
 
+function checkoutCarrierServiceProviderWriteAuthority(input: {
+  state: string
+  revision: number | null
+}) {
+  if (
+    !['shadow', 'read_only', 'active'].includes(input.state)
+    || !Number.isSafeInteger(input.revision)
+    || Number(input.revision) < 1
+  ) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_SAFETY_BLOCKED',
+      'CarrierService provider changes are blocked while Operations is Disabled or Frozen',
+      409,
+    )
+  }
+  return {
+    state: input.state as 'shadow' | 'read_only' | 'active',
+    revision: Number(input.revision),
+  }
+}
+
 async function executeResourceScopedCarrierServiceMutation(input: {
   organizationId: string
   accountGlobalId: string
   accountEnvironment: 'sandbox' | 'production'
   storeEntityName: unknown
   config: PublicShopifyCarrierServiceConfig
+  resourceAuthorizationState: 'shadow' | 'read_only' | 'active'
   resourceAuthorizationRevision: number
   operation: ShopifyCarrierServiceMutationOperation
   simulation: {
@@ -891,16 +1093,6 @@ async function executeResourceScopedCarrierServiceMutation(input: {
   actorEmail: string
   actorRole: ShopifyCarrierServiceMutationActorRole
 }) {
-  if (
-    input.operation === 'create'
-    && input.accountEnvironment !== 'sandbox'
-  ) {
-    fail(
-      'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
-      'New Shopify CarrierService registration is sandbox-only; production is limited to exact removal and reconciliation',
-      409,
-    )
-  }
   if (
     input.simulation.configRowVersion !== input.config.rowVersion
     || (
@@ -965,6 +1157,7 @@ async function executeResourceScopedCarrierServiceMutation(input: {
       operation: input.operation,
       accountEnvironment: input.accountEnvironment,
       credentialGeneration: input.config.credentialGeneration,
+      providerWriteActivationState: input.resourceAuthorizationState,
       configActivationRevision: input.config.activationRevision,
       simulationActivationRevision:
         input.simulation.activationRevision,
@@ -1183,6 +1376,7 @@ export async function GET(req: NextRequest) {
       setup: await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       }),
@@ -1196,11 +1390,12 @@ export async function POST(req: NextRequest) {
   try {
     const context = await actorContext(req)
     const body = await requestBody(req)
-    const action = String(body.action || '').trim()
+    const action = strictString(body.action, 'Shopify setup action')
     const accountId = accountGlobalId(body.accountGlobalId)
     let current = await setupState({
       organizationId: context.organizationId,
       accountGlobalId: accountId,
+      actorEmail: context.actor.email,
       canActivate: context.capabilities.canActivate,
       canManage: context.capabilities.canManage,
     })
@@ -1213,34 +1408,13 @@ export async function POST(req: NextRequest) {
       current = await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       })
     }
 
-    if (action === 'repair-activation-revision-binding') {
-      requireActivator(context.capabilities.canActivate)
-      if (
-        !current.config
-        || current.config.registrationState !== 'registered'
-        || current.reference.activation.state !== 'active'
-        || current.reference.activation.revision === null
-      ) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_ACTIVE_REBIND_NOT_REQUIRED',
-          'An exact registered Shopify CarrierService in Operations Active is required',
-          409,
-        )
-      }
-      await repairShopifyCarrierServiceActiveRevisionBindingInPostgres({
-        organizationId: context.organizationId,
-        accountGlobalId: accountId,
-        expectedRowVersion: current.config.rowVersion,
-        expectedActivationRevision:
-          current.reference.activation.revision,
-        actorEmail: context.actor.email,
-      })
-    } else if (action === 'save-config') {
+    if (action === 'save-config') {
       requireActivator(context.capabilities.canActivate)
       if (
         !current.account.configured
@@ -1254,13 +1428,10 @@ export async function POST(req: NextRequest) {
       }
       if (
         current.reference.activation.revision === null
-        || !['shadow', 'active'].includes(
-          current.reference.activation.state,
-        )
       ) {
         fail(
-          'SHOPIFY_CARRIER_SERVICE_SHADOW_REQUIRED',
-          'Set Operations to Shadow or Active before configuring checkout rating',
+          'SHOPIFY_CARRIER_SERVICE_ACTIVATION_REFERENCE_REQUIRED',
+          'Operations safety authority is unavailable',
           409,
         )
       }
@@ -1321,16 +1492,29 @@ export async function POST(req: NextRequest) {
               current.config.checkoutRateWarm,
             )
           : normalizeShopifyCheckoutRateWarmPolicy(undefined)
-      if (
-        checkoutRateWarm.enabled
-        && current.rateWarmReadiness.activationAllowed !== true
-      ) {
-        fail(
-          'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
-          current.rateWarmReadiness.reason,
-          409,
-        )
-      }
+      const shadowCheckoutAudience = Object.prototype.hasOwnProperty.call(
+        body,
+        'shadowCheckoutAudience',
+      )
+        ? normalizeShopifyCheckoutAudiencePolicy(
+            body.shadowCheckoutAudience,
+          )
+        : current.config
+          ? normalizeShopifyCheckoutAudiencePolicy(
+              current.config.shadowCheckoutAudience,
+            )
+          : normalizeShopifyCheckoutAudiencePolicy(undefined)
+      const checkoutRateControl = current.config
+        ? normalizeShopifyCheckoutRateControl(
+            current.config.checkoutRateControl,
+          )
+        : normalizeShopifyCheckoutRateControl({
+            version: SHOPIFY_CHECKOUT_RATE_CONTROL_VERSION,
+            audience: 'off',
+            rateSource: current.account.environment === 'production'
+              ? 'production'
+              : 'sandbox',
+          })
       const policySnapshot = {
         version: 'shopify-checkout-rating-policy-v1',
         ratingMode: 'whole_shipment',
@@ -1343,6 +1527,8 @@ export async function POST(req: NextRequest) {
         algorithmVersion: HYBRID_CARTONIZATION_ALGORITHM_VERSION,
         planRateOptimization,
         checkoutRateWarm,
+        shadowCheckoutAudience,
+        checkoutRateControl,
       }
       const token = shopifyCarrierServiceCallbackToken({
         organizationId: context.organizationId,
@@ -1386,8 +1572,17 @@ export async function POST(req: NextRequest) {
         actorEmail: context.actor.email,
       })
       }
-    } else if (action === 'save-plan-rate-policy') {
+    } else if (action === 'save-checkout-rate-control') {
       requireActivator(context.capabilities.canActivate)
+      requireExactBodyFields(body, [
+        'action',
+        'accountGlobalId',
+        'expectedConfigGlobalId',
+        'expectedRowVersion',
+        'expectedPolicyRevision',
+        'checkoutRateControl',
+        'reason',
+      ])
       if (!current.config) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
@@ -1395,11 +1590,40 @@ export async function POST(req: NextRequest) {
           404,
         )
       }
-      if (current.reference.activation.state !== 'shadow') {
+      const result =
+        await updateShopifyCarrierServiceRateControlInPostgres({
+          organizationId: context.organizationId,
+          accountGlobalId: accountId,
+          expectedConfigGlobalId: configGlobalId(
+            body.expectedConfigGlobalId,
+          ),
+          expectedRowVersion: integer(
+            body.expectedRowVersion,
+            'Configuration row version',
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          expectedPolicyRevision: integer(
+            body.expectedPolicyRevision,
+            'Configuration policy revision',
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          checkoutRateControl: normalizeShopifyCheckoutRateControl(
+            body.checkoutRateControl,
+          ),
+          idempotencyKey: rateControlIdempotencyKey(req),
+          reason: strictString(body.reason, 'Change reason'),
+          actorEmail: context.actor.email,
+        })
+      return json({ ok: true, result })
+    } else if (action === 'save-plan-rate-policy') {
+      requireActivator(context.capabilities.canActivate)
+      if (!current.config) {
         fail(
-          'SHOPIFY_CHECKOUT_POLICY_SHADOW_REQUIRED',
-          'Set Operations to Shadow before changing the checkout rate objective',
-          409,
+          'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
+          'Save the Shopify checkout-rating configuration first',
+          404,
         )
       }
       if (
@@ -1423,6 +1647,12 @@ export async function POST(req: NextRequest) {
         ),
         actorEmail: context.actor.email,
       })
+    } else if (action === 'save-checkout-audience') {
+      fail(
+        'SHOPIFY_CHECKOUT_RATE_CONTROL_MIGRATION_REQUIRED',
+        'Use the desired checkout audience and rate-source control; the legacy Shadow audience command no longer changes runtime behavior',
+        410,
+      )
     } else if (action === 'save-rate-warm-policy') {
       requireActivator(context.capabilities.canActivate)
       if (!current.config) {
@@ -1430,13 +1660,6 @@ export async function POST(req: NextRequest) {
           'SHOPIFY_CARRIER_SERVICE_CONFIG_REQUIRED',
           'Save the Shopify checkout-rating configuration first',
           404,
-        )
-      }
-      if (current.reference.activation.state !== 'shadow') {
-        fail(
-          'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
-          'Set Operations to Shadow before changing checkout rate warming',
-          409,
         )
       }
       if (
@@ -1454,16 +1677,6 @@ export async function POST(req: NextRequest) {
       const checkoutRateWarm = normalizeShopifyCheckoutRateWarmPolicy(
         body.checkoutRateWarm,
       )
-      if (
-        checkoutRateWarm.enabled
-        && current.rateWarmReadiness.activationAllowed !== true
-      ) {
-        fail(
-          'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED',
-          current.rateWarmReadiness.reason,
-          409,
-        )
-      }
       await updateShopifyCarrierServiceRateWarmPolicyInPostgres({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
@@ -1535,12 +1748,12 @@ export async function POST(req: NextRequest) {
       await refreshShopifyIdentity()
       if (
         !current.config
-        || current.reference.activation.state !== 'shadow'
+        || current.reference.activation.state === 'missing'
         || current.reference.activation.revision === null
       ) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_SIMULATION_STALE',
-          'Save a configuration and set Operations to Shadow before simulating',
+          'Save an exact configuration before running the zero-write simulation',
           409,
         )
       }
@@ -1549,27 +1762,6 @@ export async function POST(req: NextRequest) {
           && current.config.serviceGid
           ? 'delete'
           : 'create'
-      if (
-        operation === 'create'
-        && current.account.environment !== 'sandbox'
-      ) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
-          'New Shopify CarrierService simulation and registration are sandbox-only',
-          409,
-        )
-      }
-      if (
-        operation === 'create'
-        && current.reference.activation.revision
-          !== current.config.activationRevision
-      ) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_SIMULATION_STALE',
-          'Save the exact current Shadow configuration before simulating',
-          409,
-        )
-      }
       const mutation = carrierServiceMutation({
         operation,
         organizationId: context.organizationId,
@@ -1612,7 +1804,10 @@ export async function POST(req: NextRequest) {
             lastErrorCode: null,
             actorEmail: context.actor.email,
           })
-        const exactConfig = publicCarrierServiceConfig(finalized)
+        const exactConfig = publicCarrierServiceConfig(
+          finalized,
+          current.reference.activation.state,
+        )
         if (!exactConfig) {
           fail(
             'SHOPIFY_CARRIER_SERVICE_SIMULATION_FINALIZE_FAILED',
@@ -1652,12 +1847,11 @@ export async function POST(req: NextRequest) {
         !current.config
         || !current.nameAlignment
         || current.config.registrationState !== 'registered'
-        || current.reference.activation.state !== 'shadow'
         || current.reference.activation.revision === null
       ) {
         fail(
           'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_STALE',
-          'The exact registered CarrierService and current Shadow revision are required before name alignment can be simulated',
+          'The exact registered CarrierService is required before name alignment can be simulated',
           409,
         )
       }
@@ -1701,15 +1895,17 @@ export async function POST(req: NextRequest) {
         !current.config
         || !current.nameAlignment?.simulation
         || current.config.registrationState !== 'registered'
-        || current.reference.activation.state !== 'shadow'
-        || current.reference.activation.revision === null
       ) {
         fail(
-          'SHOPIFY_CARRIER_SERVICE_NAME_SHADOW_EVIDENCE_REQUIRED',
-          'Run the exact zero-write name-alignment simulation in Shadow before changing Shopify',
+          'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_EVIDENCE_REQUIRED',
+          'Run the exact zero-write name-alignment simulation before changing Shopify',
           409,
         )
       }
+      const providerWriteAuthority =
+        checkoutCarrierServiceProviderWriteAuthority(
+          current.reference.activation,
+        )
       if (
         current.account.environment === 'production'
         && body.confirmProductionProviderWrite !== true
@@ -1726,8 +1922,9 @@ export async function POST(req: NextRequest) {
         accountEnvironment: current.account.environment,
         storeEntityName: current.namePreference.effectiveName,
         config: current.config,
+        resourceAuthorizationState: providerWriteAuthority.state,
         resourceAuthorizationRevision:
-          current.reference.activation.revision,
+          providerWriteAuthority.revision,
         operation: 'update',
         simulation: current.nameAlignment.simulation,
         confirmationRequestId: confirmationRequestId(
@@ -1757,16 +1954,10 @@ export async function POST(req: NextRequest) {
       }
       const operation: ShopifyCarrierServiceMutationOperation =
         action === 'register' ? 'create' : 'delete'
-      if (
-        current.reference.activation.state !== 'shadow'
-        || current.reference.activation.revision === null
-      ) {
-        fail(
-          'SHOPIFY_CARRIER_SERVICE_RESOURCE_AUTHORIZATION_REQUIRES_SHADOW',
-          'The one-time CarrierService write requires the exact current Shadow revision and does not activate unrelated Operations writes',
-          409,
+      const providerWriteAuthority =
+        checkoutCarrierServiceProviderWriteAuthority(
+          current.reference.activation,
         )
-      }
       if (
         !current.shadowSimulation
         || current.shadowSimulation.operation !== operation
@@ -1774,8 +1965,8 @@ export async function POST(req: NextRequest) {
           !== current.config.rowVersion
       ) {
         fail(
-          'SHOPIFY_CARRIER_SERVICE_SHADOW_EVIDENCE_REQUIRED',
-          'Return Operations to Shadow and run the exact zero-write simulation before activating this provider change',
+          'SHOPIFY_CARRIER_SERVICE_SIMULATION_EVIDENCE_REQUIRED',
+          'Run the exact zero-write simulation before activating this provider change',
           409,
         )
       }
@@ -1805,8 +1996,9 @@ export async function POST(req: NextRequest) {
         accountEnvironment: current.account.environment,
         storeEntityName: current.namePreference.effectiveName,
         config: current.config,
+        resourceAuthorizationState: providerWriteAuthority.state,
         resourceAuthorizationRevision:
-          current.reference.activation.revision,
+          providerWriteAuthority.revision,
         operation,
         simulation: current.shadowSimulation,
         confirmationRequestId: confirmationRequestId(
@@ -1860,6 +2052,7 @@ export async function POST(req: NextRequest) {
       setup: await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       }),

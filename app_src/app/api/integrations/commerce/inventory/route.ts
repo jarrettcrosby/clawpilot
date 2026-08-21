@@ -115,6 +115,8 @@ export async function GET(req: NextRequest) {
       organizationId: organizationId(user),
       accountGlobalId: req.nextUrl.searchParams.get('accountGlobalId'),
       mappingGlobalId: req.nextUrl.searchParams.get('mappingGlobalId'),
+      idempotencyKey: req.headers.get('Idempotency-Key'),
+      actorEmail: user.email,
     })
     return json({ ok: true, inventory })
   } catch (error) {

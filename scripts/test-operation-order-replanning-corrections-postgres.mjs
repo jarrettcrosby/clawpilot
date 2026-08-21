@@ -41,6 +41,7 @@ function persistenceFor(pool) {
     '@/lib/integrations/faireFulfillmentRuntime': {},
     '@/lib/commerceFulfillmentRecoveryPolicy': {},
     '@/lib/persistence/sandboxCommerceE2eAuthorization': {},
+    '@/lib/persistence/shopifyTestStoreCanonicalE2e': {},
     '@/lib/persistence/commerceOrderRevisions': {
       assertCommerceOrderRevisionExecutionCurrent: noOp,
       CommerceOrderRevisionGateError: RevisionGateError,
@@ -63,6 +64,9 @@ function persistenceFor(pool) {
     '@/lib/operations/pickManagement': {},
     '@/lib/persistence/crm': {},
     '@/lib/persistence/cartonizationRateEvidence': {},
+    '@/lib/persistence/commerceStoreSync': {
+      readCommerceStoreSyncControlsFromPostgres: async () => [],
+    },
     '@/lib/persistence/operationPrintDelivery': {},
     '@/lib/persistence/operationShadowFulfillmentPreparation': {
       readShadowFulfillmentPreparation: async () => null,
@@ -118,7 +122,11 @@ function idsFor(index) {
   }
 }
 
-async function seedFixture(pool, { index, status }) {
+async function seedFixture(pool, {
+  index,
+  status,
+  activationState = 'active',
+}) {
   const ids = idsFor(index)
   const acceptedSourceHash = String(index).repeat(64).slice(0, 64)
   const acceptedRevisionHash = String(index + 4).repeat(64).slice(0, 64)
@@ -140,8 +148,14 @@ async function seedFixture(pool, { index, status }) {
       `INSERT INTO operations_activation_scopes (
          organization_id, data_pipeline_id, state, revision,
          reason, updated_by
-       ) VALUES ($1::uuid, $2::uuid, 'active', 7, $3, $4)`,
-      [ids.organization, ids.pipeline, 'Exact Active correction test', actorEmail],
+       ) VALUES ($1::uuid, $2::uuid, $3, 7, $4, $5)`,
+      [
+        ids.organization,
+        ids.pipeline,
+        activationState,
+        `Exact ${activationState} correction test`,
+        actorEmail,
+      ],
     )
     await client.query(
       `INSERT INTO operations_integration_accounts (
@@ -845,6 +859,24 @@ async function verifyExactAuthorityBlockers(pool, persistence) {
   )
   assert.match(releasedAction.blockedReason, /every picker device/u)
   assert.equal(releasedAction.expectedCorrectionFingerprint, null)
+
+  for (const [index, activationState] of [
+    [7, 'disabled'],
+    [8, 'frozen'],
+  ]) {
+    const emergency = await seedFixture(pool, {
+      index,
+      status: 'planned',
+      activationState,
+    })
+    const emergencyAction = await projectedAction(persistence, emergency)
+    assert.equal(emergencyAction.enabled, false)
+    assert.equal(
+      emergencyAction.blockedCode,
+      'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED',
+    )
+    assert.equal(emergencyAction.expectedCorrectionFingerprint, null)
+  }
 }
 
 async function verify(databaseUrl) {
@@ -856,11 +888,21 @@ async function verify(databaseUrl) {
       [actorEmail],
     )
     const persistence = persistenceFor(pool)
-    await verifyCorrection(
-      pool,
-      persistence,
-      await seedFixture(pool, { index: 1, status: 'planned' }),
-    )
+    for (const [index, activationState] of [
+      [1, 'active'],
+      [2, 'shadow'],
+      [9, 'read_only'],
+    ]) {
+      await verifyCorrection(
+        pool,
+        persistence,
+        await seedFixture(pool, {
+          index,
+          status: 'planned',
+          activationState,
+        }),
+      )
+    }
     await verifyExactAuthorityBlockers(pool, persistence)
 
     const source = String(

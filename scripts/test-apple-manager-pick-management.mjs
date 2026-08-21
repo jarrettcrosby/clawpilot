@@ -27,6 +27,15 @@ for (const fragment of [
   'previousAssignedTo?.lowercased()',
   'providerWrites == 0',
   'command.assignedTo != nil || interventionExceptionGlobalId != nil',
+  'public struct ManagerStoreSyncControl',
+  'public struct ManagerStoreSyncCommand',
+  'public struct ManagerStoreSyncSubmissionFence',
+  'public func fetchManagerOperations()',
+  'public func updateManagerStoreSync(',
+  'action = "update-commerce-store-sync"',
+  'control.revision == command.expectedRevision + 1',
+  'await beginAuthenticatedMutation()',
+  'request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")',
 ]) {
   assert.ok(adapters.includes(fragment), `Apple adapter is missing ${fragment}`)
 }
@@ -35,14 +44,31 @@ const model = read('clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
 for (const fragment of [
   '@Published var managerPickManagement',
   '@Published var managerSelectedPickAssignment',
-  'managerOrders = try await api.fetchManagerOrders()',
-  'managerPickManagement = try await api.fetchManagerPickManagement()',
+  'let overview = try await api.fetchManagerOperations()',
+  'managerOrders = overview.orders',
+  'managerStoreSyncControls = overview.storeSync',
+  'canManageStoreSync = overview.capabilities.canActivate',
+  'let pickManagement = try await api.fetchManagerPickManagement()',
   'Some manager data is unavailable',
   'Available orders remain usable.',
   'func managePickerAssignment(',
   '#if DEBUG',
   'installManagerPickManagementWalkthroughFixture()',
   'walkthroughScreen == "pick-intervention"',
+  '@Published var managerStoreSyncControls',
+  '@Published private(set) var canManageStoreSync',
+  '@Published private(set) var hasPendingManagerStoreSyncChange',
+  'func updateManagerStoreSync(',
+  'func retryPendingManagerStoreSyncChange()',
+  'reconcilePendingManagerStoreSyncChange()',
+  'managerStoreSyncOperationIsCurrent(',
+  'installReplacementAuthenticationProfile(',
+  'finishManagerStoreSyncSubmission(',
+  'await waitForManagerStoreSyncSubmissionToFinish()',
+  'catch PickingAPIError.rejected(let code, let message)',
+  'catch PickingAPIError.rateLimited(let seconds)',
+  'The Store sync change was rejected and was not retained',
+  'Retry or refresh the saved Store sync change before changing organizations.',
 ]) {
   assert.ok(model.includes(fragment), `iPhone manager model is missing ${fragment}`)
 }
@@ -75,8 +101,46 @@ for (const fragment of [
   '.frame(minHeight: 44)',
   'never clears scan/count evidence or physical work',
   'Existing exceptions stay open for review.',
+  'Text("Store sync")',
+  'Automatic store catalog, order, image, and inventory mirroring',
+  'value: control.desiredState == .running',
+  'value: control.effectiveState == .running',
+  'Confirm Running',
+  'View only. An organization owner or authorized administrator can change Store sync.',
+  'Retry exact saved change',
+  'Disabled or Frozen can still pause execution and will show the exact reason.',
 ]) {
   assert.ok(shell.includes(fragment), `iPhone manager UI is missing ${fragment}`)
+}
+
+const route = read('app_src/app/api/operations/route.ts')
+for (const fragment of [
+  "if (action === 'update-commerce-store-sync')",
+  "code: 'COMMERCE_STORE_SYNC_MANAGE_REQUIRED'",
+  "'accountGlobalId'",
+  "'desiredState'",
+  "'expectedDesiredState'",
+  "'expectedRevision'",
+  "'reason'",
+  'idempotencyKey: idempotencyKeyValue(req)',
+]) {
+  assert.ok(route.includes(fragment), `Operations Store sync API is missing ${fragment}`)
+}
+
+const storeSyncTests = read(
+  'clients/apple/Tests/ClawPilotPickingCoreTests/ManagerStoreSyncTests.swift',
+)
+for (const fragment of [
+  'manager Store sync decodes desired and effective state separately',
+  'manager Store sync sends the exact revision fenced command',
+  'manager Store sync retries a lost response byte identically',
+  'manager Store sync classifies a definitive rejection as not applied',
+  'manager Store sync keeps a server failure outcome ambiguous',
+  'manager Store sync rejects late state after sign-out or workspace replacement',
+  'every Store sync effective reason has one exact effective state',
+  'captured[0].1 == captured[1].1',
+]) {
+  assert.ok(storeSyncTests.includes(fragment), `Native Store sync tests are missing ${fragment}`)
 }
 for (const paragraph of [
   'Exact unstarted-work fence',

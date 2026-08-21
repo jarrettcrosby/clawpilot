@@ -199,6 +199,7 @@ export async function POST(
       'expectedExternalVariantId',
       'expectedProviderSku',
       'confirmReadOnlyProviderRequest',
+      'idempotencyKey',
     ]
     if (
       body.action !== 'refresh-faire-product-images'
@@ -222,6 +223,7 @@ export async function POST(
       expectedExternalVariantId: body.expectedExternalVariantId,
       expectedProviderSku: body.expectedProviderSku,
       confirmReadOnlyProviderRequest: body.confirmReadOnlyProviderRequest,
+      idempotencyKey: body.idempotencyKey,
       actorEmail: actor.email,
     })
     return json({ ok: true, refresh })

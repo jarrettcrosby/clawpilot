@@ -466,6 +466,11 @@ async function seedStaleReadinessEvidence(pool, tenant) {
            'minIntervalMs', 1000,
            'supportedCountries', jsonb_build_array('US'),
            'staleCartAbort', true
+         ),
+         'checkoutRateControl', jsonb_build_object(
+           'version', 'shopify-checkout-rate-control-v1',
+           'audience', 'restricted_customers',
+           'rateSource', 'sandbox'
          )
        ), 60, 30, 60,
        'authority-readiness-v1', $4, $4
@@ -1294,7 +1299,10 @@ async function verify(databaseUrl) {
     assert.equal(frozenShopifyOrders.actualReadiness.state, 'unavailable')
     assert.equal(frozenShopifyOrders.actualReadiness.evidence.activationState, 'frozen')
     assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
-      'COMMERCE_AUTHORITY_ACTIVATION_INELIGIBLE',
+      'COMMERCE_AUTHORITY_STORE_SYNC_PAUSED',
+    ))
+    assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
+      'OPERATIONS_FROZEN_OVERRIDE',
     ))
     await pool.query(
       `UPDATE operations_activation_scopes

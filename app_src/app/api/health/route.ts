@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
 import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
+import { getPrintAgentReleaseConfiguration } from '@/lib/operations/printAgentReleaseConfig'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
@@ -43,6 +44,9 @@ import {
   readShopifyOrderWebhookSignalHealthFromPostgres,
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
+  SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+} from '@/lib/persistence/shopifyOrderWebhookReconciliationHealth'
+import {
   readShopifyOrderManagementHealthFromPostgres,
 } from '@/lib/persistence/shopifyOrderManagement'
 import {
@@ -61,6 +65,20 @@ import {
 import {
   readFaireProductImageProjectionHealthInPostgres,
 } from '@/lib/persistence/faireProductImageProjection'
+import {
+  OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL,
+  OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL,
+} from '@/lib/persistence/commerceStoreSyncHealth'
+import {
+  SHIPPING_INDEPENDENCE_HEALTH_SQL,
+} from '@/lib/persistence/shippingIndependenceHealth'
+import {
+  SHIPPING_ONE_OFF_PACK_HEALTH_SQL,
+} from '@/lib/persistence/shippingOneOffPackHealth'
+import {
+  reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 import {
   commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceIntake'
@@ -111,6 +129,522 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
   'be9c9d5ce1442cf6c1df2aaffcf1dd075eeb24172fe1f7ec2e6d2002b98bea49'
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
+
+// Exact structural attestation for the development-only canonical Shopify
+// test-store lane. The migration checksum pins the DDL, while the function,
+// trigger, freshness, and single-active-workspace checks detect runtime drift.
+const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0302_operations_shopify_test_store_canonical_e2e.sql'
+      AND checksum =
+        '2e4a2d7b74322bcc4b2a8f5565c9e14da0c2d41961e25bbfd56edfd8c8e2d6cb'
+  )
+  AND (
+    SELECT count(installed.oid) = 2
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, installed_namespace.nspname,
+        installed.relkind::text, installed.relpersistence::text,
+        installed.relrowsecurity::text, installed.relforcerowsecurity::text
+      ), E'\n' ORDER BY required.table_name), 'UTF8'), 'sha256'), 'hex') =
+        'af98d5867718c9891b17d168f37b6358e7f1fbddd72fc5c8f378673c4497f830'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence'),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations')
+    ) required(table_name)
+    LEFT JOIN pg_catalog.pg_class installed
+      ON installed.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.relnamespace
+  )
+  AND (
+    SELECT count(*) = 38
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        table_row.relname, table_namespace.nspname,
+        installed.attname, installed.attnum::text,
+        pg_catalog.format_type(installed.atttypid, installed.atttypmod),
+        installed.attnotnull::text, installed.attidentity::text,
+        installed.attgenerated::text,
+        COALESCE(pg_catalog.pg_get_expr(
+          installed_default.adbin, installed_default.adrelid
+        ), ''),
+        COALESCE(installed_collation.collname, '')
+      ), E'\n' ORDER BY table_row.relname, installed.attnum),
+      'UTF8'), 'sha256'), 'hex') =
+        'f27b77a5a6f350dec333adb8ac04d5aafcf0bf1e8cb99f891ea4f56e581b62e0'
+    FROM pg_catalog.pg_attribute installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.attrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef installed_default
+      ON installed_default.adrelid = installed.attrelid
+     AND installed_default.adnum = installed.attnum
+    LEFT JOIN pg_catalog.pg_collation installed_collation
+      ON installed_collation.oid = installed.attcollation
+    WHERE installed.attnum > 0
+      AND NOT installed.attisdropped
+      AND installed.attrelid IN (
+        pg_catalog.to_regclass(
+          'public.operations_shopify_test_store_e2e_evidence'
+        ),
+        pg_catalog.to_regclass(
+          'public.operations_shopify_test_store_e2e_fulfillment_confirmations'
+        )
+      )
+  )
+  AND (
+    SELECT count(installed.oid) = 35
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, table_namespace.nspname,
+        installed.conname, installed.contype::text,
+        installed.convalidated::text, installed.condeferrable::text,
+        installed.condeferred::text,
+        trim(regexp_replace(pg_catalog.pg_get_constraintdef(installed.oid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.table_name, installed.conname),
+      'UTF8'), 'sha256'), 'hex') =
+        '59d38d75ae50f7f0de62639c1e82f8e04429e48ca72e3a6253297821f0c4c638'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence', NULL::text),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations', NULL::text),
+      ('operations_sandbox_commerce_e2e_authorizations',
+       'operations_sandbox_e2e_confirm_version_check')
+    ) required(table_name, constraint_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_constraint installed
+      ON installed.conrelid = table_row.oid
+     AND (
+       required.constraint_name IS NULL
+       OR installed.conname = required.constraint_name
+     )
+  )
+  AND (
+    SELECT count(installed.indexrelid) = 7
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        table_row.relname, table_namespace.nspname,
+        index_row.relname, index_namespace.nspname,
+        installed.indisunique::text, installed.indisprimary::text,
+        installed.indisvalid::text, installed.indisready::text,
+        trim(regexp_replace(pg_catalog.pg_get_indexdef(installed.indexrelid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY table_row.relname, index_row.relname),
+      'UTF8'), 'sha256'), 'hex') =
+        'e46f58b04972cbcaf0741c2a62b3ac1fc5d248f087eda1b85dce621b5a70c66d'
+    FROM pg_catalog.pg_index installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.indrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    JOIN pg_catalog.pg_class index_row
+      ON index_row.oid = installed.indexrelid
+    JOIN pg_catalog.pg_namespace index_namespace
+      ON index_namespace.oid = index_row.relnamespace
+    WHERE installed.indrelid IN (
+      pg_catalog.to_regclass(
+        'public.operations_shopify_test_store_e2e_evidence'
+      ),
+      pg_catalog.to_regclass(
+        'public.operations_shopify_test_store_e2e_fulfillment_confirmations'
+      )
+    ) OR installed.indexrelid = pg_catalog.to_regclass(
+      'public.operations_shopify_test_store_e2e_active_org_unique'
+    )
+  )
+  AND (
+    SELECT count(installed.oid) = 3
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.signature, installed_namespace.nspname,
+        language.lanname, installed.prokind::text,
+        installed.provolatile::text, installed.proparallel::text,
+        installed.proisstrict::text, installed.prosecdef::text,
+        installed.proleakproof::text,
+        pg_catalog.format_type(installed.prorettype, NULL),
+        installed.pronargs::text, installed.pronargdefaults::text,
+        COALESCE(array_to_string(installed.proconfig, ','), ''),
+        trim(regexp_replace(installed.prosrc, '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.signature),
+      'UTF8'), 'sha256'), 'hex') =
+        '7916b6b3bea6c7ded0f480fa653f7b21b2ae31f3e217f4520dc1493483bc429a'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_is_current(uuid,uuid,uuid)'),
+      ('protect_shopify_test_store_e2e_confirmation()'),
+      ('protect_shopify_test_store_e2e_evidence()')
+    ) required(signature)
+    LEFT JOIN pg_catalog.pg_proc installed
+      ON installed.oid = pg_catalog.to_regprocedure(
+        'public.' || required.signature
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.pronamespace
+    LEFT JOIN pg_catalog.pg_language language
+      ON language.oid = installed.prolang
+  )
+  AND (
+    SELECT count(installed.oid) = 2
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, table_namespace.nspname,
+        installed.tgname, installed.tgtype::text,
+        installed.tgenabled::text, installed.tgisinternal::text,
+        function_namespace.nspname || '.' || trigger_function.proname
+          || '(' || pg_catalog.pg_get_function_identity_arguments(
+            trigger_function.oid
+          ) || ')',
+        COALESCE(pg_catalog.pg_get_expr(
+          installed.tgqual, installed.tgrelid
+        ), ''),
+        trim(regexp_replace(pg_catalog.pg_get_triggerdef(installed.oid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.table_name, installed.tgname),
+      'UTF8'), 'sha256'), 'hex') =
+        'fb376ea9ea5eedac159dc234b5f399e9b95d3e5e605b70491e4643d930afcf9d'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence',
+       'protect_shopify_test_store_e2e_evidence_write'),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations',
+       'protect_shopify_test_store_e2e_confirmation_write')
+    ) required(table_name, trigger_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_trigger installed
+      ON installed.tgrelid = table_row.oid
+     AND installed.tgname = required.trigger_name
+    LEFT JOIN pg_catalog.pg_proc trigger_function
+      ON trigger_function.oid = installed.tgfoid
+    LEFT JOIN pg_catalog.pg_namespace function_namespace
+      ON function_namespace.oid = trigger_function.pronamespace
+  )
+`
+
+// Exact structural attestation for 0293. The migration checksum pins the
+// backfill, the pg_proc hash pins strict policy validation, and the catalog
+// constraint hash prevents a same-named but weakened CHECK from passing.
+const SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0293_shopify_checkout_audience_policy.sql'
+      AND checksum =
+        'ad112694afea9286f28d38e6522224d44b36f5b32013f87483399e6da5ce8707'
+  )
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          trim(regexp_replace(
+            installed_function.prosrc,
+            '[[:space:]]+', ' ', 'g'
+          )),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_proc installed_function
+    WHERE installed_function.oid = to_regprocedure(
+      'operations_shopify_checkout_audience_policy_is_valid(jsonb)'
+    )
+  ) = '69cf98f4440714e6907e8c9a56a9a87e57b5985dcce3909ce80fc5980c96974a'
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          concat_ws(
+            '|',
+            installed_check.conname,
+            installed_check.convalidated::text,
+            pg_get_constraintdef(installed_check.oid)
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_constraint installed_check
+    WHERE installed_check.conrelid = to_regclass(
+      'operations_shopify_carrier_service_configs'
+    )
+      AND installed_check.conname =
+        'operations_shopify_configs_checkout_audience_valid'
+      AND installed_check.contype = 'c'
+  ) = '8c5a314298d629ea08b1f0df80b28001f8bc31d413fe10d547dd7eaaaf5845a9'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM operations_shopify_carrier_service_configs config
+    WHERE config.policy_snapshot ? 'shadowCheckoutAudience'
+      AND operations_shopify_checkout_audience_policy_is_valid(
+        config.policy_snapshot -> 'shadowCheckoutAudience'
+      ) IS NOT TRUE
+  )
+`
+
+// Exact structural attestation for 0299. The migration checksum pins every
+// backfill/rewrite, while function hashes and catalog checks detect runtime
+// drift after migration application.
+const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename = '0299_operations_shopify_checkout_rate_control.sql'
+      AND checksum =
+        '09f634524cbe67e825f0675c5ca0a73290e94d57eb3229a82412f329986ae581'
+  )
+  AND (
+    SELECT count(installed.oid) = 29
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.signature,
+          installed_namespace.nspname,
+          language.lanname,
+          installed.prokind::text,
+          installed.provolatile::text,
+          installed.proparallel::text,
+          installed.proisstrict::text,
+          installed.prosecdef::text,
+          COALESCE(array_to_string(installed.proconfig, ','), ''),
+          trim(regexp_replace(
+            installed.prosrc, '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.signature
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '622a3970365026c6d9b8ed34de31737bd4b7b1cfd0ad8750e37b5db5a7e9b0c0'
+    FROM (VALUES
+      ('operations_shopify_checkout_rate_control_is_valid(jsonb)'),
+      ('operations_shopify_checkout_rate_control_response_is_valid(jsonb)'),
+      ('validate_operations_shopify_checkout_rate_control_config()'),
+      ('validate_operations_shopify_customer_rate_policy_write()'),
+      ('validate_operations_shopify_carrier_service_config()'),
+      ('protect_operations_commerce_external_effect_intent()'),
+      ('protect_ops_shopify_cs_mut_authorization()'),
+      ('protect_ops_shopify_cs_mut_attempt()'),
+      ('protect_ops_shopify_cs_mut_outcome()'),
+      ('protect_ops_shopify_cs_mut_resolution()'),
+      ('protect_ops_shopify_cs_name_update_authorization()'),
+      ('protect_ops_shopify_cs_config_mut_link()'),
+      ('operations_shopify_cs_name_has_exact_finalization_evidence(uuid,uuid,uuid,bigint,bigint,text,text,integer)'),
+      ('operations_shopify_carrier_configuration_allows_rating(jsonb,text)'),
+      ('operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)'),
+      ('operations_shopify_carrier_service_config_is_ready(uuid,uuid)'),
+      ('operations_shopify_carrier_service_rating_environment_is_ready(uuid,uuid,text)'),
+      ('operations_shopify_carrier_service_rating_runtime_is_ready(uuid,uuid)'),
+      ('operations_shopify_checkout_rating_channel_is_eligible(text,text,text,text,boolean,boolean,integer)'),
+      ('validate_operations_commerce_variant_pack_mapping()'),
+      ('validate_operations_shopify_checkout_rate_control_receipt()'),
+      ('protect_operations_shopify_checkout_rate_control_receipt()'),
+      ('validate_operations_shopify_checkout_rate_receipt_insert()'),
+      ('protect_operations_shopify_checkout_rate_receipt()'),
+      ('operations_legacy_shopify_config_carrier_account_id(uuid,text,text)'),
+      ('derive_operations_legacy_shopify_carrier_selection_key()'),
+      ('validate_one_off_rate_selection_key()'),
+      ('protect_op_shopify_checkout_provider_attempt()'),
+      ('validate_operations_pack_rate_run_complete()')
+    ) AS required(signature)
+    LEFT JOIN pg_catalog.pg_proc installed
+      ON installed.oid = to_regprocedure(
+        'public.' || required.signature
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.pronamespace
+    LEFT JOIN pg_catalog.pg_language language
+      ON language.oid = installed.prolang
+  )
+  AND (
+    SELECT count(installed.oid) = 18
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.table_name,
+          table_namespace.nspname,
+          required.trigger_name,
+          installed.tgtype::text,
+          installed.tgenabled::text,
+          installed.tgisinternal::text,
+          procedure_namespace.nspname || '.' || procedure.proname
+            || '(' || pg_get_function_identity_arguments(procedure.oid)
+            || ')',
+          trim(regexp_replace(
+            pg_get_triggerdef(installed.oid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.table_name, required.trigger_name
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '84549b7f6f070ce2f5df23d89aaf818a0711e59016ca0c88ec9b4312816d04b9'
+    FROM (VALUES
+      ('operations_commerce_external_effect_intents', 'protect_operations_commerce_external_effect_intent_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_carrier_service_config_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_checkout_rate_control_config_write'),
+      ('operations_shopify_carrier_service_configs', 'validate_operations_shopify_carrier_service_config_ready'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'protect_ops_shopify_cs_mut_auth_write'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'protect_ops_shopify_cs_name_update_auth_write'),
+      ('operations_shopify_carrier_service_mutation_attempts', 'protect_ops_shopify_cs_mut_attempt_write'),
+      ('operations_shopify_carrier_service_mutation_attempts', 'protect_ops_shopify_cs_attempt_authorization_lock_write'),
+      ('operations_shopify_carrier_service_mutation_outcomes', 'protect_ops_shopify_cs_mut_outcome_write'),
+      ('operations_shopify_carrier_service_mutation_resolutions', 'protect_ops_shopify_cs_mut_resolution_write'),
+      ('operations_shopify_carrier_service_config_mutation_links', 'protect_ops_shopify_cs_config_mut_link_write'),
+      ('operations_shopify_customer_rate_policies', 'validate_operations_shopify_customer_rate_policy_write_trigger'),
+      ('operations_commerce_variant_pack_mappings', 'validate_operations_commerce_variant_pack_mapping'),
+      ('operations_shopify_checkout_rate_control_receipts', 'validate_operations_shopify_checkout_rate_control_receipt_write'),
+      ('operations_shopify_checkout_rate_control_receipts', 'protect_operations_shopify_checkout_rate_control_receipt_write'),
+      ('operations_shopify_checkout_rate_receipts', 'validate_operations_shopify_checkout_rate_receipt_insert'),
+      ('operations_shopify_checkout_rate_receipts', 'protect_operations_shopify_checkout_rate_receipt_write'),
+      ('operations_shopify_checkout_rate_receipt_provider_attempts', 'protect_op_shopify_checkout_provider_attempt_write')
+    ) AS required(table_name, trigger_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_trigger installed
+      ON installed.tgrelid = table_row.oid
+     AND installed.tgname = required.trigger_name
+    LEFT JOIN pg_catalog.pg_proc procedure
+      ON procedure.oid = installed.tgfoid
+    LEFT JOIN pg_catalog.pg_namespace procedure_namespace
+      ON procedure_namespace.oid = procedure.pronamespace
+  )
+  AND (
+    SELECT count(installed.oid) = 18
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          required.table_name,
+          table_namespace.nspname,
+          required.constraint_name,
+          installed.contype::text,
+          installed.convalidated::text,
+          installed.condeferrable::text,
+          installed.condeferred::text,
+          trim(regexp_replace(
+            pg_get_constraintdef(installed.oid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY required.table_name, required.constraint_name
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '16218feeb6f9a6804932f1e9a29e26bb7fd1c2f7c2d0b46956571a806ba31845'
+    FROM (VALUES
+      ('operations_shopify_carrier_service_configs', 'operations_shopify_configs_org_id_account_unique'),
+      ('operations_shopify_carrier_service_configs', 'operations_shopify_configs_rate_control_valid'),
+      ('operations_shopify_carrier_service_mutation_authorizations', 'ops_shopify_cs_mut_auth_activation_state_valid'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rat_resulting_policy_revision_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_con_expected_row_version_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_con_provider_write_count_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_contro_requested_control_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_re_prior_control_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_rec_request_hash_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_receipts_check'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_checkout_rate_control_receipts_pkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_account_fkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_config_fkey'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_key_unique'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_response_valid'),
+      ('operations_shopify_checkout_rate_control_receipts', 'operations_shopify_rate_control_receipt_text_valid'),
+      ('operations_shopify_checkout_rate_receipts', 'operations_shopify_checkout_receipts_activation_state_valid'),
+      ('operations_shopify_checkout_rate_receipts', 'operations_shopify_checkout_receipts_rate_source_valid')
+    ) AS required(table_name, constraint_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_constraint installed
+      ON installed.conrelid = table_row.oid
+     AND installed.conname = required.constraint_name
+  )
+  AND (
+    SELECT count(*) = 17
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          table_row.relname,
+          table_namespace.nspname,
+          installed.attname,
+          installed.attnum::text,
+          format_type(installed.atttypid, installed.atttypmod),
+          installed.attnotnull::text,
+          installed.attidentity::text,
+          installed.attgenerated::text,
+          COALESCE(pg_get_expr(
+            installed_default.adbin, installed_default.adrelid
+          ), ''),
+          COALESCE(installed_collation.collname, '')
+        ), E'\n' ORDER BY table_row.relname, installed.attnum
+      ), 'UTF8'), 'sha256'), 'hex') =
+        '7b85db01722082bf6ad5e1d55fddbfb6045f808a47c436e2055ea887b6f2bde4'
+    FROM pg_catalog.pg_attribute installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.attrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef installed_default
+      ON installed_default.adrelid = installed.attrelid
+     AND installed_default.adnum = installed.attnum
+    LEFT JOIN pg_catalog.pg_collation installed_collation
+      ON installed_collation.oid = installed.attcollation
+    WHERE installed.attnum > 0
+      AND NOT installed.attisdropped
+      AND (
+        table_row.oid = to_regclass(
+          'public.operations_shopify_checkout_rate_control_receipts'
+        )
+        OR (
+          table_row.oid = to_regclass(
+            'public.operations_shopify_checkout_rate_receipts'
+          )
+          AND installed.attname = 'rate_source'
+        )
+      )
+  )
+  AND (
+    SELECT count(*) = 3
+      AND encode(digest(convert_to(string_agg(
+        concat_ws('|',
+          table_row.relname,
+          table_namespace.nspname,
+          index_row.relname,
+          index_namespace.nspname,
+          installed.indisunique::text,
+          installed.indisprimary::text,
+          installed.indisvalid::text,
+          installed.indisready::text,
+          trim(regexp_replace(
+            pg_get_indexdef(installed.indexrelid), '[[:space:]]+', ' ', 'g'
+          ))
+        ), E'\n' ORDER BY table_row.relname, index_row.relname
+      ), 'UTF8'), 'sha256'), 'hex') =
+        'ab9cfb51412ec44ee6d15d734652036bf56c7a5ffe8e8df418653d9a3310632a'
+    FROM pg_catalog.pg_index installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.indrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    JOIN pg_catalog.pg_class index_row
+      ON index_row.oid = installed.indexrelid
+    JOIN pg_catalog.pg_namespace index_namespace
+      ON index_namespace.oid = index_row.relnamespace
+    WHERE table_row.oid = to_regclass(
+      'public.operations_shopify_checkout_rate_control_receipts'
+    )
+       OR index_row.relname =
+         'operations_shopify_configs_org_id_account_unique'
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_carrier_service_configs config
+    WHERE operations_shopify_checkout_rate_control_is_valid(
+      config.policy_snapshot -> 'checkoutRateControl'
+    ) IS NOT TRUE
+  )
+`
 
 // Exact structural attestation for 0288. This is intentionally stricter than
 // checking schema_migrations: mapped refresh work must not run if a column,
@@ -723,6 +1257,11 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
     FROM schema_migrations
     WHERE filename = '0290_operations_shadow_training_runs.sql'
   )
+  AND EXISTS (
+    SELECT 1
+    FROM schema_migrations
+    WHERE filename = '0300_operations_order_training_independent_control.sql'
+  )
   AND (
     WITH target_table(table_name) AS (
       VALUES
@@ -994,7 +1533,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'validate_operations_shadow_training_run_identity()',
         'plpgsql', 'v',
-        '4d0a836345d3bc310ad27d9ae4f74a25b0bc2bf246e10712b3e2427bd168cf93'
+        '0c8485310e1dade3adfd8b38128b7ea288975456f2ff796fa9160a5757881dad'
       ),
       (
         'protect_operations_shadow_training_package()',
@@ -1019,12 +1558,12 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       (
         'guard_shadow_commerce_canonical_write()',
         'plpgsql', 'v',
-        'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3'
+        'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310'
       ),
       (
         'guard_shadow_training_activation_change()',
         'plpgsql', 'v',
-        'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f'
+        'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053'
       )
     ) AS required_function(
       signature, language_name, volatility, source_sha256
@@ -1184,6 +1723,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
               required_trigger.initially_deferred
         AND installed_trigger.tgfoid =
               to_regprocedure(required_trigger.function_signature)
+        AND installed_trigger.tgqual IS NULL
         AND ARRAY(
           SELECT installed_update_column.attname
           FROM unnest(installed_trigger.tgattr::smallint[])
@@ -1701,6 +2241,7 @@ export async function GET() {
     let crm: Record<string, unknown> = { status: 'disabled' }
     let knowledgeWorkers: Array<Record<string, unknown>> = []
     const repositoryRunner = getRepositoryRunnerConfiguration()
+    const printAgentRelease = getPrintAgentReleaseConfiguration()
     const commerceRevisionEvidence =
       commerceRevisionEvidenceConfiguration()
 
@@ -1746,6 +2287,9 @@ export async function GET() {
     if (repositoryRunner.enabled && !repositoryRunner.ready) {
       errors.push(repositoryRunner.reason)
     }
+    if (printAgentRelease.enabled && !printAgentRelease.ready) {
+      errors.push(printAgentRelease.reason)
+    }
     if (!String(process.env.CLAWPILOT_MAIL_FROM || '').includes('@')) {
       errors.push('Hosted runtime ClawPilot mail sender is not configured.')
     }
@@ -1790,6 +2334,7 @@ export async function GET() {
 
     if (storage === 'postgres') {
       try {
+        await reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres()
         const result = await query<{
           now: string
           worker_migration_applied: boolean
@@ -1872,7 +2417,12 @@ export async function GET() {
           operations_print_delivery_migration_applied: boolean
           operations_print_device_reference_privacy_applied: boolean
           operations_print_agent_pairing_grants_applied: boolean
+          operations_print_agent_pairing_recovery_applied: boolean
+          operations_print_outcome_uncertain_fence_applied: boolean
+          operations_print_agent_cleanup_status_applied: boolean
           shopify_carrier_configured_carriers_applied: boolean
+          shopify_checkout_audience_policy_applied: boolean
+          shopify_checkout_rate_control_applied: boolean
           carrier_shipping_diagnostics_applied: boolean
           carrier_shipping_diagnostic_attempt_counts: Record<
             'sandbox' | 'production',
@@ -1943,6 +2493,8 @@ export async function GET() {
           operations_shopify_location_routing_applied: boolean
           operations_shopify_location_administration_applied: boolean
           operations_shadow_training_applied: boolean
+          shipping_independence_applied: boolean
+          shipping_one_off_pack_applied: boolean
           operations_order_replanning_corrections_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
           operations_shopify_catalog_webhook_refresh_applied: boolean
@@ -1966,6 +2518,7 @@ export async function GET() {
           operations_shopify_shadow_test_subsidy_applied: boolean
           operations_shopify_quote_match_families_applied: boolean
           operations_sandbox_commerce_e2e_authorization_applied: boolean
+          operations_shopify_test_store_canonical_e2e_applied: boolean
           operations_commerce_active_canonical_collation_applied: boolean
           operations_sandbox_commerce_e2e_active_guards_applied: boolean
           operations_faire_sandbox_commerce_e2e_applied: boolean
@@ -1988,6 +2541,8 @@ export async function GET() {
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
+          operations_commerce_store_sync_controls_applied: boolean
+          operations_shopify_order_webhook_reconciliation_applied: boolean
           migration_checksums_present: boolean
         }>(
           `
@@ -2677,6 +3232,12 @@ export async function GET() {
                 ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
               ) AS operations_shadow_training_applied,
               (
+                ${SHIPPING_INDEPENDENCE_HEALTH_SQL}
+              ) AS shipping_independence_applied,
+              (
+                ${SHIPPING_ONE_OFF_PACK_HEALTH_SQL}
+              ) AS shipping_one_off_pack_applied,
+              (
                 ${OPERATIONS_ORDER_REPLANNING_CORRECTIONS_HEALTH_SQL}
               ) AS operations_order_replanning_corrections_applied,
               EXISTS (
@@ -2811,6 +3372,9 @@ export async function GET() {
                 WHERE filename =
                   '0198_operations_sandbox_commerce_e2e_authorization.sql'
               ) AS operations_sandbox_commerce_e2e_authorization_applied,
+              (
+                ${SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL}
+              ) AS operations_shopify_test_store_canonical_e2e_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -4295,6 +4859,348 @@ export async function GET() {
                 SELECT 1
                 FROM schema_migrations
                 WHERE filename =
+                  '0295_operations_print_agent_pairing_recovery_envelopes.sql'
+              )
+              AND (
+                SELECT count(*) = 7
+                FROM pg_attribute pairing_recovery_column
+                WHERE pairing_recovery_column.attrelid = to_regclass(
+                  'operations_print_agent_pairing_grants'
+                )
+                  AND pairing_recovery_column.attname = ANY (ARRAY[
+                    'redemption_protocol',
+                    'client_installation_id',
+                    'client_public_key_spki',
+                    'client_key_fingerprint',
+                    'credential_envelope',
+                    'credential_envelope_sha256',
+                    'recovery_expires_at'
+                  ])
+                  AND NOT pairing_recovery_column.attisdropped
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint pairing_recovery_constraint
+                WHERE pairing_recovery_constraint.conrelid = to_regclass(
+                  'operations_print_agent_pairing_grants'
+                )
+                  AND pairing_recovery_constraint.conname =
+                    'operations_print_agent_pairing_grants_envelope_shape_valid'
+                  AND pairing_recovery_constraint.contype = 'c'
+                  AND pairing_recovery_constraint.convalidated
+              ) AS operations_print_agent_pairing_recovery_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0296_operations_print_outcome_uncertain_retry_fence.sql'
+              )
+              AND to_regprocedure(
+                'prevent_operations_uncertain_print_retry()'
+              ) IS NOT NULL
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'prevent_operations_uncertain_print_retry()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%FROM operations_print_jobs job%FOR UPDATE%'
+              AND regexp_replace(
+                pg_get_functiondef(to_regprocedure(
+                  'prevent_operations_uncertain_print_retry()'
+                )),
+                '[[:space:]]+', ' ', 'g'
+              ) LIKE '%previous_error_code = ''PRINT_OUTCOME_UNCERTAIN''%'
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger uncertain_retry_guard
+                WHERE uncertain_retry_guard.tgrelid = to_regclass(
+                  'operations_print_delivery_attempts'
+                )
+                  AND uncertain_retry_guard.tgname =
+                    'prevent_operations_uncertain_print_retry_write'
+                  AND uncertain_retry_guard.tgfoid = to_regprocedure(
+                    'prevent_operations_uncertain_print_retry()'
+                  )
+                  AND uncertain_retry_guard.tgenabled = 'O'
+                  AND uncertain_retry_guard.tgtype = 7
+                  AND NOT uncertain_retry_guard.tgisinternal
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_print_jobs stranded_job
+                JOIN operations_print_agents stranded_agent
+                  ON stranded_agent.organization_id = stranded_job.organization_id
+                 AND stranded_agent.id = stranded_job.claimed_by_print_agent_id
+                JOIN operations_printers stranded_printer
+                  ON stranded_printer.organization_id = stranded_job.organization_id
+                 AND stranded_printer.id = stranded_job.printer_id
+                WHERE stranded_job.status = 'claimed'
+                  AND (
+                    stranded_agent.status <> 'active'
+                    OR stranded_printer.local_print_agent_id
+                      IS DISTINCT FROM stranded_agent.id
+                  )
+              ) AS operations_print_outcome_uncertain_fence_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0297_operations_print_agent_cleanup_status.sql'
+                  AND checksum =
+                    'e599a45aa200f6ed387003d6dff92cfe396136ffd4462a5c7cb93af7333d8e3e'
+              )
+              AND to_regclass(
+                'operations_print_agent_cleanup_credentials'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_print_agent_cleanup_receipts'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'retain_operations_print_agent_cleanup_credential()'
+              ) IS NOT NULL
+              AND to_regprocedure(
+                'protect_operations_print_agent_cleanup_evidence()'
+              ) IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger cleanup_retention_trigger
+                WHERE cleanup_retention_trigger.tgrelid = to_regclass(
+                  'operations_print_agents'
+                )
+                  AND cleanup_retention_trigger.tgname =
+                    'retain_operations_print_agent_cleanup_credential_write'
+                  AND cleanup_retention_trigger.tgfoid = to_regprocedure(
+                    'retain_operations_print_agent_cleanup_credential()'
+                  )
+                  AND cleanup_retention_trigger.tgenabled = 'O'
+                  AND NOT cleanup_retention_trigger.tgisinternal
+                  AND cleanup_retention_trigger.tgtype = 17
+              )
+              AND (
+                SELECT count(*) = 2
+                FROM pg_trigger cleanup_guard
+                WHERE cleanup_guard.tgname = ANY (ARRAY[
+                  'protect_operations_print_agent_cleanup_credential_write',
+                  'protect_operations_print_agent_cleanup_receipt_write'
+                ])
+                  AND cleanup_guard.tgfoid = to_regprocedure(
+                    'protect_operations_print_agent_cleanup_evidence()'
+                  )
+                  AND cleanup_guard.tgenabled = 'O'
+                  AND NOT cleanup_guard.tgisinternal
+                  AND cleanup_guard.tgtype = 27
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_print_delivery_attempts uncertain
+                JOIN operations_print_delivery_attempts requeued
+                  ON requeued.organization_id = uncertain.organization_id
+                 AND requeued.print_job_id = uncertain.print_job_id
+                 AND requeued.sequence_number > uncertain.sequence_number
+                 AND requeued.state = 'queued'
+                WHERE uncertain.state = 'failed'
+                  AND uncertain.error_code = 'PRINT_OUTCOME_UNCERTAIN'
+              ) AS operations_print_agent_cleanup_status_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
+                  '0298_operations_commerce_store_sync_controls.sql'
+                  AND checksum =
+                    '48f1a4014dbca95b242491060d679256a1813e939f20ccf332b1170ab396458b'
+              )
+              AND to_regclass(
+                'operations_commerce_store_sync_controls'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_store_sync_change_receipts'
+              ) IS NOT NULL
+              AND to_regclass(
+                'operations_commerce_store_sync_read_leases'
+              ) IS NOT NULL
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL}
+              AND (
+                SELECT string_agg(
+                  column_name || ':' || data_type || ':' || is_nullable || ':'
+                    || (column_default IS NOT NULL)::text,
+                  ',' ORDER BY ordinal_position
+                ) =
+                  'organization_id:uuid:NO:false,integration_account_id:uuid:NO:false,desired_state:text:NO:false,explicit_choice:boolean:NO:true,revision:bigint:NO:true,reason:text:NO:false,created_by:text:YES:false,updated_by:text:YES:false,created_at:timestamp with time zone:NO:true,updated_at:timestamp with time zone:NO:true'
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name =
+                    'operations_commerce_store_sync_controls'
+              )
+              AND (
+                SELECT string_agg(
+                  column_name || ':' || data_type || ':' || is_nullable || ':'
+                    || (column_default IS NOT NULL)::text,
+                  ',' ORDER BY ordinal_position
+                ) =
+                  'id:uuid:NO:true,organization_id:uuid:NO:false,integration_account_id:uuid:NO:false,idempotency_key:text:NO:false,request_hash:text:NO:false,previous_desired_state:text:NO:false,desired_state:text:NO:false,resulting_revision:bigint:NO:false,reason:text:NO:false,actor_email:text:NO:false,response_json:text:NO:false,created_at:timestamp with time zone:NO:true'
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name =
+                    'operations_commerce_store_sync_change_receipts'
+              )
+              AND (
+                SELECT count(*) = 5
+                  AND count(*) FILTER (WHERE contype = 'p') = 1
+                  AND count(*) FILTER (WHERE contype = 'f') = 1
+                  AND count(*) FILTER (WHERE contype = 'c') = 3
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND convalidated
+              )
+              AND (
+                SELECT count(*) = 11
+                  AND count(*) FILTER (WHERE contype = 'p') = 1
+                  AND count(*) FILTER (WHERE contype = 'f') = 1
+                  AND count(*) FILTER (WHERE contype = 'u') = 1
+                  AND count(*) FILTER (WHERE contype = 'c') = 8
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_controls_account_fkey'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_controls'
+                  )
+                  AND confrelid = to_regclass(
+                    'operations_integration_accounts'
+                  )
+                  AND contype = 'f'
+                  AND confdeltype = 'r'
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_receipts_account_fkey'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_change_receipts'
+                  )
+                  AND confrelid = to_regclass(
+                    'operations_commerce_store_sync_controls'
+                  )
+                  AND contype = 'f'
+                  AND confdeltype = 'r'
+                  AND convalidated
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname =
+                    'operations_commerce_store_sync_receipts_idempotency_unique'
+                  AND conrelid = to_regclass(
+                    'operations_commerce_store_sync_change_receipts'
+                  )
+                  AND contype = 'u'
+                  AND convalidated
+              )
+              AND (
+                SELECT count(*) = 1
+                FROM pg_index
+                WHERE indrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND indisvalid AND indisready AND indisunique
+              )
+              AND (
+                SELECT count(*) = 2
+                FROM pg_index
+                WHERE indrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND indisvalid AND indisready AND indisunique
+              )
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL}
+              AND ${OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL}
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_integration_accounts'
+                )
+                  AND installed_trigger.tgname =
+                    'seed_operations_commerce_store_sync_control_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'seed_operations_commerce_store_sync_control()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 5
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_commerce_store_sync_controls'
+                )
+                  AND installed_trigger.tgname =
+                    'validate_operations_commerce_store_sync_identity_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'validate_operations_commerce_store_sync_identity()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 23
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_trigger
+                WHERE installed_trigger.tgrelid = to_regclass(
+                  'operations_commerce_store_sync_change_receipts'
+                )
+                  AND installed_trigger.tgname =
+                    'protect_operations_commerce_store_sync_receipt_write'
+                  AND installed_trigger.tgfoid = to_regprocedure(
+                    'protect_operations_commerce_store_sync_receipt()'
+                  )
+                  AND installed_trigger.tgenabled = 'O'
+                  AND NOT installed_trigger.tgisinternal
+                  AND installed_trigger.tgtype = 27
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_integration_accounts account
+                LEFT JOIN operations_commerce_store_sync_controls control
+                  ON control.organization_id = account.organization_id
+                 AND control.integration_account_id = account.id
+                WHERE account.integration_type = 'commerce'
+                  AND account.provider IN ('shopify', 'faire')
+                  AND control.integration_account_id IS NULL
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM operations_commerce_store_sync_controls control
+                LEFT JOIN operations_integration_accounts account
+                  ON account.organization_id = control.organization_id
+                 AND account.id = control.integration_account_id
+                 AND account.integration_type = 'commerce'
+                 AND account.provider IN ('shopify', 'faire')
+                WHERE account.id IS NULL
+                   OR operations_commerce_store_sync_effective_reason(
+                        control.organization_id,
+                        control.integration_account_id
+                      ) IS NULL
+              ) AS operations_commerce_store_sync_controls_applied,
+              (
+                ${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL}
+              ) AS operations_shopify_order_webhook_reconciliation_applied,
+              EXISTS (
+                SELECT 1
+                FROM schema_migrations
+                WHERE filename =
                   '0285_shopify_carrier_service_configured_carriers.sql'
               )
               AND EXISTS (
@@ -4806,6 +5712,12 @@ export async function GET() {
                 )
               )
                 AS shopify_carrier_configured_carriers_applied,
+              (
+                ${SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL}
+              ) AS shopify_checkout_audience_policy_applied,
+              (
+                ${SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL}
+              ) AS shopify_checkout_rate_control_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -5273,7 +6185,12 @@ export async function GET() {
             && row?.operations_print_delivery_migration_applied
             && row?.operations_print_device_reference_privacy_applied
             && row?.operations_print_agent_pairing_grants_applied
+            && row?.operations_print_agent_pairing_recovery_applied
+            && row?.operations_print_outcome_uncertain_fence_applied
+            && row?.operations_print_agent_cleanup_status_applied
             && row?.shopify_carrier_configured_carriers_applied
+            && row?.shopify_checkout_audience_policy_applied
+            && row?.shopify_checkout_rate_control_applied
             && row?.carrier_shipping_diagnostics_applied
             && row?.crm_native_activity_projection_migration_applied
             && row?.crm_contact_identity_aliases_migration_applied
@@ -5334,6 +6251,8 @@ export async function GET() {
             && row?.operations_shopify_location_routing_applied
             && row?.operations_shopify_location_administration_applied
             && row?.operations_shadow_training_applied
+            && row?.shipping_independence_applied
+            && row?.shipping_one_off_pack_applied
             && row?.operations_order_replanning_corrections_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
@@ -5357,6 +6276,7 @@ export async function GET() {
             && row?.operations_shopify_shadow_test_subsidy_applied
             && row?.operations_shopify_quote_match_families_applied
             && row?.operations_sandbox_commerce_e2e_authorization_applied
+            && row?.operations_shopify_test_store_canonical_e2e_applied
             && row?.operations_commerce_active_canonical_collation_applied
             && row?.operations_sandbox_commerce_e2e_active_guards_applied
             && row?.operations_faire_sandbox_commerce_e2e_applied
@@ -5379,6 +6299,8 @@ export async function GET() {
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
+            && row?.operations_commerce_store_sync_controls_applied
+            && row?.operations_shopify_order_webhook_reconciliation_applied
             && row?.migration_checksums_present
           ),
           carrierShippingDiagnostics: {
@@ -5389,8 +6311,51 @@ export async function GET() {
           },
           printAgentPairing: {
             status: row?.operations_print_agent_pairing_grants_applied
+              && row?.operations_print_agent_pairing_recovery_applied
               ? 'ready'
               : 'migration-pending',
+            recoverySafe: Boolean(
+              row?.operations_print_agent_pairing_recovery_applied,
+            ),
+            deliveryOutcomeFence: row?.operations_print_outcome_uncertain_fence_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          printAgentCleanupStatus: {
+            status: row?.operations_print_agent_cleanup_status_applied
+              ? 'ready'
+              : 'migration-structure-or-ledger-pending',
+            redactedEvidence: Boolean(
+              row?.operations_print_agent_cleanup_status_applied,
+            ),
+          },
+          commerceStoreSync: {
+            status: row?.operations_commerce_store_sync_controls_applied
+              ? 'ready'
+              : 'migration-structure-or-coverage-pending',
+          },
+          shopifyOrderWebhookReconciliation: {
+            status: row?.operations_shopify_order_webhook_reconciliation_applied
+              ? 'ready'
+              : 'migration-structure-or-checksum-pending',
+          },
+          shopifyCheckoutAudiencePolicy: {
+            status: row?.shopify_checkout_audience_policy_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shopifyCheckoutRateControl: {
+            status: row?.shopify_checkout_rate_control_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shopifyTestStoreCanonicalE2e: {
+            status: row?.operations_shopify_test_store_canonical_e2e_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+            environment: 'development-only',
+            productionPostageAuthorized: false,
+            customerNotificationAuthorized: false,
           },
           shopifyLocationRouting: {
             status: row?.operations_shopify_location_routing_applied
@@ -5404,6 +6369,16 @@ export async function GET() {
           },
           shadowTraining: {
             status: row?.operations_shadow_training_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shippingIndependence: {
+            status: row?.shipping_independence_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shippingOneOffPack: {
+            status: row?.shipping_one_off_pack_applied
               ? 'ready'
               : 'migration-or-structure-pending',
           },
@@ -5702,7 +6677,12 @@ export async function GET() {
           || !row?.operations_print_delivery_migration_applied
           || !row?.operations_print_device_reference_privacy_applied
           || !row?.operations_print_agent_pairing_grants_applied
+          || !row?.operations_print_agent_pairing_recovery_applied
+          || !row?.operations_print_outcome_uncertain_fence_applied
+          || !row?.operations_print_agent_cleanup_status_applied
           || !row?.shopify_carrier_configured_carriers_applied
+          || !row?.shopify_checkout_audience_policy_applied
+          || !row?.shopify_checkout_rate_control_applied
           || !row?.carrier_shipping_diagnostics_applied
           || !row?.crm_native_activity_projection_migration_applied
           || !row?.crm_contact_identity_aliases_migration_applied
@@ -5763,6 +6743,8 @@ export async function GET() {
           || !row?.operations_shopify_location_routing_applied
           || !row?.operations_shopify_location_administration_applied
           || !row?.operations_shadow_training_applied
+          || !row?.shipping_independence_applied
+          || !row?.shipping_one_off_pack_applied
           || !row?.operations_order_replanning_corrections_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
           || !row?.operations_shopify_catalog_webhook_refresh_applied
@@ -5786,6 +6768,7 @@ export async function GET() {
           || !row?.operations_shopify_shadow_test_subsidy_applied
           || !row?.operations_shopify_quote_match_families_applied
           || !row?.operations_sandbox_commerce_e2e_authorization_applied
+          || !row?.operations_shopify_test_store_canonical_e2e_applied
           || !row?.operations_commerce_active_canonical_collation_applied
           || !row?.operations_sandbox_commerce_e2e_active_guards_applied
           || !row?.operations_faire_sandbox_commerce_e2e_applied
@@ -5808,6 +6791,8 @@ export async function GET() {
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied
+          || !row?.operations_commerce_store_sync_controls_applied
+          || !row?.operations_shopify_order_webhook_reconciliation_applied
           || !row?.migration_checksums_present
         ) {
           errors.push('Required database migrations are not applied.')
@@ -6231,7 +7216,10 @@ export async function GET() {
                               AND policy.policy_version
                                 = 'commerce-product-intake-policy-v1'
                               AND policy.revision = job.policy_revision
-                              AND activation.state IN ('shadow', 'active')
+                              AND operations_commerce_store_sync_is_running(
+                                account.organization_id,
+                                account.id
+                              )
                               AND (
                                 (
                                   account.provider = 'shopify'
@@ -6296,7 +7284,10 @@ export async function GET() {
                      AND credential.verification_status = 'verified'
                      AND policy.policy_version
                        = 'commerce-product-intake-policy-v1'
-                     AND activation.state IN ('shadow', 'active')
+                     AND operations_commerce_store_sync_is_running(
+                       account.organization_id,
+                       account.id
+                     )
                      AND COALESCE(
                        account.configuration->'grantedScopes',
                        '[]'::jsonb
@@ -6348,7 +7339,10 @@ export async function GET() {
                       AND credential.verification_status = 'verified'
                       AND policy.policy_version
                         = 'commerce-product-intake-policy-v1'
-                      AND activation.state IN ('shadow', 'active')
+                      AND operations_commerce_store_sync_is_running(
+                        account.organization_id,
+                        account.id
+                      )
                       AND (
                         (
                           account.provider = 'shopify'
@@ -7161,6 +8155,13 @@ export async function GET() {
           repository: repositoryRunner.repositoryFullName,
           baseBranch: repositoryRunner.baseBranch,
           patchOnly: true,
+        },
+        printAgentRelease: {
+          enabled: printAgentRelease.enabled,
+          ready: printAgentRelease.ready,
+          reason: printAgentRelease.reason,
+          version: printAgentRelease.version || null,
+          customerAssetsOnly: true,
         },
       },
       checkedAt,

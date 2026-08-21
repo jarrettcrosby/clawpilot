@@ -365,6 +365,10 @@ function createShopifyExactReadHarness(responses) {
       },
       '@/lib/persistence/commerceOrderReconciliation': {},
       '@/lib/persistence/commerceIntake': {},
+      '@/lib/persistence/commerceStoreSync': {
+        withCommerceStoreSyncProviderReadFenceInPostgres: (input) =>
+          input.read(),
+      },
       '@/lib/persistence/operations': {},
     },
   )

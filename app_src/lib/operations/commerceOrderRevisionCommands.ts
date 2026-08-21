@@ -13,6 +13,10 @@ import {
   prepareManagerCommerceOrderRevisionRefreshInPostgres,
   readManagerCommerceOrderRevisionStateFromPostgres,
 } from '@/lib/persistence/commerceOrderRevisions'
+import {
+  CommerceStoreSyncProviderReadFenceError,
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 function providerErrorCode(error: unknown) {
   if (
@@ -20,6 +24,9 @@ function providerErrorCode(error: unknown) {
       || error instanceof FaireOrderRevisionError)
     && /^[A-Z][A-Z0-9_]{2,127}$/u.test(error.code)
   ) return error.code
+  if (error instanceof CommerceStoreSyncProviderReadFenceError) {
+    return error.code
+  }
   return 'COMMERCE_ORDER_REVISION_REFRESH_FAILED'
 }
 
@@ -54,31 +61,54 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
     )
   }
   try {
-    const evidence = claim.provider === 'shopify'
-      ? await inspectShopifyCanonicalOrderRevision(claim)
-      : await inspectFaireCanonicalOrderRevision(claim)
-    if (evidence.providerWrites !== 0) {
-      throw new Error('Provider refresh crossed its provider-write fence')
+    const readFence = {
+      organizationId: claim.organizationId,
+      integrationAccountId: claim.integrationAccountId,
+      authorityKind: 'manual_read_only' as const,
+      readKind: 'order_revision' as const,
+      intentKey: `${prepared.commandReceiptId}:${claim.targetId}:${claim.leaseToken}`,
+      acquiredBy: input.actorEmail,
     }
-    await captureCommerceOrderRevisionObservationInPostgres({
-      claim,
-      sourceRevision: evidence.sourceRevision,
-      sourceHash: evidence.sourceHash,
-      revisionHash: evidence.revisionHash,
-      normalizedSnapshot: JSON.parse(
-        JSON.stringify(evidence.snapshot),
-      ) as Record<string, unknown>,
-      protectedParty: evidence.protectedParty,
-      protectedShipTo: evidence.protectedShipTo,
-      trigger: {
-        kind: 'manager',
-        commandReceiptId: prepared.commandReceiptId,
-        actorEmail: input.actorEmail,
-      },
-      providerReads: evidence.providerReads,
-      providerWrites: 0,
-      observedAt: evidence.snapshot.observedAt,
-    })
+    const capture = async (providerReadLease: Parameters<
+      typeof captureCommerceOrderRevisionObservationInPostgres
+    >[0]['providerReadLease']) => {
+      const evidence = claim.provider === 'shopify'
+        ? await inspectShopifyCanonicalOrderRevision(claim)
+        : await inspectFaireCanonicalOrderRevision(claim)
+      if (evidence.providerWrites !== 0) {
+        throw new Error('Provider refresh crossed its provider-write fence')
+      }
+      await captureCommerceOrderRevisionObservationInPostgres({
+        claim,
+        providerReadLease,
+        sourceRevision: evidence.sourceRevision,
+        sourceHash: evidence.sourceHash,
+        revisionHash: evidence.revisionHash,
+        normalizedSnapshot: JSON.parse(
+          JSON.stringify(evidence.snapshot),
+        ) as Record<string, unknown>,
+        protectedParty: evidence.protectedParty,
+        protectedShipTo: evidence.protectedShipTo,
+        trigger: {
+          kind: 'manager',
+          commandReceiptId: prepared.commandReceiptId,
+          actorEmail: input.actorEmail,
+        },
+        providerReads: evidence.providerReads,
+        providerWrites: 0,
+        observedAt: evidence.snapshot.observedAt,
+      })
+    }
+    await (claim.provider === 'shopify'
+      ? await withCommerceStoreSyncProviderReadFenceInPostgres({
+          ...readFence,
+          read: capture,
+        })
+      : await withCommerceStoreSyncProviderReadFenceInPostgres({
+          ...readFence,
+          read: capture,
+        })
+    )
     return {
       replayed: false,
       revision: await readManagerCommerceOrderRevisionStateFromPostgres({

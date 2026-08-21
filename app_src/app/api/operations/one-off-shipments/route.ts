@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   activeOperationsOrganizationId,
-  operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -15,11 +15,15 @@ import {
   createOperationsOneOffCarrierGroupInPostgres,
   readOneOffCarrierGroupExecutionModeInPostgres,
   readOneOffShipmentExecutionStateFromPostgres,
+  recoverOperationsOneOffLabelPrintInPostgres,
   refreshOperationsOneOffPackedRatesInPostgres,
   voidOperationsOneOffCarrierGroupInPostgres,
 } from '@/lib/persistence/operationOneOffShipping'
 import { requireRequestUser } from '@/lib/requestUser'
 import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipments'
+import {
+  packShippingOneOffShipmentInPostgres,
+} from '@/lib/persistence/shippingOneOffPack'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -126,11 +130,11 @@ export async function GET(req: NextRequest) {
   try {
     requirePostgres()
     const actor = await requireRequestUser(req)
-    const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canManage || !capabilities.canExecute) {
+    const capabilities = shippingCapabilities(actor)
+    if (!capabilities.canCreate) {
       return forbidden(
-        'You need Operations management and warehouse execution permission to use one-off shipments',
-        'OPERATIONS_ONE_OFF_PERMISSION_REQUIRED',
+        'You need Shipping creation permission to use one-off shipments',
+        'SHIPPING_CREATE_REQUIRED',
       )
     }
     const organizationId = activeOperationsOrganizationId(actor)
@@ -142,7 +146,11 @@ export async function GET(req: NextRequest) {
       })
       return json({ ok: true, state })
     }
-    const workspace = await readOneOffShipmentWorkspaceFromPostgres({ organizationId })
+    const workspace = await readOneOffShipmentWorkspaceFromPostgres({
+      organizationId,
+      actorEmail: actor.email,
+      canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
+    })
     return json({ ok: true, workspace })
   } catch (error) {
     return errorResponse(error)
@@ -153,11 +161,11 @@ export async function POST(req: NextRequest) {
   try {
     requirePostgres()
     const actor = await requireRequestUser(req)
-    const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canManage || !capabilities.canExecute) {
+    const capabilities = shippingCapabilities(actor)
+    if (!capabilities.canCreate) {
       return forbidden(
-        'You need Operations management and warehouse execution permission to use one-off shipments',
-        'OPERATIONS_ONE_OFF_PERMISSION_REQUIRED',
+        'You need Shipping creation permission to use one-off shipments',
+        'SHIPPING_CREATE_REQUIRED',
       )
     }
     const body = await requestBody(req)
@@ -172,10 +180,10 @@ export async function POST(req: NextRequest) {
         )
       }
       const requestedQuote = body.quote as Record<string, unknown>
-      if (requestedQuote?.executionMode === 'live' && !capabilities.canActivate) {
+      if (requestedQuote?.executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live carrier rating requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+          'Live carrier rating requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const quote = await quoteOneOffShipmentInPostgres({
@@ -201,10 +209,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         quoteGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live one-off planning requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_PLAN_PERMISSION_REQUIRED',
+          'Live one-off planning requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const result = await createAndPlanOneOffShipmentInPostgres({
@@ -213,6 +221,31 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKey(req),
         quoteGlobalId,
         selectedOfferGlobalId: String(body.selectedOfferGlobalId || ''),
+        reason: String(body.reason || ''),
+      })
+      return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'confirm-pack') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion',
+        'expectedReviewSnapshotHash', 'confirmation', 'reason',
+      ].includes(key))
+      if (unsupported) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Shipping pack confirmation command is invalid',
+        )
+      }
+      const result = await packShippingOneOffShipmentInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId: String(body.orderGlobalId || ''),
+        expectedRowVersion: Number(body.expectedRowVersion),
+        expectedReviewSnapshotHash: String(
+          body.expectedReviewSnapshotHash || '',
+        ),
+        confirmation: String(body.confirmation || ''),
         reason: String(body.reason || ''),
       })
       return json({ ok: true, result }, result.replayed ? 200 : 201)
@@ -232,10 +265,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         orderGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live packed carrier rating requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+          'Live packed carrier rating requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const result = await refreshOperationsOneOffPackedRatesInPostgres({
@@ -264,10 +297,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         orderGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live postage purchase requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_PURCHASE_PERMISSION_REQUIRED',
+          'Live postage purchase requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       if (
@@ -296,6 +329,69 @@ export async function POST(req: NextRequest) {
       })
       return json({ ok: true, result }, result.replayed ? 200 : 201)
     }
+    if (action === 'recover-label-print') {
+      const unsupported = Object.keys(body).find((key) => ![
+        'action', 'orderGlobalId', 'expectedRowVersion',
+        'packageGlobalId', 'labelGlobalId', 'expectedPrintJobGlobalId',
+        'expectedPrintJobStatus', 'expectedPrintArtifactGlobalId',
+        'expectedRecoveryAction', 'expectedPrintAttempts',
+        'expectedPrintMaxAttempts', 'expectedLatestAttemptSequenceNumber',
+        'expectedLatestErrorCode', 'reason',
+      ].includes(key))
+      const expectedPrintJobStatus = body.expectedPrintJobStatus
+      const expectedRecoveryAction = body.expectedRecoveryAction
+      if (
+        unsupported
+        || !['enqueue', 'retry', 'new_print'].includes(
+          expectedRecoveryAction as string,
+        )
+        || ![
+          null, 'queued', 'claimed', 'delivered', 'failed', 'cancelled',
+          'printed', 'rerouted',
+        ].includes(expectedPrintJobStatus as null | string)
+      ) {
+        throw new OneOffShipmentPersistenceError(
+          'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+          'Shipping label print-recovery command is invalid',
+        )
+      }
+      const result = await recoverOperationsOneOffLabelPrintInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKey(req),
+        orderGlobalId: String(body.orderGlobalId || ''),
+        expectedRowVersion: Number(body.expectedRowVersion),
+        packageGlobalId: String(body.packageGlobalId || ''),
+        labelGlobalId: String(body.labelGlobalId || ''),
+        expectedRecoveryAction: expectedRecoveryAction as
+          | 'enqueue' | 'retry' | 'new_print',
+        expectedPrintJobGlobalId: body.expectedPrintJobGlobalId === null
+          ? null
+          : String(body.expectedPrintJobGlobalId || ''),
+        expectedPrintJobStatus: expectedPrintJobStatus as
+          | 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled'
+          | 'printed' | 'rerouted' | null,
+        expectedPrintArtifactGlobalId:
+          body.expectedPrintArtifactGlobalId === null
+            ? null
+            : String(body.expectedPrintArtifactGlobalId || ''),
+        expectedPrintAttempts: body.expectedPrintAttempts === null
+          ? null
+          : Number(body.expectedPrintAttempts),
+        expectedPrintMaxAttempts: body.expectedPrintMaxAttempts === null
+          ? null
+          : Number(body.expectedPrintMaxAttempts),
+        expectedLatestAttemptSequenceNumber:
+          body.expectedLatestAttemptSequenceNumber === null
+            ? null
+            : Number(body.expectedLatestAttemptSequenceNumber),
+        expectedLatestErrorCode: body.expectedLatestErrorCode === null
+          ? null
+          : String(body.expectedLatestErrorCode || ''),
+        reason: String(body.reason || ''),
+      })
+      return json({ ok: true, result }, result.replayed ? 200 : 201)
+    }
     if (action === 'void-group') {
       const unsupported = Object.keys(body).find((key) => ![
         'action', 'orderGlobalId', 'expectedRowVersion', 'reason',
@@ -307,9 +403,20 @@ export async function POST(req: NextRequest) {
         )
       }
       const orderGlobalId = String(body.orderGlobalId || '')
+      const executionMode = await readOneOffCarrierGroupExecutionModeInPostgres({
+        organizationId,
+        orderGlobalId,
+      })
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
+        return forbidden(
+          'Live carrier cancellation requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+        )
+      }
       const result = await voidOperationsOneOffCarrierGroupInPostgres({
         organizationId,
         actorEmail: actor.email,
+        canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
         idempotencyKey: idempotencyKey(req),
         orderGlobalId,
         expectedRowVersion: Number(body.expectedRowVersion),

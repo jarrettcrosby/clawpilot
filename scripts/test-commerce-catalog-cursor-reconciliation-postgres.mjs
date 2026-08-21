@@ -16,6 +16,8 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const ts = requireFromApp('typescript')
 let runtimePool = null
+process.env.CLAWPILOT_COMMERCE_INTAKE_ENABLED = '1'
+process.env.CLAWPILOT_ENV = 'development'
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')
@@ -110,6 +112,12 @@ async function withRuntimeTransaction(callback) {
   }
 }
 
+const commerceReadRuntime = loadTypeScriptModule(
+  'app_src/lib/integrations/commerceReadRuntime.ts',
+)
+const commerceStoreSync = loadTypeScriptModule(
+  'app_src/lib/operations/commerceStoreSync.ts',
+)
 const persistence = loadTypeScriptModule(
   'app_src/lib/persistence/commerceCatalogSync.ts',
   {
@@ -127,6 +135,8 @@ const persistence = loadTypeScriptModule(
       },
       withTransaction: withRuntimeTransaction,
     },
+    '@/lib/integrations/commerceReadRuntime': commerceReadRuntime,
+    '@/lib/operations/commerceStoreSync': commerceStoreSync,
   },
 )
 
@@ -237,6 +247,76 @@ async function cursorState(pool, fixture) {
 
 async function verifyReconciliation(pool) {
   const fixture = await seedAccount(pool)
+  const retainedPausedJob = await pool.query(
+    `INSERT INTO operations_commerce_catalog_sync_jobs (
+       organization_id, integration_account_id, provider,
+       credential_version, policy_revision, requested_by
+     ) VALUES ($1::uuid, $2::uuid, 'faire', 1, 3, $3)
+     RETURNING id::text`,
+    [fixture.organizationId, fixture.integrationAccountId, fixture.actorEmail],
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Pause catalog no-churn acceptance',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [fixture.organizationId, fixture.integrationAccountId, fixture.actorEmail],
+  )
+  const pausedJobState = async () => (
+    await pool.query(
+      `SELECT status, attempt_count, cancel_requested, last_error_code,
+              locked_at::text, locked_by, lock_token::text,
+              available_at::text, updated_at::text
+       FROM operations_commerce_catalog_sync_jobs
+       WHERE id = $1::uuid`,
+      [retainedPausedJob.rows[0].id],
+    )
+  ).rows[0]
+  const beforePausedCycles = await pausedJobState()
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    assert.equal(
+      await persistence.queueAutomaticCommerceCatalogSyncsInPostgres(),
+      0,
+    )
+    assert.deepEqual(
+      Array.from(await persistence.claimCommerceCatalogSyncJobsInPostgres({
+        limit: 5,
+        workerId: `catalog-paused-worker-${cycle}`,
+      })),
+      [],
+    )
+  }
+  assert.deepEqual(
+    await pausedJobState(),
+    beforePausedCycles,
+    'Repeated Paused catalog scheduler/claimer cycles must retain exact work evidence',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'running', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Resume retained catalog acceptance work',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [fixture.organizationId, fixture.integrationAccountId, fixture.actorEmail],
+  )
+  const resumedClaims =
+    await persistence.claimCommerceCatalogSyncJobsInPostgres({
+      limit: 5,
+      workerId: 'catalog-resumed-worker',
+    })
+  assert.equal(resumedClaims.length, 1)
+  assert.equal(resumedClaims[0].id, retainedPausedJob.rows[0].id)
+  assert.equal(resumedClaims[0].attemptCount, 1)
+  await pool.query(
+    `DELETE FROM operations_commerce_catalog_sync_jobs WHERE id = $1::uuid`,
+    [retainedPausedJob.rows[0].id],
+  )
+
   const pending = await pool.query(
     `INSERT INTO operations_commerce_catalog_sync_jobs (
        organization_id, integration_account_id, provider,

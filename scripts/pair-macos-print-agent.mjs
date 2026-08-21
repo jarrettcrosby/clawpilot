@@ -271,6 +271,7 @@ if (flags.has('--dry-run')) {
     label: plan.label,
     baseUrl: plan.configuredBaseUrl,
     printerPort: plan.printerPort,
+    printerProbe: 'not_run_dry_run',
     printerEndpointStorage: 'local_launch_agent_only',
     credentialInput: 'secure_macos_keychain_pairing_grant_prompt',
     primaryPairingSecret: 'cppair.v1',
@@ -349,5 +350,6 @@ process.stdout.write(`${JSON.stringify({
   action: 'paired',
   instanceName: plan.instanceName,
   label: plan.label,
+  printerProbe: 'reachable_without_printing_or_claiming',
   printerEndpointStorage: 'local_launch_agent_only',
 })}\n`)

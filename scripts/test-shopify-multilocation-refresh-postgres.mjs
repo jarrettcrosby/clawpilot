@@ -147,7 +147,134 @@ function loadPersistence(pool) {
           },
         }
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return {
+          commerceStoreSyncRunningSql(alias) {
+            return `operations_commerce_store_sync_is_running(${alias}.organization_id, ${alias}.id)`
+          },
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') return postgres
+      return requireFromApp(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
+
+function loadProjection() {
+  const path = 'app_src/lib/operations/shopifyInventoryProjection.ts'
+  const output = ts.transpileModule(
+    readFileSync(resolve(root, path), 'utf8'),
+    {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+      },
+      fileName: path,
+    },
+  ).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Math,
+    Object,
+    exports: module.exports,
+    module,
+  }, { filename: path })
+  return module.exports
+}
+
+function loadInventoryPersistence(pool) {
+  const path = 'app_src/lib/persistence/commerceInventory.ts'
+  const output = ts.transpileModule(
+    readFileSync(resolve(root, path), 'utf8'),
+    {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+        esModuleInterop: true,
+      },
+      fileName: path,
+    },
+  ).outputText
+  const module = { exports: {} }
+  const projection = loadProjection()
+  const postgres = {
+    query(text, values = []) {
+      return pool.query(text, values)
+    },
+    async withTransaction(callback) {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        const value = await callback(client)
+        await client.query('COMMIT')
+        return value
+      } catch (error) {
+        await client.query('ROLLBACK')
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+    async acquireTransactionAdvisoryLock(client, key) {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      )
+    },
+  }
+  vm.runInNewContext(output, {
+    Buffer,
+    Date,
+    Error,
+    Intl,
+    JSON,
+    Map,
+    Math,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Set,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (specifier === '@/lib/auditWriter') {
+        return { async recordAuditEvent() {} }
+      }
+      if (specifier === '@/lib/integrations/commerceReadRuntime') {
+        return {
+          commerceReadAccountSql(alias) {
+            return `${alias}.status = 'active'`
+          },
+        }
+      }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return {
+          commerceStoreSyncRunningSql(alias) {
+            return `operations_commerce_store_sync_is_running(${alias}.organization_id, ${alias}.id)`
+          },
+        }
+      }
+      if (specifier === '@/lib/integrations/shopifyInventory') {
+        return {
+          SHOPIFY_INVENTORY_ADAPTER_VERSION:
+            'multi-location-refresh-postgres-v1',
+        }
+      }
+      if (specifier === '@/lib/operations/shopifyInventoryProjection') {
+        return projection
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+        }
+      }
+      if (specifier === '@/lib/persistence/postgres') return postgres
+      if (specifier.startsWith('@/')) return {}
       return requireFromApp(specifier)
     },
   }, { filename: path })
@@ -167,7 +294,11 @@ const ids = {
   mappingOne: '28800000-0000-4000-8000-000000000041',
   mappingTwo: '28800000-0000-4000-8000-000000000042',
   legacyJob: '28800000-0000-4000-8000-000000000050',
+  legacySuccessJob: '28800000-0000-4000-8000-000000000051',
+  legacySuccessLock: '28800000-0000-4000-8000-000000000052',
 }
+const actorEmail = null
+const pipelineOwnerEmail = 'shopify-multilocation-refresh@example.invalid'
 
 async function seedPreMigration(client) {
   await client.query('SET session_replication_role = replica')
@@ -176,6 +307,20 @@ async function seedPreMigration(client) {
       `INSERT INTO workspace_organizations (id, name)
        VALUES ($1::uuid, 'Shopify multi-location refresh fixture')`,
       [ids.organization],
+    )
+    await client.query(
+      `INSERT INTO app_users (email, role, status)
+       VALUES ($1, 'admin', 'active')`,
+      [pipelineOwnerEmail],
+    )
+    await client.query(
+      `INSERT INTO pipeline_spaces (
+         id, name, owner_email, workspace_organization_id, is_default
+       ) VALUES (
+         $1::uuid, 'Shopify multi-location refresh fixture',
+         $2, $3::uuid, true
+       )`,
+      [ids.pipeline, pipelineOwnerEmail, ids.organization],
     )
     await client.query(
       `INSERT INTO operations_activation_scopes (
@@ -243,7 +388,7 @@ async function seedPreMigration(client) {
          id, global_id, organization_id, pipeline_id, name, pool_type
        ) VALUES (
          $1::uuid, 'gip2880001', $2::uuid, $3::uuid,
-         'Shopify fixture pool', 'shared'
+         'Shopify Available-to-Promise', 'shared'
        )`,
       [ids.pool, ids.organization, ids.pipeline],
     )
@@ -351,101 +496,166 @@ async function seedPreMigration(client) {
   }
 }
 
-async function insertInventoryEvidence(pool, job) {
-  const client = await pool.connect()
-  try {
-    await client.query('SET session_replication_role = replica')
-    const attempt = await client.query(
-      `INSERT INTO operations_commerce_provider_attempts (
-         organization_id, integration_account_id, action,
-         adapter_version, idempotency_key, request_hash,
-         redacted_request, redacted_response, state,
-         requested_at, completed_at
-       ) VALUES (
-         $1::uuid, $2::uuid, 'inventory.levels.read',
-         'multi-location-refresh-postgres-v1', $3, $4,
-         '{"resource":"inventory","readOnly":true}'::jsonb,
-         '{"providerWrites":0,"orderQuantityAdjustment":0}'::jsonb,
-         'succeeded', clock_timestamp(), clock_timestamp()
-       ) RETURNING id::text`,
-      [
-        job.organizationId,
-        job.integrationAccountId,
-        `attempt:${job.id}`,
-        createHash('sha256').update(`attempt:${job.id}`).digest('hex'),
-      ],
-    )
-    const attemptId = attempt.rows[0].id
-    const capture = await client.query(
-      `INSERT INTO operations_commerce_inventory_captures (
-         organization_id, integration_account_id, provider_attempt_id,
-         warehouse_id, location_id, provider, adapter_version,
-         credential_version, request_hash, snapshot_hash,
-         provider_location_id, provider_fetched_at, level_count,
-         captured_snapshot, snapshot_bytes, created_at
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-         'shopify', 'multi-location-refresh-postgres-v1', 1,
-         $6, $7, $8, clock_timestamp(), 0, '{}'::jsonb, 2,
-         clock_timestamp()
-       ) RETURNING id::text, provider_fetched_at`,
-      [
-        job.organizationId,
-        job.integrationAccountId,
-        attemptId,
-        job.warehouseId,
-        job.inventoryLocationId,
-        createHash('sha256').update(`attempt:${job.id}`).digest('hex'),
-        createHash('sha256').update(`snapshot:${job.id}`).digest('hex'),
-        job.providerLocationId,
-      ],
-    )
-    const idempotencyKey = `shopify-inventory-refresh:${job.id}`
-    const run = await client.query(
-      `INSERT INTO operations_commerce_inventory_sync_runs (
-         organization_id, integration_account_id, provider_attempt_id,
-         capture_id, location_mapping_id, warehouse_id, location_id,
-         inventory_pool_id, provider, adapter_version,
-         credential_version, idempotency_key, request_hash, snapshot_hash,
-         status, provider_location_id, provider_location_name,
-         provider_fetched_at, levels_seen, levels_mapped,
-         levels_projected, levels_unmapped, levels_untracked,
-         negative_available_levels, equation_mismatch_levels,
-         provider_available_quantity, provider_committed_quantity,
-         provider_on_hand_quantity, operational_available_quantity,
-         positions_created, positions_updated, positions_zeroed,
-         provider_writes, order_quantity_adjustment
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-         $6::uuid, $7::uuid, $8::uuid, 'shopify',
-         'multi-location-refresh-postgres-v1', 1, $9, $10, $11,
-         'succeeded', $12, 'Fixture location', $13::timestamptz,
-         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-       ) RETURNING global_id`,
-      [
-        job.organizationId,
-        job.integrationAccountId,
-        attemptId,
-        capture.rows[0].id,
-        job.locationMappingId,
-        job.warehouseId,
-        job.inventoryLocationId,
-        job.inventoryPoolId,
-        idempotencyKey,
-        createHash('sha256').update(`attempt:${job.id}`).digest('hex'),
-        createHash('sha256').update(`snapshot:${job.id}`).digest('hex'),
-        job.providerLocationId,
-        capture.rows[0].provider_fetched_at,
-      ],
-    )
-    return {
-      effectiveIdempotencyKey: idempotencyKey,
-      inventoryRunGlobalId: run.rows[0].global_id,
-    }
-  } finally {
-    await client.query('SET session_replication_role = origin')
-      .catch(() => undefined)
-    client.release()
+async function applyInventoryEvidence(pool, inventoryPersistence, job) {
+  const mappingId = job.locationMappingId || ids.mappingOne
+  const targetResult = await pool.query(
+    `SELECT warehouse.id::text AS warehouse_id,
+            warehouse.global_id AS warehouse_global_id,
+            warehouse.name AS warehouse_name,
+            warehouse.address AS warehouse_address,
+            location.id::text AS location_id,
+            location.global_id AS location_global_id,
+            location.code AS location_code,
+            mapping.id::text AS mapping_id,
+            mapping.global_id AS mapping_global_id,
+            mapping.external_location_id,
+            mapping.external_location_name,
+            mapping.inventory_pool_id::text,
+            mapping.ownership_classification,
+            mapping.row_version::text
+     FROM operations_commerce_inventory_location_mappings mapping
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = mapping.organization_id
+      AND warehouse.id = mapping.warehouse_id
+     JOIN operations_locations location
+       ON location.organization_id = mapping.organization_id
+      AND location.id = mapping.location_id
+     WHERE mapping.organization_id = $1::uuid
+       AND mapping.integration_account_id = $2::uuid
+       AND mapping.id = $3::uuid`,
+    [job.organizationId, job.integrationAccountId, mappingId],
+  )
+  assert.equal(targetResult.rowCount, 1)
+  const row = targetResult.rows[0]
+  const providerLocation = {
+    id: row.external_location_id,
+    name: row.external_location_name,
+    isActive: true,
+    shipsInventory: true,
+    fulfillsOnlineOrders: true,
+    hasActiveInventory: true,
+    addressVerified: true,
+    isFulfillmentService: false,
+    fulfillmentService: null,
+    address: {
+      line1: '100 Refresh Lane',
+      line2: null,
+      city: 'Trumbull',
+      region: 'Connecticut',
+      regionCode: 'CT',
+      postalCode: '06611',
+      country: 'United States',
+      countryCode: 'US',
+    },
+  }
+  const target = {
+    integrationAccountId: job.integrationAccountId,
+    credentialVersion: job.credentialGeneration,
+    pipelineId: ids.pipeline,
+    warehouse: {
+      id: row.warehouse_id,
+      globalId: row.warehouse_global_id,
+      name: row.warehouse_name,
+      address: row.warehouse_address || {},
+    },
+    location: {
+      id: row.location_id,
+      globalId: row.location_global_id,
+      code: row.location_code,
+    },
+    existingMapping: {
+      id: row.mapping_id,
+      globalId: row.mapping_global_id,
+      externalLocationId: row.external_location_id,
+      externalLocationName: row.external_location_name,
+      rowVersion: Number(row.row_version),
+      inventoryPoolId: row.inventory_pool_id,
+      ownershipClassification: row.ownership_classification,
+    },
+  }
+  const runtime = {
+    organizationId: job.organizationId,
+    integrationAccountId: job.integrationAccountId,
+    globalId: job.accountGlobalId,
+    provider: 'shopify',
+    environment: 'sandbox',
+    externalAccountId: 'gid://shopify/Shop/2880001',
+    status: 'active',
+    credentialVersion: job.credentialGeneration,
+    verificationStatus: 'verified',
+    encrypted: {},
+    configuration: {},
+  }
+  const idempotencyKey = `shopify-inventory-refresh:${job.id}`
+  const requestHash = createHash('sha256')
+    .update(`request:${job.id}`)
+    .digest('hex')
+  const snapshot = {
+    fetchedAt: new Date().toISOString(),
+    location: providerLocation,
+    levels: [],
+    pageCount: 1,
+    enrichment: {
+      unitCostAvailable: false,
+      productDimensionKeys: {},
+      variantDimensionKeys: {},
+      ambiguousDimensionDefinitions: [],
+    },
+    snapshotHash: createHash('sha256')
+      .update(`snapshot:${job.id}`)
+      .digest('hex'),
+  }
+  const attempt = await inventoryPersistence
+    .prepareShopifyInventoryReadInPostgres({
+      runtime,
+      target,
+      idempotencyKey,
+      requestHash,
+      actorEmail: null,
+      providerReadAuthority: 'automatic',
+    })
+  const capture = await inventoryPersistence
+    .captureShopifyInventorySnapshotInPostgres({
+      runtime,
+      target,
+      attempt,
+      requestHash,
+      snapshot,
+      actorEmail: null,
+    })
+  const applied = await inventoryPersistence
+    .applyShopifyInventorySnapshotInPostgres({
+      runtime,
+      target,
+      attempt,
+      capture,
+      providerLocation,
+      mappingMethod: 'automatic_exact_address',
+      idempotencyKey,
+      requestHash,
+      actorEmail: null,
+      expectedRefreshFence: {
+        jobId: job.id,
+        carrierServiceConfigId: job.carrierServiceConfigId,
+        warehouseId: job.warehouseId,
+        locationMappingId: job.locationMappingId,
+        locationMappingRowVersion: job.locationMappingRowVersion,
+        providerLocationId: job.providerLocationId,
+        inventoryLocationId: job.inventoryLocationId,
+        inventoryPoolId: job.inventoryPoolId,
+        credentialGeneration: job.credentialGeneration,
+        activationRevision: job.activationRevision,
+        configRowVersion: job.configRowVersion,
+        policyRevision: job.policyRevision,
+        policyHash: job.policyHash,
+        inventoryMaxAgeSeconds: job.inventoryMaxAgeSeconds,
+        requestedDirtyVersion: job.requestedDirtyVersion,
+        lockToken: job.lockToken,
+      },
+    })
+  return {
+    effectiveIdempotencyKey: idempotencyKey,
+    inventoryRunGlobalId: applied.runGlobalId,
   }
 }
 
@@ -607,11 +817,46 @@ async function exercise(pool) {
          )
        RETURNS boolean LANGUAGE sql STABLE AS 'SELECT true'`,
     )
+    for (const file of files.slice(migrationIndex + 1)) {
+      await applyMigration(client, file)
+    }
+    await client.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'running', explicit_choice = true,
+           revision = revision + 1,
+           reason = 'Inventory acceptance remains Running in Read only',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $3::uuid`,
+      [ids.organization, actorEmail, ids.account],
+    )
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'read_only', revision = revision + 1,
+           reason = 'Inventory Store sync independence acceptance',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid`,
+      [ids.organization, actorEmail],
+    )
+    const inventoryReadiness = await client.query(
+      `SELECT
+         operations_commerce_store_sync_is_running($1::uuid, $2::uuid)
+           AS store_sync_running,
+         operations_shopify_inventory_read_config_is_ready(
+           $1::uuid, $3::uuid
+         ) AS inventory_ready`,
+      [ids.organization, ids.account, ids.config],
+    )
+    assert.deepEqual(inventoryReadiness.rows[0], {
+      store_sync_running: true,
+      inventory_ready: true,
+    }, 'explicit Running + Read only must retain shadow-simulated inventory reads')
   } finally {
     client.release()
   }
 
   const persistence = loadPersistence(pool)
+  const inventoryPersistence = loadInventoryPersistence(pool)
   const queued = await persistence
     .queueAutomaticShopifyInventoryRefreshesInPostgres()
   assert.deepEqual(JSON.parse(JSON.stringify(queued)), {
@@ -650,6 +895,65 @@ async function exercise(pool) {
       status: 'mapped_pending',
     },
   ])
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Pause inventory without cancelling retained work',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.account, actorEmail],
+  )
+  const pausedInventoryJobsBefore = (
+    await pool.query(
+      `SELECT id::text, status, attempt_count, cancel_requested,
+              requested_dirty_version::text, locked_at, locked_by,
+              lock_token::text, lease_expires_at, updated_at
+       FROM operations_shopify_inventory_refresh_jobs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'failed', 'mapped_pending', 'mapped_failed')
+       ORDER BY id`,
+      [ids.organization, ids.account],
+    )
+  ).rows
+  for (let pausedCycle = 0; pausedCycle < 2; pausedCycle += 1) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.queueAutomaticShopifyInventoryRefreshesInPostgres(),
+      )),
+      { queued: 0, cancelled: 0 },
+    )
+  }
+  const pausedInventoryJobsAfter = (
+    await pool.query(
+      `SELECT id::text, status, attempt_count, cancel_requested,
+              requested_dirty_version::text, locked_at, locked_by,
+              lock_token::text, lease_expires_at, updated_at
+       FROM operations_shopify_inventory_refresh_jobs
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND status IN ('pending', 'failed', 'mapped_pending', 'mapped_failed')
+       ORDER BY id`,
+      [ids.organization, ids.account],
+    )
+  ).rows
+  assert.deepEqual(
+    pausedInventoryJobsAfter,
+    pausedInventoryJobsBefore,
+    'repeated Paused inventory scheduler cycles must preserve retained work',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'running', explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Resume retained inventory work',
+         updated_by = $3, updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [ids.organization, ids.account, actorEmail],
+  )
   const oldClaimAgainstMapped = await claimWithLegacySql(
     pool,
     'pre-0288-worker-after-fanout',
@@ -728,7 +1032,11 @@ async function exercise(pool) {
     'Only one mapped provider read may process for an account',
   )
 
-  const firstEvidence = await insertInventoryEvidence(pool, firstClaim[0])
+  const firstEvidence = await applyInventoryEvidence(
+    pool,
+    inventoryPersistence,
+    firstClaim[0],
+  )
   const firstCompletion = await persistence
     .completeShopifyInventoryRefreshJobInPostgres({
       job: firstClaim[0],
@@ -771,7 +1079,11 @@ async function exercise(pool) {
     secondClaim[0].locationMappingId,
     firstClaim[0].locationMappingId,
   )
-  const secondEvidence = await insertInventoryEvidence(pool, secondClaim[0])
+  const secondEvidence = await applyInventoryEvidence(
+    pool,
+    inventoryPersistence,
+    secondClaim[0],
+  )
   const secondCompletion = await persistence
     .completeShopifyInventoryRefreshJobInPostgres({
       job: secondClaim[0],
@@ -816,6 +1128,157 @@ async function exercise(pool) {
     watermark.rows[0].last_reconciled_run_global_id,
     secondEvidence.inventoryRunGlobalId,
   )
+
+  const legacyJobInsert = await pool.query(
+    `INSERT INTO operations_shopify_inventory_refresh_jobs (
+       id, organization_id, integration_account_id,
+       carrier_service_config_id, warehouse_id,
+       credential_generation, activation_revision, config_row_version,
+       policy_revision, policy_hash, inventory_max_age_seconds,
+       requested_dirty_version, status, attempt_count,
+       locked_at, locked_by, lock_token, lease_expires_at, started_at
+     ) SELECT
+       $1::uuid, $2::uuid, $3::uuid, config.id, $5::uuid,
+       config.credential_generation, config.activation_revision,
+       config.row_version, config.policy_revision, config.policy_hash,
+       config.inventory_max_age_seconds, 1, 'processing', 1,
+       now(), 'rolling-legacy-worker', $6::uuid,
+       now() + interval '20 minutes', now()
+     FROM operations_shopify_carrier_service_configs config
+     WHERE config.organization_id = $2::uuid
+       AND config.id = $4::uuid
+     RETURNING credential_generation, activation_revision,
+               config_row_version::text, policy_revision::text,
+               policy_hash, inventory_max_age_seconds`,
+    [
+      ids.legacySuccessJob,
+      ids.organization,
+      ids.account,
+      ids.config,
+      ids.warehouseOne,
+      ids.legacySuccessLock,
+    ],
+  )
+  assert.equal(legacyJobInsert.rowCount, 1)
+  const legacyJobFence = legacyJobInsert.rows[0]
+  const legacySuccessClaim = {
+    id: ids.legacySuccessJob,
+    organizationId: ids.organization,
+    integrationAccountId: ids.account,
+    accountGlobalId: 'gia2880001',
+    carrierServiceConfigId: ids.config,
+    warehouseId: ids.warehouseOne,
+    locationMappingId: null,
+    locationMappingRowVersion: null,
+    providerLocationId: null,
+    inventoryLocationId: null,
+    inventoryPoolId: null,
+    credentialGeneration: Number(legacyJobFence.credential_generation),
+    activationRevision: Number(legacyJobFence.activation_revision),
+    configRowVersion: Number(legacyJobFence.config_row_version),
+    policyRevision: Number(legacyJobFence.policy_revision),
+    policyHash: legacyJobFence.policy_hash,
+    inventoryMaxAgeSeconds: Number(
+      legacyJobFence.inventory_max_age_seconds,
+    ),
+    requestedDirtyVersion: 1,
+    attemptCount: 1,
+    maxAttempts: 8,
+    lockToken: ids.legacySuccessLock,
+    startedAt: new Date().toISOString(),
+  }
+  const legacyFenceState = await pool.query(
+    `SELECT job.status, job.cancel_requested,
+            job.lock_token::text AS lock_token,
+            job.lease_expires_at > clock_timestamp() AS lease_is_live,
+            job.credential_generation = config.credential_generation
+              AS credential_matches,
+            job.activation_revision = config.activation_revision
+              AS config_activation_matches,
+            job.config_row_version = config.row_version
+              AS config_row_matches,
+            job.policy_revision = config.policy_revision
+              AS policy_revision_matches,
+            job.policy_hash = config.policy_hash AS policy_hash_matches,
+            job.inventory_max_age_seconds = config.inventory_max_age_seconds
+              AS max_age_matches,
+            account.status AS account_status,
+            account.commerce_credential_generation::text
+              AS account_credential_generation,
+            credential.verification_status,
+            config.registration_state,
+            operations_commerce_store_sync_effective_reason(
+              job.organization_id, job.integration_account_id
+            ) AS store_sync_reason,
+            operations_shopify_inventory_read_config_is_ready(
+              config.organization_id, config.id
+            ) AS inventory_ready
+     FROM operations_shopify_inventory_refresh_jobs job
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = job.organization_id
+      AND config.id = job.carrier_service_config_id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = job.organization_id
+      AND account.id = job.integration_account_id
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = job.organization_id
+      AND credential.integration_account_id = job.integration_account_id
+     WHERE job.id = $1::uuid`,
+    [ids.legacySuccessJob],
+  )
+  assert.deepEqual(legacyFenceState.rows[0], {
+    status: 'processing',
+    cancel_requested: false,
+    lock_token: ids.legacySuccessLock,
+    lease_is_live: true,
+    credential_matches: true,
+    config_activation_matches: true,
+    config_row_matches: true,
+    policy_revision_matches: true,
+    policy_hash_matches: true,
+    max_age_matches: true,
+    account_status: 'active',
+    account_credential_generation: '1',
+    verification_status: 'verified',
+    registration_state: 'shadow_simulated',
+    store_sync_reason: 'STORE_SYNC_EXPLICIT_RUNNING',
+    inventory_ready: true,
+  }, 'legacy inventory evidence must retain every exact non-mode fence')
+  const legacyEvidence = await applyInventoryEvidence(
+    pool,
+    inventoryPersistence,
+    legacySuccessClaim,
+  )
+  const legacyState = await pool.query(
+    `UPDATE operations_shopify_inventory_refresh_jobs
+     SET status = 'succeeded',
+         result_summary = jsonb_build_object(
+           'resource', 'inventory',
+           'readOnly', true,
+           'providerWrites', 0,
+           'orderQuantityAdjustment', 0,
+           'inventoryRunGlobalId', $3::text
+         ),
+         completed_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = NULL,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND status = 'processing'
+       AND lock_token = $2::uuid
+       AND lease_expires_at > now()
+     RETURNING status`,
+    [
+      ids.legacySuccessJob,
+      ids.legacySuccessLock,
+      legacyEvidence.inventoryRunGlobalId,
+    ],
+  )
+  assert.equal(legacyState.rowCount, 1)
+  assert.equal(legacyState.rows[0].status, 'succeeded')
 
   await pool.query(
     `INSERT INTO operations_shopify_inventory_refresh_jobs (

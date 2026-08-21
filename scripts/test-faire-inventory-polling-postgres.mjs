@@ -64,10 +64,12 @@ function loadTypeScriptModule(path, mocks = {}) {
     RegExp,
     Set,
     String,
+    clearInterval,
     console,
     exports: loaded.exports,
     module: loaded,
     process,
+    setInterval,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
         return mocks[specifier]
@@ -75,6 +77,17 @@ function loadTypeScriptModule(path, mocks = {}) {
       if (specifier === '@/lib/integrations/commerceReadRuntime') {
         return loadTypeScriptModule(
           'app_src/lib/integrations/commerceReadRuntime.ts',
+        )
+      }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/persistence/commerceStoreSync.ts',
+          mocks,
         )
       }
       return nodeRequire(specifier)
@@ -415,15 +428,137 @@ async function verifyPolling(pool) {
   assert.equal(target.credentialVersion, 1)
   assert.equal(target.activationRevision, 1)
   assert.equal(target.recoveredLease, false)
+  let releaseInFlightRead
+  let markInFlightReadStarted
+  const inFlightReadStarted = new Promise((resolvePromise) => {
+    markInFlightReadStarted = resolvePromise
+  })
+  const releaseRead = new Promise((resolvePromise) => {
+    releaseInFlightRead = resolvePromise
+  })
+  const inFlightRead = polling.withFaireInventoryPollProviderReadFenceInPostgres({
+    target,
+    async read() {
+      markInFlightReadStarted()
+      await releaseRead
+      return 'provider-read-finished-before-pause'
+    },
+  })
+  await inFlightReadStarted
+  const pauseClient = await pool.connect()
+  const pauseCommitted = pauseClient.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'paused',
+         explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Pause serialization acceptance',
+         updated_by = $3,
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [targetData.organizationId, targetData.accountId, targetData.actorEmail],
+  ).finally(() => pauseClient.release())
   assert.equal(
-    await polling.withFaireInventoryPollProviderReadFenceInPostgres({
+    await Promise.race([
+      pauseCommitted.then(() => 'committed'),
+      new Promise((resolvePromise) => {
+        setTimeout(() => resolvePromise('waiting-for-read'), 100)
+      }),
+    ]),
+    'committed',
+  )
+  const draining = await pool.query(
+    `SELECT operations_commerce_store_sync_effective_reason(
+       $1::uuid,
+       $2::uuid
+     ) AS reason`,
+    [targetData.organizationId, targetData.accountId],
+  )
+  assert.equal(
+    draining.rows[0].reason,
+    'STORE_SYNC_EXPLICIT_PAUSED_DRAINING',
+  )
+  releaseInFlightRead()
+  await assert.rejects(
+    inFlightRead,
+    (error) => error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST',
+  )
+  await pauseCommitted
+  const paused = await pool.query(
+    `SELECT operations_commerce_store_sync_effective_reason(
+       $1::uuid,
+       $2::uuid
+     ) AS reason`,
+    [targetData.organizationId, targetData.accountId],
+  )
+  assert.equal(paused.rows[0].reason, 'STORE_SYNC_EXPLICIT_PAUSED')
+
+  let postPauseReadCalls = 0
+  await assert.rejects(
+    polling.withFaireInventoryPollProviderReadFenceInPostgres({
       target,
       async read() {
-        return 'provider-read-authorized'
+        postPauseReadCalls += 1
+        return 'must-not-run'
       },
     }),
-    'provider-read-authorized',
+    (error) => error?.code === 'FAIRE_INVENTORY_POLL_FENCE_CHANGED',
   )
+  assert.equal(postPauseReadCalls, 0)
+  const parked = await polling
+    .parkFaireInventoryPollForStoreSyncPauseInPostgres({ target })
+  assert.equal(parked.parked, true)
+  const pausedJobBefore = (
+    await pool.query(
+      `SELECT status, attempt_count, selector_after, locked_at, locked_by,
+              lock_token, lease_expires_at, available_at, updated_at
+       FROM operations_faire_inventory_poll_jobs
+       WHERE id = $1::uuid`,
+      [target.id],
+    )
+  ).rows[0]
+  for (let pausedCycle = 0; pausedCycle < 2; pausedCycle += 1) {
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await polling.queueAutomaticFaireInventoryPollsInPostgres(),
+      )),
+      { queued: 0, cancelled: 0 },
+    )
+  }
+  const pausedJobAfter = (
+    await pool.query(
+      `SELECT status, attempt_count, selector_after, locked_at, locked_by,
+              lock_token, lease_expires_at, available_at, updated_at
+       FROM operations_faire_inventory_poll_jobs
+       WHERE id = $1::uuid`,
+      [target.id],
+    )
+  ).rows[0]
+  assert.deepEqual(
+    pausedJobAfter,
+    pausedJobBefore,
+    'repeated Paused scheduler cycles must not churn retained Faire work',
+  )
+  await pool.query(
+    `UPDATE operations_commerce_store_sync_controls
+     SET desired_state = 'running',
+         explicit_choice = true,
+         revision = revision + 1,
+         reason = 'Resume after pause serialization acceptance',
+         updated_by = $3,
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND integration_account_id = $2::uuid`,
+    [targetData.organizationId, targetData.accountId, targetData.actorEmail],
+  )
+  const [resumedTarget] =
+    await polling.claimFaireInventoryPollJobsInPostgres({
+      limit: 1,
+      workerId: 'faire-postgres-worker-resumed',
+    })
+  assert.ok(resumedTarget)
+  assert.equal(resumedTarget.id, target.id)
+  target = resumedTarget
 
   let completed = null
   const observedVariantIds = []
@@ -449,13 +584,19 @@ async function verifyPolling(pool) {
         `faire-inventory-observation-${page.selectors[0].externalVariantId}`,
       ),
     }
-    completed = await polling.completeFaireInventoryPollPageInPostgres({
+    completed = await polling.withFaireInventoryPollProviderReadFenceInPostgres({
       target,
-      selectors: page.selectors,
-      observations: [observation],
-      hasMore: page.hasMore,
-      nextSelectorAfter: page.nextSelectorAfter,
-      observedAt: '2026-08-02T18:00:00.000Z',
+      read: (providerReadLease) => (
+        polling.completeFaireInventoryPollPageInPostgres({
+          target,
+          providerReadLease,
+          selectors: page.selectors,
+          observations: [observation],
+          hasMore: page.hasMore,
+          nextSelectorAfter: page.nextSelectorAfter,
+          observedAt: '2026-08-02T18:00:00.000Z',
+        })
+      ),
     })
     if (pageIndex < 9) {
       assert.equal(page.hasMore, true)

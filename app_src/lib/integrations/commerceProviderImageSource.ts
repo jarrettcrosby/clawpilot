@@ -25,6 +25,10 @@ import {
 import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
+import {
+  CommerceStoreSyncProviderReadFenceError,
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 const SHOPIFY_MEDIA_PAGE_SIZE = 50
 const MAX_PROVIDER_IMAGES = 50
@@ -477,18 +481,26 @@ async function readFaireSources(input: {
 }
 
 /**
- * Re-reads the exact current provider product and returns only transient image
- * locators. Raw URLs must be consumed in-process and must never enter durable
- * state, audit payloads, logs, API responses, or thrown messages.
+ * Re-reads the exact current provider product and lets one in-process consumer
+ * use its transient locators under the same bounded Store sync lock. This is
+ * the worker-safe seam for source metadata plus the selected byte fetch: it
+ * avoids nested transactions while Pause still waits for the entire read.
  */
-export async function readCurrentCommerceProviderImageSources(input: {
+export async function withCurrentCommerceProviderImageSources<T>(input: {
   organizationId: string
   accountGlobalId: string
   provider: CommerceProviderImageSourceProvider
   credentialGeneration: number
   externalProductId: string
   requireExactOrderedSet?: boolean
-}): Promise<readonly CommerceProviderImageSource[]> {
+  authorityKind: 'automatic' | 'manual_read_only'
+  intentKey: string
+  acquiredBy: string
+  consume: (
+    sources: readonly CommerceProviderImageSource[],
+    lease: import('@/lib/persistence/commerceStoreSync').CommerceStoreSyncProviderReadLease,
+  ) => Promise<T>
+}): Promise<T> {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
   if (
@@ -527,21 +539,71 @@ export async function readCurrentCommerceProviderImageSources(input: {
     )
   }
   try {
-    return input.provider === 'shopify'
-      ? await readShopifySources({ runtime, externalProductId: input.externalProductId })
-      : await readFaireSources({
-          runtime,
-          externalProductId: input.externalProductId,
-          requireExactOrderedSet: input.requireExactOrderedSet === true,
-        })
+    return await withCommerceStoreSyncProviderReadFenceInPostgres({
+      organizationId: runtime.organizationId,
+      integrationAccountId: runtime.integrationAccountId,
+      authorityKind: input.authorityKind,
+      readKind: 'product_image_import',
+      intentKey: input.intentKey,
+      acquiredBy: input.acquiredBy,
+      read: async (lease) => {
+        let sources: readonly CommerceProviderImageSource[]
+        try {
+          sources = input.provider === 'shopify'
+            ? await readShopifySources({
+                runtime,
+                externalProductId: input.externalProductId,
+              })
+            : await readFaireSources({
+                runtime,
+                externalProductId: input.externalProductId,
+                requireExactOrderedSet:
+                  input.requireExactOrderedSet === true,
+              })
+        } catch (error) {
+          if (error instanceof CommerceProviderImageSourceError) throw error
+          fail(
+            'COMMERCE_PROVIDER_IMAGE_SOURCE_READ_FAILED',
+            'Provider product images could not be read',
+            502,
+          )
+        }
+        return input.consume(sources, lease)
+      },
+    })
   } catch (error) {
     if (error instanceof CommerceProviderImageSourceError) throw error
-    fail(
-      'COMMERCE_PROVIDER_IMAGE_SOURCE_READ_FAILED',
-      'Provider product images could not be read',
-      502,
-    )
+    if (error instanceof CommerceStoreSyncProviderReadFenceError) {
+      fail(
+        'COMMERCE_PROVIDER_IMAGE_SOURCE_STORE_SYNC_PAUSED',
+        'Store sync paused before the provider image-source read',
+        409,
+      )
+    }
+    throw error
   }
+}
+
+/**
+ * Standalone source read for manual refresh/review. Raw URLs must be consumed
+ * in-process and must never enter durable state, audit payloads, logs, API
+ * responses, or thrown messages.
+ */
+export async function readCurrentCommerceProviderImageSources(input: {
+  organizationId: string
+  accountGlobalId: string
+  provider: CommerceProviderImageSourceProvider
+  credentialGeneration: number
+  externalProductId: string
+  requireExactOrderedSet?: boolean
+  intentKey: string
+  acquiredBy: string
+}): Promise<readonly CommerceProviderImageSource[]> {
+  return withCurrentCommerceProviderImageSources({
+    ...input,
+    authorityKind: 'manual_read_only',
+    consume: async (sources) => sources,
+  })
 }
 
 export function selectCommerceProviderImageSource(input: {

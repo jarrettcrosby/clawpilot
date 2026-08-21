@@ -45,6 +45,47 @@ const SHOPIFY_ORDER_TOPIC_ENUMS: Record<
   'orders/partially_fulfilled': 'ORDERS_PARTIALLY_FULFILLED',
 }
 
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_VERSION =
+  'shopify-order-webhooks-reconcile-v1' as const
+
+export function shopifyOrderWebhookReconciliationConfirmation(
+  accountGlobalId: string,
+) {
+  if (!/^gia(?:[0-9]{7}|[0-9a-v]{12})$/u.test(accountGlobalId)) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_ACCOUNT_INVALID',
+      'A valid Shopify account is required',
+    )
+  }
+  return `RECONCILE 7 ORDER WEBHOOKS FOR ${accountGlobalId}`
+}
+
+export function shopifyOrderWebhookReconciliationRequestHash(input: {
+  organizationId: string
+  accountGlobalId: string
+  integrationAccountId: string
+  credentialGeneration: number
+  externalAccountId: string
+  shopDomain: string
+  desiredUri: string
+  actorEmail: string
+}) {
+  return createHash('sha256').update(JSON.stringify({
+    schema: SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_VERSION,
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    integrationAccountId: input.integrationAccountId,
+    credentialGeneration: input.credentialGeneration,
+    externalAccountId: input.externalAccountId,
+    shopDomain: input.shopDomain,
+    desiredUri: exactHttpsUri(input.desiredUri),
+    topics: [...SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS],
+    format: 'JSON',
+    includeFields: [...SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS],
+    actorEmail: input.actorEmail,
+  })).digest('hex')
+}
+
 export type ShopifyOrderWebhookSignalEvidence = Readonly<{
   topic: ShopifyOrderSignalWebhookTopic
   externalOrderId: string
@@ -75,6 +116,27 @@ export type ShopifyOrderWebhookSubscriptionReadiness = Readonly<{
   providerWrites: 0
 }>
 
+export type ShopifyOrderWebhookMutationPlanItem = Readonly<{
+  topic: ShopifyOrderSignalWebhookTopic
+  action: 'create' | 'update'
+  providerId: string | null
+}>
+
+export type ShopifyOrderWebhookMutationCompletion = Readonly<{
+  topic: ShopifyOrderSignalWebhookTopic
+  action: 'create' | 'update'
+  providerId: string
+}>
+
+export type ShopifyOrderWebhookReconciliationResult = Readonly<{
+  before: ShopifyOrderWebhookSubscriptionReadiness
+  after: ShopifyOrderWebhookSubscriptionReadiness
+  plan: readonly ShopifyOrderWebhookMutationPlanItem[]
+  providerWrites: number
+  providerReferences: readonly string[]
+  completedMutations: readonly ShopifyOrderWebhookMutationCompletion[]
+}>
+
 export class ShopifyOrderWebhookError extends Error {
   constructor(
     readonly code: string,
@@ -83,6 +145,20 @@ export class ShopifyOrderWebhookError extends Error {
   ) {
     super(message)
     this.name = 'ShopifyOrderWebhookError'
+  }
+}
+
+export class ShopifyOrderWebhookDispatchError extends ShopifyOrderWebhookError {
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    readonly stopClassification: 'deterministic_rejection' | 'ambiguous',
+    readonly stoppedMutation: ShopifyOrderWebhookMutationPlanItem | null,
+    readonly completedMutations: readonly ShopifyOrderWebhookMutationCompletion[],
+  ) {
+    super(code, message, status)
+    this.name = 'ShopifyOrderWebhookDispatchError'
   }
 }
 
@@ -319,35 +395,37 @@ function equalStringArrays(left: readonly string[], right: readonly string[]) {
  * an earlier runtime snapshot is not sufficient because a later read-only
  * discovery may already have downgraded the subscription profile.
  */
-export function shopifyOrderWebhookSubscriptionEvidenceReady(
+function exactShopifyOrderWebhookSubscriptionEvidence(
   value: unknown,
   input: {
     accountGlobalId: string
     credentialGeneration: number
-    now?: string | Date
+    desiredUri?: string
   },
 ) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const evidence = value as Record<string, unknown>
   if (
     evidence.accountGlobalId !== input.accountGlobalId
     || evidence.credentialGeneration !== input.credentialGeneration
     || !Number.isSafeInteger(input.credentialGeneration)
     || input.credentialGeneration < 1
-  ) return false
+  ) return null
 
   let desiredUri: string
   try {
-    if (typeof evidence.desiredUri !== 'string') return false
+    if (typeof evidence.desiredUri !== 'string') return null
     desiredUri = exactHttpsUri(evidence.desiredUri)
     const parsed = new URL(desiredUri)
     if (
       desiredUri !== evidence.desiredUri
+      || (input.desiredUri !== undefined
+        && desiredUri !== exactHttpsUri(input.desiredUri))
       || parsed.pathname !==
         `/api/integrations/commerce/shopify/webhooks/${input.accountGlobalId}`
-    ) return false
+    ) return null
   } catch {
-    return false
+    return null
   }
 
   const requiredTopics = exactStringArray(evidence.requiredTopics)
@@ -357,7 +435,7 @@ export function shopifyOrderWebhookSubscriptionEvidenceReady(
   const missingTopics = exactStringArray(evidence.missingTopics)
   const conflictingTopics = exactStringArray(evidence.conflictingTopics)
   const observedAt = exactIso(evidence.observedAt)
-  const now = new Date(input.now || new Date())
+  if (!observedAt || observedAt !== evidence.observedAt) return null
   return Boolean(
     requiredTopics
     && equalStringArrays(
@@ -378,15 +456,46 @@ export function shopifyOrderWebhookSubscriptionEvidenceReady(
     && evidence.exactReadProcessorReady === true
     && evidence.scheduledPollBackstop === true
     && evidence.ready === true
-    && observedAt
-    && observedAt === evidence.observedAt
-    && Number.isFinite(now.getTime())
-    && new Date(observedAt).getTime() >= now.getTime()
-      - SHOPIFY_ORDER_WEBHOOK_DISCOVERY_MAX_AGE_SECONDS * 1_000
-    && new Date(observedAt).getTime() <= now.getTime() + 10 * 60 * 1_000
     && evidence.discoveryState === 'succeeded'
     && evidence.discoveryErrorCode === null
     && evidence.providerWrites === 0
+  ) ? { evidence, observedAt } : null
+}
+
+/**
+ * Signed inbound delivery fence. Exact account generation, callback URI,
+ * seven-topic/two-field profile, and processor evidence remain mandatory, but
+ * the age of a previously successful discovery does not reject live traffic.
+ */
+export function shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
+  value: unknown,
+  input: {
+    accountGlobalId: string
+    credentialGeneration: number
+    desiredUri: string
+  },
+) {
+  return exactShopifyOrderWebhookSubscriptionEvidence(value, input) !== null
+}
+
+/** Operational/UI readiness keeps the 24-hour discovery freshness signal. */
+export function shopifyOrderWebhookSubscriptionEvidenceReady(
+  value: unknown,
+  input: {
+    accountGlobalId: string
+    credentialGeneration: number
+    desiredUri?: string
+    now?: string | Date
+  },
+) {
+  const exact = exactShopifyOrderWebhookSubscriptionEvidence(value, input)
+  const now = new Date(input.now || new Date())
+  return Boolean(
+    exact
+    && Number.isFinite(now.getTime())
+    && new Date(exact.observedAt).getTime() >= now.getTime()
+      - SHOPIFY_ORDER_WEBHOOK_DISCOVERY_MAX_AGE_SECONDS * 1_000
+    && new Date(exact.observedAt).getTime() <= now.getTime() + 10 * 60 * 1_000
   )
 }
 
@@ -530,5 +639,301 @@ export async function discoverShopifyOrderWebhookSubscriptions(
     ready: missingTopics.length === 0 && conflictingTopics.length === 0,
     processorState: 'available',
     providerWrites: 0,
+  })
+}
+
+const SHOPIFY_ORDER_WEBHOOK_SUBSCRIPTION_CREATE_MUTATION =
+  `mutation ClawPilotOrderWebhookSubscriptionCreate(
+    $topic: WebhookSubscriptionTopic!
+    $subscription: WebhookSubscriptionInput!
+  ) {
+    webhookSubscriptionCreate(
+      topic: $topic
+      webhookSubscription: $subscription
+    ) {
+      webhookSubscription { id topic uri format includeFields }
+      userErrors { field message }
+    }
+  }`
+
+const SHOPIFY_ORDER_WEBHOOK_SUBSCRIPTION_UPDATE_MUTATION =
+  `mutation ClawPilotOrderWebhookSubscriptionUpdate(
+    $id: ID!
+    $subscription: WebhookSubscriptionInput!
+  ) {
+    webhookSubscriptionUpdate(
+      id: $id
+      webhookSubscription: $subscription
+    ) {
+      webhookSubscription { id topic uri format includeFields }
+      userErrors { field message }
+    }
+  }`
+
+function mutationPlan(
+  readiness: ShopifyOrderWebhookSubscriptionReadiness,
+): ShopifyOrderWebhookMutationPlanItem[] {
+  const plan: ShopifyOrderWebhookMutationPlanItem[] = []
+  for (const topic of SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS) {
+    const current = readiness.subscriptions.filter(
+      (subscription) => subscription.topic === topic,
+    )
+    if (current.length > 1) {
+      throw new ShopifyOrderWebhookError(
+        'SHOPIFY_ORDER_WEBHOOK_DUPLICATE_REVIEW_REQUIRED',
+        `Shopify has multiple ${topic} subscriptions; review them before reconciliation`,
+        409,
+      )
+    }
+    if (current.length === 0) {
+      plan.push(Object.freeze({ topic, action: 'create', providerId: null }))
+    } else if (!current[0].exactProfile) {
+      plan.push(Object.freeze({
+        topic,
+        action: 'update',
+        providerId: current[0].providerId,
+      }))
+    }
+  }
+  return plan
+}
+
+export function planShopifyOrderWebhookReconciliation(
+  readiness: ShopifyOrderWebhookSubscriptionReadiness,
+) {
+  return Object.freeze(mutationPlan(readiness))
+}
+
+export function decideShopifyOrderWebhookRecovery(
+  commandStatus: 'prepared' | 'recoverable' | 'unknown',
+  readiness: ShopifyOrderWebhookSubscriptionReadiness,
+) {
+  if (readiness.ready) {
+    return Object.freeze({
+      action: 'reconcile_read_only' as const,
+      plan: Object.freeze([] as ShopifyOrderWebhookMutationPlanItem[]),
+    })
+  }
+  if (commandStatus === 'unknown') {
+    return Object.freeze({
+      action: 'manual_review' as const,
+      plan: Object.freeze([] as ShopifyOrderWebhookMutationPlanItem[]),
+    })
+  }
+  return Object.freeze({
+    action: 'dispatch' as const,
+    plan: Object.freeze(mutationPlan(readiness)),
+  })
+}
+
+function exactMutationNode(
+  value: unknown,
+  expected: {
+    topic: ShopifyOrderSignalWebhookTopic
+    desiredUri: string
+    providerId: string | null
+  },
+) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_MUTATION_RESPONSE_INVALID',
+      'Shopify returned invalid order webhook mutation evidence',
+      502,
+    )
+  }
+  const node = value as Record<string, unknown>
+  const includeFields = exactStringArray(node.includeFields)
+  if (
+    typeof node.id !== 'string'
+    || !/^gid:\/\/shopify\/WebhookSubscription\/[1-9][0-9]*$/u.test(node.id)
+    || (expected.providerId !== null && node.id !== expected.providerId)
+    || node.topic !== SHOPIFY_ORDER_TOPIC_ENUMS[expected.topic]
+    || node.uri !== expected.desiredUri
+    || node.format !== 'JSON'
+    || !includeFields
+    || !equalStringArrays(
+      includeFields,
+      [...SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS].sort(),
+    )
+  ) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_MUTATION_RESPONSE_INVALID',
+      'Shopify returned invalid order webhook mutation evidence',
+      502,
+    )
+  }
+  return node.id
+}
+
+async function applyShopifyOrderWebhookMutation(
+  credential: ShopifyCommerceRuntimeCredential,
+  desiredUri: string,
+  plan: ShopifyOrderWebhookMutationPlanItem,
+  options: ShopifyCommerceClientOptions,
+) {
+  const request = {
+    uri: desiredUri,
+    format: 'JSON',
+    includeFields: [...SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS],
+  }
+  const update = plan.action === 'update'
+  const data = await shopifyAdminGraphql<Record<string, unknown>>(
+    credential,
+    {
+      query: update
+        ? SHOPIFY_ORDER_WEBHOOK_SUBSCRIPTION_UPDATE_MUTATION
+        : SHOPIFY_ORDER_WEBHOOK_SUBSCRIPTION_CREATE_MUTATION,
+      operationName: update
+        ? 'ClawPilotOrderWebhookSubscriptionUpdate'
+        : 'ClawPilotOrderWebhookSubscriptionCreate',
+      variables: update
+        ? { id: plan.providerId, subscription: request }
+        : {
+            topic: SHOPIFY_ORDER_TOPIC_ENUMS[plan.topic],
+            subscription: request,
+          },
+    },
+    options,
+  )
+  const result = data[update
+    ? 'webhookSubscriptionUpdate'
+    : 'webhookSubscriptionCreate']
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_MUTATION_RESPONSE_INVALID',
+      'Shopify returned invalid order webhook mutation evidence',
+      502,
+    )
+  }
+  const payload = result as Record<string, unknown>
+  if (!Array.isArray(payload.userErrors)) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_MUTATION_RESPONSE_INVALID',
+      'Shopify returned invalid order webhook mutation evidence',
+      502,
+    )
+  }
+  if (payload.userErrors.length > 0) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED',
+      'Shopify rejected the minimized order webhook profile',
+      422,
+    )
+  }
+  return exactMutationNode(payload.webhookSubscription, {
+    topic: plan.topic,
+    desiredUri,
+    providerId: plan.providerId,
+  })
+}
+
+/**
+ * Reconcile only the bounded order-signal subscriptions. Existing unrelated
+ * topics are never queried or deleted. A duplicated required topic fails
+ * closed so an operator can review it without ClawPilot removing evidence.
+ */
+export async function reconcileShopifyOrderWebhookSubscriptions(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: {
+    desiredUri: string
+    expectedPlan?: readonly ShopifyOrderWebhookMutationPlanItem[]
+    preparedReadiness?: ShopifyOrderWebhookSubscriptionReadiness
+  },
+  options: ShopifyCommerceClientOptions = {},
+): Promise<ShopifyOrderWebhookReconciliationResult> {
+  const desiredUri = exactHttpsUri(input.desiredUri)
+  const before = input.preparedReadiness
+    || await discoverShopifyOrderWebhookSubscriptions(
+      credential,
+      { desiredUri },
+      options,
+    )
+  if (before.desiredUri !== desiredUri) {
+    throw new ShopifyOrderWebhookError(
+      'SHOPIFY_ORDER_WEBHOOK_PLAN_DRIFT',
+      'Shopify order webhook callback changed before reconciliation',
+      409,
+    )
+  }
+  const plan = mutationPlan(before)
+  if (input.expectedPlan) {
+    const expected = JSON.stringify(input.expectedPlan)
+    if (JSON.stringify(plan) !== expected) {
+      throw new ShopifyOrderWebhookError(
+        'SHOPIFY_ORDER_WEBHOOK_PLAN_DRIFT',
+        'Shopify order webhook subscriptions changed before reconciliation',
+        409,
+      )
+    }
+  }
+  const completedMutations: ShopifyOrderWebhookMutationCompletion[] = []
+  for (const item of plan) {
+    try {
+      const providerId = await applyShopifyOrderWebhookMutation(
+        credential,
+        before.desiredUri,
+        item,
+        options,
+      )
+      completedMutations.push(Object.freeze({
+        topic: item.topic,
+        action: item.action,
+        providerId,
+      }))
+    } catch (error) {
+      const known = error instanceof ShopifyOrderWebhookError
+        ? error
+        : null
+      throw new ShopifyOrderWebhookDispatchError(
+        known?.code || 'SHOPIFY_ORDER_WEBHOOK_MUTATION_OUTCOME_UNKNOWN',
+        known?.message || 'Shopify order webhook mutation outcome is uncertain',
+        known?.status || 502,
+        known?.code === 'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED'
+          ? 'deterministic_rejection'
+          : 'ambiguous',
+        item,
+        Object.freeze([...completedMutations]),
+      )
+    }
+  }
+  let after: ShopifyOrderWebhookSubscriptionReadiness
+  try {
+    after = await discoverShopifyOrderWebhookSubscriptions(
+      credential,
+      { desiredUri: before.desiredUri },
+      options,
+    )
+  } catch (error) {
+    if (plan.length === 0) throw error
+    const known = error instanceof ShopifyOrderWebhookError ? error : null
+    throw new ShopifyOrderWebhookDispatchError(
+      known?.code || 'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_UNVERIFIED',
+      known?.message || 'Shopify order webhook verification is uncertain',
+      known?.status || 502,
+      'ambiguous',
+      null,
+      Object.freeze([...completedMutations]),
+    )
+  }
+  if (!after.ready) {
+    throw new ShopifyOrderWebhookDispatchError(
+      'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_UNVERIFIED',
+      'Shopify order webhook reconciliation could not be verified',
+      502,
+      'ambiguous',
+      null,
+      Object.freeze([...completedMutations]),
+    )
+  }
+  const providerReferences = completedMutations.map(
+    (completion) => completion.providerId,
+  )
+  return Object.freeze({
+    before,
+    after,
+    plan,
+    providerWrites: plan.length,
+    providerReferences: Object.freeze(providerReferences),
+    completedMutations: Object.freeze([...completedMutations]),
   })
 }

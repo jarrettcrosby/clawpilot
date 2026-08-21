@@ -222,7 +222,6 @@ export default function ShippingWorkflowDevelopmentFixture() {
         open={open}
         onClose={() => setOpen(false)}
         onCreated={() => undefined}
-        canActivate={false}
         developmentFixture={developmentFixture}
       />
     </>

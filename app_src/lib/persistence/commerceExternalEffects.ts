@@ -524,12 +524,24 @@ function assertCurrentAccountFence(
   account: AccountFenceRow,
   input: {
     provider: CommerceExternalEffectProvider
+    action: string
     desiredMode: CommerceExternalEffectMode
     credentialGeneration: number
     activationRevision: number
+    aggregateType: string
   },
   exactProductMediaAuthority = false,
 ) {
+  const checkoutCarrierServiceSimulation = (
+    input.provider === 'shopify'
+    && input.desiredMode === 'shadow'
+    && input.aggregateType === 'shopify_carrier_service_configuration'
+    && [
+      'shopify.carrier_service.create',
+      'shopify.carrier_service.update',
+      'shopify.carrier_service.delete',
+    ].includes(input.action)
+  )
   if (
     account.provider !== input.provider
     || (
@@ -554,8 +566,11 @@ function assertCurrentAccountFence(
     )
   }
   if (
-    account.activation_state !== (
-      exactProductMediaAuthority ? 'shadow' : input.desiredMode
+    (
+      !checkoutCarrierServiceSimulation
+      && account.activation_state !== (
+        exactProductMediaAuthority ? 'shadow' : input.desiredMode
+      )
     )
     || account.activation_revision !== input.activationRevision
   ) {

@@ -59,6 +59,42 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/operations/shopifyCheckoutRateControl') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '00000000-0000-4000-8000-000000000298',
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              intentFingerprintSha256: 'a'.repeat(64),
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            })
+          },
+        }
+      }
+      if (specifier === '@/lib/persistence/shopifyTestStoreCanonicalE2e') {
+        return {
+          async requireActiveShopifyTestStoreCanonicalE2eAuthorization() {
+            throw new Error('Unexpected Shopify test-store authorization')
+          },
+          async requireExactShopifyTestStoreConfirmedLabelSnapshot() {
+            throw new Error('Unexpected Shopify test-store label confirmation')
+          },
+        }
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'
@@ -572,6 +608,10 @@ function loadShopifyCheckoutRatingPersistence(pool) {
         loadTypeScriptModule(
           'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
         ),
+      '@/lib/operations/shopifyCheckoutAudiencePolicy':
+        loadTypeScriptModule(
+          'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+        ),
       '@/lib/persistence/postgres': postgres,
     },
   )
@@ -1062,14 +1102,6 @@ function loadOperationalWarehouseServices(pool) {
         readDefaultProductPackagingWithClient: async () => new Map(),
       },
       '@/lib/persistence/shopifyCheckoutRating': {
-        lockShopifyCarrierServiceConfigWritersForActivationWithClient:
-          mustNotRun(
-            'lockShopifyCarrierServiceConfigWritersForActivationWithClient',
-          ),
-        rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient:
-          mustNotRun(
-            'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient',
-          ),
         shopifyCheckoutRateLineageIsRequired: () => false,
         shopifyCheckoutRateOutcomeAllowsFulfillment: () => false,
       },
@@ -1385,6 +1417,22 @@ async function seedCapturedRead(client, ids, envelope) {
       [ids.faireIntegrationAccount, ids.organization, actorEmail],
     )
     await client.query(
+      `INSERT INTO operations_commerce_store_sync_controls (
+         organization_id, integration_account_id, desired_state,
+         explicit_choice, revision, reason, created_by, updated_by
+       ) VALUES
+         ($1, $2, 'running', true, 1,
+          'Commerce staging automatic-read fixture', $4, $4),
+         ($1, $3, 'running', true, 1,
+          'Commerce staging automatic-read fixture', $4, $4)`,
+      [
+        ids.organization,
+        ids.integrationAccount,
+        ids.faireIntegrationAccount,
+        actorEmail,
+      ],
+    )
+    await client.query(
       `INSERT INTO crm_products (
          id, pipeline_id, source_key, reference_code, name, sku,
          status, price, cost, currency, source_hash, sync_status,
@@ -1464,11 +1512,12 @@ async function seedCapturedRead(client, ids, envelope) {
          window_start, window_end, query_hash, intent_state,
          provider_attempt_id, response_ciphertext, response_iv, response_tag,
          response_hash, response_bytes, response_encryption_version,
-         created_by, updated_by, expires_at
+         provider_read_authority, created_by, updated_by, expires_at
        ) VALUES (
          $1, $2, $3, $4, 'shopify', 'orders', 'fetch', $5, $6,
          1, 'none', $7, 1, NULL, $8::timestamptz, $9, 'captured',
-         $10, $11, $12, $13, $14, 2, 1, $15, $15, $16::timestamptz
+         $10, $11, $12, $13, $14, 2, 1, 'automatic',
+         $15, $15, $16::timestamptz
        )`,
       [
         ids.readIntent,
@@ -1532,11 +1581,12 @@ async function seedAdditionalCapturedRead(client, ids, input) {
          window_start, window_end, query_hash, intent_state,
          provider_attempt_id, response_ciphertext, response_iv, response_tag,
          response_hash, response_bytes, response_encryption_version,
-         created_by, updated_by, expires_at
+         provider_read_authority, created_by, updated_by, expires_at
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7, $8, $9,
          1, 'none', $10, 1, NULL, $11::timestamptz, $12, 'captured',
-         $13, $14, $15, $16, $17, 2, 1, $18, $18, $19::timestamptz
+         $13, $14, $15, $16, $17, 2, 1, 'automatic',
+         $18, $18, $19::timestamptz
        )`,
       [
         input.readIntentId,
@@ -5252,7 +5302,8 @@ async function verifyAutomaticShopifyCleanPromotion(
            algorithm_version, request_fingerprint, destination_fingerprint,
            carrier_destination_fingerprint, line_quantity_fingerprint,
            request_evidence_hash, redacted_request_snapshot, currency,
-           idempotency_key, status, line_count, package_count, offer_count,
+           idempotency_key, status, rate_source,
+           line_count, package_count, offer_count,
            package_plan_hash, result_hash, result_snapshot,
            provider_write_count, inventory_snapshot_hash,
            inventory_snapshot_at, reconciliation_window_seconds,
@@ -5261,7 +5312,8 @@ async function verifyAutomaticShopifyCleanPromotion(
          ) VALUES (
            $1, $2::uuid, $3::uuid, $4::uuid, 0, 1, 1, 'shadow', 1, $5,
            $6::uuid, 'shopify-clean-path-test-v1', $7, $8, $9, $10, $11,
-           '{}'::jsonb, 'USD', $12, 'succeeded', 1, 1, 1, $13, $14,
+           '{}'::jsonb, 'USD', $12, 'succeeded', 'sandbox',
+           1, 1, 1, $13, $14,
            '{}'::jsonb, 0, $15, $16::timestamptz, $17::integer,
            $18::timestamptz, $19::timestamptz, $20::timestamptz,
            $21::timestamptz, $21::timestamptz
@@ -7889,7 +7941,6 @@ async function verifyAcceptance(databaseUrl) {
   }, 'COMMERCE_NORMALIZATION_SCOPE_MISMATCH')
   await expectPreStageRejection({
     ...stageInput,
-    idempotencyKey: 'commerce-staging-postgres-continuation-invalid',
     page: null,
   }, 'COMMERCE_INTAKE_CONTINUATION_INVALID')
   await expectPreStageRejection({
@@ -8042,6 +8093,7 @@ async function verifyAcceptance(databaseUrl) {
     observedAt,
     providerUpdatedAt: observedAt,
     actorEmail,
+    providerReadAuthority: 'automatic',
     images: [imageFixture.expectedObservation],
   })
   assert.doesNotMatch(
@@ -8383,6 +8435,7 @@ async function verifyAcceptance(databaseUrl) {
       continuationRowVersion: Number(continuation.row_version),
     },
     pageSize: 25,
+    providerReadAuthority: 'automatic',
     readOnly: true,
     providerWrites: 0,
     syncCursorAdvance: false,
@@ -8479,13 +8532,13 @@ async function verifyAcceptance(databaseUrl) {
          continuation_row_version, session_id, batch_number, window_start,
          window_end, query_hash, intent_state, provider_attempt_id,
          response_ciphertext, response_iv, response_tag, response_hash,
-         response_bytes, response_encryption_version, created_by, updated_by,
-         expires_at
+         response_bytes, response_encryption_version, provider_read_authority,
+         created_by, updated_by, expires_at
        ) VALUES (
          $1, $2, $3, $4, 'shopify', 'orders', 'fetch-next', $5, $6,
          1, 'continuation', $7, $8, $9, $10, $11, $12,
          $13::timestamptz, $14::timestamptz, $15, 'captured', $16,
-         $17, $18, $19, $20, 2, 1,
+         $17, $18, $19, $20, 2, 1, 'automatic',
          $21, $21, $22::timestamptz
        )`,
       [
@@ -8598,6 +8651,7 @@ async function verifyAcceptance(databaseUrl) {
       target: { kind: 'none' },
       continuationRunGlobalId: continuation.global_id,
       pageSize: 25,
+      providerReadAuthority: 'automatic',
     }),
     (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
   )
@@ -8649,6 +8703,7 @@ async function verifyAcceptance(databaseUrl) {
       target: { kind: 'none' },
       continuationRunGlobalId: continuation.global_id,
       pageSize: 25,
+      providerReadAuthority: 'automatic',
     }),
     (error) => error.code === 'COMMERCE_INTAKE_IDEMPOTENCY_CONFLICT',
   )
@@ -8690,6 +8745,7 @@ async function verifyAcceptance(databaseUrl) {
       target: { kind: 'none' },
       continuationRunGlobalId: continuation.global_id,
       pageSize: 25,
+      providerReadAuthority: 'automatic',
     })
   assert.equal(recoveredIntent.id, recoveryIntent)
 
@@ -8735,6 +8791,7 @@ async function verifyAcceptance(databaseUrl) {
       target: { kind: 'none' },
       continuationRunGlobalId: continuation.global_id,
       pageSize: 25,
+      providerReadAuthority: 'automatic',
     })
   assert.equal(recoveredReadingIntent.id, recoveryIntent)
   await assert.rejects(
@@ -8784,6 +8841,7 @@ async function verifyAcceptance(databaseUrl) {
       target: { kind: 'none' },
       continuationRunGlobalId: continuation.global_id,
       pageSize: 25,
+      providerReadAuthority: 'automatic',
     })
   assert.equal(recoveredExpiredReadingIntent.id, recoveryIntent)
   await assert.rejects(

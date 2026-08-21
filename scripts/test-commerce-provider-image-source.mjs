@@ -79,6 +79,13 @@ function locatorFingerprint(value) {
   return createHash('sha256').update(url.toString()).digest('hex')
 }
 
+class StoreSyncFenceError extends Error {
+  constructor() {
+    super('Store sync is Paused for this commerce connection')
+    this.code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+  }
+}
+
 function shopifyRuntime(overrides = {}) {
   return {
     configuration: { shopDomain: 'example.myshopify.com' },
@@ -102,6 +109,8 @@ function fixture(overrides = {}) {
     faireCalls: 0,
     faireProfileCalls: 0,
     runtimeReads: 0,
+    storeSyncFenceCalls: 0,
+    storeSyncIntentKeys: [],
   }
   const values = {
     runtime: shopifyRuntime(),
@@ -208,6 +217,21 @@ function fixture(overrides = {}) {
             return values.runtime
           },
         },
+        '@/lib/persistence/commerceStoreSync': {
+          CommerceStoreSyncProviderReadFenceError: StoreSyncFenceError,
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            state.storeSyncFenceCalls += 1
+            state.storeSyncIntentKeys.push(input.intentKey)
+            if (values.storeSyncPaused) {
+              throw new StoreSyncFenceError()
+            }
+            return input.read({
+              id: '00000000-0000-4000-8000-000000000298',
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+            })
+          },
+        },
       },
     },
   )
@@ -221,6 +245,8 @@ function sourceInput(overrides = {}) {
     externalProductId: 'gid://shopify/Product/200',
     organizationId: '00000000-0000-4000-8000-000000000002',
     provider: 'shopify',
+    intentKey: 'manual-image-review-command-0001',
+    acquiredBy: 'image-reviewer@example.com',
     ...overrides,
   }
 }
@@ -261,6 +287,21 @@ test('re-reads one current Shopify product and returns query-free matching evide
     }),
     sources[0],
   )
+})
+
+test('sequential manual reviews use distinct durable command identities', async () => {
+  const { module, state } = fixture()
+  await module.readCurrentCommerceProviderImageSources(sourceInput({
+    intentKey: 'manual-image-review-command-0001',
+  }))
+  await module.readCurrentCommerceProviderImageSources(sourceInput({
+    intentKey: 'manual-image-review-command-0002',
+  }))
+  assert.equal(state.graphqlCalls, 2)
+  assert.deepEqual(state.storeSyncIntentKeys, [
+    'manual-image-review-command-0001',
+    'manual-image-review-command-0002',
+  ])
 })
 
 test('rejects a Shopify image set larger than the durable bounded set', async () => {
@@ -353,6 +394,18 @@ test('fails before provider I/O when the connection is disabled', async () => {
     'COMMERCE_PROVIDER_IMAGE_SOURCE_CONNECTION_REQUIRED',
   )
   assert.equal(state.graphqlCalls, 0)
+  assert.equal(state.faireCalls, 0)
+})
+
+test('committed Store sync Pause invokes no provider image-source call', async () => {
+  const { module, state } = fixture({ storeSyncPaused: true })
+  await expectCode(
+    module.readCurrentCommerceProviderImageSources(sourceInput()),
+    'COMMERCE_PROVIDER_IMAGE_SOURCE_STORE_SYNC_PAUSED',
+  )
+  assert.equal(state.storeSyncFenceCalls, 1)
+  assert.equal(state.graphqlCalls, 0)
+  assert.equal(state.faireProfileCalls, 0)
   assert.equal(state.faireCalls, 0)
 })
 

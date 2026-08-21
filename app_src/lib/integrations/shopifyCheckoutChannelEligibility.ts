@@ -43,3 +43,21 @@ export function isShopifySandboxCheckoutChannelEligible(
     && Number(input.weightGrams) > 0
   )
 }
+
+/**
+ * Rating-only lifecycle predicate for an exact local Shopify checkout
+ * mapping. Unlike the legacy sandbox predicate, this may consume verified
+ * production channel evidence; it grants no Shopify mutation authority.
+ */
+export function isShopifyRatingCheckoutChannelEligible(
+  input: ShopifyCheckoutChannelEligibilityInput,
+) {
+  const environment = normalizedText(input.accountEnvironment)
+  if (environment !== 'sandbox' && environment !== 'production') {
+    return false
+  }
+  return isShopifySandboxCheckoutChannelEligible({
+    ...input,
+    accountEnvironment: 'sandbox',
+  })
+}

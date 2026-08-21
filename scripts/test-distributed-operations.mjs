@@ -1267,6 +1267,13 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CommerceStoreSyncPersistenceError extends Error {
+    constructor(code, message, status = 400) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   class CarrierIntegrationRequestError extends Error {
     constructor(message, status = 409, code = 'CARRIER_REQUEST_INVALID') {
       super(message)
@@ -1314,6 +1321,7 @@ async function verifyRouteBehavior() {
     activeTransitions: [],
     productionRerates: [],
   }
+  let proofWriteError = null
   let productionRerateError = null
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
@@ -1340,6 +1348,12 @@ async function verifyRouteBehavior() {
         ),
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/persistence/commerceStoreSync': {
+        CommerceStoreSyncPersistenceError,
+        updateCommerceStoreSyncControlInPostgres: async () => {
+          throw new Error('Store sync updates are covered by their focused route contract')
+        },
+      },
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
       },
@@ -1446,6 +1460,22 @@ async function verifyRouteBehavior() {
           state: 'active',
         }),
       },
+      '@/lib/integrations/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2eError: class extends Error {},
+        authorizeShopifyTestStoreCanonicalE2e: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not authorize Shopify test-store E2E',
+          )
+        },
+      },
+      '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2ePersistenceError: class extends Error {},
+        confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not confirm Shopify test fulfillment',
+          )
+        },
+      },
       '@/lib/persistence/commerceOrderRevisions': {
         CommerceOrderRevisionDispositionError: class extends Error {},
         cancelUnstartedCommerceOrderFromProviderRevisionInPostgres:
@@ -1466,6 +1496,7 @@ async function verifyRouteBehavior() {
           return { organizationId: input.organizationId, orders: [], capabilities: input.capabilities }
         },
         runMockOperationsProofFromPostgres: async (input) => {
+          if (proofWriteError) throw proofWriteError
           calls.proofs.push(input)
           return {
             orderGlobalId: 'gor1234567',
@@ -1659,6 +1690,35 @@ async function verifyRouteBehavior() {
     openingQuantity: 12,
   }])
 
+  proofWriteError = Object.assign(
+    new Error('OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'),
+    {
+      code: 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+      status: 409,
+    },
+  )
+  const packEvidenceConflict = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'run-proof-order',
+        proof: {
+          ...proof,
+          externalOrderId: 'route-proof-pack-evidence-conflict',
+          orderNumber: 'ROUTE-PACK-CONFLICT',
+        },
+      }),
+    },
+  ))
+  assert.equal(packEvidenceConflict.status, 409)
+  assert.equal(
+    (await payload(packEvidenceConflict)).code,
+    'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+  )
+  assert.equal(calls.proofs.length, 1, 'Conflicted writer must have zero transition')
+  proofWriteError = null
+
   const { productGlobalId: _productGlobalId, quantity: _quantity, openingQuantity: _openingQuantity, ...proofBase } = proof
   const multiLineWrite = await route.POST(request('http://localhost/api/operations', {
     headers: { 'Content-Type': 'application/json' },
@@ -1725,6 +1785,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 4,
     reason: 'Reviewed plan',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'release-route-proof-1',
   })
 
@@ -1770,6 +1831,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 5,
     reason: 'Picker verified every ready task',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-route-proof-1',
   })
 
@@ -1841,6 +1903,7 @@ async function verifyRouteBehavior() {
     reason: 'Picker verified the multi-unit count',
     countEvidenceIdempotencyKey: 'wearable-count-route-proof-1',
     countEvidence,
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-count-route-proof-1',
   })
 
@@ -1886,6 +1949,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 6,
     reason: 'Packer verified the carton',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'pack-route-proof-1',
   })
 
@@ -3787,6 +3851,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const commerceOrderRevisionEvidence = loadTypeScriptModule(
       'app_src/lib/integrations/commerceOrderRevisionEvidence.ts',
     )
+    const commerceStoreSyncPolicy = loadTypeScriptModule(
+      'app_src/lib/operations/commerceStoreSync.ts',
+    )
     const commerceOrderRevisions = loadTypeScriptModule(
       'app_src/lib/persistence/commerceOrderRevisions.ts',
       {
@@ -3794,6 +3861,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/integrations/commerceOrderRevisionEvidence':
             commerceOrderRevisionEvidence,
+          '@/lib/operations/commerceStoreSync': commerceStoreSyncPolicy,
+          '@/lib/persistence/commerceStoreSync': {
+            assertCommerceStoreSyncProviderReadLeaseCurrentWithClient:
+              async () => {},
+          },
           '@/lib/integrations/commerceCredentialCrypto': {
             commerceOrderRevisionEvidenceKeyAvailable: () => false,
             commerceOrderRevisionProtectedContentFingerprint: () => {
@@ -3899,6 +3971,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const shopifyCheckoutRateWarmPolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
     )
+    const shopifyCheckoutAudiencePolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+    )
+    const shopifyCheckoutRateControl = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -3908,6 +3986,10 @@ async function verifyPostgresAcceptance(databaseUrl) {
             shopifyCheckoutPlanRatePolicy,
           '@/lib/operations/shopifyCheckoutRateWarmPolicy':
             shopifyCheckoutRateWarmPolicy,
+          '@/lib/operations/shopifyCheckoutAudiencePolicy':
+            shopifyCheckoutAudiencePolicy,
+          '@/lib/operations/shopifyCheckoutRateControl':
+            shopifyCheckoutRateControl,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -4012,7 +4094,22 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+          requireActiveShopifyTestStoreCanonicalE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no Shopify test-store authorization',
+            )
+          },
+          requireExactShopifyTestStoreConfirmedLabelSnapshot: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no confirmed Shopify test labels',
+            )
+          },
+        },
         '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisions,
+        '@/lib/persistence/commerceStoreSync': {
+          readCommerceStoreSyncControlsFromPostgres: async () => [],
+        },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,

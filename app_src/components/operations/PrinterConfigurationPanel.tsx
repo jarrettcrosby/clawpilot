@@ -96,16 +96,31 @@ type PrintAgentPairingGrant = {
   supportedDocumentTypes: PrintDocumentType[]
 }
 
-type PrintAgentDistributionManifest = {
-  version: string
-  artifactHref: string
+type CustomerPrintAgentReleaseArtifact = {
+  platform: 'macos' | 'windows'
+  architecture: 'universal' | 'x64'
+  filename: string
   byteLength: number
   sha256: string
-  checksumHref: string
-  signed: boolean
+  signed: true
   notarized: boolean
-  nodeMinimumMajor: number
-  deliveryBackend: string
+  stapled: boolean
+  customerReleaseReady: true
+  href: string
+}
+
+type CustomerPrintAgentRelease = {
+  schemaVersion: 1
+  product: 'ClawPilot Print Agent'
+  version: string
+  customerReleaseReady: true
+  artifacts: CustomerPrintAgentReleaseArtifact[]
+}
+
+type CustomerPrintAgentReleasePayload = {
+  ok?: boolean
+  error?: string
+  release?: CustomerPrintAgentRelease
 }
 
 type PrintJobPayload = {
@@ -135,11 +150,6 @@ const LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES =
 const BUNDLED_PRINTER_DEFAULT_FORMATS = LEGACY_BUNDLED_AGENT_FORMATS
 const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA
 const BUNDLED_PRINTER_DEFAULT_DOCUMENT_TYPES = LEGACY_BUNDLED_AGENT_DOCUMENT_TYPES
-const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'
-const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'
-const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`
-const MACOS_PRINT_AGENT_CHECKSUM_NAME = `${MACOS_PRINT_AGENT_DOWNLOAD_NAME}.sha256`
-const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'
 const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000
 
 const fieldSx = {
@@ -153,9 +163,9 @@ const fieldSx = {
 const LABELS: Record<string, string> = {
   thermal: 'Thermal',
   nonthermal: 'Nonthermal',
-  local_agent: 'Local print agent',
-  browser: 'Browser download',
-  system_service: 'System service',
+  local_agent: 'Background LAN print agent',
+  browser: 'Web app download / manual print',
+  system_service: 'System service (not implemented)',
   pack: 'Pack station',
   shipping: 'Shipping station',
   receiving: 'Receiving station',
@@ -223,29 +233,53 @@ function formatBytes(value: number | null) {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function PrintAgentDistributionFacts({
-  manifest,
+function customerReleaseArtifactIsValid(
+  artifact: CustomerPrintAgentReleaseArtifact,
+): boolean {
+  const expectedArchitecture = artifact.platform === 'macos' ? 'universal' : 'x64'
+  const expectedSuffix = artifact.platform === 'macos' ? '.dmg' : '.exe'
+  const expectedHref = '/api/operations/print-agent/releases/download'
+    + `?platform=${artifact.platform}&architecture=${artifact.architecture}`
+  return artifact.architecture === expectedArchitecture
+    && artifact.filename.endsWith(expectedSuffix)
+    && Number.isSafeInteger(artifact.byteLength)
+    && artifact.byteLength > 0
+    && /^[a-f0-9]{64}$/.test(artifact.sha256)
+    && artifact.signed === true
+    && artifact.customerReleaseReady === true
+    && artifact.href === expectedHref
+    && (artifact.platform !== 'macos' || (
+      artifact.notarized === true && artifact.stapled === true
+    ))
+    && (artifact.platform !== 'windows' || (
+      artifact.notarized === false && artifact.stapled === false
+    ))
+}
+
+function customerReleaseIsValid(release: CustomerPrintAgentRelease): boolean {
+  return release.schemaVersion === 1
+    && release.product === 'ClawPilot Print Agent'
+    && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(release.version)
+    && release.customerReleaseReady === true
+    && release.artifacts.length === 2
+    && new Set(release.artifacts.map((artifact) => artifact.platform)).size === 2
+    && release.artifacts.every(customerReleaseArtifactIsValid)
+}
+
+function CustomerPrintAgentDownloadButton({
+  artifact,
 }: {
-  manifest: PrintAgentDistributionManifest | null
+  artifact: CustomerPrintAgentReleaseArtifact
 }) {
   return (
-    <Stack direction="row" alignItems="center" spacing={0.75} flexWrap="wrap" useFlexGap>
-      <Typography variant="caption" color="text.secondary">
-        {manifest
-          ? `v${manifest.version} · ${formatBytes(manifest.byteLength)} · raw-network ZPL · unsigned/unnotarized · Node.js ${manifest.nodeMinimumMajor}+ · SHA-256 ${manifest.sha256.slice(0, 12)}…`
-          : 'macOS raw-network ZPL preview · unsigned and not notarized · Node.js 20 or newer required'}
-      </Typography>
-      <Button
-        component="a"
-        href={MACOS_PRINT_AGENT_CHECKSUM_PATH}
-        download={MACOS_PRINT_AGENT_CHECKSUM_NAME}
-        size="small"
-        variant="text"
-        sx={{ minWidth: 0, p: 0.25, fontSize: '0.72rem' }}
-      >
-        SHA-256
-      </Button>
-    </Stack>
+    <Button
+      component="a"
+      href={artifact.href}
+      variant="outlined"
+      startIcon={<DownloadRounded />}
+    >
+      {artifact.platform === 'macos' ? 'Download for macOS' : 'Download for Windows'}
+    </Button>
   )
 }
 
@@ -454,6 +488,15 @@ function statusColor(status: string): 'default' | 'success' | 'warning' | 'error
   return 'default'
 }
 
+function hasUncertainPrintOutcome(job: OperationsPrintJobListItem): boolean {
+  const latest = job.attemptHistory[job.attemptHistory.length - 1]
+  return job.status === 'failed'
+    && latest?.state === 'failed'
+    && ['local_print_agent', 'system'].includes(latest.actorType)
+    && latest.errorCode === 'PRINT_OUTCOME_UNCERTAIN'
+    && latest.physicalOutputVerified === false
+}
+
 export default function PrinterConfigurationPanel() {
   const { measurementSystem } = useMeasurementSystem()
   const theme = useTheme()
@@ -480,50 +523,50 @@ export default function PrinterConfigurationPanel() {
   } | null>(null)
   const [pairingGrant, setPairingGrant] = useState<PrintAgentPairingGrant | null>(null)
   const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
-  const [pairingBaseUrl, setPairingBaseUrl] = useState('https://dev.aiapp.eigenracing.com')
-  const [printAgentDistribution, setPrintAgentDistribution] =
-    useState<PrintAgentDistributionManifest | null>(null)
-  const pairingCommand = `npm run print-agent:pair:macos -- --base-url '${pairingBaseUrl}'`
-
-  useEffect(() => {
-    setPairingBaseUrl(window.location.origin)
-  }, [])
+  const [customerPrintAgentRelease, setCustomerPrintAgentRelease] =
+    useState<CustomerPrintAgentRelease | null>(null)
+  const [customerPrintAgentReleaseLoading, setCustomerPrintAgentReleaseLoading] = useState(true)
 
   useEffect(() => {
     const controller = new AbortController()
     void (async () => {
       try {
-        const response = await fetch(MACOS_PRINT_AGENT_MANIFEST_PATH, {
+        const response = await fetch('/api/operations/print-agent/releases', {
           cache: 'no-store',
           signal: controller.signal,
         })
-        if (!response.ok) return
-        const manifest = await response.json() as Partial<PrintAgentDistributionManifest>
+        if (!response.ok) {
+          setCustomerPrintAgentRelease(null)
+          return
+        }
+        const payload = await responsePayload<CustomerPrintAgentReleasePayload>(response)
         if (
-          manifest.artifactHref === MACOS_PRINT_AGENT_DOWNLOAD_PATH
-          && manifest.checksumHref === MACOS_PRINT_AGENT_CHECKSUM_PATH
-          && typeof manifest.version === 'string'
-          && /^\d+\.\d+\.\d+-preview\.\d+$/.test(manifest.version)
-          && typeof manifest.byteLength === 'number'
-          && Number.isSafeInteger(manifest.byteLength)
-          && manifest.byteLength > 0
-          && typeof manifest.sha256 === 'string'
-          && /^[a-f0-9]{64}$/.test(manifest.sha256)
-          && manifest.signed === false
-          && manifest.notarized === false
-          && manifest.nodeMinimumMajor === 20
-          && manifest.deliveryBackend === 'raw-network-zpl'
+          payload.ok
+          && payload.release
+          && customerReleaseIsValid(payload.release)
         ) {
-          setPrintAgentDistribution(manifest as PrintAgentDistributionManifest)
+          setCustomerPrintAgentRelease(payload.release)
+        } else {
+          setCustomerPrintAgentRelease(null)
         }
       } catch (caught) {
         if (!(caught instanceof DOMException && caught.name === 'AbortError')) {
-          setPrintAgentDistribution(null)
+          setCustomerPrintAgentRelease(null)
         }
+      } finally {
+        if (!controller.signal.aborted) setCustomerPrintAgentReleaseLoading(false)
       }
     })()
     return () => controller.abort()
   }, [])
+
+  const printAgentSetupReady = Boolean(customerPrintAgentRelease)
+  const customerMacPrintAgent = customerPrintAgentRelease?.artifacts.find(
+    (artifact) => artifact.platform === 'macos',
+  ) || null
+  const customerWindowsPrintAgent = customerPrintAgentRelease?.artifacts.find(
+    (artifact) => artifact.platform === 'windows',
+  ) || null
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
@@ -746,6 +789,10 @@ export default function PrinterConfigurationPanel() {
 
   async function savePrinter() {
     if (!printerForm) return
+    if (printerForm.connectionMode === 'system_service') {
+      setError('System service printing is not implemented. Choose Web app download/manual print or Background LAN print agent.')
+      return
+    }
     if (!printerForm.code.trim() || !printerForm.name.trim()) {
       setError('Printer code and name are required')
       return
@@ -888,9 +935,11 @@ export default function PrinterConfigurationPanel() {
 
   async function runJobAction() {
     if (!jobAction) return
+    const uncertainOutcomeRecovery = jobAction.action === 'reprint-job'
+      && hasUncertainPrintOutcome(jobAction.job)
     if (!jobAction.reason.trim()) {
       const actionName = jobAction.action === 'reprint-job'
-        ? 'Reprint'
+        ? uncertainOutcomeRecovery ? 'New-print authorization' : 'Reprint'
         : jobAction.action === 'cancel-job'
           ? 'Cancellation'
           : 'Retry'
@@ -920,7 +969,9 @@ export default function PrinterConfigurationPanel() {
       setJobAction(null)
       setNotice(
         jobAction.action === 'reprint-job'
-          ? `Reprint ${result.job.globalId} was queued`
+          ? uncertainOutcomeRecovery
+            ? `New print ${result.job.globalId} was authorized and queued; ${jobAction.job.globalId} remains preserved as an uncertain outcome`
+            : `Reprint ${result.job.globalId} was queued`
           : jobAction.action === 'cancel-job'
             ? `${result.job.globalId} was cancelled`
             : `${result.job.globalId} was queued for retry`,
@@ -942,7 +993,14 @@ export default function PrinterConfigurationPanel() {
             Route durable documents, supervise local agents, and audit every delivery attempt.
           </Typography>
         </Box>
-        <Stack direction="row" spacing={1} alignItems="center">
+        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ xs: 'stretch', sm: 'center' }}>
+          <Button
+            variant="outlined"
+            startIcon={<TokenRounded />}
+            onClick={() => setView('agents')}
+          >
+            {printAgentSetupReady ? 'Print Agent setup' : 'Local print service'}
+          </Button>
           {printers?.capabilities.canView && (
             <Button
               variant="outlined"
@@ -1044,7 +1102,10 @@ export default function PrinterConfigurationPanel() {
                     >
                       Details
                     </Button>
-                    {job.status === 'failed' && jobs.capabilities.canExecute && job.attempts < job.maxAttempts && (
+                    {job.status === 'failed'
+                      && !hasUncertainPrintOutcome(job)
+                      && jobs.capabilities.canExecute
+                      && job.attempts < job.maxAttempts && (
                       <Button
                         size="small"
                         variant="outlined"
@@ -1052,6 +1113,17 @@ export default function PrinterConfigurationPanel() {
                         onClick={() => setJobAction({ job, action: 'retry-job', reason: '' })}
                       >
                         Retry
+                      </Button>
+                    )}
+                    {hasUncertainPrintOutcome(job) && jobs.capabilities.canReprint && (
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="warning"
+                        startIcon={<ReplayRounded />}
+                        onClick={() => setJobAction({ job, action: 'reprint-job', reason: '' })}
+                      >
+                        Authorize new print
                       </Button>
                     )}
                     {job.status === 'delivered' && jobs.capabilities.canReprint && (
@@ -1084,7 +1156,26 @@ export default function PrinterConfigurationPanel() {
         </Box>
       ) : view === 'printers' ? (
         <Box sx={{ pt: 2 }}>
-          <Stack direction="row" justifyContent="flex-end">
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            justifyContent="flex-end"
+            spacing={1}
+          >
+            {customerMacPrintAgent && (
+              <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+            )}
+            {customerWindowsPrintAgent && (
+              <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+            )}
+            <Button
+              variant="outlined"
+              startIcon={<TokenRounded />}
+              onClick={() => setView('agents')}
+            >
+              {printAgentSetupReady
+                ? 'Configure network printer'
+                : 'View local agent status'}
+            </Button>
             {printers?.capabilities.canManage && (
               <Button
                 variant="contained"
@@ -1096,6 +1187,21 @@ export default function PrinterConfigurationPanel() {
               </Button>
             )}
           </Stack>
+          {customerPrintAgentRelease ? (
+            <Alert severity="info" sx={{ mt: 2 }}>
+              Install the signed ClawPilot Print Agent for macOS or Windows, then enter the
+              Zebra&apos;s private network IP and raw port 9100 in that local app. ClawPilot stores
+              only the logical printer-to-agent assignment; the IP stays on the computer. The
+              computer must remain on, connected to the printer network, and signed in for
+              background printing.
+            </Alert>
+          ) : (
+            <Alert severity="warning" sx={{ mt: 2 }}>
+              {customerPrintAgentReleaseLoading
+                ? 'Checking for a verified ClawPilot Print Agent release...'
+                : 'A verified signed Print Agent release is not currently available. Existing paired background agents remain available; do not distribute the unsigned developer helper to operators.'}
+            </Alert>
+          )}
           {!printers?.warehouses.length ? (
             <Alert severity="warning" sx={{ mt: 2 }}>Create an active warehouse before configuring printers.</Alert>
           ) : !printers.printers.length ? (
@@ -1213,27 +1319,40 @@ export default function PrinterConfigurationPanel() {
               gap={2}
             >
               <Box sx={{ minWidth: 0 }}>
-                <Typography fontWeight={700}>Set up local printing</Typography>
-                <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                  Configure agents, printers, and routing in ClawPilot. The downloaded Mac pairing
-                  helper asks for the printer&apos;s local hostname/IP and port without sending that
-                  endpoint to ClawPilot.
-                </Typography>
-                <Box sx={{ mt: 0.75 }}>
-                  <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-                </Box>
+                {customerPrintAgentRelease ? (
+                  <>
+                    <Typography fontWeight={700}>
+                      ClawPilot Print Agent v{customerPrintAgentRelease.version}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      Download the verified signed installer for this computer, then create a
+                      one-time workspace pairing code. The app collects and tests the Zebra&apos;s
+                      private network IP and port 9100 locally without printing, keeps that
+                      endpoint out of ClawPilot, and runs in the signed-in user&apos;s background tray.
+                      The computer must stay on, signed in, and connected to the printer network
+                      whenever ClawPilot should print. Web app download/manual print remains a
+                      separate delivery choice.
+                    </Typography>
+                  </>
+                ) : (
+                  <>
+                    <Typography fontWeight={700}>Verified Print Agent release unavailable</Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                      {customerPrintAgentReleaseLoading
+                        ? 'ClawPilot is checking the verified signed macOS and Windows release.'
+                        : 'New operator pairing stays disabled until the exact signed macOS and Windows release passes verification. Existing paired background agents remain visible below, and web app download/manual print remains available.'}
+                    </Typography>
+                  </>
+                )}
               </Box>
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} flexShrink={0}>
-                <Button
-                  component="a"
-                  href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-                  download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-                  variant="outlined"
-                  startIcon={<DownloadRounded />}
-                >
-                  Download macOS pairing helper
-                </Button>
-                {agents?.capabilities.canManage && (
+                {customerMacPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+                )}
+                {customerWindowsPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+                )}
+                {printAgentSetupReady && agents?.capabilities.canManage && (
                   <Button
                     variant="contained"
                     startIcon={<TokenRounded />}
@@ -1265,13 +1384,15 @@ export default function PrinterConfigurationPanel() {
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Download the Mac pairing helper, then create a one-time code for this workspace.
+                {customerPrintAgentRelease
+                  ? 'Download and open the signed Print Agent, then create a one-time code for this workspace. The app prompts locally for the private Zebra IP and port 9100.'
+                  : 'A verified signed macOS or Windows Print Agent is required before a new operator can pair this workspace.'}
               </Typography>
             </Box>
           ) : (
             <Stack sx={{ mt: 1 }}>
               <Stack direction="row" justifyContent="flex-end" sx={{ mb: 0.5 }}>
-                {agents?.capabilities.canManage && (
+                {printAgentSetupReady && agents?.capabilities.canManage && (
                   <Button
                     size="small"
                     variant="text"
@@ -1693,6 +1814,7 @@ export default function PrinterConfigurationPanel() {
             </Button>
           )}
           {selectedJob?.status === 'failed'
+            && !hasUncertainPrintOutcome(selectedJob)
             && jobs?.capabilities.canExecute
             && selectedJob.attempts < selectedJob.maxAttempts && (
             <Button
@@ -1703,6 +1825,20 @@ export default function PrinterConfigurationPanel() {
               }}
             >
               Retry
+            </Button>
+          )}
+          {selectedJob
+            && hasUncertainPrintOutcome(selectedJob)
+            && jobs?.capabilities.canReprint && (
+            <Button
+              color="warning"
+              startIcon={<ReplayRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                setJobAction({ job: selectedJob, action: 'reprint-job', reason: '' })
+              }}
+            >
+              Authorize new print
             </Button>
           )}
           {selectedJob?.status === 'delivered' && jobs?.capabilities.canReprint && (
@@ -1815,21 +1951,57 @@ export default function PrinterConfigurationPanel() {
                   select
                   fullWidth
                   size="small"
-                  label="Connection"
+                  label="Print delivery method"
                   value={printerForm.connectionMode}
                   onChange={(event) => chooseConnection(event.target.value as PrinterConnectionMode)}
+                  helperText="Choose one: web app download/manual print or a durable background LAN agent."
                   sx={fieldSx}
                 >
-                  {PRINTER_CONNECTION_MODES.map((item) => <MenuItem key={item} value={item}>{label(item)}</MenuItem>)}
+                  {PRINTER_CONNECTION_MODES.map((item) => (
+                    <MenuItem key={item} value={item} disabled={item === 'system_service'}>
+                      {item === 'system_service' ? 'System service (not implemented)' : label(item)}
+                    </MenuItem>
+                  ))}
                 </TextField>
               </Stack>
+              {printerForm.connectionMode === 'browser' && (
+                <Alert severity="info">
+                  Browser download/manual print opens or downloads the document for an operator.
+                  It is best-effort, creates no durable device acknowledgement, and cannot send
+                  raw TCP to a Zebra hostname/IP.
+                </Alert>
+              )}
+              {printerForm.connectionMode === 'system_service' && (
+                <Alert severity="warning">
+                  System service is a reserved schema value only; ClawPilot has no certified
+                  delivery backend for it. Choose Web app download/manual print or Background LAN
+                  print agent.
+                </Alert>
+              )}
               {printerForm.printerType === 'thermal'
                 && printerForm.connectionMode === 'local_agent' && (
                 <Alert severity="info">
-                  New Zebra profiles retain the 4 x 6 carrier-label preset. For barcode
-                  printing, select only the label sizes this physical device is ready to use,
-                  then add Product barcode label and Location barcode label. The bundled agent
-                  supports all five listed Zebra label sizes without a custom runtime.
+                  <Stack spacing={1} alignItems="flex-start">
+                    <Typography variant="body2">
+                      {customerPrintAgentRelease
+                        ? 'Enter the Zebra private network IP and raw port 9100 in the signed ClawPilot Print Agent for macOS or Windows, not in this hosted form.'
+                        : 'A verified signed Print Agent release is required before entering the Zebra private network IP and raw port 9100; this hosted form never collects it.'}
+                      {' '}This form defines routing and capabilities only. New Zebra profiles
+                      retain the 4 x 6 carrier-label preset; select only the label sizes physically
+                      loaded and calibrated.
+                    </Typography>
+                    <Button
+                      size="small"
+                      variant="text"
+                      startIcon={<TokenRounded />}
+                      onClick={() => {
+                        setPrinterForm(null)
+                        setView('agents')
+                      }}
+                    >
+                      View Print Agent status
+                    </Button>
+                  </Stack>
                 </Alert>
               )}
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -1988,7 +2160,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={Boolean(enrollForm)}
+        open={printAgentSetupReady && Boolean(enrollForm)}
         onClose={() => !saving && setEnrollForm(null)}
         fullWidth
         maxWidth="sm"
@@ -2141,7 +2313,9 @@ export default function PrinterConfigurationPanel() {
       >
         <DialogTitle>
           {jobAction?.action === 'reprint-job'
-            ? 'Authorize reprint'
+            ? hasUncertainPrintOutcome(jobAction.job)
+              ? 'Authorize new print after uncertain outcome'
+              : 'Authorize reprint'
             : jobAction?.action === 'cancel-job'
               ? 'Cancel print job'
               : 'Retry print job'}
@@ -2151,7 +2325,9 @@ export default function PrinterConfigurationPanel() {
             <Stack spacing={2}>
               <Typography variant="body2" color="text.secondary">
                 {jobAction.action === 'reprint-job'
-                  ? `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
+                  ? hasUncertainPrintOutcome(jobAction.job)
+                    ? `The printer may already have produced ${jobAction.job.globalId}. Inspect the physical printer first. This preserves that uncertain job and creates a new audited job with the same immutable document; a duplicate physical print is possible, but no additional carrier label or postage is purchased.`
+                    : `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
                   : jobAction.action === 'cancel-job'
                     ? `This fences ${jobAction.job.globalId} from further delivery. A claimed device may already have accepted the document.`
                     : `This requeues ${jobAction.job.globalId} within its existing bounded attempt limit.`}
@@ -2161,7 +2337,9 @@ export default function PrinterConfigurationPanel() {
                 multiline
                 minRows={3}
                 label={jobAction.action === 'reprint-job'
-                  ? 'Reprint reason'
+                  ? hasUncertainPrintOutcome(jobAction.job)
+                    ? 'Required duplicate-risk authorization reason'
+                    : 'Reprint reason'
                   : jobAction.action === 'cancel-job'
                     ? 'Cancellation reason'
                     : 'Retry reason'}
@@ -2186,7 +2364,9 @@ export default function PrinterConfigurationPanel() {
             {saving
               ? 'Working...'
               : jobAction?.action === 'reprint-job'
-                ? 'Queue reprint'
+                ? hasUncertainPrintOutcome(jobAction.job)
+                  ? 'Queue new print'
+                  : 'Queue reprint'
                 : jobAction?.action === 'cancel-job'
                   ? 'Cancel job'
                   : 'Queue retry'}
@@ -2195,7 +2375,7 @@ export default function PrinterConfigurationPanel() {
       </Dialog>
 
       <Dialog
-        open={Boolean(pairingGrant?.pairingCode)}
+        open={printAgentSetupReady && Boolean(pairingGrant?.pairingCode)}
         onClose={() => setPairingGrant(null)}
         fullWidth
         maxWidth="sm"
@@ -2204,28 +2384,36 @@ export default function PrinterConfigurationPanel() {
         <DialogContent dividers>
           <Stack spacing={2}>
             <Box>
-              <Typography fontWeight={700}>1. Download the macOS pairing helper</Typography>
+              <Typography fontWeight={700}>
+                1. Download and open the signed Print Agent
+              </Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                The download is credential-free. It never contains this workspace&apos;s pairing
+                Choose the installer for this computer. Only use the verified installer linked
+                here. The app is credential-free and never contains this workspace&apos;s pairing
                 code, printer IP, or ClawPilot session.
               </Typography>
-              <Button
-                component="a"
-                href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}
-                download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}
-                variant="outlined"
-                startIcon={<DownloadRounded />}
-                sx={{ mt: 1 }}
-              >
-                Download macOS pairing helper
-              </Button>
-              <Box sx={{ mt: 0.75 }}>
-                <PrintAgentDistributionFacts manifest={printAgentDistribution} />
-              </Box>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1 }}>
+                {customerMacPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerMacPrintAgent} />
+                )}
+                {customerWindowsPrintAgent && (
+                  <CustomerPrintAgentDownloadButton artifact={customerWindowsPrintAgent} />
+                )}
+              </Stack>
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>2. Copy the one-time pairing code</Typography>
+              <Typography fontWeight={700}>2. Enter the local Zebra connection</Typography>
+              <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                In the Print Agent choose Pair workspace. Confirm the trusted ClawPilot site, then
+                enter the printer&apos;s private network IPv4 address and raw port 9100. The app probes
+                reachability without sending printer bytes or claiming a job. The endpoint remains
+                only in this computer&apos;s protected per-user app data and is never sent to ClawPilot.
+              </Typography>
+            </Box>
+            <Divider />
+            <Box>
+              <Typography fontWeight={700}>3. Copy the one-time pairing code</Typography>
               <Alert severity="warning" sx={{ mt: 1 }}>
                 One-time pairing code: this short-lived code is shown once and expires{' '}
                 {timestamp(pairingGrant?.expiresAt || null)}. If it is lost or expires, create a
@@ -2261,20 +2449,21 @@ export default function PrinterConfigurationPanel() {
             </Box>
             <Divider />
             <Box>
-              <Typography fontWeight={700}>3. Connect on this Mac</Typography>
+              <Typography fontWeight={700}>4. Finish pairing in the Print Agent</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Unzip the download and double-click ClawPilot Print Agent.command. Its Terminal
-                menu prompts for a unique workspace instance, this pairing code, and the printer
-                hostname/IP with its raw port, normally 9100.
-                The printer IP stays on this Mac and is never submitted to the hosted
-                printer-configuration API.
+                Paste the one-time cppair code only into the signed app. It redeems the code and
+                stores the long-lived credential using macOS Keychain or Windows protected storage,
+                never in the installer or a command line.
               </Typography>
             </Box>
             <Box>
-              <Typography fontWeight={700}>4. Finish setup in ClawPilot</Typography>
+              <Typography fontWeight={700}>5. Verify and finish setup in ClawPilot</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                 Return to Agents to confirm Connected, then use Printers to create the logical
-                printer profile, assign this agent, and choose its document routing.
+                printer profile, assign this agent, and choose its document routing. Use Test
+                connection in the local app any time to probe the same IP/9100 endpoint without
+                printing or claiming a job. Leave the computer on and signed in for background
+                printing.
               </Typography>
               <Button
                 size="small"
@@ -2290,44 +2479,12 @@ export default function PrinterConfigurationPanel() {
               </Button>
             </Box>
             <Divider />
-            <Box component="details">
-              <Box component="summary" sx={{ cursor: 'pointer', fontWeight: 700 }}>
-                Advanced terminal pairing
-              </Box>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                Repository checkouts can run the guided pairing command. It prompts locally for
-                the code and printer endpoint; neither value is placed in the command.
-              </Typography>
-              <Box
-                component="pre"
-                sx={{
-                  mt: 1,
-                  mb: 1,
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.15)',
-                  borderRadius: '6px',
-                  overflowWrap: 'anywhere',
-                  whiteSpace: 'pre-wrap',
-                  fontSize: '0.8rem',
-                }}
-              >
-                {pairingCommand}
-              </Box>
-              <Button
-                size="small"
-                variant="outlined"
-                startIcon={<ContentCopyRounded />}
-                onClick={() => void navigator.clipboard.writeText(pairingCommand)}
-              >
-                Copy Mac pairing command
-              </Button>
-            </Box>
             <Box>
               <Typography fontWeight={700}>Pair another workspace</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-                Keep the downloaded helper. Switch workspaces in ClawPilot, create a new pairing
-                code, then run the .command file again with a unique instance name. The same physical
-                printer may be used, while each workspace retains its own agent identity, Keychain
+                Keep the installed app. Switch workspaces in ClawPilot, create a new pairing code,
+                then add another workspace in the Print Agent. The same physical printer may be
+                used while each workspace retains its own authoritative agent identity, protected
                 credential, delivery ledger, and logical printer profile.
               </Typography>
             </Box>

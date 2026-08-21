@@ -97,6 +97,17 @@ final class PickingPhoneModel: ObservableObject {
     @Published var workspaceStatus = "Orders, assigned picks, people, and UPH follow this organization."
     @Published var sessionProfile: ClawPilotSessionProfile?
     @Published var managerOrders: [ManagerOrderSummary] = []
+    @Published var managerStoreSyncControls: [ManagerStoreSyncControl] = []
+    @Published private(set) var canManageStoreSync = false
+    @Published private(set) var isManagerStoreSyncBusy = false
+    @Published private(set) var hasPendingManagerStoreSyncChange = false
+    @Published private(set) var managerStoreSyncStatus: String?
+    @Published var managerShopifyCheckoutRateControls: [ManagerShopifyCheckoutRateControl] = []
+    @Published private(set) var isManagerSettingsControlsBusy = false
+    @Published private(set) var isManagerShopifyCheckoutRateBusy = false
+    @Published private(set) var hasPendingManagerShopifyCheckoutRateChange = false
+    @Published private(set) var managerShopifyCheckoutRateStatus: String?
+    @Published private(set) var managerShopifyCheckoutRateReviewGeneration: UInt64 = 0
     @Published var managerPickers: [ManagerPicker] = []
     @Published var pickerPerformance: [PickerPerformanceMetric] = []
     @Published var managerPickManagement: ManagerPickManagementWorkspace?
@@ -172,6 +183,12 @@ final class PickingPhoneModel: ObservableObject {
     private var dismissedCountContextToken: String?
     private var authenticationGeneration: UInt64 = 0
     private var workspaceSwitchCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var managerStoreSyncCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingManagerStoreSyncCommand: ManagerStoreSyncCommand?
+    private var managerShopifyCheckoutRateCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingManagerShopifyCheckoutRateCommand: ManagerShopifyCheckoutRateCommand?
+    private var activeManagerShopifyCheckoutRateSubmissionFence:
+        ManagerShopifyCheckoutRateSubmissionFence?
 
     var canSendCode: Bool {
         canRequestCode && !isAuthBusy && email.contains("@") && email.count <= 254
@@ -237,8 +254,13 @@ final class PickingPhoneModel: ObservableObject {
             && !isRequestingPickHandoff
             && !isWorkspaceBusy
             && !isManagerBusy
+            && !isManagerStoreSyncBusy
+            && !isManagerSettingsControlsBusy
+            && !isManagerShopifyCheckoutRateBusy
             && !isQueueBusy
             && !hasPendingWorkspaceTransition
+            && !hasPendingManagerStoreSyncChange
+            && !hasPendingManagerShopifyCheckoutRateChange
         guard idle else { return false }
         if hasPendingPickHandoff {
             guard let recoveryWorkspaceId = pendingPickHandoffRecoveryWorkspaceId else {
@@ -521,11 +543,11 @@ final class PickingPhoneModel: ObservableObject {
         let restoredProfile: ClawPilotSessionProfile
         do {
             restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
-            isAuthenticated = true
+            installReplacementAuthenticationProfile(restoredProfile)
         } catch {
             sessionProfile = nil
             isAuthenticated = false
+            clearManagerStoreSyncState()
             status = "Sign in to continue."
             return
         }
@@ -601,10 +623,9 @@ final class PickingPhoneModel: ObservableObject {
         }
         do {
             let restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
+            installReplacementAuthenticationProfile(restoredProfile)
             isRestoringSession = true
             defer { isRestoringSession = false }
-            isAuthenticated = true
             biometrics.rememberAuthenticatedSession()
             codeRequested = false
             code = ""
@@ -691,11 +712,10 @@ final class PickingPhoneModel: ObservableObject {
                 }
             }
             let restoredProfile = try await api.fetchSessionProfile()
-            sessionProfile = restoredProfile
+            installReplacementAuthenticationProfile(restoredProfile)
             isRestoringSession = true
             defer { isRestoringSession = false }
             email = restoredProfile.effectiveUser.email
-            isAuthenticated = true
             isLocallyLocked = false
             biometrics.rememberAuthenticatedSession()
             let transitionRecovery = await recoverWorkspaceTransitionIfNeeded(
@@ -869,7 +889,11 @@ final class PickingPhoneModel: ObservableObject {
                     ? "Only the organization that owns the saved confirmation can be selected until it is resolved."
                     : (hasPendingManagerOrderReplanning
                         ? "Only the organization that owns the saved correction can be selected until it is resolved."
-                        : "Wait for the current operation to finish before changing organizations."))
+                        : (hasPendingManagerShopifyCheckoutRateChange
+                            ? "Retry or refresh the pending Shopify checkout-rate change before changing organizations."
+                            : (hasPendingManagerStoreSyncChange
+                                ? "Retry or refresh the saved Store sync change before changing organizations."
+                                : "Wait for the current operation to finish before changing organizations."))))
             return
         }
         guard (!hasPendingConfirmation
@@ -924,6 +948,7 @@ final class PickingPhoneModel: ObservableObject {
             guard authenticationIsCurrent(operationGeneration) else { return }
 
             managerOrders = []
+            clearManagerStoreSyncState()
             managerPickers = []
             pickerPerformance = []
             managerPickManagement = nil
@@ -989,6 +1014,7 @@ final class PickingPhoneModel: ObservableObject {
             guard authenticationIsCurrent(operationGeneration) else { return }
             sessionProfile = nil
             isAuthenticated = false
+            clearManagerStoreSyncState()
             workspaceStatus = "Your session expired while changing organizations. Sign in again."
             status = "Sign in to continue."
         } catch {
@@ -1017,34 +1043,97 @@ final class PickingPhoneModel: ObservableObject {
             managerStatus = "Manager access is not assigned to this account."
             return
         }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return }
         isManagerBusy = true
-        defer { isManagerBusy = false }
+        defer {
+            if managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) {
+                isManagerBusy = false
+            }
+        }
         var failures: [String] = []
         do {
-            managerOrders = try await api.fetchManagerOrders()
+            let overview = try await api.fetchManagerOperations()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerOrders = overview.orders
+            managerStoreSyncControls = overview.storeSync
+            canManageStoreSync = overview.capabilities.canActivate
+            reconcilePendingManagerStoreSyncChange()
         } catch {
-            failures.append("orders: \(error.localizedDescription)")
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerStoreSyncControls = []
+            canManageStoreSync = false
+            failures.append("orders and Store sync: \(error.localizedDescription)")
         }
+        await loadManagerSettingsControls()
+        guard managerStoreSyncOperationIsCurrent(
+            generation: operationGeneration,
+            organizationId: operationOrganizationId
+        ) else { return }
         do {
-            managerPickers = try await api.fetchManagerPickers()
+            let pickers = try await api.fetchManagerPickers()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerPickers = pickers
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             failures.append("picker access: \(error.localizedDescription)")
         }
         do {
-            pickerPerformance = try await api.fetchPickerPerformance()
+            let performance = try await api.fetchPickerPerformance()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            pickerPerformance = performance
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             failures.append("performance: \(error.localizedDescription)")
         }
         do {
-            managerPickManagement = try await api.fetchManagerPickManagement()
-            if let eligible = managerPickManagement?.eligiblePickers,
-               eligible.isEmpty == false {
+            let pickManagement = try await api.fetchManagerPickManagement()
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerPickManagement = pickManagement
+            let eligible = pickManagement.eligiblePickers
+            if eligible.isEmpty == false {
                 managerPickers = eligible
             }
         } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
             managerPickManagement = nil
             failures.append("current assignments/history: \(error.localizedDescription)")
         }
+        guard managerStoreSyncOperationIsCurrent(
+            generation: operationGeneration,
+            organizationId: operationOrganizationId
+        ) else { return }
         if failures.isEmpty == false {
             managerStatus = "Some manager data is unavailable (\(failures.joined(separator: "; "))). Available orders remain usable."
         } else if managerPickManagement?.current.isEmpty == false {
@@ -1054,6 +1143,608 @@ final class PickingPhoneModel: ObservableObject {
                 ? "No Operations orders are available."
                 : "Review an order to wave and assign its picks."
         }
+    }
+
+    func loadManagerSettingsControls() async {
+        if walkthroughScreen != nil {
+#if DEBUG
+            installManagerPickManagementWalkthroughFixture()
+#endif
+            return
+        }
+        guard canUseManager else {
+            managerShopifyCheckoutRateStatus =
+                "Manager access is not assigned to this account."
+            return
+        }
+        guard !isManagerSettingsControlsBusy,
+              !isManagerStoreSyncBusy,
+              !isManagerShopifyCheckoutRateBusy else { return }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return }
+        isManagerSettingsControlsBusy = true
+        defer {
+            if managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) {
+                isManagerSettingsControlsBusy = false
+            }
+        }
+        do {
+            let accounts = try await api.fetchManagerCommerceAccounts(
+                organizationId: operationOrganizationId
+            )
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            var controls: [ManagerShopifyCheckoutRateControl] = []
+            var failures: [String] = []
+            for account in accounts where account.provider == "shopify" {
+                do {
+                    let control = try await api.fetchManagerShopifyCheckoutRateControl(
+                        accountGlobalId: account.accountGlobalId
+                    )
+                    guard managerStoreSyncOperationIsCurrent(
+                        generation: operationGeneration,
+                        organizationId: operationOrganizationId
+                    ) else { return }
+                    controls.append(control)
+                } catch {
+                    guard managerStoreSyncOperationIsCurrent(
+                        generation: operationGeneration,
+                        organizationId: operationOrganizationId
+                    ) else { return }
+                    failures.append(
+                        "\(account.displayName): \(error.localizedDescription)"
+                    )
+                }
+            }
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerShopifyCheckoutRateControls = controls.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+                    == .orderedAscending
+            }
+            reconcilePendingManagerShopifyCheckoutRateChange()
+            if failures.isEmpty {
+                if !hasPendingManagerShopifyCheckoutRateChange {
+                    managerShopifyCheckoutRateStatus = nil
+                }
+            } else if !hasPendingManagerShopifyCheckoutRateChange {
+                managerShopifyCheckoutRateStatus =
+                    "Some checkout controls are unavailable (\(failures.joined(separator: "; ")))."
+            }
+        } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerShopifyCheckoutRateControls = []
+            if !hasPendingManagerShopifyCheckoutRateChange {
+                managerShopifyCheckoutRateStatus =
+                    "Checkout account discovery is unavailable: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func updateManagerStoreSync(
+        control: ManagerStoreSyncControl,
+        desiredState: ManagerStoreSyncDesiredState,
+        reason: String
+    ) async -> Bool {
+        guard canUseManager, canManageStoreSync else {
+            managerStoreSyncStatus = "Only an organization owner or authorized administrator may change Store sync."
+            return false
+        }
+        let command: ManagerStoreSyncCommand
+        do {
+            if let pendingManagerStoreSyncCommand {
+                guard pendingManagerStoreSyncCommand.accountGlobalId
+                        == control.accountGlobalId,
+                      pendingManagerStoreSyncCommand.desiredState
+                        == desiredState,
+                      pendingManagerStoreSyncCommand.reason
+                        == reason.trimmingCharacters(in: .whitespacesAndNewlines)
+                else {
+                    managerStoreSyncStatus = "Retry or refresh the saved Store sync change before starting another one."
+                    return false
+                }
+                command = pendingManagerStoreSyncCommand
+            } else {
+                command = try ManagerStoreSyncCommand(
+                    control: control,
+                    desiredState: desiredState,
+                    reason: reason
+                )
+                pendingManagerStoreSyncCommand = command
+                hasPendingManagerStoreSyncChange = true
+            }
+        } catch {
+            managerStoreSyncStatus = error.localizedDescription
+            return false
+        }
+        return await submitManagerStoreSync(command)
+    }
+
+    func retryPendingManagerStoreSyncChange() async -> Bool {
+        guard let pendingManagerStoreSyncCommand else {
+            managerStoreSyncStatus = "There is no saved Store sync change to retry."
+            return false
+        }
+        return await submitManagerStoreSync(pendingManagerStoreSyncCommand)
+    }
+
+    private func submitManagerStoreSync(
+        _ command: ManagerStoreSyncCommand
+    ) async -> Bool {
+        guard !isManagerStoreSyncBusy else { return false }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return false }
+        isManagerStoreSyncBusy = true
+        defer {
+            finishManagerStoreSyncSubmission(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            )
+        }
+        do {
+            let control = try await api.updateManagerStoreSync(command)
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            if let index = managerStoreSyncControls.firstIndex(where: {
+                $0.accountGlobalId == control.accountGlobalId
+            }) {
+                managerStoreSyncControls[index] = control
+            } else {
+                managerStoreSyncControls.append(control)
+            }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = control.effectiveReasonLabel
+            return true
+        } catch PickingAPIError.conflict(let code, let message) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "\(message) (\(code))"
+            await loadManagerOperations()
+            return false
+        } catch PickingAPIError.rejected(let code, let message) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "The Store sync change was rejected and was not retained: \(message) (\(code)). Review the refreshed control before trying again."
+            await loadManagerOperations()
+            return false
+        } catch PickingAPIError.unauthorized {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "Your session expired before Store sync could be changed. Sign in and review the current control."
+            return false
+        } catch PickingAPIError.invalidOrigin {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "The configured ClawPilot server is invalid. The Store sync change was not sent or retained."
+            return false
+        } catch PickingAPIError.rateLimited(let seconds) {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            managerStoreSyncStatus = "The exact Store sync change remains saved for retry after \(seconds) seconds."
+            return false
+        } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return false }
+            managerStoreSyncStatus = "The exact Store sync change remains saved for retry: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func reconcilePendingManagerStoreSyncChange() {
+        guard let command = pendingManagerStoreSyncCommand else { return }
+        guard let control = managerStoreSyncControls.first(where: {
+            $0.accountGlobalId == command.accountGlobalId
+        }) else { return }
+        if control.desiredState == command.desiredState,
+           control.explicitChoice,
+           control.revision == command.expectedRevision + 1,
+           control.reason == command.reason {
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = control.effectiveReasonLabel
+        } else if control.revision != command.expectedRevision {
+            pendingManagerStoreSyncCommand = nil
+            hasPendingManagerStoreSyncChange = false
+            managerStoreSyncStatus = "Store sync changed after it was reviewed. Review the refreshed control before trying again."
+        }
+    }
+
+    func updateManagerShopifyCheckoutRateControl(
+        control: ManagerShopifyCheckoutRateControl,
+        desiredAudience: ManagerShopifyCheckoutAudience,
+        desiredRateSource: ManagerShopifyCheckoutRateSource,
+        reason: String
+    ) async -> Bool {
+        guard canUseManager,
+              let organizationId = sessionProfile?.activeWorkspace.organizationId else {
+            managerShopifyCheckoutRateStatus = "Manager access is required to review Shopify checkout rates."
+            return false
+        }
+        guard managerShopifyCheckoutRateReviewIsCurrent(control),
+              let currentControl = managerShopifyCheckoutRateControls.first(
+                where: { $0.accountGlobalId == control.accountGlobalId }
+              ) else {
+            managerShopifyCheckoutRateReviewGeneration &+= 1
+            managerShopifyCheckoutRateStatus = "Shopify checkout-rate configuration or permission changed after review. Refresh and review the current control before saving."
+            return false
+        }
+        let command: ManagerShopifyCheckoutRateCommand
+        do {
+            if let pendingManagerShopifyCheckoutRateCommand {
+                guard pendingManagerShopifyCheckoutRateCommand.isSameRequestedChange(
+                    accountGlobalId: control.accountGlobalId,
+                    desiredAudience: desiredAudience,
+                    desiredRateSource: desiredRateSource,
+                    reason: reason
+                ), pendingManagerShopifyCheckoutRateCommand.isCurrentReview(currentControl) else {
+                    managerShopifyCheckoutRateStatus = "Retry or refresh the exact pending Shopify checkout-rate change before starting another one."
+                    return false
+                }
+                command = pendingManagerShopifyCheckoutRateCommand
+            } else {
+                command = try ManagerShopifyCheckoutRateCommand(
+                    control: currentControl,
+                    authenticationGeneration: authenticationGeneration,
+                    organizationId: organizationId,
+                    actorEmail: sessionProfile?.effectiveUser.email ?? "",
+                    desiredAudience: desiredAudience,
+                    desiredRateSource: desiredRateSource,
+                    reason: reason
+                )
+                pendingManagerShopifyCheckoutRateCommand = command
+                hasPendingManagerShopifyCheckoutRateChange = true
+            }
+        } catch {
+            managerShopifyCheckoutRateStatus = error.localizedDescription
+            return false
+        }
+        return await submitManagerShopifyCheckoutRateControl(command)
+    }
+
+    func managerShopifyCheckoutRateReviewIsCurrent(
+        _ reviewed: ManagerShopifyCheckoutRateControl
+    ) -> Bool {
+        guard reviewed.isContractValid,
+              reviewed.canEdit,
+              let current = managerShopifyCheckoutRateControls.first(where: {
+                  $0.accountGlobalId == reviewed.accountGlobalId
+              }) else { return false }
+        return current.isContractValid
+            && current.canEdit
+            && current.configGlobalId == reviewed.configGlobalId
+            && current.rowVersion == reviewed.rowVersion
+            && current.policyRevision == reviewed.policyRevision
+    }
+
+    func retryPendingManagerShopifyCheckoutRateChange() async -> Bool {
+        guard let command = pendingManagerShopifyCheckoutRateCommand else {
+            managerShopifyCheckoutRateStatus = "There is no pending Shopify checkout-rate change to retry."
+            return false
+        }
+        return await submitManagerShopifyCheckoutRateControl(command)
+    }
+
+    private func submitManagerShopifyCheckoutRateControl(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) async -> Bool {
+        guard !isManagerShopifyCheckoutRateBusy,
+              command.permitsStateMutation(
+                currentAuthenticationGeneration: authenticationGeneration,
+                currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+                currentActorEmail: sessionProfile?.effectiveUser.email,
+                currentAccountGlobalId: command.accountGlobalId,
+                isAuthenticated: isAuthenticated
+              ),
+              managerShopifyCheckoutRateControls.contains(where: {
+                  command.isCurrentReview($0)
+              }) else {
+            return false
+        }
+        activeManagerShopifyCheckoutRateSubmissionFence =
+            ManagerShopifyCheckoutRateSubmissionFence(command: command)
+        isManagerShopifyCheckoutRateBusy = true
+        defer { finishManagerShopifyCheckoutRateSubmission(command) }
+        do {
+            _ = try await api.updateManagerShopifyCheckoutRateControl(command)
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            pendingManagerShopifyCheckoutRateCommand = nil
+            hasPendingManagerShopifyCheckoutRateChange = false
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            managerShopifyCheckoutRateStatus = "Desired checkout audience and saved carrier source were accepted with zero provider writes. Refreshing effective availability."
+            do {
+                let refreshed = try await api.fetchManagerShopifyCheckoutRateControl(
+                    accountGlobalId: command.accountGlobalId
+                )
+                guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                    return false
+                }
+                installManagerShopifyCheckoutRateControl(refreshed)
+                managerShopifyCheckoutRateStatus = command.isConfirmedApplied(by: refreshed)
+                    ? refreshed.effectiveReason.label
+                    : "The checkout-rate change was accepted, then its configuration changed again. Review the refreshed desired and effective state."
+            } catch PickingAPIError.unauthorized {
+                await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                    command
+                )
+                return false
+            } catch {
+                guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                    return false
+                }
+                managerShopifyCheckoutRateStatus = "The checkout-rate change was accepted, but authoritative refresh is unavailable. Refresh before reviewing or changing it again."
+            }
+            return true
+        } catch PickingAPIError.conflict(let code, let message) {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            managerShopifyCheckoutRateStatus = "\(message) (\(code)) Review the refreshed control before trying again."
+            await refreshManagerShopifyCheckoutRateControl(for: command)
+            return false
+        } catch PickingAPIError.rejected(let code, let message) {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            managerShopifyCheckoutRateStatus = "The checkout-rate change was definitively rejected: \(message) (\(code)). Review the refreshed control before trying again."
+            await refreshManagerShopifyCheckoutRateControl(for: command)
+            return false
+        } catch PickingAPIError.unauthorized {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
+            return false
+        } catch PickingAPIError.invalidOrigin {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            managerShopifyCheckoutRateStatus = "The configured ClawPilot server is invalid. The checkout-rate change was not sent or retained."
+            return false
+        } catch PickingAPIError.rateLimited(let seconds) {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            if let recovered = await reconcileAmbiguousManagerShopifyCheckoutRateCommand(
+                command
+            ) {
+                return recovered
+            }
+            managerShopifyCheckoutRateStatus = "The exact Shopify checkout-rate change is retained in this signed-in app session for byte-identical retry after \(seconds) seconds. Relaunching refreshes authoritative state but does not retain this retry command."
+            return false
+        } catch {
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return false
+            }
+            let recovered = await reconcileAmbiguousManagerShopifyCheckoutRateCommand(
+                command
+            )
+            if recovered == true { return true }
+            if recovered == false { return false }
+            managerShopifyCheckoutRateStatus = "The checkout-rate result is ambiguous. The exact key and request body remain in this signed-in app session for byte-identical retry; relaunching refreshes authoritative state without retaining the command: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func reconcileAmbiguousManagerShopifyCheckoutRateCommand(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) async -> Bool? {
+        let control: ManagerShopifyCheckoutRateControl?
+        do {
+            control = try await api.fetchManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+        } catch PickingAPIError.unauthorized {
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
+            return false
+        } catch {
+            control = nil
+        }
+        guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+            return false
+        }
+        let resolution = ManagerShopifyCheckoutRatePendingModel(
+            command: command
+        ).resolve(
+            currentAuthenticationGeneration: authenticationGeneration,
+            currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            currentActorEmail: sessionProfile?.effectiveUser.email,
+            currentAccountGlobalId: command.accountGlobalId,
+            isAuthenticated: isAuthenticated,
+            failure: .ambiguous,
+            refreshedControl: control
+        )
+        if resolution == .ignoreSupersededContext { return false }
+        if let control { installManagerShopifyCheckoutRateControl(control) }
+        if resolution == .applied, let control {
+            quarantineManagerShopifyCheckoutRateCommand()
+            managerShopifyCheckoutRateStatus = control.effectiveReason.label
+            return true
+        }
+        if resolution == .retainExactRetry { return nil }
+        if resolution == .quarantineAndRefresh {
+            quarantineManagerShopifyCheckoutRateCommand()
+            managerShopifyCheckoutRateStatus = "Shopify checkout-rate configuration changed after review. The old retry was quarantined; review the refreshed desired and effective state."
+            return false
+        }
+        return nil
+    }
+
+    private func refreshManagerShopifyCheckoutRateControl(
+        for command: ManagerShopifyCheckoutRateCommand
+    ) async {
+        do {
+            let control = try await api.fetchManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return
+            }
+            installManagerShopifyCheckoutRateControl(control)
+        } catch PickingAPIError.unauthorized {
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
+        } catch {
+            // The reviewed control remains invalidated until a later GET succeeds.
+        }
+    }
+
+    private func installManagerShopifyCheckoutRateControl(
+        _ control: ManagerShopifyCheckoutRateControl
+    ) {
+        if let index = managerShopifyCheckoutRateControls.firstIndex(where: {
+            $0.accountGlobalId == control.accountGlobalId
+        }) {
+            let prior = managerShopifyCheckoutRateControls[index]
+            managerShopifyCheckoutRateControls[index] = control
+            if prior.configGlobalId != control.configGlobalId
+                || prior.rowVersion != control.rowVersion
+                || prior.policyRevision != control.policyRevision
+                || prior.canEdit != control.canEdit {
+                managerShopifyCheckoutRateReviewGeneration &+= 1
+            }
+        } else {
+            managerShopifyCheckoutRateControls.append(control)
+        }
+    }
+
+    private func reconcilePendingManagerShopifyCheckoutRateChange() {
+        guard let command = pendingManagerShopifyCheckoutRateCommand,
+              let control = managerShopifyCheckoutRateControls.first(where: {
+                  $0.accountGlobalId == command.accountGlobalId
+              }) else { return }
+        if command.isConfirmedApplied(by: control) {
+            quarantineManagerShopifyCheckoutRateCommand()
+            managerShopifyCheckoutRateStatus = control.effectiveReason.label
+        } else if !command.isCurrentReview(control) {
+            quarantineManagerShopifyCheckoutRateCommand()
+            managerShopifyCheckoutRateStatus = "Shopify checkout-rate configuration changed after review. Review the refreshed control before trying again."
+        }
+    }
+
+    private func quarantineManagerShopifyCheckoutRateCommand() {
+        pendingManagerShopifyCheckoutRateCommand = nil
+        hasPendingManagerShopifyCheckoutRateChange = false
+        managerShopifyCheckoutRateReviewGeneration &+= 1
+    }
+
+    private func invalidateManagerShopifyCheckoutRateControl(
+        accountGlobalId: String
+    ) {
+        let priorCount = managerShopifyCheckoutRateControls.count
+        managerShopifyCheckoutRateControls.removeAll {
+            $0.accountGlobalId == accountGlobalId
+        }
+        if managerShopifyCheckoutRateControls.count != priorCount {
+            managerShopifyCheckoutRateReviewGeneration &+= 1
+        }
+    }
+
+    private func supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) async {
+        guard managerShopifyCheckoutRateOperationIsCurrent(command) else { return }
+        isAuthBusy = true
+        defer { isAuthBusy = false }
+        authenticationGeneration &+= 1
+        isAuthenticated = false
+        sessionProfile = nil
+        clearPublishedPickProjection()
+        managerOrders = []
+        clearManagerStoreSyncState()
+        managerPickers = []
+        pickerPerformance = []
+        managerPickManagement = nil
+        managerSelectedPickAssignment = nil
+        managerSelectedOrder = nil
+        googleAuthState = nil
+        GIDSignIn.sharedInstance.signOut()
+        biometrics.forgetAuthenticatedSession()
+        isLocallyLocked = false
+        await WebSessionBridge.clearCookies()
+        status = "Sign in to continue."
+        managerShopifyCheckoutRateStatus = nil
+    }
+
+    private func clearManagerStoreSyncState() {
+        managerStoreSyncControls = []
+        canManageStoreSync = false
+        isManagerStoreSyncBusy = false
+        hasPendingManagerStoreSyncChange = false
+        managerStoreSyncStatus = nil
+        pendingManagerStoreSyncCommand = nil
+        managerShopifyCheckoutRateControls = []
+        isManagerSettingsControlsBusy = false
+        isManagerShopifyCheckoutRateBusy = false
+        hasPendingManagerShopifyCheckoutRateChange = false
+        managerShopifyCheckoutRateStatus = nil
+        pendingManagerShopifyCheckoutRateCommand = nil
+        activeManagerShopifyCheckoutRateSubmissionFence = nil
+        managerShopifyCheckoutRateReviewGeneration &+= 1
+        let checkoutRateWaiters = managerShopifyCheckoutRateCompletionWaiters
+        managerShopifyCheckoutRateCompletionWaiters.removeAll()
+        checkoutRateWaiters.forEach { $0.resume() }
     }
 
     func loadManagerOrder(_ order: ManagerOrderSummary) async {
@@ -1543,6 +2234,8 @@ final class PickingPhoneModel: ObservableObject {
         sessionProfile = nil
         clearPublishedPickProjection()
         await waitForWorkspaceSwitchToFinish()
+        await waitForManagerStoreSyncSubmissionToFinish()
+        await waitForManagerShopifyCheckoutRateSubmissionToFinish()
         var serverLogoutError: Error?
         do {
             try await api.logout()
@@ -1568,7 +2261,9 @@ final class PickingPhoneModel: ObservableObject {
         status = serverLogoutError == nil
             ? "Signed out."
             : "Signed out on this device. The server sign-out response was unavailable."
+        isManagerBusy = false
         managerOrders = []
+        clearManagerStoreSyncState()
         managerPickers = []
         pickerPerformance = []
         managerPickManagement = nil
@@ -1586,6 +2281,83 @@ final class PickingPhoneModel: ObservableObject {
 
     private func authenticationIsCurrent(_ generation: UInt64) -> Bool {
         generation == authenticationGeneration && isAuthenticated
+    }
+
+    private func installReplacementAuthenticationProfile(
+        _ profile: ClawPilotSessionProfile
+    ) {
+        authenticationGeneration &+= 1
+        clearManagerStoreSyncState()
+        sessionProfile = profile
+        isAuthenticated = true
+    }
+
+    private func managerStoreSyncOperationIsCurrent(
+        generation: UInt64,
+        organizationId: String
+    ) -> Bool {
+        ManagerStoreSyncSubmissionFence(
+            authenticationGeneration: generation,
+            organizationId: organizationId
+        ).permitsStateMutation(
+            currentAuthenticationGeneration: authenticationGeneration,
+            currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            isAuthenticated: isAuthenticated
+        )
+    }
+
+    private func waitForManagerStoreSyncSubmissionToFinish() async {
+        guard isManagerStoreSyncBusy else { return }
+        await withCheckedContinuation { continuation in
+            managerStoreSyncCompletionWaiters.append(continuation)
+        }
+    }
+
+    private func finishManagerStoreSyncSubmission(
+        generation: UInt64,
+        organizationId: String
+    ) {
+        if managerStoreSyncOperationIsCurrent(
+            generation: generation,
+            organizationId: organizationId
+        ) {
+            isManagerStoreSyncBusy = false
+        }
+        let waiters = managerStoreSyncCompletionWaiters
+        managerStoreSyncCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func managerShopifyCheckoutRateOperationIsCurrent(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) -> Bool {
+        activeManagerShopifyCheckoutRateSubmissionFence?.permitsStateMutation(
+            for: command,
+            currentAuthenticationGeneration: authenticationGeneration,
+            currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            currentActorEmail: sessionProfile?.effectiveUser.email,
+            isAuthenticated: isAuthenticated
+        ) == true
+    }
+
+    private func waitForManagerShopifyCheckoutRateSubmissionToFinish() async {
+        guard isManagerShopifyCheckoutRateBusy else { return }
+        await withCheckedContinuation { continuation in
+            managerShopifyCheckoutRateCompletionWaiters.append(continuation)
+        }
+    }
+
+    private func finishManagerShopifyCheckoutRateSubmission(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) {
+        guard activeManagerShopifyCheckoutRateSubmissionFence?.ownsCompletion(
+            of: command
+        ) == true else { return }
+        isManagerShopifyCheckoutRateBusy = false
+        activeManagerShopifyCheckoutRateSubmissionFence = nil
+        let waiters = managerShopifyCheckoutRateCompletionWaiters
+        managerShopifyCheckoutRateCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 
     private func waitForWorkspaceSwitchToFinish() async {

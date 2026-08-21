@@ -30,16 +30,24 @@ function expectCode(invoke: () => unknown, code: string) {
   })
 }
 
-test('accepts exact imported Shopify/Faire orders from sandbox or production connections', () => {
-  assert.doesNotThrow(() => assertShadowTrainingEligibility(eligible))
+test('accepts local training in every current safety profile', () => {
+  for (const activationState of [
+    'disabled', 'shadow', 'read_only', 'active', 'frozen',
+  ]) {
+    assert.doesNotThrow(() => assertShadowTrainingEligibility({
+      ...eligible,
+      activationState,
+    }))
+  }
   assert.doesNotThrow(() => assertShadowTrainingEligibility({
     ...eligible,
+    activationState: 'read_only',
     sourceProvider: 'faire',
     accountEnvironment: 'production',
   }))
 })
 
-test('rejects mock accounts and non-Shadow or already-progressed orders', () => {
+test('rejects mock accounts, missing safety state, and progressed orders', () => {
   expectCode(
     () => assertShadowTrainingEligibility({
       ...eligible,
@@ -48,8 +56,8 @@ test('rejects mock accounts and non-Shadow or already-progressed orders', () => 
     'OPERATIONS_SHADOW_TRAINING_CONNECTION_REQUIRED',
   )
   expectCode(
-    () => assertShadowTrainingEligibility({ ...eligible, activationState: 'active' }),
-    'OPERATIONS_SHADOW_TRAINING_SHADOW_REQUIRED',
+    () => assertShadowTrainingEligibility({ ...eligible, activationState: 'missing' }),
+    'OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED',
   )
   expectCode(
     () => assertShadowTrainingEligibility({ ...eligible, orderStatus: 'planned' }),

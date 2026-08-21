@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
@@ -24,6 +24,26 @@ import ShopifyCustomerRatePolicyPanel
 import {
   CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
 } from '@/lib/integrations/carrierCheckoutRate'
+import type {
+  CommerceStoreSyncControl,
+  CommerceStoreSyncDesiredState,
+  CommerceStoreSyncPendingCommand,
+} from '@/lib/operations/commerceStoreSync'
+import {
+  CommerceStoreSyncHttpError,
+  commerceStoreSyncControlMatchesCommand,
+  commerceStoreSyncPendingResolution,
+} from '@/lib/operations/commerceStoreSync'
+import {
+  ShopifyCheckoutRateControlHttpError,
+  assertShopifyCheckoutRateControlCommandResult,
+  persistShopifyCheckoutRateControlPendingCommand,
+  readShopifyCheckoutRateControlPendingCommand,
+  selectShopifyCheckoutRateControlFormState,
+  shopifyCheckoutRateControlPendingResolution,
+  type ShopifyCheckoutRateControlCommandResult,
+  type ShopifyCheckoutRateControlPendingCommand,
+} from '@/lib/operations/shopifyCheckoutRateControlCommand'
 
 type Provider = 'ups_rest' | 'fedex_rest'
 type PlanRateObjective =
@@ -47,6 +67,20 @@ type CheckoutRateWarmPolicy = {
   minIntervalMs: number
   supportedCountries: ['US']
   staleCartAbort: true
+}
+type CheckoutAudienceMode =
+  | 'off'
+  | 'restricted_customers'
+  | 'all_eligible'
+type CheckoutAudiencePolicy = {
+  version: 'shopify-checkout-audience-v1'
+  mode: CheckoutAudienceMode
+}
+type CheckoutRateSource = 'sandbox' | 'production'
+type CheckoutRateControl = {
+  version: 'shopify-checkout-rate-control-v1'
+  audience: CheckoutAudienceMode
+  rateSource: CheckoutRateSource
 }
 type ActivationState =
   | 'missing'
@@ -78,6 +112,17 @@ const DEFAULT_CHECKOUT_RATE_WARM: CheckoutRateWarmPolicy = {
   minIntervalMs: 1_000,
   supportedCountries: ['US'],
   staleCartAbort: true,
+}
+
+const DEFAULT_CHECKOUT_AUDIENCE: CheckoutAudiencePolicy = {
+  version: 'shopify-checkout-audience-v1',
+  mode: 'restricted_customers',
+}
+
+const DEFAULT_CHECKOUT_RATE_CONTROL: CheckoutRateControl = {
+  version: 'shopify-checkout-rate-control-v1',
+  audience: 'restricted_customers',
+  rateSource: 'sandbox',
 }
 
 const OBJECTIVE_PRESETS: Array<{
@@ -117,11 +162,18 @@ type SetupPayload = {
   setup?: ShopifyCarrierServiceSetup
 }
 
+type RateControlCommandPayload = {
+  ok?: boolean
+  code?: string
+  error?: string
+  result?: ShopifyCheckoutRateControlCommandResult
+}
+
 type ShopifyCarrierServiceSetup = {
+  actorEmail: string
+  storeSync: CommerceStoreSyncControl
   account: {
     globalId: string
-    configGlobalId: string
-    configRowVersion: number
     environment: 'sandbox' | 'production'
     status: 'active' | 'disabled' | 'error'
     receiptIntakeEnabled: boolean
@@ -146,8 +198,11 @@ type ShopifyCarrierServiceSetup = {
     policyHash: string
     planRateOptimization: PlanRateOptimization
     checkoutRateWarm: CheckoutRateWarmPolicy
+    shadowCheckoutAudience: CheckoutAudiencePolicy
+    checkoutRateControl: CheckoutRateControl
     rowVersion: number
     ready: boolean
+    ratingRuntimeReady: boolean
     checkoutBrandNameOverride: string | null
     registeredServiceName: string | null
     warehouseGlobalId: string
@@ -160,6 +215,31 @@ type ShopifyCarrierServiceSetup = {
       carrierAccountGlobalId: string
     }>
   } | null
+  checkoutRateLastChange: {
+    configGlobalId: string
+    idempotencyKey: string
+    requestHash: string
+    actorEmail: string
+    requestedControl: CheckoutRateControl
+    resultingRowVersion: number
+    resultingPolicyRevision: number
+    reason: string
+  } | null
+  checkoutRateOperatingProfile: {
+    desiredAudience: CheckoutAudienceMode | null
+    desiredRateSource: CheckoutRateSource | null
+    effectiveState: 'not_configured' | 'empty' | 'serving' | 'not_ready'
+    effectiveReason:
+      | 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED'
+      | 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN'
+      | 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF'
+      | 'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED'
+      | 'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED'
+      | 'SHOPIFY_CHECKOUT_RATING_RUNTIME_NOT_READY'
+      | 'SHOPIFY_CHECKOUT_RATES_SERVING'
+    serving: boolean
+    emergencyOverride: boolean
+  }
   rateWarmReadiness: {
     deliveryCustomizationDurable: boolean
     activationAllowed: boolean
@@ -167,14 +247,18 @@ type ShopifyCarrierServiceSetup = {
   }
   checkoutAudience: {
     state:
-      | 'shadow_binary_ready'
+      | 'shadow_off'
+      | 'shadow_restricted_ready'
+      | 'shadow_all_eligible_ready'
       | 'shadow_customer_required'
       | 'active_default_ready_provider_overrides_blocked'
       | 'inactive'
     defaultPolicy: 'show_all' | 'hide_all'
+    mode: CheckoutAudienceMode
     policyCount: number
     unexpiredShadowPolicyCount: number
     shadowAllowedCustomerCount: number
+    eligibleCustomerCount: number
     expiredShadowPolicyCount: number
     blockedPolicyCount: number
     enforcedPolicyCount: number
@@ -438,12 +522,93 @@ export default function ShopifyCarrierServiceSetupPanel({
       ...DEFAULT_CHECKOUT_RATE_WARM,
       supportedCountries: ['US'],
     })
+  const [shadowCheckoutAudience, setShadowCheckoutAudience] =
+    useState<CheckoutAudiencePolicy>(DEFAULT_CHECKOUT_AUDIENCE)
+  const [checkoutRateControl, setCheckoutRateControl] =
+    useState<CheckoutRateControl>(DEFAULT_CHECKOUT_RATE_CONTROL)
+  const [checkoutRateControlReason, setCheckoutRateControlReason] =
+    useState('')
+  const [pendingRateControlCommand, setPendingRateControlCommand] =
+    useState<ShopifyCheckoutRateControlPendingCommand | null>(null)
   const [confirmWrite, setConfirmWrite] = useState(false)
   const [confirmNameAlignment, setConfirmNameAlignment] = useState(false)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [confirmRecovery, setConfirmRecovery] = useState(false)
+  const pendingStoreSyncCommand = useRef<
+    CommerceStoreSyncPendingCommand | null
+  >(null)
+  const pendingRateControlStorageKey =
+    `clawpilot:shopify-rate-control:${accountGlobalId}`
+  const activeAccountGlobalId = useRef(accountGlobalId)
+  activeAccountGlobalId.current = accountGlobalId
+  const activeRateControlActorEmail = setup?.actorEmail
+    .trim().toLowerCase() ?? null
+
+  const clearPendingRateControlCommand = useCallback(() => {
+    try {
+      sessionStorage.removeItem(pendingRateControlStorageKey)
+      if (sessionStorage.getItem(pendingRateControlStorageKey) !== null) {
+        return false
+      }
+    } catch {
+      return false
+    }
+    setPendingRateControlCommand(null)
+    setCheckoutRateControlReason('')
+    return true
+  }, [pendingRateControlStorageKey])
 
   const applySetup = useCallback((next: ShopifyCarrierServiceSetup) => {
+    if (next.account.globalId !== activeAccountGlobalId.current) {
+      return
+    }
+    let retainedPending: ShopifyCheckoutRateControlPendingCommand | null = null
+    try {
+      retainedPending = readShopifyCheckoutRateControlPendingCommand(
+        sessionStorage,
+        pendingRateControlStorageKey,
+      )
+      if (
+        retainedPending
+        && (
+          retainedPending.accountGlobalId !== next.account.globalId
+          || retainedPending.actorEmail
+            !== next.actorEmail.trim().toLowerCase()
+          || retainedPending.configGlobalId !== next.config?.globalId
+        )
+      ) {
+        throw new Error('Pending command account binding changed')
+      }
+      if (retainedPending && next.config) {
+        const resolution = shopifyCheckoutRateControlPendingResolution({
+          state: {
+            accountGlobalId: next.account.globalId,
+            configGlobalId: next.config.globalId,
+            checkoutRateControl: next.config.checkoutRateControl,
+            rowVersion: next.config.rowVersion,
+            policyRevision: next.config.policyRevision,
+            canEdit: next.canActivate && next.canManage,
+            lastChange: next.checkoutRateLastChange,
+          },
+          command: retainedPending,
+          failure: new TypeError('Authoritative setup reconciliation'),
+        })
+        if (resolution !== 'retain_exact_retry') {
+          sessionStorage.removeItem(pendingRateControlStorageKey)
+          if (sessionStorage.getItem(pendingRateControlStorageKey) !== null) {
+            throw new Error('Pending command could not be quarantined')
+          }
+          retainedPending = null
+        }
+      }
+    } catch {
+      try {
+        sessionStorage.removeItem(pendingRateControlStorageKey)
+      } catch {
+        // Browser storage can be unavailable; never let that expose stale UI.
+      }
+      retainedPending = null
+    }
     setSetup(next)
     setWarehouseGlobalId(
       next.config?.warehouseGlobalId
@@ -474,7 +639,25 @@ export default function ShopifyCarrierServiceSetupPanel({
       ...nextCheckoutRateWarm,
       supportedCountries: ['US'],
     })
-  }, [])
+    setShadowCheckoutAudience(
+      next.config?.shadowCheckoutAudience ?? DEFAULT_CHECKOUT_AUDIENCE,
+    )
+    const rateControlForm = selectShopifyCheckoutRateControlFormState({
+      pendingCommand: retainedPending,
+      accountGlobalId: next.account.globalId,
+      actorEmail: next.actorEmail,
+      configGlobalId: next.config?.globalId ?? '',
+      serverControl: next.config?.checkoutRateControl ?? {
+        ...DEFAULT_CHECKOUT_RATE_CONTROL,
+        rateSource: next.account.environment === 'production'
+          ? 'production'
+          : 'sandbox',
+      },
+    })
+    setCheckoutRateControl(rateControlForm.checkoutRateControl)
+    setPendingRateControlCommand(retainedPending)
+    setCheckoutRateControlReason(rateControlForm.reason ?? '')
+  }, [pendingRateControlStorageKey])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -491,12 +674,14 @@ export default function ShopifyCarrierServiceSetupPanel({
         throw new Error(payload.error || 'Checkout-rating setup is unavailable')
       }
       applySetup(payload.setup)
+      return payload.setup
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
           : 'Checkout-rating setup is unavailable',
       )
+      return null
     } finally {
       setLoading(false)
     }
@@ -505,6 +690,42 @@ export default function ShopifyCarrierServiceSetupPanel({
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => {
+    setPendingRateControlCommand(null)
+    setCheckoutRateControlReason('')
+    try {
+      const pending = readShopifyCheckoutRateControlPendingCommand(
+        sessionStorage,
+        pendingRateControlStorageKey,
+      )
+      if (!pending) return
+      if (
+        pending.accountGlobalId !== accountGlobalId
+        || (
+          activeRateControlActorEmail
+          && pending.actorEmail !== activeRateControlActorEmail
+        )
+      ) {
+        throw new Error('Pending command account binding changed')
+      }
+      setPendingRateControlCommand(pending)
+      setCheckoutRateControl(pending.body.checkoutRateControl)
+      setCheckoutRateControlReason(pending.body.reason)
+    } catch {
+      try {
+        sessionStorage.removeItem(pendingRateControlStorageKey)
+      } catch {
+        // Browser storage can be unavailable; pending UI stays fail-closed.
+      }
+      setPendingRateControlCommand(null)
+      setCheckoutRateControlReason('')
+    }
+  }, [
+    accountGlobalId,
+    activeRateControlActorEmail,
+    pendingRateControlStorageKey,
+  ])
 
   const run = async (
     action: string,
@@ -548,6 +769,109 @@ export default function ShopifyCarrierServiceSetupPanel({
     }
   }
 
+  const updateStoreSync = async (
+    desiredState: CommerceStoreSyncDesiredState,
+  ) => {
+    if (
+      !setup
+      || (
+        desiredState === setup.storeSync.desiredState
+        && setup.storeSync.explicitChoice
+      )
+    ) return
+    const retainedCommand = pendingStoreSyncCommand.current
+    if (retainedCommand && retainedCommand.desiredState !== desiredState) {
+      setError(
+        'A prior Store sync response is uncertain. Retry that exact change or reload before issuing a different change.',
+      )
+      return
+    }
+    const command: CommerceStoreSyncPendingCommand = retainedCommand || {
+      accountGlobalId,
+      desiredState,
+      expectedDesiredState: setup.storeSync.desiredState,
+      expectedRevision: setup.storeSync.revision,
+      reason: desiredState === setup.storeSync.desiredState
+        ? `Confirmed ${desiredState} as an independent Store sync choice in Shopify setup`
+        : `Changed Store sync from ${setup.storeSync.desiredState} to ${desiredState} in Shopify setup`,
+      idempotencyKey: `store-sync:${crypto.randomUUID()}`,
+    }
+    pendingStoreSyncCommand.current = command
+    setBusy('store-sync')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'update-commerce-store-sync',
+          accountGlobalId: command.accountGlobalId,
+          desiredState: command.desiredState,
+          expectedDesiredState: command.expectedDesiredState,
+          expectedRevision: command.expectedRevision,
+          reason: command.reason,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as {
+        ok?: boolean
+        code?: string
+        error?: string
+        result?: { control?: CommerceStoreSyncControl }
+      }
+      if (!response.ok) {
+        throw new CommerceStoreSyncHttpError(
+          response.status,
+          payload.error || 'Store sync could not be updated',
+          payload.code,
+        )
+      }
+      if (!payload.result?.control) {
+        throw new Error(payload.error || 'Store sync could not be updated')
+      }
+      if (!commerceStoreSyncControlMatchesCommand(
+        payload.result.control,
+        command,
+      )) {
+        throw new Error('Store sync returned a response for a different command')
+      }
+      pendingStoreSyncCommand.current = null
+      setNotice(
+        `Store sync is ${payload.result.control.effectiveState}. ${payload.result.control.effectiveReasonLabel}`,
+      )
+      await load()
+    } catch (caught) {
+      const refreshed = await load().catch(() => null)
+      const refreshedControl = refreshed?.storeSync
+      const resolution = commerceStoreSyncPendingResolution(
+        refreshedControl,
+        command,
+        caught,
+      )
+      if (resolution === 'applied' && refreshedControl) {
+        pendingStoreSyncCommand.current = null
+        setNotice(
+          `Store sync is ${refreshedControl.effectiveState}. ${refreshedControl.effectiveReasonLabel}`,
+        )
+        setError('')
+      } else if (resolution === 'definitive_rejection') {
+        pendingStoreSyncCommand.current = null
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} Current Store sync state was refreshed. Review it before trying again.`,
+        )
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'Store sync could not be updated'} The exact command is retained for retry.`,
+        )
+      }
+    } finally {
+      setBusy('')
+    }
+  }
+
   const accountScopes = scopes(setup?.account.configuration.grantedScopes)
   const scopeReady = accountScopes.includes('write_shipping')
   const connectionReady = setup?.account.configured === true
@@ -560,12 +884,7 @@ export default function ShopifyCarrierServiceSetupPanel({
     ),
     [setup, warehouseGlobalId],
   )
-  const selectedRateEnvironment = setup?.reference.activation.state
-    === 'shadow'
-    ? 'sandbox'
-    : setup?.reference.activation.state === 'active'
-      ? 'production'
-      : null
+  const selectedRateEnvironment = checkoutRateControl.rateSource
   const callbackRateLaneExecutable = selectedRateEnvironment !== null
   const directRateCarriers = useMemo(
     () => (setup?.reference.carrierAccounts || []).filter(
@@ -648,17 +967,15 @@ export default function ShopifyCarrierServiceSetupPanel({
     ))
   )
   const registered = setup?.config?.registrationState === 'registered'
-  const activeRevisionBindingRequired = Boolean(
+  const callbackServingReady = Boolean(
     registered
-    && setup?.reference.activation.state === 'active'
-    && setup.reference.activation.revision !== null
-    && setup.config?.activationRevision
-      !== setup.reference.activation.revision,
+    && setup?.config?.serviceGid
+    && setup.config.ratingRuntimeReady === true
+    && setup.callbackUrl
+    && setup.checkoutRateOperatingProfile.serving
   )
-  const planRatePolicyEditable =
-    setup?.reference.activation.state === 'shadow' && !busy
-  const rateWarmPolicyEditable =
-    setup?.reference.activation.state === 'shadow' && !busy
+  const planRatePolicyEditable = Boolean(setup?.canActivate && !busy)
+  const rateWarmPolicyEditable = Boolean(setup?.canActivate && !busy)
   const nameAlignment = registered ? setup?.nameAlignment || null : null
   const savedCheckoutBrandNameOverride =
     setup?.namePreference.overrideName || ''
@@ -687,9 +1004,12 @@ export default function ShopifyCarrierServiceSetupPanel({
     ? setup.shadowSimulation
     : null
   const simulated = Boolean(exactShadowSimulation)
-  const shadowRegistered = registered
-    && setup?.reference.activation.state === 'shadow'
-    && setup.config?.ready === true
+  const providerWriteAllowed = Boolean(
+    setup
+    && ['shadow', 'read_only', 'active'].includes(
+      setup.reference.activation.state,
+    ),
+  )
   const reconciliationRequired = setup?.mutationAuthorizations.find(
     (authorization) => authorization.reconciliationRequired,
   ) || null
@@ -734,12 +1054,30 @@ export default function ShopifyCarrierServiceSetupPanel({
   const evidenceComplete =
     (setup?.reference.evidence.succeededReceipts || 0) > 0
   const checkoutAudience = setup?.checkoutAudience || null
-  const shadowAudienceReady = Boolean(
-    checkoutAudience?.shadowBinaryTestReady,
+  const restrictedAudiencePolicyReady = Boolean(
+    checkoutAudience?.mode === 'restricted_customers'
+    && checkoutAudience.eligibleCustomerCount > 0,
   )
-  const activeAudienceReady =
-    setup?.reference.activation.state === 'active'
-  const checkoutAudienceReady = shadowAudienceReady || activeAudienceReady
+  const checkoutAudienceReady = Boolean(
+    checkoutAudience?.mode === 'off'
+    || (
+      setup?.checkoutRateOperatingProfile.serving
+      && (
+        checkoutAudience?.mode === 'all_eligible'
+        || restrictedAudiencePolicyReady
+      )
+    ),
+  )
+  const rateWarmAudienceReady = Boolean(
+    setup?.checkoutRateOperatingProfile.serving
+    && (
+      checkoutAudience?.mode === 'all_eligible'
+      || restrictedAudiencePolicyReady
+    ),
+  )
+  const authenticatedCallbackInstalled = Boolean(
+    registered && setup?.config?.serviceGid && setup.callbackUrl,
+  )
   const rateWarmConfigured = Boolean(
     setup?.config?.checkoutRateWarm.enabled
     && setup.rateWarmReadiness.activationAllowed,
@@ -762,6 +1100,7 @@ export default function ShopifyCarrierServiceSetupPanel({
     orderReconciliationWindowSeconds: 86400,
     planRateOptimization,
     checkoutRateWarm,
+    shadowCheckoutAudience,
   }, 'The exact warehouse, package, carrier, and inventory policy was saved.')
   const savePlanRatePolicy = () => run('save-plan-rate-policy', {
     planRateOptimization,
@@ -769,6 +1108,143 @@ export default function ShopifyCarrierServiceSetupPanel({
   const saveRateWarmPolicy = () => run('save-rate-warm-policy', {
     checkoutRateWarm,
   }, 'The disabled saved-address rate cache-preparation policy was saved without changing the registered Shopify service.')
+  const saveCheckoutRateControl = async () => {
+    if (!setup?.config || setup.account.globalId !== accountGlobalId) return
+    const reason = checkoutRateControlReason.trim()
+    const desiredBody = {
+      expectedConfigGlobalId: setup.config.globalId,
+      expectedRowVersion: setup.config.rowVersion,
+      expectedPolicyRevision: setup.config.policyRevision,
+      checkoutRateControl,
+      reason,
+    }
+    const exactPendingCommand = pendingRateControlCommand
+      && pendingRateControlCommand.accountGlobalId === accountGlobalId
+      && pendingRateControlCommand.actorEmail
+        === setup.actorEmail.trim().toLowerCase()
+      && pendingRateControlCommand.configGlobalId
+        === setup.config.globalId
+      ? pendingRateControlCommand
+      : null
+    const requestedCommand = exactPendingCommand
+      ? exactPendingCommand
+      : {
+          accountGlobalId,
+          actorEmail: setup.actorEmail.trim().toLowerCase(),
+          configGlobalId: setup.config.globalId,
+          idempotencyKey: `shopify-rate-control:${crypto.randomUUID()}`,
+          expectedPolicyRevision: setup.config.policyRevision,
+          body: desiredBody,
+        }
+    setBusy('save-checkout-rate-control')
+    setError('')
+    setNotice('')
+    try {
+      const command = persistShopifyCheckoutRateControlPendingCommand(
+        sessionStorage,
+        pendingRateControlStorageKey,
+        requestedCommand,
+      )
+      setPendingRateControlCommand(command)
+      const response = await fetch(
+        '/api/integrations/commerce/shopify/carrier-service',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': command.idempotencyKey,
+          },
+          body: JSON.stringify({
+            action: 'save-checkout-rate-control',
+            accountGlobalId,
+            ...command.body,
+          }),
+        },
+      )
+      const payload = (
+        await response.json().catch(() => ({}))
+      ) as RateControlCommandPayload
+      if (!response.ok) {
+        throw new ShopifyCheckoutRateControlHttpError(
+          response.status,
+          payload.error || 'Checkout-rate control save failed',
+          payload.code,
+        )
+      }
+      if (!payload.result) {
+        throw new Error(payload.error || 'Checkout-rate control save failed')
+      }
+      assertShopifyCheckoutRateControlCommandResult({
+        value: payload.result,
+        command,
+        accountGlobalId,
+        configGlobalId: setup.config.globalId,
+      })
+      if (!clearPendingRateControlCommand()) {
+        throw new Error(
+          'The confirmed checkout-rate control command could not be cleared from this browser session.',
+        )
+      }
+      setNotice(
+        'Desired checkout audience and carrier-rate source were saved with zero provider writes.',
+      )
+      setSetup(null)
+      await load()
+    } catch (caught) {
+      const refreshed = await load()
+      const resolution = shopifyCheckoutRateControlPendingResolution({
+        state: refreshed?.config
+          ? {
+              accountGlobalId: refreshed.account.globalId,
+              configGlobalId: refreshed.config.globalId,
+              checkoutRateControl: refreshed.config.checkoutRateControl,
+              rowVersion: refreshed.config.rowVersion,
+              policyRevision: refreshed.config.policyRevision,
+              canEdit: refreshed.canActivate && refreshed.canManage,
+              lastChange: refreshed.checkoutRateLastChange,
+            }
+          : null,
+        command: requestedCommand,
+        failure: caught,
+      })
+      if (resolution === 'applied') {
+        if (!clearPendingRateControlCommand()) {
+          setError(
+            'The saved checkout-rate change was confirmed, but its browser retry record could not be cleared. Reload before making another change.',
+          )
+        } else {
+          if (refreshed) applySetup(refreshed)
+          setError('')
+          setNotice(
+            'Desired checkout audience and carrier-rate source were saved with zero provider writes.',
+          )
+        }
+      } else if (
+        resolution === 'definitive_rejection'
+        || resolution === 'superseded'
+      ) {
+        if (!clearPendingRateControlCommand()) {
+          setError(
+            'Checkout-rate control was rejected, but its stale browser retry record could not be cleared. Reload before trying again.',
+          )
+        } else {
+          if (refreshed) applySetup(refreshed)
+          else setSetup(null)
+          setError(
+            resolution === 'superseded'
+              ? 'Checkout-rate control or permission changed after review. The stale retry was quarantined; review current authoritative state before trying again.'
+              : `${caught instanceof Error ? caught.message : 'Checkout-rate control save failed'} Current checkout-rate state was refreshed. Review it before trying again.`,
+          )
+        }
+      } else {
+        setError(
+          `${caught instanceof Error ? caught.message : 'Checkout-rate control save failed'} The exact command remains saved for retry.`,
+        )
+      }
+    } finally {
+      setBusy('')
+    }
+  }
 
   if (loading && !setup) {
     return (
@@ -872,8 +1348,8 @@ export default function ShopifyCarrierServiceSetupPanel({
         </Typography>
         <Typography variant="caption" color="text.secondary" display="block">
           {selectedRateEnvironment === 'production'
-            ? 'Active executes only the LIVE group. It never falls back to TEST and checkout rating does not buy postage or create labels.'
-            : 'Shadow executes only the TEST group. The saved LIVE group remains available for an explicit Active transition.'}
+            ? 'The saved checkout control executes only the LIVE group. It never falls back to TEST, and checkout rating does not buy postage or create labels.'
+            : 'The saved checkout control executes only the TEST group. The saved LIVE group remains dormant until an authorized administrator explicitly selects it.'}
         </Typography>
       </Box>
       {(['sandbox', 'production'] as const).map((environment) => {
@@ -1089,7 +1565,11 @@ export default function ShopifyCarrierServiceSetupPanel({
       </Box>
       <Button
         variant="contained"
-        disabled={!bindingsReady || Boolean(busy)}
+        disabled={
+          !bindingsReady
+          || Boolean(busy)
+          || Boolean(pendingRateControlCommand)
+        }
         onClick={() => void saveConfig()}
       >
         {busy === 'save-config'
@@ -1114,16 +1594,14 @@ export default function ShopifyCarrierServiceSetupPanel({
       </Typography>
       <Alert severity="info" sx={{ mt: 1 }}>
         {setup?.rateWarmReadiness.reason
-          || 'A verified sandbox Shopify account in Operations Shadow is required.'}
+          || 'Save an explicit audience and carrier rate source first.'}
       </Alert>
       <Alert severity="warning" sx={{ mt: 1 }}>
-        This is only a bounded, isolated allowlisted test-variant proof.
-        Shopify does not
-        guarantee Customer GID in a CarrierService callback, and its
-        successful-rate cache is customer-neutral. Cache preparation is not
-        an order quote, does not select a service, and must not be treated as
-        deterministic customer enforcement. An unidentified or expired
-        Shadow callback fails closed.
+        {checkoutAudience?.mode === 'all_eligible'
+          ? `All-eligible cache preparation skips the customer allow-policy lookup. It still requires a signed-in customer to read saved addresses, and exact product mapping, inventory, packaging, and ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier readiness remain fail-closed.`
+          : checkoutAudience?.mode === 'off'
+            ? 'Checkout rates are Off. Cache preparation is disabled and does not request a Shopify Admin token or read saved customer addresses.'
+            : 'Restricted cache preparation requires a signed-in customer with an unexpired allow policy. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; cache preparation is not deterministic customer enforcement.'}
       </Alert>
       <Stack spacing={1} sx={{ mt: 1 }}>
         <FormControlLabel
@@ -1131,10 +1609,7 @@ export default function ShopifyCarrierServiceSetupPanel({
             <Checkbox
               size="small"
               checked={checkoutRateWarm.enabled}
-              disabled={
-                !rateWarmPolicyEditable
-                || setup?.rateWarmReadiness.activationAllowed !== true
-              }
+              disabled={!rateWarmPolicyEditable}
               onChange={(event) => setCheckoutRateWarm((current) => ({
                 ...current,
                 enabled: event.target.checked,
@@ -1489,7 +1964,7 @@ export default function ShopifyCarrierServiceSetupPanel({
             <Alert severity="warning">
               Checkout callbacks are fail-closed while the desired name and
               Shopify&apos;s provider-confirmed applied name differ. Run the
-              exact Shadow simulation and one-time in-place alignment below.
+              exact zero-write simulation and one-time in-place alignment below.
             </Alert>
           ) : null}
           {registered
@@ -1500,7 +1975,6 @@ export default function ShopifyCarrierServiceSetupPanel({
               disabled={
                 !nameAlignment
                 || namePreferenceChanged
-                || setup?.reference.activation.state !== 'shadow'
                 || !setup?.canActivate
                 || Boolean(recoveryRequired)
                 || Boolean(mutationInFlight)
@@ -1509,7 +1983,7 @@ export default function ShopifyCarrierServiceSetupPanel({
               onClick={() => void run(
                 'simulate-name-alignment',
                 {},
-                'The exact CarrierService name alignment was simulated in Shadow with zero Shopify writes.',
+                'The exact CarrierService name alignment was simulated with zero Shopify writes.',
               )}
             >
               {busy === 'simulate-name-alignment'
@@ -1541,7 +2015,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                 disabled={
                   !nameAlignment
                   || namePreferenceChanged
-                  || setup?.reference.activation.state !== 'shadow'
+                  || !providerWriteAllowed
                   || !setup?.canActivate
                   || !confirmNameAlignment
                   || Boolean(recoveryRequired)
@@ -1576,12 +2050,12 @@ export default function ShopifyCarrierServiceSetupPanel({
       ),
     } satisfies IntegrationSetupStep] : []),
     {
-      key: 'shadow',
+      key: 'simulation',
       label: registered
-        ? 'Simulate exact removal in Shadow'
-        : 'Simulate registration in Shadow',
+        ? 'Simulate exact removal'
+        : 'Simulate registration',
       description:
-        'Shadow records immutable terminal evidence for this exact configuration row with zero credential decryption, zero Shopify network calls, and zero provider writes.',
+        'This refreshes the current verified Shopify identity with a read-only provider check, then records immutable terminal evidence for the exact configuration row. It may decrypt the saved Shopify credential and make a Shopify read request, but performs zero Shopify mutations and zero provider writes. It is available in every Advanced safety mode.',
       state: stepState(
         Boolean(simulated),
         Boolean(setup?.config && !simulated),
@@ -1601,11 +2075,6 @@ export default function ShopifyCarrierServiceSetupPanel({
           variant="outlined"
           disabled={
             !setup?.config
-            || (
-              !registered
-              && setup.account.environment !== 'sandbox'
-            )
-            || setup.reference.activation.state !== 'shadow'
             || namePreferenceChanged
             || Boolean(busy)
             || Boolean(simulated)
@@ -1613,7 +2082,7 @@ export default function ShopifyCarrierServiceSetupPanel({
           onClick={() => void run(
             'simulate-registration',
             {},
-            `Shadow ${registered ? 'removal' : 'registration'} simulation completed with zero provider writes.`,
+            `${registered ? 'Removal' : 'Registration'} simulation completed with zero provider writes.`,
           )}
         >
           {busy === 'simulate-registration'
@@ -1630,7 +2099,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         ? 'Authorize exact resource removal'
         : 'Authorize exact resource registration',
       description:
-        'Keep global Operations in Shadow. After the exact zero-write simulation, an owner or authorized administrator may grant one short-lived, single-use Shopify provider mutation for only this CarrierService configuration row and exact Shadow revision.',
+        'After the exact zero-write simulation, an owner or authorized administrator may grant one short-lived, single-use Shopify mutation for only this CarrierService row. Read only, Shadow, and Active may apply it; Disabled and Frozen block the provider write.',
       state: stepState(
         false,
         Boolean(simulated),
@@ -1641,8 +2110,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         <Stack spacing={1}>
           <Alert severity="warning">
             Current Operations mode:{' '}
-            {setup?.reference.activation.state || 'unknown'}. Keep it in
-            Shadow. Provider credentials remain encrypted and no Shopify
+            {setup?.reference.activation.state || 'unknown'}. Provider credentials remain encrypted and no Shopify
             network call can begin until the exact resource-scoped,
             single-use authorization is durably claimed.
           </Alert>
@@ -1717,12 +2185,6 @@ export default function ShopifyCarrierServiceSetupPanel({
           ) : null}
           {!registered ? (
             <>
-              {setup?.account.environment === 'production' ? (
-                <Alert severity="warning">
-                  New CarrierService registration is sandbox-only in this
-                  development slice.
-                </Alert>
-              ) : null}
               <FormControlLabel
                 control={(
                   <Checkbox
@@ -1733,15 +2195,16 @@ export default function ShopifyCarrierServiceSetupPanel({
                     }}
                   />
                 )}
-                label="I authorize exactly one sandbox Shopify CarrierService registration for this simulated configuration revision."
+                label={setup?.account.environment === 'production'
+                  ? 'I authorize exactly one production Shopify CarrierService registration for this simulated configuration revision.'
+                  : 'I authorize exactly one sandbox Shopify CarrierService registration for this simulated configuration revision.'}
               />
               <Button
                 variant="contained"
                 color="warning"
                 disabled={
                   !exactShadowSimulation
-                  || setup?.reference.activation.state !== 'shadow'
-                  || setup?.account.environment !== 'sandbox'
+                  || !providerWriteAllowed
                   || namePreferenceChanged
                   || !setup?.canActivate
                   || !confirmWrite
@@ -1753,10 +2216,12 @@ export default function ShopifyCarrierServiceSetupPanel({
                   'register',
                   {
                     confirmProviderWrite: true,
+                    confirmProductionProviderWrite:
+                      setup?.account.environment === 'production',
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed the sandbox CarrierService registration under the exact Shadow revision and one-time resource authorization.',
+                  'Shopify confirmed the CarrierService registration under the exact one-time resource authorization.',
                 )}
               >
                 {busy === 'register'
@@ -1785,7 +2250,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                 color="error"
                 disabled={
                   !exactShadowSimulation
-                  || setup?.reference.activation.state !== 'shadow'
+                  || !providerWriteAllowed
                   || !setup?.canActivate
                   || !confirmRemove
                   || Boolean(recoveryRequired)
@@ -1801,7 +2266,7 @@ export default function ShopifyCarrierServiceSetupPanel({
                     confirmationRequestId:
                       globalThis.crypto.randomUUID(),
                   },
-                  'Shopify confirmed exact CarrierService removal under the Shadow revision and one-time resource authorization.',
+                  'Shopify confirmed exact CarrierService removal under the one-time resource authorization.',
                 )}
               >
                 {busy === 'unregister'
@@ -1838,38 +2303,38 @@ export default function ShopifyCarrierServiceSetupPanel({
     },
     {
       key: 'audience',
-      label: setup?.reference.activation.state === 'shadow'
-        ? 'Select the Shadow checkout audience'
-        : 'Confirm the checkout audience',
-      description: setup?.reference.activation.state === 'shadow'
-        ? 'Select at least one exact authenticated Shopify customer before cache preparation or live-cart proof. Shadow can test binary allow or hide only; it does not provide live per-service filtering.'
-        : setup?.reference.activation.state === 'active'
-          ? 'Active defaults to the complete eligible customer-neutral service set for guests and authenticated customers. Customer-specific and per-service provider enforcement remains blocked.'
-          : 'Checkout-audience changes require Operations Shadow or Active.',
+      label: 'Choose checkout audience and rate source',
+      description:
+        'Set the account-level desired audience and explicit TEST or LIVE carrier lane. Read only does not pause rating. Disabled and Frozen make new authenticated callbacks empty, but Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.',
       state: stepState(
         Boolean(setup?.config && checkoutAudienceReady),
         Boolean(setup?.config),
-        Boolean(
-          setup?.config
-          && setup.reference.activation.state === 'shadow'
-          && !shadowAudienceReady,
-        ),
+        Boolean(setup?.config && !checkoutAudienceReady),
       ),
       facts: [
         {
-          label: 'Default audience policy',
-          value: checkoutAudience?.defaultPolicy === 'show_all'
-            ? 'Show all eligible rates'
-            : 'Hide all ClawPilot rates',
+          label: 'Desired audience',
+          value: setup?.checkoutRateOperatingProfile.desiredAudience
+            === 'all_eligible'
+            ? 'All eligible checkouts'
+            : setup?.checkoutRateOperatingProfile.desiredAudience
+              === 'restricted_customers'
+              ? 'Restricted customers'
+              : 'Off',
+        },
+        {
+          label: 'Desired source',
+          value: setup?.checkoutRateOperatingProfile.desiredRateSource
+            === 'production' ? 'LIVE' : 'TEST',
         },
         {
           label: 'Saved customer policies',
           value: String(checkoutAudience?.policyCount || 0),
         },
         {
-          label: 'Unexpired Shadow allow customers',
+          label: 'Eligible restricted customers',
           value: String(
-            checkoutAudience?.shadowAllowedCustomerCount || 0,
+            checkoutAudience?.eligibleCustomerCount || 0,
           ),
         },
         {
@@ -1881,22 +2346,157 @@ export default function ShopifyCarrierServiceSetupPanel({
       ],
       action: setup ? (
         <Stack spacing={1}>
-          <Alert severity={shadowAudienceReady ? 'info' : 'warning'}>
-            {setup.reference.activation.state === 'shadow'
-              ? 'Only binary allow or hide is testable in Shadow. Any unexpired non-hide policy admits the complete customer-neutral ClawPilot service set; hide-all denies it. Include-only and exclude selections remain saved intent and do not filter live services.'
-              : setup.reference.activation.state === 'active'
-                ? 'Active serves the complete eligible customer-neutral service set by default. Saved customer-specific and per-service policies are not live provider enforcement.'
-                : 'Customer-rate policies are review-only in the current Operations mode.'}
+          {pendingRateControlCommand ? (
+            <Alert severity="warning">
+              A prior save has an unknown response. Audience, source, and
+              reason are locked until the exact saved request is retried and
+              authoritatively reconciled.
+            </Alert>
+          ) : null}
+          <Alert severity="info">
+            Shopify sends rate requests for the store, not for existing orders.
+            These desired controls are independent of Advanced safety except
+            that Disabled and Frozen make new authenticated callbacks empty.
+            Shopify may still reuse a prior successful customer-neutral rate
+            response for up to 15 minutes. Product mapping, fresh inventory,
+            factual packaging, destination, and the selected carrier lane
+            still fail closed.
           </Alert>
-          <Alert severity="warning">
-            {checkoutAudience?.providerEnforcementRequirement
-              || 'Customer-specific and per-service Shopify enforcement requires an eligible Delivery Customization delivered by a limited-visibility public app or a custom app on Shopify Plus, followed by provider activation and verification.'}
-          </Alert>
-          <ShopifyCustomerRatePolicyPanel
-            accountGlobalId={accountGlobalId}
-            activationState={setup.reference.activation.state}
-            canManage={setup.canManage}
+          <FormControl size="small" fullWidth>
+            <InputLabel id={`shopify-checkout-audience-${accountGlobalId}`}>
+              Checkout audience
+            </InputLabel>
+            <Select
+              labelId={`shopify-checkout-audience-${accountGlobalId}`}
+              label="Checkout audience"
+              value={checkoutRateControl.audience}
+              disabled={
+                !setup.canActivate
+                || Boolean(busy)
+                || Boolean(pendingRateControlCommand)
+              }
+              onChange={(event) => {
+                const audience = event.target.value as CheckoutAudienceMode
+                setCheckoutRateControl((current) => ({
+                  ...current,
+                  audience,
+                }))
+                setShadowCheckoutAudience({
+                  version: 'shopify-checkout-audience-v1',
+                  mode: audience,
+                })
+              }}
+            >
+              <MenuItem value="off">Off — return no ClawPilot rates</MenuItem>
+              <MenuItem value="restricted_customers">
+                Restricted customers — require an exact local policy
+              </MenuItem>
+              <MenuItem value="all_eligible">All eligible checkouts</MenuItem>
+            </Select>
+          </FormControl>
+          <FormControl size="small" fullWidth>
+            <InputLabel id={`shopify-checkout-source-${accountGlobalId}`}>
+              Carrier rate source
+            </InputLabel>
+            <Select
+              labelId={`shopify-checkout-source-${accountGlobalId}`}
+              label="Carrier rate source"
+              value={checkoutRateControl.rateSource}
+              disabled={
+                !setup.canActivate
+                || Boolean(busy)
+                || Boolean(pendingRateControlCommand)
+              }
+              onChange={(event) => setCheckoutRateControl((current) => ({
+                ...current,
+                rateSource: event.target.value as CheckoutRateSource,
+              }))}
+            >
+              <MenuItem value="sandbox">
+                TEST carrier accounts
+                {setup.account.environment === 'production'
+                  && checkoutRateControl.audience !== 'off'
+                  ? ' — desired only; effective empty on a production store'
+                  : ''}
+              </MenuItem>
+              <MenuItem value="production">LIVE carrier accounts</MenuItem>
+            </Select>
+          </FormControl>
+          <TextField
+            size="small"
+            fullWidth
+            label="Reason for this change"
+            value={checkoutRateControlReason}
+            disabled={
+              !setup.canActivate
+              || Boolean(busy)
+              || Boolean(pendingRateControlCommand)
+            }
+            inputProps={{ maxLength: 500 }}
+            onChange={(event) => setCheckoutRateControlReason(
+              event.target.value,
+            )}
+            helperText="Required and retained with the immutable control revision."
           />
+          <Button
+            size="small"
+            variant="contained"
+            disabled={
+              !setup.config
+              || !setup.canActivate
+              || Boolean(busy)
+              || checkoutRateControlReason.trim().length < 3
+              || (
+                checkoutRateControl.audience
+                  === setup.config.checkoutRateControl.audience
+                && checkoutRateControl.rateSource
+                  === setup.config.checkoutRateControl.rateSource
+                && !pendingRateControlCommand
+              )
+            }
+            onClick={() => void saveCheckoutRateControl()}
+          >
+            {busy === 'save-checkout-rate-control'
+              ? 'Saving desired checkout controls…'
+              : pendingRateControlCommand
+                ? 'Retry exact pending save'
+                : 'Save desired checkout controls'}
+          </Button>
+          <Alert severity={checkoutAudienceReady ? 'info' : 'warning'}>
+            {setup.checkoutRateOperatingProfile.effectiveReason
+              === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED'
+              ? 'Disabled makes new authenticated callbacks empty. Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+              : setup.checkoutRateOperatingProfile.effectiveReason
+                === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN'
+                ? 'Frozen makes new authenticated callbacks empty. Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+                : setup.checkoutRateOperatingProfile.effectiveReason
+                  === 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF'
+                  ? 'The saved audience is Off; authenticated callbacks return an empty 200 before cart parsing or carrier calls.'
+                  : setup.checkoutRateOperatingProfile.effectiveReason
+                    === 'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED'
+                    ? 'The TEST source is saved as desired, but this production Shopify store returns authenticated empty rates. Choose LIVE only when the desired audience is safe to serve.'
+                  : setup.checkoutRateOperatingProfile.effectiveReason
+                    === 'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED'
+                    ? 'Restricted + LIVE is saved as desired, but new authenticated callbacks return empty rates until customer-specific provider enforcement is durably verified. Shopify caches successful CarrierService rates without customer identity.'
+                  : setup.checkoutRateOperatingProfile.serving
+                    ? `Serving ${setup.checkoutRateOperatingProfile.desiredAudience === 'all_eligible' ? 'all otherwise eligible checkouts' : 'restricted customers'} from the ${setup.checkoutRateOperatingProfile.desiredRateSource === 'production' ? 'LIVE' : 'TEST'} carrier lane.`
+                    : 'Desired controls are saved, but current mapping, inventory, package, origin, registration, credential, or carrier facts are not ready.'}
+          </Alert>
+          {checkoutRateControl.audience === 'restricted_customers' ? (
+            <>
+              <Alert severity="warning">
+                {checkoutAudience?.providerEnforcementRequirement
+                  || 'Customer-specific and per-service Shopify enforcement requires an eligible Delivery Customization delivered by a limited-visibility public app or a custom app on Shopify Plus, followed by provider activation and verification.'}
+              </Alert>
+              <ShopifyCustomerRatePolicyPanel
+                accountGlobalId={accountGlobalId}
+                accountEnvironment={setup.account.environment}
+                activationState={setup.reference.activation.state}
+                rateSource={checkoutRateControl.rateSource}
+                canManage={setup.canManage}
+              />
+            </>
+          ) : null}
           <Button
             size="small"
             variant="outlined"
@@ -1918,7 +2518,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       optional: true,
       state: stepState(
         rateWarmConfigured,
-        Boolean(shadowRegistered && shadowAudienceReady),
+        rateWarmAudienceReady,
         Boolean(
           setup?.config?.checkoutRateWarm.enabled
           && setup.rateWarmReadiness.activationAllowed !== true,
@@ -1927,7 +2527,11 @@ export default function ShopifyCarrierServiceSetupPanel({
       facts: [
         {
           label: 'Audience prerequisite',
-          value: shadowAudienceReady ? 'Ready' : 'Select an allowed customer',
+          value: checkoutAudience?.mode === 'off'
+            ? 'Checkout rates are Off'
+            : rateWarmAudienceReady
+              ? 'Ready'
+              : 'Select an allowed customer',
         },
         {
           label: 'Cache preparation',
@@ -1940,24 +2544,27 @@ export default function ShopifyCarrierServiceSetupPanel({
     },
     {
       key: 'evidence',
-      label: 'Prove a live cart request',
-      description: setup?.reference.activation.state === 'active'
-        ? 'Create any eligible cart. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.'
-        : 'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy and the isolated allowlisted test item. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.',
+      label: checkoutAudience?.mode === 'off'
+        ? 'Verify new callbacks return no rates'
+        : 'Prove a live cart request',
+      description: checkoutAudience?.mode === 'off'
+        ? 'Open an otherwise eligible Shopify cart and confirm a new authenticated ClawPilot callback returns an empty 200 without parsing the cart, creating a receipt, reading inventory, or calling a carrier. Shopify may still reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+        : !callbackServingReady
+          ? 'The saved checkout controls are not runtime-ready. Resolve the exact registration, mapping, inventory, package, origin, credential, and selected carrier-lane blockers before a live proof.'
+          : checkoutAudience?.mode === 'all_eligible'
+            ? `Use any otherwise eligible cart. No customer gate is applied, but exact product mapping, fresh inventory, factual packaging, destination, and ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier readiness still fail closed.`
+            : 'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy and an exactly mapped shippable item. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.',
       state: stepState(
         evidenceComplete,
         Boolean(
-          (shadowRegistered && shadowAudienceReady)
-          || (
-            activeAudienceReady
-            && registered
-            && setup?.config?.ready === true
-          ),
+          checkoutAudience?.mode === 'off'
+            ? authenticatedCallbackInstalled
+            : rateWarmAudienceReady,
         ),
         Boolean(
-          shadowRegistered
-          && setup?.reference.activation.state === 'shadow'
-          && !shadowAudienceReady,
+          setup?.config
+          && checkoutAudience?.mode !== 'off'
+          && !rateWarmAudienceReady,
         ),
       ),
       facts: [
@@ -2000,6 +2607,32 @@ export default function ShopifyCarrierServiceSetupPanel({
     },
   ]
 
+  const operatingActivation = setup?.reference.activation.state || 'missing'
+  const checkoutRateSummary =
+    setup?.checkoutRateOperatingProfile.effectiveReason
+      === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED'
+      ? 'Empty rates · Disabled emergency override'
+      : setup?.checkoutRateOperatingProfile.effectiveReason
+        === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN'
+        ? 'Empty rates · Frozen emergency override'
+        : setup?.checkoutRateOperatingProfile.effectiveReason
+          === 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF'
+          ? 'Off · authenticated empty-rate response'
+          : setup?.checkoutRateOperatingProfile.effectiveReason
+            === 'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED'
+            ? 'Desired TEST source · production store effective empty'
+          : setup?.checkoutRateOperatingProfile.effectiveReason
+            === 'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED'
+            ? 'Desired Restricted · LIVE blocked pending verified provider enforcement'
+          : setup?.checkoutRateOperatingProfile.serving
+            ? `${setup.checkoutRateOperatingProfile.desiredAudience === 'all_eligible' ? 'All eligible' : 'Restricted customers'} · ${setup.checkoutRateOperatingProfile.desiredRateSource === 'production' ? 'LIVE' : 'TEST'} carrier-rate source`
+            : 'Not serving · current runtime facts are not ready'
+  const orderExecutionSummary = operatingActivation === 'active'
+    ? 'Live only for exact authorized store-write capabilities'
+    : operatingActivation === 'shadow'
+      ? 'Orders mirrored · per-order local Training available'
+      : 'Local order execution unavailable'
+
   return (
     <Stack spacing={1.5}>
       {error ? (
@@ -2018,35 +2651,130 @@ export default function ShopifyCarrierServiceSetupPanel({
           callback URL or change registration state.
         </Alert>
       ) : null}
-      {activeRevisionBindingRequired ? (
-        <Alert severity="error">
+      {setup ? (
+        <Box
+          sx={{
+            border: 1,
+            borderColor: 'divider',
+            borderRadius: 1.5,
+            p: 1.5,
+          }}
+        >
           <Stack spacing={1}>
-            <Typography variant="body2">
-              ClawPilot checkout rates are paused because this registered
-              Shopify service is bound to an older Operations activation
-              revision. Refreshing authority preserves the exact Shopify
-              service, callback token, name, policy, warehouse, packages, and
-              carriers; it performs no Shopify write.
-            </Typography>
-            <Box>
-              <Button
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              justifyContent="space-between"
+              gap={0.5}
+            >
+              <Box>
+                <Typography variant="subtitle2">
+                  Current operating profile
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Store sync is independently controlled here. Pausing stops
+                  new provider catalog, order,
+                  image, and inventory mirroring; existing mirrored data
+                  remains available. Desired checkout audience and rate source
+                  are also account-level.
+                  Disabled or Frozen makes new authenticated callbacks empty;
+                  Shopify may retain a prior successful customer-neutral rate
+                  response for up to 15 minutes.
+                </Typography>
+              </Box>
+              <Chip
                 size="small"
-                variant="contained"
-                color="error"
-                disabled={!setup?.canActivate || Boolean(busy)}
-                onClick={() => void run(
-                  'repair-activation-revision-binding',
-                  {},
-                  'Active checkout authority was refreshed locally with zero Shopify writes and no callback-token rotation.',
+                variant="outlined"
+                label={`Advanced safety · ${operatingActivation}`}
+              />
+            </Stack>
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' },
+                gap: 1,
+              }}
+            >
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Store sync
+                </Typography>
+                <Typography variant="body2" fontWeight={700}>
+                  Desired {setup.storeSync.desiredState === 'running'
+                    ? 'Running'
+                    : 'Paused'} · Effective{' '}
+                  {setup.storeSync.effectiveState === 'running'
+                    ? 'Running'
+                    : 'Paused'} ·{' '}
+                  {setup.account.environment === 'sandbox'
+                    ? 'sandbox store'
+                    : 'production store'}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {setup.storeSync.effectiveReason}:{' '}
+                  {setup.storeSync.effectiveReasonLabel}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                  {setup.storeSync.explicitChoice
+                    ? 'Independent Store sync choice'
+                    : 'Legacy-derived default; confirm it to make Store sync independent'}
+                </Typography>
+                <TextField
+                  select
+                  size="small"
+                  label="Desired Store sync"
+                  value={setup.storeSync.desiredState}
+                  onChange={(event) => void updateStoreSync(
+                    event.target.value as CommerceStoreSyncDesiredState,
+                  )}
+                  disabled={!setup.canActivate || Boolean(busy)}
+                  inputProps={{
+                    'aria-label': `${displayName} desired Store sync`,
+                  }}
+                  sx={{ mt: 1, minWidth: { xs: '100%', sm: 170 } }}
+                >
+                  <MenuItem value="running">Running</MenuItem>
+                  <MenuItem value="paused">Paused</MenuItem>
+                </TextField>
+                {!setup.storeSync.explicitChoice && (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    disabled={!setup.canActivate || Boolean(busy)}
+                    onClick={() => void updateStoreSync(
+                      setup.storeSync.desiredState,
+                    )}
+                    sx={{ mt: 1, width: { xs: '100%', sm: 'auto' } }}
+                  >
+                    Make independent
+                  </Button>
                 )}
-              >
-                {busy === 'repair-activation-revision-binding'
-                  ? 'Refreshing authority…'
-                  : 'Refresh Active checkout authority'}
-              </Button>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Checkout rates
+                </Typography>
+                <Typography variant="body2" fontWeight={700}>
+                  {checkoutRateSummary}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Rating only; checkout rating never buys postage or creates a
+                  label.
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Order execution
+                </Typography>
+                <Typography variant="body2" fontWeight={700}>
+                  {orderExecutionSummary}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Training and live store writeback are separate order paths.
+                </Typography>
+              </Box>
             </Box>
           </Stack>
-        </Alert>
+        </Box>
       ) : null}
       <IntegrationSetupJourney
         title={`${displayName} · live checkout shipping`}

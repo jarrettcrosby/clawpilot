@@ -63,6 +63,10 @@ WITH current_shopify_accounts AS (
     credential.verification_status,
     credential.webhook_verification_status,
     activation.state AS activation_state,
+    operations_commerce_store_sync_is_running(
+      account.organization_id,
+      account.id
+    ) AS store_sync_running,
     COALESCE(
       account.updated_by,
       account.created_by,
@@ -87,6 +91,7 @@ WITH current_shopify_accounts AS (
     account.account_global_id,
     receipt.received_at,
     CASE
+      WHEN NOT account.store_sync_running THEN 'informational'
       WHEN receipt.state = 'queued'
        AND receipt.received_at <= clock_timestamp() - interval '2 minutes'
         THEN 'stale_queued'
@@ -108,7 +113,7 @@ WITH current_shopify_accounts AS (
        AND account.auth_mode = 'shopify_client_credentials'
        AND account.verification_status = 'verified'
        AND account.webhook_verification_status = 'verified'
-       AND account.activation_state IN ('shadow', 'active')
+       AND account.store_sync_running
        AND account.actor_email IS NOT NULL
         THEN 'held_product_delete'
       ELSE 'informational'

@@ -66,6 +66,7 @@ const migration = read(
 
 const workerCalls = []
 let workerReadShouldFail = false
+let workerStoreSyncPaused = false
 const worker = loadTypeScriptModule(
   'app_src/lib/shopifyOrderWebhookWorker.ts',
   {
@@ -91,6 +92,16 @@ const worker = loadTypeScriptModule(
       },
     },
     '@/lib/persistence/shopifyOrderWebhookSignals': {
+      async assertShopifyOrderWebhookClaimCurrentForProviderReadInPostgres(
+        input,
+      ) {
+        workerCalls.push(['assert-current', input])
+        if (workerStoreSyncPaused) {
+          throw Object.assign(new Error('Store sync paused'), {
+            code: 'SHOPIFY_ORDER_WEBHOOK_PROVIDER_READ_FENCE_CHANGED',
+          })
+        }
+      },
       async claimShopifyOrderWebhookTargetsInPostgres(input) {
         workerCalls.push(['claim', input])
         return [{
@@ -122,6 +133,24 @@ const worker = loadTypeScriptModule(
         workerCalls.push(['fail', input])
         return { status: 'failed' }
       },
+      async parkShopifyOrderWebhookExactReadForStoreSyncPauseInPostgres(input) {
+        workerCalls.push(['park', input])
+        return { parked: true }
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({
+          id: '00000000-0000-4000-8000-000000000298',
+          organizationId: input.organizationId,
+          integrationAccountId: input.integrationAccountId,
+          authorityKind: input.authorityKind,
+          readKind: input.readKind,
+          controlRevision: 1,
+          activationRevision: 1,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        })
+      },
     },
   },
 )
@@ -149,6 +178,24 @@ assert.equal(workerFailure.succeeded, 0)
 assert.equal(workerFailure.failed, 1)
 assert.equal(workerFailure.providerWrites, 0)
 assert.equal(workerCalls.filter(([kind]) => kind === 'fail').length, 1)
+
+const readsBeforePause = workerCalls.filter(([kind]) => kind === 'read').length
+workerStoreSyncPaused = true
+const workerPaused = await worker.processShopifyOrderWebhookSignals({
+  workerId: 'order-webhook-test',
+  limit: 1,
+})
+workerStoreSyncPaused = false
+assert.equal(workerPaused.claimed, 1)
+assert.equal(workerPaused.succeeded, 0)
+assert.equal(workerPaused.failed, 0)
+assert.equal(workerPaused.parked, 1)
+assert.equal(workerCalls.filter(([kind]) => kind === 'park').length, 1)
+assert.equal(
+  workerCalls.filter(([kind]) => kind === 'read').length,
+  readsBeforePause,
+  'a pause after claim must stop the Shopify provider read',
+)
 
 let providerData = {
   webhookSubscriptions: {
@@ -324,6 +371,47 @@ for (const invalid of [
     },
   ), false)
 }
+const olderThan24Hours = {
+  ...storedReady,
+  observedAt: '2026-08-11T17:00:00.000Z',
+}
+assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceReady(
+  olderThan24Hours,
+  {
+    accountGlobalId: 'gia0009301',
+    credentialGeneration: 1,
+    desiredUri: callback,
+    now: '2026-08-13T17:01:00Z',
+  },
+), false, 'operational readiness retains the 24-hour freshness signal')
+assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
+  olderThan24Hours,
+  {
+    accountGlobalId: 'gia0009301',
+    credentialGeneration: 1,
+    desiredUri: callback,
+  },
+), true, 'an exact signed delivery is not rejected only because discovery is old')
+for (const drifted of [
+  { ...olderThan24Hours, credentialGeneration: 2 },
+  {
+    ...olderThan24Hours,
+    desiredUri: callback.replace('clawpilot.example', 'drift.example'),
+  },
+  {
+    ...olderThan24Hours,
+    requiredIncludeFields: ['admin_graphql_api_id'],
+  },
+]) {
+  assert.equal(module.shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery(
+    drifted,
+    {
+      accountGlobalId: 'gia0009301',
+      credentialGeneration: 1,
+      desiredUri: callback,
+    },
+  ), false)
+}
 
 providerData = {
   webhookSubscriptions: {
@@ -441,7 +529,12 @@ assert.match(persistenceSource, /providerWrites: 0 as const/u)
 assert.match(persistenceSource, /commerceOrderSyncAccountLockKey/u)
 assert.match(
   persistenceSource,
-  /account\.configuration->'orderWebhookSubscriptions'[\s\S]+?shopifyOrderWebhookSubscriptionEvidenceReady\([\s\S]+?current\.order_webhook_subscriptions/u,
+  /account\.configuration->'orderWebhookSubscriptions'[\s\S]+?shopifyOrderWebhookSubscriptionEvidenceAcceptsDelivery\([\s\S]+?current\.order_webhook_subscriptions/u,
+)
+assert.ok(
+  serviceSource.indexOf('verifyShopifyWebhookHmac({')
+    < serviceSource.indexOf('recordShopifyOrderWebhookSignalInPostgres({'),
+  'HMAC verification must precede the age-independent structural delivery fence',
 )
 assert.match(
   persistenceSource,

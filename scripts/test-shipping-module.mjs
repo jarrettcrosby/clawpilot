@@ -30,6 +30,7 @@ const navigation = read('app_src/components/Navigation.tsx')
 const homeClient = read('app_src/app/HomeClient.tsx')
 const appHeader = read('app_src/components/AppHeader.tsx')
 const shippingSection = read('app_src/components/shipping/ShippingSection.tsx')
+const shippingExecutionPanel = read('app_src/components/shipping/ShippingOneOffExecutionPanel.tsx')
 const parcelDialog = read('app_src/components/operations/OneOffShipmentDialog.tsx')
 const shippingRoute = read('app_src/app/api/operations/shipping/route.ts')
 const shippingPersistence = read('app_src/lib/persistence/shipping.ts')
@@ -91,7 +92,29 @@ assertIncludes(shippingSection, [
   "fetch('/api/operations/shipping'",
   '<OneOffShipmentDialog',
   '<LtlFreightClassAssessmentPanel',
+  '<ShippingOneOffExecutionPanel',
+  'standaloneOneOffPackEligible',
+  'standaloneOneOffExecutionEligible',
+  'One-off pack and postage',
+  'canCreateShipments={Boolean(workspace?.capabilities.canCreate)}',
 ], 'Shipping module')
+assertIncludes(shippingExecutionPanel, [
+  "action: 'confirm-pack'",
+  "action: 'refresh-packed-rates'",
+  "action: 'purchase-group'",
+  "action: 'void-group'",
+  'Check status',
+  'Create TEST labels',
+  'Purchase LIVE postage',
+  'Confirm physical pack',
+  'definitiveClientRejection',
+  'command.body',
+], 'Standalone Shipping postage controls')
+assert.doesNotMatch(
+  shippingExecutionPanel,
+  /canManage|canExecute|canActivate|operations_activation_scopes/,
+  'Standalone Shipping postage controls must not depend on Operations access or mode',
+)
 assert.match(
   shippingSection,
   /disabled=\{true\}|disabled\s/,
@@ -133,7 +156,7 @@ assertIncludes(shippingContract, [
 assertIncludes(shippingRoute, [
   'export async function GET',
   'requireRequestUser(req)',
-  'operationsCapabilities(actor)',
+  'shippingCapabilities(actor)',
   'if (!capabilities.canView)',
   'activeOperationsOrganizationId(actor)',
   'readShippingWorkspaceFromPostgres({',
@@ -141,6 +164,11 @@ assertIncludes(shippingRoute, [
   "code: 'UNAUTHORIZED'",
   "'Cache-Control': 'private, no-store'",
 ], 'Shipping read route')
+assert.doesNotMatch(
+  shippingRoute,
+  /operationsCapabilities|operations_activation_scopes/,
+  'Shipping reads must not depend on Operations permission or activation state',
+)
 assert.doesNotMatch(
   shippingRoute,
   /searchParams\.get\(['"]organizationId['"]\)|req(?:uest)?\.json\(/,

@@ -686,6 +686,749 @@ public struct ManagerOrderSummary: Decodable, Equatable, Identifiable, Sendable 
     }
 }
 
+public struct ManagerOperationsCapabilities: Decodable, Equatable, Sendable {
+    public let canActivate: Bool
+}
+
+public struct ManagerCommerceAccountSummary: Decodable, Equatable, Identifiable, Sendable {
+    public let accountGlobalId: String
+    public let provider: String
+    public let environment: String
+    public let displayName: String
+    public let status: String
+
+    public var id: String { accountGlobalId }
+
+    public var isContractValid: Bool {
+        accountGlobalId.range(
+            of: #"^gia(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil
+            && ["shopify", "faire"].contains(provider)
+            && ["mock", "sandbox", "production"].contains(environment)
+            && ["active", "disabled", "error"].contains(status)
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+public enum ManagerStoreSyncDesiredState: String, Codable, Equatable, Sendable {
+    case running
+    case paused
+}
+
+public enum ManagerStoreSyncEffectiveState: String, Decodable, Equatable, Sendable {
+    case running
+    case paused
+}
+
+public enum ManagerStoreSyncEffectiveReason: String, Decodable, Equatable, Sendable {
+    case operationsDisabledOverride = "OPERATIONS_DISABLED_OVERRIDE"
+    case operationsFrozenOverride = "OPERATIONS_FROZEN_OVERRIDE"
+    case controlMissing = "STORE_SYNC_CONTROL_MISSING"
+    case accountUnavailable = "STORE_SYNC_ACCOUNT_UNAVAILABLE"
+    case explicitRunning = "STORE_SYNC_EXPLICIT_RUNNING"
+    case explicitPausedDraining = "STORE_SYNC_EXPLICIT_PAUSED_DRAINING"
+    case explicitPaused = "STORE_SYNC_EXPLICIT_PAUSED"
+    case legacyShadowRunning = "STORE_SYNC_LEGACY_SHADOW_RUNNING"
+    case legacyActiveRunning = "STORE_SYNC_LEGACY_ACTIVE_RUNNING"
+    case legacyReadOnlyPaused = "STORE_SYNC_LEGACY_READ_ONLY_PAUSED"
+
+    public var expectedState: ManagerStoreSyncEffectiveState {
+        switch self {
+        case .explicitRunning, .legacyShadowRunning, .legacyActiveRunning:
+            .running
+        default:
+            .paused
+        }
+    }
+}
+
+public struct ManagerStoreSyncControl: Decodable, Equatable, Identifiable, Sendable {
+    public let accountGlobalId: String
+    public let provider: String
+    public let environment: String
+    public let displayName: String
+    public let accountStatus: String
+    public let desiredState: ManagerStoreSyncDesiredState
+    public let effectiveState: ManagerStoreSyncEffectiveState
+    public let effectiveReason: ManagerStoreSyncEffectiveReason
+    public let effectiveReasonLabel: String
+    public let explicitChoice: Bool
+    public let revision: Int
+    public let reason: String
+    public let updatedAt: String
+
+    public var id: String { accountGlobalId }
+
+    public var isContractValid: Bool {
+        accountGlobalId.range(
+            of: #"^gia(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil
+            && ["shopify", "faire"].contains(provider)
+            && ["mock", "sandbox", "production"].contains(environment)
+            && ["active", "disabled", "error"].contains(accountStatus)
+            && effectiveState == effectiveReason.expectedState
+            && revision >= 1
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !effectiveReasonLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+public struct ManagerOperationsOverview: Equatable, Sendable {
+    public let orders: [ManagerOrderSummary]
+    public let storeSync: [ManagerStoreSyncControl]
+    public let capabilities: ManagerOperationsCapabilities
+}
+
+public enum ManagerShopifyCheckoutAudience: String, Codable, CaseIterable, Equatable, Sendable {
+    case off
+    case restrictedCustomers = "restricted_customers"
+    case allEligible = "all_eligible"
+
+    public var label: String {
+        switch self {
+        case .off: "Off"
+        case .restrictedCustomers: "Restricted customers"
+        case .allEligible: "All eligible"
+        }
+    }
+}
+
+public enum ManagerShopifyCheckoutRateSource: String, Codable, CaseIterable, Equatable, Sendable {
+    case test = "sandbox"
+    case live = "production"
+
+    public var label: String {
+        switch self {
+        case .test: "TEST"
+        case .live: "LIVE"
+        }
+    }
+}
+
+public enum ManagerShopifyCheckoutEffectiveState: String, Decodable, Equatable, Sendable {
+    case notConfigured = "not_configured"
+    case empty
+    case serving
+    case notReady = "not_ready"
+
+    public var label: String {
+        switch self {
+        case .notConfigured: "Not configured"
+        case .empty: "Empty"
+        case .serving: "Available"
+        case .notReady: "Not ready"
+        }
+    }
+}
+
+public enum ManagerShopifyCheckoutEffectiveReason: String, Decodable, Equatable, Sendable {
+    case emergencyDisabled = "SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED"
+    case emergencyFrozen = "SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN"
+    case configuredOff = "SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF"
+    case productionSourceRequired = "SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED"
+    case restrictedLiveEnforcementRequired = "SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED"
+    case runtimeNotReady = "SHOPIFY_CHECKOUT_RATING_RUNTIME_NOT_READY"
+    case serving = "SHOPIFY_CHECKOUT_RATES_SERVING"
+
+    public var expectedState: ManagerShopifyCheckoutEffectiveState {
+        switch self {
+        case .emergencyDisabled, .emergencyFrozen, .configuredOff,
+             .productionSourceRequired, .restrictedLiveEnforcementRequired:
+            .empty
+        case .runtimeNotReady:
+            .notReady
+        case .serving:
+            .serving
+        }
+    }
+
+    public var label: String {
+        switch self {
+        case .emergencyDisabled:
+            "Disabled is overriding checkout availability; the desired setting remains saved."
+        case .emergencyFrozen:
+            "Frozen is overriding checkout availability; the desired setting remains saved."
+        case .configuredOff:
+            "The saved checkout audience is Off."
+        case .productionSourceRequired:
+            "A production Shopify store cannot serve the saved TEST carrier source."
+        case .restrictedLiveEnforcementRequired:
+            "Restricted customers with LIVE rates remains empty until customer-specific provider enforcement is verified."
+        case .runtimeNotReady:
+            "Checkout rating is not ready to serve this saved setting."
+        case .serving:
+            "Checkout rating is available for the saved audience and carrier source."
+        }
+    }
+}
+
+public struct ManagerShopifyCheckoutRateLastChange: Decodable, Equatable, Sendable {
+    public struct RequestedControl: Decodable, Equatable, Sendable {
+        public let version: String
+        public let audience: ManagerShopifyCheckoutAudience
+        public let rateSource: ManagerShopifyCheckoutRateSource
+    }
+
+    public let configGlobalId: String
+    public let idempotencyKey: String
+    public let requestHash: String
+    public let actorEmail: String
+    public let requestedControl: RequestedControl
+    public let resultingRowVersion: Int
+    public let resultingPolicyRevision: Int
+    public let reason: String
+}
+
+public struct ManagerShopifyCheckoutRateControl: Equatable, Identifiable, Sendable {
+    public let accountGlobalId: String
+    public let provider: String
+    public let environment: String
+    public let displayName: String
+    public let accountStatus: String
+    public let configGlobalId: String?
+    public let rowVersion: Int?
+    public let policyRevision: Int?
+    public let desiredAudience: ManagerShopifyCheckoutAudience?
+    public let desiredRateSource: ManagerShopifyCheckoutRateSource?
+    public let effectiveState: ManagerShopifyCheckoutEffectiveState
+    public let effectiveReason: ManagerShopifyCheckoutEffectiveReason
+    public let serving: Bool
+    public let emergencyOverride: Bool
+    public let canActivate: Bool
+    public let canManage: Bool
+    public let lastChange: ManagerShopifyCheckoutRateLastChange?
+
+    public var id: String { accountGlobalId }
+    public var isConfigured: Bool { configGlobalId != nil }
+    public var canEdit: Bool { isConfigured && canActivate && canManage }
+
+    public init(
+        accountGlobalId: String,
+        provider: String,
+        environment: String,
+        displayName: String,
+        accountStatus: String,
+        configGlobalId: String?,
+        rowVersion: Int?,
+        policyRevision: Int?,
+        desiredAudience: ManagerShopifyCheckoutAudience?,
+        desiredRateSource: ManagerShopifyCheckoutRateSource?,
+        effectiveState: ManagerShopifyCheckoutEffectiveState,
+        effectiveReason: ManagerShopifyCheckoutEffectiveReason,
+        serving: Bool,
+        emergencyOverride: Bool,
+        canActivate: Bool,
+        canManage: Bool,
+        lastChange: ManagerShopifyCheckoutRateLastChange?
+    ) {
+        self.accountGlobalId = accountGlobalId
+        self.provider = provider
+        self.environment = environment
+        self.displayName = displayName
+        self.accountStatus = accountStatus
+        self.configGlobalId = configGlobalId
+        self.rowVersion = rowVersion
+        self.policyRevision = policyRevision
+        self.desiredAudience = desiredAudience
+        self.desiredRateSource = desiredRateSource
+        self.effectiveState = effectiveState
+        self.effectiveReason = effectiveReason
+        self.serving = serving
+        self.emergencyOverride = emergencyOverride
+        self.canActivate = canActivate
+        self.canManage = canManage
+        self.lastChange = lastChange
+    }
+
+    public var isContractValid: Bool {
+        let accountValid = accountGlobalId.range(
+            of: #"^gia(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil
+            && provider == "shopify"
+            && ["mock", "sandbox", "production"].contains(environment)
+            && ["active", "disabled", "error"].contains(accountStatus)
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard accountValid else { return false }
+
+        if configGlobalId == nil {
+            return rowVersion == nil
+                && policyRevision == nil
+                && desiredAudience == nil
+                && desiredRateSource == nil
+                && effectiveState == .notConfigured
+                && effectiveReason == .runtimeNotReady
+                && !serving
+                && lastChange == nil
+        }
+        guard let configGlobalId,
+              configGlobalId.range(
+                of: #"^gscf(?:[0-9]{7}|[0-9a-v]{12})$"#,
+                options: .regularExpression
+              ) != nil,
+              let rowVersion, rowVersion >= 0,
+              let policyRevision, policyRevision >= 1,
+              desiredAudience != nil,
+              desiredRateSource != nil,
+              effectiveState == effectiveReason.expectedState,
+              serving == (effectiveState == .serving),
+              effectiveProjectionMatches0299 else {
+            return false
+        }
+        if emergencyOverride != [
+            ManagerShopifyCheckoutEffectiveReason.emergencyDisabled,
+            .emergencyFrozen,
+        ].contains(effectiveReason) {
+            return false
+        }
+        guard let lastChange else { return true }
+        let reason = lastChange.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return lastChange.configGlobalId == configGlobalId
+            && lastChange.idempotencyKey.range(
+                of: #"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$"#,
+                options: .regularExpression
+            ) != nil
+            && lastChange.requestHash.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+            ) != nil
+            && lastChange.actorEmail
+                == lastChange.actorEmail.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+            && lastChange.actorEmail.contains("@")
+            && lastChange.actorEmail.utf8.count <= 320
+            && lastChange.actorEmail.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            })
+            && lastChange.requestedControl.version
+                == "shopify-checkout-rate-control-v1"
+            && lastChange.requestedControl.audience == desiredAudience
+            && lastChange.requestedControl.rateSource == desiredRateSource
+            && lastChange.resultingRowVersion >= 1
+            && lastChange.resultingRowVersion <= rowVersion
+            && lastChange.resultingPolicyRevision >= 1
+            && lastChange.resultingPolicyRevision <= policyRevision
+            && reason.count >= 3
+            && reason.count <= 500
+            && reason.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+    }
+
+    private var effectiveProjectionMatches0299: Bool {
+        guard let desiredAudience, let desiredRateSource else { return false }
+        if emergencyOverride {
+            return effectiveReason == .emergencyDisabled
+                || effectiveReason == .emergencyFrozen
+        }
+        if effectiveReason == .emergencyDisabled
+            || effectiveReason == .emergencyFrozen {
+            return false
+        }
+        if desiredAudience == .off {
+            return effectiveReason == .configuredOff
+        }
+        if environment == "production" && desiredRateSource == .test {
+            return effectiveReason == .productionSourceRequired
+        }
+        if desiredAudience == .restrictedCustomers
+            && desiredRateSource == .live {
+            return effectiveReason == .restrictedLiveEnforcementRequired
+        }
+        return effectiveReason == .runtimeNotReady || effectiveReason == .serving
+    }
+}
+
+public enum ManagerShopifyCheckoutRateClientError: Error, Equatable, Sendable {
+    case invalidControl
+    case notAuthorized
+    case invalidOrganization
+    case invalidReason
+    case invalidIdempotencyKey
+    case mismatchedResponse
+}
+
+extension ManagerShopifyCheckoutRateClientError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidControl:
+            "Refresh the exact Shopify checkout-rate control before changing it."
+        case .notAuthorized:
+            "Only an organization owner or authorized administrator may change Shopify checkout rates."
+        case .invalidOrganization:
+            "The Shopify checkout-rate change is not bound to a valid organization."
+        case .invalidReason:
+            "Enter a readable checkout-rate reason between 3 and 500 characters."
+        case .invalidIdempotencyKey:
+            "The Shopify checkout-rate retry identity is invalid."
+        case .mismatchedResponse:
+            "ClawPilot returned checkout-rate evidence that did not match the reviewed change."
+        }
+    }
+}
+
+public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
+    public let authenticationGeneration: UInt64
+    public let organizationId: String
+    public let actorEmail: String
+    public let accountGlobalId: String
+    public let configGlobalId: String
+    public let expectedRowVersion: Int
+    public let expectedPolicyRevision: Int
+    public let desiredAudience: ManagerShopifyCheckoutAudience
+    public let desiredRateSource: ManagerShopifyCheckoutRateSource
+    public let reason: String
+    public let idempotencyKey: String
+
+    public init(
+        control: ManagerShopifyCheckoutRateControl,
+        authenticationGeneration: UInt64,
+        organizationId: String,
+        actorEmail: String,
+        desiredAudience: ManagerShopifyCheckoutAudience,
+        desiredRateSource: ManagerShopifyCheckoutRateSource,
+        reason: String,
+        idempotencyKey: String = "shopify-rate-control:\(UUID().uuidString.lowercased())"
+    ) throws {
+        guard control.isContractValid,
+              let configGlobalId = control.configGlobalId,
+              let rowVersion = control.rowVersion,
+              let policyRevision = control.policyRevision else {
+            throw ManagerShopifyCheckoutRateClientError.invalidControl
+        }
+        guard control.canEdit else {
+            throw ManagerShopifyCheckoutRateClientError.notAuthorized
+        }
+        let normalizedOrganizationId = organizationId.lowercased()
+        guard UUID(uuidString: normalizedOrganizationId) != nil else {
+            throw ManagerShopifyCheckoutRateClientError.invalidOrganization
+        }
+        let normalizedActorEmail = actorEmail
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedActorEmail.contains("@"),
+              normalizedActorEmail.utf8.count <= 320,
+              normalizedActorEmail.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ManagerShopifyCheckoutRateClientError.notAuthorized
+        }
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedReason.count >= 3,
+              normalizedReason.count <= 500,
+              normalizedReason.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ManagerShopifyCheckoutRateClientError.invalidReason
+        }
+        guard idempotencyKey.range(
+            of: #"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$"#,
+            options: .regularExpression
+        ) != nil else {
+            throw ManagerShopifyCheckoutRateClientError.invalidIdempotencyKey
+        }
+        self.authenticationGeneration = authenticationGeneration
+        self.organizationId = normalizedOrganizationId
+        self.actorEmail = normalizedActorEmail
+        accountGlobalId = control.accountGlobalId
+        self.configGlobalId = configGlobalId
+        expectedRowVersion = rowVersion
+        expectedPolicyRevision = policyRevision
+        self.desiredAudience = desiredAudience
+        self.desiredRateSource = desiredRateSource
+        self.reason = normalizedReason
+        self.idempotencyKey = idempotencyKey
+    }
+
+    public func isSameRequestedChange(
+        accountGlobalId: String,
+        desiredAudience: ManagerShopifyCheckoutAudience,
+        desiredRateSource: ManagerShopifyCheckoutRateSource,
+        reason: String
+    ) -> Bool {
+        self.accountGlobalId == accountGlobalId
+            && self.desiredAudience == desiredAudience
+            && self.desiredRateSource == desiredRateSource
+            && self.reason == reason.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func isCurrentReview(
+        _ control: ManagerShopifyCheckoutRateControl
+    ) -> Bool {
+        control.isContractValid
+            && control.canEdit
+            && control.accountGlobalId == accountGlobalId
+            && control.configGlobalId == configGlobalId
+            && control.rowVersion == expectedRowVersion
+            && control.policyRevision == expectedPolicyRevision
+    }
+
+    public func isConfirmedApplied(
+        by control: ManagerShopifyCheckoutRateControl
+    ) -> Bool {
+        control.isContractValid
+            && control.accountGlobalId == accountGlobalId
+            && control.configGlobalId == configGlobalId
+            && control.rowVersion == expectedRowVersion + 1
+            && control.policyRevision == expectedPolicyRevision + 1
+            && control.desiredAudience == desiredAudience
+            && control.desiredRateSource == desiredRateSource
+            && control.lastChange?.resultingRowVersion == expectedRowVersion + 1
+            && control.lastChange?.resultingPolicyRevision == expectedPolicyRevision + 1
+            && control.lastChange?.reason == reason
+            && control.lastChange?.idempotencyKey == idempotencyKey
+            && control.lastChange?.actorEmail
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == actorEmail
+            && control.lastChange?.requestedControl.audience == desiredAudience
+            && control.lastChange?.requestedControl.rateSource == desiredRateSource
+    }
+
+    public func permitsStateMutation(
+        currentAuthenticationGeneration: UInt64,
+        currentOrganizationId: String?,
+        currentActorEmail: String?,
+        currentAccountGlobalId: String?,
+        isAuthenticated: Bool
+    ) -> Bool {
+        isAuthenticated
+            && currentAuthenticationGeneration == authenticationGeneration
+            && currentOrganizationId?.lowercased() == organizationId
+            && currentActorEmail?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == actorEmail
+            && currentAccountGlobalId == accountGlobalId
+    }
+}
+
+public struct ManagerShopifyCheckoutRateSubmissionFence: Equatable, Sendable {
+    public let command: ManagerShopifyCheckoutRateCommand
+
+    public init(command: ManagerShopifyCheckoutRateCommand) {
+        self.command = command
+    }
+
+    public func ownsCompletion(
+        of finishingCommand: ManagerShopifyCheckoutRateCommand
+    ) -> Bool {
+        command == finishingCommand
+    }
+
+    public func permitsStateMutation(
+        for responseCommand: ManagerShopifyCheckoutRateCommand,
+        currentAuthenticationGeneration: UInt64,
+        currentOrganizationId: String?,
+        currentActorEmail: String?,
+        isAuthenticated: Bool
+    ) -> Bool {
+        command == responseCommand
+            && command.permitsStateMutation(
+                currentAuthenticationGeneration: currentAuthenticationGeneration,
+                currentOrganizationId: currentOrganizationId,
+                currentActorEmail: currentActorEmail,
+                currentAccountGlobalId: responseCommand.accountGlobalId,
+                isAuthenticated: isAuthenticated
+            )
+    }
+}
+
+public enum ManagerShopifyCheckoutRateModelFailure: Equatable, Sendable {
+    case definitive
+    case ambiguous
+}
+
+public enum ManagerShopifyCheckoutRateModelResolution: Equatable, Sendable {
+    case ignoreSupersededContext
+    case applied
+    case quarantineAndRefresh
+    case retainExactRetry
+}
+
+public struct ManagerShopifyCheckoutRatePendingModel: Equatable, Sendable {
+    public let command: ManagerShopifyCheckoutRateCommand
+
+    public init(command: ManagerShopifyCheckoutRateCommand) {
+        self.command = command
+    }
+
+    public func resolve(
+        currentAuthenticationGeneration: UInt64,
+        currentOrganizationId: String?,
+        currentActorEmail: String?,
+        currentAccountGlobalId: String?,
+        isAuthenticated: Bool,
+        failure: ManagerShopifyCheckoutRateModelFailure,
+        refreshedControl: ManagerShopifyCheckoutRateControl?
+    ) -> ManagerShopifyCheckoutRateModelResolution {
+        guard command.permitsStateMutation(
+            currentAuthenticationGeneration: currentAuthenticationGeneration,
+            currentOrganizationId: currentOrganizationId,
+            currentActorEmail: currentActorEmail,
+            currentAccountGlobalId: currentAccountGlobalId,
+            isAuthenticated: isAuthenticated
+        ) else {
+            return .ignoreSupersededContext
+        }
+        if let refreshedControl,
+           command.isConfirmedApplied(by: refreshedControl) {
+            return .applied
+        }
+        if failure == .definitive {
+            return .quarantineAndRefresh
+        }
+        if let refreshedControl,
+           !command.isCurrentReview(refreshedControl) {
+            return .quarantineAndRefresh
+        }
+        return .retainExactRetry
+    }
+}
+
+public struct ManagerShopifyCheckoutRateCommandResult: Decodable, Equatable, Sendable {
+    private struct SavedControl: Decodable, Equatable, Sendable {
+        let version: String
+        let audience: ManagerShopifyCheckoutAudience
+        let rateSource: ManagerShopifyCheckoutRateSource
+    }
+
+    public let version: String
+    public let accountGlobalId: String
+    public let configGlobalId: String
+    public let idempotencyKey: String
+    public let requestHash: String
+    private let checkoutRateControl: SavedControl
+    public let rowVersion: Int
+    public let policyRevision: Int
+    public let providerWrites: Int
+
+    public func validated(
+        for command: ManagerShopifyCheckoutRateCommand
+    ) throws -> ManagerShopifyCheckoutRateCommandResult {
+        guard version == "shopify-checkout-rate-control-command-result-v1",
+              accountGlobalId == command.accountGlobalId,
+              configGlobalId == command.configGlobalId,
+              idempotencyKey == command.idempotencyKey,
+              requestHash.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+              ) != nil,
+              checkoutRateControl.version == "shopify-checkout-rate-control-v1",
+              checkoutRateControl.audience == command.desiredAudience,
+              checkoutRateControl.rateSource == command.desiredRateSource,
+              rowVersion == command.expectedRowVersion + 1,
+              policyRevision == command.expectedPolicyRevision + 1,
+              providerWrites == 0 else {
+            throw ManagerShopifyCheckoutRateClientError.mismatchedResponse
+        }
+        return self
+    }
+}
+
+public struct ManagerStoreSyncSubmissionFence: Equatable, Sendable {
+    public let authenticationGeneration: UInt64
+    public let organizationId: String
+
+    public init(authenticationGeneration: UInt64, organizationId: String) {
+        self.authenticationGeneration = authenticationGeneration
+        self.organizationId = organizationId
+    }
+
+    public func permitsStateMutation(
+        currentAuthenticationGeneration: UInt64,
+        currentOrganizationId: String?,
+        isAuthenticated: Bool
+    ) -> Bool {
+        isAuthenticated
+            && currentAuthenticationGeneration == authenticationGeneration
+            && currentOrganizationId == organizationId
+    }
+}
+
+public enum ManagerStoreSyncClientError: Error, Equatable, Sendable {
+    case invalidControl
+    case invalidReason
+    case invalidIdempotencyKey
+    case mismatchedResponse
+}
+
+extension ManagerStoreSyncClientError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidControl:
+            "Refresh the exact Store sync control before changing it."
+        case .invalidReason:
+            "Enter a readable Store sync reason between 1 and 500 characters."
+        case .invalidIdempotencyKey:
+            "The Store sync retry identity is invalid."
+        case .mismatchedResponse:
+            "ClawPilot returned Store sync evidence that did not match the reviewed change."
+        }
+    }
+}
+
+public struct ManagerStoreSyncCommand: Encodable, Equatable, Sendable {
+    public let action = "update-commerce-store-sync"
+    public let accountGlobalId: String
+    public let desiredState: ManagerStoreSyncDesiredState
+    public let expectedDesiredState: ManagerStoreSyncDesiredState
+    public let expectedRevision: Int
+    public let reason: String
+    public let idempotencyKey: String
+
+    public init(
+        control: ManagerStoreSyncControl,
+        desiredState: ManagerStoreSyncDesiredState,
+        reason: String,
+        idempotencyKey: String = "store-sync:\(UUID().uuidString.lowercased())"
+    ) throws {
+        guard control.isContractValid else {
+            throw ManagerStoreSyncClientError.invalidControl
+        }
+        let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedReason.isEmpty,
+              normalizedReason.count <= 500,
+              normalizedReason.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ManagerStoreSyncClientError.invalidReason
+        }
+        guard idempotencyKey.range(
+            of: #"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$"#,
+            options: .regularExpression
+        ) != nil else {
+            throw ManagerStoreSyncClientError.invalidIdempotencyKey
+        }
+        self.accountGlobalId = control.accountGlobalId
+        self.desiredState = desiredState
+        expectedDesiredState = control.desiredState
+        expectedRevision = control.revision
+        self.reason = normalizedReason
+        self.idempotencyKey = idempotencyKey
+    }
+}
+
+public struct ManagerStoreSyncUpdateResult: Decodable, Equatable, Sendable {
+    public let control: ManagerStoreSyncControl
+
+    public func validated(
+        for command: ManagerStoreSyncCommand
+    ) throws -> ManagerStoreSyncControl {
+        guard control.isContractValid,
+              control.accountGlobalId == command.accountGlobalId,
+              control.desiredState == command.desiredState,
+              control.explicitChoice,
+              control.revision == command.expectedRevision + 1,
+              control.reason == command.reason else {
+            throw ManagerStoreSyncClientError.mismatchedResponse
+        }
+        return control
+    }
+}
+
 public struct ManagerOrderActionAvailability: Decodable, Equatable, Sendable {
     public let action: String
     public let label: String
@@ -1477,10 +2220,116 @@ public actor PickingAPIClient {
         struct Workspace: Decodable {
             let orders: [ManagerOrderSummary]
             let selectedOrder: ManagerOrderDetail?
+            let storeSync: [ManagerStoreSyncControl]?
+            let capabilities: ManagerOperationsCapabilities?
         }
 
         let ok: Bool
         let operations: Workspace?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerCommerceAccountsEnvelope: Decodable {
+        let ok: Bool
+        let organizationId: String?
+        let accounts: [ManagerCommerceAccountSummary]?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerStoreSyncEnvelope: Decodable {
+        let ok: Bool
+        let result: ManagerStoreSyncUpdateResult?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerShopifyCheckoutRateSetupEnvelope: Decodable {
+        struct Setup: Decodable {
+            struct Account: Decodable {
+                let globalId: String
+                let provider: String
+                let environment: String
+                let displayName: String
+                let status: String
+            }
+
+            struct SavedControl: Decodable {
+                let version: String
+                let audience: ManagerShopifyCheckoutAudience
+                let rateSource: ManagerShopifyCheckoutRateSource
+            }
+
+            struct Config: Decodable {
+                let globalId: String
+                let rowVersion: Int
+                let policyRevision: Int
+                let checkoutRateControl: SavedControl
+            }
+
+            struct OperatingProfile: Decodable {
+                let desiredAudience: ManagerShopifyCheckoutAudience?
+                let desiredRateSource: ManagerShopifyCheckoutRateSource?
+                let effectiveState: ManagerShopifyCheckoutEffectiveState
+                let effectiveReason: ManagerShopifyCheckoutEffectiveReason
+                let serving: Bool
+                let emergencyOverride: Bool
+            }
+
+            let account: Account
+            let config: Config?
+            let checkoutRateLastChange: ManagerShopifyCheckoutRateLastChange?
+            let checkoutRateOperatingProfile: OperatingProfile
+            let canActivate: Bool
+            let canManage: Bool
+
+            func validatedControl() throws -> ManagerShopifyCheckoutRateControl {
+                if let config {
+                    guard config.checkoutRateControl.version
+                            == "shopify-checkout-rate-control-v1",
+                          checkoutRateOperatingProfile.desiredAudience
+                            == config.checkoutRateControl.audience,
+                          checkoutRateOperatingProfile.desiredRateSource
+                            == config.checkoutRateControl.rateSource else {
+                        throw PickingAPIError.invalidResponse
+                    }
+                }
+                let control = ManagerShopifyCheckoutRateControl(
+                    accountGlobalId: account.globalId,
+                    provider: account.provider,
+                    environment: account.environment,
+                    displayName: account.displayName,
+                    accountStatus: account.status,
+                    configGlobalId: config?.globalId,
+                    rowVersion: config?.rowVersion,
+                    policyRevision: config?.policyRevision,
+                    desiredAudience: checkoutRateOperatingProfile.desiredAudience,
+                    desiredRateSource: checkoutRateOperatingProfile.desiredRateSource,
+                    effectiveState: checkoutRateOperatingProfile.effectiveState,
+                    effectiveReason: checkoutRateOperatingProfile.effectiveReason,
+                    serving: checkoutRateOperatingProfile.serving,
+                    emergencyOverride: checkoutRateOperatingProfile.emergencyOverride,
+                    canActivate: canActivate,
+                    canManage: canManage,
+                    lastChange: checkoutRateLastChange
+                )
+                guard control.isContractValid else {
+                    throw PickingAPIError.invalidResponse
+                }
+                return control
+            }
+        }
+
+        let ok: Bool
+        let setup: Setup?
+        let code: String?
+        let error: String?
+    }
+
+    private struct ManagerShopifyCheckoutRateCommandEnvelope: Decodable {
+        let ok: Bool
+        let result: ManagerShopifyCheckoutRateCommandResult?
         let code: String?
         let error: String?
     }
@@ -1548,6 +2397,43 @@ public actor PickingAPIClient {
         let reason: String
     }
 
+    private struct ManagerStoreSyncBody: Encodable {
+        let action: String
+        let accountGlobalId: String
+        let desiredState: ManagerStoreSyncDesiredState
+        let expectedDesiredState: ManagerStoreSyncDesiredState
+        let expectedRevision: Int
+        let reason: String
+    }
+
+    private struct ManagerShopifyCheckoutRateBody: Encodable {
+        struct SavedControl: Encodable {
+            let version = "shopify-checkout-rate-control-v1"
+            let audience: ManagerShopifyCheckoutAudience
+            let rateSource: ManagerShopifyCheckoutRateSource
+        }
+
+        let action = "save-checkout-rate-control"
+        let accountGlobalId: String
+        let expectedConfigGlobalId: String
+        let expectedRowVersion: Int
+        let expectedPolicyRevision: Int
+        let checkoutRateControl: SavedControl
+        let reason: String
+
+        init(command: ManagerShopifyCheckoutRateCommand) {
+            accountGlobalId = command.accountGlobalId
+            expectedConfigGlobalId = command.configGlobalId
+            expectedRowVersion = command.expectedRowVersion
+            expectedPolicyRevision = command.expectedPolicyRevision
+            checkoutRateControl = SavedControl(
+                audience: command.desiredAudience,
+                rateSource: command.desiredRateSource
+            )
+            reason = command.reason
+        }
+    }
+
     private struct ConfirmBody: Encodable {
         let action: String
         let orderGlobalId: String
@@ -1600,6 +2486,7 @@ public actor PickingAPIClient {
             HTTPCookieStorage.shared.cookieAcceptPolicy = .always
             self.session = URLSession(configuration: configuration)
         }
+        encoder.outputFormatting = [.sortedKeys]
         encoder.dateEncodingStrategy = .clawPilotFractionalISO8601
         decoder.dateDecodingStrategy = .iso8601
     }
@@ -1857,6 +2744,255 @@ public actor PickingAPIClient {
             )
         }
         return operations.orders
+    }
+
+    public func fetchManagerOperations() async throws -> ManagerOperationsOverview {
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        try validateHTTP(response)
+        let envelope = try decoder.decode(ManagerOperationsEnvelope.self, from: data)
+        guard envelope.ok,
+              let operations = envelope.operations,
+              let controls = operations.storeSync,
+              let capabilities = operations.capabilities,
+              controls.allSatisfy(\.isContractValid),
+              Set(controls.map(\.accountGlobalId)).count == controls.count else {
+            throw PickingAPIError.rejected(
+                code: envelope.code ?? "OPERATIONS_MANAGER_FAILED",
+                message: envelope.error ?? "Manager Operations controls are unavailable"
+            )
+        }
+        return ManagerOperationsOverview(
+            orders: operations.orders,
+            storeSync: controls,
+            capabilities: capabilities
+        )
+    }
+
+    public func fetchManagerCommerceAccounts(
+        organizationId: String
+    ) async throws -> [ManagerCommerceAccountSummary] {
+        let expectedOrganizationId = organizationId.lowercased()
+        guard UUID(uuidString: expectedOrganizationId) != nil else {
+            throw PickingAPIError.invalidResponse
+        }
+        var request = URLRequest(
+            url: try endpoint("/api/integrations/commerce/accounts")
+        )
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(
+            ManagerCommerceAccountsEnvelope.self,
+            from: data
+        )
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(
+                http.value(forHTTPHeaderField: "Retry-After") ?? ""
+            ) ?? 60
+            throw PickingAPIError.rateLimited(
+                retryAfterSeconds: max(1, seconds)
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              envelope.organizationId?.lowercased() == expectedOrganizationId,
+              let accounts = envelope.accounts,
+              accounts.allSatisfy(\.isContractValid),
+              Set(accounts.map(\.accountGlobalId)).count == accounts.count else {
+            if (400..<500).contains(http.statusCode) {
+                throw PickingAPIError.rejected(
+                    code: envelope?.code
+                        ?? "COMMERCE_ACCOUNT_DISCOVERY_REJECTED",
+                    message: envelope?.error
+                        ?? "Commerce-account discovery is unavailable"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return accounts
+    }
+
+    public func updateManagerStoreSync(
+        _ command: ManagerStoreSyncCommand
+    ) async throws -> ManagerStoreSyncControl {
+        await beginAuthenticatedMutation()
+        defer { finishAuthenticatedMutation() }
+        var request = URLRequest(url: try endpoint("/api/operations"))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(command.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try encoder.encode(ManagerStoreSyncBody(
+            action: command.action,
+            accountGlobalId: command.accountGlobalId,
+            desiredState: command.desiredState,
+            expectedDesiredState: command.expectedDesiredState,
+            expectedRevision: command.expectedRevision,
+            reason: command.reason
+        ))
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(ManagerStoreSyncEnvelope.self, from: data)
+        if http.statusCode == 409 {
+            throw PickingAPIError.conflict(
+                code: envelope?.code ?? "COMMERCE_STORE_SYNC_REVISION_CONFLICT",
+                message: envelope?.error
+                    ?? "Store sync changed after it was reviewed. Refresh and choose again."
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            if http.statusCode == 429 {
+                let seconds = Int(
+                    http.value(forHTTPHeaderField: "Retry-After") ?? ""
+                ) ?? 60
+                throw PickingAPIError.rateLimited(
+                    retryAfterSeconds: max(1, seconds)
+                )
+            }
+            if (400..<500).contains(http.statusCode) {
+                throw PickingAPIError.rejected(
+                    code: envelope?.code ?? "COMMERCE_STORE_SYNC_UPDATE_REJECTED",
+                    message: envelope?.error ?? "Store sync was not changed"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return try result.validated(for: command)
+    }
+
+    public func fetchManagerShopifyCheckoutRateControl(
+        accountGlobalId: String
+    ) async throws -> ManagerShopifyCheckoutRateControl {
+        var components = URLComponents(
+            url: try endpoint(
+                "/api/integrations/commerce/shopify/carrier-service"
+            ),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "accountGlobalId", value: accountGlobalId),
+        ]
+        guard let url = components.url else {
+            throw PickingAPIError.invalidOrigin
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(
+            ManagerShopifyCheckoutRateSetupEnvelope.self,
+            from: data
+        )
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(
+                http.value(forHTTPHeaderField: "Retry-After") ?? ""
+            ) ?? 60
+            throw PickingAPIError.rateLimited(
+                retryAfterSeconds: max(1, seconds)
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let setup = envelope.setup else {
+            if (400..<500).contains(http.statusCode) {
+                throw PickingAPIError.rejected(
+                    code: envelope?.code
+                        ?? "SHOPIFY_CHECKOUT_RATE_CONTROL_READ_REJECTED",
+                    message: envelope?.error
+                        ?? "Shopify checkout-rate controls are unavailable"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        let control = try setup.validatedControl()
+        guard control.accountGlobalId == accountGlobalId else {
+            throw PickingAPIError.invalidResponse
+        }
+        return control
+    }
+
+    public func updateManagerShopifyCheckoutRateControl(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) async throws -> ManagerShopifyCheckoutRateCommandResult {
+        await beginAuthenticatedMutation()
+        defer { finishAuthenticatedMutation() }
+        var request = URLRequest(url: try endpoint(
+            "/api/integrations/commerce/shopify/carrier-service"
+        ))
+        request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            command.idempotencyKey,
+            forHTTPHeaderField: "Idempotency-Key"
+        )
+        request.httpBody = try encoder.encode(
+            ManagerShopifyCheckoutRateBody(command: command)
+        )
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(
+            ManagerShopifyCheckoutRateCommandEnvelope.self,
+            from: data
+        )
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(
+                http.value(forHTTPHeaderField: "Retry-After") ?? ""
+            ) ?? 60
+            throw PickingAPIError.rateLimited(
+                retryAfterSeconds: max(1, seconds)
+            )
+        }
+        if http.statusCode == 409 {
+            throw PickingAPIError.conflict(
+                code: envelope?.code
+                    ?? "SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT",
+                message: envelope?.error
+                    ?? "Shopify checkout-rate settings changed after review. Refresh and choose again."
+            )
+        }
+        if (400..<500).contains(http.statusCode),
+           http.statusCode != 408,
+           http.statusCode != 425 {
+            throw PickingAPIError.rejected(
+                code: envelope?.code
+                    ?? "SHOPIFY_CHECKOUT_RATE_CONTROL_UPDATE_REJECTED",
+                message: envelope?.error
+                    ?? "Shopify checkout-rate settings were not changed"
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              let result = envelope.result else {
+            // 408, 425, 5xx, transport failures, and malformed success bodies
+            // are intentionally ambiguous. The caller retains this exact
+            // command and may re-POST the same key and sorted JSON bytes.
+            throw PickingAPIError.invalidResponse
+        }
+        return try result.validated(for: command)
     }
 
     public func fetchManagerOrderDetail(_ orderGlobalId: String) async throws -> ManagerOrderDetail {

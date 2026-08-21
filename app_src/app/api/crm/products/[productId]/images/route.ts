@@ -14,6 +14,9 @@ import {
   setPrimaryCrmProductImageAssetInPostgres,
   uploadCrmProductImageAssetInPostgres,
 } from '@/lib/persistence/crmProductImageAssets'
+import {
+  readCommerceStoreSyncControlsFromPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole } from '@/lib/users'
 
@@ -324,9 +327,13 @@ export async function GET(
       organizationId,
       productId,
     })
+    const storeSync = await readCommerceStoreSyncControlsFromPostgres(
+      organizationId,
+    )
     return json({
       ok: true,
       ...state,
+      storeSync,
       imageImportAvailable: commerceReadRuntimeAvailable(),
     })
   } catch (error) {

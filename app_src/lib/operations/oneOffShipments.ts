@@ -8,6 +8,7 @@ export type OneOffRateEnvironment = 'sandbox' | 'production'
 export type OneOffExecutionMode = 'test' | 'live'
 export {
   ONE_OFF_LIVE_POSTAGE_CONFIRMATION,
+  ONE_OFF_PACK_CONFIRMATION,
   ONE_OFF_MAX_SYNCHRONOUS_PACKAGES,
 } from '@/lib/operations/oneOffShipmentConstants'
 
@@ -55,9 +56,21 @@ export type OneOffNewProductLine = {
   physicalUnitsOnHandConfirmed: true
 }
 
+export type OneOffAdHocLine = {
+  kind: 'ad_hoc'
+  lineKey: string
+  name: string
+  sku: string | null
+  quantity: number
+  unitPriceMinor: number
+  unitWeightGrams: number
+  unitDimensionsMm: Millimeters
+}
+
 export type OneOffShipmentLineInput =
   | OneOffExistingProductLine
   | OneOffNewProductLine
+  | OneOffAdHocLine
 
 export type OneOffShipmentPackageInput = {
   packageKey: string
@@ -73,10 +86,10 @@ export type OneOffShipmentPackageInput = {
 
 export type OneOffShipmentQuoteInput = {
   executionMode: OneOffExecutionMode
-  customerGlobalId: string
+  customerGlobalId: string | null
   warehouseGlobalId: string
-  inventoryPoolGlobalId: string
-  receivingLocationGlobalId: string
+  inventoryPoolGlobalId: string | null
+  receivingLocationGlobalId: string | null
   referenceNumber: string
   currency: string
   requestedDeliveryAt: string | null
@@ -150,12 +163,75 @@ export type OneOffCarrierGroupCommandResult = {
   replayed: boolean
 }
 
+export type OneOffShippingPackReview = {
+  state: 'review_required' | 'packed'
+  required: boolean
+  evidenceHash: string | null
+  blocker: string | null
+  lines: Array<{
+    lineKey: string
+    kind: 'existing' | 'new' | 'ad_hoc'
+    name: string
+    sku: string | null
+    productGlobalId: string | null
+    quantity: number
+  }>
+  packages: Array<{
+    globalId: string
+    packageNumber: number
+    description: string
+    status: 'planned' | 'packed' | 'labeled' | 'shipped'
+    dimensionsMm: Millimeters
+    grossWeightGrams: number
+    contents: Array<{
+      lineKey: string
+      quantity: number
+    }>
+  }>
+  reservations: Array<{
+    globalId: string
+    lineKey: string
+    productGlobalId: string
+    positionGlobalId: string
+    positionRowVersion: number
+    quantity: number
+    status: 'active' | 'released' | 'consumed'
+  }>
+  receipt: null | {
+    requestIdempotencyKey: string
+    reviewSnapshotHash: string
+    packageCount: number
+    reservationCount: number
+    packedAt: string
+  }
+}
+
+export type OneOffShippingPackCommandResult = {
+  orderGlobalId: string
+  orderStatus: 'packed'
+  rowVersion: number
+  fulfillmentPlanGlobalId: string
+  reviewSnapshotHash: string
+  packageCount: number
+  reservationCount: number
+  packedAt: string
+  effects: {
+    providerWrites: 0
+    labelWrites: 0
+    shipmentWrites: 0
+    inventoryWrites: 0
+  }
+  replayed: boolean
+}
+
 export type OneOffShipmentExecutionState = {
   orderGlobalId: string
+  orderStatus: 'planned' | 'packed'
   rowVersion: number
   executionMode: OneOffExecutionMode
   environment: OneOffRateEnvironment
   packageCount: number
+  packReview: OneOffShippingPackReview
   planning: {
     quoteGlobalId: string
     offerGlobalId: string
@@ -167,6 +243,7 @@ export type OneOffShipmentExecutionState = {
   }
   packedRate: null | {
     quoteGlobalId: string
+    requestIdempotencyKey: string
     expiresAt: string
     status: 'succeeded' | 'partial' | 'failed'
     consumed: boolean
@@ -174,6 +251,9 @@ export type OneOffShipmentExecutionState = {
   }
   carrierGroup: null | {
     createAttemptGlobalId: string
+    createRequestIdempotencyKey: string
+    purchaseQuoteGlobalId: string
+    purchaseOfferGlobalId: string
     state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
     provider: OneOffCarrierProvider
     serviceCode: string
@@ -189,6 +269,7 @@ export type OneOffShipmentExecutionState = {
     unresolved: boolean
     active: boolean
     voidAttemptGlobalId: string | null
+    voidRequestIdempotencyKey: string | null
     voidAction: 'void' | 'close_sample' | null
     voidState: 'prepared' | 'succeeded' | 'failed' | 'unknown' | null
     labels: Array<{
@@ -198,10 +279,48 @@ export type OneOffShipmentExecutionState = {
       trackingNumber: string
       status: 'created' | 'voided'
       printJobGlobalId: string | null
-      printStatus: 'queued' | 'printed' | 'failed' | 'rerouted' | null
+      printStatus: 'queued' | 'printing' | 'printed' | 'failed' | 'rerouted' | null
+      printJobStatus: 'queued' | 'claimed' | 'delivered' | 'failed'
+        | 'cancelled' | 'printed' | 'rerouted' | null
+      printArtifactGlobalId: string | null
+      printContentSha256: string | null
+      printByteLength: number | null
+      printAttempts: number | null
+      printMaxAttempts: number | null
+      printLatestAttemptSequenceNumber: number | null
+      printLatestErrorCode: string | null
+      printJobRequestIdempotencyKey: string | null
+      printLastOperatorRetryIdempotencyKey: string | null
+      printOperatorRetryIdempotencyKeys: string[]
+      printReprintOfJobGlobalId: string | null
+      printOutcomeUncertain: boolean
+      printRecoveryAction: 'enqueue' | 'retry' | 'new_print' | null
       printWarning: string | null
     }>
   }
+}
+
+export type OneOffShippingPrintRecoveryResult = {
+  orderGlobalId: string
+  packageGlobalId: string
+  labelGlobalId: string
+  action: 'enqueue' | 'retry' | 'new_print'
+  printJobGlobalId: string
+  sourcePrintJobGlobalId: string | null
+  printJobStatus: 'queued' | 'claimed' | 'delivered' | 'failed'
+    | 'cancelled' | 'printed' | 'rerouted'
+  printStatus: 'queued' | 'printing' | 'printed' | 'failed' | 'rerouted'
+  printArtifactGlobalId: string
+  printContentSha256: string
+  printByteLength: number
+  printAttempts: number
+  printMaxAttempts: number
+  effects: {
+    carrierWrites: 0
+    providerWrites: 0
+    labelWrites: 0
+  }
+  replayed: boolean
 }
 
 export type OneOffShipmentQuote = {
@@ -226,12 +345,13 @@ export type OneOffShipmentQuote = {
 
 export type OneOffShipmentCreateResult = {
   orderGlobalId: string
-  orderStatus: 'planned'
+  orderStatus: 'planned' | 'packed'
   rowVersion: number
   fulfillmentPlanGlobalId: string
   quoteGlobalId: string
   selectedOfferGlobalId: string
   createdProductGlobalIds: string[]
+  adHocItemGlobalIds: string[]
   receiptGlobalId: string | null
   packageCount: number
   replayed: boolean
@@ -279,6 +399,44 @@ export type OneOffShipmentWorkspace = {
     displayName: string
     senderOriginWarehouseGlobalId: string | null
   }>
+}
+
+export function oneOffShippingExecutionModes(input: {
+  runtimeEnvironment: OneOffRateEnvironment
+  canPurchaseLivePostage: boolean
+  sandboxCarrierCount: number
+  productionCarrierCount: number
+}): OneOffShipmentWorkspace['executionModes'] {
+  return [
+    {
+      mode: 'test',
+      environment: 'sandbox',
+      enabled: input.sandboxCarrierCount > 0,
+      blockers: input.sandboxCarrierCount > 0
+        ? []
+        : ['Enable a verified sandbox parcel rate account'],
+    },
+    {
+      mode: 'live',
+      environment: 'production',
+      enabled: input.runtimeEnvironment === 'production'
+        && input.canPurchaseLivePostage
+        && input.productionCarrierCount > 0,
+      blockers: [
+        ...(input.runtimeEnvironment === 'production'
+          ? []
+          : [
+              'Live postage is available only in production or the trusted Railway development service',
+            ]),
+        ...(input.canPurchaseLivePostage
+          ? []
+          : ['Your role needs live-postage permission']),
+        ...(input.productionCarrierCount > 0
+          ? []
+          : ['Enable a verified production parcel rate account']),
+      ],
+    },
+  ]
 }
 
 function canonicalJson(value: unknown): string {

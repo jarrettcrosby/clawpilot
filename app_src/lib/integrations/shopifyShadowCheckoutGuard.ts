@@ -1,4 +1,11 @@
 export const ShopifyShadowCheckoutGuardDenialReason = {
+  AudienceOff: 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF',
+  ActivationDisabled:
+    'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED',
+  ActivationFrozen:
+    'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN',
+  AllEligibleSandboxRequired:
+    'SHOPIFY_SHADOW_GUARD_ALL_ELIGIBLE_SANDBOX_REQUIRED',
   MissingCustomer: 'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER',
   MissingVariantConfiguration:
     'SHOPIFY_SHADOW_GUARD_MISSING_VARIANT_CONFIGURATION',
@@ -24,7 +31,7 @@ export type ShopifyShadowCheckoutGuardDecision =
 export type ShopifyShadowCheckoutPrePolicyDecision =
   | {
       ready: true
-      customerId: string
+      customerId: string | null
     }
   | {
       ready: false
@@ -34,30 +41,36 @@ export type ShopifyShadowCheckoutPrePolicyDecision =
 export function shopifyShadowCheckoutGuardDenialTelemetry(input: {
   accountGlobalId: string
   reasonCode: ShopifyShadowCheckoutGuardDenialReason
+  checkpoint?: 'account_authenticated' | 'request_parsed'
 }) {
   return {
     accountGlobalId: input.accountGlobalId,
     stage: 'shadow_guard' as const,
-    checkpoint: 'request_parsed' as const,
+    checkpoint: input.checkpoint || 'request_parsed',
     reasonCode: input.reasonCode,
   }
 }
 
 export function evaluateShopifyShadowCheckoutPrePolicy(input: {
   customerId: string | null | undefined
+  customerRequired?: boolean
+  variantAllowlistRequired?: boolean
   configuredVariantIds: ReadonlySet<string> | null
   items: ReadonlyArray<{
     requiresShipping: boolean
     variantId: string
   }>
 }): ShopifyShadowCheckoutPrePolicyDecision {
-  if (!input.customerId) {
+  if (input.customerRequired !== false && !input.customerId) {
     return {
       ready: false,
       reasonCode: ShopifyShadowCheckoutGuardDenialReason.MissingCustomer,
     }
   }
-  if (!input.configuredVariantIds) {
+  if (
+    input.variantAllowlistRequired !== false
+    && !input.configuredVariantIds
+  ) {
     return {
       ready: false,
       reasonCode:
@@ -71,9 +84,12 @@ export function evaluateShopifyShadowCheckoutPrePolicy(input: {
       reasonCode: ShopifyShadowCheckoutGuardDenialReason.NoShippableItems,
     }
   }
-  if (shippableItems.some(
-    (item) => !input.configuredVariantIds?.has(item.variantId),
-  )) {
+  if (
+    input.variantAllowlistRequired !== false
+    && shippableItems.some(
+      (item) => !input.configuredVariantIds?.has(item.variantId),
+    )
+  ) {
     return {
       ready: false,
       reasonCode:
@@ -82,7 +98,7 @@ export function evaluateShopifyShadowCheckoutPrePolicy(input: {
   }
   return {
     ready: true,
-    customerId: input.customerId,
+    customerId: input.customerId || null,
   }
 }
 

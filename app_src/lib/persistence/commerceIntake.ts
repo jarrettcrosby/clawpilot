@@ -67,6 +67,10 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
+import {
   applyCommerceCatalogSyncPolicyWithClient,
   commerceCatalogCredentialSupportsProducts,
   readCommerceCatalogSyncStateWithClient,
@@ -110,6 +114,10 @@ type CommandContext = {
   actorEmail: string
   idempotencyKey: string
 }
+
+export type CommerceIntakeProviderReadAuthority =
+  | 'automatic'
+  | 'manual_read_only'
 
 export type CommerceIntakeStageAction =
   | 'fetch'
@@ -163,6 +171,7 @@ type ContinuationRow = {
   provider: 'shopify' | 'faire'
   resource: 'orders' | 'products'
   credential_version: number
+  provider_read_authority: CommerceIntakeProviderReadAuthority
   window_start: string | Date | null
   window_end: string | Date
   query_hash: string
@@ -184,6 +193,8 @@ type ContinuationRow = {
 type CandidateCommandContext = CommandContext & {
   candidateGlobalId: string
   candidateRowVersion: number
+  automaticStoreSync?: boolean
+  localReviewCommand?: boolean
 }
 
 type AutomaticFaireRuntimeScope = Pick<
@@ -210,6 +221,12 @@ type IntakeAccountRow = {
     | 'active'
     | 'frozen'
   activation_revision: number
+  store_sync_running: boolean
+  store_sync_effective_reason: string
+  store_sync_desired_state: 'running' | 'paused' | null
+  store_sync_explicit_choice: boolean | null
+  store_sync_revision: string | number | null
+  store_sync_reason: string | null
 }
 
 export type CommerceCustomerPrefetchBindingPlan = {
@@ -816,13 +833,28 @@ async function resolveAccount(
        account.commerce_credential_generation AS credential_version,
        pipeline.id::text AS pipeline_id,
        activation.state AS activation_state,
-       activation.revision AS activation_revision
+       activation.revision AS activation_revision,
+       operations_commerce_store_sync_is_running(
+         account.organization_id,
+         account.id
+       ) AS store_sync_running,
+       operations_commerce_store_sync_effective_reason(
+         account.organization_id,
+         account.id
+       ) AS store_sync_effective_reason,
+       store_sync.desired_state AS store_sync_desired_state,
+       store_sync.explicit_choice AS store_sync_explicit_choice,
+       store_sync.revision AS store_sync_revision,
+       store_sync.reason AS store_sync_reason
      FROM operations_integration_accounts account
      JOIN operations_activation_scopes activation
        ON activation.organization_id = account.organization_id
      JOIN pipeline_spaces pipeline
-       ON pipeline.workspace_organization_id = activation.organization_id
+      ON pipeline.workspace_organization_id = activation.organization_id
       AND pipeline.id = activation.data_pipeline_id
+     LEFT JOIN operations_commerce_store_sync_controls store_sync
+       ON store_sync.organization_id = account.organization_id
+      AND store_sync.integration_account_id = account.id
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
        AND account.integration_type = 'commerce'
@@ -855,6 +887,76 @@ async function resolveAccount(
     )
   }
   return row
+}
+
+async function lockCommerceStoreSyncState(
+  client: PoolClient,
+  input: { organizationId: string; integrationAccountId: string },
+) {
+  const state = await client.query<{
+    running: boolean
+    effective_reason: string
+    activation_state: IntakeAccountRow['activation_state']
+  }>(
+    `SELECT
+       operations_commerce_store_sync_is_running(
+         control.organization_id,
+         control.integration_account_id
+       ) AS running,
+       operations_commerce_store_sync_effective_reason(
+         control.organization_id,
+         control.integration_account_id
+       ) AS effective_reason
+       , activation.state AS activation_state
+     FROM operations_commerce_store_sync_controls control
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = control.organization_id
+     WHERE control.organization_id = $1::uuid
+       AND control.integration_account_id = $2::uuid
+     LIMIT 1
+     FOR UPDATE OF control, activation`,
+    [input.organizationId, input.integrationAccountId],
+  )
+  return state.rows[0] || {
+    running: false,
+    effective_reason: 'STORE_SYNC_CONTROL_MISSING',
+    activation_state: 'disabled',
+  }
+}
+
+function requireCommerceStoreSyncRunning(state: {
+  running: boolean
+  effective_reason: string
+}) {
+  if (!state.running) {
+    intakeError(
+      'COMMERCE_STORE_SYNC_PAUSED',
+      `Store sync is Paused (${state.effective_reason || 'STORE_SYNC_CONTROL_MISSING'})`,
+      409,
+    )
+  }
+}
+
+function requireCommerceProviderReadAuthority(
+  state: {
+    running: boolean
+    effective_reason: string
+    activation_state: IntakeAccountRow['activation_state']
+  },
+  authority: CommerceIntakeProviderReadAuthority,
+) {
+  if (authority === 'automatic') {
+    requireCommerceStoreSyncRunning(state)
+    return
+  }
+  if (state.activation_state === 'disabled'
+      || state.activation_state === 'frozen') {
+    intakeError(
+      'COMMERCE_PROVIDER_READ_EMERGENCY_OVERRIDE',
+      `Manual provider reads are unavailable while Operations is ${state.activation_state}`,
+      409,
+    )
+  }
 }
 
 function normalizedCustomerPrefetchEmail(value: unknown) {
@@ -927,12 +1029,6 @@ async function customerPrefetchBindingPlanWithClient(
       'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
       'Pre-fetch retailer binding is available only for a Faire connection',
       409,
-    )
-  }
-  if (!['shadow', 'active'].includes(account.activation_state)) {
-    intakeError(
-      'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-      'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
     )
   }
   if (input.lock) {
@@ -1151,10 +1247,10 @@ export async function confirmCommerceCustomerPrefetchBindingInPostgres(input: {
         409,
       )
     }
-    if (!['shadow', 'active'].includes(account.activation_state)) {
+    if (account.activation_state === 'frozen') {
       intakeError(
-        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-        'Open Operations and set Activation to Shadow or Active before binding a Faire retailer',
+        'COMMERCE_INTAKE_FROZEN',
+        'Faire retailer binding changes are unavailable while Operations is Frozen',
       )
     }
     const requestHash = commandHash({
@@ -1559,6 +1655,7 @@ async function reconcileStagedCommerceProductImages(
     >
     envelope: CommerceNormalizationEnvelope
     actorEmail: string
+    providerReadAuthority: CommerceIntakeProviderReadAuthority
   },
   client: PoolClient,
 ) {
@@ -1593,6 +1690,7 @@ async function reconcileStagedCommerceProductImages(
       observedAt: input.envelope.observedAt,
       providerUpdatedAt: product.providerUpdatedAt,
       actorEmail: input.actorEmail,
+      providerReadAuthority: input.providerReadAuthority,
       images: product.images.map((image) => ({
         providerImageId: image.providerImageId,
         locatorSha256: image.locatorFingerprint,
@@ -1789,10 +1887,33 @@ async function commandStart(
     requestHash,
     actorEmail: context.actorEmail,
   })
-  if (!['shadow', 'active'].includes(account.activation_state)) {
+  const automaticMirror = context.automaticStoreSync === true
+    || context.actorEmail === 'system:commerce-order-reconciliation'
+  const localReviewCommand = context.localReviewCommand === true
+  const lockedStoreSync = automaticMirror
+    ? await lockCommerceStoreSyncState(client, {
+        organizationId: account.organization_id,
+        integrationAccountId: account.id,
+      })
+    : null
+  if (
+    automaticMirror
+      ? !lockedStoreSync?.running
+      : localReviewCommand
+        ? account.activation_state === 'frozen'
+        : !['shadow', 'active'].includes(account.activation_state)
+  ) {
     intakeError(
-      'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-      'Open Operations and set Activation to Shadow or Active before resolving or promoting orders',
+      automaticMirror
+        ? 'COMMERCE_STORE_SYNC_PAUSED'
+        : localReviewCommand
+          ? 'COMMERCE_INTAKE_FROZEN'
+          : 'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
+      automaticMirror
+        ? `Store sync is Paused (${lockedStoreSync?.effective_reason || 'STORE_SYNC_CONTROL_MISSING'})`
+        : localReviewCommand
+          ? 'Local commerce review changes are unavailable while Operations is Frozen'
+          : 'Open Operations and set Activation to Shadow or Active before resolving or promoting orders',
     )
   }
   return { account, requestHash, ...prepared }
@@ -3780,6 +3901,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
   exactExternalProductIdHash?: string | null
   continuationRunGlobalId: string | null
   pageSize: number
+  providerReadAuthority: CommerceIntakeProviderReadAuthority
 }) {
   const prepared = await withTransaction(async (client) => {
     const account = await resolveAccount(client, {
@@ -3787,12 +3909,11 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       accountGlobalId: input.runtime.globalId,
       forUpdate: true,
     })
-    if (!['shadow', 'active'].includes(account.activation_state)) {
-      intakeError(
-        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-        'Open Operations and set Activation to Shadow or Active before reading commerce data',
-      )
-    }
+    requireCommerceProviderReadAuthority({
+      running: account.store_sync_running,
+      effective_reason: account.store_sync_effective_reason,
+      activation_state: account.activation_state,
+    }, input.providerReadAuthority)
     const continuationAction = (
       input.action === 'fetch-next'
       || input.action === 'fetch-next-products'
@@ -4030,6 +4151,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         ? { exactExternalProductIdHash: input.exactExternalProductIdHash }
         : {}),
       pageSize: input.pageSize,
+      providerReadAuthority: input.providerReadAuthority,
       readOnly: true,
       providerWrites: 0,
       syncCursorAdvance: false,
@@ -4057,6 +4179,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
       window_end: Date
       query_hash: string
       provider_attempt_id: string | null
+      provider_read_authority: CommerceIntakeProviderReadAuthority
       target_kind: 'none' | 'candidate' | 'rejection' | 'continuation'
       target_global_id: string | null
       continuation_id: string | null
@@ -4068,6 +4191,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
               credential_version, intent_state, session_id::text,
               batch_number, window_start, window_end, query_hash,
               provider_attempt_id::text, target_kind, target_global_id,
+              provider_read_authority,
               continuation_id::text, continuation_cursor_hash,
               continuation_row_version::text, expires_at
        FROM operations_commerce_intake_read_intents
@@ -4098,6 +4222,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         && prior.provider === account.provider
         && prior.resource === input.resource
         && prior.credential_version === account.credential_version
+        && prior.provider_read_authority === input.providerReadAuthority
         && prior.target_kind === 'continuation'
         && prior.target_global_id === continuation.run_global_id
         && prior.continuation_id === continuation.id
@@ -4265,12 +4390,12 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
          target_source_hash, target_external_id_hash, continuation_id,
          continuation_cursor_hash, continuation_row_version, session_id,
          batch_number, window_start, window_end, query_hash, created_by,
-         updated_by, expires_at
+         updated_by, expires_at, provider_read_authority
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
          $11, $12, $13, $14::uuid, $15, $16, $17::uuid, $18,
          $19::timestamptz, $20::timestamptz, $21, $22, $22,
-         now() + interval '30 days'
+         now() + interval '30 days', $23
        )
        RETURNING id::text`,
       [
@@ -4296,6 +4421,7 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
         windowEnd,
         queryHash,
         input.actorEmail,
+        input.providerReadAuthority,
       ],
     )
     return {
@@ -4326,6 +4452,7 @@ type CommerceReadIntentPersistenceRow = {
   idempotency_key: string
   request_hash: string
   credential_version: number
+  provider_read_authority: CommerceIntakeProviderReadAuthority
   intent_state:
     | 'prepared'
     | 'reading'
@@ -4434,7 +4561,8 @@ export async function reserveCommerceIntakeProviderReadInPostgres(input: {
     })
     const intentResult = await client.query<CommerceReadIntentPersistenceRow>(
       `SELECT id::text, provider, resource, intake_action, idempotency_key,
-              request_hash, credential_version, intent_state,
+              request_hash, credential_version, provider_read_authority,
+              intent_state,
               provider_attempt_id::text, lease_token::text, lease_expires_at,
               response_ciphertext, response_iv, response_tag, response_hash,
               response_bytes, continuation_id::text,
@@ -4566,6 +4694,10 @@ export async function reserveCommerceIntakeProviderReadInPostgres(input: {
         continuationInvalidated: Boolean(intent.continuation_id),
       }
     }
+    requireCommerceProviderReadAuthority(await lockCommerceStoreSyncState(client, {
+      organizationId: account.organization_id,
+      integrationAccountId: account.id,
+    }), intent.provider_read_authority)
     const previousAttempt = await client.query<{
       request_hash: string
       state: string
@@ -4709,6 +4841,7 @@ export async function captureCommerceIntakeProviderReadInPostgres(input: {
   requestHash: string
   result: CommerceIntakeReadResult
   redactedResponse: Record<string, unknown>
+  providerReadLease: CommerceStoreSyncProviderReadLease
 }) {
   const protectedResult = encryptCommerceIntakeReadResult(
     input.result as unknown as {
@@ -4723,6 +4856,13 @@ export async function captureCommerceIntakeProviderReadInPostgres(input: {
     input.requestHash,
   )
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.runtime.organizationId,
+      integrationAccountId: input.runtime.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: input.providerReadLease.authorityKind,
+      readKind: 'catalog_intake',
+    })
     const account = await resolveAccount(client, {
       organizationId: input.runtime.organizationId,
       accountGlobalId: input.runtime.globalId,
@@ -4731,8 +4871,9 @@ export async function captureCommerceIntakeProviderReadInPostgres(input: {
     const intent = await client.query<{
       id: string
       request_hash: string
+      provider_read_authority: CommerceIntakeProviderReadAuthority
     }>(
-      `SELECT id::text, request_hash
+      `SELECT id::text, request_hash, provider_read_authority
        FROM operations_commerce_intake_read_intents
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -4763,6 +4904,13 @@ export async function captureCommerceIntakeProviderReadInPostgres(input: {
         409,
       )
     }
+    requireCommerceProviderReadAuthority(await lockCommerceStoreSyncState(
+      client,
+      {
+        organizationId: account.organization_id,
+        integrationAccountId: account.id,
+      },
+    ), intent.rows[0].provider_read_authority)
     const attempt = await client.query(
       `UPDATE operations_commerce_provider_attempts
        SET redacted_response = $7::jsonb,
@@ -4860,7 +5008,8 @@ export async function markCommerceIntakeProviderReadUncertainInPostgres(input: {
     })
     const intentResult = await client.query<CommerceReadIntentPersistenceRow>(
       `SELECT id::text, provider, resource, intake_action, idempotency_key,
-              request_hash, credential_version, intent_state,
+              request_hash, credential_version, provider_read_authority,
+              intent_state,
               provider_attempt_id::text, lease_token::text, lease_expires_at,
               response_ciphertext, response_iv, response_tag, response_hash,
               response_bytes, continuation_id::text,
@@ -4958,12 +5107,38 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         422,
       )
     }
-    if (!['shadow', 'active'].includes(account.activation_state)) {
+    const stageAuthority = await client.query<{
+      provider_read_authority: CommerceIntakeProviderReadAuthority
+    }>(
+      `SELECT provider_read_authority
+       FROM operations_commerce_intake_read_intents
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND id = $3::uuid
+         AND idempotency_key = $4
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        account.organization_id,
+        account.id,
+        input.readIntentId,
+        input.idempotencyKey,
+      ],
+    )
+    if (!stageAuthority.rows[0]) {
       intakeError(
-        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-        'Open Operations and set Activation to Shadow or Active before staging commerce data',
+        'COMMERCE_INTAKE_INTENT_INVALID',
+        'The captured provider-read intent is unavailable for staging',
+        409,
       )
     }
+    requireCommerceProviderReadAuthority(await lockCommerceStoreSyncState(
+      client,
+      {
+        organizationId: account.organization_id,
+        integrationAccountId: account.id,
+      },
+    ), stageAuthority.rows[0].provider_read_authority)
     const exactAction = (
       input.stageAction === 'refresh'
       || input.stageAction === 'retry-rejection'
@@ -5201,6 +5376,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
               | 'uncertain'
               | 'expired'
             provider_attempt_id: string | null
+            provider_read_authority: CommerceIntakeProviderReadAuthority
             response_hash: string | null
             continuation_id: string | null
             continuation_cursor_hash: string | null
@@ -5224,6 +5400,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
                     session_id::text,
                     window_start, window_end, query_hash, intent_state,
                     provider_attempt_id::text, response_hash,
+                    provider_read_authority,
                     continuation_id::text, continuation_cursor_hash,
                     continuation_row_version::text,
                     expires_at
@@ -5249,6 +5426,8 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         || readIntent.intake_action !== input.stageAction
         || readIntent.credential_version !== account.credential_version
         || readIntent.response_hash !== input.capturedResponseHash
+        || readIntent.provider_read_authority
+          !== stageAuthority.rows[0].provider_read_authority
         || !readIntent.provider_attempt_id
         || (
           input.exactExternalOrderIdHash !== undefined
@@ -6927,6 +7106,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
       account,
       envelope: input.envelope,
       actorEmail: input.actorEmail,
+      providerReadAuthority: readIntent.provider_read_authority,
     }, client)
     const stagedIntent = await client.query(
       `UPDATE operations_commerce_intake_read_intents
@@ -7229,18 +7409,6 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
       )
     }
     if (input.unmatchedAction === 'auto_create') {
-      const activation = (
-        await client.query<{
-          state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
-        }>(
-          `SELECT state
-           FROM operations_activation_scopes
-           WHERE organization_id = $1::uuid
-           LIMIT 1
-           FOR UPDATE`,
-          [input.organizationId],
-        )
-      ).rows[0]
       const credential = (
         await client.query<{
           credential_version: number
@@ -7265,13 +7433,6 @@ export async function updateCommerceProductIntakePolicyInPostgres(input: {
         intakeError(
           'COMMERCE_PRODUCT_AUTO_CREATE_CONNECTION_REQUIRED',
           'Verify and repair this commerce connection before turning on automatic product creation',
-          409,
-        )
-      }
-      if (!activation || !['shadow', 'active'].includes(activation.state)) {
-        intakeError(
-          'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-          'Set Operations to Shadow or Active before turning on automatic product creation',
           409,
         )
       }
@@ -8248,6 +8409,21 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         operatorCommandsAllowed: ['shadow', 'active'].includes(
           account.activation_state,
         ),
+        manualProviderReadsAllowed: !['disabled', 'frozen'].includes(
+          account.activation_state,
+        ),
+        localReviewCommandsAllowed: account.activation_state !== 'frozen',
+        storeSync: {
+          desiredState: account.store_sync_desired_state || 'paused',
+          effectiveState: account.store_sync_running ? 'running' : 'paused',
+          effectiveReason:
+            account.store_sync_effective_reason || 'STORE_SYNC_CONTROL_MISSING',
+          explicitChoice: account.store_sync_explicit_choice === true,
+          revision: account.store_sync_revision === null
+            ? null
+            : Number(account.store_sync_revision),
+          reason: account.store_sync_reason,
+        },
         providerWritesAllowed: false,
         syncCursorAdvanceAllowed: false,
         productIntake: productIntakePolicy,
@@ -8579,7 +8755,11 @@ export async function resolveCommerceProductCandidateInPostgres(input: {
     }
     const started = await commandStart(
       client,
-      input,
+      {
+        ...input,
+        automaticStoreSync: Boolean(input.automatic),
+        localReviewCommand: !input.automatic,
+      },
       'commerce.intake.resolve_product_candidate',
       {
         resolution: input.resolution.mode === 'exclude'
@@ -9272,7 +9452,12 @@ async function recordAutomaticProductFailureInPostgres(input: {
     const account = await resolveAccount(client, {
       organizationId: input.runtime.organizationId,
       accountGlobalId: input.runtime.globalId,
+      forUpdate: true,
     })
+    requireCommerceStoreSyncRunning(await lockCommerceStoreSyncState(client, {
+      organizationId: account.organization_id,
+      integrationAccountId: account.id,
+    }))
     const failed = await client.query<{
       global_id: string
       row_version: string
@@ -9347,7 +9532,12 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
     const account = await resolveAccount(client, {
       organizationId: input.runtime.organizationId,
       accountGlobalId: input.runtime.globalId,
+      forUpdate: true,
     })
+    requireCommerceStoreSyncRunning(await lockCommerceStoreSyncState(client, {
+      organizationId: account.organization_id,
+      integrationAccountId: account.id,
+    }))
     const policy = (
       await client.query<ProductIntakePolicyRow>(
         `SELECT policy_version, unmatched_action, revision, updated_at
@@ -9441,7 +9631,10 @@ export async function autoCreateCommerceProductsForRunInPostgres(input: {
       failedByCode[errorCode] = (failedByCode[errorCode] || 0) + 1
       if (
         error instanceof CommerceIntegrationRequestError
-        && error.code === 'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'
+        && (
+          error.code === 'COMMERCE_PRODUCT_AUTO_CREATE_DISABLED'
+          || error.code === 'COMMERCE_STORE_SYNC_PAUSED'
+        )
       ) {
         stoppedBecauseDisabled = true
         break
@@ -9537,10 +9730,10 @@ export async function excludeCommerceIntakeRejectionInPostgres(input: {
       accountGlobalId: input.runtime.globalId,
       forUpdate: true,
     })
-    if (!['shadow', 'active'].includes(account.activation_state)) {
+    if (account.activation_state === 'frozen') {
       intakeError(
-        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-        'Open Operations and set Activation to Shadow or Active before excluding a rejected record',
+        'COMMERCE_INTAKE_FROZEN',
+        'Local rejection review changes are unavailable while Operations is Frozen',
       )
     }
     const requestHash = commandHash({
@@ -9673,7 +9866,7 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
   return withTransaction(async (client) => {
     const started = await commandStart(
       client,
-      input,
+      { ...input, localReviewCommand: true },
       'commerce.intake.resolve_product',
       {
         lineGlobalId: input.lineGlobalId,
@@ -9918,6 +10111,10 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
   idempotencyKey: string
   candidateGlobalId: string
   candidateRowVersion: number
+  automatic?: {
+    source: 'commerce_intake_customer_resolution'
+    runGlobalId: string
+  }
   customer:
     | {
         mode: 'existing'
@@ -9934,9 +10131,13 @@ export async function resolveCommerceCandidateCustomerInPostgres(input: {
   return withTransaction(async (client) => {
     const started = await commandStart(
       client,
-      input,
+      {
+        ...input,
+        automaticStoreSync: Boolean(input.automatic),
+        localReviewCommand: !input.automatic,
+      },
       'commerce.intake.resolve_customer',
-      { customer: input.customer },
+      { customer: input.customer, automatic: input.automatic || null },
     )
     if (started.replayed) return replayPayload(started.receipt)
     const candidate = await lockCandidate(client, input)
@@ -12622,7 +12823,7 @@ export async function validateCommerceCandidateInPostgres(input: {
   return withTransaction(async (client) => {
     const started = await commandStart(
       client,
-      input,
+      { ...input, localReviewCommand: true },
       'commerce.intake.validate',
       { policyVersion: POLICY_VERSION },
     )
@@ -13010,10 +13211,10 @@ export async function markAutomaticFaireOrderPromotionAttentionInPostgres(
         409,
       )
     }
-    if (!['shadow', 'active'].includes(account.activation_state)) {
+    if (!account.store_sync_running) {
       intakeError(
-        'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-        'Open Operations and set Activation to Shadow or Active before resolving or promoting orders',
+        'COMMERCE_STORE_SYNC_PAUSED',
+        `Store sync is Paused (${account.store_sync_effective_reason || 'STORE_SYNC_CONTROL_MISSING'})`,
       )
     }
     await assertCurrentAutomaticFaireOrderCredentialFence(client, {
@@ -13440,7 +13641,7 @@ export async function markCommerceCandidateUnsupportedInPostgres(input: {
     }
     const started = await commandStart(
       client,
-      input,
+      { ...input, localReviewCommand: true },
       'commerce.intake.mark_unsupported',
       {
         reasonCode: safeReasonCode,
@@ -14926,7 +15127,7 @@ reconcilePromotedCommerceCandidateCheckoutRateInPostgres(input: {
   return withTransaction(async (client) => {
     const started = await commandStart(
       client,
-      input,
+      { ...input, localReviewCommand: true },
       'commerce.intake.reconcile_checkout_rate',
       {
         policyVersion: POLICY_VERSION,

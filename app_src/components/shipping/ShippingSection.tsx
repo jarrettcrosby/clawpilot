@@ -38,6 +38,7 @@ import {
 
 import LtlFreightClassAssessmentPanel from '@/components/operations/LtlFreightClassAssessmentPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
+import ShippingOneOffExecutionPanel from '@/components/shipping/ShippingOneOffExecutionPanel'
 import type { OneOffShipmentCreateResult } from '@/lib/operations/oneOffShipments'
 import type {
   ShippingRecord,
@@ -80,12 +81,22 @@ function formatDate(value: string) {
 }
 
 function recordStage(record: ShippingRecord) {
-  if (record.kind === 'shipment_plan') return 'Planned'
+  if (record.kind === 'shipment_plan' && record.status === 'planned') {
+    return record.standaloneOneOffPackEligible ? 'Pack review' : 'Planned'
+  }
+  if (record.kind === 'shipment_plan' && record.status === 'packed') {
+    return 'Postage ready'
+  }
+  if (record.kind === 'shipment_plan') return display(record.status)
   if (record.kind === 'ltl_tender') return 'Tendered'
   return display(record.status)
 }
 
 function recordStageColor(record: ShippingRecord) {
+  if (record.kind === 'shipment_plan' && record.status === 'planned') {
+    return record.standaloneOneOffPackEligible ? 'warning' as const : 'info' as const
+  }
+  if (record.kind === 'shipment_plan' && record.status === 'packed') return 'success' as const
   if (record.kind === 'shipment_plan') return 'info' as const
   if (record.status === 'delivered') return 'success' as const
   if (record.status === 'exception') return 'error' as const
@@ -249,9 +260,15 @@ function ShipmentRecords({
 function RecordDialog({
   record,
   onClose,
+  canCreateShipments,
+  canPurchaseLivePostage,
+  onUpdated,
 }: {
   record: ShippingRecord | null
   onClose: () => void
+  canCreateShipments: boolean
+  canPurchaseLivePostage: boolean
+  onUpdated: () => void | Promise<void>
 }) {
   return (
     <Dialog open={Boolean(record)} onClose={onClose} fullWidth maxWidth="sm">
@@ -294,6 +311,32 @@ function RecordDialog({
                 <Typography key={tracking}>{tracking}</Typography>
               )) : <Typography>None — this is a plan, not a carrier-confirmed shipment.</Typography>}
             </Box>
+            {(record.standaloneOneOffPackEligible
+              || record.standaloneOneOffExecutionEligible)
+              && canCreateShipments ? (
+              <>
+                <Divider />
+                <Box>
+                  <Typography fontWeight={750} sx={{ mb: 1 }}>
+                    One-off pack and postage
+                  </Typography>
+                  <ShippingOneOffExecutionPanel
+                    orderGlobalId={record.orderGlobalId}
+                    canPurchaseLivePostage={canPurchaseLivePostage}
+                    onUpdated={onUpdated}
+                  />
+                </Box>
+              </>
+            ) : (record.standaloneOneOffPackEligible
+              || record.standaloneOneOffExecutionEligible) ? (
+              <Alert severity="info">
+                Create shipments permission is required to confirm physical pack, refresh rates, create labels, or cancel this standalone shipment.
+              </Alert>
+            ) : record.kind === 'shipment_plan' && record.executionMode ? (
+              <Alert severity="info">
+                This plan is not currently eligible for the exact Shipping pack or postage transition. Refresh after resolving its displayed status.
+              </Alert>
+            ) : null}
           </Stack>
         </DialogContent>
       )}
@@ -351,9 +394,9 @@ export default function ShippingSection({
   )
 
   const onCreated = (result: OneOffShipmentCreateResult) => {
-    setNotice(
-      `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. No postage, label, or tracking number was created during planning.`,
-    )
+    setNotice(result.orderStatus === 'packed'
+      ? `Parcel shipment ${result.orderGlobalId} is packed and ready for a current postage quote. No postage, label, or tracking number was created yet.`
+      : `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. Open it in Shipments to physically review and confirm pack; no postage, label, or tracking number was created during planning.`)
     setMode('parcel')
     void loadWorkspace()
   }
@@ -405,7 +448,7 @@ export default function ShippingSection({
               <Stack spacing={1.25} alignItems="flex-start">
                 {!workspace?.capabilities.canCreate && (
                   <Alert severity="warning">
-                    Operations management and warehouse execution permission are required.
+                    Create shipments permission is required.
                   </Alert>
                 )}
                 <Button
@@ -419,6 +462,9 @@ export default function ShippingSection({
                 >
                   Create parcel shipment
                 </Button>
+                <Alert severity="info">
+                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products retain exact reservations, then can be physically reviewed, packed, rerated, labeled, and cancelled entirely in Shipping without Operations activation.
+                </Alert>
               </Stack>
             ) : (
               <Stack spacing={2}>
@@ -430,7 +476,7 @@ export default function ShippingSection({
                   <LtlFreightClassAssessmentPanel />
                 ) : (
                   <Alert severity="warning">
-                    Operations management and warehouse execution permission are required to prepare LTL class evidence.
+                    Create shipments permission is required to prepare LTL class evidence.
                   </Alert>
                 )}
               </Stack>
@@ -473,9 +519,14 @@ export default function ShippingSection({
         open={parcelDialogOpen}
         onClose={() => setParcelDialogOpen(false)}
         onCreated={onCreated}
-        canActivate={Boolean(workspace?.capabilities.canActivate)}
       />
-      <RecordDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} />
+      <RecordDialog
+        record={selectedRecord}
+        onClose={() => setSelectedRecord(null)}
+        canCreateShipments={Boolean(workspace?.capabilities.canCreate)}
+        canPurchaseLivePostage={Boolean(workspace?.capabilities.canPurchaseLivePostage)}
+        onUpdated={loadWorkspace}
+      />
     </Box>
   )
 }

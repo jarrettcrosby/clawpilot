@@ -19,6 +19,12 @@ import {
 import {
   requireCommerceActiveCapabilityClaimInPostgres,
 } from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
+  requireShopifyTestStoreFulfillmentWriteClaimInPostgres,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
+import {
+  requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres,
+} from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_GID = /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
@@ -29,6 +35,9 @@ const SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID =
 const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]*$/
 const SHOPIFY_LOCATION_GID = /^gid:\/\/shopify\/Location\/[1-9][0-9]*$/
 const REQUIRED_SCOPE = 'write_merchant_managed_fulfillment_orders'
+type SandboxE2eAuthorityKind =
+  | 'legacy_packed'
+  | 'shopify_test_store_canonical'
 
 export type ShopifyFulfillmentWritebackInput = {
   organizationId: unknown
@@ -40,6 +49,9 @@ export type ShopifyFulfillmentWritebackInput = {
   notifyCustomer: unknown
   expectedLineItems: unknown
   attemptSignature?: unknown
+  sandboxE2eAuthorizationGlobalId?: unknown
+  sandboxE2eAuthorityKind?: unknown
+  commerceExportGlobalId?: unknown
 }
 
 export type ShopifyFulfillmentAttemptSignature = {
@@ -61,6 +73,7 @@ export type ShopifyFulfillmentAttemptSignature = {
   carrier: string
   trackingNumbers: string[]
   notifyCustomer: boolean
+  sandboxE2eAuthorityKind: SandboxE2eAuthorityKind | null
 }
 
 export type ShopifyFulfillmentWritebackPreparation = {
@@ -90,6 +103,10 @@ export class ShopifyFulfillmentWritebackError extends Error {
 type ShopifyFulfillmentWritebackDependencies = {
   readRuntimeCredential: typeof readCommerceRuntimeCredentialFromPostgres
   requireCapability: typeof requireCommerceActiveCapabilityClaimInPostgres
+  requireTestStoreClaim:
+    typeof requireShopifyTestStoreFulfillmentWriteClaimInPostgres
+  requireLegacySandboxClaim:
+    typeof requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres
   decryptCredential: typeof decryptCommerceCredential
   requestAccessToken: typeof requestShopifyAccessToken
   probeConnection: typeof probeShopifyConnection
@@ -100,6 +117,10 @@ type ShopifyFulfillmentWritebackDependencies = {
 const DEFAULT_DEPENDENCIES: ShopifyFulfillmentWritebackDependencies = {
   readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
   requireCapability: requireCommerceActiveCapabilityClaimInPostgres,
+  requireTestStoreClaim:
+    requireShopifyTestStoreFulfillmentWriteClaimInPostgres,
+  requireLegacySandboxClaim:
+    requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres,
   decryptCredential: decryptCommerceCredential,
   requestAccessToken: requestShopifyAccessToken,
   probeConnection: probeShopifyConnection,
@@ -143,6 +164,21 @@ function normalizedTrackingNumbers(single: unknown, multiple: unknown) {
   return normalized
 }
 
+function sandboxE2eAuthorityKind(value: unknown): SandboxE2eAuthorityKind | null {
+  const normalized = String(value || '').trim()
+  if (!normalized) return null
+  if (
+    normalized !== 'legacy_packed'
+    && normalized !== 'shopify_test_store_canonical'
+  ) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_TEST_E2E_AUTHORITY_KIND_INVALID',
+      'Exact sandbox fulfillment authority kind is invalid',
+    )
+  }
+  return normalized
+}
+
 async function authorizedShopifyFulfillmentWriteback(
   input: ShopifyFulfillmentWritebackInput,
   dependencies: ShopifyFulfillmentWritebackDependencies,
@@ -163,20 +199,90 @@ async function authorizedShopifyFulfillmentWriteback(
   }
   const notifyCustomer = input.notifyCustomer
   const expectedLineItems = normalizeExpectedLineItems(input.expectedLineItems)
-
-  const [fulfillmentClaim, trackingClaim, runtime] = await Promise.all([
-    dependencies.requireCapability({
-      organizationId,
-      accountGlobalId,
-      capability: 'fulfillment_export',
-    }),
-    dependencies.requireCapability({
-      organizationId,
-      accountGlobalId,
-      capability: 'tracking_export',
-    }),
-    dependencies.readRuntimeCredential({ organizationId, accountGlobalId }),
-  ])
+  const authorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
+  const commerceExportGlobalId = String(
+    input.commerceExportGlobalId || '',
+  ).trim() || null
+  const requestedAuthorityKind = sandboxE2eAuthorityKind(
+    input.sandboxE2eAuthorityKind,
+  )
+  if (
+    Boolean(authorizationGlobalId) !== Boolean(commerceExportGlobalId)
+    || (requestedAuthorityKind !== null && !authorizationGlobalId)
+  ) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_TEST_E2E_FULFILLMENT_CLAIM_INVALID',
+      'Exact sandbox authorization, authority kind, and commerce export evidence are required together',
+    )
+  }
+  const runtimePromise = dependencies.readRuntimeCredential({
+    organizationId,
+    accountGlobalId,
+  })
+  let fulfillmentClaim: Awaited<ReturnType<typeof dependencies.requireCapability>> | null = null
+  let trackingClaim: Awaited<ReturnType<typeof dependencies.requireCapability>> | null = null
+  let testStoreClaim: Awaited<ReturnType<typeof dependencies.requireTestStoreClaim>> | null = null
+  let legacySandboxClaim: Awaited<ReturnType<typeof dependencies.requireLegacySandboxClaim>> | null = null
+  let runtime: Awaited<ReturnType<typeof dependencies.readRuntimeCredential>>
+  const claimInput = {
+    organizationId,
+    accountGlobalId,
+    externalOrderId,
+    authorizationGlobalId,
+    commerceExportGlobalId,
+  }
+  if (requestedAuthorityKind === 'shopify_test_store_canonical') {
+    [testStoreClaim, runtime] = await Promise.all([
+      dependencies.requireTestStoreClaim(claimInput),
+      runtimePromise,
+    ])
+  } else if (
+    requestedAuthorityKind === 'legacy_packed'
+    || (authorizationGlobalId && commerceExportGlobalId)
+  ) {
+    [fulfillmentClaim, trackingClaim, legacySandboxClaim, runtime] =
+      await Promise.all([
+        dependencies.requireCapability({
+          organizationId,
+          accountGlobalId,
+          capability: 'fulfillment_export',
+        }),
+        dependencies.requireCapability({
+          organizationId,
+          accountGlobalId,
+          capability: 'tracking_export',
+        }),
+        dependencies.requireLegacySandboxClaim(claimInput),
+        runtimePromise,
+      ])
+  } else {
+    [fulfillmentClaim, trackingClaim, runtime] = await Promise.all([
+      dependencies.requireCapability({
+        organizationId,
+        accountGlobalId,
+        capability: 'fulfillment_export',
+      }),
+      dependencies.requireCapability({
+        organizationId,
+        accountGlobalId,
+        capability: 'tracking_export',
+      }),
+      runtimePromise,
+    ])
+  }
+  const authorityKind = testStoreClaim
+    ? 'shopify_test_store_canonical' as const
+    : legacySandboxClaim
+      ? 'legacy_packed' as const
+      : null
+  const allowLegacySignatureWithoutAuthorityKind = Boolean(
+    authorityKind === 'legacy_packed'
+    && requestedAuthorityKind === null
+    && legacySandboxClaim
+    && legacySandboxClaim.authorityKindPersisted === false,
+  )
   if (!runtime || runtime.provider !== 'shopify' || runtime.status !== 'active'
       || runtime.verificationStatus !== 'verified') {
     throw new ShopifyFulfillmentWritebackError(
@@ -184,8 +290,42 @@ async function authorizedShopifyFulfillmentWriteback(
       'A verified active Shopify connection is required',
     )
   }
-  if (
-    fulfillmentClaim.activationRevision !== trackingClaim.activationRevision
+  if (testStoreClaim) {
+    if (
+      notifyCustomer !== false
+      || runtime.environment !== 'sandbox'
+      || testStoreClaim.authorityKind
+        !== 'shopify_test_store_canonical'
+      || testStoreClaim.notifyCustomer !== false
+      || testStoreClaim.credentialGeneration !== runtime.credentialVersion
+      || testStoreClaim.externalAccountId !== runtime.externalAccountId
+    ) {
+      throw new ShopifyFulfillmentWritebackError(
+        'SHOPIFY_TEST_E2E_FULFILLMENT_AUTHORIZATION_STALE',
+        'Exact Shopify test-store fulfillment authority is stale or unsafe',
+      )
+    }
+  } else if (
+    !fulfillmentClaim
+    || !trackingClaim
+    || (
+      authorityKind === 'legacy_packed'
+      && (
+        !legacySandboxClaim
+        || legacySandboxClaim.authorityKind !== 'legacy_packed'
+        || legacySandboxClaim.notifyCustomer !== false
+        || (
+          requestedAuthorityKind === 'legacy_packed'
+          && legacySandboxClaim.authorityKindPersisted !== true
+        )
+        || (
+          requestedAuthorityKind === null
+          && legacySandboxClaim.authorityKindPersisted !== false
+        )
+        || notifyCustomer !== false
+      )
+    )
+    || fulfillmentClaim.activationRevision !== trackingClaim.activationRevision
     || fulfillmentClaim.credentialGeneration !== runtime.credentialVersion
     || trackingClaim.credentialGeneration !== runtime.credentialVersion
   ) {
@@ -240,6 +380,8 @@ async function authorizedShopifyFulfillmentWriteback(
       carrier,
       notifyCustomer,
       expectedLineItems,
+      sandboxE2eAuthorityKind: authorityKind,
+      allowLegacySignatureWithoutAuthorityKind,
     },
   }
 }
@@ -364,6 +506,8 @@ type ProviderWriteInput = {
   carrier: string
   notifyCustomer: boolean
   expectedLineItems: Array<{ lineItemId: string; quantity: number }>
+  sandboxE2eAuthorityKind: SandboxE2eAuthorityKind | null
+  allowLegacySignatureWithoutAuthorityKind: boolean
 }
 
 type ObservedFulfillment = {
@@ -530,6 +674,7 @@ function canonicalSignature(input: {
   carrier: string
   trackingNumbers: string[]
   notifyCustomer: boolean
+  sandboxE2eAuthorityKind: SandboxE2eAuthorityKind | null
 }): ShopifyFulfillmentAttemptSignature {
   const fulfillmentOrders = input.fulfillmentOrders
     .map((fulfillmentOrder) => ({
@@ -555,6 +700,7 @@ function canonicalSignature(input: {
     carrier: input.carrier,
     trackingNumbers: sortedUnique(input.trackingNumbers),
     notifyCustomer: input.notifyCustomer,
+    sandboxE2eAuthorityKind: input.sandboxE2eAuthorityKind ?? null,
   }
 }
 
@@ -636,16 +782,48 @@ function normalizeAttemptSignature(
   if (typeof signature.notifyCustomer !== 'boolean') {
     return signatureInvalid('Shopify fulfillment notification signature is invalid')
   }
+  const authorityKind = sandboxE2eAuthorityKind(
+    signature.sandboxE2eAuthorityKind,
+  )
   const normalized = canonicalSignature({
     externalOrderId,
     fulfillmentOrders,
     carrier,
     trackingNumbers,
     notifyCustomer: signature.notifyCustomer,
+    sandboxE2eAuthorityKind: authorityKind,
   })
   const suppliedLineItems = normalizeExpectedLineItems(signature.lineItems)
   if (JSON.stringify(normalized.lineItems) !== JSON.stringify(suppliedLineItems)) {
     return signatureInvalid('Shopify fulfillment aggregate line-item signature is invalid')
+  }
+  return normalized
+}
+
+function normalizeAttemptSignatureForInput(
+  value: unknown,
+  input: ProviderWriteInput,
+) {
+  const normalized = normalizeAttemptSignature(value)
+  const omittedAuthorityKind = Boolean(
+    value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && !Object.prototype.hasOwnProperty.call(
+      value,
+      'sandboxE2eAuthorityKind',
+    ),
+  )
+  if (
+    input.allowLegacySignatureWithoutAuthorityKind === true
+    && input.sandboxE2eAuthorityKind === 'legacy_packed'
+    && omittedAuthorityKind
+    && normalized.sandboxE2eAuthorityKind === null
+  ) {
+    return {
+      ...normalized,
+      sandboxE2eAuthorityKind: 'legacy_packed' as const,
+    }
   }
   return normalized
 }
@@ -667,6 +845,7 @@ function requireSignatureMatchesInput(
     trackingNumbers: sortedUnique(input.trackingNumbers),
     lineItems: input.expectedLineItems,
     notifyCustomer: input.notifyCustomer,
+    sandboxE2eAuthorityKind: input.sandboxE2eAuthorityKind ?? null,
   }
   if (
     signature.externalOrderId !== requestShape.externalOrderId
@@ -674,6 +853,8 @@ function requireSignatureMatchesInput(
     || JSON.stringify(signature.trackingNumbers) !== JSON.stringify(requestShape.trackingNumbers)
     || JSON.stringify(signature.lineItems) !== JSON.stringify(requestShape.lineItems)
     || signature.notifyCustomer !== requestShape.notifyCustomer
+    || signature.sandboxE2eAuthorityKind
+      !== requestShape.sandboxE2eAuthorityKind
   ) {
     throw new ShopifyFulfillmentWritebackError(
       'SHOPIFY_FULFILLMENT_SIGNATURE_INPUT_MISMATCH',
@@ -795,6 +976,7 @@ function deriveOpenFulfillmentPlan(
     carrier: input.carrier,
     trackingNumbers: input.trackingNumbers,
     notifyCustomer: input.notifyCustomer,
+    sandboxE2eAuthorityKind: input.sandboxE2eAuthorityKind,
   })
   return {
     signature,
@@ -961,7 +1143,7 @@ export async function writeShopifyFulfillment(
 ): Promise<ShopifyFulfillmentWritebackResult> {
   const suppliedSignature = attemptSignature === undefined
     ? null
-    : normalizeAttemptSignature(attemptSignature)
+    : normalizeAttemptSignatureForInput(attemptSignature, input)
   if (suppliedSignature) requireSignatureMatchesInput(suppliedSignature, input)
   const inspection = await inspectShopifyFulfillment(credential, input)
 
@@ -1155,7 +1337,7 @@ export async function readShopifyFulfillment(
       'Shopify fulfillment reconciliation requires the prepared attempt signature',
     )
   }
-  const signature = normalizeAttemptSignature(attemptSignature)
+  const signature = normalizeAttemptSignatureForInput(attemptSignature, input)
   requireSignatureMatchesInput(signature, input)
   const inspection = await inspectShopifyFulfillment(credential, input)
   return findExactExistingFulfillment(

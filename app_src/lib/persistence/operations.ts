@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   executeShopifyFulfillmentWriteback,
@@ -38,6 +39,10 @@ import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  requireActiveShopifyTestStoreCanonicalE2eAuthorization,
+  requireExactShopifyTestStoreConfirmedLabelSnapshot,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
+import {
   assertCommerceOrderRevisionExecutionCurrent,
   CommerceOrderRevisionGateError,
 } from '@/lib/persistence/commerceOrderRevisions'
@@ -54,6 +59,7 @@ import {
   cartonizeSinglePackage,
   DeterministicFulfillmentOptimizer,
   operationsOrderReplanningActionAvailability,
+  operationsOrderReplanningProfileAllowsCorrection,
   priceContract,
   selectPromiseRate,
 } from '@/lib/operations/domain'
@@ -136,7 +142,6 @@ import {
 } from '@/lib/persistence/cartonizationRateEvidence'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
 import { readShadowFulfillmentPreparation } from '@/lib/persistence/operationShadowFulfillmentPreparation'
-import { assertNoOpenOperationsShadowTrainingRunsForActivation } from '@/lib/persistence/operationShadowTraining'
 import { readDefaultProductPackagingWithClient } from '@/lib/persistence/productPackaging'
 import {
   acquireTransactionAdvisoryLock,
@@ -144,9 +149,6 @@ import {
   withTransaction,
 } from '@/lib/persistence/postgres'
 import {
-  lockShopifyCarrierServiceConfigWritersForActivationWithClient,
-  rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient,
-  ShopifyCheckoutRatingPersistenceError,
   shopifyCheckoutRateLineageIsRequired,
   shopifyCheckoutRateOutcomeAllowsFulfillment,
   type ShopifyCheckoutRateReconciliationOutcome,
@@ -1333,6 +1335,11 @@ export async function resolveCommerceCustomerInPostgres(input: {
   integrationAccountGlobalId: string
   actorEmail: string
   identity: CommerceCustomerIdentity
+  automaticStoreSync?: {
+    source: 'commerce_intake_customer_resolution'
+    runGlobalId: string
+    candidateGlobalId: string
+  }
 }): Promise<CommerceCustomerResolution> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = trimmed(input.actorEmail, 320).toLowerCase()
@@ -1368,6 +1375,35 @@ export async function resolveCommerceCustomerInPostgres(input: {
         'Select an active commerce integration for this provider',
         404,
       )
+    }
+    if (input.automaticStoreSync) {
+      const automaticAuthority = await client.query<{ running: boolean }>(
+        `SELECT operations_commerce_store_sync_is_running(
+           account.organization_id,
+           account.id
+         ) AS running
+         FROM operations_integration_accounts account
+         JOIN operations_commerce_store_sync_controls control
+           ON control.organization_id = account.organization_id
+          AND control.integration_account_id = account.id
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = account.organization_id
+         WHERE account.organization_id = $1::uuid
+           AND account.id = $2::uuid
+           AND account.global_id = $3
+           AND account.integration_type = 'commerce'
+           AND account.provider = $4
+         LIMIT 1
+         FOR UPDATE OF account, control, activation`,
+        [organizationId, integration.id, integrationAccountGlobalId, provider],
+      )
+      if (automaticAuthority.rows[0]?.running !== true) {
+        throw new OperationsRequestError(
+          'COMMERCE_STORE_SYNC_PAUSED',
+          'Store sync is Paused for this automatic commerce customer resolution',
+          409,
+        )
+      }
     }
     const pipeline = await resolvePipeline(client, organizationId)
     const mapped = await client.query<CustomerIdentityRow>(
@@ -2659,7 +2695,7 @@ async function readOperationsOrderReplanningProjection(
     ...overrides,
   })
   if (
-    activation.state !== 'active'
+    !operationsOrderReplanningProfileAllowsCorrection(activation.state)
     || !input.canManage
     || !input.canExecute
     || !['shopify', 'faire'].includes(order.source_provider)
@@ -3816,6 +3852,11 @@ async function readOrderDetail(
       unresolvedLabelAttemptCount: Number(row.unresolved_label_attempt_count),
       existingShipmentCount: Number(row.existing_shipment_count),
       sandboxE2eAuthorized: Boolean(sandboxCommerceE2eAuthorization),
+      sandboxE2eAuthorityKind:
+        sandboxCommerceE2eAuthorization?.authorityKind || null,
+      sandboxE2eFulfillmentConfirmed: Boolean(
+        sandboxCommerceE2eAuthorization?.fulfillmentConfirmedAt,
+      ),
       nativeOneOffGroupReady: nativeOneOffShipmentAvailability.ready,
       nativeOneOffGroupBlockedReason:
         nativeOneOffShipmentAvailability.blockedReason,
@@ -3829,6 +3870,9 @@ async function readOrderDetail(
             sandboxCommerceE2eAuthorization.authorizationGlobalId,
           authorizedAt: sandboxCommerceE2eAuthorization.authorizedAt,
           expiresAt: sandboxCommerceE2eAuthorization.expiresAt,
+          authorityKind: sandboxCommerceE2eAuthorization.authorityKind,
+          fulfillmentConfirmedAt:
+            sandboxCommerceE2eAuthorization.fulfillmentConfirmedAt,
         }
       : null,
     fulfillmentPreparation,
@@ -4014,7 +4058,10 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const activation = await withTransaction((client) => resolveActivation(client, organizationId))
+  const [activation, storeSync] = await Promise.all([
+    withTransaction((client) => resolveActivation(client, organizationId)),
+    readCommerceStoreSyncControlsFromPostgres(organizationId),
+  ])
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid', 'orders.archived_at IS NULL']
   const exceptionValues: unknown[] = [organizationId]
@@ -4542,6 +4589,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       reason: activation.reason,
       updatedAt: activation.updated_at.toISOString(),
     },
+    storeSync,
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),
@@ -5630,10 +5678,6 @@ export async function updateOperationsActivationInPostgres(input: {
         client,
         `commerce-active-transition:${organizationId}`,
       )
-      await lockShopifyCarrierServiceConfigWritersForActivationWithClient(
-        client,
-        organizationId,
-      )
     }
     if (input.expectedCurrentState !== undefined) {
       const observed = await client.query<{
@@ -5661,10 +5705,6 @@ export async function updateOperationsActivationInPostgres(input: {
     }
     const current = await resolveActivation(client, organizationId, true)
     if (input.state === 'active') {
-      await assertNoOpenOperationsShadowTrainingRunsForActivation(
-        client,
-        organizationId,
-      )
       const sandboxPlan = await client.query<{ global_id: string }>(
         `SELECT plan.global_id
          FROM operations_fulfillment_plans plan
@@ -5746,31 +5786,6 @@ export async function updateOperationsActivationInPostgres(input: {
       [organizationId, input.state, reason, actorEmail],
     )
     const updated = await resolveActivation(client, organizationId)
-    let shadowCarrierServiceRebindings: Awaited<ReturnType<
-      typeof rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient
-    >> = []
-    if (input.state === 'shadow') {
-      try {
-        shadowCarrierServiceRebindings =
-          await rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(
-            client,
-            {
-              organizationId,
-              targetActivationRevision: updated.revision,
-              actorEmail,
-            },
-          )
-      } catch (error) {
-        if (error instanceof ShopifyCheckoutRatingPersistenceError) {
-          throw new OperationsRequestError(
-            error.code,
-            error.message,
-            error.status,
-          )
-        }
-        throw error
-      }
-    }
     await recordAuditEvent({
       actor: actorEmail,
       eventType: 'operations.activation.updated',
@@ -5785,21 +5800,6 @@ export async function updateOperationsActivationInPostgres(input: {
         revision: updated.revision,
         reason: updated.reason,
         dataPipelineId: updated.data_pipeline_id,
-        carrierServiceRebindings: shadowCarrierServiceRebindings.map(
-          (rebound) => ({
-            configGlobalId: rebound.configGlobalId,
-            accountGlobalId: rebound.accountGlobalId,
-            serviceGid: rebound.serviceGid,
-            fromActivationRevision: rebound.fromActivationRevision,
-            activationRevision: rebound.activationRevision,
-            fromRowVersion: rebound.fromRowVersion,
-            rowVersion: rebound.rowVersion,
-            callbackTokenVersionRetained:
-              rebound.callbackTokenVersion,
-            providerWrites: 0,
-            callbackTokenRotations: 0,
-          }),
-        ),
       },
     }, client)
     return activationPayload(updated)
@@ -11535,6 +11535,7 @@ export async function planOperationsOrderFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsPlanCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -11544,6 +11545,9 @@ export async function planOperationsOrderFromPostgres(input: {
   ).trim()
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) {
     throw new OperationsRequestError(
       'OPERATIONS_ACTOR_REQUIRED',
@@ -11635,6 +11639,7 @@ export async function planOperationsOrderFromPostgres(input: {
       cartonizationEvidenceGlobalId: evidenceGlobalId,
       expectedRowVersion: input.expectedRowVersion,
       reason,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -11675,7 +11680,10 @@ export async function planOperationsOrderFromPostgres(input: {
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before planning warehouse work',
@@ -11788,6 +11796,16 @@ export async function planOperationsOrderFromPostgres(input: {
           'This order changed after it was opened. Refresh it before planning warehouse work.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'imported',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -13436,6 +13454,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
   reason: string
   idempotencyKey: string
   assignedTo?: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -13443,6 +13462,9 @@ export async function releaseOperationsOrderFromPostgres(input: {
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   const explicitAssignedTo = String(input.assignedTo || '').trim().toLowerCase()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   const assignedTo = explicitAssignedTo || actorEmail
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
@@ -13469,6 +13491,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
       expectedRowVersion: input.expectedRowVersion,
       reason,
       assignedTo,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
   })
@@ -13484,7 +13507,10 @@ export async function releaseOperationsOrderFromPostgres(input: {
       )
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before releasing warehouse work',
@@ -13516,6 +13542,16 @@ export async function releaseOperationsOrderFromPostgres(input: {
           'This order changed after it was opened. Refresh the order before releasing it.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'planned',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -13859,6 +13895,7 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
   assignedTo: string
   reason: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -13866,6 +13903,9 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
   const assignedTo = String(input.assignedTo || '').trim().toLowerCase()
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -13892,6 +13932,7 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
       expectedRowVersion: input.expectedRowVersion,
       assignedTo,
       reason,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -13906,6 +13947,17 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
+      const activation = await resolveActivation(client, organizationId)
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before assigning warehouse work',
+          409,
+        )
+      }
       await requireEligibleOperationsPicker(client, organizationId, assignedTo)
       const orderResult = await client.query<OrderIdentityRow>(
         `SELECT id::text, global_id, status, row_version::text
@@ -13924,6 +13976,16 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
           'This order changed before the picker assignment was saved. Refresh and try again.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'released',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -15463,11 +15525,15 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
   expectedRowVersion: number
   scanEvidence: WearablePickTaskScanEvidenceInput[]
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<WearablePickScanEvidenceCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -15493,6 +15559,7 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
       orderGlobalId,
       expectedRowVersion: input.expectedRowVersion,
       scanEvidence: input.scanEvidence,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -15508,7 +15575,10 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before recording warehouse scans',
@@ -15535,6 +15605,16 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
           'The order changed after its scan queue was loaded. Refresh and scan again.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'released',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -17062,6 +17142,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   countEvidenceIdempotencyKey?: string
   countEvidence?: WearablePickTaskCountEvidenceInput[]
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -17075,6 +17156,9 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
   ).trim() || undefined
   const countEvidence = input.countEvidence
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -17127,6 +17211,7 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
       scanEvidenceIdempotencyKey: scanEvidenceIdempotencyKey || null,
       countEvidenceIdempotencyKey: countEvidenceIdempotencyKey || null,
       countEvidence: countEvidence || null,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
     targetGlobalId: orderGlobalId,
@@ -17145,7 +17230,10 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
         )
       }
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before confirming warehouse work',
@@ -17170,6 +17258,16 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           'This order changed after it was opened. Refresh the order before confirming picks.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'released',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -17641,12 +17739,16 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
   expectedRowVersion: number
   reason: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsOrderCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const reason = String(input.reason || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
   if (!actorEmail) throw new OperationsRequestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
   if (!/^gor(?:[0-9]{7}|[0-9a-v]{12})$/.test(orderGlobalId)) {
     throw new OperationsRequestError('OPERATIONS_ORDER_INVALID', 'Order is invalid')
@@ -17665,7 +17767,12 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
     organizationId,
     commandType: 'verify_operations_order_pack',
     idempotencyKey,
-    requestHash: commandRequestHash({ orderGlobalId, expectedRowVersion: input.expectedRowVersion, reason }),
+    requestHash: commandRequestHash({
+      orderGlobalId,
+      expectedRowVersion: input.expectedRowVersion,
+      reason,
+      sandboxE2eAuthorizationGlobalId,
+    }),
     actorEmail,
   })
   if (command.completed) {
@@ -17676,7 +17783,10 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before verifying packages',
@@ -17707,6 +17817,16 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
           'This order changed after it was opened. Refresh the order before verifying packages.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId,
+          actorEmail,
+          expectedOrderRowVersion: input.expectedRowVersion,
+          expectedOrderStatus: 'picking',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -17984,12 +18104,16 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
   packageGlobalId: string
   expectedRowVersion: number
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId?: string | null
 }): Promise<OperationsPackingSlipCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
   const orderGlobalId = String(input.orderGlobalId || '').trim()
   const packageGlobalId = String(input.packageGlobalId || '').trim()
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const sandboxE2eAuthorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim()
   if (!actorEmail) {
     throw new OperationsRequestError(
       'OPERATIONS_ACTOR_REQUIRED',
@@ -18033,6 +18157,7 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
       orderGlobalId,
       packageGlobalId,
       expectedRowVersion: input.expectedRowVersion,
+      sandboxE2eAuthorizationGlobalId,
     }),
     actorEmail,
   })
@@ -18047,7 +18172,10 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         `operations:package-packing-list:${organizationId}:${packageGlobalId}`,
       )
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before generating warehouse documents',
@@ -18146,6 +18274,16 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           'This order changed after it was opened. Refresh before generating the Pack Work Instruction.',
           409,
         )
+      }
+      if (sandboxE2eAuthorizationGlobalId) {
+        await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+          organizationId,
+          actorEmail,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderGlobalId: source.order_global_id,
+          expectedOrderRowVersion: Number(source.row_version),
+          expectedOrderStatus: 'packed',
+        })
       }
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
@@ -19184,6 +19322,13 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         carrier,
         notifyCustomer: claimed.decision.notifyCustomer === true,
         expectedLineItems: snapshot.shippedLines,
+        sandboxE2eAuthorizationGlobalId:
+          snapshot.sandboxE2eAuthorizationGlobalId,
+        sandboxE2eAuthorityKind: snapshot.sandboxE2eAuthorityKind,
+        commerceExportGlobalId:
+          snapshot.sandboxE2eAuthorizationGlobalId == null
+            ? null
+            : claimed.row.global_id,
       }
       if (claimed.recoveryMode === 'reconcile_only') {
         if (!claimed.row.provider_attempt_request) {
@@ -20043,7 +20188,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
       const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
+      if (
+        !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
         throw new OperationsRequestError(
           'OPERATIONS_EXECUTION_STATE_INVALID',
           'Set Operations to Shadow or Active before confirming shipments',
@@ -20131,14 +20279,56 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       }
       let resolvedCustomerNotification: OperationsCustomerNotificationDecision
       let sandboxE2eAuthorizationValidated = false
+      let canonicalShopifyTestAuthorizationValidated = false
+      let sandboxE2eAuthorityKind:
+        | 'legacy_packed'
+        | 'shopify_test_store_canonical'
+        | null = null
       if (sandboxE2eAuthorizationGlobalId) {
-        await requireActiveSandboxCommerceE2eAuthorization(client, {
+        const sandboxAuthority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId,
           authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
           orderGlobalId,
           actorEmail,
         })
+        if (
+          sandboxAuthority.confirmation_statement_version
+            === 'shopify-test-store-canonical-e2e-v1'
+        ) {
+          await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+            organizationId,
+            authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+            orderGlobalId,
+            actorEmail,
+            expectedOrderRowVersion: input.expectedRowVersion,
+            expectedOrderStatus: 'packed',
+            requireFulfillmentConfirmation: true,
+          })
+          canonicalShopifyTestAuthorizationValidated = true
+          sandboxE2eAuthorityKind = 'shopify_test_store_canonical'
+        } else if (
+          sandboxAuthority.confirmation_statement_version
+            === 'sandbox-commerce-e2e-v1'
+        ) {
+          sandboxE2eAuthorityKind = 'legacy_packed'
+        } else {
+          throw new OperationsRequestError(
+            'OPERATIONS_SANDBOX_E2E_AUTHORITY_KIND_INVALID',
+            'Sandbox E2E authorization has an unsupported authority kind',
+            409,
+          )
+        }
         sandboxE2eAuthorizationValidated = true
+      }
+      if (
+        activation.state === 'read_only'
+        && !canonicalShopifyTestAuthorizationValidated
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+          'Read only shipment confirmation requires the exact current Shopify test-store authorization and second fulfillment confirmation',
+          403,
+        )
       }
       if (order.source_provider === 'shopify') {
         if (!order.integration_account_id) {
@@ -20455,6 +20645,23 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           'Every package must use the same carrier and service',
           409,
         )
+      }
+      if (
+        canonicalShopifyTestAuthorizationValidated
+        && sandboxE2eAuthorizationGlobalId
+        && order.source_provider === 'shopify'
+      ) {
+        await requireExactShopifyTestStoreConfirmedLabelSnapshot(client, {
+          organizationId,
+          authorizationGlobalId: sandboxE2eAuthorizationGlobalId,
+          orderId: order.id,
+          labels: labelResult.rows.map((item) => ({
+            packageGlobalId: item.package_global_id,
+            labelGlobalId: item.global_id,
+            trackingNumber: item.tracking_number,
+            environment: item.environment,
+          })),
+        })
       }
 
       const blockingResult = await client.query<QueryResultRow & { count: string }>(
@@ -20890,6 +21097,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         serviceCode: shipment.service_code,
         shippedAt,
         sandboxE2eAuthorizationGlobalId,
+        sandboxE2eAuthorityKind,
         oneOffCarrierGroupGlobalId:
           nativeOneOffAuthority?.groupAttemptGlobalId || null,
         oneOffSelectedAmountMinor:

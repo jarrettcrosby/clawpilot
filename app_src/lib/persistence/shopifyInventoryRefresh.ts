@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -14,6 +15,7 @@ const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
 )
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const INVENTORY_READABLE_CONNECTION_SQL = `(
   COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
     ?| ARRAY['read_inventory', 'write_inventory']
@@ -564,7 +566,6 @@ function currentFenceSql(jobAlias = 'job') {
      AND mapping.inventory_pool_id = ${jobAlias}.inventory_pool_id
     JOIN operations_activation_scopes activation
       ON activation.organization_id = ${jobAlias}.organization_id
-     AND activation.revision = ${jobAlias}.activation_revision
      AND (
        ${jobAlias}.location_mapping_id IS NULL
        OR mapping.id IS NOT NULL
@@ -581,13 +582,8 @@ function currentFenceSql(jobAlias = 'job') {
                ${jobAlias}.integration_account_id
        )
      )
-     AND (
-       (config.registration_state = 'registered'
-         AND activation.state IN ('shadow', 'active'))
-       OR
-       (config.registration_state = 'shadow_simulated'
-         AND activation.state = 'shadow')
-     )
+     AND ${STORE_SYNC_RUNNING_SQL}
+     AND config.registration_state IN ('registered', 'shadow_simulated')
   `
 }
 
@@ -659,18 +655,10 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
              AND credential.credential_version =
                  job.credential_generation
              AND credential.verification_status = 'verified'
-             AND activation.revision = job.activation_revision
-             AND (
-               (config.registration_state = 'registered'
-                 AND activation.state IN ('shadow', 'active'))
-               OR
-               (config.registration_state = 'shadow_simulated'
-                 AND activation.state = 'shadow')
+             AND config.registration_state IN (
+               'registered', 'shadow_simulated'
              )
              AND ${INVENTORY_READABLE_CONNECTION_SQL}
-             AND operations_shopify_carrier_service_config_is_ready(
-               config.organization_id, config.id
-             )
              AND (
                job.location_mapping_id IS NULL
                OR mapping.id IS NOT NULL
@@ -726,16 +714,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                config.credential_generation
            AND credential.credential_version = config.credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.revision = config.activation_revision
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
            )
            AND ${INVENTORY_READABLE_CONNECTION_SQL}
-           AND operations_shopify_carrier_service_config_is_ready(
+           AND operations_shopify_inventory_read_config_is_ready(
              config.organization_id, config.id
            )
        )
@@ -922,16 +906,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
                config.credential_generation
            AND credential.credential_version = config.credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.revision = config.activation_revision
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
            )
            AND ${INVENTORY_READABLE_CONNECTION_SQL}
-           AND operations_shopify_carrier_service_config_is_ready(
+           AND operations_shopify_inventory_read_config_is_ready(
              config.organization_id, config.id
            )
        )
@@ -1135,7 +1115,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
              AND job.available_at <= now()
              AND job.cancel_requested = false
              AND ${INVENTORY_READABLE_CONNECTION_SQL}
-             AND operations_shopify_carrier_service_config_is_ready(
+             AND operations_shopify_inventory_read_config_is_ready(
                config.organization_id, config.id
              )
              AND NOT EXISTS (
@@ -1256,7 +1236,7 @@ async function currentJobFence(
        AND job.lease_expires_at > now()
        AND job.cancel_requested = false
        AND ${INVENTORY_READABLE_CONNECTION_SQL}
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_inventory_read_config_is_ready(
          config.organization_id, config.id
        )
      FOR UPDATE OF job`,
@@ -1689,6 +1669,41 @@ export async function failShopifyInventoryRefreshJobInPostgres(input: {
   return outcome
 }
 
+export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
+  input: { job: ShopifyInventoryRefreshJob },
+) {
+  const parked = await query(
+    `UPDATE operations_shopify_inventory_refresh_jobs
+     SET status = CASE
+           WHEN location_mapping_id IS NULL THEN 'pending'
+           ELSE 'mapped_pending'
+         END,
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         cancel_requested = false,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         completed_at = NULL,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND organization_id = $2::uuid
+       AND integration_account_id = $3::uuid
+       AND status IN ('processing', 'mapped_processing')
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.job.id,
+      input.job.organizationId,
+      input.job.integrationAccountId,
+      input.job.lockToken,
+    ],
+  )
+  return { parked: parked.rowCount === 1 }
+}
+
 export async function recordShopifyInventoryRefreshWorkerHeartbeatInPostgres(
   details: Record<string, unknown>,
 ) {
@@ -1753,7 +1768,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = config.organization_id
-       WHERE operations_shopify_carrier_service_config_is_ready(
+       WHERE operations_shopify_inventory_read_config_is_ready(
            config.organization_id, config.id
          )
          AND config.registration_state IN (
@@ -1767,13 +1782,9 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
          AND credential.credential_version =
              config.credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.revision = config.activation_revision
-         AND (
-           (config.registration_state = 'registered'
-             AND activation.state IN ('shadow', 'active'))
-           OR
-           (config.registration_state = 'shadow_simulated'
-             AND activation.state = 'shadow')
+         AND ${STORE_SYNC_RUNNING_SQL}
+         AND config.registration_state IN (
+           'registered', 'shadow_simulated'
          )
          AND ${INVENTORY_READABLE_CONNECTION_SQL}
      ),

@@ -208,7 +208,9 @@ function loadOperationalGeometryRatePlan() {
 function loadOperationalFaireRoute(
   observed,
   {
+    activationState = 'shadow',
     providers = ['ups_rest', 'fedex_rest'],
+    operationalGeometry = false,
     sandboxGeometry = false,
     planTransform = null,
     shadowTraining = false,
@@ -251,7 +253,7 @@ function loadOperationalFaireRoute(
     .digest('hex')
   const cartonizationRead = {
     organizationGlobalId: 'ga0000001',
-    activationState: 'shadow',
+    activationState,
     readAt: '2026-08-02T20:00:00.000Z',
     account: {
       globalId: 'gia0000001',
@@ -378,7 +380,7 @@ function loadOperationalFaireRoute(
       }],
     },
   }
-  let plan = sandboxGeometry ? {
+  let plan = sandboxGeometry || operationalGeometry ? {
     policyVersion: 'hybrid-cartonization-policy-v1',
     algorithmVersion: 'approved-recipe-v1',
     inputHash: 'a'.repeat(64),
@@ -525,6 +527,41 @@ function loadOperationalFaireRoute(
     },
     '@/lib/operations/operationalGeometryCartonization': {
       planOperationalGeometryRatePackages: async () => {
+        if (operationalGeometry) {
+          observed.geometryCalls = (observed.geometryCalls || 0) + 1
+          return {
+            status: 'ready',
+            packages: [{
+              packageKey: 'geometry-package-1',
+              packageSequence: 1,
+              planningMethod: 'or_tools',
+              packagingMaterialGlobalId: 'gmat0000001',
+              materialRowVersion: 2,
+              recipes: [],
+              orToolsProfiles: [],
+              innerDimensionsMm: {
+                length: 270,
+                width: 220,
+                height: 170,
+              },
+              ratedOuterDimensionsMm: {
+                length: 280,
+                width: 230,
+                height: 180,
+              },
+              contentWeightGrams: 400,
+              tareWeightGrams: 120,
+              ratedGrossWeightGrams: 520,
+              maxWeightGrams: 5000,
+              allocations: [{
+                lineGlobalId: 'gcol0000001',
+                productGlobalId: 'gpr0000001',
+                title: 'Shopify training product',
+                quantity: 1,
+              }],
+            }],
+          }
+        }
         throw new Error(
           'The recipe and sandbox route fixtures must not use operational geometry',
         )
@@ -596,6 +633,12 @@ function loadOperationalFaireRoute(
     '@/lib/persistence/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityPersistenceError: PersistenceError,
       readOperationalOrderPlanningProviderFromPostgres: async () => sourceProvider,
+    },
+    '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+      ShopifyTestStoreCanonicalE2ePersistenceError: PersistenceError,
+      assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres: async () => {
+        throw new Error('Unexpected Shopify test-store planning authorization')
+      },
     },
     '@/lib/persistence/operationShadowTraining': {
       assertOperationsShadowTrainingEvidenceRequestInPostgres: async (input) => {
@@ -965,6 +1008,7 @@ const operationalGeometryFence = section(
   'Operational geometry fence',
 )
 assertIncludes(operationalGeometryFence, [
+  '!request.shadowTraining',
   "read.activationState !== 'shadow'",
   'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
   'configuredOrToolsFulfillmentOptimizer()',
@@ -2306,6 +2350,81 @@ assert.equal(
   trainingRouteObserved.write.planSnapshot.shadowTraining.commerceProviderWrites,
   0,
 )
+
+for (const activationState of [
+  'disabled',
+  'shadow',
+  'read_only',
+  'active',
+  'frozen',
+]) {
+  const geometryTrainingObserved = {
+    carrierReads: [],
+    readInput: null,
+    write: null,
+    sequence: [],
+    shopifyAuthorityCalls: 0,
+    trainingAuthorization: null,
+    geometryCalls: 0,
+  }
+  const geometryTrainingRoute = loadOperationalFaireRoute(
+    geometryTrainingObserved,
+    {
+      activationState,
+      providers: ['ups_rest'],
+      operationalGeometry: true,
+      shadowTraining: true,
+      sourceProvider: 'shopify',
+      zeroMaterialStock: true,
+    },
+  )
+  const geometryTrainingResponse = await geometryTrainingRoute.POST(
+    new Request(
+      'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          accountGlobalId: 'gia0000001',
+          candidateGlobalId: 'gcoc0000001',
+          expectedCandidateRowVersion: 1,
+          warehouseGlobalId: 'gwh0000001',
+          idempotencyKey:
+            `order-training-geometry-${activationState}`,
+          evidenceMode: 'operational',
+          selectedMaterials: [{
+            materialGlobalId: 'gmat0000001',
+            expectedRowVersion: 2,
+          }],
+          shadowTraining: {
+            runGlobalId: 'gtrn0000001',
+            expectedRowVersion: 0,
+          },
+        }),
+      },
+    ),
+  )
+  assert.equal(
+    geometryTrainingResponse.status,
+    200,
+    `${activationState} must permit exact local geometry training`,
+  )
+  assert.equal(geometryTrainingObserved.geometryCalls, 1)
+  assert.equal(geometryTrainingObserved.shopifyAuthorityCalls, 0)
+  assert.equal(geometryTrainingObserved.carrierReads.length, 1)
+  assert.equal(
+    geometryTrainingObserved.write.planSnapshot.shadowTraining.runGlobalId,
+    'gtrn0000001',
+  )
+  assert.equal(
+    geometryTrainingObserved.write.packages[0].planningMethod,
+    'or_tools',
+  )
+  assert.equal(
+    geometryTrainingObserved.write.packages[0].orToolsProfiles.length,
+    0,
+  )
+}
 
 const ordinaryZeroStockObserved = {
   carrierReads: [],

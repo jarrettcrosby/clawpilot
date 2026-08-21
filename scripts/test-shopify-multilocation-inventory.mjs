@@ -227,6 +227,15 @@ const integration = loadTypeScriptModule(
         },
         SHOPIFY_INVENTORY_ADAPTER_VERSION: 'test',
       },
+      '@/lib/persistence/commerceStoreSync': {
+        async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+          return input.read({
+            id: '11111111-1111-4111-8111-111111111111',
+            globalId: 'gprl000000000001',
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          })
+        },
+      },
       '@/lib/persistence/commerceInventory': {
         CommerceInventoryPersistenceError,
         async mapShopifyInventoryLocationInPostgres(input) {
@@ -382,6 +391,8 @@ const integration = loadTypeScriptModule(
 const initial = await integration.getShopifyInventoryState({
   organizationId: runtime.organizationId,
   accountGlobalId: runtime.globalId,
+  idempotencyKey: 'inventory-state:initial-0001',
+  actorEmail: 'owner@example.com',
 })
 assert.equal(initial.providerLocations.length, 3)
 assert.equal(initial.providerLocations[0].ownershipClassification, 'merchant_managed')

@@ -3,11 +3,17 @@ import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const POLL_INTERVAL = '30 minutes'
 const POLL_LEASE = '10 minutes'
@@ -17,6 +23,7 @@ const FAIRE_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
 )
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 // This is only a scheduler/configuration hint. Faire's inventory endpoint is
 // the authority for whether the current credential can actually read inventory.
@@ -198,7 +205,6 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
                  job.credential_version
              AND credential.credential_version = job.credential_version
              AND credential.verification_status = 'verified'
-             AND activation.state IN ('shadow', 'active')
              AND activation.revision = job.activation_revision
              AND ${REQUESTED_READ_ACCOUNT_SQL}
          )`,
@@ -222,7 +228,7 @@ export async function queueAutomaticFaireInventoryPollsInPostgres() {
            AND credential.credential_version =
                account.commerce_credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND ${REQUESTED_READ_ACCOUNT_SQL}
            AND EXISTS (
              SELECT 1
@@ -334,7 +340,7 @@ export async function claimFaireInventoryPollJobsInPostgres(input: {
                job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND activation.revision = job.activation_revision
            AND ${REQUESTED_READ_ACCOUNT_SQL}
          ORDER BY job.available_at, job.created_at, job.id
@@ -462,7 +468,7 @@ export async function readFaireInventoryPollSelectorsInPostgres(input: {
        AND account.commerce_credential_generation = job.credential_version
        AND credential.credential_version = job.credential_version
        AND credential.verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${STORE_SYNC_RUNNING_SQL}
        AND activation.revision = job.activation_revision
        AND ${REQUESTED_READ_ACCOUNT_SQL}
        AND channel_state.product_id IS NOT NULL
@@ -537,6 +543,9 @@ async function lockCurrentJob(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls store_sync
+         ON store_sync.organization_id = account.organization_id
+        AND store_sync.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
        WHERE job.id = $1::uuid
@@ -551,10 +560,11 @@ async function lockCurrentJob(
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
-       FOR UPDATE OF job`,
+       FOR UPDATE OF job
+       FOR SHARE OF store_sync`,
       [
         target.id,
         target.organizationId,
@@ -570,10 +580,10 @@ async function lockCurrentJob(
 export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
   input: {
     target: FaireInventoryPollTarget
-    read: () => Promise<T>
+    read: (lease: CommerceStoreSyncProviderReadLease) => Promise<T>
   },
 ) {
-  return withTransaction(async (client) => {
+  const current = await withTransaction(async (client) => {
     const current = await client.query(
       `SELECT job.id
        FROM operations_faire_inventory_poll_jobs job
@@ -583,6 +593,9 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
+       JOIN operations_commerce_store_sync_controls store_sync
+         ON store_sync.organization_id = account.organization_id
+        AND store_sync.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = account.organization_id
        WHERE job.id = $1::uuid
@@ -599,10 +612,10 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
          AND account.commerce_credential_generation = job.credential_version
          AND credential.credential_version = job.credential_version
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND activation.revision = job.activation_revision
          AND ${REQUESTED_READ_ACCOUNT_SQL}
-       FOR SHARE OF job, account, credential, activation`,
+       FOR SHARE OF job, account, credential, store_sync, activation`,
       [
         input.target.id,
         input.target.organizationId,
@@ -618,15 +631,28 @@ export async function withFaireInventoryPollProviderReadFenceInPostgres<T>(
         { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
       )
     }
-    // Keep shared locks only around the bounded provider GETs. Activation,
-    // account, or credential mutation must wait, so no read starts after its
-    // authorization fence changes.
-    return input.read()
+    return true
+  })
+  if (!current) {
+    throw Object.assign(
+      new Error('Faire inventory polling authority changed'),
+      { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
+    )
+  }
+  return withCommerceStoreSyncProviderReadFenceInPostgres({
+    organizationId: input.target.organizationId,
+    integrationAccountId: input.target.integrationAccountId,
+    authorityKind: 'automatic',
+    readKind: 'faire_inventory_poll',
+    intentKey: `${input.target.id}:${input.target.lockToken}`,
+    acquiredBy: 'system:faire-inventory-poll',
+    read: input.read,
   })
 }
 
 export async function completeFaireInventoryPollPageInPostgres(input: {
   target: FaireInventoryPollTarget
+  providerReadLease?: CommerceStoreSyncProviderReadLease
   selectors: FaireInventoryPollSelector[]
   observations: FaireInventoryObservation[]
   hasMore: boolean
@@ -650,6 +676,21 @@ export async function completeFaireInventoryPollPageInPostgres(input: {
     throw new Error('Faire inventory continuation selector is invalid')
   }
   return withTransaction(async (client) => {
+    if (input.selectors.length > 0) {
+      if (!input.providerReadLease) {
+        throw Object.assign(
+          new Error('Faire inventory provider-read lease evidence is required'),
+          { code: 'FAIRE_INVENTORY_POLL_FENCE_CHANGED' },
+        )
+      }
+      await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+        organizationId: input.target.organizationId,
+        integrationAccountId: input.target.integrationAccountId,
+        lease: input.providerReadLease,
+        authorityKind: 'automatic',
+        readKind: 'faire_inventory_poll',
+      })
+    }
     const job = await lockCurrentJob(client, input.target)
     if (!job) {
       return { leaseLost: true, completed: false, continued: false }
@@ -906,6 +947,50 @@ export async function failFaireInventoryPollJobInPostgres(input: {
   })
 }
 
+export async function parkFaireInventoryPollForStoreSyncPauseInPostgres(input: {
+  target: FaireInventoryPollTarget
+}) {
+  return withTransaction(async (client) => {
+    const parked = await client.query(
+      `UPDATE operations_faire_inventory_poll_jobs
+       SET status = 'pending',
+           attempt_count = GREATEST(0, attempt_count - 1),
+           available_at = clock_timestamp(),
+           locked_at = NULL,
+           locked_by = NULL,
+           lock_token = NULL,
+           lease_expires_at = NULL,
+           last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+           completed_at = NULL,
+           updated_at = clock_timestamp()
+       WHERE id = $1::uuid
+         AND organization_id = $3::uuid
+         AND integration_account_id = $4::uuid
+         AND status = 'processing'
+         AND lock_token = $2::uuid
+       RETURNING id`,
+      [
+        input.target.id,
+        input.target.lockToken,
+        input.target.organizationId,
+        input.target.integrationAccountId,
+      ],
+    )
+    if (parked.rowCount !== 1) return { leaseLost: true, parked: false }
+    await client.query(
+      `UPDATE operations_commerce_sync_cursors
+       SET reconciliation_status = 'idle',
+           last_error_code = NULL,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND resource = 'inventory'`,
+      [input.target.organizationId, input.target.integrationAccountId],
+    )
+    return { leaseLost: false, parked: true }
+  })
+}
+
 export async function recoverFaireInventoryPollInPostgres(input: {
   organizationId: string
   accountGlobalId: string
@@ -986,7 +1071,7 @@ export async function recoverFaireInventoryPollInPostgres(input: {
            AND account.commerce_credential_generation = job.credential_version
            AND credential.credential_version = job.credential_version
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND activation.revision = job.activation_revision
            AND ${REQUESTED_READ_ACCOUNT_SQL}
          FOR UPDATE OF job`,
@@ -1158,7 +1243,6 @@ export async function readFaireInventoryPollStateFromPostgres(input: {
        WHERE job.organization_id = account.organization_id
          AND job.integration_account_id = account.id
          AND job.credential_version = account.commerce_credential_generation
-         AND job.activation_revision = activation.revision
        ORDER BY job.created_at DESC, job.id DESC
        LIMIT 1
      ) latest_job ON true
@@ -1175,7 +1259,6 @@ export async function readFaireInventoryPollStateFromPostgres(input: {
          AND current_observation.integration_account_id = account.id
          AND current_observation.credential_version =
              account.commerce_credential_generation
-         AND observation_job.activation_revision = activation.revision
      ) observation ON true
      WHERE account.organization_id = $1::uuid
        AND account.global_id = $2
@@ -1316,7 +1399,7 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          AND credential.credential_version =
              account.commerce_credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
      ), variants AS (
        SELECT count(*)::text AS eligible_variants
        FROM operations_product_channel_states state
@@ -1361,7 +1444,6 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          ON account.organization_id = observation.organization_id
         AND account.id = observation.integration_account_id
         AND account.credential_version = observation.credential_version
-        AND account.activation_revision = observation_job.activation_revision
        ORDER BY observation.organization_id,
                 observation.integration_account_id,
                 observation.external_variant_id,
@@ -1407,8 +1489,6 @@ export async function readFaireInventoryPollHealthFromPostgres() {
          AND current_account.id = current_job.integration_account_id
          AND current_account.credential_version =
              current_job.credential_version
-         AND current_account.activation_revision =
-             current_job.activation_revision
         WHERE current_job.status = 'succeeded') AS latest_success_at,
        (SELECT max(observed_at) FROM latest_observations)
          AS latest_observation_at,

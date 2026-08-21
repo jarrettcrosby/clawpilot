@@ -4,11 +4,15 @@ import {
   claimCommerceOrderBackfillsInPostgres,
   ensureContinuousCommerceOrderPollsInPostgres,
   failCommerceOrderBackfillInPostgres,
+  parkCommerceOrderBackfillForStoreSyncPauseInPostgres,
   readCommerceOrderBackfillCursorFromPostgres,
   readCommerceOrderSyncCursorKeyReadinessFromPostgres,
   readCommerceOrderSyncHealthFromPostgres,
   redactExpiredCommerceOrderSensitiveEvidenceInPostgres,
 } from '@/lib/persistence/commerceOrderSync'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 // One Shopify page is bounded to token + identity + list + five exact-order
 // reads. Failed page attempts reserve that entire envelope because the adapter
@@ -31,6 +35,14 @@ export const commerceOrderHistoryWorkerLimits = Object.freeze({
 
 function providerReadLimit(provider: 'shopify' | 'faire') {
   return provider === 'shopify' ? MAX_PROVIDER_READS_PER_PAGE : 2
+}
+
+function isStoreSyncReadPause(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
 }
 
 function assertBoundedProviderReads(input: {
@@ -73,6 +85,7 @@ export async function processCommerceOrderHistory(input: {
   let pageAttempts = 0
   let providerReadReservations = 0
   let failurePersistenceErrors = 0
+  let parked = 0
   const initialClaimWithinDeadline = Date.now() < claimDeadline
   let drainStopReason:
     | 'deadline'
@@ -100,32 +113,45 @@ export async function processCommerceOrderHistory(input: {
       try {
         const providerCursor =
           await readCommerceOrderBackfillCursorFromPostgres(job)
-        const page = await readCommerceOrderHistoryPage({
+        const captured = await withCommerceStoreSyncProviderReadFenceInPostgres({
           organizationId: job.organizationId,
-          accountGlobalId: job.accountGlobalId,
-          expectedCredentialGeneration: job.credentialGeneration,
-          requestedFrom: job.requestedFrom,
-          requestedThrough: job.requestedThrough,
-          providerCursor,
-          mode: job.sessionKind,
+          integrationAccountId: job.integrationAccountId,
+          authorityKind: 'automatic',
+          readKind: 'order_history',
+          intentKey: `${job.id}:${job.lockToken}:${job.pageCount + 1}`,
+          acquiredBy: input.workerId,
+          read: async (providerReadLease) => {
+            const page = await readCommerceOrderHistoryPage({
+              organizationId: job.organizationId,
+              accountGlobalId: job.accountGlobalId,
+              expectedCredentialGeneration: job.credentialGeneration,
+              requestedFrom: job.requestedFrom,
+              requestedThrough: job.requestedThrough,
+              providerCursor,
+              mode: job.sessionKind,
+            })
+            if (page.provider !== job.provider || page.providerWrites !== 0) {
+              throw new Error('Commerce order history provider authority changed')
+            }
+            assertBoundedProviderReads({
+              provider: job.provider,
+              providerReads: page.providerReads,
+            })
+            const result = await appendCommerceOrderBackfillPageInPostgres({
+              job,
+              providerReadLease,
+              pageNumber: job.pageCount + 1,
+              providerRecordsSeen: page.providerRowsSeen,
+              observations: page.observations,
+              hasNextPage: page.nextProviderCursor !== null,
+              nextProviderCursor: page.nextProviderCursor,
+              readAllOrdersScopeObserved: page.readAllOrdersScopeObserved,
+              returnHistoryScopeObserved: page.returnHistoryScopeObserved,
+            })
+            return { page, result }
+          },
         })
-        if (page.provider !== job.provider || page.providerWrites !== 0) {
-          throw new Error('Commerce order history provider authority changed')
-        }
-        assertBoundedProviderReads({
-          provider: job.provider,
-          providerReads: page.providerReads,
-        })
-        const result = await appendCommerceOrderBackfillPageInPostgres({
-          job,
-          pageNumber: job.pageCount + 1,
-          providerRecordsSeen: page.providerRowsSeen,
-          observations: page.observations,
-          hasNextPage: page.nextProviderCursor !== null,
-          nextProviderCursor: page.nextProviderCursor,
-          readAllOrdersScopeObserved: page.readAllOrdersScopeObserved,
-          returnHistoryScopeObserved: page.returnHistoryScopeObserved,
-        })
+        const { page, result } = captured
         providerReads += page.providerReads
         providerRecordsSeen += page.providerRowsSeen
         observationsAppended += result.appended
@@ -136,6 +162,13 @@ export async function processCommerceOrderHistory(input: {
           waveHasContinuation = true
         }
       } catch (error) {
+        if (isStoreSyncReadPause(error)) {
+          const disposition =
+            await parkCommerceOrderBackfillForStoreSyncPauseInPostgres({ job })
+          if (disposition.parked) parked += 1
+          else failurePersistenceErrors += 1
+          continue
+        }
         try {
           const result = await failCommerceOrderBackfillInPostgres({ job, error })
           failed += 'status' in result && result.status === 'failed' ? 1 : 0
@@ -200,6 +233,7 @@ export async function processCommerceOrderHistory(input: {
     observationsPreserved,
     providerReadReservations,
     failurePersistenceErrors,
+    parked,
     drainStopReason,
     drainLimits: commerceOrderHistoryWorkerLimits,
     sensitiveEvidenceRedaction,

@@ -1,0 +1,64 @@
+{
+  "description": "Non-secret deterministic interoperability fixture for ClawPilot print-agent pairing v2.",
+  "request": {
+    "schemaVersion": 2,
+    "pairingCode": "cppair.v1.11111111-1111-4111-8111-111111111111.PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "installationId": "22222222-2222-4222-8222-222222222222",
+    "clientPublicKey": "MCowBQYDK2VuAyEAfGl-un8rZ2tUyMOZ7-vm3RD40Xh4P8_UFTDQK0BnHi4",
+    "clientKeyFingerprint": "KTg3xwpJ86JLP1ip8f8kGXZ4qYag_2-0Ah4JpQhIjV4"
+  },
+  "idempotencyKey": "pairing-vector-idempotency-0001",
+  "clientPrivateKeyPkcs8": "MC4CAQAwBQYDK2VuBCIEIAgc20J1mQpDkw2LA7C7aquFVJJOt5wBnFPJZRt2Fi1I",
+  "response": {
+    "schemaVersion": 2,
+    "replayed": false,
+    "installationId": "22222222-2222-4222-8222-222222222222",
+    "clientKeyFingerprint": "KTg3xwpJ86JLP1ip8f8kGXZ4qYag_2-0Ah4JpQhIjV4",
+    "recoveryExpiresAt": "2026-08-15T12:10:00.000Z",
+    "agent": {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "globalId": "gpt0000001",
+      "name": "Vector agent",
+      "warehouseId": "44444444-4444-4444-8444-444444444444",
+      "warehouseGlobalId": "gwh0000001",
+      "warehouseName": "Vector warehouse"
+    },
+    "sealedEnrollment": {
+      "schemaVersion": 1,
+      "keyAgreement": "X25519",
+      "keyDerivation": "HKDF-SHA256",
+      "contentEncryption": "A256GCM",
+      "serverPublicKey": "MCowBQYDK2VuAyEAFIgpqAX1YQgAjhbeZaM3ylilWea6Xl23PqPJd3vnpms",
+      "salt": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "iv": "AAECAwQFBgcICQoL",
+      "ciphertext": "HGtB-IGI0_YZFEXlZ2QIeFvTXoQeVnM8DB1wDwu334kruYwDCWaiXlxi8oqe59syfMceLZEammMqMCGKqD4Zbg3cauhKbqlw7TINc7p3DxnRVed0lcfniFVUmJbRuC3VGPJSmYUwJzsXlGPScKX9p-X7fXo-fnDEZg5DW4VZ-vEThe6CKPxNsqVIHs0gql31WIDK8h1fSArEzhVNDZ8pFt6lYvAKw88bsZwxQsgk6Wj4E8I1-mAHz-NgU_l4Kr0MioLPlPF8sfxUMCmIL5CZeOPKKLi_agcyUdTRceV-4xUu1TrF12g0NjHVlvgKB2Vvu01pepKHtF7s9hQ1VYVuZBrrTqHxSw6hp4aAZd7aklP7JMRcc63W22dfRSMUXDtidH3UUCApsqGx0_shGeLbdRE7XYDy1nx75-UfJq9rohcMXvGdrOAb1r6AlqnuXtCyIEZbLGQPQbZphnU4JzEI6pKCbmcyTKqdJz9vplgC0-SrAuFhxfdZvOvH8BXxK15o-SED_r1O5d-qUVIkIDw92Ehuzw_cwyGQnBM_St_Xl5EBqyiG158epwZ2LbpST-4y4Qv7S4TgkgHtsn1pzMGX41QaqH7yXrNGNw4haV2T4TKWuUiKeRoFGN6NwsJFfJ6umLuqAZZMaH6Hx37u7XWaBMMpT4YDmndvyG2-i1EqrgdTDaKqgqyQ0PF6RqIpBtWlUdS5zl7kt50AbS8ndV9IYSd53BWc-n1oIjw_kcsxu7EVJ-LWfjOa6VYV9pFQsBSmsg0YRLExV2JfJkurtkIisTBlklud6e6lv39fBHyG9AQz2T1-VsWN50AKBv8vkWx-c1Pg5d8oiMWAArFI_E-OrhgYexYkNsawcUfq2oCRAER6TQLd7Q7G-XCZLd1N3-49OuLsV_UwFfKv03PooLc4C02YX1qlhWf8axeHt1NjbpBNTkhROOrQW045C6J8gJx4QCVx0Y_kV20JabgdP1y5Eaoy5xfoaM2jz0OyXw4sU0MKFVKofgH3oxWcXjnxmPaLAYV-IF71xUwXZwFDwB5TNkCCgeO69XYlaSnjBQlf1udNicMi4bFTcKXk3iptS8PlU30Xm7POss3O-dGJQFjEpK932qk5PYC19hhkb0yhKR8BiJaLY5lryQDlptoKTCNprjRPWQZ7AoMv4zkFoQg4WyrjxQW4AjF_ngl6KXOwTgW-f3zMEtAjqeKaFNT07_1F1atQ3V0Ri1GYNaAKwxE",
+      "authTag": "8kLSnBPv7MsyywbBqaFV7Q",
+      "authenticatedContext": "eyJjbGllbnRLZXlGaW5nZXJwcmludCI6IktUZzN4d3BKODZKTFAxaXA4ZjhrR1haNHFZYWdfMi0wQWg0SnBRaElqVjQiLCJlbmRwb2ludCI6Ii9hcGkvb3BlcmF0aW9ucy9wcmludC1hZ2VudC9wYWlyIiwiaWRlbXBvdGVuY3lLZXkiOiJwYWlyaW5nLXZlY3Rvci1pZGVtcG90ZW5jeS0wMDAxIiwiaW5zdGFsbGF0aW9uSWQiOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJvcmdhbml6YXRpb25JZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsInBhaXJpbmdHcmFudElkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwicHJpbnRBZ2VudEdsb2JhbElkIjoiZ3B0MDAwMDAwMSIsInByaW50QWdlbnRJZCI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMzMyIsInJlY292ZXJ5RXhwaXJlc0F0IjoiMjAyNi0wOC0xNVQxMjoxMDowMC4wMDBaIiwicmVkZW1wdGlvblJlcXVlc3RGaW5nZXJwcmludCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYifQ"
+    }
+  },
+  "expected": {
+    "credential": "cpprint.v1.33333333-3333-4333-8333-333333333333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "agent": {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "globalId": "gpt0000001",
+      "name": "Vector agent",
+      "warehouseId": "44444444-4444-4444-8444-444444444444",
+      "warehouseGlobalId": "gwh0000001",
+      "warehouseName": "Vector warehouse"
+    },
+    "binding": {
+      "endpoint": "/api/operations/print-agent/pair",
+      "pairingGrantId": "11111111-1111-4111-8111-111111111111",
+      "organizationId": "55555555-5555-4555-8555-555555555555",
+      "printAgentId": "33333333-3333-4333-8333-333333333333",
+      "printAgentGlobalId": "gpt0000001",
+      "installationId": "22222222-2222-4222-8222-222222222222",
+      "clientKeyFingerprint": "KTg3xwpJ86JLP1ip8f8kGXZ4qYag_2-0Ah4JpQhIjV4",
+      "idempotencyKey": "pairing-vector-idempotency-0001",
+      "redemptionRequestFingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "recoveryExpiresAt": "2026-08-15T12:10:00.000Z"
+    },
+    "authenticatedContextUtf8": "{\"clientKeyFingerprint\":\"KTg3xwpJ86JLP1ip8f8kGXZ4qYag_2-0Ah4JpQhIjV4\",\"endpoint\":\"/api/operations/print-agent/pair\",\"idempotencyKey\":\"pairing-vector-idempotency-0001\",\"installationId\":\"22222222-2222-4222-8222-222222222222\",\"organizationId\":\"55555555-5555-4555-8555-555555555555\",\"pairingGrantId\":\"11111111-1111-4111-8111-111111111111\",\"printAgentGlobalId\":\"gpt0000001\",\"printAgentId\":\"33333333-3333-4333-8333-333333333333\",\"recoveryExpiresAt\":\"2026-08-15T12:10:00.000Z\",\"redemptionRequestFingerprint\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}",
+    "plaintextUtf8": "{\"agent\":{\"globalId\":\"gpt0000001\",\"id\":\"33333333-3333-4333-8333-333333333333\",\"name\":\"Vector agent\",\"warehouseGlobalId\":\"gwh0000001\",\"warehouseId\":\"44444444-4444-4444-8444-444444444444\",\"warehouseName\":\"Vector warehouse\"},\"binding\":{\"clientKeyFingerprint\":\"KTg3xwpJ86JLP1ip8f8kGXZ4qYag_2-0Ah4JpQhIjV4\",\"endpoint\":\"/api/operations/print-agent/pair\",\"idempotencyKey\":\"pairing-vector-idempotency-0001\",\"installationId\":\"22222222-2222-4222-8222-222222222222\",\"organizationId\":\"55555555-5555-4555-8555-555555555555\",\"pairingGrantId\":\"11111111-1111-4111-8111-111111111111\",\"printAgentGlobalId\":\"gpt0000001\",\"printAgentId\":\"33333333-3333-4333-8333-333333333333\",\"recoveryExpiresAt\":\"2026-08-15T12:10:00.000Z\",\"redemptionRequestFingerprint\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"credential\":\"cpprint.v1.33333333-3333-4333-8333-333333333333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"schemaVersion\":1}"
+  }
+}

@@ -11,7 +11,7 @@ type ShopifyRateWarmTenantRow = {
   organization_id: string
   account_global_id: string
   shop_domain: string
-  activation_state: 'shadow' | 'active'
+  activation_state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
   policy_revision: string | number | null
   policy_snapshot: Record<string, unknown> | null
 }
@@ -19,7 +19,7 @@ type ShopifyRateWarmTenantRow = {
 export type ShopifyRateWarmRuntimeRecord = {
   runtime: CommerceRuntimeCredentialRecord
   shopDomain: string
-  activationState: 'shadow' | 'active'
+  activationState: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
   policyRevision: number
   policySnapshot: Record<string, unknown>
 }
@@ -72,10 +72,9 @@ export async function readShopifyRateWarmRuntimeByShopFromPostgres(
   if (!candidate) return null
   if (
     normalizeShopifyShopDomain(candidate.shop_domain) !== shopDomain
-    || (
-      candidate.activation_state !== 'shadow'
-      && candidate.activation_state !== 'active'
-    )
+    || ![
+      'disabled', 'shadow', 'read_only', 'active', 'frozen',
+    ].includes(candidate.activation_state)
   ) {
     return null
   }

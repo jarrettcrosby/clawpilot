@@ -4,6 +4,35 @@ type GlobalWithPg = typeof globalThis & {
   __clawpilotPgPool?: Pool
 }
 
+export const SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY_CODE =
+  'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+
+export class PostgresPersistenceConflictError extends Error {
+  readonly status = 409
+
+  constructor(readonly code: string) {
+    super(code)
+    this.name = 'PostgresPersistenceConflictError'
+  }
+}
+
+export function normalizePostgresPersistenceError(error: unknown): unknown {
+  if (error instanceof PostgresPersistenceConflictError) return error
+  if (
+    error instanceof Error
+    && error.message === SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY_CODE
+    && error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === '55P03'
+  ) {
+    return new PostgresPersistenceConflictError(
+      SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY_CODE,
+    )
+  }
+  return error
+}
+
 function buildPool(): Pool {
   if (!process.env.DATABASE_URL) {
     throw new Error('DATABASE_URL is required for Postgres storage')
@@ -30,7 +59,11 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   values: unknown[] = [],
 ): Promise<QueryResult<T>> {
-  return getPostgresPool().query<T>(text, values)
+  try {
+    return await getPostgresPool().query<T>(text, values)
+  } catch (error) {
+    throw normalizePostgresPersistenceError(error)
+  }
 }
 
 export async function acquireTransactionAdvisoryLock(client: PoolClient, key: string) {
@@ -49,7 +82,7 @@ export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>)
     return result
   } catch (error) {
     await client.query('ROLLBACK')
-    throw error
+    throw normalizePostgresPersistenceError(error)
   } finally {
     client.release()
   }

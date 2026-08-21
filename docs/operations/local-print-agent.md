@@ -63,22 +63,41 @@ print agent:
 - a dedicated always-on workstation or print server is preferable to relying on
   an operator's browser tab.
 
-The web app remains the control plane: operators enroll or rotate a
-warehouse-scoped agent, create a short-lived pairing code, bind printer profiles,
-and inspect last-seen and job evidence under **Operations > Printing**. The
-macOS download is the local delivery plane. It asks for the printer hostname
-or IP locally, stores the credential in Keychain, and installs the LaunchAgent.
-Neither path replaces the other.
+The web app remains the control plane: operators select the organization and
+warehouse, bind printer profiles, and inspect last-seen and job evidence under
+**Operations > Printing**. The intended **Configure network printer** action
+launches a signed and notarized native macOS Print Agent with organization,
+warehouse, and one-time pairing context only. The native app asks for the Zebra
+hostname/IP and raw port (normally `9100`), probes reachability without
+printing or claiming a job, stores the endpoint locally, and redeems the
+pairing grant into Keychain. The LAN endpoint must not be sent to hosted state,
+put in a URL, or retained in browser history.
 
-The current download is served without embedded organization data or a
-credential at `/downloads/ClawPilot-Print-Agent-macOS.zip`. It is an unsigned,
-unnotarized preview ZIP rather than a signed `.app` or `.pkg`, supports macOS
-and raw network ZPL only, and requires Node.js 20 or newer. After extraction,
-open **ClawPilot Print Agent.command** to pair an instance, test raw printer
-reachability without claiming or printing a job, stop an instance, or begin a
-new uniquely named pairing. A native signed/notarized application remains a
-separate distribution milestone; the download does not imply those release
-controls.
+That customer-distributable native application is not released yet. The only
+current macOS artifact is a credential-free, unsigned, unnotarized, Node.js
+developer preview ZIP. It is not a `.app` or `.pkg`, can be blocked by managed
+browser policy and Gatekeeper, and must not be offered as operator setup. The
+normal web UI therefore hides its download and pairing actions. Its exact ZIP,
+checksum, and manifest paths return `404` unless
+`NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW=true`; even when enabled,
+hosted access remains behind browser authentication. The preview manifest and
+README declare `developers-only` distribution and no customer-release
+readiness.
+
+Do not conflate the future visible setup application with the existing print
+runtime. Current connected `local_agent` records run as headless macOS
+LaunchAgents: no application window or Dock icon is expected. The signed native
+application will configure/install that background runtime. The separate
+`browser` connection mode remains web app download/manual print only; it cannot
+open raw TCP to a LAN printer and creates no durable delivery acknowledgement.
+`system_service` is a reserved schema/UI placeholder with no certified backend
+and is not selectable for new printer setup.
+
+The internal preview retains the production privacy contracts: no embedded
+organization data or credentials, the `cppair.v1` code remains separate, and
+the Zebra endpoint stays in the local LaunchAgent. A Developer ID signed and
+Apple-notarized native app may reuse the enrollment, Keychain credential,
+delivery ledger, claim fencing, and local endpoint contracts.
 
 Do not vendor an indiscriminate collection of GitHub printer drivers into the
 agent. Prefer carrier-native output, driverless IPP/CUPS where the device
@@ -90,6 +109,10 @@ and printer model before it may advertise compatibility.
 ## Configure Printing
 
 Open **Operations > Printing**.
+
+New operator pairing is release-gated until the signed and notarized native
+macOS application is available. Existing paired agents remain visible and may
+continue operating. On an explicitly enabled developer environment only:
 
 1. In **Agents**, create a short-lived pairing code for the warehouse and declare only the formats, media, and document types its installed runtime can actually deliver.
 2. Redeem the one-time `cppair.v1` code on the Mac. The helper stores the resulting `cpprint.v1` runtime credential in Keychain; that credential remains valid until the agent is revoked.

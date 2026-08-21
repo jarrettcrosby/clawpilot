@@ -131,6 +131,62 @@ function loadPersistence() {
         }, { filename: policyPath })
         return policyModule.exports
       }
+      if (
+        specifier
+        === '@/lib/operations/shopifyCheckoutAudiencePolicy'
+      ) {
+        const policyPath =
+          'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts'
+        const policyOutput = ts.transpileModule(read(policyPath), {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+            esModuleInterop: true,
+          },
+          fileName: policyPath,
+        }).outputText
+        const policyModule = { exports: {} }
+        vm.runInNewContext(policyOutput, {
+          Array,
+          Error,
+          Object,
+          String,
+          exports: policyModule.exports,
+          module: policyModule,
+        }, { filename: policyPath })
+        return policyModule.exports
+      }
+      if (
+        specifier
+        === '@/lib/operations/shopifyCheckoutRateControl'
+      ) {
+        const controlPath =
+          'app_src/lib/operations/shopifyCheckoutRateControl.ts'
+        const controlOutput = ts.transpileModule(read(controlPath), {
+          compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2022,
+            esModuleInterop: true,
+          },
+          fileName: controlPath,
+        }).outputText
+        const controlModule = { exports: {} }
+        vm.runInNewContext(controlOutput, {
+          Array,
+          Error,
+          Object,
+          String,
+          exports: controlModule.exports,
+          module: controlModule,
+          require(controlSpecifier) {
+            if (controlSpecifier === './shopifyCheckoutAudiencePolicy') {
+              return {}
+            }
+            return requireFromApp(controlSpecifier)
+          },
+        }, { filename: controlPath })
+        return controlModule.exports
+      }
       if (specifier === '@/lib/persistence/postgres') {
         return {
           acquireTransactionAdvisoryLock: async () => {},
@@ -465,8 +521,8 @@ includes(persistenceSource, [
   'normalizeShopifyCarrierServiceConfigInput',
   'normalizeShopifyCheckoutReceiptClaimInput',
   "'SHOPIFY_CHECKOUT_ATTEMPT_KEY_INVALID'",
-  "left(receipt.idempotency_key, length($11) + 9)",
   "left(receipt.idempotency_key, length($10) + 9)",
+  "left(receipt.idempotency_key, length($9) + 9)",
   "left(receipt.idempotency_key, length($5) + 9)",
   'shopifyCheckoutRatingHash',
   'shopifyCheckoutPackagePlanHash',
@@ -513,8 +569,8 @@ includes(persistenceSource, [
   "outcome.outcome = 'failed'",
   'outcome.provider_write_count = 0',
   "resolution.disposition = 'confirmed_not_applied'",
-  'activation.state !== input.expectedActivationState',
-  'activation.revision !== input.expectedActivationRevision',
+  'checkoutRateControl.rateSource !== input.rateSource',
+  'existing.rows[0].rate_source !== input.rateSource',
   "receipt.status IN ('succeeded', 'failed')",
   'receipt.expires_at > now()',
   "AND receipt.status = 'processing'",
@@ -1658,8 +1714,7 @@ const validClaim = {
   organizationId: validConfig.organizationId,
   accountGlobalId: validConfig.accountGlobalId,
   expectedConfigRowVersion: 7,
-  expectedActivationState: 'shadow',
-  expectedActivationRevision: 5,
+  rateSource: 'sandbox',
   requestFingerprint: 'c'.repeat(64),
   destinationFingerprint: 'd'.repeat(64),
   carrierDestinationFingerprint: 'f'.repeat(64),
@@ -2072,11 +2127,11 @@ assert.throws(
 assert.throws(
   () => normalizeShopifyCheckoutReceiptClaimInput({
     ...validClaim,
-    expectedActivationState: 'read_only',
+    rateSource: 'invalid',
   }),
   (error) => (
     error instanceof ShopifyCheckoutRatingPersistenceError
-    && error.code === 'SHOPIFY_CHECKOUT_ACTIVATION_STATE_INVALID'
+    && error.code === 'SHOPIFY_CHECKOUT_RATE_SOURCE_INVALID'
   ),
 )
 assert.throws(

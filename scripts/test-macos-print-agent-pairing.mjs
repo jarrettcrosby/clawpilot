@@ -42,6 +42,7 @@ assert.equal(result.credentialInput, 'secure_macos_keychain_pairing_grant_prompt
 assert.equal(result.primaryPairingSecret, 'cppair.v1')
 assert.equal(result.legacyManualCompatibility, 'cpprint.v1')
 assert.equal(result.printerPort, 9100)
+assert.equal(result.printerProbe, 'not_run_dry_run')
 assert.ok(!output.includes(host), 'Dry-run output must not disclose the local printer endpoint')
 assert.ok(!output.includes('cpprint.v1.'), 'Pairing output must never contain a credential')
 
@@ -74,6 +75,24 @@ const pairingSource = read('scripts/pair-macos-print-agent.mjs')
 assert.match(pairingSource, /beginMacPrintPairingTransaction/)
 assert.match(pairingSource, /rollbackMacPrintPairingTransaction/)
 assert.match(pairingSource, /credentialStored && rollback\.cleaned/)
+const pairingPromptOrder = [
+  "'ClawPilot URL'",
+  "'Unique workspace / printer instance name'",
+  "'Printer hostname or IP (stored only on this Mac)'",
+  "'Raw printer port'",
+]
+for (let index = 1; index < pairingPromptOrder.length; index += 1) {
+  assert.ok(
+    pairingSource.indexOf(pairingPromptOrder[index - 1])
+      < pairingSource.indexOf(pairingPromptOrder[index]),
+    `Local setup must prompt for ${pairingPromptOrder[index - 1]} before ${pairingPromptOrder[index]}`,
+  )
+}
+assert.ok(
+  pairingSource.indexOf('await probePrinter(plan.printerHost, plan.printerPort)')
+    < pairingSource.indexOf('await storeRuntimeCredential({'),
+  'The local Zebra endpoint must be probed before the cppair grant reaches Keychain',
+)
 assert.ok(
   !pairingSource.includes('rmSync(plan.runtimeDirectory'),
   'Pairing must never recursively delete a retained runtime directory',
@@ -159,33 +178,59 @@ try {
 
 const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
 for (const text of [
-  'Download macOS pairing helper',
+  'Download developer preview',
+  'Developer-only local printing preview',
+  'Verified Print Agent release unavailable',
+  'ClawPilot Print Agent v',
+  'Download for macOS',
+  'Download for Windows',
+  'Configure network printer',
+  'Local print service',
+  'View local agent status',
+  'Background LAN print agent',
+  'Web app download / manual print',
   'Create pairing code',
-  'Connect on this Mac',
+  'Finish pairing in the Print Agent',
   'Waiting for connection',
   'Refresh connection status',
   'Configure printers',
   'Pair another workspace',
-  'double-click ClawPilot Print Agent.command',
-  'run the .command file again with a unique instance name',
-  'The download is credential-free',
-  'The printer IP stays on this Mac',
+  'Keep the installed app',
+  'credential-free',
+  'private network IPv4 address and raw port 9100',
+  'never sent to ClawPilot',
   'raw-network ZPL preview',
   'unsigned and not notarized',
-  'Node.js 20 or newer required',
+  'never distribute to operators',
   'One-time pairing code',
   'Copy Mac pairing command',
   'Local device reference:',
+  'View Print Agent status',
+  'The app probes',
+  'reachability without sending printer bytes or claiming a job',
+  'Use Test',
+  'Leave the computer on and signed in',
+  'Browser download/manual print opens or downloads the document for an operator',
+  'cannot send',
+  'raw TCP to a Zebra hostname/IP',
+  'System service (not implemented)',
+  'reserved schema value only',
+  'runs in the signed-in user&apos;s background tray',
 ]) assert.ok(panel.includes(text), `Printer pairing UI is missing: ${text}`)
 for (const fragment of [
   "const MACOS_PRINT_AGENT_DOWNLOAD_PATH = '/downloads/ClawPilot-Print-Agent-macOS.zip'",
   "const MACOS_PRINT_AGENT_DOWNLOAD_NAME = 'ClawPilot-Print-Agent-macOS.zip'",
   'const MACOS_PRINT_AGENT_CHECKSUM_PATH = `${MACOS_PRINT_AGENT_DOWNLOAD_PATH}.sha256`',
   "const MACOS_PRINT_AGENT_MANIFEST_PATH = '/downloads/ClawPilot-Print-Agent-macOS.json'",
+  "process.env.NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW === 'true'",
+  'function DeveloperPrintAgentDownloadButton()',
+  'if (!ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW) return null',
   'href={MACOS_PRINT_AGENT_DOWNLOAD_PATH}',
   'download={MACOS_PRINT_AGENT_DOWNLOAD_NAME}',
   'href={MACOS_PRINT_AGENT_CHECKSUM_PATH}',
   'manifest.sha256.slice(0, 12)',
+  "manifest.distributionAudience === 'developers-only'",
+  'manifest.customerReleaseReady === false',
   "manifest.deliveryBackend === 'raw-network-zpl'",
   'const PRINT_AGENT_HEARTBEAT_RECENT_MS = 30_000',
   'printers.generatedAt',
@@ -196,9 +241,36 @@ for (const fragment of [
   "'Seen before'",
 ]) assert.ok(panel.includes(fragment), `Print-agent download UI is missing: ${fragment}`)
 assert.ok(
-  panel.indexOf('Download macOS pairing helper') < panel.indexOf('One-time pairing code'),
-  'The credential-free app download must appear before the one-time pairing code',
+  panel.indexOf('Download developer preview') < panel.indexOf('One-time pairing code'),
+  'The developer helper must be obtained before the one-time pairing code',
 )
+assert.ok(
+  panel.indexOf('Download for macOS') < panel.indexOf('One-time pairing code'),
+  'The verified customer installer must be offered before the one-time pairing code',
+)
+assert.equal(
+  panel.match(/href=\{MACOS_PRINT_AGENT_DOWNLOAD_PATH\}/g)?.length,
+  1,
+  'All preview downloads must flow through the default-off developer-only button',
+)
+assert.ok(panel.includes('open={printAgentSetupReady && Boolean(enrollForm)}'))
+assert.ok(panel.includes('open={printAgentSetupReady && Boolean(pairingGrant?.pairingCode)}'))
+assert.ok(!panel.includes('Control-click'), 'Customer UI must never present Gatekeeper bypass as setup')
+assert.ok(!panel.includes('choose Open'), 'Customer UI must never present Gatekeeper bypass as setup')
+const exampleEnv = read('.env.example')
+assert.ok(exampleEnv.includes('# NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW=false'))
+assert.ok(exampleEnv.includes('Leave disabled for every'))
+const webSetupOrder = [
+  '2. Enter the local Zebra connection',
+  '3. Copy the one-time pairing code',
+  '4. Finish pairing in the Print Agent',
+]
+for (let index = 1; index < webSetupOrder.length; index += 1) {
+  assert.ok(
+    panel.indexOf(webSetupOrder[index - 1]) < panel.indexOf(webSetupOrder[index]),
+    `Web setup must present ${webSetupOrder[index - 1]} before ${webSetupOrder[index]}`,
+  )
+}
 for (const fragment of [
   "action: 'create-pairing-grant'",
   'result.pairingGrant.pairingCode',
@@ -221,6 +293,13 @@ assert.ok(!panel.includes('label="Printer IP"'), 'Hosted printer setup must not 
 const printerRoute = read('app_src/app/api/operations/printers/route.ts')
 assert.ok(!printerRoute.includes("'printerHost'"), 'Hosted printer API must not accept a local endpoint')
 assert.ok(!printerRoute.includes("'printerIp'"), 'Hosted printer API must not accept a local endpoint')
+
+const manager = read('scripts/manage-macos-print-agent.mjs')
+for (const text of [
+  'Pairing complete. The Zebra hostname/IP and raw port were reachable',
+  'no label was printed and no ClawPilot print job was claimed',
+  'same physical Zebra in another workspace',
+]) assert.ok(manager.includes(text), `Local manager handoff is missing: ${text}`)
 
 const persistence = read('app_src/lib/persistence/operationPrintDelivery.ts')
 for (const fragment of [

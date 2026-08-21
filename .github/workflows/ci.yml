@@ -52,5 +52,17 @@ jobs:
       - name: Tests
         run: npm run test
 
+      - name: Shopify test-store canonical E2E contract
+        run: npm run test:shopify-test-store-canonical-e2e
+
+      - name: Store sync PostgreSQL acceptance
+        run: npm run test:commerce-store-sync
+
+      - name: Shipping independence PostgreSQL acceptance
+        run: npm run test:shipping-independence-postgres
+
+      - name: Shopify order webhook reconciliation acceptance
+        run: npm run test:shopify-order-webhook-reconciliation
+
       - name: Predeploy verification
         run: npm run verify:predeploy

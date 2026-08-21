@@ -28,12 +28,22 @@ import {
   type OneOffCarrierSelectionInput,
   type OneOffExecutionMode,
   type OneOffPackedRateRefresh,
+  type OneOffShippingPrintRecoveryResult,
   type OneOffShipmentExecutionState,
   type OneOffShipmentPackageInput,
   type OneOffShipmentQuoteInput,
 } from '@/lib/operations/oneOffShipments'
 import { defaultCanonicalPackageProfile } from '@/lib/operations/packageCatalog'
-import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
+import {
+  enqueueOperationsPrintJobInPostgres,
+  operationsPrintFailureProvesZeroBytes,
+  reprintOperationsPrintJobInPostgres,
+  retryOperationsPrintJobInPostgres,
+} from '@/lib/persistence/operationPrintDelivery'
+import type {
+  OperationsPrintJobListItem,
+  PrintJobStatus,
+} from '@/lib/operations/printing'
 import {
   OneOffShipmentPersistenceError,
   quoteOneOffShipmentInPostgres,
@@ -43,6 +53,9 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  readShippingOneOffPackReviewFromPostgres,
+} from '@/lib/persistence/shippingOneOffPack'
 
 type JsonObject = Record<string, unknown>
 type Provider = 'ups_rest' | 'fedex_rest'
@@ -54,6 +67,10 @@ const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
 const QUOTE_GLOBAL_ID = /^goq(?:[0-9]{7}|[0-9a-v]{12})$/
 const OFFER_GLOBAL_ID = /^goo(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRINTER_GLOBAL_ID = /^gpr(?:[0-9]{7}|[0-9a-v]{12})$/
+const PACKAGE_GLOBAL_ID = /^gpa(?:[0-9]{7}|[0-9a-v]{12})$/
+const LABEL_GLOBAL_ID = /^glb(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINT_JOB_GLOBAL_ID = /^gpj(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRINT_ARTIFACT_GLOBAL_ID = /^gpf(?:[0-9]{7}|[0-9a-v]{12})$/
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/
 
 function fail(code: string, message: string, status = 409): never {
@@ -129,9 +146,11 @@ function addressParty(value: JsonObject, fallbackName: string) {
 }
 
 type PackedLineRow = QueryResultRow & {
+  kind: 'existing' | 'ad_hoc'
   external_line_id: string
-  product_global_id: string
+  product_global_id: string | null
   quantity: string
+  item_snapshot: JsonObject | null
 }
 
 type PackedPackageRow = QueryResultRow & {
@@ -154,15 +173,14 @@ type GroupContext = QueryResultRow & {
   order_status: string
   row_version: string
   currency: string
-  activation_state: string
   plan_id: string
   plan_global_id: string
   warehouse_id: string
   warehouse_global_id: string
   warehouse_address: JsonObject
-  customer_global_id: string
-  inventory_pool_global_id: string
-  receiving_location_global_id: string
+  customer_global_id: string | null
+  inventory_pool_global_id: string | null
+  receiving_location_global_id: string | null
   planning_quote_id: string
   planning_quote_global_id: string
   planning_offer_id: string
@@ -207,7 +225,6 @@ async function readGroupContext(
             source_order.global_id AS order_global_id,
             source_order.order_number, source_order.status AS order_status,
             source_order.row_version::text, source_order.currency,
-            activation.state AS activation_state,
             plan.id::text AS plan_id, plan.global_id AS plan_global_id,
             plan.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
             warehouse.address AS warehouse_address,
@@ -237,8 +254,6 @@ async function readGroupContext(
             selected_rate.id::text AS carrier_rate_id,
             selected_rate.global_id AS carrier_rate_global_id
      FROM operations_orders source_order
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = source_order.organization_id
      JOIN LATERAL (
        SELECT candidate.*
        FROM operations_fulfillment_plans candidate
@@ -271,13 +286,13 @@ async function readGroupContext(
       AND selected_rate.selected = true
       AND selected_rate.one_off_quote_id = plan.one_off_quote_id
       AND selected_rate.one_off_offer_id = plan.one_off_offer_id
-     JOIN crm_organizations customer
+     LEFT JOIN crm_organizations customer
        ON customer.pipeline_id = planning_quote.pipeline_id
       AND customer.id = planning_quote.customer_id
-     JOIN operations_inventory_pools pool
+     LEFT JOIN operations_inventory_pools pool
        ON pool.organization_id = planning_quote.organization_id
       AND pool.id = planning_quote.inventory_pool_id
-     JOIN operations_locations location
+     LEFT JOIN operations_locations location
        ON location.organization_id = planning_quote.organization_id
       AND location.id = planning_quote.receiving_location_id
      WHERE source_order.organization_id = $1::uuid
@@ -309,13 +324,24 @@ async function readPackedLines(
 ) {
   const result = await dbQuery<PackedLineRow>(
     client,
-    `SELECT line.external_line_id, product.reference_code AS product_global_id,
-            line.quantity::text
-     FROM operations_current_order_lines line
-     JOIN crm_products product
-       ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
-     WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
-     ORDER BY line.external_line_id, line.id`,
+    `SELECT packed.kind, packed.external_line_id, packed.product_global_id,
+            packed.quantity, packed.item_snapshot
+     FROM (
+       SELECT 'existing'::text AS kind, line.external_line_id,
+              product.reference_code AS product_global_id,
+              line.quantity::text, NULL::jsonb AS item_snapshot,
+              line.id AS stable_id
+       FROM operations_current_order_lines line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
+       WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
+       UNION ALL
+       SELECT 'ad_hoc'::text, line.line_key, NULL::text,
+              line.quantity::text, line.item_snapshot, line.id
+       FROM operations_one_off_ad_hoc_order_lines line
+       WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
+     ) packed
+     ORDER BY packed.external_line_id, packed.stable_id`,
     [organizationId, orderId],
   )
   return result.rows
@@ -337,16 +363,30 @@ async function readPackedPackages(
               AS quote_package_key,
             COALESCE((
               SELECT jsonb_agg(jsonb_build_object(
-                'lineKey', order_line.external_line_id,
-                'quantity', content.quantity
-              ) ORDER BY order_line.external_line_id)
-              FROM operations_package_contents content
-              JOIN operations_current_order_lines order_line
-                ON order_line.organization_id = content.organization_id
-               AND order_line.id = content.order_line_id
-              WHERE content.organization_id = package.organization_id
-                AND content.plan_id = package.plan_id
-                AND content.package_id = package.id
+                'lineKey', allocation.line_key,
+                'quantity', allocation.quantity
+              ) ORDER BY allocation.line_key)
+              FROM (
+                SELECT order_line.external_line_id AS line_key,
+                       content.quantity
+                FROM operations_package_contents content
+                JOIN operations_current_order_lines order_line
+                  ON order_line.organization_id = content.organization_id
+                 AND order_line.id = content.order_line_id
+                WHERE content.organization_id = package.organization_id
+                  AND content.plan_id = package.plan_id
+                  AND content.package_id = package.id
+                UNION ALL
+                SELECT ad_hoc.line_key, content.quantity
+                FROM operations_one_off_ad_hoc_package_contents content
+                JOIN operations_one_off_ad_hoc_order_lines ad_hoc
+                  ON ad_hoc.organization_id = content.organization_id
+                 AND ad_hoc.order_id = content.order_id
+                 AND ad_hoc.id = content.ad_hoc_order_line_id
+                WHERE content.organization_id = package.organization_id
+                  AND content.plan_id = package.plan_id
+                  AND content.package_id = package.id
+              ) allocation
             ), '[]'::jsonb) AS allocations
      FROM operations_packages package
      JOIN operations_one_off_shipment_quotes quote
@@ -365,15 +405,6 @@ function assertPackedContext(
   packages: PackedPackageRow[],
   expectedRowVersion: number,
 ) {
-  const requiredActivation = context.execution_mode === 'live' ? 'active' : 'shadow'
-  if (context.activation_state !== requiredActivation) {
-    fail(
-      context.execution_mode === 'live'
-        ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
-        : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
-      `${context.execution_mode === 'live' ? 'LIVE' : 'TEST'} one-off shipment execution requires Operations ${requiredActivation}`,
-    )
-  }
   if (context.order_status !== 'packed') {
     fail(
       'OPERATIONS_ONE_OFF_GROUP_NOT_PACKED',
@@ -531,12 +562,38 @@ function quoteInput(
       postalCode: String(destination.postalCode || '').trim(),
       country: String(destination.country || 'US').trim(),
     },
-    lines: lines.map((line) => ({
-      kind: 'existing' as const,
-      lineKey: line.external_line_id,
-      productGlobalId: line.product_global_id,
-      quantity: numberValue(line.quantity),
-    })),
+    lines: lines.map((line) => {
+      if (line.kind === 'ad_hoc') {
+        const snapshot = line.item_snapshot || {}
+        return {
+          kind: 'ad_hoc' as const,
+          lineKey: line.external_line_id,
+          name: String(snapshot.name || '').trim(),
+          sku: String(snapshot.sku || '').trim() || null,
+          quantity: numberValue(line.quantity),
+          unitPriceMinor: numberValue(snapshot.unitPriceMinor),
+          unitWeightGrams: numberValue(snapshot.unitWeightGrams),
+          unitDimensionsMm: {
+            length: numberValue((snapshot.unitDimensionsMm as JsonObject)?.length),
+            width: numberValue((snapshot.unitDimensionsMm as JsonObject)?.width),
+            height: numberValue((snapshot.unitDimensionsMm as JsonObject)?.height),
+          },
+        }
+      }
+      if (!line.product_global_id) {
+        fail(
+          'OPERATIONS_ONE_OFF_GROUP_EVIDENCE_INVALID',
+          'The packed product line is missing its immutable product reference',
+          500,
+        )
+      }
+      return {
+        kind: 'existing' as const,
+        lineKey: line.external_line_id,
+        productGlobalId: line.product_global_id,
+        quantity: numberValue(line.quantity),
+      }
+    }),
     packages: packages.map((item, index) => ({
       packageKey: item.quote_package_key,
       packageProfile:
@@ -577,6 +634,10 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
   const organizationId = requiredOrganizationId(input.organizationId)
   const orderGlobalId = requiredId(input.orderGlobalId, 'Order', ORDER_GLOBAL_ID)
   const context = await readGroupContext(organizationId, orderGlobalId, null, false)
+  const packReview = await readShippingOneOffPackReviewFromPostgres({
+    organizationId,
+    orderGlobalId,
+  })
   const packages = await readPackedPackages(
     organizationId,
     context.plan_id,
@@ -584,6 +645,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
   )
   const packedRateRows = await query<{
     quote_global_id: string
+    idempotency_key: string
     expires_at: Date
     status: 'succeeded' | 'partial' | 'failed'
     consumed: boolean
@@ -602,6 +664,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     credential_version: number
   }>(
     `SELECT packed_quote.global_id AS quote_global_id,
+            packed_quote.idempotency_key,
             packed_quote.expires_at, packed_quote.status,
             EXISTS (
               SELECT 1
@@ -659,7 +722,11 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     ],
   )
   const group = await query<GroupAttemptRow & {
+    create_idempotency_key: string
+    purchase_quote_global_id: string
+    purchase_offer_global_id: string
     void_global_id: string | null
+    void_idempotency_key: string | null
     void_action: 'void' | 'close_sample' | null
     void_state: GroupState | null
   }>(
@@ -677,12 +744,17 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
             create_attempt.package_count, create_attempt.environment,
             create_attempt.provider, create_attempt.service_code,
             create_attempt.error_code,
+            create_attempt.idempotency_key AS create_idempotency_key,
+            purchase_quote.global_id AS purchase_quote_global_id,
+            purchase_offer.global_id AS purchase_offer_global_id,
             close_attempt.global_id AS void_global_id,
+            close_attempt.idempotency_key AS void_idempotency_key,
             close_attempt.action AS void_action,
             close_attempt.state AS void_state
      FROM operations_one_off_carrier_group_attempts create_attempt
      LEFT JOIN LATERAL (
-       SELECT candidate.global_id, candidate.action, candidate.state
+       SELECT candidate.global_id, candidate.idempotency_key,
+              candidate.action, candidate.state
        FROM operations_one_off_carrier_group_attempts candidate
        WHERE candidate.organization_id = create_attempt.organization_id
          AND candidate.create_attempt_id = create_attempt.id
@@ -690,6 +762,13 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
        ORDER BY candidate.created_at DESC, candidate.id DESC
        LIMIT 1
      ) close_attempt ON true
+     JOIN operations_one_off_shipment_quotes purchase_quote
+       ON purchase_quote.organization_id = create_attempt.organization_id
+      AND purchase_quote.id = create_attempt.purchase_quote_id
+     JOIN operations_one_off_shipment_quote_offers purchase_offer
+       ON purchase_offer.organization_id = create_attempt.organization_id
+      AND purchase_offer.quote_id = create_attempt.purchase_quote_id
+      AND purchase_offer.id = create_attempt.purchase_offer_id
      WHERE create_attempt.organization_id = $1::uuid
        AND create_attempt.order_id = $2::uuid
        AND create_attempt.plan_id = $3::uuid
@@ -702,14 +781,84 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
   const labels = create
     ? await query<ResultLabelRow & {
         print_job_global_id: string | null
-        print_status: 'queued' | 'printed' | 'failed' | 'rerouted' | null
+        print_job_status: 'queued' | 'claimed' | 'delivered' | 'failed'
+          | 'cancelled' | 'printed' | 'rerouted' | null
+        print_status: 'queued' | 'printing' | 'printed' | 'failed'
+          | 'rerouted' | null
+        print_artifact_global_id: string | null
+        print_content_sha256: string | null
+        print_byte_length: string | null
+        print_attempts: number | null
+        print_max_attempts: number | null
+        print_latest_attempt_sequence_number: number | null
+        print_latest_error_code: string | null
+        print_job_request_idempotency_key: string | null
+        print_last_operator_retry_idempotency_key: string | null
+        print_operator_retry_idempotency_keys: string[]
+        print_reprint_of_job_global_id: string | null
+        print_outcome_uncertain: boolean
+        print_recovery_action: 'enqueue' | 'retry' | 'new_print' | null
         print_warning: string | null
       }>(
         `SELECT package.global_id AS package_global_id,
                 member.package_number, label.global_id AS label_global_id,
                 label.tracking_number, label.status,
                 print_job.global_id AS print_job_global_id,
-                print_job.status AS print_status,
+                print_job.status AS print_job_status,
+                CASE print_job.status
+                  WHEN 'claimed' THEN 'printing'
+                  WHEN 'delivered' THEN 'printed'
+                  WHEN 'printed' THEN 'printed'
+                  WHEN 'failed' THEN 'failed'
+                  WHEN 'cancelled' THEN 'failed'
+                  WHEN 'queued' THEN 'queued'
+                  WHEN 'rerouted' THEN 'rerouted'
+                  ELSE NULL
+                END AS print_status,
+                print_job.artifact_global_id AS print_artifact_global_id,
+                print_job.content_sha256 AS print_content_sha256,
+                print_job.byte_length::text AS print_byte_length,
+                print_job.attempts AS print_attempts,
+                print_job.max_attempts AS print_max_attempts,
+                print_job.latest_attempt_sequence_number
+                  AS print_latest_attempt_sequence_number,
+                print_job.latest_error_code AS print_latest_error_code,
+                print_job.idempotency_key
+                  AS print_job_request_idempotency_key,
+                print_job.last_operator_retry_idempotency_key
+                  AS print_last_operator_retry_idempotency_key,
+                print_job.operator_retry_idempotency_keys
+                  AS print_operator_retry_idempotency_keys,
+                print_job.reprint_of_job_global_id
+                  AS print_reprint_of_job_global_id,
+                COALESCE(print_job.outcome_uncertain, false)
+                  AS print_outcome_uncertain,
+                CASE
+                  WHEN print_job.global_id IS NULL THEN 'enqueue'
+                  WHEN print_job.status = 'failed'
+                    AND NOT print_job.outcome_uncertain
+                    AND print_job.latest_error_code IN (
+                      'LOCAL_PRINTER_BUSY',
+                      'PRINTER_UNAVAILABLE',
+                      'PRINT_ARTIFACT_INVALID',
+                      'PRINT_CLAIM_LEASE_TOO_SHORT',
+                      'PRINT_DELIVERY_STOPPED'
+                    )
+                    AND print_job.attempts < print_job.max_attempts
+                    THEN 'retry'
+                  WHEN print_job.status = 'failed'
+                    AND NOT print_job.outcome_uncertain
+                    AND print_job.latest_error_code IN (
+                      'LOCAL_PRINTER_BUSY',
+                      'PRINTER_UNAVAILABLE',
+                      'PRINT_ARTIFACT_INVALID',
+                      'PRINT_CLAIM_LEASE_TOO_SHORT',
+                      'PRINT_DELIVERY_STOPPED'
+                    )
+                    AND print_job.attempts >= print_job.max_attempts
+                    THEN 'new_print'
+                  ELSE NULL
+                END AS print_recovery_action,
                 print_job.last_error AS print_warning
          FROM operations_one_off_carrier_group_members member
          JOIN operations_packages package
@@ -723,8 +872,67 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
            ON label.organization_id = result.organization_id
           AND label.id = result.label_id
          LEFT JOIN LATERAL (
-           SELECT job.global_id, job.status, job.last_error
+           SELECT job.global_id, job.status, job.last_error,
+                  job.attempts, job.max_attempts, job.idempotency_key,
+                  artifact.global_id AS artifact_global_id,
+                  artifact.content_sha256, artifact.byte_length,
+                  original.global_id AS reprint_of_job_global_id,
+                  (
+                    SELECT attempt.sequence_number
+                    FROM operations_print_delivery_attempts attempt
+                    WHERE attempt.organization_id = job.organization_id
+                      AND attempt.print_job_id = job.id
+                    ORDER BY attempt.sequence_number DESC, attempt.id DESC
+                    LIMIT 1
+                  ) AS latest_attempt_sequence_number,
+                  (
+                    SELECT attempt.error_code
+                    FROM operations_print_delivery_attempts attempt
+                    WHERE attempt.organization_id = job.organization_id
+                      AND attempt.print_job_id = job.id
+                    ORDER BY attempt.sequence_number DESC, attempt.id DESC
+                    LIMIT 1
+                  ) AS latest_error_code,
+                  (
+                    SELECT attempt.idempotency_key
+                    FROM operations_print_delivery_attempts attempt
+                    WHERE attempt.organization_id = job.organization_id
+                      AND attempt.print_job_id = job.id
+                      AND attempt.actor_type = 'user'
+                      AND attempt.state = 'queued'
+                      AND attempt.idempotency_key LIKE 'print-user:retry:%'
+                    ORDER BY attempt.sequence_number DESC, attempt.id DESC
+                    LIMIT 1
+                  ) AS last_operator_retry_idempotency_key,
+                  ARRAY(
+                    SELECT attempt.idempotency_key
+                    FROM operations_print_delivery_attempts attempt
+                    WHERE attempt.organization_id = job.organization_id
+                      AND attempt.print_job_id = job.id
+                      AND attempt.actor_type = 'user'
+                      AND attempt.state = 'queued'
+                      AND attempt.idempotency_key LIKE 'print-user:retry:%'
+                    ORDER BY attempt.sequence_number, attempt.id
+                  ) AS operator_retry_idempotency_keys,
+                  COALESCE((
+                    SELECT attempt.state = 'failed'
+                      AND attempt.actor_type IN ('local_print_agent', 'system')
+                      AND attempt.error_code = 'PRINT_OUTCOME_UNCERTAIN'
+                      AND attempt.physical_output_verified = false
+                    FROM operations_print_delivery_attempts attempt
+                    WHERE attempt.organization_id = job.organization_id
+                      AND attempt.print_job_id = job.id
+                    ORDER BY attempt.sequence_number DESC, attempt.id DESC
+                    LIMIT 1
+                  ), false) AS outcome_uncertain
            FROM operations_print_jobs job
+           JOIN operations_print_artifacts artifact
+             ON artifact.organization_id = job.organization_id
+            AND artifact.id = job.artifact_id
+            AND artifact.source_label_id = label.id
+           LEFT JOIN operations_print_jobs original
+             ON original.organization_id = job.organization_id
+            AND original.id = job.reprint_of_job_id
            WHERE job.organization_id = label.organization_id
              AND job.label_id = label.id
            ORDER BY job.created_at DESC, job.id DESC
@@ -753,10 +961,12 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     : null
   return {
     orderGlobalId,
+    orderStatus: context.order_status === 'planned' ? 'planned' : 'packed',
     rowVersion: numberValue(context.row_version),
     executionMode: context.execution_mode,
     environment: context.environment,
     packageCount: packages.length,
+    packReview,
     planning: {
       quoteGlobalId: context.planning_quote_global_id,
       offerGlobalId: context.planning_offer_global_id,
@@ -768,6 +978,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     },
     packedRate: latestQuote ? {
       quoteGlobalId: latestQuote.quote_global_id,
+      requestIdempotencyKey: latestQuote.idempotency_key,
       expiresAt: new Date(latestQuote.expires_at).toISOString(),
       status: latestQuote.status,
       consumed: latestQuote.consumed,
@@ -795,6 +1006,9 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     } : null,
     carrierGroup: create ? {
       createAttemptGlobalId: create.global_id,
+      createRequestIdempotencyKey: create.create_idempotency_key,
+      purchaseQuoteGlobalId: create.purchase_quote_global_id,
+      purchaseOfferGlobalId: create.purchase_offer_global_id,
       state: create.state,
       provider: create.provider,
       serviceCode: create.service_code,
@@ -816,6 +1030,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
         && create.void_state !== 'succeeded'
         && create.void_state !== 'unknown',
       voidAttemptGlobalId: create.void_global_id,
+      voidRequestIdempotencyKey: create.void_idempotency_key,
       voidAction: create.void_action,
       voidState: create.void_state,
       labels: labels.rows.map((label) => ({
@@ -826,10 +1041,731 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
         status: label.status,
         printJobGlobalId: label.print_job_global_id,
         printStatus: label.print_status,
+        printJobStatus: label.print_job_status,
+        printArtifactGlobalId: label.print_artifact_global_id,
+        printContentSha256: label.print_content_sha256,
+        printByteLength: label.print_byte_length === null
+          ? null
+          : numberValue(label.print_byte_length),
+        printAttempts: label.print_attempts,
+        printMaxAttempts: label.print_max_attempts,
+        printLatestAttemptSequenceNumber:
+          label.print_latest_attempt_sequence_number,
+        printLatestErrorCode: label.print_latest_error_code,
+        printJobRequestIdempotencyKey:
+          label.print_job_request_idempotency_key,
+        printLastOperatorRetryIdempotencyKey:
+          label.print_last_operator_retry_idempotency_key,
+        printOperatorRetryIdempotencyKeys:
+          label.print_operator_retry_idempotency_keys || [],
+        printReprintOfJobGlobalId:
+          label.print_reprint_of_job_global_id,
+        printOutcomeUncertain: label.print_outcome_uncertain,
+        printRecoveryAction: label.status === 'created'
+          && create.state === 'succeeded'
+          && create.void_state !== 'prepared'
+          && create.void_state !== 'succeeded'
+          && create.void_state !== 'unknown'
+          ? label.print_recovery_action
+          : null,
         printWarning: label.print_warning,
       })),
     } : null,
   }
+}
+
+type ShippingPrintRecoveryContextRow = QueryResultRow & {
+  label_id: string
+  label_global_id: string
+  label_status: 'created'
+  package_global_id: string
+  warehouse_id: string
+}
+
+type ShippingPrintRecoveryJobRow = QueryResultRow & {
+  id: string
+  global_id: string
+  status: PrintJobStatus
+  attempts: number
+  max_attempts: number
+  idempotency_key: string
+  artifact_global_id: string
+  content_sha256: string
+  byte_length: string
+  reprint_of_job_global_id: string | null
+  last_operator_retry_idempotency_key: string | null
+  operator_retry_idempotency_keys: string[]
+  latest_attempt_sequence_number: number | null
+  latest_attempt_state: PrintJobStatus | null
+  latest_attempt_actor_type: 'user' | 'local_print_agent' | 'system' | null
+  latest_attempt_error_code: string | null
+  latest_attempt_physical_output_verified: boolean | null
+}
+
+type ShippingPrintRecoveryKeyUsageRow = QueryResultRow & {
+  action: 'enqueue' | 'retry' | 'new_print' | 'invalid'
+  label_id: string
+  print_job_global_id: string
+  source_print_job_global_id: string | null
+  source_print_artifact_global_id: string | null
+}
+
+function shippingPrintStatus(status: PrintJobStatus) {
+  if (status === 'claimed') return 'printing' as const
+  if (status === 'delivered' || status === 'printed') return 'printed' as const
+  if (status === 'failed' || status === 'cancelled') return 'failed' as const
+  if (status === 'rerouted') return 'rerouted' as const
+  return 'queued' as const
+}
+
+function shippingPrintRecoveryResult(input: {
+  orderGlobalId: string
+  packageGlobalId: string
+  labelGlobalId: string
+  sourcePrintJobGlobalId: string | null
+  action: OneOffShippingPrintRecoveryResult['action']
+  job: OperationsPrintJobListItem
+  replayed: boolean
+}): OneOffShippingPrintRecoveryResult {
+  if (
+    !input.job.artifactGlobalId
+    || !input.job.artifactContentSha256
+    || input.job.artifactByteLength === null
+  ) {
+    fail(
+      'OPERATIONS_ONE_OFF_PRINT_EVIDENCE_INVALID',
+      'The durable print job is missing immutable artifact evidence',
+      500,
+    )
+  }
+  return {
+    orderGlobalId: input.orderGlobalId,
+    packageGlobalId: input.packageGlobalId,
+    labelGlobalId: input.labelGlobalId,
+    action: input.action,
+    printJobGlobalId: input.job.globalId,
+    sourcePrintJobGlobalId: input.sourcePrintJobGlobalId,
+    printJobStatus: input.job.status,
+    printStatus: shippingPrintStatus(input.job.status),
+    printArtifactGlobalId: input.job.artifactGlobalId,
+    printContentSha256: input.job.artifactContentSha256,
+    printByteLength: input.job.artifactByteLength,
+    printAttempts: input.job.attempts,
+    printMaxAttempts: input.job.maxAttempts,
+    effects: {
+      carrierWrites: 0,
+      providerWrites: 0,
+      labelWrites: 0,
+    },
+    replayed: input.replayed,
+  }
+}
+
+export async function recoverOperationsOneOffLabelPrintInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  packageGlobalId: string
+  labelGlobalId: string
+  expectedRecoveryAction: 'enqueue' | 'retry' | 'new_print'
+  expectedPrintJobGlobalId: string | null
+  expectedPrintJobStatus: PrintJobStatus | null
+  expectedPrintArtifactGlobalId: string | null
+  expectedPrintAttempts: number | null
+  expectedPrintMaxAttempts: number | null
+  expectedLatestAttemptSequenceNumber: number | null
+  expectedLatestErrorCode: string | null
+  reason: string
+}): Promise<OneOffShippingPrintRecoveryResult> {
+  const organizationId = requiredOrganizationId(input.organizationId)
+  const actorEmail = requiredText(input.actorEmail, 'Actor', 320).toLowerCase()
+  if (!actorEmail.includes('@')) {
+    fail('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  }
+  const idempotencyKey = requiredIdempotencyKey(input.idempotencyKey)
+  const orderGlobalId = requiredId(input.orderGlobalId, 'Order', ORDER_GLOBAL_ID)
+  const expectedRowVersion = requiredVersion(input.expectedRowVersion)
+  const packageGlobalId = requiredId(
+    input.packageGlobalId,
+    'Package',
+    PACKAGE_GLOBAL_ID,
+  )
+  const labelGlobalId = requiredId(
+    input.labelGlobalId,
+    'Label',
+    LABEL_GLOBAL_ID,
+  )
+  const expectedPrintJobGlobalId = input.expectedPrintJobGlobalId === null
+    ? null
+    : requiredId(
+      input.expectedPrintJobGlobalId,
+      'Expected print job',
+      PRINT_JOB_GLOBAL_ID,
+    )
+  const expectedPrintArtifactGlobalId = input.expectedPrintArtifactGlobalId
+    === null
+    ? null
+    : requiredId(
+      input.expectedPrintArtifactGlobalId,
+      'Expected print artifact',
+      PRINT_ARTIFACT_GLOBAL_ID,
+    )
+  const expectedRecoveryAction = input.expectedRecoveryAction
+  if (!['enqueue', 'retry', 'new_print'].includes(expectedRecoveryAction)) {
+    fail(
+      'OPERATIONS_ONE_OFF_PRINT_REQUEST_INVALID',
+      'Expected print-recovery action is invalid',
+      400,
+    )
+  }
+  const allowedStatuses = new Set<PrintJobStatus>([
+    'queued', 'claimed', 'delivered', 'failed', 'cancelled', 'printed',
+    'rerouted',
+  ])
+  const expectedPrintJobStatus = input.expectedPrintJobStatus
+  const expectedPrintAttempts = input.expectedPrintAttempts
+  const expectedPrintMaxAttempts = input.expectedPrintMaxAttempts
+  const expectedLatestAttemptSequenceNumber =
+    input.expectedLatestAttemptSequenceNumber
+  const expectedLatestErrorCode = input.expectedLatestErrorCode === null
+    ? null
+    : requiredText(input.expectedLatestErrorCode, 'Latest print error code', 100)
+  const hasExactAttemptEvidence = Number.isSafeInteger(expectedPrintAttempts)
+    && Number(expectedPrintAttempts) >= 0
+    && Number.isSafeInteger(expectedPrintMaxAttempts)
+    && Number(expectedPrintMaxAttempts) > 0
+    && Number.isSafeInteger(expectedLatestAttemptSequenceNumber)
+    && Number(expectedLatestAttemptSequenceNumber) > 0
+  if (
+    (expectedPrintJobGlobalId === null) !== (expectedPrintJobStatus === null)
+    || (expectedPrintJobGlobalId === null)
+      !== (expectedPrintArtifactGlobalId === null)
+    || (
+      expectedPrintJobStatus !== null
+      && !allowedStatuses.has(expectedPrintJobStatus)
+    )
+    || (
+      expectedPrintJobGlobalId === null
+      && (
+        expectedRecoveryAction !== 'enqueue'
+        || expectedPrintAttempts !== null
+        || expectedPrintMaxAttempts !== null
+        || expectedLatestAttemptSequenceNumber !== null
+        || expectedLatestErrorCode !== null
+      )
+    )
+    || (
+      expectedPrintJobGlobalId !== null
+      && (
+        expectedRecoveryAction === 'enqueue'
+        || !hasExactAttemptEvidence
+      )
+    )
+  ) {
+    fail(
+      'OPERATIONS_ONE_OFF_PRINT_REQUEST_INVALID',
+      'Expected print-job evidence is invalid',
+      400,
+    )
+  }
+  const reason = requiredText(input.reason, 'Print recovery reason', 500)
+  if (reason.length < 10) {
+    fail(
+      'OPERATIONS_ONE_OFF_PRINT_REQUEST_INVALID',
+      'Print recovery reason must contain at least 10 characters',
+      400,
+    )
+  }
+  const idempotencyContext = {
+    workflow: 'shipping-one-off-label-print-recovery.v1',
+    orderGlobalId,
+    expectedRowVersion,
+    packageGlobalId,
+    labelGlobalId,
+    expectedRecoveryAction,
+    expectedPrintJobGlobalId,
+    expectedPrintJobStatus,
+    expectedPrintArtifactGlobalId,
+    expectedPrintAttempts,
+    expectedPrintMaxAttempts,
+    expectedLatestAttemptSequenceNumber,
+    expectedLatestErrorCode,
+    reason,
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:one-off-label-print-recovery:${organizationId}:${idempotencyKey}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-job:${organizationId}:${idempotencyKey}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-label:${organizationId}:${labelGlobalId}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-attempt:${organizationId}:print-user:retry:${idempotencyKey}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-reprint:${organizationId}:${idempotencyKey}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:one-off-carrier-group:${organizationId}:${orderGlobalId}`,
+    )
+    const context = await readGroupContext(
+      organizationId,
+      orderGlobalId,
+      client,
+      true,
+    )
+    if (
+      numberValue(context.row_version) !== expectedRowVersion
+      || context.order_status !== 'packed'
+    ) {
+      fail(
+        'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+        'The one-off order changed before print recovery. Refresh its exact status.',
+      )
+    }
+    const locked = await client.query<ShippingPrintRecoveryContextRow>(
+      `SELECT label.id::text AS label_id,
+              label.global_id AS label_global_id,
+              label.status AS label_status,
+              package.global_id AS package_global_id,
+              warehouse.id::text AS warehouse_id
+       FROM operations_orders source_order
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = source_order.organization_id
+        AND plan.id = $3::uuid
+        AND plan.order_id = source_order.id
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = plan.organization_id
+        AND warehouse.id = plan.warehouse_id
+       JOIN operations_one_off_carrier_group_attempts create_attempt
+         ON create_attempt.organization_id = plan.organization_id
+        AND create_attempt.order_id = source_order.id
+        AND create_attempt.plan_id = plan.id
+        AND create_attempt.action = 'create'
+        AND create_attempt.state = 'succeeded'
+       JOIN operations_one_off_carrier_group_members member
+         ON member.organization_id = create_attempt.organization_id
+        AND member.carrier_group_attempt_id = create_attempt.id
+       JOIN operations_packages package
+         ON package.organization_id = member.organization_id
+        AND package.id = member.package_id
+        AND package.plan_id = plan.id
+       JOIN operations_one_off_carrier_group_results group_result
+         ON group_result.organization_id = member.organization_id
+        AND group_result.carrier_group_attempt_id = member.carrier_group_attempt_id
+        AND group_result.package_id = member.package_id
+       JOIN operations_labels label
+         ON label.organization_id = group_result.organization_id
+        AND label.id = group_result.label_id
+        AND label.package_id = package.id
+        AND label.one_off_carrier_group_attempt_id = create_attempt.id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.id = $2::uuid
+         AND source_order.global_id = $4
+         AND source_order.source_provider = 'clawpilot_native'
+         AND source_order.order_type = 'one_off'
+         AND source_order.status = 'packed'
+         AND source_order.archived_at IS NULL
+         AND create_attempt.id = (
+           SELECT candidate.id
+           FROM operations_one_off_carrier_group_attempts candidate
+           WHERE candidate.organization_id = create_attempt.organization_id
+             AND candidate.order_id = create_attempt.order_id
+             AND candidate.plan_id = create_attempt.plan_id
+             AND candidate.action = 'create'
+           ORDER BY candidate.created_at DESC, candidate.id DESC
+           LIMIT 1
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_one_off_carrier_group_attempts close_attempt
+           WHERE close_attempt.organization_id = create_attempt.organization_id
+             AND close_attempt.create_attempt_id = create_attempt.id
+             AND close_attempt.action IN ('void', 'close_sample')
+             AND close_attempt.state IN ('prepared', 'succeeded', 'unknown')
+         )
+         AND package.global_id = $5
+         AND package.status = 'labeled'
+         AND label.global_id = $6
+         AND label.status = 'created'
+         AND label.one_off_void_group_attempt_id IS NULL
+       LIMIT 1
+       FOR UPDATE OF source_order, create_attempt, package
+       FOR SHARE OF plan, warehouse, member, group_result, label`,
+      [
+        organizationId,
+        context.order_id,
+        context.plan_id,
+        orderGlobalId,
+        packageGlobalId,
+        labelGlobalId,
+      ],
+    )
+    const recoveryContext = locked.rows[0]
+    if (!recoveryContext) {
+      fail(
+        'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+        'The active carrier group, package, or created label changed before print recovery.',
+      )
+    }
+    const currentJobResult = await client.query<ShippingPrintRecoveryJobRow>(
+      `SELECT job.id::text, job.global_id, job.status,
+              job.attempts, job.max_attempts, job.idempotency_key,
+              artifact.global_id AS artifact_global_id,
+              artifact.content_sha256, artifact.byte_length::text,
+              original.global_id AS reprint_of_job_global_id,
+              retry.idempotency_key AS last_operator_retry_idempotency_key,
+              ARRAY(
+                SELECT operator_retry.idempotency_key
+                FROM operations_print_delivery_attempts operator_retry
+                WHERE operator_retry.organization_id = job.organization_id
+                  AND operator_retry.print_job_id = job.id
+                  AND operator_retry.actor_type = 'user'
+                  AND operator_retry.state = 'queued'
+                  AND operator_retry.idempotency_key
+                    LIKE 'print-user:retry:%'
+                ORDER BY operator_retry.sequence_number, operator_retry.id
+              ) AS operator_retry_idempotency_keys,
+              outcome.sequence_number AS latest_attempt_sequence_number,
+              outcome.state AS latest_attempt_state,
+              outcome.actor_type AS latest_attempt_actor_type,
+              outcome.error_code AS latest_attempt_error_code,
+              outcome.physical_output_verified
+                AS latest_attempt_physical_output_verified
+       FROM operations_print_jobs job
+       JOIN operations_print_artifacts artifact
+         ON artifact.organization_id = job.organization_id
+        AND artifact.id = job.artifact_id
+        AND artifact.source_label_id = $2::uuid
+        AND artifact.source_order_id = $3::uuid
+       LEFT JOIN operations_print_jobs original
+         ON original.organization_id = job.organization_id
+        AND original.id = job.reprint_of_job_id
+       LEFT JOIN LATERAL (
+         SELECT attempt.idempotency_key
+         FROM operations_print_delivery_attempts attempt
+         WHERE attempt.organization_id = job.organization_id
+           AND attempt.print_job_id = job.id
+           AND attempt.actor_type = 'user'
+           AND attempt.state = 'queued'
+           AND attempt.idempotency_key LIKE 'print-user:retry:%'
+         ORDER BY attempt.sequence_number DESC, attempt.id DESC
+         LIMIT 1
+       ) retry ON true
+       LEFT JOIN LATERAL (
+         SELECT attempt.sequence_number, attempt.state, attempt.actor_type,
+                attempt.error_code,
+                attempt.physical_output_verified
+         FROM operations_print_delivery_attempts attempt
+         WHERE attempt.organization_id = job.organization_id
+           AND attempt.print_job_id = job.id
+         ORDER BY attempt.sequence_number DESC, attempt.id DESC
+         LIMIT 1
+       ) outcome ON true
+       WHERE job.organization_id = $1::uuid
+         AND job.label_id = $2::uuid
+       ORDER BY job.created_at DESC, job.id DESC
+       LIMIT 1
+       FOR UPDATE OF job`,
+      [organizationId, recoveryContext.label_id, context.order_id],
+    )
+    const currentJob = currentJobResult.rows[0] || null
+    const keyUsageResult = await client.query<ShippingPrintRecoveryKeyUsageRow>(
+      `SELECT CASE
+                WHEN job.idempotency_key = $2
+                  AND job.reprint_of_job_id IS NULL THEN 'enqueue'
+                WHEN job.idempotency_key = 'print-user:reprint:' || $2
+                  AND job.reprint_of_job_id IS NOT NULL THEN 'new_print'
+                ELSE 'invalid'
+              END AS action,
+              job.label_id::text,
+              job.global_id AS print_job_global_id,
+              source.global_id AS source_print_job_global_id,
+              source_artifact.global_id
+                AS source_print_artifact_global_id
+       FROM operations_print_jobs job
+       LEFT JOIN operations_print_jobs source
+         ON source.organization_id = job.organization_id
+        AND source.id = job.reprint_of_job_id
+       LEFT JOIN operations_print_artifacts source_artifact
+         ON source_artifact.organization_id = source.organization_id
+        AND source_artifact.id = source.artifact_id
+       WHERE job.organization_id = $1::uuid
+         AND job.idempotency_key IN (
+           $2,
+           'print-user:reprint:' || $2
+         )
+       UNION ALL
+       SELECT 'retry' AS action,
+              job.label_id::text,
+              job.global_id AS print_job_global_id,
+              job.global_id AS source_print_job_global_id,
+              artifact.global_id AS source_print_artifact_global_id
+       FROM operations_print_delivery_attempts attempt
+       JOIN operations_print_jobs job
+         ON job.organization_id = attempt.organization_id
+        AND job.id = attempt.print_job_id
+       JOIN operations_print_artifacts artifact
+         ON artifact.organization_id = job.organization_id
+        AND artifact.id = job.artifact_id
+       WHERE attempt.organization_id = $1::uuid
+         AND attempt.idempotency_key = 'print-user:retry:' || $2
+         AND attempt.actor_type = 'user'
+         AND attempt.state = 'queued'`,
+      [organizationId, idempotencyKey],
+    )
+    const keyUsageSignatures = new Set(keyUsageResult.rows.map((usage) => (
+      JSON.stringify([
+        usage.action,
+        usage.label_id,
+        usage.print_job_global_id,
+        usage.source_print_job_global_id,
+        usage.source_print_artifact_global_id,
+      ])
+    )))
+    if (keyUsageSignatures.size > 1) {
+      fail(
+        'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+        'This print-recovery idempotency key is already bound to another durable action.',
+      )
+    }
+    const keyUsage = keyUsageResult.rows[0] || null
+
+    let action: OneOffShippingPrintRecoveryResult['action']
+    let replayed = false
+    let sourcePrintJobGlobalId: string | null = null
+    let job: OperationsPrintJobListItem
+    if (keyUsage) {
+      const exactEnqueue = keyUsage.action === 'enqueue'
+        && expectedRecoveryAction === 'enqueue'
+        && expectedPrintJobGlobalId === null
+        && keyUsage.label_id === recoveryContext.label_id
+      const exactRetry = keyUsage.action === 'retry'
+        && expectedRecoveryAction === 'retry'
+        && expectedPrintJobGlobalId !== null
+        && keyUsage.label_id === recoveryContext.label_id
+        && keyUsage.source_print_job_global_id === expectedPrintJobGlobalId
+        && keyUsage.source_print_artifact_global_id
+          === expectedPrintArtifactGlobalId
+      const exactNewPrint = keyUsage.action === 'new_print'
+        && expectedRecoveryAction === 'new_print'
+        && expectedPrintJobGlobalId !== null
+        && keyUsage.label_id === recoveryContext.label_id
+        && keyUsage.source_print_job_global_id === expectedPrintJobGlobalId
+        && keyUsage.source_print_artifact_global_id
+          === expectedPrintArtifactGlobalId
+      if (!exactEnqueue && !exactRetry && !exactNewPrint) {
+        fail(
+          'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+          'This print-recovery idempotency key is already bound to another order, label, or action.',
+        )
+      }
+      action = keyUsage.action as OneOffShippingPrintRecoveryResult['action']
+      replayed = true
+      sourcePrintJobGlobalId = action === 'enqueue'
+        ? null
+        : expectedPrintJobGlobalId
+      if (action === 'enqueue') {
+        job = await enqueueOperationsPrintJobInPostgres({
+          organizationId,
+          actorEmail,
+          idempotencyKey,
+          idempotencyContext,
+          warehouseId: recoveryContext.warehouse_id,
+          document: {
+            type: 'shipping_label',
+            sourceLabelGlobalId: labelGlobalId,
+            media: 'label_4x6',
+          },
+        }, client)
+      } else if (action === 'retry') {
+        job = await retryOperationsPrintJobInPostgres({
+          organizationId,
+          actorEmail,
+          idempotencyKey,
+          idempotencyContext,
+          jobGlobalId: expectedPrintJobGlobalId!,
+          reason,
+        }, client)
+      } else {
+        job = await reprintOperationsPrintJobInPostgres({
+          organizationId,
+          actorEmail,
+          idempotencyKey,
+          idempotencyContext,
+          jobGlobalId: expectedPrintJobGlobalId!,
+          reason,
+        }, client, 'certain_exhausted_only')
+      }
+    } else if (expectedPrintJobGlobalId === null) {
+      if (currentJob) {
+        fail(
+          'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+          'This label already has another immutable print job. Refresh its exact status.',
+        )
+      }
+      action = 'enqueue'
+      job = await enqueueOperationsPrintJobInPostgres({
+        organizationId,
+        actorEmail,
+        idempotencyKey,
+        idempotencyContext,
+        warehouseId: recoveryContext.warehouse_id,
+        document: {
+          type: 'shipping_label',
+          sourceLabelGlobalId: labelGlobalId,
+          media: 'label_4x6',
+        },
+      }, client)
+    } else {
+      if (
+        !currentJob
+        || currentJob.global_id !== expectedPrintJobGlobalId
+        || currentJob.artifact_global_id !== expectedPrintArtifactGlobalId
+      ) {
+        fail(
+          'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+          'The exact print job or immutable label artifact changed. Refresh its status.',
+        )
+      }
+      sourcePrintJobGlobalId = expectedPrintJobGlobalId
+      if (
+        currentJob.status !== expectedPrintJobStatus
+        || currentJob.attempts !== expectedPrintAttempts
+        || currentJob.max_attempts !== expectedPrintMaxAttempts
+        || currentJob.latest_attempt_sequence_number
+          !== expectedLatestAttemptSequenceNumber
+        || currentJob.latest_attempt_error_code !== expectedLatestErrorCode
+      ) {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+            'The exact print-job status or attempt evidence changed. Refresh before deciding whether another physical print is safe.',
+          )
+      }
+        const outcomeUncertain = currentJob.latest_attempt_state === 'failed'
+          && ['local_print_agent', 'system'].includes(
+            currentJob.latest_attempt_actor_type || '',
+          )
+          && currentJob.latest_attempt_error_code === 'PRINT_OUTCOME_UNCERTAIN'
+          && currentJob.latest_attempt_physical_output_verified === false
+        if (outcomeUncertain) {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_OUTCOME_UNCERTAIN',
+            'Printer delivery may already have occurred. Shipping will not resend or create another physical print.',
+          )
+        }
+        if (
+          currentJob.status === 'delivered'
+          || currentJob.status === 'printed'
+        ) {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_ALREADY_ACKNOWLEDGED',
+            'The printer path already acknowledged this label. Shipping will not create another physical print.',
+          )
+        }
+        if (
+          currentJob.status !== 'failed'
+          || currentJob.latest_attempt_state !== 'failed'
+          || currentJob.latest_attempt_physical_output_verified !== false
+        ) {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_RECOVERY_UNAVAILABLE',
+            'This print state is not safe for Shipping recovery. Refresh or use the stronger controlled printer authority.',
+          )
+        }
+        if (!operationsPrintFailureProvesZeroBytes(
+          currentJob.latest_attempt_error_code,
+        )) {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_RECOVERY_UNAVAILABLE',
+            'Shipping recovery requires exact evidence that zero bytes reached the printer.',
+          )
+        }
+        if (expectedRecoveryAction === 'retry') {
+          if (currentJob.attempts >= currentJob.max_attempts) {
+            fail(
+              'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+              'The retained retry action no longer matches the exact attempt evidence.',
+            )
+          }
+          action = 'retry'
+          job = await retryOperationsPrintJobInPostgres({
+            organizationId,
+            actorEmail,
+            idempotencyKey,
+            idempotencyContext,
+            jobGlobalId: expectedPrintJobGlobalId,
+            reason,
+          }, client)
+        } else if (expectedRecoveryAction === 'new_print') {
+          if (currentJob.attempts < currentJob.max_attempts) {
+            fail(
+              'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+              'The retained new-print action no longer matches the exact attempt evidence.',
+            )
+          }
+          action = 'new_print'
+          job = await reprintOperationsPrintJobInPostgres({
+            organizationId,
+            actorEmail,
+            idempotencyKey,
+            idempotencyContext,
+            jobGlobalId: expectedPrintJobGlobalId,
+            reason,
+          }, client, 'certain_exhausted_only')
+        } else {
+          fail(
+            'OPERATIONS_ONE_OFF_PRINT_CONTEXT_CHANGED',
+            'The retained recovery action no longer matches the exact print job.',
+          )
+        }
+    }
+    const result = shippingPrintRecoveryResult({
+      orderGlobalId,
+      packageGlobalId,
+      labelGlobalId,
+      sourcePrintJobGlobalId,
+      action,
+      job,
+      replayed,
+    })
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.one_off_shipment.label_print_recovered',
+      aggregateType: 'operations.order',
+      aggregateId: orderGlobalId,
+      subject: labelGlobalId,
+      organizationId,
+      eventKey: `operations:one-off-label-print:${organizationId}:${idempotencyKey}`,
+      payload: {
+        action,
+        orderGlobalId,
+        packageGlobalId,
+        labelGlobalId,
+        printJobGlobalId: result.printJobGlobalId,
+        sourcePrintJobGlobalId,
+        printArtifactGlobalId: result.printArtifactGlobalId,
+        replayed,
+        carrierWrites: 0,
+        providerWrites: 0,
+        labelWrites: 0,
+        reason,
+      },
+    }, client)
+    return result
+  })
 }
 
 export async function refreshOperationsOneOffPackedRatesInPostgres(input: {
@@ -1706,8 +2642,6 @@ export async function createOperationsOneOffCarrierGroupInPostgres(input: {
          ON purchase_offer.organization_id = purchase_quote.organization_id
         AND purchase_offer.quote_id = purchase_quote.id
         AND purchase_offer.id = attempt.purchase_offer_id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = attempt.organization_id
        JOIN operations_one_off_purchase_quote_consumptions consumption
          ON consumption.organization_id = attempt.organization_id
         AND consumption.quote_id = attempt.purchase_quote_id
@@ -1718,10 +2652,6 @@ export async function createOperationsOneOffCarrierGroupInPostgres(input: {
        WHERE attempt.organization_id = $1::uuid AND attempt.id = $2::uuid
          AND attempt.state = 'prepared'
          AND purchase_quote.expires_at > clock_timestamp()
-         AND (
-           (attempt.environment = 'sandbox' AND activation.state = 'shadow')
-           OR (attempt.environment = 'production' AND activation.state = 'active')
-         )
          AND purchase_offer.provider = attempt.provider
          AND purchase_offer.environment = attempt.environment
          AND purchase_offer.service_code = attempt.service_code
@@ -2363,6 +3293,7 @@ async function readVoidCreateAttempt(
 export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
   organizationId: string
   actorEmail: string
+  canPurchaseLivePostage: boolean
   idempotencyKey: string
   orderGlobalId: string
   expectedRowVersion: number
@@ -2375,6 +3306,13 @@ export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
   const expectedRowVersion = requiredVersion(input.expectedRowVersion)
   const reason = requiredText(input.reason, 'Whole-shipment void reason', 500)
   const initial = await readGroupContext(organizationId, orderGlobalId, null, false)
+  if (initial.execution_mode === 'live' && !input.canPurchaseLivePostage) {
+    fail(
+      'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+      'Live carrier cancellation requires live-postage permission',
+      403,
+    )
+  }
   const replay = await readVoidReplay(organizationId, idempotencyKey)
   if (replay) {
     assertVoidReplayRequest({
@@ -2474,6 +3412,13 @@ export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
       client,
       true,
     )
+    if (context.execution_mode === 'live' && !input.canPurchaseLivePostage) {
+      fail(
+        'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+        'Live carrier cancellation requires live-postage permission',
+        403,
+      )
+    }
     const racedReplay = await readVoidReplay(
       organizationId,
       idempotencyKey,

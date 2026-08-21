@@ -7,7 +7,7 @@ import type {
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
 import {
-  isShopifySandboxCheckoutChannelEligible,
+  isShopifyRatingCheckoutChannelEligible,
 } from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import type { ShopifyCheckoutRatingAccount } from '@/lib/persistence/shopifyCheckoutRating'
 import { getPostgresPool } from '@/lib/persistence/postgres'
@@ -329,7 +329,7 @@ function mapLines(
       )
     }
     if (
-      !isShopifySandboxCheckoutChannelEligible({
+      !isShopifyRatingCheckoutChannelEligible({
         provider: 'shopify',
         accountEnvironment: account.environment,
         providerStatusRaw: row.state_provider_status_raw,

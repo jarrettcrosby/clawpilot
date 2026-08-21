@@ -15,11 +15,16 @@ import {
   commerceReadAccountSql,
 } from '@/lib/integrations/commerceReadRuntime'
 import { isHostedRuntime } from '@/lib/persistence/config'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const POLICY_VERSION = 'commerce-order-sync-policy-v1'
 const BACKFILL_LEASE = '10 minutes'
@@ -30,6 +35,7 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/u
 const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account', {
   developmentRequiresActive: true,
 })
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 export function commerceOrderSyncAccountLockKey(input: {
   organizationId: string
@@ -1135,6 +1141,7 @@ type AccountRow = {
   webhook_verification_status: 'unverified' | 'verified' | 'failed' | 'not_applicable'
   credential_version: number
   activation_state: string | null
+  store_sync_running: boolean
 }
 
 async function lockAccount(
@@ -1152,7 +1159,8 @@ async function lockAccount(
             credential.verification_status,
             credential.webhook_verification_status,
             credential.credential_version,
-            activation.state AS activation_state
+            activation.state AS activation_state,
+            ${STORE_SYNC_RUNNING_SQL} AS store_sync_running
      FROM operations_integration_accounts account
      LEFT JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
@@ -1299,8 +1307,8 @@ export async function requestCommerceOrderBackfillInPostgres(input: {
         || account.credential_external_account_id
           !== account.external_account_id
         ? 'COMMERCE_ORDER_SYNC_CREDENTIAL_INELIGIBLE'
-        : !['shadow', 'active'].includes(account.activation_state || '')
-          ? 'COMMERCE_ORDER_SYNC_ACTIVATION_REQUIRED'
+        : !account.store_sync_running
+          ? 'COMMERCE_ORDER_SYNC_PAUSED'
           : null
     const blockerCode = accountBlocker || readiness.blockers[0] || null
     const webhookSubscriptions = jsonRecord(
@@ -1535,7 +1543,7 @@ export async function ensureContinuousCommerceOrderPollsInPostgres(input: {
            OR (account.provider = 'faire'
              AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth'))
          )
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND (
            (account.provider = 'shopify' AND (
              COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
@@ -1683,7 +1691,6 @@ export async function claimCommerceOrderBackfillsInPostgres(input: {
             AND policy.authority = 'provider'
            JOIN operations_activation_scopes activation
              ON activation.organization_id = account.organization_id
-            AND activation.state IN ('shadow', 'active')
            WHERE account.organization_id = session.organization_id
              AND account.id = session.integration_account_id
              AND account.integration_type = 'commerce'
@@ -1802,7 +1809,7 @@ export async function claimCommerceOrderBackfillsInPostgres(input: {
            OR (account.provider = 'faire'
              AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth'))
          )
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND NOT EXISTS (
            SELECT 1
            FROM stale_terminalized stale
@@ -1925,7 +1932,7 @@ export async function readCommerceOrderBackfillCursorFromPostgres(
            OR (account.provider = 'faire'
              AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth'))
          )
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND policy.authority = 'provider'
          AND (
            (session.session_kind = 'historical_backfill'
@@ -2015,6 +2022,7 @@ export async function readCommerceOrderBackfillCursorFromPostgres(
 
 export async function appendCommerceOrderBackfillPageInPostgres(input: {
   job: CommerceOrderBackfillJob
+  providerReadLease: CommerceStoreSyncProviderReadLease
   pageNumber: number
   providerRecordsSeen: number
   observations: readonly CommerceOrderObservationInput[]
@@ -2131,6 +2139,13 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       ? 'available'
       : 'unavailable'
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.job.organizationId,
+      integrationAccountId: input.job.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'automatic',
+      readKind: 'order_history',
+    })
     const session = (
       await client.query<{
         id: string
@@ -2194,7 +2209,7 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
              OR (account.provider = 'faire'
                AND credential.auth_mode IN ('faire_brand_token', 'faire_oauth'))
            )
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND policy.authority = 'provider'
            AND (
              (session.session_kind = 'historical_backfill'
@@ -2547,6 +2562,40 @@ export async function failCommerceOrderBackfillInPostgres(input: {
   }
 }
 
+export async function parkCommerceOrderBackfillForStoreSyncPauseInPostgres(
+  input: { job: CommerceOrderBackfillJob },
+) {
+  const result = await query(
+    `UPDATE operations_commerce_order_backfill_sessions
+     SET status = 'pending',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         completed_at = NULL,
+         updated_at = now()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND global_id = $3
+       AND status = 'processing'
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.job.organizationId,
+      input.job.id,
+      input.job.globalId,
+      input.job.lockToken,
+    ],
+  )
+  return {
+    parked: result.rowCount === 1,
+    providerWrites: 0 as const,
+  }
+}
+
 export async function readCommerceOrderSyncStateFromPostgres(input: {
   organizationId: string
   accountGlobalId: string
@@ -2688,33 +2737,77 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
     overdue_polls: number
     scheduled_poll_policies: number
     webhook_signal_plus_poll_policies: number
+    paused_retained_sessions: number
     expired_sensitive_evidence: number
     last_completed_at: Date | null
   }>(
     `SELECT
-       count(*) FILTER (WHERE session.status = 'pending')::integer AS pending,
-       count(*) FILTER (WHERE session.status = 'processing')::integer
+       count(*) FILTER (
+         WHERE session.status = 'pending'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer AS pending,
+       count(*) FILTER (
+         WHERE session.status = 'processing'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer
          AS processing,
        count(*) FILTER (
          WHERE session.status = 'processing'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
            AND session.lease_expires_at <= now()
        )::integer AS stale_processing,
-       count(*) FILTER (WHERE session.status = 'failed')::integer AS failed,
-       count(*) FILTER (WHERE session.status = 'dead')::integer AS dead,
-       count(*) FILTER (WHERE session.status = 'blocked')::integer AS blocked,
+       count(*) FILTER (
+         WHERE session.status = 'failed'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer AS failed,
+       count(*) FILTER (
+         WHERE session.status = 'dead'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer AS dead,
+       count(*) FILTER (
+         WHERE session.status = 'blocked'
+           AND operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer AS blocked,
+       count(*) FILTER (
+         WHERE session.status IN ('pending', 'processing', 'failed')
+           AND NOT operations_commerce_store_sync_is_running(
+             session.organization_id, session.integration_account_id
+           )
+       )::integer AS paused_retained_sessions,
        (SELECT count(*)::integer
         FROM operations_commerce_order_sync_policies policy
         WHERE policy.continuous_observation_enabled
           AND policy.continuous_high_watermark IS NOT NULL
-          AND policy.continuous_next_poll_at <= now()) AS overdue_polls,
+          AND policy.continuous_next_poll_at <= now()
+          AND operations_commerce_store_sync_is_running(
+            policy.organization_id, policy.integration_account_id
+          )) AS overdue_polls,
        (SELECT count(*)::integer
         FROM operations_commerce_order_sync_policies policy
         WHERE policy.continuous_observation_enabled
+          AND operations_commerce_store_sync_is_running(
+            policy.organization_id, policy.integration_account_id
+          )
           AND policy.continuous_transport = 'scheduled_poll')
          AS scheduled_poll_policies,
        (SELECT count(*)::integer
         FROM operations_commerce_order_sync_policies policy
         WHERE policy.continuous_observation_enabled
+          AND operations_commerce_store_sync_is_running(
+            policy.organization_id, policy.integration_account_id
+          )
           AND policy.continuous_transport = 'webhook_signal_plus_poll')
          AS webhook_signal_plus_poll_policies,
        (SELECT count(*)::integer
@@ -2747,6 +2840,7 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
     failed: Number(row?.failed || 0),
     dead: Number(row?.dead || 0),
     blocked: Number(row?.blocked || 0),
+    pausedRetainedSessions: Number(row?.paused_retained_sessions || 0),
     overduePolls: Number(row?.overdue_polls || 0),
     continuousTransportCounts: {
       scheduledPoll: scheduledPollPolicies,

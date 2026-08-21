@@ -1,0 +1,359 @@
+name: Print Gateway Customer Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact package version to sign and publish
+        required: true
+        type: string
+      confirmation:
+        description: Type SIGN_AND_PUBLISH after approving both platform releases
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: print-gateway-customer-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.confirmation == 'SIGN_AND_PUBLISH'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - run: npm --prefix app_src ci --ignore-scripts
+      - run: npm --prefix clients/print-gateway test
+      - run: node scripts/test-local-print-device.mjs
+      - run: node scripts/test-operation-print-agent-pairing.mjs
+      - run: node scripts/test-operation-print-agent-cleanup-status.mjs
+      - run: node scripts/test-operation-print-agent-runtime.mjs
+      - run: node scripts/test-operations-print-delivery.mjs --contracts-only
+      - id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Customer signing may run only from refs/heads/main" >&2
+            exit 1
+          fi
+          if ! [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "GitHub did not provide an exact source commit" >&2
+            exit 1
+          fi
+          package_version="$(node -p "require('./clients/print-gateway/package.json').version")"
+          if [ "$package_version" != "$REQUESTED_VERSION" ]; then
+            echo "Requested version does not match package.json" >&2
+            exit 1
+          fi
+          if ! [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Package version is not release-safe" >&2
+            exit 1
+          fi
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: preflight
+    runs-on: macos-14
+    timeout-minutes: 45
+    environment: print-gateway-customer-release
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - name: Test exact macOS release source before signing
+        env:
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          npm --prefix clients/print-gateway test
+          node scripts/test-local-print-device.mjs
+          node scripts/test-submit-raw-print.mjs
+          node scripts/test-local-print-agent.mjs
+      - name: Import Developer ID and App Store Connect API credentials
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.PRINT_GATEWAY_MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.PRINT_GATEWAY_MACOS_CERTIFICATE_PASSWORD }}
+          API_KEY_BASE64: ${{ secrets.PRINT_GATEWAY_APPLE_API_KEY_P8_BASE64 }}
+          API_KEY_ID_VALUE: ${{ secrets.PRINT_GATEWAY_APPLE_API_KEY_ID }}
+          API_ISSUER_VALUE: ${{ secrets.PRINT_GATEWAY_APPLE_API_ISSUER }}
+          APPLE_TEAM_VALUE: ${{ secrets.PRINT_GATEWAY_APPLE_TEAM_ID }}
+          DEVELOPER_IDENTITY: ${{ secrets.PRINT_GATEWAY_MACOS_DEVELOPER_ID_APPLICATION }}
+        shell: bash
+        run: |
+          for value in "$CERTIFICATE_BASE64" "$CERTIFICATE_PASSWORD" "$API_KEY_BASE64" "$API_KEY_ID_VALUE" "$API_ISSUER_VALUE" "$APPLE_TEAM_VALUE" "$DEVELOPER_IDENTITY"; do
+            if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "Protected Apple signing values must be single-line" >&2
+              exit 1
+            fi
+          done
+          if ! [[ "$API_KEY_ID_VALUE" =~ ^[A-Z0-9]{10}$ ]] \
+            || ! [[ "$API_ISSUER_VALUE" =~ ^[0-9a-fA-F-]{36}$ ]] \
+            || ! [[ "$APPLE_TEAM_VALUE" =~ ^[A-Z0-9]{10}$ ]] \
+            || ! [[ "$DEVELOPER_IDENTITY" =~ ^Developer\ ID\ Application:\ .+\ \("$APPLE_TEAM_VALUE"\)$ ]]; then
+            echo "Protected Apple signing metadata is invalid" >&2
+            exit 1
+          fi
+          cert_path="$RUNNER_TEMP/clawpilot-developer-id.p12"
+          api_key_path="$RUNNER_TEMP/AuthKey_${API_KEY_ID_VALUE}.p8"
+          keychain_path="$RUNNER_TEMP/clawpilot-release.keychain-db"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$cert_path"
+          printf '%s' "$API_KEY_BASE64" | base64 --decode > "$api_key_path"
+          security create-keychain -p "$CERTIFICATE_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$CERTIFICATE_PASSWORD" "$keychain_path"
+          security import "$cert_path" -k "$keychain_path" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$CERTIFICATE_PASSWORD" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" | grep -F -- "$DEVELOPER_IDENTITY"
+          {
+            echo "CSC_LINK=$cert_path"
+            echo "CSC_KEYCHAIN=$keychain_path"
+            echo "APPLE_API_KEY=$api_key_path"
+          } >> "$GITHUB_ENV"
+      - name: Build, notarize, staple, and verify macOS release
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.PRINT_GATEWAY_MACOS_CERTIFICATE_PASSWORD }}
+          CSC_NAME: ${{ secrets.PRINT_GATEWAY_MACOS_DEVELOPER_ID_APPLICATION }}
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.PRINT_GATEWAY_MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_TEAM_ID: ${{ secrets.PRINT_GATEWAY_APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.PRINT_GATEWAY_APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.PRINT_GATEWAY_APPLE_API_ISSUER }}
+        shell: bash
+        run: |
+          rm -rf clients/print-gateway/dist
+          npm --prefix clients/print-gateway run build:mac
+      - name: Execute the exact mounted, signed, stapled DMG payload
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmgs=(clients/print-gateway/dist/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "Expected exactly one verified DMG" >&2
+            exit 1
+          fi
+          mount_point="$(mktemp -d "$RUNNER_TEMP/clawpilot-dmg-smoke.XXXXXX")"
+          cleanup_mount() {
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            rmdir "$mount_point" 2>/dev/null || true
+          }
+          trap cleanup_mount EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "${dmgs[0]}"
+          CLAWPILOT_PACKAGED_PAYLOAD_DIRECTORY="$mount_point" \
+            npm --prefix clients/print-gateway run smoke:packaged
+      - name: Stage verified macOS release files
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/macos-release"
+          cp clients/print-gateway/dist/*.dmg "$RUNNER_TEMP/macos-release/"
+          cp clients/print-gateway/dist/*.artifact.json "$RUNNER_TEMP/macos-release/"
+          cp clients/print-gateway/dist/*.sha256 "$RUNNER_TEMP/macos-release/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-macos-print-gateway
+          path: ${{ runner.temp }}/macos-release
+          if-no-files-found: error
+      - name: Remove temporary signing credentials
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/clawpilot-release.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/clawpilot-developer-id.p12" "$RUNNER_TEMP"/AuthKey_*.p8
+
+  windows:
+    needs: preflight
+    runs-on: windows-latest
+    timeout-minutes: 35
+    environment: print-gateway-customer-release
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - name: Test exact Windows release source before signing
+        env:
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:SOURCE_COMMIT) { throw 'Release checkout SHA drifted' }
+          npm --prefix clients/print-gateway test
+          node scripts/test-local-print-device.mjs
+          node scripts/test-submit-raw-print.mjs
+          node scripts/test-local-print-agent.mjs
+      - name: Materialize Authenticode certificate for this job
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.PRINT_GATEWAY_WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          SIGNING_SUBJECT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_SUBJECT }}
+          SIGNING_THUMBPRINT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_THUMBPRINT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64) -or $env:CERTIFICATE_BASE64.Contains("`n") -or $env:CERTIFICATE_BASE64.Contains("`r") -or [string]::IsNullOrWhiteSpace($env:SIGNING_SUBJECT) -or $env:SIGNING_SUBJECT.Contains("`n") -or $env:SIGNING_SUBJECT.Contains("`r") -or $env:SIGNING_THUMBPRINT -notmatch '^[A-Fa-f0-9]{40}$') {
+            throw 'Protected Windows signing identity is invalid'
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'clawpilot-authenticode.pfx'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          "WIN_CSC_LINK=$certificatePath" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build and verify Windows release
+        env:
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.PRINT_GATEWAY_WINDOWS_CERTIFICATE_PASSWORD }}
+          WIN_SIGNING_SUBJECT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_SUBJECT }}
+          WIN_SIGNING_THUMBPRINT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_THUMBPRINT }}
+        shell: pwsh
+        run: |
+          if ($env:WIN_CSC_KEY_PASSWORD.Contains("`n") -or $env:WIN_CSC_KEY_PASSWORD.Contains("`r") -or $env:WIN_SIGNING_SUBJECT.Contains("`n") -or $env:WIN_SIGNING_SUBJECT.Contains("`r") -or $env:WIN_SIGNING_THUMBPRINT -notmatch '^[A-Fa-f0-9]{40}$') {
+            throw 'Protected Windows signing values must be single-line'
+          }
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue clients/print-gateway/dist
+          npm --prefix clients/print-gateway run build:win
+      - name: Install, execute, verify autostart, and uninstall exact signed NSIS release
+        env:
+          WIN_SIGNING_SUBJECT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_SUBJECT }}
+          WIN_SIGNING_THUMBPRINT: ${{ secrets.PRINT_GATEWAY_WINDOWS_SIGNING_THUMBPRINT }}
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem clients/print-gateway/dist -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "Expected exactly one signed NSIS installer; found $($installers.Count)" }
+          $installDirectory = Join-Path $env:RUNNER_TEMP 'clawpilot-installed-agent'
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $installDirectory
+          $install = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDirectory") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS install failed with $($install.ExitCode)" }
+          $installedApp = Join-Path $installDirectory 'ClawPilot Print Agent.exe'
+          $uninstaller = Join-Path $installDirectory 'Uninstall ClawPilot Print Agent.exe'
+          if (!(Test-Path $installedApp) -or !(Test-Path $uninstaller)) { throw 'Installed app or uninstaller is missing' }
+          $signedPayloads = @(Get-ChildItem $installDirectory -Recurse -File | Where-Object { $_.Extension -in @('.exe', '.dll', '.node') })
+          if ($signedPayloads.Count -lt 2) { throw 'Installed signed PE payload set is incomplete' }
+          foreach ($file in $signedPayloads) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -ne $env:WIN_SIGNING_SUBJECT -or $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $env:WIN_SIGNING_THUMBPRINT.ToUpperInvariant() -or $null -eq $signature.TimeStamperCertificate) {
+              throw "Installed Authenticode/timestamp verification failed: $($file.FullName)"
+            }
+          }
+          $env:CLAWPILOT_RELEASE_INSTALL_SMOKE = '1'
+          $loginItemSmoke = Start-Process -FilePath $installedApp -ArgumentList '--release-smoke-login-item' -Wait -PassThru
+          if ($loginItemSmoke.ExitCode -ne 0) { throw "Installed login-item registration smoke failed with $($loginItemSmoke.ExitCode)" }
+          Remove-Item Env:CLAWPILOT_RELEASE_INSTALL_SMOKE
+          $env:CLAWPILOT_PACKAGED_PAYLOAD_DIRECTORY = $installDirectory
+          npm --prefix clients/print-gateway run smoke:packaged
+          Remove-Item Env:CLAWPILOT_PACKAGED_PAYLOAD_DIRECTORY
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "NSIS uninstall failed with $($uninstall.ExitCode)" }
+          if (Test-Path $installedApp) { throw 'NSIS uninstall left the installed application executable behind' }
+      - name: Stage verified Windows release files
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'windows-release'
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          Copy-Item clients/print-gateway/dist/*.exe $destination
+          Copy-Item clients/print-gateway/dist/*.artifact.json $destination
+          Copy-Item clients/print-gateway/dist/*.sha256 $destination
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-windows-print-gateway
+          path: ${{ runner.temp }}/windows-release
+          if-no-files-found: error
+      - name: Remove temporary signing credential
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:RUNNER_TEMP 'clawpilot-authenticode.pfx')
+
+  publish:
+    needs:
+      - preflight
+      - macos
+      - windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: print-gateway-customer-release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: verified-*-print-gateway
+          path: ${{ runner.temp }}/verified
+      - name: Build atomic cross-platform release index
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          find "$RUNNER_TEMP/verified" -type f -exec cp '{}' "$RUNNER_TEMP/release/" \;
+          node clients/print-gateway/scripts/create-release-index.mjs \
+            --input "$RUNNER_TEMP/verified" \
+            --output "$RUNNER_TEMP/release"
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign and verify manifests and checksums with GitHub OIDC
+        shell: bash
+        run: |
+          identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          for file in "$RUNNER_TEMP"/release/*.artifact.json "$RUNNER_TEMP"/release/*.sha256 "$RUNNER_TEMP"/release/*-release.json "$RUNNER_TEMP"/release/SHA256SUMS.txt; do
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "$file"
+            cosign verify-blob \
+              --bundle "${file}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$file"
+          done
+      - name: Require exact immutable customer asset contract
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: node clients/print-gateway/scripts/assert-release-asset-set.mjs --directory "$RUNNER_TEMP/release" --version "$RELEASE_VERSION"
+      - name: Publish only the complete verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        shell: bash
+        run: |
+          tag="print-gateway-v${RELEASE_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace immutable artifacts" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; refusing to attach customer assets to pre-existing provenance" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --draft \
+            --target "$SOURCE_COMMIT" \
+            --title "ClawPilot Print Agent $RELEASE_VERSION" \
+            --notes "Signed macOS universal DMG and Windows x64 installer built from commit $SOURCE_COMMIT. Verify SHA256SUMS.txt and its Sigstore bundle before installation."
+          tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          if [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release tag resolved to unexpected commit $tag_commit" >&2
+            exit 1
+          fi
+          gh release upload "$tag" "$RUNNER_TEMP"/release/*
+          prepublish_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          if [ "$prepublish_commit" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release tag drifted during asset upload to $prepublish_commit; leaving release unpublished" >&2
+            exit 1
+          fi
+          gh release edit "$tag" --draft=false
+          published_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          if [ "$published_commit" != "$SOURCE_COMMIT" ]; then
+            echo "Published release tag drifted to $published_commit" >&2
+            exit 1
+          fi

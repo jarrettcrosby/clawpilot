@@ -134,6 +134,9 @@ async function runDrainScenario({ finalPage }) {
         return { ready: true, referencedKeyIds: [] }
       },
     },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
+    },
   })
   const result = await runtime.processCommerceOrderHistory({
     workerId: 'multi-page-drain-test',
@@ -244,6 +247,9 @@ const isolatedFailureRuntime = loadWorker({
     async readCommerceOrderSyncCursorKeyReadinessFromPostgres() {
       return { ready: true, referencedKeyIds: [] }
     },
+  },
+  '@/lib/persistence/commerceStoreSync': {
+    withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
   },
 })
 const isolatedFailure = await isolatedFailureRuntime.processCommerceOrderHistory({

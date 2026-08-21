@@ -887,25 +887,21 @@ for (const mutation of [
   const { calls, deps } = authorizedDependencies(authorization, {
     runtime: runtime({ environment: 'production' }),
   })
-  await assert.rejects(
-    () =>
-      registration.executeAuthorizedShopifyCarrierServiceMutation(
-        { authorization, mutation },
-        deps,
-      ),
-    (error) =>
-      error
-        instanceof registration.ShopifyCarrierServiceRegistrationError
-      && error.code ===
-        'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED',
-  )
+  const result =
+    await registration.executeAuthorizedShopifyCarrierServiceMutation(
+      { authorization, mutation },
+      deps,
+    )
+  assert.equal(result.operation, 'create')
+  assert.equal(result.providerReference, serviceId)
+  assert.equal(result.authorization.status, 'succeeded')
   assert.deepEqual(
     calls.map(([name]) => name),
-    ['authorized-finalize'],
-    'production create must fail and finalize zero-write evidence before decrypt or network',
+    ['runtime', 'decrypt', 'token', 'create', 'authorized-finalize'],
+    'an exact resource-scoped production authorization may dispatch one confirmed CarrierService create',
   )
-  assert.equal(calls[0][1].outcome, 'failed')
-  assert.equal(calls[0][1].providerWriteCount, 0)
+  assert.equal(calls.at(-1)[1].outcome, 'succeeded')
+  assert.equal(calls.at(-1)[1].providerWriteCount, 1)
 }
 
 {
