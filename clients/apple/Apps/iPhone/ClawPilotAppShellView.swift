@@ -871,6 +871,7 @@ private struct ManagerShopifyCheckoutRateConfirmationView: View {
                     .disabled(
                         normalizedReason.count < 3
                         || normalizedReason.count > 500
+                        || model.isManagerSettingsControlsBusy
                         || model.isManagerShopifyCheckoutRateBusy
                         || !model.managerShopifyCheckoutRateReviewIsCurrent(
                             prompt.control
@@ -905,7 +906,8 @@ private struct ManagerShopifyCheckoutRateControlsView: View {
                         .foregroundStyle(AppShellTheme.muted)
                 }
                 Spacer()
-                if model.isManagerShopifyCheckoutRateBusy {
+                if model.isManagerSettingsControlsBusy
+                    || model.isManagerShopifyCheckoutRateBusy {
                     ProgressView().tint(AppShellTheme.primary)
                 }
             }
@@ -932,7 +934,10 @@ private struct ManagerShopifyCheckoutRateControlsView: View {
                         }
                     }
                     .buttonStyle(.bordered)
-                    .disabled(model.isManagerShopifyCheckoutRateBusy)
+                    .disabled(
+                        model.isManagerSettingsControlsBusy
+                        || model.isManagerShopifyCheckoutRateBusy
+                    )
                 }
             } else if let status = model.managerShopifyCheckoutRateStatus {
                 Text(status)
@@ -1026,7 +1031,8 @@ private struct ManagerShopifyCheckoutRateControlsView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(
-                    model.isManagerShopifyCheckoutRateBusy
+                    model.isManagerSettingsControlsBusy
+                    || model.isManagerShopifyCheckoutRateBusy
                     || model.hasPendingManagerShopifyCheckoutRateChange
                 )
             } else if !control.isConfigured {
@@ -1085,14 +1091,17 @@ private struct ManagerShopifyCheckoutRateSettingsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    Task { await model.loadManagerOperations() }
+                    Task { await model.loadManagerSettingsControls() }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .disabled(model.isManagerBusy)
+                .disabled(
+                    model.isManagerSettingsControlsBusy
+                    || model.isManagerShopifyCheckoutRateBusy
+                )
             }
         }
-        .task { await model.loadManagerOperations() }
+        .task { await model.loadManagerSettingsControls() }
     }
 }
 

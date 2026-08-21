@@ -690,6 +690,27 @@ public struct ManagerOperationsCapabilities: Decodable, Equatable, Sendable {
     public let canActivate: Bool
 }
 
+public struct ManagerCommerceAccountSummary: Decodable, Equatable, Identifiable, Sendable {
+    public let accountGlobalId: String
+    public let provider: String
+    public let environment: String
+    public let displayName: String
+    public let status: String
+
+    public var id: String { accountGlobalId }
+
+    public var isContractValid: Bool {
+        accountGlobalId.range(
+            of: #"^gia(?:[0-9]{7}|[0-9a-v]{12})$"#,
+            options: .regularExpression
+        ) != nil
+            && ["shopify", "faire"].contains(provider)
+            && ["mock", "sandbox", "production"].contains(environment)
+            && ["active", "disabled", "error"].contains(status)
+            && !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
 public enum ManagerStoreSyncDesiredState: String, Codable, Equatable, Sendable {
     case running
     case paused
@@ -2209,6 +2230,14 @@ public actor PickingAPIClient {
         let error: String?
     }
 
+    private struct ManagerCommerceAccountsEnvelope: Decodable {
+        let ok: Bool
+        let organizationId: String?
+        let accounts: [ManagerCommerceAccountSummary]?
+        let code: String?
+        let error: String?
+    }
+
     private struct ManagerStoreSyncEnvelope: Decodable {
         let ok: Bool
         let result: ManagerStoreSyncUpdateResult?
@@ -2740,6 +2769,55 @@ public actor PickingAPIClient {
             storeSync: controls,
             capabilities: capabilities
         )
+    }
+
+    public func fetchManagerCommerceAccounts(
+        organizationId: String
+    ) async throws -> [ManagerCommerceAccountSummary] {
+        let expectedOrganizationId = organizationId.lowercased()
+        guard UUID(uuidString: expectedOrganizationId) != nil else {
+            throw PickingAPIError.invalidResponse
+        }
+        var request = URLRequest(
+            url: try endpoint("/api/integrations/commerce/accounts")
+        )
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let (data, response) = try await authenticatedData(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw PickingAPIError.invalidResponse
+        }
+        let envelope = try? decoder.decode(
+            ManagerCommerceAccountsEnvelope.self,
+            from: data
+        )
+        if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+        if http.statusCode == 429 {
+            let seconds = Int(
+                http.value(forHTTPHeaderField: "Retry-After") ?? ""
+            ) ?? 60
+            throw PickingAPIError.rateLimited(
+                retryAfterSeconds: max(1, seconds)
+            )
+        }
+        guard (200..<300).contains(http.statusCode),
+              let envelope,
+              envelope.ok,
+              envelope.organizationId?.lowercased() == expectedOrganizationId,
+              let accounts = envelope.accounts,
+              accounts.allSatisfy(\.isContractValid),
+              Set(accounts.map(\.accountGlobalId)).count == accounts.count else {
+            if (400..<500).contains(http.statusCode) {
+                throw PickingAPIError.rejected(
+                    code: envelope?.code
+                        ?? "COMMERCE_ACCOUNT_DISCOVERY_REJECTED",
+                    message: envelope?.error
+                        ?? "Commerce-account discovery is unavailable"
+                )
+            }
+            throw PickingAPIError.invalidResponse
+        }
+        return accounts
     }
 
     public func updateManagerStoreSync(

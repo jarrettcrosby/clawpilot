@@ -103,6 +103,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published private(set) var hasPendingManagerStoreSyncChange = false
     @Published private(set) var managerStoreSyncStatus: String?
     @Published var managerShopifyCheckoutRateControls: [ManagerShopifyCheckoutRateControl] = []
+    @Published private(set) var isManagerSettingsControlsBusy = false
     @Published private(set) var isManagerShopifyCheckoutRateBusy = false
     @Published private(set) var hasPendingManagerShopifyCheckoutRateChange = false
     @Published private(set) var managerShopifyCheckoutRateStatus: String?
@@ -254,6 +255,7 @@ final class PickingPhoneModel: ObservableObject {
             && !isWorkspaceBusy
             && !isManagerBusy
             && !isManagerStoreSyncBusy
+            && !isManagerSettingsControlsBusy
             && !isManagerShopifyCheckoutRateBusy
             && !isQueueBusy
             && !hasPendingWorkspaceTransition
@@ -1067,32 +1069,6 @@ final class PickingPhoneModel: ObservableObject {
             managerStoreSyncControls = overview.storeSync
             canManageStoreSync = overview.capabilities.canActivate
             reconcilePendingManagerStoreSyncChange()
-            var checkoutRateControls: [ManagerShopifyCheckoutRateControl] = []
-            for account in overview.storeSync where account.provider == "shopify" {
-                do {
-                    let control = try await api.fetchManagerShopifyCheckoutRateControl(
-                        accountGlobalId: account.accountGlobalId
-                    )
-                    guard managerStoreSyncOperationIsCurrent(
-                        generation: operationGeneration,
-                        organizationId: operationOrganizationId
-                    ) else { return }
-                    checkoutRateControls.append(control)
-                } catch {
-                    guard managerStoreSyncOperationIsCurrent(
-                        generation: operationGeneration,
-                        organizationId: operationOrganizationId
-                    ) else { return }
-                    failures.append(
-                        "\(account.displayName) checkout rates: \(error.localizedDescription)"
-                    )
-                }
-            }
-            managerShopifyCheckoutRateControls = checkoutRateControls.sorted {
-                $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
-                    == .orderedAscending
-            }
-            reconcilePendingManagerShopifyCheckoutRateChange()
         } catch {
             guard managerStoreSyncOperationIsCurrent(
                 generation: operationGeneration,
@@ -1100,9 +1076,13 @@ final class PickingPhoneModel: ObservableObject {
             ) else { return }
             managerStoreSyncControls = []
             canManageStoreSync = false
-            managerShopifyCheckoutRateControls = []
-            failures.append("orders: \(error.localizedDescription)")
+            failures.append("orders and Store sync: \(error.localizedDescription)")
         }
+        await loadManagerSettingsControls()
+        guard managerStoreSyncOperationIsCurrent(
+            generation: operationGeneration,
+            organizationId: operationOrganizationId
+        ) else { return }
         do {
             let pickers = try await api.fetchManagerPickers()
             guard managerStoreSyncOperationIsCurrent(
@@ -1162,6 +1142,96 @@ final class PickingPhoneModel: ObservableObject {
             managerStatus = managerOrders.isEmpty
                 ? "No Operations orders are available."
                 : "Review an order to wave and assign its picks."
+        }
+    }
+
+    func loadManagerSettingsControls() async {
+        if walkthroughScreen != nil {
+#if DEBUG
+            installManagerPickManagementWalkthroughFixture()
+#endif
+            return
+        }
+        guard canUseManager else {
+            managerShopifyCheckoutRateStatus =
+                "Manager access is not assigned to this account."
+            return
+        }
+        guard !isManagerSettingsControlsBusy,
+              !isManagerStoreSyncBusy,
+              !isManagerShopifyCheckoutRateBusy else { return }
+        let operationGeneration = authenticationGeneration
+        guard let operationOrganizationId = sessionProfile?.activeWorkspace.organizationId,
+              managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+              ) else { return }
+        isManagerSettingsControlsBusy = true
+        defer {
+            if managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) {
+                isManagerSettingsControlsBusy = false
+            }
+        }
+        do {
+            let accounts = try await api.fetchManagerCommerceAccounts(
+                organizationId: operationOrganizationId
+            )
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            var controls: [ManagerShopifyCheckoutRateControl] = []
+            var failures: [String] = []
+            for account in accounts where account.provider == "shopify" {
+                do {
+                    let control = try await api.fetchManagerShopifyCheckoutRateControl(
+                        accountGlobalId: account.accountGlobalId
+                    )
+                    guard managerStoreSyncOperationIsCurrent(
+                        generation: operationGeneration,
+                        organizationId: operationOrganizationId
+                    ) else { return }
+                    controls.append(control)
+                } catch {
+                    guard managerStoreSyncOperationIsCurrent(
+                        generation: operationGeneration,
+                        organizationId: operationOrganizationId
+                    ) else { return }
+                    failures.append(
+                        "\(account.displayName): \(error.localizedDescription)"
+                    )
+                }
+            }
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerShopifyCheckoutRateControls = controls.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+                    == .orderedAscending
+            }
+            reconcilePendingManagerShopifyCheckoutRateChange()
+            if failures.isEmpty {
+                if !hasPendingManagerShopifyCheckoutRateChange {
+                    managerShopifyCheckoutRateStatus = nil
+                }
+            } else if !hasPendingManagerShopifyCheckoutRateChange {
+                managerShopifyCheckoutRateStatus =
+                    "Some checkout controls are unavailable (\(failures.joined(separator: "; ")))."
+            }
+        } catch {
+            guard managerStoreSyncOperationIsCurrent(
+                generation: operationGeneration,
+                organizationId: operationOrganizationId
+            ) else { return }
+            managerShopifyCheckoutRateControls = []
+            if !hasPendingManagerShopifyCheckoutRateChange {
+                managerShopifyCheckoutRateStatus =
+                    "Checkout account discovery is unavailable: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1665,6 +1735,7 @@ final class PickingPhoneModel: ObservableObject {
         managerStoreSyncStatus = nil
         pendingManagerStoreSyncCommand = nil
         managerShopifyCheckoutRateControls = []
+        isManagerSettingsControlsBusy = false
         isManagerShopifyCheckoutRateBusy = false
         hasPendingManagerShopifyCheckoutRateChange = false
         managerShopifyCheckoutRateStatus = nil

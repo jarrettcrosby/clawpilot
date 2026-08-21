@@ -239,6 +239,108 @@ private final class CheckoutStatusURLProtocol: URLProtocol, @unchecked Sendable 
     override func stopLoading() {}
 }
 
+private struct CheckoutAvailabilityRequest: Equatable, Sendable {
+    let method: String
+    let path: String
+}
+
+private final class CheckoutAvailabilityURLProtocol: URLProtocol, @unchecked Sendable {
+    enum OperationsOutcome {
+        case serverFailure
+        case malformedSuccess
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var operationsOutcome =
+        OperationsOutcome.serverFailure
+    nonisolated(unsafe) private static var requests: [CheckoutAvailabilityRequest] = []
+
+    static func reset(operationsOutcome: OperationsOutcome) {
+        lock.lock()
+        Self.operationsOutcome = operationsOutcome
+        requests = []
+        lock.unlock()
+    }
+
+    static func captured() -> [CheckoutAvailabilityRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        let method = request.httpMethod ?? "GET"
+        Self.lock.lock()
+        Self.requests.append(.init(method: method, path: path))
+        let operationsOutcome = Self.operationsOutcome
+        Self.lock.unlock()
+
+        let status: Int
+        let body: String
+        switch (method, path) {
+        case ("GET", "/api/operations"):
+            switch operationsOutcome {
+            case .serverFailure:
+                status = 500
+                body = #"{"ok":false,"code":"OPERATIONS_UNAVAILABLE"}"#
+            case .malformedSuccess:
+                status = 200
+                body = #"{"ok":true,"operations":{"orders":[]}}"#
+            }
+        case ("GET", "/api/integrations/commerce/accounts"):
+            status = 200
+            body = #"{"ok":true,"organizationId":""#
+                + checkoutOrganizationId
+                + #"","accounts":[{"accountGlobalId":"gia0009801","provider":"shopify","environment":"production","displayName":"Pro Bakery Bites","status":"active"},{"accountGlobalId":"gia0009802","provider":"faire","environment":"production","displayName":"Faire wholesale","status":"active"}]}"#
+        case ("GET", "/api/integrations/commerce/shopify/carrier-service"):
+            status = 200
+            body = checkoutSetupJSON()
+        case ("POST", "/api/integrations/commerce/shopify/carrier-service"):
+            status = 200
+            body = #"{"ok":true,"result":{"version":"shopify-checkout-rate-control-command-result-v1","accountGlobalId":"gia0009801","configGlobalId":"gscf0009801","idempotencyKey":"shopify-rate-control:availability-command","requestHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","checkoutRateControl":{"version":"shopify-checkout-rate-control-v1","audience":"all_eligible","rateSource":"production"},"rowVersion":13,"policyRevision":10,"providerWrites":0}}"#
+        default:
+            status = 500
+            body = #"{"ok":false,"code":"UNEXPECTED_TEST_REQUEST"}"#
+        }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class CheckoutMismatchedOrganizationURLProtocol:
+    URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        let body = #"{"ok":true,"organizationId":"22222222-2222-4222-8222-222222222222","accounts":[{"accountGlobalId":"gia0009801","provider":"shopify","environment":"production","displayName":"Pro Bakery Bites","status":"active"}]}"#
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private func checkoutClient(
     protocolClass: URLProtocol.Type
 ) throws -> PickingAPIClient {
@@ -337,6 +439,97 @@ func nativeCheckoutRatesDecodeDesiredAndEffectiveSeparately() async throws {
     #expect(control.lastChange?.reason == "Keep the reviewed checkout lane")
     #expect(control.policyRevision == 9)
     #expect(control.canEdit)
+}
+
+@Test("native checkout availability survives failed or malformed Operations independently")
+func nativeCheckoutAvailabilityDoesNotDependOnOperationsOverview() async throws {
+    for outcome in [
+        CheckoutAvailabilityURLProtocol.OperationsOutcome.serverFailure,
+        .malformedSuccess,
+    ] {
+        CheckoutAvailabilityURLProtocol.reset(operationsOutcome: outcome)
+        let client = try checkoutClient(
+            protocolClass: CheckoutAvailabilityURLProtocol.self
+        )
+        await #expect(throws: Error.self) {
+            _ = try await client.fetchManagerOperations()
+        }
+
+        let accounts = try await client.fetchManagerCommerceAccounts(
+            organizationId: checkoutOrganizationId
+        )
+        let shopify = try #require(
+            accounts.first(where: { $0.provider == "shopify" })
+        )
+        let control = try await client.fetchManagerShopifyCheckoutRateControl(
+            accountGlobalId: shopify.accountGlobalId
+        )
+        let command = try ManagerShopifyCheckoutRateCommand(
+            control: control,
+            authenticationGeneration: 4,
+            organizationId: checkoutOrganizationId,
+            actorEmail: checkoutActorEmail,
+            desiredAudience: .allEligible,
+            desiredRateSource: .live,
+            reason: "Keep checkout available without Operations overview",
+            idempotencyKey: "shopify-rate-control:availability-command"
+        )
+        let result = try await client.updateManagerShopifyCheckoutRateControl(
+            command
+        )
+        #expect(result.providerWrites == 0)
+
+        let requests = CheckoutAvailabilityURLProtocol.captured()
+        #expect(requests == [
+            .init(method: "GET", path: "/api/operations"),
+            .init(method: "GET", path: "/api/integrations/commerce/accounts"),
+            .init(
+                method: "GET",
+                path: "/api/integrations/commerce/shopify/carrier-service"
+            ),
+            .init(
+                method: "POST",
+                path: "/api/integrations/commerce/shopify/carrier-service"
+            ),
+        ])
+    }
+}
+
+@Test("native checkout account discovery and presentation fences reject workspace drift")
+func nativeCheckoutAvailabilityRejectsWorkspaceDrift() async throws {
+    let otherOrganizationId = "22222222-2222-4222-8222-222222222222"
+    let client = try checkoutClient(
+        protocolClass: CheckoutMismatchedOrganizationURLProtocol.self
+    )
+    await #expect(throws: PickingAPIError.invalidResponse) {
+        _ = try await client.fetchManagerCommerceAccounts(
+            organizationId: checkoutOrganizationId
+        )
+    }
+    let fence = ManagerStoreSyncSubmissionFence(
+        authenticationGeneration: 4,
+        organizationId: checkoutOrganizationId
+    )
+    #expect(fence.permitsStateMutation(
+        currentAuthenticationGeneration: 4,
+        currentOrganizationId: checkoutOrganizationId,
+        isAuthenticated: true
+    ))
+    #expect(!fence.permitsStateMutation(
+        currentAuthenticationGeneration: 5,
+        currentOrganizationId: checkoutOrganizationId,
+        isAuthenticated: true
+    ))
+    #expect(!fence.permitsStateMutation(
+        currentAuthenticationGeneration: 4,
+        currentOrganizationId: otherOrganizationId,
+        isAuthenticated: true
+    ))
+    #expect(!fence.permitsStateMutation(
+        currentAuthenticationGeneration: 4,
+        currentOrganizationId: checkoutOrganizationId,
+        isAuthenticated: false
+    ))
 }
 
 @Test("native checkout rates allow every desired state while overrides stay effective only")
