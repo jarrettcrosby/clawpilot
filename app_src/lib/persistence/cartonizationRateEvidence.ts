@@ -12,6 +12,10 @@ import {
   validateFulfillmentOptimizationInput,
   type FulfillmentOptimizationInputV1,
 } from '@/lib/operations/fulfillmentOptimizerContract'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   acquireTransactionAdvisoryLock,
   getPostgresPool,
@@ -1218,6 +1222,7 @@ export async function readCartonizationRateCandidateContext(input: {
     ship_to_snapshot_ciphertext: Buffer | null
     ship_to_snapshot_iv: Buffer | null
     ship_to_snapshot_tag: Buffer | null
+    canonical_order_global_id: string | null
   }>(
     `SELECT
        candidate.organization_id::text,
@@ -1228,11 +1233,15 @@ export async function readCartonizationRateCandidateContext(input: {
        candidate.ship_to_snapshot_state,
        candidate.ship_to_snapshot_ciphertext,
        candidate.ship_to_snapshot_iv,
-       candidate.ship_to_snapshot_tag
+       candidate.ship_to_snapshot_tag,
+       canonical_order.global_id AS canonical_order_global_id
      FROM operations_commerce_order_candidates candidate
      JOIN operations_integration_accounts account
        ON account.organization_id = candidate.organization_id
       AND account.id = candidate.integration_account_id
+     LEFT JOIN operations_orders canonical_order
+       ON canonical_order.organization_id = candidate.organization_id
+      AND canonical_order.id = candidate.canonical_order_id
      WHERE candidate.organization_id = $1::uuid
        AND account.global_id = $2
        AND candidate.global_id = $3
@@ -1261,30 +1270,39 @@ export async function readCartonizationRateCandidateContext(input: {
       'CARTONIZATION_RATE_CANDIDATE_REVISION_CONFLICT',
     )
   }
-  if (
-    row.ship_to_snapshot_state !== 'confirmed'
-    || !row.ship_to_snapshot_ciphertext
-    || !row.ship_to_snapshot_iv
-    || !row.ship_to_snapshot_tag
-  ) {
-    fail(
-      'Confirm the provider or manual ship-to address before comparing carrier rates',
-      409,
-      'CARTONIZATION_RATE_DESTINATION_REQUIRED',
-    )
-  }
-  const decrypted = decryptCommerceCandidateSnapshot(
-    {
-      ciphertext: row.ship_to_snapshot_ciphertext,
-      iv: row.ship_to_snapshot_iv,
-      tag: row.ship_to_snapshot_tag,
-    },
-    row.organization_id,
-    row.account_global_id,
-    row.external_order_id,
-    row.source_hash,
-    'ship_to',
-  )
+  const decrypted = row.canonical_order_global_id
+    ? orderShipToStorageValue((
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId: row.organization_id,
+          orderGlobalId: row.canonical_order_global_id,
+        })
+      ).value)
+    : (() => {
+        if (
+          row.ship_to_snapshot_state !== 'confirmed'
+          || !row.ship_to_snapshot_ciphertext
+          || !row.ship_to_snapshot_iv
+          || !row.ship_to_snapshot_tag
+        ) {
+          fail(
+            'Add the ship-to details needed to compare carrier rates',
+            409,
+            'CARTONIZATION_RATE_DESTINATION_REQUIRED',
+          )
+        }
+        return decryptCommerceCandidateSnapshot(
+          {
+            ciphertext: row.ship_to_snapshot_ciphertext!,
+            iv: row.ship_to_snapshot_iv!,
+            tag: row.ship_to_snapshot_tag!,
+          },
+          row.organization_id,
+          row.account_global_id,
+          row.external_order_id,
+          row.source_hash,
+          'ship_to',
+        )
+      })()
   const destination = (() => {
     try {
       return normalizeCarrierSandboxParty({
@@ -1936,6 +1954,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       ship_to_snapshot_ciphertext: Buffer | null
       ship_to_snapshot_iv: Buffer | null
       ship_to_snapshot_tag: Buffer | null
+      canonical_order_global_id: string | null
       warehouse_id: string
       inventory_sync_run_id: string | null
     }>(
@@ -1950,6 +1969,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
          candidate.ship_to_snapshot_ciphertext,
          candidate.ship_to_snapshot_iv,
          candidate.ship_to_snapshot_tag,
+         canonical_order.global_id AS canonical_order_global_id,
          warehouse.id::text AS warehouse_id,
          inventory_run.id::text AS inventory_sync_run_id
        FROM operations_integration_accounts account
@@ -1957,6 +1977,9 @@ export async function writeCartonizationRateEvidenceInPostgres(
          ON candidate.organization_id = account.organization_id
         AND candidate.integration_account_id = account.id
         AND candidate.global_id = $3
+       LEFT JOIN operations_orders canonical_order
+         ON canonical_order.organization_id = candidate.organization_id
+        AND canonical_order.id = candidate.canonical_order_id
        JOIN operations_warehouses warehouse
          ON warehouse.organization_id = account.organization_id
         AND warehouse.global_id = $5
@@ -1991,30 +2014,41 @@ export async function writeCartonizationRateEvidenceInPostgres(
         'CARTONIZATION_RATE_EVIDENCE_REVISION_CONFLICT',
       )
     }
-    if (
-      exactContext.ship_to_snapshot_state !== 'confirmed'
-      || !exactContext.ship_to_snapshot_ciphertext
-      || !exactContext.ship_to_snapshot_iv
-      || !exactContext.ship_to_snapshot_tag
-    ) {
-      fail(
-        'The confirmed destination changed before the proof could be saved',
-        409,
-        'CARTONIZATION_RATE_DESTINATION_STALE',
-      )
-    }
-    const exactDestinationSnapshot = decryptCommerceCandidateSnapshot(
-        {
-          ciphertext: exactContext.ship_to_snapshot_ciphertext,
-          iv: exactContext.ship_to_snapshot_iv,
-          tag: exactContext.ship_to_snapshot_tag,
-        },
-        input.organizationId,
-        exactContext.account_global_id,
-        exactContext.external_order_id,
-        exactContext.candidate_source_hash,
-        'ship_to',
-      )
+    const exactDestinationSnapshot = exactContext.canonical_order_global_id
+      ? orderShipToStorageValue((
+          await readOperationsOrderShipmentAddressInPostgres({
+            organizationId: input.organizationId,
+            orderGlobalId: exactContext.canonical_order_global_id,
+            client,
+            lock: true,
+          })
+        ).value)
+      : (() => {
+          if (
+            exactContext.ship_to_snapshot_state !== 'confirmed'
+            || !exactContext.ship_to_snapshot_ciphertext
+            || !exactContext.ship_to_snapshot_iv
+            || !exactContext.ship_to_snapshot_tag
+          ) {
+            fail(
+              'The destination changed before the proof could be saved',
+              409,
+              'CARTONIZATION_RATE_DESTINATION_STALE',
+            )
+          }
+          return decryptCommerceCandidateSnapshot(
+            {
+              ciphertext: exactContext.ship_to_snapshot_ciphertext!,
+              iv: exactContext.ship_to_snapshot_iv!,
+              tag: exactContext.ship_to_snapshot_tag!,
+            },
+            input.organizationId,
+            exactContext.account_global_id,
+            exactContext.external_order_id,
+            exactContext.candidate_source_hash,
+            'ship_to',
+          )
+        })()
     const exactDestination = normalizeCarrierSandboxParty({
       name: destinationText(
         exactDestinationSnapshot.name,

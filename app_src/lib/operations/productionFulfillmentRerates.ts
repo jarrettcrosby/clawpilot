@@ -29,6 +29,10 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   assertCommerceOrderRevisionExecutionCurrent,
   CommerceOrderRevisionGateError,
@@ -601,7 +605,6 @@ type ActiveExecutionContextRow = QueryResultRow & {
   current_activation_revision: number
   order_currency: string
   group_currency: string
-  ship_to: JsonObject
 }
 
 function packageSnapshotFromRow(
@@ -964,8 +967,7 @@ export async function prepareProductionFulfillmentRerateInPostgres(
                 activation.state AS current_activation_state,
                 activation.revision AS current_activation_revision,
                 orders.currency AS order_currency,
-                shipment_group.currency AS group_currency,
-                orders.ship_to
+                shipment_group.currency AS group_currency
          FROM operations_active_fulfillment_executions execution
          JOIN workspace_organizations organization
            ON organization.id = execution.organization_id
@@ -1026,7 +1028,16 @@ export async function prepareProductionFulfillmentRerateInPostgres(
           'Production rerate currency must match the canonical order and shipment group',
         )
       }
-      if (!sameOrderDestination(context.ship_to, destination)) {
+      const operationalDestination =
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId,
+          orderGlobalId: context.order_global_id,
+          client,
+        })
+      if (!sameOrderDestination(
+        orderShipToStorageValue(operationalDestination.value),
+        destination,
+      )) {
         fail(
           'OPERATIONS_PRODUCTION_RERATE_DESTINATION_MISMATCH',
           'Production rerate destination must match the canonical order',
@@ -2746,29 +2757,36 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
       }
       const orderResult = await client.query<{
         currency: string
-        destination_matches: boolean
+        order_global_id: string
       }>(
-        `SELECT orders.currency,
-                operations_dispatch_address_matches_core(
-                  $3::jsonb,
-                  orders.ship_to
-                ) AS destination_matches
+        `SELECT orders.currency, orders.global_id AS order_global_id
          FROM operations_orders orders
          WHERE orders.organization_id = $1::uuid
            AND orders.id = $2::uuid
          LIMIT 1
          FOR SHARE`,
-        [
-          organizationId,
-          candidate.order_id,
-          JSON.stringify(candidate.destination_snapshot),
-        ],
+        [organizationId, candidate.order_id],
       )
       const currentOrder = orderResult.rows[0]
+      const candidateDestination = normalizeAddress(
+        candidate.destination_snapshot as unknown as ActiveCarrierDispatchAddressSnapshot,
+        'Destination',
+      )
+      const currentOperationalDestination = currentOrder
+        ? await readOperationsOrderShipmentAddressInPostgres({
+            organizationId,
+            orderGlobalId: currentOrder.order_global_id,
+            client,
+          })
+        : null
       if (
         !currentOrder
         || currency(currentOrder.currency) !== currency(candidate.currency)
-        || currentOrder.destination_matches !== true
+        || !currentOperationalDestination
+        || !sameOrderDestination(
+          orderShipToStorageValue(currentOperationalDestination.value),
+          candidateDestination,
+        )
       ) {
         fail(
           'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE',
@@ -2963,7 +2981,6 @@ type DispatchSelectionRow = QueryResultRow & {
   order_id: string
   order_global_id: string
   current_order_currency: string
-  current_order_ship_to: JsonObject
   plan_id: string
   plan_global_id: string
   warehouse_id: string
@@ -3040,7 +3057,6 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
               run.order_id::text AS order_id,
               orders.global_id AS order_global_id,
               orders.currency AS current_order_currency,
-              orders.ship_to AS current_order_ship_to,
               run.plan_id::text AS plan_id, plan.global_id AS plan_global_id,
               run.warehouse_id::text AS warehouse_id,
               warehouse.global_id AS warehouse_global_id,
@@ -3197,9 +3213,18 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
       row.destination_snapshot as unknown as ActiveCarrierDispatchAddressSnapshot,
       'Destination',
     )
+    const currentOperationalDestination =
+      await readOperationsOrderShipmentAddressInPostgres({
+        organizationId,
+        orderGlobalId: row.order_global_id,
+        client,
+      })
     if (
       currency(row.current_order_currency) !== currency(row.currency)
-      || !sameOrderDestination(row.current_order_ship_to, destination)
+      || !sameOrderDestination(
+        orderShipToStorageValue(currentOperationalDestination.value),
+        destination,
+      )
     ) {
       fail(
         'OPERATIONS_PRODUCTION_RERATE_ORDER_BINDING_STALE',

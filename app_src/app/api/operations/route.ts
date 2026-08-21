@@ -22,6 +22,12 @@ import {
   updateCommerceStoreSyncControlInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 import {
+  CommerceOrderWorkbenchError,
+} from '@/lib/persistence/commerceOrderWorkbench'
+import {
+  OperationsOrderShipmentAddressError,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
+import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
   consumeCommerceActiveTransitionAuthorizationInPostgres,
@@ -1006,6 +1012,12 @@ function errorResponse(error: unknown) {
     }, error.status)
   }
   if (error instanceof CommerceStoreSyncPersistenceError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof CommerceOrderWorkbenchError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof OperationsOrderShipmentAddressError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof OperationsShadowTrainingError) {

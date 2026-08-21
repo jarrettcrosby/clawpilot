@@ -3160,6 +3160,7 @@ export async function GET() {
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
+          operations_commerce_provider_write_controls_applied: boolean
           operations_commerce_store_sync_controls_applied: boolean
           operations_commerce_store_sync_authority_contract: string | null
           operations_shopify_order_webhook_reconciliation_applied: boolean
@@ -5410,11 +5411,338 @@ export async function GET() {
                       )
                     AND NOT
                       installed_shopify_order_management_trigger.tgisinternal
-                    AND installed_shopify_order_management_trigger.tgenabled =
+                  AND installed_shopify_order_management_trigger.tgenabled =
                       'O'
                 )
               )
+              AND (
+                NOT EXISTS (
+                  SELECT 1
+                  FROM public.schema_migrations
+                  WHERE filename =
+                    '0308_operations_commerce_provider_write_controls.sql'
+                )
+                OR (
+                  EXISTS (
+                    SELECT 1
+                    FROM public.schema_migrations
+                    WHERE filename =
+                      '0308_operations_commerce_provider_write_controls.sql'
+                      AND checksum =
+                        '86e39d6e19962894b94466a6fad367682093dc6271e0df92c9cade112ad075b6'
+                  )
+                  AND pg_catalog.to_regclass(
+                    'public.operations_commerce_provider_write_controls'
+                  ) IS NOT NULL
+                  AND pg_catalog.to_regclass(
+                    'public.operations_commerce_provider_write_control_current'
+                  ) IS NOT NULL
+                  AND (
+                    SELECT pg_catalog.count(*) = 15
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            installed.table_schema,
+                            installed.table_name,
+                            installed.column_name,
+                            installed.ordinal_position::text,
+                            installed.data_type,
+                            installed.udt_schema,
+                            installed.udt_name,
+                            installed.is_nullable,
+                            COALESCE(installed.column_default, '')
+                          ), E'\n' ORDER BY installed.ordinal_position
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        'a9da22137541b3163a7c91952d15672a828c67e7630d3cbdd880d1a44232e0b3'
+                    FROM information_schema.columns installed
+                    WHERE installed.table_schema = 'public'
+                      AND installed.table_name =
+                        'operations_commerce_provider_write_controls'
+                  )
+                  AND (
+                    SELECT pg_catalog.count(*) = 4
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            installed.table_schema,
+                            installed.table_name,
+                            installed.column_name,
+                            installed.ordinal_position::text,
+                            installed.data_type,
+                            installed.udt_schema,
+                            installed.udt_name,
+                            installed.is_nullable,
+                            COALESCE(installed.column_default, '')
+                          ), E'\n' ORDER BY installed.table_name,
+                            installed.column_name
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        'b01ac9162311410b6c3dac55b8a39a975eda0f5a25f7b219e33014a6889e3815'
+                    FROM information_schema.columns installed
+                    WHERE installed.table_schema = 'public'
+                      AND (installed.table_name, installed.column_name) IN (
+                        (
+                          'operations_shopify_order_management_authorizations',
+                          'provider_write_control_row_version'
+                        ),
+                        (
+                          'operations_shopify_order_management_authorizations',
+                          'provider_write_scope_digest'
+                        ),
+                        (
+                          'operations_shopify_order_management_attempts',
+                          'provider_write_control_row_version'
+                        ),
+                        (
+                          'operations_shopify_order_management_attempts',
+                          'provider_write_scope_digest'
+                        )
+                      )
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 15
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            table_namespace.nspname,
+                            table_row.relname,
+                            installed.conname,
+                            installed.contype::text,
+                            installed.convalidated::text,
+                            installed.condeferrable::text,
+                            installed.condeferred::text,
+                            pg_catalog.pg_get_constraintdef(
+                              installed.oid, false
+                            )
+                          ), E'\n' ORDER BY installed.conname
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '1a46074f7ce4e50835f4dc4ff7cfa168452add477a13a6c0de66072f59bbe57a'
+                    FROM pg_catalog.pg_constraint installed
+                    JOIN pg_catalog.pg_class table_row
+                      ON table_row.oid = installed.conrelid
+                    JOIN pg_catalog.pg_namespace table_namespace
+                      ON table_namespace.oid = table_row.relnamespace
+                    WHERE installed.conrelid = pg_catalog.to_regclass(
+                      'public.operations_commerce_provider_write_controls'
+                    )
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 7
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            table_namespace.nspname,
+                            table_row.relname,
+                            installed.conname,
+                            installed.contype::text,
+                            installed.convalidated::text,
+                            installed.condeferrable::text,
+                            installed.condeferred::text,
+                            pg_catalog.pg_get_constraintdef(
+                              installed.oid, false
+                            )
+                          ), E'\n' ORDER BY required.table_name,
+                            required.constraint_name
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        'e1346bb362320d201fe83b37eb6ea53dfc706b39c40fd07b79b777642515d9ab'
+                    FROM (VALUES
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'ops_shopify_order_mgmt_auth_legacy_activation_valid'
+                      ),
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'ops_shopify_order_mgmt_auth_manage_role_valid'
+                      ),
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'ops_shopify_order_mgmt_auth_provider_write_binding_valid'
+                      ),
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'ops_shopify_order_mgmt_auth_provider_write_control_fkey'
+                      ),
+                      (
+                        'operations_shopify_order_management_attempts',
+                        'ops_shopify_order_mgmt_attempt_legacy_activation_valid'
+                      ),
+                      (
+                        'operations_shopify_order_management_attempts',
+                        'ops_shopify_order_mgmt_attempt_provider_write_binding_valid'
+                      ),
+                      (
+                        'operations_shopify_order_management_attempts',
+                        'ops_shopify_order_mgmt_attempt_provider_write_control_fkey'
+                      )
+                    ) required(table_name, constraint_name)
+                    LEFT JOIN pg_catalog.pg_class table_row
+                      ON table_row.oid = pg_catalog.to_regclass(
+                        'public.' || required.table_name
+                      )
+                    LEFT JOIN pg_catalog.pg_namespace table_namespace
+                      ON table_namespace.oid = table_row.relnamespace
+                    LEFT JOIN pg_catalog.pg_constraint installed
+                      ON installed.conrelid = table_row.oid
+                     AND installed.conname = required.constraint_name
+                  )
+                  AND (
+                    SELECT pg_catalog.count(*) = 4
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            index_row.relname,
+                            installed.indisunique::text,
+                            installed.indisprimary::text,
+                            installed.indisvalid::text,
+                            installed.indisready::text,
+                            pg_catalog.btrim(pg_catalog.regexp_replace(
+                              pg_catalog.pg_get_indexdef(
+                                installed.indexrelid
+                              ), '[[:space:]]+', ' ', 'g'
+                            ))
+                          ), E'\n' ORDER BY index_row.relname
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '6c186511e48e5831eaccb5318c18e138258463ccbb0698eb70a8bea2916b67f5'
+                    FROM pg_catalog.pg_index installed
+                    JOIN pg_catalog.pg_class index_row
+                      ON index_row.oid = installed.indexrelid
+                    WHERE installed.indrelid = pg_catalog.to_regclass(
+                      'public.operations_commerce_provider_write_controls'
+                    )
+                  )
+                  AND pg_catalog.encode(public.digest(
+                    pg_catalog.convert_to(pg_catalog.btrim(
+                      pg_catalog.regexp_replace(
+                        pg_catalog.pg_get_viewdef(pg_catalog.to_regclass(
+                          'public.operations_commerce_provider_write_control_current'
+                        ), false), '[[:space:]]+', ' ', 'g'
+                      )
+                    ), 'UTF8'), 'sha256'
+                  ), 'hex') =
+                    '442a1b8a8cac37652c6f193d5ab07ae3325891dcfa98f80593603e8166ac97d6'
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 7
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            required.signature,
+                            installed_namespace.nspname,
+                            language.lanname,
+                            installed.prokind::text,
+                            installed.provolatile::text,
+                            installed.proparallel::text,
+                            installed.proisstrict::text,
+                            installed.prosecdef::text,
+                            installed.proleakproof::text,
+                            pg_catalog.format_type(
+                              installed.prorettype, NULL
+                            ),
+                            installed.pronargs::text,
+                            installed.pronargdefaults::text,
+                            COALESCE(pg_catalog.array_to_string(
+                              installed.proconfig, ','
+                            ), ''),
+                            pg_catalog.btrim(pg_catalog.regexp_replace(
+                              installed.prosrc, '[[:space:]]+', ' ', 'g'
+                            ))
+                          ), E'\n' ORDER BY required.signature
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b'
+                    FROM (VALUES
+                      ('operations_commerce_granted_scope_snapshot(jsonb)'),
+                      ('operations_commerce_granted_scope_digest(text[])'),
+                      ('validate_operations_commerce_provider_write_control()'),
+                      ('reject_operations_commerce_provider_write_control_mutation()'),
+                      ('operations_shopify_order_management_is_current(uuid,uuid,boolean)'),
+                      ('protect_shopify_order_management_authorization()'),
+                      ('protect_shopify_order_management_attempt()')
+                    ) required(signature)
+                    LEFT JOIN pg_catalog.pg_proc installed
+                      ON installed.oid = pg_catalog.to_regprocedure(
+                        'public.' || required.signature
+                      )
+                    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+                      ON installed_namespace.oid = installed.pronamespace
+                    LEFT JOIN pg_catalog.pg_language language
+                      ON language.oid = installed.prolang
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 4
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            required.table_name,
+                            table_namespace.nspname,
+                            installed.tgname,
+                            installed.tgtype::text,
+                            installed.tgenabled::text,
+                            installed.tgisinternal::text,
+                            function_namespace.nspname || '.' ||
+                              trigger_function.proname || '(' ||
+                              pg_catalog.pg_get_function_identity_arguments(
+                                trigger_function.oid
+                              ) || ')',
+                            COALESCE(pg_catalog.pg_get_expr(
+                              installed.tgqual, installed.tgrelid
+                            ), ''),
+                            pg_catalog.btrim(pg_catalog.regexp_replace(
+                              pg_catalog.pg_get_triggerdef(installed.oid),
+                              '[[:space:]]+', ' ', 'g'
+                            ))
+                          ), E'\n' ORDER BY required.table_name,
+                            required.trigger_name
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '9d0946bfb810bd7be8b859e8643b1fa51a946dd98c32b5e781b573c163cdbaf5'
+                    FROM (VALUES
+                      (
+                        'operations_commerce_provider_write_controls',
+                        'operations_commerce_provider_write_controls_validate'
+                      ),
+                      (
+                        'operations_commerce_provider_write_controls',
+                        'operations_commerce_provider_write_controls_immutable'
+                      ),
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'protect_shopify_order_management_authorization_write'
+                      ),
+                      (
+                        'operations_shopify_order_management_attempts',
+                        'protect_shopify_order_management_attempt_write'
+                      )
+                    ) required(table_name, trigger_name)
+                    LEFT JOIN pg_catalog.pg_class table_row
+                      ON table_row.oid = pg_catalog.to_regclass(
+                        'public.' || required.table_name
+                      )
+                    LEFT JOIN pg_catalog.pg_namespace table_namespace
+                      ON table_namespace.oid = table_row.relnamespace
+                    LEFT JOIN pg_catalog.pg_trigger installed
+                      ON installed.tgrelid = table_row.oid
+                     AND installed.tgname = required.trigger_name
+                    LEFT JOIN pg_catalog.pg_proc trigger_function
+                      ON trigger_function.oid = installed.tgfoid
+                    LEFT JOIN pg_catalog.pg_namespace function_namespace
+                      ON function_namespace.oid = trigger_function.pronamespace
+                  )
+                )
+              )
                 AS operations_shopify_order_management_applied,
+              EXISTS (
+                SELECT 1
+                FROM public.schema_migrations
+                WHERE filename =
+                  '0308_operations_commerce_provider_write_controls.sql'
+                  AND checksum =
+                    '86e39d6e19962894b94466a6fad367682093dc6271e0df92c9cade112ad075b6'
+              )
+                AS operations_commerce_provider_write_controls_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -7219,9 +7547,11 @@ export async function GET() {
               ? 'degraded'
               : durable.processing > 0
                 ? 'processing'
-                : shopifyOrderManagementRuntimeState.available
+                : row.operations_commerce_provider_write_controls_applied
                   ? 'ready'
-                  : 'disabled',
+                  : shopifyOrderManagementRuntimeState.available
+                    ? 'ready'
+                    : 'disabled',
             runtime: shopifyOrderManagementRuntimeSummary,
             durable,
           }

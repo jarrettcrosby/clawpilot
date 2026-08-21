@@ -108,6 +108,10 @@ let readImpl = async (input) => {
   calls.push(['read', input])
   return managementFixture(input.orderGlobalId)
 }
+let saveImpl = async (input) => {
+  calls.push(['save', input])
+  return resultFixture('succeeded')
+}
 let prepareImpl = async (input) => {
   calls.push(['prepare', input])
   return authorizationFixture()
@@ -193,6 +197,7 @@ function loadRoute() {
           prepareShopifyOrderManagementCommand: (...args) => prepareImpl(...args),
           readShopifyOrderManagementState: (...args) => readImpl(...args),
           reconcileShopifyOrderManagementCommand: (...args) => reconcileImpl(...args),
+          saveShopifyOrderManagementCommand: (...args) => saveImpl(...args),
           ShopifyOrderManagementCommandError: MockTypedError,
         }
       }
@@ -247,6 +252,10 @@ function reset(overrides = {}) {
   readImpl = async (input) => {
     calls.push(['read', input])
     return managementFixture(input.orderGlobalId)
+  }
+  saveImpl = async (input) => {
+    calls.push(['save', input])
+    return resultFixture('succeeded')
   }
   prepareImpl = async (input) => {
     calls.push(['prepare', input])
@@ -313,13 +322,18 @@ async function post(body, options = {}) {
   )))
 }
 
-// All three existing Operations capabilities are a conjunctive write gate.
-for (const capability of ['canActivate', 'canManage', 'canExecute']) {
+// Ordinary order reads and saves require Operations-management permission.
+// Account-level On remains a separate owner/admin control in its own route.
+reset({ capabilities: { ...fullCapabilities, canManage: false } })
+let denied = await get()
+assert.equal(denied.status, 403)
+assert.equal(denied.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED')
+assert.equal(calls.length, 0, 'authority rejection must precede command reads')
+for (const capability of ['canActivate', 'canExecute']) {
   reset({ capabilities: { ...fullCapabilities, [capability]: false } })
-  const result = await get()
-  assert.equal(result.status, 403, `${capability} must be required`)
-  assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED')
-  assert.equal(calls.length, 0, 'authority rejection must precede command reads')
+  const allowed = await get()
+  assert.equal(allowed.status, 200, `${capability} must not gate normal order work`)
+  assert.equal(calls.length, 1)
 }
 
 reset()
@@ -365,6 +379,26 @@ assert.equal(result.status, 400)
 assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID')
 
 const addTagMutation = Object.freeze({ kind: 'add_tag', tag: 'ClawPilot test' })
+reset({ actor: { activeOrganizationId: organizationB } })
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: addTagMutation,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['save', {
+  organizationId: organizationB,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: addTagMutation,
+  idempotencyKey: idempotency,
+}]])
+assert.equal(JSON.stringify(result.payload).includes(organizationB), false)
+
+// Legacy prepare/execute actions remain accepted only for rolling-runtime
+// compatibility; the normal UI uses the single save action above.
 reset({ actor: { activeOrganizationId: organizationB } })
 result = await post({
   action: 'prepare',
@@ -423,6 +457,10 @@ assert.deepEqual(plain(calls), [['reconcile', {
 // Strict field and value allowlists prevent tenant injection, action
 // smuggling, multi-tag ambiguity, and malformed idempotency keys.
 for (const [body, expectedCode] of [
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: addTagMutation, reason,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
   [{
     action: 'prepare', orderGlobalId, expectedRowVersion: 7,
     mutation: addTagMutation, reason, organizationId: organizationB,

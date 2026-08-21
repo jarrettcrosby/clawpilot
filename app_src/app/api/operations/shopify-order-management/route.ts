@@ -8,6 +8,7 @@ import {
   prepareShopifyOrderManagementCommand,
   readShopifyOrderManagementState,
   reconcileShopifyOrderManagementCommand,
+  saveShopifyOrderManagementCommand,
   ShopifyOrderManagementCommandError,
 } from '@/lib/operations/shopifyOrderManagementCommands'
 import { ShopifyOrderManagementError } from '@/lib/integrations/shopifyOrderManagement'
@@ -467,14 +468,10 @@ async function requestBody(req: NextRequest) {
 
 function requireWriteAuthority(actor: Awaited<ReturnType<typeof requireRequestUser>>) {
   const capabilities = operationsCapabilities(actor)
-  if (
-    !capabilities.canActivate
-    || !capabilities.canManage
-    || !capabilities.canExecute
-  ) {
+  if (!capabilities.canManage) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED',
-      'Owner or authorized operations administrator approval is required',
+      'Operations-management permission is required',
       403,
     )
   }
@@ -553,6 +550,25 @@ export async function POST(req: NextRequest) {
     const action = boundedText(body.action, 'Shopify order action', 24)
     const exactKey = idempotencyKey(req)
 
+    if (action === 'save') {
+      exactFields(body, [
+        'action', 'orderGlobalId', 'expectedRowVersion', 'mutation',
+      ])
+      const result = await saveShopifyOrderManagementCommand({
+        organizationId,
+        actorEmail: actor.email,
+        orderGlobalId: exactId(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: rowVersion(body.expectedRowVersion),
+        mutation: mutation(body.mutation),
+        idempotencyKey: exactKey,
+      })
+      return json({ ok: true, result: publicResult(result) })
+    }
+
     if (action === 'prepare') {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation', 'reason',
@@ -623,7 +639,7 @@ export async function POST(req: NextRequest) {
 
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
-      'Supported actions are prepare, execute, and reconcile',
+      'Supported actions are save, prepare, execute, and reconcile',
     )
   } catch (error) {
     return errorResponse(error)

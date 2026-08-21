@@ -44,8 +44,10 @@ export type ShopifyOrderManagementAuthorization = {
   externalAccountId: string
   shopDomain: string
   credentialGeneration: number
-  activationState: 'shadow' | 'active'
-  activationRevision: number
+  legacyActivationState: 'shadow' | 'active' | null
+  legacyActivationRevision: number | null
+  providerWriteControlRowVersion: number | null
+  providerWriteScopeDigest: string | null
   orderGlobalId: string
   externalOrderId: string
   orderNumber: string
@@ -71,7 +73,7 @@ export type ShopifyOrderManagementAuthorization = {
   status: ShopifyOrderManagementStatus
   storedStatus: ShopifyOrderManagementStatus
   authorizedBy: string
-  authorizedRole: 'owner' | 'admin'
+  authorizedRole: 'owner' | 'admin' | 'member'
   providerAttemptGlobalId: string | null
   processingLeaseExpiresAt: string | null
   latestOutcomeGlobalId: string | null
@@ -112,8 +114,10 @@ export type ShopifyOrderManagementTarget = {
   shopDomain: string | null
   credentialGeneration: number
   credentialCurrent: boolean
-  activationState: string
-  activationRevision: number
+  providerWriteControlRowVersion: number
+  providerWriteRequestedMode: 'off' | 'on'
+  providerWriteBindingCurrent: boolean
+  providerWriteScopeDigest: string | null
   orderGlobalId: string
   externalOrderId: string
   orderNumber: string
@@ -215,8 +219,10 @@ type AuthorizationRow = {
   external_account_id: string
   shop_domain: string
   credential_generation: number
-  activation_state: 'shadow' | 'active'
-  activation_revision: number
+  activation_state: 'shadow' | 'active' | null
+  activation_revision: number | null
+  provider_write_control_row_version: number | string | null
+  provider_write_scope_digest: string | null
   order_id: string
   order_global_id: string
   external_order_id: string
@@ -243,7 +249,7 @@ type AuthorizationRow = {
   status: ShopifyOrderManagementStatus
   effective_status?: ShopifyOrderManagementStatus
   authorized_by: string
-  authorized_role: 'owner' | 'admin'
+  authorized_role: 'owner' | 'admin' | 'member'
   provider_attempt_id: string | null
   provider_attempt_global_id?: string | null
   provider_attempt_hash?: string | null
@@ -278,8 +284,11 @@ type BindingRow = {
   credential_version: number
   auth_mode: string
   verification_status: string
-  activation_state: 'shadow' | 'active'
-  activation_revision: number
+  credential_last_error_code: string | null
+  provider_write_control_row_version: number | string
+  provider_write_requested_mode: 'off' | 'on'
+  provider_write_binding_current: boolean
+  provider_write_scope_digest: string | null
   order_id: string
   order_global_id: string
   external_order_id: string
@@ -682,6 +691,26 @@ function authorization(
     || row.provider_write_count === undefined
     ? null
     : Number(row.provider_write_count)
+  const providerWriteControlRowVersion =
+    row.provider_write_control_row_version === null
+      ? null
+      : Number(row.provider_write_control_row_version)
+  if ((
+    providerWriteControlRowVersion !== null
+    && (!Number.isSafeInteger(providerWriteControlRowVersion)
+      || providerWriteControlRowVersion < 1
+      || !row.provider_write_scope_digest
+      || !SHA256.test(row.provider_write_scope_digest))
+  ) || (
+    providerWriteControlRowVersion === null
+    && row.provider_write_scope_digest !== null
+  )) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+      'Stored Provider writes binding is invalid',
+      500,
+    )
+  }
   return {
     authorizationGlobalId: row.global_id,
     organizationId: row.organization_id,
@@ -691,8 +720,12 @@ function authorization(
     externalAccountId: row.external_account_id,
     shopDomain: row.shop_domain,
     credentialGeneration: Number(row.credential_generation),
-    activationState: row.activation_state,
-    activationRevision: Number(row.activation_revision),
+    legacyActivationState: row.activation_state,
+    legacyActivationRevision: row.activation_revision === null
+      ? null
+      : Number(row.activation_revision),
+    providerWriteControlRowVersion,
+    providerWriteScopeDigest: row.provider_write_scope_digest,
     orderGlobalId: row.order_global_id,
     externalOrderId: row.external_order_id,
     orderNumber: row.order_number,
@@ -771,7 +804,7 @@ async function requireActorRole(
   client: PoolClient,
   input: { organizationId: string; actorEmail: string },
 ) {
-  const result = await client.query<{ role: 'owner' | 'admin' }>(
+  const result = await client.query<{ role: 'owner' | 'admin' | 'member' }>(
     `SELECT membership.role
      FROM app_user_organization_memberships membership
      WHERE membership.organization_id = $1::uuid
@@ -779,26 +812,19 @@ async function requireActorRole(
        AND membership.status = 'active'
        AND (
          membership.role = 'owner'
-         OR (
-           membership.role = 'admin'
-           AND COALESCE(
-             (membership.permissions->>'manageOperations')::boolean,
-             false
-           )
-           AND COALESCE(
-             (membership.permissions->>'executeWarehouse')::boolean,
-             false
-           )
+         OR COALESCE(
+           (membership.permissions->>'manageOperations')::boolean,
+           false
          )
        )
      FOR SHARE`,
     [input.organizationId, input.actorEmail],
   )
   const role = result.rows[0]?.role
-  if (role !== 'owner' && role !== 'admin') {
+  if (role !== 'owner' && role !== 'admin' && role !== 'member') {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
-      'Shopify order management requires an owner or a fully authorized operations administrator',
+      'Shopify order management requires Operations-management permission',
       403,
     )
   }
@@ -825,8 +851,28 @@ async function readBinding(
        credential.credential_version,
        credential.auth_mode,
        credential.verification_status,
-       activation.state AS activation_state,
-       activation.revision AS activation_revision,
+       credential.last_error_code AS credential_last_error_code,
+       provider_control.row_version AS provider_write_control_row_version,
+       provider_control.requested_mode AS provider_write_requested_mode,
+       provider_control.bound_granted_scope_digest
+         AS provider_write_scope_digest,
+       (
+         provider_control.requested_mode = 'on'
+         AND provider_control.row_version > 0
+         AND provider_control.bound_credential_generation =
+               account.commerce_credential_generation
+         AND provider_control.bound_granted_scopes =
+               operations_commerce_granted_scope_snapshot(
+                 account.configuration
+               )
+         AND 'write_orders' = ANY(provider_control.bound_granted_scopes)
+         AND provider_control.bound_granted_scope_digest =
+               operations_commerce_granted_scope_digest(
+                 operations_commerce_granted_scope_snapshot(
+                   account.configuration
+                 )
+               )
+       ) AS provider_write_binding_current,
        order_row.id::text AS order_id,
        order_row.global_id AS order_global_id,
        order_row.external_order_id,
@@ -852,8 +898,9 @@ async function readBinding(
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_provider_write_control_current provider_control
+       ON provider_control.organization_id = account.organization_id
+      AND provider_control.integration_account_id = account.id
      JOIN operations_commerce_order_revision_targets target
        ON target.organization_id = order_row.organization_id
       AND target.order_id = order_row.id
@@ -870,7 +917,7 @@ async function readBinding(
      WHERE order_row.organization_id = $1::uuid
        AND account.global_id = $2
        AND order_row.global_id = $3
-     FOR UPDATE OF order_row, account, credential, activation, target`,
+     FOR UPDATE OF order_row, account, credential, target`,
     [input.organizationId, input.accountGlobalId, input.orderGlobalId],
   )
   const row = result.rows[0]
@@ -902,11 +949,23 @@ function assertCurrentBinding(
     || row.credential_version !== row.credential_generation
     || row.auth_mode !== 'shopify_client_credentials'
     || row.verification_status !== 'verified'
-    || !['shadow', 'active'].includes(row.activation_state)
+    || row.credential_last_error_code !== null
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_CURRENT',
-      'The Shopify sandbox account, credential, or activation is not current',
+      'The Shopify sandbox account or credential is not current',
+    )
+  }
+  if (
+    row.provider_write_requested_mode !== 'on'
+    || row.provider_write_binding_current !== true
+    || Number(row.provider_write_control_row_version) < 1
+    || !row.provider_write_scope_digest
+    || !SHA256.test(row.provider_write_scope_digest)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Turn Provider writes On for this Shopify connection before saving changes',
     )
   }
   if (
@@ -1092,7 +1151,8 @@ export async function prepareShopifyOrderManagementInPostgres(
          organization_id, integration_account_id,
          integration_account_global_id, provider, account_environment,
          external_account_id, shop_domain, credential_generation,
-         activation_state, activation_revision, order_id, order_global_id,
+         provider_write_control_row_version, provider_write_scope_digest,
+         order_id, order_global_id,
          external_order_id, order_number, expected_order_row_version,
          expected_source_hash, provider_order_updated_at,
          provider_order_observed_at, provider_order_test,
@@ -1122,8 +1182,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         binding.external_account_id,
         binding.shop_domain,
         binding.credential_generation,
-        binding.activation_state,
-        binding.activation_revision,
+        Number(binding.provider_write_control_row_version),
+        binding.provider_write_scope_digest,
         binding.order_id,
         binding.order_global_id,
         binding.external_order_id,
@@ -1166,7 +1226,9 @@ export async function prepareShopifyOrderManagementInPostgres(
         externalOrderId: row.external_order_id,
         action: row.action,
         credentialGeneration: row.credential_generation,
-        activationRevision: row.activation_revision,
+        providerWriteControlRowVersion:
+          row.provider_write_control_row_version,
+        providerWriteScopeDigest: row.provider_write_scope_digest,
         expectedOrderRowVersion,
         expectedSourceHash,
         acceptedObservationId,
@@ -1230,6 +1292,10 @@ export async function claimShopifyOrderManagementInPostgres(
         404,
       )
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${scopedOrganizationId}:${row.integration_account_global_id}`,
+    )
     if (
       row.authorized_by !== claimedBy
       || row.authorized_role !== role
@@ -1282,7 +1348,7 @@ export async function claimShopifyOrderManagementInPostgres(
     if (current.rows[0]?.current !== true) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
-        'The account, credential, activation, order, source, or warehouse state changed',
+        'The account, credential, Provider writes control, order, source, or warehouse state changed',
       )
     }
     await acquireTransactionAdvisoryLock(
@@ -1295,7 +1361,9 @@ export async function claimShopifyOrderManagementInPostgres(
       organizationId: row.organization_id,
       accountGlobalId: row.integration_account_global_id,
       credentialGeneration: row.credential_generation,
-      activationRevision: row.activation_revision,
+      providerWriteControlRowVersion:
+        row.provider_write_control_row_version,
+      providerWriteScopeDigest: row.provider_write_scope_digest,
       orderGlobalId: row.order_global_id,
       externalOrderId: row.external_order_id,
       expectedOrderRowVersion: Number(row.expected_order_row_version),
@@ -1319,7 +1387,8 @@ export async function claimShopifyOrderManagementInPostgres(
        INSERT INTO operations_shopify_order_management_attempts (
          organization_id, authorization_id, integration_account_id,
          integration_account_global_id, provider, external_account_id,
-         credential_generation, activation_revision, order_id,
+         credential_generation, provider_write_control_row_version,
+         provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
          expected_source_hash, provider_snapshot_hash, action, intent_hash,
          expected_line_quantity, attempt_hash, dispatch_state, claimed_by,
@@ -1327,8 +1396,8 @@ export async function claimShopifyOrderManagementInPostgres(
          claimed_at, processing_lease_expires_at
        ) SELECT
          $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
-         $8::uuid, $9, $10, $11::bigint, $12, $13, $14, $15, $16,
-         $17, 'authorized', $18, $19::uuid, $20::timestamptz,
+         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15, $16,
+         $17, $18, 'authorized', $19, $20::uuid, $21::timestamptz,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -1341,7 +1410,8 @@ export async function claimShopifyOrderManagementInPostgres(
         row.integration_account_global_id,
         row.external_account_id,
         row.credential_generation,
-        row.activation_revision,
+        row.provider_write_control_row_version,
+        row.provider_write_scope_digest,
         row.order_id,
         row.order_global_id,
         row.external_order_id,
@@ -1389,7 +1459,9 @@ export async function claimShopifyOrderManagementInPostgres(
         externalOrderId: row.external_order_id,
         action: row.action,
         credentialGeneration: row.credential_generation,
-        activationRevision: row.activation_revision,
+        providerWriteControlRowVersion:
+          row.provider_write_control_row_version,
+        providerWriteScopeDigest: row.provider_write_scope_digest,
         expectedOrderRowVersion: Number(row.expected_order_row_version),
         expectedSourceHash: row.expected_source_hash,
         acceptedObservationId: row.accepted_observation_id,
@@ -2106,8 +2178,10 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     shop_domain: string | null
     commerce_credential_generation: number
     credential_current: boolean
-    activation_state: string
-    activation_revision: number
+    provider_write_control_row_version: string | number
+    provider_write_requested_mode: 'off' | 'on'
+    provider_write_scope_digest: string | null
+    provider_write_binding_current: boolean
     order_global_id: string
     external_order_id: string
     order_number: string
@@ -2140,9 +2214,29 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
                account.commerce_credential_generation
          AND credential.auth_mode = 'shopify_client_credentials'
          AND credential.verification_status = 'verified'
+         AND credential.last_error_code IS NULL
        ) AS credential_current,
-       activation.state AS activation_state,
-       activation.revision AS activation_revision,
+       provider_control.row_version AS provider_write_control_row_version,
+       provider_control.requested_mode AS provider_write_requested_mode,
+       provider_control.bound_granted_scope_digest
+         AS provider_write_scope_digest,
+       (
+         provider_control.requested_mode = 'on'
+         AND provider_control.row_version > 0
+         AND provider_control.bound_credential_generation =
+               account.commerce_credential_generation
+         AND provider_control.bound_granted_scopes =
+               operations_commerce_granted_scope_snapshot(
+                 account.configuration
+               )
+         AND 'write_orders' = ANY(provider_control.bound_granted_scopes)
+         AND provider_control.bound_granted_scope_digest =
+               operations_commerce_granted_scope_digest(
+                 operations_commerce_granted_scope_snapshot(
+                   account.configuration
+                 )
+               )
+       ) AS provider_write_binding_current,
        order_row.global_id AS order_global_id,
        order_row.external_order_id,
        order_row.order_number,
@@ -2171,8 +2265,9 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
      LEFT JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_provider_write_control_current provider_control
+       ON provider_control.organization_id = account.organization_id
+      AND provider_control.integration_account_id = account.id
      JOIN operations_commerce_order_revision_targets target
        ON target.organization_id = order_row.organization_id
       AND target.order_id = order_row.id
@@ -2238,8 +2333,13 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     shopDomain: row.shop_domain,
     credentialGeneration: Number(row.commerce_credential_generation),
     credentialCurrent: row.credential_current === true,
-    activationState: row.activation_state,
-    activationRevision: Number(row.activation_revision),
+    providerWriteControlRowVersion: Number(
+      row.provider_write_control_row_version,
+    ),
+    providerWriteRequestedMode: row.provider_write_requested_mode,
+    providerWriteBindingCurrent:
+      row.provider_write_binding_current === true,
+    providerWriteScopeDigest: row.provider_write_scope_digest,
     orderGlobalId: row.order_global_id,
     externalOrderId: row.external_order_id,
     orderNumber: row.order_number,

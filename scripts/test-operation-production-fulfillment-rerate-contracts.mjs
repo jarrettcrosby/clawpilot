@@ -18,6 +18,13 @@ const migration = readFileSync(
   ),
   'utf8',
 )
+const shipmentAddressMigration = readFileSync(
+  resolve(
+    process.cwd(),
+    'db/migrations/0310_operations_order_shipment_address_working_copy.sql',
+  ),
+  'utf8',
+)
 const application = readFileSync(
   resolve(
     process.cwd(),
@@ -228,6 +235,14 @@ assertIncludes(migration, [
   'rerate_run.destination_snapshot',
   'current_order.ship_to',
 ], 'Active dispatch linkage to production authority')
+assertIncludes(shipmentAddressMigration, [
+  'operations_order_dispatch_destination_matches',
+  'dispatch_core_fingerprint',
+  'public.validate_operations_production_rerate_run_insert()',
+  'public.validate_operations_production_rerate_attempt_insert()',
+  'public.validate_operations_production_rerate_selection_insert()',
+  'public.validate_operations_active_carrier_group_attempt_prepare()',
+], 'Effective operational destination upgrade')
 
 for (const source of [attemptTable, resultTable, selectionTable]) {
   assert.doesNotMatch(
@@ -267,9 +282,14 @@ assertIncludes(application, [
   "'Provider completed at'",
   'clock_timestamp() AS server_now',
   'orders.currency AS current_order_currency',
-  'orders.ship_to AS current_order_ship_to',
-  '!sameOrderDestination(row.current_order_ship_to, destination)',
+  'readOperationsOrderShipmentAddressInPostgres({',
+  'orderShipToStorageValue(currentOperationalDestination.value)',
 ], 'Application-layer prepared-request, package, TTL, and dispatch authority')
+assert.doesNotMatch(
+  application,
+  /orders\.ship_to|current_order_ship_to|context\.ship_to/u,
+  'Production rerate authority must not bypass the operational destination override',
+)
 assert.doesNotMatch(
   application,
   /\batInput\b|input\.outcome\.completedAt|input\.outcome\.expiresAt|input\.outcome\.resultHash/u,

@@ -65,6 +65,19 @@ function loadPersistence() {
     if (specifier === '@/lib/operations/fulfillmentOptimizerContract') {
       return fulfillmentOptimizerContract
     }
+    if (specifier === '@/lib/operations/orderShipTo') {
+      return { orderShipToStorageValue: (value) => value }
+    }
+    if (
+      specifier
+        === '@/lib/persistence/operationsOrderShipmentAddress'
+    ) {
+      return {
+        readOperationsOrderShipmentAddressInPostgres: async () => {
+          throw new Error('not used by the hash contract')
+        },
+      }
+    }
     if (specifier === '@/lib/persistence/postgres') {
       return {
         acquireTransactionAdvisoryLock: async () => {},

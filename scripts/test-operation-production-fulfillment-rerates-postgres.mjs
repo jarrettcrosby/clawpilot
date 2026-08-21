@@ -40,6 +40,16 @@ const destination = Object.freeze({
   countryCode: 'US',
   residential: true,
 })
+const sourceDestination = Object.freeze({
+  name: 'Original provider recipient',
+  contactName: 'Original provider recipient',
+  line1: '1 Provider Source Lane',
+  city: 'Stamford',
+  region: 'CT',
+  postalCode: '06901',
+  countryCode: 'US',
+  residential: true,
+})
 const registeredOrigin = Object.freeze({
   line1: '7009 S 108th Street',
   city: 'La Vista',
@@ -143,6 +153,36 @@ const commerceOrderRevisionGate = {
   async assertCommerceOrderRevisionExecutionCurrent() {},
   CommerceOrderRevisionGateError: class extends Error {},
 }
+const orderShipTo = loadTypeScriptModule(
+  'app_src/lib/operations/orderShipTo.ts',
+)
+const operationsOrderShipmentAddress = loadTypeScriptModule(
+  'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+  {
+    '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+    '@/lib/integrations/commerceCredentialCrypto': {
+      decryptCommerceCandidateSnapshot(fields) {
+        return JSON.parse(fields.ciphertext.toString('utf8'))
+      },
+      encryptCommerceCandidateSnapshot() {
+        throw new Error('Production rerate fixture does not edit addresses')
+      },
+    },
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/postgres': {
+      acquireTransactionAdvisoryLock: (client, key) => client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      ),
+      query() {
+        throw new Error('Production rerate must supply its transaction client')
+      },
+      withTransaction() {
+        throw new Error('Production rerate must supply its transaction client')
+      },
+    },
+  },
+)
 
 const productionRerates = loadTypeScriptModule(
   'app_src/lib/operations/productionFulfillmentRerates.ts',
@@ -169,6 +209,9 @@ const productionRerates = loadTypeScriptModule(
         throw new Error('Unexpected dispatch binding in finalizer test')
       },
     },
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/operationsOrderShipmentAddress':
+      operationsOrderShipmentAddress,
     '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -202,6 +245,9 @@ const productionReratesForDispatch = loadTypeScriptModule(
       },
     },
     '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/operationsOrderShipmentAddress':
+      operationsOrderShipmentAddress,
     '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -450,6 +496,19 @@ async function seedPrerequisiteLineage(client, ids) {
       ],
     )
     await client.query(
+      `INSERT INTO operations_integration_accounts (
+         id, global_id, organization_id, provider, integration_type,
+         environment, display_name, status, configuration,
+         external_account_id, commerce_credential_generation,
+         created_by, updated_by
+       ) VALUES (
+         $1, 'gia0008999', $2, 'shopify', 'commerce', 'sandbox',
+         'Shopify source fixture', 'active', '{}'::jsonb,
+         'gid://shopify/Shop/rerate-fixture', 1, $3, $3
+       )`,
+      [ids.commerceIntegration, ids.organization, actorEmail],
+    )
+    await client.query(
       `INSERT INTO operations_orders (
          id, global_id, organization_id, pipeline_id, customer_id,
          integration_account_id, source_provider, external_order_id,
@@ -466,7 +525,46 @@ async function seedPrerequisiteLineage(client, ids) {
         ids.pipeline,
         ids.customer,
         ids.commerceIntegration,
+        JSON.stringify(sourceDestination),
+      ],
+    )
+    const sourceOrderHash = operationsOrderShipmentAddress
+      .operationsOrderShipmentAddressSourceHash({
+        orderGlobalId: 'gor0009001',
+        sourceProvider: 'shopify',
+        externalOrderId: 'rerate-order-1',
+        sourceShipTo: orderShipTo.normalizeOrderShipToDraft(sourceDestination),
+      })
+    await client.query(
+      `INSERT INTO operations_order_shipment_address_working_copies (
+         organization_id, order_id,
+         source_order_row_version, source_order_hash,
+         ship_to_state, ship_to_ciphertext, ship_to_iv, ship_to_tag,
+         ship_to_hash, dispatch_core_fingerprint,
+         ship_to_encryption_version,
+         last_command_receipt_id, last_idempotency_key,
+         last_request_hash, created_by, updated_by
+       ) VALUES (
+         $1, $2, 0, $3, 'local_carrier_ready', $4, $5, $6,
+         $7, operations_dispatch_address_core_fingerprint($8::jsonb),
+         1, gen_random_uuid(), 'rerate-local-address-proof',
+         $9, $10, $10
+       )`,
+      [
+        ids.organization,
+        ids.order,
+        sourceOrderHash,
+        Buffer.from(JSON.stringify(
+          orderShipTo.orderShipToStorageValue(
+            orderShipTo.normalizeOrderShipToDraft(destination),
+          ),
+        ), 'utf8'),
+        Buffer.from('010203040506070809101112', 'hex'),
+        Buffer.from('01020304050607080910111213141516', 'hex'),
+        '8'.repeat(64),
         JSON.stringify(destination),
+        '9'.repeat(64),
+        actorEmail,
       ],
     )
     await client.query(
@@ -1630,6 +1728,34 @@ async function verifyAcceptance(databaseUrl) {
           selectedBy: actorEmail,
         }, client)
       },
+    )
+    const effectiveDestinationAfterCurrencyRollback = await client.query(
+      `SELECT orders.currency,
+              operations_order_dispatch_destination_matches(
+                orders.organization_id, orders.id, $3::jsonb
+              ) AS destination_matches,
+              operations_dispatch_address_matches_core(
+                $3::jsonb, orders.ship_to
+              ) AS source_matches
+       FROM operations_orders orders
+       WHERE orders.organization_id = $1::uuid
+         AND orders.id = $2::uuid`,
+      [ids.organization, ids.order, JSON.stringify(destination)],
+    )
+    assert.deepEqual(effectiveDestinationAfterCurrencyRollback.rows[0], {
+      currency: 'USD',
+      destination_matches: true,
+      source_matches: false,
+    })
+    const appEffectiveDestination = await operationsOrderShipmentAddress
+      .readOperationsOrderShipmentAddressInPostgres({
+        organizationId: ids.organization,
+        orderGlobalId: 'gor0009001',
+        client,
+      })
+    assert.equal(
+      JSON.stringify(appEffectiveDestination.value),
+      JSON.stringify(orderShipTo.normalizeOrderShipToDraft(destination)),
     )
     await expectServiceError(
       client,

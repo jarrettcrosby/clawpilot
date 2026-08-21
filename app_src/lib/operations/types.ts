@@ -1,3 +1,9 @@
+import type {
+  OrderShipToDraft,
+  OrderShipToIssue,
+  OrderShipToReadiness,
+} from '@/lib/operations/orderShipTo'
+
 export type OperationsProvider = 'shopify' | 'bigcommerce' | 'etsy' | 'mock-commerce'
 
 export type OperationsOrderStatus =
@@ -789,6 +795,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
       revision: 0
     }
   shipTo: Address
+  shipmentShipTo: OperationsOrderShipmentAddress
   lines: Array<{
     globalId: string
     productGlobalId: string
@@ -914,6 +921,42 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   }>
 }
 
+export type OperationsOrderShipmentAddress = {
+  orderGlobalId: string
+  orderRowVersion: number
+  rowVersion: number
+  value: OrderShipToDraft
+  sourceValue: OrderShipToDraft
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  provenance: 'source' | 'local'
+  sourceVersionChanged: boolean
+  editable: boolean
+  editBlockedReason: string | null
+  providerWrites: 0
+}
+
+export type OperationsOrderShipmentAddressUpdateResult = {
+  orderGlobalId: string
+  orderRowVersion: number
+  rowVersion: number
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  changedFields: Array<
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  >
+  sourceVersionChanged: false
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
+}
+
 export type OperationsWorkspace = {
   organizationId: string
   configured: boolean
@@ -932,6 +975,7 @@ export type OperationsWorkspace = {
   }
   storeSync: import('@/lib/operations/commerceStoreSync').CommerceStoreSyncControl[]
   summary: OperationsSummary
+  importedOrders: OperationsImportedOrderWorkingCopy[]
   orders: OperationsOrderListItem[]
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
@@ -1062,6 +1106,63 @@ export type OperationsWorkspace = {
     }>
   }
   generatedAt: string
+}
+
+export type OperationsImportedOrderWorkingCopy = {
+  kind: 'imported_working_copy'
+  globalId: string
+  candidateGlobalId: string
+  canonicalOrderGlobalId: string | null
+  integrationAccountGlobalId: string
+  integrationAccountName: string
+  provider: 'shopify' | 'faire'
+  externalOrderId: string
+  orderNumber: string
+  status: 'imported'
+  needsInfo: boolean
+  customerName: string | null
+  lineCount: number
+  sourceUpdatedAt: string
+  candidateRowVersion: number
+  rowVersion: number
+  providerVersionChanged: boolean
+  shipTo: {
+    value: OrderShipToDraft
+    readiness: OrderShipToReadiness
+    provenance: 'provider' | 'local'
+    syncStatus:
+      | 'provider_snapshot'
+      | 'local_only'
+      | 'provider_sync_pending'
+      | 'provider_synced'
+      | 'provider_sync_failed'
+    issues: OrderShipToIssue[]
+  }
+  providerWrites: 0
+}
+
+export type OperationsImportedOrderShipToUpdateResult = {
+  candidateGlobalId: string
+  canonicalOrderGlobalId: string | null
+  rowVersion: number
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  changedFields: Array<
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  >
+  syncStatus: 'local_only'
+  promotionStatus: 'not_ready' | 'needs_info' | 'promoted'
+  remainingBlockerCodes: string[]
+  providerVersionChanged: boolean
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
 }
 
 export type OperationsInventoryPoolInput = {

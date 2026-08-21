@@ -1,0 +1,703 @@
+import { createHash } from 'node:crypto'
+import type { PoolClient, QueryResult, QueryResultRow } from 'pg'
+import { recordAuditEvent } from '@/lib/auditWriter'
+import {
+  acquireTransactionAdvisoryLock,
+  query,
+  withTransaction,
+} from '@/lib/persistence/postgres'
+
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/u
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
+
+export type CommerceProviderWriteMode = 'off' | 'on'
+export type CommerceProviderWriteBindingStatus =
+  | 'off'
+  | 'current'
+  | 'unavailable'
+  | 'revalidation_required'
+
+export type CommerceProviderWriteBlocker = {
+  code:
+    | 'COMMERCE_PROVIDER_WRITES_ACCOUNT_UNAVAILABLE'
+    | 'COMMERCE_PROVIDER_WRITES_CREDENTIAL_UNAVAILABLE'
+    | 'COMMERCE_PROVIDER_WRITES_GRANTED_SCOPES_UNAVAILABLE'
+    | 'COMMERCE_PROVIDER_WRITES_WRITE_SCOPE_REQUIRED'
+    | 'COMMERCE_PROVIDER_WRITES_FAIRE_OAUTH_REQUIRED'
+    | 'COMMERCE_PROVIDER_WRITES_FAIRE_SCOPE_EVIDENCE_REQUIRED'
+    | 'COMMERCE_PROVIDER_WRITES_COMMAND_ENFORCEMENT_UNAVAILABLE'
+    | 'COMMERCE_PROVIDER_WRITES_BINDING_STALE'
+  message: string
+}
+
+export type CommerceProviderWriteControl = {
+  accountGlobalId: string
+  accountDisplayName: string
+  provider: 'shopify' | 'faire'
+  environment: 'mock' | 'sandbox' | 'production'
+  requestedMode: CommerceProviderWriteMode
+  rowVersion: number
+  effectiveFromDefault: boolean
+  bindingStatus: CommerceProviderWriteBindingStatus
+  bindingCurrent: boolean
+  enableAvailable: boolean
+  blocker: CommerceProviderWriteBlocker | null
+  boundCredentialGeneration: number | null
+  boundGrantedScopeDigest: string | null
+  currentCredentialGeneration: number
+  currentGrantedScopeDigest: string | null
+  changedBy: string | null
+  changedRole: 'owner' | 'admin' | 'member' | null
+  updatedAt: string | null
+  commandEnforcement: 'shopify_order_management' | 'not_connected'
+  providerWritesEffective: boolean
+}
+
+export type CommerceProviderWriteControlState = {
+  organizationId: string
+  accounts: CommerceProviderWriteControl[]
+}
+
+export type SetCommerceProviderWriteControlResult = {
+  control: CommerceProviderWriteControl
+  replayed: boolean
+}
+
+type TimestampValue = string | Date
+
+type ControlRow = {
+  integration_account_id: string
+  account_global_id: string
+  account_display_name: string
+  provider: string
+  environment: string
+  account_status: string
+  external_account_id: string | null
+  current_credential_generation: number | string
+  current_configuration: Record<string, unknown>
+  credential_external_account_id: string | null
+  credential_version: number | string | null
+  auth_mode: string | null
+  verification_status: string | null
+  credential_last_error_code: string | null
+  faire_scope_evidence_current: boolean
+  row_version: number | string
+  requested_mode: string
+  bound_credential_generation: number | string | null
+  bound_granted_scopes: string[] | null
+  bound_granted_scope_digest: string | null
+  changed_by: string | null
+  changed_role: string | null
+  created_at: TimestampValue | null
+  effective_from_default: boolean
+}
+
+type RevisionRow = {
+  integration_account_id: string
+  row_version: number | string
+  requested_mode: string
+  bound_credential_generation: number | string | null
+  bound_granted_scopes: string[] | null
+  bound_granted_scope_digest: string | null
+  changed_by: string
+  changed_role: string
+  request_hash: string
+  created_at: TimestampValue
+}
+
+type QueryExecutor = {
+  query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values?: unknown[],
+  ): Promise<QueryResult<T>>
+}
+
+export class CommerceProviderWriteControlError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly status = 409,
+  ) {
+    super(message)
+    this.name = 'CommerceProviderWriteControlError'
+  }
+}
+
+function fail(code: string, message: string, status = 409): never {
+  throw new CommerceProviderWriteControlError(code, message, status)
+}
+
+function organizationId(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!UUID.test(normalized)) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ORGANIZATION_INVALID',
+      'Active organization is invalid',
+      400,
+    )
+  }
+  return normalized
+}
+
+function accountGlobalId(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!ACCOUNT_GLOBAL_ID.test(normalized)) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ACCOUNT_INVALID',
+      'Commerce account is invalid',
+      400,
+    )
+  }
+  return normalized
+}
+
+function requestedMode(value: unknown): CommerceProviderWriteMode {
+  if (value !== 'off' && value !== 'on') {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_MODE_INVALID',
+      'Provider writes mode must be Off or On',
+      400,
+    )
+  }
+  return value
+}
+
+function expectedRowVersion(value: unknown) {
+  if (
+    !Number.isSafeInteger(value)
+    || Number(value) < 0
+    || Number(value) >= Number.MAX_SAFE_INTEGER
+  ) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ROW_VERSION_INVALID',
+      'Provider writes row version is invalid',
+      400,
+    )
+  }
+  return Number(value)
+}
+
+function actorEmail(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (
+    !normalized
+    || normalized.length > 320
+    || !normalized.includes('@')
+    || /[\u0000-\u001f\u007f]/u.test(normalized)
+  ) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ACTOR_INVALID',
+      'A signed-in operations manager is required',
+      401,
+    )
+  }
+  return normalized
+}
+
+function actorRole(value: unknown): 'owner' | 'admin' | 'member' {
+  if (value !== 'owner' && value !== 'admin' && value !== 'member') {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ROLE_FORBIDDEN',
+      'Operations-management permission is required',
+      403,
+    )
+  }
+  return value
+}
+
+function idempotencyKey(value: unknown) {
+  if (
+    typeof value !== 'string'
+    || value !== value.trim()
+    || !IDEMPOTENCY_KEY.test(value)
+  ) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_IDEMPOTENCY_KEY_INVALID',
+      'A valid Idempotency-Key header is required',
+      400,
+    )
+  }
+  return value
+}
+
+function exactInteger(value: unknown) {
+  const number = Number(value)
+  return Number.isSafeInteger(number) ? number : 0
+}
+
+function timestamp(value: TimestampValue | null) {
+  if (!value) return null
+  const date = value instanceof Date ? value : new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+export function canonicalCommerceGrantedScopes(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
+    return null
+  }
+  const scopes: string[] = []
+  for (const entry of value) {
+    if (
+      typeof entry !== 'string'
+      || entry !== entry.trim()
+      || entry.length < 1
+      || entry.length > 128
+      || /[\u0000-\u001f\u007f]/u.test(entry)
+    ) {
+      return null
+    }
+    scopes.push(entry)
+  }
+  const canonical = [...new Set(scopes)].sort()
+  return canonical.length === scopes.length ? canonical : null
+}
+
+export function commerceGrantedScopeDigest(scopes: readonly string[]) {
+  return createHash('sha256').update(scopes.join('\n'), 'utf8').digest('hex')
+}
+
+export function commerceProviderHasWriteScope(
+  provider: 'shopify' | 'faire',
+  scopes: readonly string[],
+) {
+  return provider === 'shopify'
+    ? scopes.some((scope) => scope.startsWith('write_'))
+    : scopes.some((scope) => [
+      'WRITE_PRODUCTS',
+      'WRITE_INVENTORIES',
+      'WRITE_ORDERS',
+    ].includes(scope))
+}
+
+function provider(value: string): 'shopify' | 'faire' {
+  if (value !== 'shopify' && value !== 'faire') {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ACCOUNT_INVALID',
+      'Commerce account provider is unsupported',
+      404,
+    )
+  }
+  return value
+}
+
+function environment(
+  value: string,
+): 'mock' | 'sandbox' | 'production' {
+  if (value === 'mock' || value === 'sandbox' || value === 'production') {
+    return value
+  }
+  fail(
+    'COMMERCE_PROVIDER_WRITES_ACCOUNT_INVALID',
+    'Commerce account environment is invalid',
+    500,
+  )
+}
+
+function enableBlocker(row: ControlRow): CommerceProviderWriteBlocker | null {
+  const accountProvider = provider(row.provider)
+  if (row.account_status !== 'active') {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_ACCOUNT_UNAVAILABLE',
+      message: 'Reconnect or restore this provider account before turning writes on.',
+    }
+  }
+  const credentialCurrent = exactInteger(row.credential_version) > 0
+    && exactInteger(row.credential_version)
+      === exactInteger(row.current_credential_generation)
+    && row.credential_external_account_id !== null
+    && row.credential_external_account_id === row.external_account_id
+    && row.verification_status === 'verified'
+    && row.credential_last_error_code === null
+  if (!credentialCurrent) {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_CREDENTIAL_UNAVAILABLE',
+      message: 'Test or reconnect the current provider credential before turning writes on.',
+    }
+  }
+  if (
+    accountProvider === 'shopify'
+    && row.auth_mode !== 'shopify_client_credentials'
+  ) {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_CREDENTIAL_UNAVAILABLE',
+      message: 'The current Shopify credential cannot be bound for provider writes.',
+    }
+  }
+  if (accountProvider === 'faire' && row.auth_mode !== 'faire_oauth') {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_FAIRE_OAUTH_REQUIRED',
+      message: 'Reconnect Faire with Custom App OAuth before turning provider writes on.',
+    }
+  }
+  const scopes = canonicalCommerceGrantedScopes(
+    row.current_configuration?.grantedScopes,
+  )
+  if (!scopes) {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_GRANTED_SCOPES_UNAVAILABLE',
+      message: 'Refresh the connection so ClawPilot can verify the current granted scopes.',
+    }
+  }
+  if (!commerceProviderHasWriteScope(accountProvider, scopes)) {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_WRITE_SCOPE_REQUIRED',
+      message: 'Approve at least one provider write scope before turning writes on.',
+    }
+  }
+  if (accountProvider === 'faire' && !row.faire_scope_evidence_current) {
+    return {
+      code: 'COMMERCE_PROVIDER_WRITES_FAIRE_SCOPE_EVIDENCE_REQUIRED',
+      message: 'Reconnect Faire so the current OAuth write-scope grant can be verified.',
+    }
+  }
+  return null
+}
+
+function mapControl(row: ControlRow): CommerceProviderWriteControl {
+  const accountProvider = provider(row.provider)
+  const mode: CommerceProviderWriteMode = row.requested_mode === 'on'
+    ? 'on'
+    : 'off'
+  const scopes = canonicalCommerceGrantedScopes(
+    row.current_configuration?.grantedScopes,
+  )
+  const currentDigest = scopes ? commerceGrantedScopeDigest(scopes) : null
+  const commandConnected = accountProvider === 'shopify'
+    && row.environment === 'sandbox'
+    && scopes?.includes('write_orders') === true
+  const connectionBlocker = enableBlocker(row)
+  const blocker = connectionBlocker || (!commandConnected ? {
+    code: 'COMMERCE_PROVIDER_WRITES_COMMAND_ENFORCEMENT_UNAVAILABLE' as const,
+    message: accountProvider !== 'shopify'
+      ? 'Provider write commands are not connected for this provider yet.'
+      : row.environment !== 'sandbox'
+        ? 'Shopify production order-write commands are not connected yet.'
+        : 'Approve the write_orders scope before turning Provider writes on.',
+  } : null)
+  const bindingCurrent = mode === 'on'
+    && blocker === null
+    && exactInteger(row.bound_credential_generation)
+      === exactInteger(row.current_credential_generation)
+    && row.bound_granted_scope_digest === currentDigest
+    && Array.isArray(row.bound_granted_scopes)
+    && JSON.stringify(row.bound_granted_scopes) === JSON.stringify(scopes)
+  let bindingStatus: CommerceProviderWriteBindingStatus = 'off'
+  let resolvedBlocker = blocker
+  if (mode === 'on' && bindingCurrent) {
+    bindingStatus = 'current'
+    resolvedBlocker = null
+  } else if (mode === 'on') {
+    bindingStatus = 'revalidation_required'
+    resolvedBlocker = {
+      code: 'COMMERCE_PROVIDER_WRITES_BINDING_STALE',
+      message: blocker?.message
+        || 'The credential generation or granted scopes changed. Turn writes Off, then On to bind the current connection.',
+    }
+  } else if (blocker) {
+    bindingStatus = 'unavailable'
+  }
+  return {
+    accountGlobalId: row.account_global_id,
+    accountDisplayName: row.account_display_name,
+    provider: accountProvider,
+    environment: environment(row.environment),
+    requestedMode: mode,
+    rowVersion: exactInteger(row.row_version),
+    effectiveFromDefault: row.effective_from_default,
+    bindingStatus,
+    bindingCurrent,
+    enableAvailable: blocker === null,
+    blocker: resolvedBlocker,
+    boundCredentialGeneration: row.bound_credential_generation === null
+      ? null
+      : exactInteger(row.bound_credential_generation),
+    boundGrantedScopeDigest: row.bound_granted_scope_digest,
+    currentCredentialGeneration: exactInteger(
+      row.current_credential_generation,
+    ),
+    currentGrantedScopeDigest: currentDigest,
+    changedBy: row.changed_by,
+    changedRole: row.changed_role === 'owner'
+      || row.changed_role === 'admin'
+      || row.changed_role === 'member'
+      ? row.changed_role
+      : null,
+    updatedAt: timestamp(row.created_at),
+    commandEnforcement: commandConnected
+      ? 'shopify_order_management'
+      : 'not_connected',
+    providerWritesEffective: commandConnected && bindingCurrent,
+  }
+}
+
+const CONTROL_SELECT = `SELECT
+  current_control.integration_account_id::text,
+  current_control.account_global_id,
+  current_control.display_name AS account_display_name,
+  current_control.provider,
+  current_control.environment,
+  current_control.account_status,
+  account.external_account_id,
+  current_control.current_credential_generation,
+  current_control.current_configuration,
+  credential.external_account_id AS credential_external_account_id,
+  credential.credential_version,
+  credential.auth_mode,
+  credential.verification_status,
+  credential.last_error_code AS credential_last_error_code,
+  CASE WHEN current_control.provider = 'faire' THEN EXISTS (
+    SELECT 1
+    FROM public.operations_faire_provider_write_scope_evidence evidence
+    WHERE evidence.organization_id = current_control.organization_id
+      AND evidence.integration_account_id =
+            current_control.integration_account_id
+      AND evidence.credential_generation =
+            current_control.current_credential_generation
+      AND public.operations_faire_provider_write_scope_evidence_is_current(
+        current_control.organization_id,
+        evidence.id,
+        current_control.integration_account_id,
+        current_control.current_credential_generation
+      )
+  ) ELSE true END AS faire_scope_evidence_current,
+  current_control.row_version,
+  current_control.requested_mode,
+  current_control.bound_credential_generation,
+  current_control.bound_granted_scopes,
+  current_control.bound_granted_scope_digest,
+  current_control.changed_by,
+  current_control.changed_role,
+  current_control.created_at,
+  current_control.effective_from_default
+FROM public.operations_commerce_provider_write_control_current current_control
+JOIN public.operations_integration_accounts account
+  ON account.organization_id = current_control.organization_id
+ AND account.id = current_control.integration_account_id
+LEFT JOIN public.operations_commerce_credentials credential
+  ON credential.organization_id = current_control.organization_id
+ AND credential.integration_account_id =
+       current_control.integration_account_id
+WHERE current_control.organization_id = $1::uuid`
+
+async function readControls(
+  executor: QueryExecutor,
+  input: { organizationId: string; accountGlobalId?: string },
+) {
+  const values: unknown[] = [input.organizationId]
+  const exactAccount = input.accountGlobalId
+    ? ' AND current_control.account_global_id = $2'
+    : ''
+  if (input.accountGlobalId) values.push(input.accountGlobalId)
+  const result = await executor.query<ControlRow>(
+    `${CONTROL_SELECT}${exactAccount}
+     ORDER BY current_control.provider, current_control.display_name,
+              current_control.account_global_id`,
+    values,
+  )
+  return result.rows.map(mapControl)
+}
+
+export async function readCommerceProviderWriteControlsFromPostgres(input: {
+  organizationId: unknown
+}): Promise<CommerceProviderWriteControlState> {
+  const normalizedOrganizationId = organizationId(input.organizationId)
+  return {
+    organizationId: normalizedOrganizationId,
+    accounts: await readControls({ query }, {
+      organizationId: normalizedOrganizationId,
+    }),
+  }
+}
+
+function requestHash(input: {
+  organizationId: string
+  accountGlobalId: string
+  mode: CommerceProviderWriteMode
+  expectedRowVersion: number
+  actorEmail: string
+  actorRole: 'owner' | 'admin' | 'member'
+}) {
+  return createHash('sha256').update(JSON.stringify({
+    version: 'commerce-provider-write-control-v1',
+    ...input,
+  })).digest('hex')
+}
+
+async function accountForChange(client: PoolClient, input: {
+  organizationId: string
+  accountGlobalId: string
+}) {
+  const rowResult = await client.query<ControlRow>(
+    `${CONTROL_SELECT}
+     AND current_control.account_global_id = $2
+     FOR SHARE OF account`,
+    [input.organizationId, input.accountGlobalId],
+  )
+  const row = rowResult.rows[0]
+  if (!row) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ACCOUNT_NOT_FOUND',
+      'Commerce account is unavailable in the active organization',
+      404,
+    )
+  }
+  return { control: mapControl(row), row }
+}
+
+export async function setCommerceProviderWriteControlInPostgres(rawInput: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  mode: unknown
+  expectedRowVersion: unknown
+  actorEmail: unknown
+  actorRole: unknown
+  idempotencyKey: unknown
+}): Promise<SetCommerceProviderWriteControlResult> {
+  const input = {
+    organizationId: organizationId(rawInput.organizationId),
+    accountGlobalId: accountGlobalId(rawInput.accountGlobalId),
+    mode: requestedMode(rawInput.mode),
+    expectedRowVersion: expectedRowVersion(rawInput.expectedRowVersion),
+    actorEmail: actorEmail(rawInput.actorEmail),
+    actorRole: actorRole(rawInput.actorRole),
+    idempotencyKey: idempotencyKey(rawInput.idempotencyKey),
+  }
+  if (input.mode === 'on' && input.actorRole === 'member') {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_ACTIVATE_REQUIRED',
+      'Organization owner or operations-administrator access is required to turn provider writes on',
+      403,
+    )
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const { control, row } = await accountForChange(client, input)
+    const hash = requestHash(input)
+    const replay = await client.query<RevisionRow>(
+      `SELECT integration_account_id::text, row_version, requested_mode,
+              bound_credential_generation, bound_granted_scopes,
+              bound_granted_scope_digest, changed_by, changed_role,
+              request_hash, created_at
+       FROM public.operations_commerce_provider_write_controls
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND idempotency_key = $3
+       LIMIT 1`,
+      [input.organizationId, row.integration_account_id, input.idempotencyKey],
+    )
+    if (replay.rows[0]) {
+      if (replay.rows[0].request_hash !== hash) {
+        fail(
+          'COMMERCE_PROVIDER_WRITES_IDEMPOTENCY_CONFLICT',
+          'Idempotency-Key was already used for a different provider writes change',
+        )
+      }
+      const exactReplay = replay.rows[0]
+      return {
+        control: mapControl({
+          ...row,
+          row_version: exactReplay.row_version,
+          requested_mode: exactReplay.requested_mode,
+          bound_credential_generation:
+            exactReplay.bound_credential_generation,
+          bound_granted_scopes: exactReplay.bound_granted_scopes,
+          bound_granted_scope_digest:
+            exactReplay.bound_granted_scope_digest,
+          changed_by: exactReplay.changed_by,
+          changed_role: exactReplay.changed_role,
+          created_at: exactReplay.created_at,
+          effective_from_default: false,
+        }),
+        replayed: true,
+      }
+    }
+    if (control.rowVersion !== input.expectedRowVersion) {
+      fail(
+        'COMMERCE_PROVIDER_WRITES_ROW_VERSION_CONFLICT',
+        'Provider writes changed; refresh and try again',
+      )
+    }
+    if (input.mode === 'on' && !control.enableAvailable) {
+      fail(
+        control.blocker?.code || 'COMMERCE_PROVIDER_WRITES_UNAVAILABLE',
+        control.blocker?.message || 'Provider writes are unavailable for this connection',
+      )
+    }
+    const scopes = input.mode === 'on'
+      ? canonicalCommerceGrantedScopes(row.current_configuration?.grantedScopes)
+      : null
+    if (input.mode === 'on' && !scopes) {
+      fail(
+        'COMMERCE_PROVIDER_WRITES_GRANTED_SCOPES_UNAVAILABLE',
+        'Refresh the connection so ClawPilot can verify the current granted scopes',
+      )
+    }
+    const digest = scopes ? commerceGrantedScopeDigest(scopes) : null
+    await client.query(
+      `INSERT INTO public.operations_commerce_provider_write_controls (
+         organization_id, integration_account_id, provider,
+         row_version, expected_row_version, requested_mode,
+         bound_credential_generation, bound_granted_scopes,
+         bound_granted_scope_digest, changed_by, changed_role,
+         idempotency_key, request_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, $5, $6,
+         $7, $8::text[], $9, $10, $11, $12, $13
+       )`,
+      [
+        input.organizationId,
+        row.integration_account_id,
+        row.provider,
+        control.rowVersion + 1,
+        control.rowVersion,
+        input.mode,
+        input.mode === 'on'
+          ? exactInteger(row.current_credential_generation)
+          : null,
+        scopes,
+        digest,
+        input.actorEmail,
+        input.actorRole,
+        input.idempotencyKey,
+        hash,
+      ],
+    )
+    const [saved] = await readControls(client, input)
+    if (!saved || saved.rowVersion !== control.rowVersion + 1) {
+      fail(
+        'COMMERCE_PROVIDER_WRITES_NOT_RETAINED',
+        'Provider writes change was not retained',
+        500,
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      organizationId: input.organizationId,
+      eventType: input.mode === 'on'
+        ? 'commerce.provider_writes.turned_on'
+        : 'commerce.provider_writes.turned_off',
+      aggregateType: 'operations.commerce_provider_write_control',
+      aggregateId: input.accountGlobalId,
+      eventKey:
+        `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}:${input.idempotencyKey}`,
+      payload: {
+        accountGlobalId: input.accountGlobalId,
+        provider: saved.provider,
+        requestedMode: saved.requestedMode,
+        rowVersion: saved.rowVersion,
+        expectedRowVersion: control.rowVersion,
+        boundCredentialGeneration: saved.boundCredentialGeneration,
+        boundGrantedScopeDigest: saved.boundGrantedScopeDigest,
+        commandEnforcement: saved.commandEnforcement,
+        providerWritesEffective: saved.providerWritesEffective,
+      },
+    }, client)
+    return { control: saved, replayed: false }
+  })
+}

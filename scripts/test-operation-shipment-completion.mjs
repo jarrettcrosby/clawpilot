@@ -1121,6 +1121,27 @@ async function verifyShipmentCompletion(databaseUrl) {
     let faireFulfillmentAuthorizationRevision = 4
     let faireFulfillmentExecutionCalls = 0
     const faireFulfillmentInputs = []
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error('No local shipment-address copy is expected')
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error('Shipment completion does not edit addresses')
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const persistence = loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
       mocks: {
         '@/lib/auditWriter': auditWriter,
@@ -1132,6 +1153,12 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/commerceStoreSync': {
           readCommerceStoreSyncControlsFromPostgres: async () => [],
         },
+        '@/lib/persistence/commerceOrderWorkbench': {
+          readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
+        '@/lib/operations/orderShipTo': orderShipTo,
+        '@/lib/persistence/operationsOrderShipmentAddress':
+          operationsOrderShipmentAddress,
         '@/lib/integrations/carrierCheckoutRate': {
           rateCheckoutShipment: async () => {
             throw new Error(
@@ -1332,6 +1359,9 @@ async function verifyShipmentCompletion(databaseUrl) {
       {
         mocks: {
           '@/lib/auditWriter': auditWriter,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/integrations/carrierIntegrations': {
             CarrierIntegrationRequestError:
               FocusedCarrierIntegrationRequestError,

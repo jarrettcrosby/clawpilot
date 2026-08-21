@@ -77,6 +77,7 @@ for (const fragment of [
   'shopifyOrderManagementRuntime',
   "'0283_operations_shopify_order_management.sql'",
   'operations_shopify_order_management_applied',
+  'operations_commerce_provider_write_controls_applied',
   'shopifyOrderManagement,',
   'allowlistedAccountCount',
   'durable.processing > 0',
@@ -84,6 +85,13 @@ for (const fragment of [
   'durable.unknown > 0',
   'Shopify order management has stale provider-write attempts requiring reconciliation.',
   'Shopify order management has unknown provider-write outcomes requiring reconciliation.',
+  "'0308_operations_commerce_provider_write_controls.sql'",
+  "'public.operations_commerce_provider_write_controls'",
+  "'public.operations_commerce_provider_write_control_current'",
+  '86e39d6e19962894b94466a6fad367682093dc6271e0df92c9cade112ad075b6',
+  '98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b',
+  '9d0946bfb810bd7be8b859e8643b1fa51a946dd98c32b5e781b573c163cdbaf5',
+  '442a1b8a8cac37652c6f193d5ab07ae3325891dcfa98f80593603e8166ac97d6',
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -121,6 +129,31 @@ assert.match(
   routeSource,
   /installed_shopify_order_management_trigger\.tgenabled\s*=\s*'O'/u,
   'Health structural query must require normally enabled triggers',
+)
+assert.match(
+  routeSource,
+  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0308_operations_commerce_provider_write_controls\.sql[\s\S]{0,180}OR \(/u,
+  'Health readiness must accept the old phase only while 0308 is absent',
+)
+assert.match(
+  routeSource,
+  /pg_catalog\.to_regprocedure\(\s*'public\.' \|\| required\.signature/u,
+  'Post-0308 function resolvers must be schema-qualified',
+)
+assert.match(
+  routeSource,
+  /pg_catalog\.pg_get_triggerdef\(installed\.oid\)/u,
+  'Post-0308 readiness must hash exact trigger definitions',
+)
+assert.match(
+  routeSource,
+  /row\.operations_commerce_provider_write_controls_applied[\s\S]{0,100}\? 'ready'/u,
+  'Post-0308 health status must use per-account Provider writes authority',
+)
+assert.doesNotMatch(
+  routeSource,
+  /'provider_write_control_row_version'\s+IN pg_get_functiondef/u,
+  'Token-presence checks are not exact function-body attestation',
 )
 const migrationError = "errors.push('Required database migrations are not applied.')"
 const migrationErrorIndex = routeSource.indexOf(migrationError)
@@ -449,7 +482,7 @@ const disabled = await executeScenario({
   structureApplied: true,
 })
 assert.equal(disabled.responseStatus, 200)
-assert.equal(disabled.body.shopifyOrderManagement.status, 'disabled')
+assert.equal(disabled.body.shopifyOrderManagement.status, 'ready')
 assert.equal(disabled.body.shopifyOrderManagement.runtime.available, false)
 assert.equal(
   disabled.body.shopifyOrderManagement.runtime.providerWritesEnabled,
@@ -497,5 +530,94 @@ assert.ok(missing.body.errors.includes(
 assert.equal(missing.body.shopifyOrderManagement.status, 'migration-pending')
 assert.equal(missing.body.shopifyOrderManagement.durable, null)
 assert.equal(missing.healthReads, 0)
+
+const liveDatabaseUrl = process.env.SHOPIFY_ORDER_MANAGEMENT_HEALTH_DATABASE_URL
+if (liveDatabaseUrl) {
+  const { Pool } = requireFromApp('pg')
+  const pool = new Pool({ connectionString: liveDatabaseUrl, max: 1 })
+  const client = await pool.connect()
+  const phaseMarker = processing.mainQuery.indexOf(
+    "'0308_operations_commerce_provider_write_controls.sql'",
+  )
+  const phaseStart = processing.mainQuery.lastIndexOf('AND (', phaseMarker) + 4
+  assert.ok(phaseMarker > 0 && phaseStart > 3)
+  let phaseEnd = -1
+  let depth = 0
+  let quoted = false
+  for (let index = phaseStart; index < processing.mainQuery.length; index += 1) {
+    const character = processing.mainQuery[index]
+    if (character === "'") {
+      if (quoted && processing.mainQuery[index + 1] === "'") {
+        index += 1
+      } else {
+        quoted = !quoted
+      }
+    } else if (!quoted && character === '(') {
+      depth += 1
+    } else if (!quoted && character === ')') {
+      depth -= 1
+      if (depth === 0) {
+        phaseEnd = index + 1
+        break
+      }
+    }
+  }
+  assert.ok(phaseEnd > phaseStart)
+  const providerWriteHealthExpression = processing.mainQuery.slice(
+    phaseStart,
+    phaseEnd,
+  )
+  const structuralReady = async () => {
+    const result = await client.query(
+      `SELECT ${providerWriteHealthExpression} AS ready`,
+    )
+    return result.rows[0]?.ready === true
+  }
+  try {
+    assert.equal(await structuralReady(), true)
+
+    await client.query('BEGIN')
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0308_operations_commerce_provider_write_controls.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `CREATE OR REPLACE FUNCTION
+         public.operations_shopify_order_management_is_current(
+           p_organization_id uuid,
+           p_authorization_id uuid,
+           p_require_claim_fence boolean DEFAULT true
+         )
+       RETURNS boolean
+       LANGUAGE sql
+       STABLE
+       SET search_path = pg_catalog, public, pg_temp
+       AS 'SELECT true'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       DISABLE TRIGGER
+         protect_shopify_order_management_authorization_write`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+    assert.equal(await structuralReady(), true)
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined)
+    client.release()
+    await pool.end()
+  }
+}
 
 console.log('Shopify order management health acceptance passed')

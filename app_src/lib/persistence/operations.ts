@@ -2,6 +2,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
+import { readCommerceOrderWorkbenchFromPostgres } from '@/lib/persistence/commerceOrderWorkbench'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   executeShopifyFulfillmentWriteback,
@@ -3416,6 +3421,12 @@ async function readOrderDetail(
   const row = orderResult.rows[0]
   if (!row) return null
 
+  const shipmentShipTo =
+    await readOperationsOrderShipmentAddressInPostgres({
+      organizationId,
+      orderGlobalId: row.global_id,
+    })
+
   const [
     lineResult,
     packageResult,
@@ -3911,7 +3922,8 @@ async function readOrderDetail(
     expectedRevenueMinor: row.expected_revenue_minor,
     expectedMarginMinor: row.expected_margin_minor,
     trackingNumber: row.tracking_number,
-    shipTo: address(row.ship_to),
+    shipTo: address(orderShipToStorageValue(shipmentShipTo.value)),
+    shipmentShipTo,
     updatedAt: row.updated_at.toISOString(),
     lines: lineResult.rows.map((item) => ({
       globalId: item.global_id,
@@ -4058,9 +4070,13 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const [activation, storeSync] = await Promise.all([
+  const [activation, storeSync, importedOrders] = await Promise.all([
     withTransaction((client) => resolveActivation(client, organizationId)),
     readCommerceStoreSyncControlsFromPostgres(organizationId),
+    readCommerceOrderWorkbenchFromPostgres({
+      organizationId,
+      search: input.search,
+    }),
   ])
   const values: unknown[] = [organizationId]
   const where = ['orders.organization_id = $1::uuid', 'orders.archived_at IS NULL']
@@ -4590,6 +4606,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       updatedAt: activation.updated_at.toISOString(),
     },
     storeSync,
+    importedOrders,
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),
@@ -6277,6 +6294,13 @@ async function readShadowExecutionContext(
       409,
     )
   }
+  const operationalShipTo =
+    await readOperationsOrderShipmentAddressInPostgres({
+      organizationId: input.organizationId,
+      orderGlobalId: order.global_id,
+      client,
+    })
+  order.ship_to = orderShipToStorageValue(operationalShipTo.value)
   await requireCurrentCommerceOrderRevision(client, {
     organizationId: input.organizationId,
     orderId: order.id,
@@ -18275,6 +18299,13 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
           409,
         )
       }
+      const operationalShipTo =
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId,
+          orderGlobalId: source.order_global_id,
+          client,
+        })
+      source.ship_to = orderShipToStorageValue(operationalShipTo.value)
       if (sandboxE2eAuthorizationGlobalId) {
         await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
           organizationId,
@@ -20256,6 +20287,13 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           409,
         )
       }
+      const operationalShipTo =
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId,
+          orderGlobalId: order.global_id,
+          client,
+        })
+      order.ship_to = orderShipToStorageValue(operationalShipTo.value)
       await requireCurrentCommerceOrderRevision(client, {
         organizationId,
         orderId: order.id,

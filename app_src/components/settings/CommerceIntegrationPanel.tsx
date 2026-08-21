@@ -30,6 +30,7 @@ import InputAdornment from '@mui/material/InputAdornment'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
+import Switch from '@mui/material/Switch'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
@@ -176,6 +177,45 @@ type CommerceAccount = {
 type CommerceState = {
   organizationId: string
   accounts: CommerceAccount[]
+}
+
+type ProviderWriteControl = {
+  accountGlobalId: string
+  accountDisplayName: string
+  provider: CommerceProvider
+  environment: 'mock' | CommerceEnvironment
+  requestedMode: 'off' | 'on'
+  rowVersion: number
+  effectiveFromDefault: boolean
+  bindingStatus: 'off' | 'current' | 'unavailable' | 'revalidation_required'
+  bindingCurrent: boolean
+  enableAvailable: boolean
+  blocker: { code: string; message: string } | null
+  boundCredentialGeneration: number | null
+  boundGrantedScopeDigest: string | null
+  currentCredentialGeneration: number
+  currentGrantedScopeDigest: string | null
+  changedBy: string | null
+  changedRole: 'owner' | 'admin' | 'member' | null
+  updatedAt: string | null
+  commandEnforcement: 'shopify_order_management' | 'not_connected'
+  providerWritesEffective: boolean
+}
+
+type ProviderWritePayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  state?: {
+    organizationId: string
+    accounts: ProviderWriteControl[]
+  }
+  result?: {
+    control: ProviderWriteControl
+    replayed: boolean
+  }
+  canManage?: boolean
+  canEnable?: boolean
 }
 
 type CapabilityDefinition = {
@@ -500,6 +540,24 @@ async function requestCommerce(init?: RequestInit): Promise<CommercePayload> {
   return result
 }
 
+async function requestProviderWrites(
+  init?: RequestInit,
+): Promise<ProviderWritePayload> {
+  const response = await fetch('/api/integrations/commerce/provider-writes', {
+    cache: 'no-store',
+    ...init,
+  })
+  const result = await response.json().catch(() => ({})) as
+    ProviderWritePayload
+  if (!response.ok || !result.ok) {
+    throw new CommerceRequestError(
+      result.error || 'Provider writes control request failed',
+      result.code,
+    )
+  }
+  return result
+}
+
 async function requestShopifyOrderPreview(
   accountGlobalId: string,
   init?: RequestInit,
@@ -672,6 +730,10 @@ export default function CommerceIntegrationPanel({
   const [canActivate, setCanActivate] = useState(false)
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [intakeAvailable, setIntakeAvailable] = useState(false)
+  const [providerWriteControls, setProviderWriteControls] = useState<
+    Record<string, ProviderWriteControl>
+  >({})
+  const [providerWritesError, setProviderWritesError] = useState('')
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [notificationPolicyDrafts, setNotificationPolicyDrafts] = useState<
@@ -740,8 +802,28 @@ export default function CommerceIntegrationPanel({
     }
   }
 
+  function applyProviderWritePayload(payload: ProviderWritePayload) {
+    if (!payload.state) return
+    setProviderWriteControls(Object.fromEntries(
+      payload.state.accounts.map((control) => [
+        control.accountGlobalId,
+        control,
+      ]),
+    ))
+    setProviderWritesError('')
+  }
+
   useEffect(() => {
     let active = true
+    requestProviderWrites()
+      .then((payload) => {
+        if (active) applyProviderWritePayload(payload)
+      })
+      .catch((requestError) => {
+        if (active) {
+          setProviderWritesError(actionableCommerceError(requestError))
+        }
+      })
     requestCommerce()
       .then((payload) => {
         if (active) {
@@ -861,6 +943,13 @@ export default function CommerceIntegrationPanel({
         body: JSON.stringify(body),
       })
       applyPayload(payload)
+      void requestProviderWrites()
+        .then((providerWritePayload) => {
+          applyProviderWritePayload(providerWritePayload)
+        })
+        .catch((requestError) => {
+          setProviderWritesError(actionableCommerceError(requestError))
+        })
       setNotice(successMessage)
       return payload
     } catch (requestError) {
@@ -870,6 +959,62 @@ export default function CommerceIntegrationPanel({
         .catch(() => undefined)
       setError(actionError)
       return false
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function setProviderWrites(
+    account: CommerceAccount,
+    mode: 'off' | 'on',
+  ) {
+    const current = providerWriteControls[account.globalId]
+    if (!current) return
+    const key = `provider-writes:${account.globalId}`
+    setPendingAction(key)
+    setProviderWritesError('')
+    setError('')
+    setNotice('')
+    try {
+      const payload = await requestProviderWrites({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': [
+            'provider-writes',
+            account.globalId,
+            current.rowVersion,
+            mode,
+            crypto.randomUUID(),
+          ].join(':'),
+        },
+        body: JSON.stringify({
+          accountGlobalId: account.globalId,
+          mode,
+          expectedRowVersion: current.rowVersion,
+        }),
+      })
+      const saved = payload.result?.control
+      if (!saved) {
+        throw new CommerceRequestError(
+          'Provider writes control response was incomplete',
+          'COMMERCE_PROVIDER_WRITES_RESPONSE_INVALID',
+        )
+      }
+      setProviderWriteControls((controls) => ({
+        ...controls,
+        [saved.accountGlobalId]: saved,
+      }))
+      setNotice(
+        mode === 'on'
+          ? `${account.displayName} Provider writes set to On for the current credential and granted scopes.`
+          : `${account.displayName} Provider writes set to Off.`,
+      )
+    } catch (requestError) {
+      setProviderWritesError(actionableCommerceError(requestError))
+      await requestProviderWrites()
+        .then((payload) => applyProviderWritePayload(payload))
+        .catch(() => undefined)
     } finally {
       setPendingAction('')
     }
@@ -1790,6 +1935,9 @@ export default function CommerceIntegrationPanel({
         </DialogActions>
       </Dialog>
       {error ? <Alert severity="error">{error}</Alert> : null}
+      {providerWritesError ? (
+        <Alert severity="warning">{providerWritesError}</Alert>
+      ) : null}
       {notice ? <Alert severity="success">{notice}</Alert> : null}
 
       {setupInProgressAccounts.length ? (
@@ -2765,6 +2913,29 @@ export default function CommerceIntegrationPanel({
                 === `fulfillment-notifications:${account.globalId}`
               const fulfillmentReadiness =
                 account.fulfillmentWriteReadiness
+              const providerWriteControl =
+                providerWriteControls[account.globalId]
+              const providerWritePending = pendingAction
+                === `provider-writes:${account.globalId}`
+              const providerWriteStatusLabel = !providerWriteControl
+                ? 'Loading'
+                : providerWriteControl.commandEnforcement
+                    !== 'shopify_order_management'
+                  ? 'Not connected'
+                  : providerWriteControl.providerWritesEffective
+                    ? 'On'
+                    : providerWriteControl.requestedMode === 'on'
+                      ? 'Revalidation required'
+                      : 'Off'
+              const providerWriteDetail = !providerWriteControl
+                ? 'Loading this connection control.'
+                : providerWriteControl.bindingStatus
+                  === 'revalidation_required'
+                  ? providerWriteControl.blocker?.message
+                    || 'The saved credential or scope binding is stale.'
+                  : providerWriteControl.commandEnforcement === 'shopify_order_management'
+                    ? 'Controls Shopify order changes for this connection. Imports and refresh remain available while Off.'
+                    : 'Provider write commands are not connected for this provider yet. Imports and refresh remain available.'
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -2847,6 +3018,87 @@ export default function CommerceIntegrationPanel({
                           ? 'This connection authorizes automatic product catalog sync with no second approval. The signed receipt control below only chooses whether new verified webhook receipts are queued for intake or retained as held evidence. It does not change the API credential, product-catalog authorization, Operations activation, or provider-write authority.'
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
+
+                      <Box
+                        sx={{
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 1.5,
+                          px: 1.5,
+                          py: 1,
+                        }}
+                      >
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          alignItems={{ xs: 'stretch', sm: 'center' }}
+                          justifyContent="space-between"
+                          spacing={1}
+                        >
+                          <Box>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Provider writes
+                              </Typography>
+                              <Chip
+                                size="small"
+                                color={providerWriteControl?.bindingStatus
+                                  === 'revalidation_required'
+                                  ? 'warning'
+                                  : 'default'}
+                                label={providerWriteStatusLabel}
+                              />
+                            </Stack>
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.25 }}
+                            >
+                              {providerWriteDetail}
+                            </Typography>
+                          </Box>
+                          {providerWriteControl?.commandEnforcement
+                            === 'shopify_order_management' ? (
+                              <Switch
+                                checked={providerWriteControl.requestedMode
+                                  === 'on'}
+                                disabled={providerWritePending
+                                  || pendingAction !== ''
+                                  || (providerWriteControl.requestedMode
+                                      !== 'on'
+                                    && (!canActivate
+                                      || !providerWriteControl.enableAvailable))}
+                                onChange={(_, checked) => {
+                                  void setProviderWrites(
+                                    account,
+                                    checked ? 'on' : 'off',
+                                  )
+                                }}
+                                slotProps={{
+                                  input: {
+                                    'aria-label': `Provider writes for ${account.displayName}`,
+                                  },
+                                }}
+                              />
+                            ) : null}
+                        </Stack>
+                        {providerWriteControl?.blocker
+                          && !providerWriteControl.providerWritesEffective ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {providerWriteControl.blocker.message}
+                            </Typography>
+                          ) : null}
+                        {providerWritePending ? (
+                          <Typography variant="caption" color="text.secondary">
+                            Saving…
+                          </Typography>
+                        ) : null}
+                      </Box>
 
                       {account.provider === 'shopify'
                         && webhookReceiptHealth

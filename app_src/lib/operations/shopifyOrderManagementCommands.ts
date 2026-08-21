@@ -101,15 +101,12 @@ function exactCurrentSource(target: ShopifyOrderManagementTarget) {
   )
 }
 
-function targetBlocker(target: ShopifyOrderManagementTarget) {
+function targetReadBlocker(target: ShopifyOrderManagementTarget) {
   if (target.accountEnvironment !== 'sandbox') {
     return 'SHOPIFY_ORDER_MANAGEMENT_SANDBOX_ACCOUNT_REQUIRED'
   }
   if (!target.credentialCurrent) {
     return 'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT'
-  }
-  if (target.activationState !== 'shadow' && target.activationState !== 'active') {
-    return 'SHOPIFY_ORDER_MANAGEMENT_ACTIVATION_REQUIRED'
   }
   if (
     target.orderStatus !== 'imported'
@@ -119,6 +116,22 @@ function targetBlocker(target: ShopifyOrderManagementTarget) {
     return 'SHOPIFY_ORDER_MANAGEMENT_UNSTARTED_ORDER_REQUIRED'
   }
   return null
+}
+
+function providerWriteBlocker(target: ShopifyOrderManagementTarget) {
+  if (
+    target.providerWriteRequestedMode !== 'on'
+    || !target.providerWriteBindingCurrent
+    || target.providerWriteControlRowVersion < 1
+    || !target.providerWriteScopeDigest
+  ) {
+    return 'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF'
+  }
+  return null
+}
+
+function targetBlocker(target: ShopifyOrderManagementTarget) {
+  return targetReadBlocker(target) || providerWriteBlocker(target)
 }
 
 function assertReconciliationTarget(
@@ -139,15 +152,22 @@ function assertReconciliationTarget(
   }
 }
 
-function assertRuntimeWriteAuthorized(accountGlobalId: string) {
+function assertProviderWritesEnabled(target: ShopifyOrderManagementTarget) {
+  if (providerWriteBlocker(target)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Turn Provider writes On for this Shopify connection before saving changes',
+      409,
+    )
+  }
+}
+
+function assertLegacyRollingWriteAuthorized(accountGlobalId: string) {
   const runtime = shopifyOrderManagementRuntime()
-  if (
-    !runtime.available
-    || !shopifyOrderManagementAccountAllowed(accountGlobalId)
-  ) {
+  if (!runtime.available || !shopifyOrderManagementAccountAllowed(accountGlobalId)) {
     fail(
       runtime.blockerCode || 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED',
-      'Shopify test-order writes are not enabled for this development account',
+      'The rolling-deploy Shopify write lane is unavailable',
       503,
     )
   }
@@ -439,15 +459,7 @@ export async function readShopifyOrderManagementState(input: {
   orderGlobalId: string
 }) {
   const target = await exactTarget(input)
-  const runtime = shopifyOrderManagementRuntime()
-  const accountAllowed = shopifyOrderManagementAccountAllowed(
-    target.accountGlobalId,
-  )
-  const blockerCode = !runtime.available
-    ? runtime.blockerCode
-    : !accountAllowed
-      ? 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED'
-      : targetBlocker(target)
+  const blockerCode = targetReadBlocker(target)
   if (blockerCode) {
     return publicState({
       target,
@@ -528,7 +540,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
       'The ClawPilot order changed before this action was prepared',
     )
   }
-  assertRuntimeWriteAuthorized(target.accountGlobalId)
+  assertProviderWritesEnabled(target)
   const action = providerAction(input.mutation, input.reason)
   const live = await inspect({
     organizationId: input.organizationId,
@@ -591,6 +603,37 @@ export async function prepareShopifyOrderManagementCommand(input: {
   })
 }
 
+function automaticSaveReason(mutation: ShopifyOrderManagementMutation) {
+  if (mutation.kind === 'add_tag') return 'Saved Shopify order tag in ClawPilot'
+  if (mutation.kind === 'cancel') return 'Saved Shopify order cancellation in ClawPilot'
+  return 'Saved Shopify order line quantity in ClawPilot'
+}
+
+export async function saveShopifyOrderManagementCommand(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  mutation: ShopifyOrderManagementMutation
+  idempotencyKey: string
+}) {
+  const reason = automaticSaveReason(input.mutation)
+  const prepared = await prepareShopifyOrderManagementCommand({
+    ...input,
+    reason,
+  })
+  return executeShopifyOrderManagementCommand({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    authorizationGlobalId: prepared.authorizationGlobalId,
+    intentHash: prepared.intentHash,
+    confirmationStatement: prepared.confirmationStatement,
+    mutation: input.mutation,
+    reason,
+    idempotencyKey: input.idempotencyKey,
+  })
+}
+
 function actionMatchesMutation(
   authorization: ShopifyOrderManagementAuthorization,
   action: ShopifyOrderManagementAction,
@@ -628,7 +671,6 @@ async function localResult(input: {
     organizationId: input.organizationId,
     orderGlobalId: input.authorization.orderGlobalId,
   })
-  const runtime = shopifyOrderManagementRuntime()
   return Object.freeze({
     authorizationGlobalId: input.authorization.authorizationGlobalId,
     attemptGlobalId: input.authorization.providerAttemptGlobalId || '',
@@ -641,8 +683,8 @@ async function localResult(input: {
       target,
       preview: placeholderPreview(target),
       grantedScopes: [],
-      runtimeAvailable: runtime.available,
-      blockerCode: runtime.available ? null : runtime.blockerCode,
+      runtimeAvailable: targetReadBlocker(target) === null,
+      blockerCode: targetBlocker(target),
       authorization: input.authorization,
     }),
   })
@@ -727,11 +769,6 @@ export async function executeShopifyOrderManagementCommand(input: {
       providerReads: 0,
     })
   }
-  // Preparation is intentionally short-lived, but runtime authority remains
-  // revocable. Re-check the development-only flag and exact account allowlist
-  // immediately before creating a durable provider attempt. A prepared row
-  // must never outlive an operator disabling this proving lane.
-  assertRuntimeWriteAuthorized(authorization.accountGlobalId)
   // Resolve and decrypt the exact current credential before committing the
   // provider-attempt row. Once claim succeeds, every adapter return is either
   // a retained terminal result or an explicitly unknown outcome.
@@ -739,14 +776,20 @@ export async function executeShopifyOrderManagementCommand(input: {
     organizationId: input.organizationId,
     orderGlobalId: authorization.orderGlobalId,
   })
+  const legacyRollingAuthorization =
+    authorization.providerWriteControlRowVersion === null
+    && authorization.providerWriteScopeDigest === null
+    && authorization.legacyActivationState !== null
+    && authorization.legacyActivationRevision !== null
+  if (legacyRollingAuthorization) {
+    assertLegacyRollingWriteAuthorized(authorization.accountGlobalId)
+  } else {
+    assertProviderWritesEnabled(target)
+  }
   const credential = await credentialFor({
     organizationId: input.organizationId,
     target,
   })
-  // Keep revocation effective across the credential-resolution window. A
-  // disabled flag or removed exact-account allowlist entry must win before the
-  // transaction creates its immutable provider-attempt row.
-  assertRuntimeWriteAuthorized(authorization.accountGlobalId)
   const claimed = await claimShopifyOrderManagementInPostgres({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,

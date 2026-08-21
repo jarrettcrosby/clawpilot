@@ -58,8 +58,10 @@ function targetFixture(overrides = {}) {
     shopDomain: 'ag-alchemy.myshopify.com',
     credentialGeneration: 3,
     credentialCurrent: true,
-    activationState: 'shadow',
-    activationRevision: 13,
+    providerWriteRequestedMode: 'on',
+    providerWriteControlRowVersion: 8,
+    providerWriteBindingCurrent: true,
+    providerWriteScopeDigest: 'f'.repeat(64),
     orderGlobalId,
     externalOrderId,
     orderNumber: '#6600',
@@ -154,6 +156,7 @@ function authorizationFixture({
   providerWriteCount = 0,
   providerReference = null,
   errorCode = null,
+  authorizationReason = reason,
 } = {}) {
   return {
     authorizationGlobalId,
@@ -164,8 +167,10 @@ function authorizationFixture({
     externalAccountId,
     shopDomain: 'ag-alchemy.myshopify.com',
     credentialGeneration: 3,
-    activationState: 'shadow',
-    activationRevision: 13,
+    legacyActivationState: null,
+    legacyActivationRevision: null,
+    providerWriteControlRowVersion: 8,
+    providerWriteScopeDigest: 'f'.repeat(64),
     orderGlobalId,
     externalOrderId,
     orderNumber: '#6600',
@@ -199,7 +204,7 @@ function authorizationFixture({
           staffNote: action.staffNote,
         })
       : null,
-    authorizationReason: reason,
+    authorizationReason,
     intentHash,
     idempotencyKey,
     requestHash: 'd'.repeat(64),
@@ -403,7 +408,10 @@ function loadCommands() {
             events.push(['prepare-persist', input])
             lastPrepareInput = input
             const action = input.action
-            currentAuthorization = authorizationFixture({ action })
+            currentAuthorization = authorizationFixture({
+              action,
+              authorizationReason: input.reason,
+            })
             return { ...currentAuthorization, replayed: false }
           },
           async readShopifyOrderManagementAuthorizationInPostgres(input) {
@@ -571,8 +579,6 @@ let prepared = await commands.prepareShopifyOrderManagementCommand({
 })
 assert.deepEqual(events.map(([event]) => event), [
   'target-read',
-  'runtime',
-  'account-allowed',
   'credential-read',
   'decrypt',
   'inspect',
@@ -600,14 +606,37 @@ for (const secret of [
   assert.equal(JSON.stringify(prepared).includes(secret), false)
 }
 
-// Runtime and exact-account allowlists reject before credential access or a
-// provider read.
+// Provider writes Off rejects before credential access, inspection, durable
+// intent, or any provider call.
 reset()
+target = targetFixture({
+  providerWriteRequestedMode: 'off',
+  providerWriteControlRowVersion: 9,
+  providerWriteBindingCurrent: false,
+  providerWriteScopeDigest: null,
+})
+await expectCode(commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: { kind: 'add_tag', tag: 'ClawPilot test' },
+  reason,
+  idempotencyKey,
+}), 'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF')
+assert.deepEqual(events.map(([event]) => event), ['target-read'])
+assert.equal(lastPrepareInput, null)
+assert.equal(providerExecutionCount, 0)
+
+// New per-account commands have no dependency on the retired global runtime
+// activation or account allowlist.
+reset()
+accountAllowed = false
 runtime = {
   available: false,
   blockerCode: 'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_DISABLED',
 }
-await expectCode(commands.prepareShopifyOrderManagementCommand({
+prepared = await commands.prepareShopifyOrderManagementCommand({
   organizationId,
   actorEmail,
   orderGlobalId,
@@ -615,22 +644,42 @@ await expectCode(commands.prepareShopifyOrderManagementCommand({
   mutation: { kind: 'add_tag', tag: 'ClawPilot test' },
   reason,
   idempotencyKey,
-}), 'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_DISABLED')
-assert.deepEqual(events.map(([event]) => event), ['target-read', 'runtime'])
-
-reset()
-accountAllowed = false
-await expectCode(commands.prepareShopifyOrderManagementCommand({
-  organizationId,
-  actorEmail,
-  orderGlobalId,
-  expectedRowVersion: 7,
-  mutation: { kind: 'add_tag', tag: 'ClawPilot test' },
-  reason,
-  idempotencyKey,
-}), 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED')
+})
+assert.equal(prepared.providerWrites, 0)
 assert.deepEqual(events.map(([event]) => event), [
-  'target-read', 'runtime', 'account-allowed',
+  'target-read', 'credential-read', 'decrypt', 'inspect', 'prepare-persist',
+])
+
+// The user-facing Save command internally prepares, claims, writes once, and
+// retains the outcome without exposing typed confirmation or a reason field.
+reset()
+adapterExecution = successfulExecution()
+let saved = await commands.saveShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: { kind: 'add_tag', tag: 'ClawPilot test' },
+  idempotencyKey,
+})
+assert.equal(saved.state, 'succeeded')
+assert.equal(saved.providerWrites, 1)
+assert.equal(providerExecutionCount, 1)
+assert.equal(lastPrepareInput.reason, 'Saved Shopify order tag in ClawPilot')
+assert.equal(lastClaimInput.reason, 'Saved Shopify order tag in ClawPilot')
+assert.deepEqual(events.map(([event]) => event), [
+  'target-read',
+  'credential-read',
+  'decrypt',
+  'inspect',
+  'prepare-persist',
+  'authorization-read',
+  'target-read',
+  'credential-read',
+  'decrypt',
+  'claim',
+  'provider-execute',
+  'outcome-record',
 ])
 
 // Destructive controls are offered only when the accepted immutable provider
@@ -697,13 +746,9 @@ adapterExecution = successfulExecution()
 let result = await commands.executeShopifyOrderManagementCommand(commandInput())
 assert.deepEqual(events.map(([event]) => event), [
   'authorization-read',
-  'runtime',
-  'account-allowed',
   'target-read',
   'credential-read',
   'decrypt',
-  'runtime',
-  'account-allowed',
   'claim',
   'provider-execute',
   'outcome-record',
@@ -747,9 +792,8 @@ assert.equal(result.providerReads, 2)
 assert.equal(result.providerWrites, 0)
 assert.equal(lastOutcomeInput.providerWriteCount, 0)
 
-// Runtime authority is revocable after prepare. Disabling the development
-// proving lane leaves the authorization prepared and prevents a claim or
-// provider call. Removing the exact account from the allowlist does the same.
+// Turning this exact account Off after prepare leaves the authorization
+// prepared and prevents credential resolution, claim, or provider call.
 reset()
 await commands.prepareShopifyOrderManagementCommand({
   organizationId,
@@ -762,6 +806,35 @@ await commands.prepareShopifyOrderManagementCommand({
 })
 assert.equal(currentAuthorization.status, 'prepared')
 events = []
+target = targetFixture({
+  providerWriteRequestedMode: 'off',
+  providerWriteControlRowVersion: 9,
+  providerWriteBindingCurrent: false,
+  providerWriteScopeDigest: null,
+})
+await expectCode(
+  commands.executeShopifyOrderManagementCommand(commandInput()),
+  'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+)
+assert.deepEqual(events.map(([event]) => event), [
+  'authorization-read', 'target-read',
+])
+assert.equal(currentAuthorization.status, 'prepared')
+assert.equal(lastClaimInput, null)
+assert.equal(lastOutcomeInput, null)
+assert.equal(providerExecutionCount, 0)
+
+// Only the exact legacy rolling-runtime authorization shape consults the old
+// activation allowlist. New normal commands can never construct this shape.
+reset()
+currentAuthorization = authorizationFixture({})
+currentAuthorization = {
+  ...currentAuthorization,
+  legacyActivationState: 'shadow',
+  legacyActivationRevision: 13,
+  providerWriteControlRowVersion: null,
+  providerWriteScopeDigest: null,
+}
 runtime = {
   available: false,
   blockerCode: 'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_DISABLED',
@@ -771,43 +844,7 @@ await expectCode(
   'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_DISABLED',
 )
 assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'runtime',
-])
-assert.equal(currentAuthorization.status, 'prepared')
-assert.equal(lastClaimInput, null)
-assert.equal(lastOutcomeInput, null)
-assert.equal(providerExecutionCount, 0)
-
-reset()
-currentAuthorization = authorizationFixture()
-accountAllowed = false
-await expectCode(
-  commands.executeShopifyOrderManagementCommand(commandInput()),
-  'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED',
-)
-assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'runtime', 'account-allowed',
-])
-assert.equal(currentAuthorization.status, 'prepared')
-assert.equal(lastClaimInput, null)
-assert.equal(lastOutcomeInput, null)
-assert.equal(providerExecutionCount, 0)
-
-reset()
-currentAuthorization = authorizationFixture()
-revokeAfterCredentialRead = true
-await expectCode(
-  commands.executeShopifyOrderManagementCommand(commandInput()),
-  'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_DISABLED',
-)
-assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read',
-  'runtime',
-  'account-allowed',
-  'target-read',
-  'credential-read',
-  'decrypt',
-  'runtime',
+  'authorization-read', 'target-read', 'runtime',
 ])
 assert.equal(currentAuthorization.status, 'prepared')
 assert.equal(lastClaimInput, null)
@@ -835,7 +872,7 @@ assert.equal(result.state, 'failed')
 assert.equal(result.replayed, true)
 assert.equal(providerExecutionCount, 1)
 assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'target-read', 'runtime',
+  'authorization-read', 'target-read',
 ])
 
 // An unknown provider outcome is persisted once. A repeated execute returns
@@ -862,7 +899,7 @@ assert.equal(result.state, 'unknown')
 assert.equal(result.replayed, true)
 assert.equal(providerExecutionCount, 1)
 assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'target-read', 'runtime',
+  'authorization-read', 'target-read',
 ])
 
 // A duplicate execute or reconcile while the provider-dispatch lease is live
@@ -920,7 +957,7 @@ assert.equal(
 assert.equal(providerExecutionCount, 0)
 assert.equal(lastClaimInput, null)
 assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'recover-processing', 'target-read', 'runtime',
+  'authorization-read', 'recover-processing', 'target-read',
 ])
 
 reset()
@@ -968,7 +1005,7 @@ assert.equal(result.state, 'succeeded')
 assert.equal(result.replayed, true)
 assert.equal(providerExecutionCount, 0)
 assert.deepEqual(events.map(([event]) => event), [
-  'authorization-read', 'target-read', 'runtime',
+  'authorization-read', 'target-read',
 ])
 
 // Reconciliation is an exact-tenant, read-only observation. It records a
@@ -981,6 +1018,12 @@ currentAuthorization = authorizationFixture({
   status: 'unknown',
   providerAttemptGlobalId: attemptGlobalId,
   providerWriteCount: null,
+})
+target = targetFixture({
+  providerWriteRequestedMode: 'off',
+  providerWriteControlRowVersion: 9,
+  providerWriteBindingCurrent: false,
+  providerWriteScopeDigest: null,
 })
 inspection = inspectionFixture(previewFixture({ tags: [tagAction.tag] }))
 result = await commands.reconcileShopifyOrderManagementCommand({
@@ -995,6 +1038,10 @@ assert.equal(lastReconcileInput.authorizationGlobalId, authorizationGlobalId)
 assert.equal(lastReconcileInput.providerAttemptGlobalId, attemptGlobalId)
 assert.equal(lastReconcileInput.resolution, 'applied')
 assert.equal(providerExecutionCount, 0)
+assert.equal(
+  result.management.blockerCode,
+  'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+)
 assert.deepEqual(events.map(([event]) => event), [
   'attempt-read',
   'target-read',
@@ -1014,7 +1061,7 @@ assert.equal(result.state, 'reconciled')
 assert.equal(result.replayed, true)
 assert.equal(providerExecutionCount, 0)
 assert.deepEqual(events.map(([event]) => event), [
-  'attempt-read', 'target-read', 'runtime',
+  'attempt-read', 'target-read',
 ])
 
 // Unknown writes are reconciled only from affirmative provider state. An

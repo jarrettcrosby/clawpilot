@@ -17,7 +17,11 @@ import {
 } from '@/lib/integrations/carrierSandboxLabel'
 import { CARRIER_SANDBOX_RATE_FIXTURE } from '@/lib/integrations/carrierSandboxRate'
 import type { OperationsSandboxLabelCommandResult } from '@/lib/operations/types'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import {
   assertCommerceOrderRevisionExecutionCurrent,
@@ -44,6 +48,7 @@ type OrderRow = QueryResultRow & {
   status: string
   row_version: string
   ship_to: Record<string, unknown>
+  shipment_ship_to_ready: boolean
   activation_state: string
   plan_id: string | null
   warehouse_id: string | null
@@ -345,6 +350,15 @@ async function readShippingContext(
       404,
     )
   }
+  const shipmentShipTo =
+    await readOperationsOrderShipmentAddressInPostgres({
+      organizationId,
+      orderGlobalId: order.global_id,
+      client,
+    })
+  order.ship_to = orderShipToStorageValue(shipmentShipTo.value)
+  order.shipment_ship_to_ready =
+    shipmentShipTo.readiness === 'carrier_ready'
   if (!order.plan_id || !order.warehouse_id) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_PLAN_REQUIRED',
@@ -506,6 +520,13 @@ function assertCreateContext(
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_VERSION_CONFLICT',
       'The order changed. Refresh it before creating a label.',
+      409,
+    )
+  }
+  if (!context.order.shipment_ship_to_ready) {
+    throw new OperationsRequestError(
+      'OPERATIONS_LABEL_SHIP_TO_INCOMPLETE',
+      'Add the missing ship-to details before creating a label.',
       409,
     )
   }

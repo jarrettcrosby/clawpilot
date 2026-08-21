@@ -36,48 +36,51 @@ assert.match(source.section, /import ShopifyOrderManagementPanel from/)
 assert.match(
   source.section,
   /order\.sourceProvider === 'shopify'[\s\S]{0,250}<ShopifyOrderManagementPanel/,
-  'Shopify order detail must mount the real provider-write panel',
+  'Shopify order detail must mount the provider-write panel',
 )
 assert.match(source.section, /orderGlobalId=\{order\.globalId\}/)
 assert.match(source.section, /orderRowVersion=\{order\.rowVersion\}/)
-assert.match(source.section, /canExecute=\{canExecute\}/)
-assert.match(source.section, /canActivate=\{canActivate\}/)
 assert.match(source.section, /onOrderChanged=\{onOrderRevisionChanged\}/)
+assert.doesNotMatch(
+  source.section,
+  /order\.sourceProvider === 'shopify' && activationState !== 'shadow'/,
+  'global Operations Shadow must not hide Shopify read or per-account writes',
+)
+assert.doesNotMatch(
+  source.panel,
+  /canExecute: boolean|canActivate: boolean/,
+  'the order editor contract must require canManage only',
+)
 
-assert.match(source.panel, />Manage in Shopify</)
-assert.match(source.panel, /This panel performs real Shopify provider writes/)
-assert.match(source.panel, /Shopify test flag: FALSE/)
-assert.match(source.panel, /exact order \{management\.order\.name\}/)
-assert.match(source.panel, /\{management\.shopDomain\}/)
-assert.match(source.panel, /\{management\.accountLabel\}/)
-assert.match(source.panel, /Add Shopify tag/)
-assert.match(source.panel, /#6600/)
-assert.match(source.panel, /Decrease Shopify line quantity/)
-assert.match(source.panel, /Cancel Shopify order/)
-assert.match(source.panel, /if \(!canManage \|\| !canExecute \|\| !canActivate\) return/)
-assert.match(source.panel, /Only an organization owner or administrator with activation authority/)
-
-for (const disclosure of [
-  'sends no customer notification',
-  'issues no refund',
-  'does not restock inventory',
-]) {
-  assert.match(
-    source.panel,
-    new RegExp(disclosure),
-    `provider-write review must disclose that it ${disclosure}`,
-  )
-}
+assert.match(source.panel, />Shopify order</)
+assert.match(
+  source.panel,
+  /Edit this order here\. Changes save to Shopify when Provider writes is On\./,
+)
+assert.match(source.panel, /\{state\.accountLabel\} · \{state\.shopDomain\}/)
+assert.match(source.panel, />Tags</)
+assert.match(source.panel, />Line quantities</)
+assert.match(source.panel, />Cancel order</)
+assert.match(source.panel, /if \(!canManage\) return/)
+assert.doesNotMatch(
+  source.panel,
+  /if \(!canManage \|\| !canExecute \|\| !canActivate\)/,
+  'normal order work must require canManage only',
+)
+assert.match(
+  source.panel,
+  /Refunds, restocking, and customer notifications remain separate\./,
+)
 
 assert.match(
   source.panel,
   /fetch\(\s*`\/api\/operations\/shopify-order-management\?\$\{query\.toString\(\)\}`/,
-  'authority must load from the isolated order-management route',
+  'read and refresh must remain available through the isolated route',
 )
 assert.equal(
   (source.panel.match(/fetch\('\/api\/operations\/shopify-order-management'/g) || []).length,
-  3,
-  'prepare, execute, and reconcile must all use the isolated route',
+  2,
+  'save and reconcile must both use the isolated route',
 )
 assert.doesNotMatch(
   source.panel,
@@ -86,107 +89,79 @@ assert.doesNotMatch(
 )
 assert.equal(
   (source.panel.match(/'Idempotency-Key': key/g) || []).length,
-  3,
+  2,
   'every POST must carry an idempotency key',
 )
 assert.match(source.panel, /shopify-order-management:\$\{action\}:\$\{exactId\}:\$\{nonce\}/)
-assert.match(source.panel, /const prepareAttempt = useRef<IdempotencyAttempt \| null>/)
-assert.match(source.panel, /const executeAttempt = useRef<IdempotencyAttempt \| null>/)
+assert.match(source.panel, /const saveAttempt = useRef<IdempotencyAttempt \| null>/)
 assert.match(source.panel, /const reconcileAttempt = useRef<IdempotencyAttempt \| null>/)
 
-for (const prepareField of [
-  "action: 'prepare' as const",
+for (const saveField of [
+  "action: 'save' as const",
   'orderGlobalId,',
-  'expectedRowVersion: requestRowVersion',
+  'expectedRowVersion: state.order.rowVersion',
   'mutation,',
-  'reason: reason.trim()',
 ]) {
-  assert.ok(source.panel.includes(prepareField), `prepare payload is missing ${prepareField}`)
-}
-for (const executionField of [
-  "action: 'execute' as const",
-  'authorizationGlobalId: pending.authorization.authorizationGlobalId',
-  'intentHash: pending.authorization.intentHash',
-  'confirmationStatement: confirmation',
-  'mutation: pending.mutation',
-  'reason: pending.reason',
-]) {
-  assert.ok(source.panel.includes(executionField), `execute payload is missing ${executionField}`)
+  assert.ok(source.panel.includes(saveField), `save payload is missing ${saveField}`)
 }
 assert.match(source.panel, /action: 'reconcile' as const/)
 assert.match(source.panel, /attemptGlobalId: attempt\.attemptGlobalId/)
+assert.match(source.panel, />\s*Save tag\s*</)
+assert.match(source.panel, />\s*Save quantity\s*</)
+assert.match(source.panel, />\s*Cancel Shopify order\s*</)
+assert.match(source.panel, /save\(\{ kind: 'add_tag'/)
+assert.match(source.panel, /save\(\{[\s\S]{0,120}kind: 'set_line_quantity'/)
+assert.match(source.panel, /save\(\{ kind: 'cancel' \}\)/)
 
-for (const exactField of [
-  'authorizationGlobalId',
-  'intentHash',
-  'expiresAt',
-  'confirmationStatement',
-  'providerReads',
-  'providerWrites',
-  'attemptGlobalId',
-  'providerReference',
+for (const retiredCeremony of [
+  /action: 'prepare'/,
+  /action: 'execute'/,
+  /confirmationStatement/,
+  /Type the exact confirmation/,
+  /Authorization reason/,
+  /<Dialog/,
 ]) {
-  assert.match(source.panel, new RegExp(`\\b${exactField}\\b`), `audit UI is missing ${exactField}`)
+  assert.doesNotMatch(
+    source.panel,
+    retiredCeremony,
+    'the normal workflow must not expose prepare/execute confirmation ceremony',
+  )
 }
-assert.match(source.panel, /candidate\.providerWrites !== 0/)
-assert.match(source.panel, /candidate\.providerWrites <= 3/)
-assert.match(source.panel, /candidate\.providerWrites === null/)
-assert.match(source.panel, /providerWrites === null[\s\S]{0,80}\? 'Unknown'/)
-assert.ok(source.panel.includes('const AUTHORIZATION_GLOBAL_ID = /^gsom'))
-assert.ok(source.panel.includes('const ATTEMPT_GLOBAL_ID = /^gsoa'))
-assert.ok(source.panel.includes('const SHA256 = /^[a-f0-9]{64}$/'))
-assert.match(source.panel, /candidate\.authorizationGlobalId !== expectedAuthorizationGlobalId/)
-assert.match(source.panel, /result\.attemptGlobalId !== attempt\.attemptGlobalId/)
-assert.match(source.panel, /result\.state === 'unknown'/)
-
-assert.match(source.panel, /Type the exact confirmation statement/)
-assert.match(
-  source.panel,
-  /confirmation !== pending\.authorization\.confirmationStatement/,
-  'execution must require the server-provided exact statement',
-)
-assert.match(source.panel, />\s*Close without writing\s*</)
-assert.match(source.panel, />\s*Execute exact Shopify write\s*</)
-assert.match(source.panel, /Prepare is read-only/)
 
 assert.match(
   source.panel,
-  /openAttempt\?\.state === 'processing' \|\| openAttempt\?\.state === 'unknown'/,
-  'processing and unknown attempts must block every new preparation',
+  /retainedAttempt[\s\S]{0,220}Resolve it before saving another change/,
+  'processing and unknown attempts must block every new save',
 )
-assert.match(
-  source.panel,
-  /attempt\.state !== 'unknown'/,
-  'reconciliation must fail closed for every state except unknown',
-)
-assert.match(source.panel, /Reconciliation is the only available action/)
-assert.match(source.panel, /attempt\.state !== 'processing' && attempt\.state !== 'unknown'/)
-assert.match(source.panel, /Check provider outcome/)
-assert.match(source.panel, /Reconcile unknown outcome/)
-assert.match(source.panel, /does not authorize a second provider write/)
+assert.match(source.panel, /Reconciliation reads Shopify and never sends a second write\./)
+assert.match(source.panel, /: 'Reconcile outcome'\}/)
+assert.match(source.panel, /No second write was sent\./)
+assert.match(source.panel, /saved\.state === 'unknown'/)
+assert.match(source.panel, /caught instanceof TypeError/)
+assert.match(source.panel, /setAmbiguousSave\(true\)/)
 assert.doesNotMatch(
   source.panel,
   />\s*(?:Retry execute|Execute again|Retry Shopify write)\s*</i,
   'unknown outcomes must not expose an execution retry control',
 )
-assert.doesNotMatch(source.panel, /openAttempt\.(?:tag|mutation|staffNote)/)
 
-assert.match(source.panel, /Disabled: \{value\}/)
-assert.match(source.panel, /management\.eligibility\.addTag\.reason/)
-assert.match(source.panel, /management\.eligibility\.cancel\.reason/)
-assert.match(source.panel, /eligibility\.reason \|\| 'Shopify did not allow this line edit\.'/)
-assert.match(source.panel, /!management\.eligibility\.addTag\.allowed/)
-assert.match(source.panel, /!management\.eligibility\.cancel\.allowed/)
+assert.match(source.panel, /state\.eligibility\.addTag\.reason/)
+assert.match(source.panel, /state\.eligibility\.cancel\.reason/)
+assert.match(source.panel, /eligibility\.reason \|\| 'Shopify does not allow this line edit\.'/)
+assert.match(source.panel, /!state\.eligibility\.addTag\.allowed/)
+assert.match(source.panel, /!state\.eligibility\.cancel\.allowed/)
+assert.match(source.panel, /providerWrites === null/)
+assert.ok(source.panel.includes('const AUTHORIZATION_GLOBAL_ID = /^gsom'))
+assert.ok(source.panel.includes('const ATTEMPT_GLOBAL_ID = /^gsoa'))
+assert.ok(source.panel.includes('const SHA256 = /^[a-f0-9]{64}$/'))
 
-const mobileColumns = source.panel.match(/gridTemplateColumns: \{ xs: 'minmax\(0, 1fr\)'/g) || []
-assert.ok(mobileColumns.length >= 4, 'management layouts must collapse to one safe mobile column')
 assert.ok(
-  (source.panel.match(/minHeight: 44/g) || []).length >= 7,
+  (source.panel.match(/minHeight: 44/g) || []).length >= 5,
   'all provider-write controls must retain mobile touch targets',
 )
 assert.match(source.panel, /direction=\{\{ xs: 'column', sm: 'row' \}\}/)
 assert.match(source.panel, /alignSelf: \{ xs: 'stretch', sm: 'flex-start' \}/)
-assert.match(source.panel, /DialogActions sx=\{\{ flexWrap: 'wrap'/)
+assert.match(source.panel, /gridTemplateColumns: \{[\s\S]{0,100}xs: 'minmax\(0, 1fr\)'/)
 assert.match(source.panel, /overflowWrap: 'anywhere'/)
 assert.ok(
   (source.panel.match(/component="span" sx=\{\{ display: 'block' \}\}/g) || []).length >= 3,
