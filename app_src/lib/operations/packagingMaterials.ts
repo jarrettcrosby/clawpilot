@@ -302,6 +302,8 @@ export function packagingMaterialReadiness(input: {
   }
   dimensionBasis?: PackagingDimensionBasis
   dimensionEvidenceType?: PackagingDimensionEvidenceType
+  dimensionEvidenceReference?: string | null
+  dimensionConfirmedAt?: string | null
   tareWeightGrams?: number | null
   maxWeightGrams?: number | null
   unitCostMinor: number | null
@@ -330,7 +332,12 @@ export function packagingMaterialReadiness(input: {
   }
   if (
     input.dimensionEvidenceType !== undefined
-    && input.dimensionEvidenceType === 'unknown'
+    && (
+      input.dimensionEvidenceType === 'unknown'
+      || !input.dimensionEvidenceReference?.trim()
+      || !input.dimensionConfirmedAt
+      || !Number.isFinite(Date.parse(input.dimensionConfirmedAt))
+    )
   ) {
     missing.push('dimension_evidence')
   }

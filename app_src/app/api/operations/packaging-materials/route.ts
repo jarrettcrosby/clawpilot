@@ -320,12 +320,15 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     500,
   )
   if (
-    ['customer_confirmed', 'measured'].includes(dimensionEvidenceType)
+    (
+      ['customer_confirmed', 'measured'].includes(dimensionEvidenceType)
+      || status === 'active'
+    )
     && dimensionEvidenceReference === null
   ) {
     fail(
       'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
-      'Describe the customer confirmation or measurement evidence',
+      'Describe the retained factual dimension evidence before activation',
       409,
     )
   }

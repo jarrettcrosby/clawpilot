@@ -804,12 +804,15 @@ export default function PackagingMaterialsPanel() {
     setMaterialSubmitted(true)
     if (!materialMeasurementsValid) return
     if (
-      ['customer_confirmed', 'measured'].includes(
-        materialDraft.dimensionEvidenceType,
+      (
+        ['customer_confirmed', 'measured'].includes(
+          materialDraft.dimensionEvidenceType,
+        )
+        || editingMaterial?.status === 'active'
       )
       && !materialDraft.dimensionEvidenceReference.trim()
     ) {
-      setError('Describe the customer confirmation or measurement evidence')
+      setError('Describe the retained factual dimension evidence')
       return
     }
     setBusy(true)
@@ -1725,10 +1728,11 @@ export default function PackagingMaterialsPanel() {
                     ...materialDraft,
                     dimensionEvidenceReference: event.target.value,
                   })}
-                  helperText="Required for customer-confirmed or measured facts"
-                  required={['customer_confirmed', 'measured'].includes(
-                    materialDraft.dimensionEvidenceType,
-                  )}
+                  helperText="Required before activation for every evidence source"
+                  required={editingMaterial?.status === 'active'
+                    || ['customer_confirmed', 'measured'].includes(
+                      materialDraft.dimensionEvidenceType,
+                    )}
                 />
               </Box>
               <Box
