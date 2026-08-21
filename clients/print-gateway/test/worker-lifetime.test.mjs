@@ -1381,7 +1381,8 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
       documentGlobalId: 'gpf0000021',
       zpl: '^XA^FO20,20^FDOrganization A only^FS^XZ',
       claims: 0,
-      acknowledgements: 0,
+      acknowledgementRequests: 0,
+      acknowledgementIdempotencyKeys: new Set(),
       revoked: false,
     },
     {
@@ -1396,7 +1397,8 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
       documentGlobalId: 'gpf0000022',
       zpl: '^XA^FO20,20^FDOrganization B only^FS^XZ',
       claims: 0,
-      acknowledgements: 0,
+      acknowledgementRequests: 0,
+      acknowledgementIdempotencyKeys: new Set(),
       revoked: false,
     },
   ]
@@ -1418,7 +1420,7 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       if (body.action === 'claim') {
         organization.claims += 1
-        const jobs = organization.acknowledgements > 0 ? [] : [{
+        const jobs = organization.acknowledgementIdempotencyKeys.size > 0 ? [] : [{
           globalId: organization.jobGlobalId,
           claimToken: organization.claimToken,
           serverNow: new Date().toISOString(),
@@ -1449,9 +1451,22 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
         response.end(JSON.stringify({ ok: false, code: 'CROSS_ORGANIZATION_REQUEST' }))
         return
       }
-      organization.acknowledgements += 1
+      organization.acknowledgementRequests += 1
+      const acknowledgementIdempotencyKey = String(
+        request.headers['idempotency-key'] || '',
+      )
+      assert.equal(
+        acknowledgementIdempotencyKey,
+        `ack:${organization.jobGlobalId}:${organization.claimToken}`,
+      )
+      organization.acknowledgementIdempotencyKeys.add(
+        acknowledgementIdempotencyKey,
+      )
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ ok: true }))
+      response.end(JSON.stringify({
+        ok: true,
+        replayed: organization.acknowledgementRequests > 1,
+      }))
     })
   })
   api.listen(0, '127.0.0.1')
@@ -1504,13 +1519,24 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
   try {
     firstGeneration.startEnabled()
     await waitFor(
-      () => organizations.every((organization) => organization.acknowledgements === 1),
+      () => organizations.every(
+        (organization) => organization.acknowledgementIdempotencyKeys.size === 1,
+      ),
       'Both organization-scoped workers did not acknowledge their exact jobs',
     )
     await waitFor(() => printerPayloads.length === 2, 'Shared printer did not finish both jobs')
     assert.deepEqual([...printerPayloads].sort(), organizations.map(({ zpl }) => zpl).sort())
     assert.equal(crossOrganizationRequests, 0)
-    assert.deepEqual(organizations.map(({ acknowledgements }) => acknowledgements), [1, 1])
+    assert.deepEqual(
+      organizations.map(({ acknowledgementIdempotencyKeys }) => (
+        acknowledgementIdempotencyKeys.size
+      )),
+      [1, 1],
+    )
+    assert.equal(
+      organizations.every(({ acknowledgementRequests }) => acknowledgementRequests >= 1),
+      true,
+    )
     await Promise.all(instances.map((instance) => firstGeneration.stopAndWait(instance.id, 10_000)))
 
     const priorClaimCounts = organizations.map(({ claims }) => claims)
@@ -1528,7 +1554,12 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
       )),
       'Overlapping supervisor did not fail closed for both organization instances',
     )
-    assert.deepEqual(organizations.map(({ acknowledgements }) => acknowledgements), [1, 1])
+    assert.deepEqual(
+      organizations.map(({ acknowledgementIdempotencyKeys }) => (
+        acknowledgementIdempotencyKeys.size
+      )),
+      [1, 1],
+    )
     assert.equal(printerPayloads.length, 2)
     overlappingSupervisor.shutdown()
     await Promise.all(instances.map((instance) => restartedGeneration.stopAndWait(instance.id, 10_000)))
@@ -1556,8 +1587,12 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
       'Removing and revoking the first organization blocked the surviving organization',
     )
     await survivorGeneration.stopAndWait(instances[1].id, 10_000)
-    assert.equal(organizations[0].acknowledgements, 1)
-    assert.equal(organizations[1].acknowledgements, 1)
+    assert.equal(organizations[0].acknowledgementIdempotencyKeys.size, 1)
+    assert.equal(organizations[1].acknowledgementIdempotencyKeys.size, 1)
+    assert.equal(
+      organizations.every(({ acknowledgementRequests }) => acknowledgementRequests >= 1),
+      true,
+    )
     assert.equal(printerPayloads.length, 2)
     assert.equal(crossOrganizationRequests, 0)
     assert.equal(readFileSync(path.join(secondDirectory, 'claim-ledger.json')).equals(secondLedgerBefore), true)
