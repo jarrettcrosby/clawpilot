@@ -109,6 +109,7 @@ import {
 } from '@/lib/persistence/shopifyOrderWebhookSignals'
 import {
   claimShopifyOrderWebhookReconciliationInPostgres,
+  failShopifyOrderWebhookPreDispatchInPostgres,
   finalizeShopifyOrderWebhookReconciliationInPostgres,
   markStaleShopifyOrderWebhookAttemptUnknownInPostgres,
   prepareShopifyOrderWebhookReconciliationInPostgres,
@@ -1728,6 +1729,21 @@ function orderWebhookResultSnapshot(input: {
   }
 }
 
+const SHOPIFY_ORDER_WEBHOOK_AMBIGUOUS_PREFLIGHT_CODES = new Set([
+  'SHOPIFY_RATE_LIMITED',
+  'SHOPIFY_TIMEOUT',
+  'SHOPIFY_UNAVAILABLE',
+  'SHOPIFY_UPSTREAM_FAILED',
+])
+
+function ambiguousShopifyOrderWebhookPreDispatch(error: unknown) {
+  return error instanceof ShopifyCommerceClientError
+    && (
+      error.retryable
+      || SHOPIFY_ORDER_WEBHOOK_AMBIGUOUS_PREFLIGHT_CODES.has(error.code)
+    )
+}
+
 export async function recoverShopifyOrderWebhookCommandKey(input: {
   organizationId: unknown
   accountGlobalId: unknown
@@ -1871,53 +1887,76 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
       ? command.callbackUri
       : desiredUri
 
-    const stored = decryptStoredCredential(runtime)
-    if (stored.provider !== 'shopify') {
-      throw new Error('Stored commerce credential could not be decrypted')
-    }
-    const grant = await requestShopifyAccessToken({
-      shopDomain,
-      clientId: stored.clientId,
-      clientSecret: stored.clientSecret,
-    })
-    const providerCredential = {
-      shopDomain,
-      accessToken: grant.accessToken,
-    }
-    const probe = await probeShopifyConnection(providerCredential)
-    if (
-      probe.shopId !== runtime.externalAccountId
-      || probe.shopDomain !== shopDomain
-    ) {
-      throw new CommerceIntegrationRequestError(
-        'Shopify returned a different verified store identity or canonical domain',
-        409,
-        'SHOPIFY_ORDER_WEBHOOK_STORE_DRIFT',
-      )
-    }
-    if (
-      !grant.grantedScopes.includes('read_orders')
-      || !probe.grantedScopes.includes('read_orders')
-    ) {
-      throw new CommerceIntegrationRequestError(
-        'Shopify read_orders access is required for minimized order webhooks',
-        409,
-        'SHOPIFY_ORDER_WEBHOOK_SCOPE_REQUIRED',
-      )
-    }
-
-    const readiness = await discoverShopifyOrderWebhookSubscriptions(
-      providerCredential,
-      { desiredUri: recoveryDesiredUri },
-    )
-    const recovery = decideShopifyOrderWebhookRecovery(
-      command.status === 'recoverable'
-        ? 'recoverable'
-        : command.status === 'unknown'
-          ? 'unknown'
-          : 'prepared',
-      readiness,
-    )
+    const preflight = await (async () => {
+      try {
+        const stored = decryptStoredCredential(runtime)
+        if (stored.provider !== 'shopify') {
+          throw new Error('Stored commerce credential could not be decrypted')
+        }
+        const grant = await requestShopifyAccessToken({
+          shopDomain,
+          clientId: stored.clientId,
+          clientSecret: stored.clientSecret,
+        })
+        const providerCredential = {
+          shopDomain,
+          accessToken: grant.accessToken,
+        }
+        const probe = await probeShopifyConnection(providerCredential)
+        if (
+          probe.shopId !== runtime.externalAccountId
+          || probe.shopDomain !== shopDomain
+        ) {
+          throw new CommerceIntegrationRequestError(
+            'Shopify returned a different verified store identity or canonical domain',
+            409,
+            'SHOPIFY_ORDER_WEBHOOK_STORE_DRIFT',
+          )
+        }
+        if (
+          !grant.grantedScopes.includes('read_orders')
+          || !probe.grantedScopes.includes('read_orders')
+        ) {
+          throw new CommerceIntegrationRequestError(
+            'Shopify read_orders access is required for minimized order webhooks',
+            409,
+            'SHOPIFY_ORDER_WEBHOOK_SCOPE_REQUIRED',
+          )
+        }
+        const readiness = await discoverShopifyOrderWebhookSubscriptions(
+          providerCredential,
+          { desiredUri: recoveryDesiredUri },
+        )
+        const recovery = decideShopifyOrderWebhookRecovery(
+          command.status === 'recoverable'
+            ? 'recoverable'
+            : command.status === 'unknown'
+              ? 'unknown'
+              : 'prepared',
+          readiness,
+        )
+        return { providerCredential, readiness, recovery }
+      } catch (error) {
+        const sanitized = sanitize(error)
+        if (
+          (command.status === 'prepared' || command.status === 'recoverable')
+          && !ambiguousShopifyOrderWebhookPreDispatch(error)
+        ) {
+          try {
+            await failShopifyOrderWebhookPreDispatchInPostgres({
+              organizationId: runtime.organizationId,
+              commandId: command.commandId,
+              actorEmail: input.actorEmail,
+              errorCode: sanitized.code,
+            })
+          } catch {
+            // Preserve the exact provider/preflight rejection for the caller.
+          }
+        }
+        throw sanitized
+      }
+    })()
+    const { providerCredential, readiness, recovery } = preflight
     if (recovery.action === 'manual_review') {
       throw new CommerceIntegrationRequestError(
         'The prior Shopify mutation response is ambiguous and read-only discovery is not ready; ClawPilot will issue zero residual provider writes until manual review or exact readiness is observed',

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createHash, webcrypto } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
@@ -11,6 +12,10 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const ts = requireFromApp('typescript')
+
+function sha(value) {
+  return createHash('sha256').update(String(value)).digest('hex')
+}
 
 function loadTypeScriptModule(path, mocks = {}) {
   const output = ts.transpileModule(readFileSync(resolve(root, path), 'utf8'), {
@@ -35,8 +40,10 @@ function loadTypeScriptModule(path, mocks = {}) {
     RegExp,
     Set,
     String,
+    TextEncoder,
     URL,
     console,
+    crypto: webcrypto,
     exports: loaded.exports,
     module: loaded,
     process,
@@ -102,12 +109,15 @@ assert.match(
   /SHOPIFY_ORDER_WEBHOOK_CALLBACK_DRIFT_RESTART_REQUIRED/u,
 )
 assert.match(integration, /markStaleShopifyOrderWebhookAttemptUnknownInPostgres/u)
+assert.match(integration, /failShopifyOrderWebhookPreDispatchInPostgres/u)
+assert.match(integration, /ambiguousShopifyOrderWebhookPreDispatch/u)
 assert.match(integration, /revalidated\.credentialVersion !== runtime\.credentialVersion/u)
 assert.match(integration, /probe\.shopId !== runtime\.externalAccountId/u)
 assert.match(integration, /grant\.grantedScopes\.includes\('read_orders'\)/u)
 assert.match(integration, /probe\.grantedScopes\.includes\('read_orders'\)/u)
 assert.match(persistence, /operations_shopify_order_webhook_attempts/u)
 assert.match(persistence, /operations_shopify_order_webhook_outcomes/u)
+assert.match(persistence, /status = 'failed'/u)
 assert.match(integration, /read-only discovery/u)
 assert.match(migration, /attempts are immutable/u)
 assert.match(migration, /outcomes are immutable/u)
@@ -185,11 +195,21 @@ assert.equal(recovery.clearShopifyOrderWebhookRecoveryDraft({
 const exactRecoveryIdentity = {
   ...recoveryIdentity,
   credentialGeneration: 3,
+  idempotencyKeyHash: sha('order-webhooks-current-03030001'),
   callbackUri: (
     'https://development.clawpilot.test/api/integrations/commerce/'
     + `shopify/webhooks/${recoveryIdentity.accountGlobalId}`
   ),
 }
+assert.equal(
+  await recovery.shopifyOrderWebhookRecoveryKeyHash(
+    'order-webhooks-current-03030001',
+  ),
+  exactRecoveryIdentity.idempotencyKeyHash,
+  'the browser must bind the exact stable key without exposing it in state',
+)
+const exactCompletedAt = new Date(Date.now() - 2_000).toISOString()
+const exactObservedAt = new Date(Date.now() - 1_000).toISOString()
 const exactRecoveryPayload = {
   ok: true,
   integrations: {
@@ -222,8 +242,16 @@ const exactRecoveryPayload = {
           discoveryState: 'succeeded',
           discoveryErrorCode: null,
           providerWrites: 0,
-          observedAt: new Date().toISOString(),
+          observedAt: exactObservedAt,
           ready: true,
+        },
+        orderWebhookReconciliation: {
+          commandId: '03030000-0000-4000-8000-000000000088',
+          status: 'succeeded',
+          idempotencyKeyHash: exactRecoveryIdentity.idempotencyKeyHash,
+          requestHash: sha('exact-order-webhook-command'),
+          providerWriteCount: 7,
+          completedAt: exactCompletedAt,
         },
       },
     }],
@@ -249,6 +277,10 @@ for (const [label, mutate] of [
   ['seven-topic profile', (payload) => {
     payload.integrations.accounts[0].configuration
       .orderWebhookSubscriptions.requiredTopics.pop()
+  }],
+  ['terminal command key', (payload) => {
+    payload.integrations.accounts[0].configuration
+      .orderWebhookReconciliation.idempotencyKeyHash = sha('prior-command')
   }],
 ]) {
   const changed = JSON.parse(JSON.stringify(exactRecoveryPayload))
@@ -295,6 +327,36 @@ const lostResponseRecovered = await controller({
 }, exactRecoveryPayload)
 assert.equal(lostResponseRecovered.disposition, 'succeeded')
 assert.equal(refreshCalls, 2)
+const stalePriorProjection = JSON.parse(JSON.stringify(exactRecoveryPayload))
+const staleObservedAt = new Date(
+  Date.now() - 23 * 60 * 60 * 1_000,
+).toISOString()
+stalePriorProjection.integrations.accounts[0].configuration
+  .orderWebhookSubscriptions.observedAt = staleObservedAt
+stalePriorProjection.integrations.accounts[0].configuration
+  .orderWebhookReconciliation = {
+    commandId: '03030000-0000-4000-8000-000000000077',
+    status: 'succeeded',
+    idempotencyKeyHash: sha('order-webhooks-prior-03030001'),
+    requestHash: sha('prior-order-webhook-command'),
+    providerWriteCount: 7,
+    completedAt: new Date(
+      Date.now() - 23 * 60 * 60 * 1_000 - 1_000,
+    ).toISOString(),
+  }
+const lostResponseWithStalePriorProjection = await controller({
+  status: null,
+  code: null,
+  message: 'connection reset while a new command remains open',
+  payload: null,
+  transportError: true,
+  malformed: false,
+}, stalePriorProjection)
+assert.equal(
+  lostResponseWithStalePriorProjection.disposition,
+  'retain',
+  'a 23-hour prior success must not clear a new command recovery key',
+)
 for (const patch of [
   {
     status: 503,
@@ -354,6 +416,19 @@ assert.equal(
   'rejected',
   'a definitive non-applied 4xx must require review even if prior state is ready',
 )
+const invalidPreflightWithPreviouslyReadyProjection = await controller({
+  status: 502,
+  code: 'SHOPIFY_PROBE_INVALID',
+  message: 'Shopify returned malformed read-only identity evidence.',
+  payload: { ok: false },
+  transportError: false,
+  malformed: false,
+}, exactRecoveryPayload)
+assert.equal(
+  invalidPreflightWithPreviouslyReadyProjection.disposition,
+  'rejected',
+  'a definitive terminal preflight response must release its browser key',
+)
 const partialWithPreviouslyReadyProjection = await controller({
   status: 422,
   code: 'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED',
@@ -369,6 +444,7 @@ assert.equal(
 )
 assert.match(ui, /resolveShopifyOrderWebhookRecovery/u)
 assert.match(ui, /isShopifyOrderWebhookRecoveryKey/u)
+assert.match(ui, /shopifyOrderWebhookRecoveryKeyHash/u)
 assert.match(ui, /recovery\.recoveryIdempotencyKey/u)
 assert.match(ui, /outcome\.disposition === 'retain'/u)
 assert.match(ui, /The rejected command was released/u)

@@ -68,6 +68,7 @@ import {
   loadShopifyOrderWebhookRecoveryDraft,
   resolveShopifyOrderWebhookRecovery,
   saveShopifyOrderWebhookRecoveryDraft,
+  shopifyOrderWebhookRecoveryKeyHash,
 } from '@/lib/integrations/shopifyOrderWebhookRecovery'
 
 type CommerceProvider = 'shopify' | 'faire'
@@ -1211,6 +1212,14 @@ export default function CommerceIntegrationPanel({
     const stableKey = draft.idempotencyKey
       || recoveredKey
       || crypto.randomUUID()
+    const stableKeyHash = await shopifyOrderWebhookRecoveryKeyHash(stableKey)
+    if (!stableKeyHash) {
+      finishPending()
+      setError(
+        'ClawPilot could not bind the safe retry key to this browser; order webhooks were not changed.',
+      )
+      return
+    }
     let recoveryStorage: Storage
     try {
       recoveryStorage = window.sessionStorage
@@ -1247,6 +1256,7 @@ export default function CommerceIntegrationPanel({
       accountGlobalId: account.globalId,
       credentialGeneration: account.credentialVersion,
       callbackUri: account.webhookUrl,
+      idempotencyKeyHash: stableKeyHash,
     }
     setPendingAction(`reconcile-order-webhooks:${account.globalId}`)
     setError('')

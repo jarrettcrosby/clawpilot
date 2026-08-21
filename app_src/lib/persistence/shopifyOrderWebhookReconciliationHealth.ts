@@ -330,4 +330,51 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
     LEFT JOIN pg_catalog.pg_namespace installed_namespace
       ON installed_namespace.oid = installed_table.relnamespace
   )
+  AND (
+    SELECT encode(
+      digest(
+        convert_to(
+          string_agg(
+            concat_ws(
+              '|',
+              complete_namespace.nspname,
+              complete_table.relname,
+              complete_trigger.tgname,
+              complete_trigger.tgenabled,
+              complete_trigger.tgtype::text,
+              complete_trigger.tgisinternal::text,
+              complete_trigger.tgparentid::text,
+              complete_trigger.tgfoid::regprocedure::text,
+              COALESCE(pg_catalog.pg_get_expr(
+                complete_trigger.tgqual,
+                complete_trigger.tgrelid
+              ), ''),
+              pg_catalog.pg_get_triggerdef(complete_trigger.oid, false)
+            ),
+            chr(10) ORDER BY
+              complete_table.relname,
+              complete_trigger.tgname
+          ),
+          'UTF8'
+        ),
+        'sha256'
+      ),
+      'hex'
+    )
+    FROM pg_catalog.pg_trigger complete_trigger
+    JOIN pg_catalog.pg_class complete_table
+      ON complete_table.oid = complete_trigger.tgrelid
+    JOIN pg_catalog.pg_namespace complete_namespace
+      ON complete_namespace.oid = complete_table.relnamespace
+    WHERE complete_namespace.nspname = 'public'
+      AND NOT complete_trigger.tgisinternal
+      AND complete_table.relname IN (
+        'operations_shopify_order_webhook_commands',
+        'operations_shopify_order_webhook_attempts',
+        'operations_shopify_order_webhook_outcomes',
+        'operations_integration_accounts',
+        'operations_commerce_credentials',
+        'app_user_organization_memberships'
+      )
+  ) = '0ebf3a87d12028aff7bf8252f3c82d3565e654879311f8c427eefd7d5d88c39a'
 `

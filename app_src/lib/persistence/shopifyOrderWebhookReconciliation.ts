@@ -468,6 +468,79 @@ export async function prepareShopifyOrderWebhookReconciliationInPostgres(
 }
 
 /**
+ * Close an exact command when a read-only provider preflight produced a
+ * definitive rejection before a provider mutation attempt was claimed. The
+ * prior error code remains the durable terminal reason and the one-open fence
+ * is released so credentials or account setup can be repaired.
+ */
+export async function failShopifyOrderWebhookPreDispatchInPostgres(raw: {
+  organizationId: unknown
+  commandId: unknown
+  actorEmail: unknown
+  errorCode: unknown
+}) {
+  const organizationId = exactText(raw.organizationId, 'Organization', UUID, 64)
+  const commandId = exactText(raw.commandId, 'Command', UUID, 64)
+  const authorizedBy = actorEmail(raw.actorEmail)
+  const errorCode = exactText(
+    raw.errorCode,
+    'Error code',
+    /^[A-Z][A-Z0-9_]{2,127}$/u,
+    128,
+  )
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-webhook-claim:${organizationId}:${commandId}`,
+    )
+    const commandResult = await client.query<CommandRow>(
+      `${COMMAND_SELECT}
+       WHERE command.organization_id = $1::uuid
+         AND command.id = $2::uuid
+       LIMIT 1
+       FOR UPDATE OF command`,
+      [organizationId, commandId],
+    )
+    const command = commandResult.rows[0]
+    if (!command) {
+      fail(
+        'SHOPIFY_ORDER_WEBHOOK_COMMAND_NOT_FOUND',
+        'Shopify webhook command was not found',
+        404,
+      )
+    }
+    if (command.status === 'failed') return commandState(command, true)
+    if (command.status !== 'prepared' && command.status !== 'recoverable') {
+      return commandState(command, true)
+    }
+    const current = await binding(client, {
+      organizationId: command.organization_id,
+      accountGlobalId: command.integration_account_global_id,
+      actorEmail: authorizedBy,
+      lock: true,
+    })
+    assertExpectedBinding(current, {
+      integrationAccountId: command.integration_account_id,
+      credentialGeneration: command.credential_generation,
+      externalAccountId: command.external_account_id,
+      shopDomain: command.shop_domain,
+    })
+    const failed = await client.query<CommandRow>(
+      `UPDATE public.operations_shopify_order_webhook_commands
+       SET status = 'failed',
+           completed_at = statement_timestamp(),
+           error_code = $3,
+           updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       RETURNING *, NULL::jsonb AS result_snapshot,
+         NULL::text AS outcome_state`,
+      [organizationId, commandId, errorCode],
+    )
+    return commandState(failed.rows[0], false)
+  })
+}
+
+/**
  * Read-only recovery of the one durable open-command key. The caller must be
  * a current owner/admin on the exact active, verified Shopify binding. This
  * lets a remounted tab or successor administrator resume the existing command
@@ -787,6 +860,10 @@ export async function finalizeShopifyOrderWebhookReconciliationInPostgres(input:
       const summary = {
         commandId: command.id,
         status: input.outcome,
+        idempotencyKeyHash: createHash('sha256')
+          .update(command.idempotency_key)
+          .digest('hex'),
+        requestHash: command.request_hash,
         providerWriteCount: input.providerWriteCount,
         completedAt,
       }

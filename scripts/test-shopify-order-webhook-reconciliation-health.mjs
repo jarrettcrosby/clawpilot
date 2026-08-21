@@ -54,6 +54,9 @@ for (const exactCatalogEvidence of [
   'installed_trigger.tgqual',
   'installed_trigger.tgfoid =',
   'pg_get_triggerdef',
+  'complete_trigger.tgname',
+  'complete_trigger.tgisinternal',
+  'complete_trigger.tgfoid::regprocedure',
 ]) assert.match(health, new RegExp(
   exactCatalogEvidence.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'),
   'u',

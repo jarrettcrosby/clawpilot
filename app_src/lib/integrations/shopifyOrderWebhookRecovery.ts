@@ -23,6 +23,7 @@ export type ShopifyOrderWebhookRecoveryIdentity = Readonly<{
   accountGlobalId: string
   credentialGeneration: number
   callbackUri: string
+  idempotencyKeyHash: string
 }>
 
 export type ShopifyOrderWebhookRecoveryHttpResult = Readonly<{
@@ -47,9 +48,30 @@ const ORGANIZATION_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
+const UUID =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u
+const SHA256 = /^[a-f0-9]{64}$/u
 
-export function isShopifyOrderWebhookRecoveryKey(value: unknown) {
+export function isShopifyOrderWebhookRecoveryKey(
+  value: unknown,
+): value is string {
   return typeof value === 'string' && IDEMPOTENCY_KEY.test(value)
+}
+
+export async function shopifyOrderWebhookRecoveryKeyHash(value: unknown) {
+  if (!isShopifyOrderWebhookRecoveryKey(value)) return null
+  try {
+    const subtle = globalThis.crypto?.subtle
+    if (!subtle) return null
+    const digest = await subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(value),
+    )
+    return Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
 }
 
 function storageKey(organizationId: string, accountGlobalId: string) {
@@ -192,14 +214,38 @@ export function hasExactShopifyOrderWebhookRecoveryReadiness(
   if (!readiness || typeof readiness !== 'object' || Array.isArray(readiness)) {
     return false
   }
+  const reconciliation = (configuration as Record<string, unknown>)
+    .orderWebhookReconciliation
+  if (
+    !reconciliation
+    || typeof reconciliation !== 'object'
+    || Array.isArray(reconciliation)
+  ) return false
   const state = readiness as Record<string, unknown>
+  const summary = reconciliation as Record<string, unknown>
   const observedAt = typeof state.observedAt === 'string'
     ? Date.parse(state.observedAt)
+    : Number.NaN
+  const completedAt = typeof summary.completedAt === 'string'
+    ? Date.parse(summary.completedAt)
     : Number.NaN
   const evidenceIsCurrent = Number.isFinite(observedAt)
     && observedAt >= Date.now() - 24 * 60 * 60 * 1_000
     && observedAt <= Date.now() + 5 * 60 * 1_000
-  return state.accountGlobalId === identity.accountGlobalId
+  const exactTerminalCommand = UUID.test(String(summary.commandId || ''))
+    && (summary.status === 'succeeded' || summary.status === 'reconciled')
+    && summary.idempotencyKeyHash === identity.idempotencyKeyHash
+    && SHA256.test(identity.idempotencyKeyHash)
+    && SHA256.test(String(summary.requestHash || ''))
+    && Number.isInteger(summary.providerWriteCount)
+    && Number(summary.providerWriteCount) >= 0
+    && Number(summary.providerWriteCount) <= 7
+    && Number.isFinite(completedAt)
+    && completedAt <= observedAt + 5 * 60 * 1_000
+    && completedAt >= Date.now() - 24 * 60 * 60 * 1_000
+    && completedAt <= Date.now() + 5 * 60 * 1_000
+  return exactTerminalCommand
+    && state.accountGlobalId === identity.accountGlobalId
     && state.credentialGeneration === identity.credentialGeneration
     && state.desiredUri === identity.callbackUri
     && exactStringArray(
@@ -231,11 +277,20 @@ const RETAINED_CODES = new Set([
   'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED',
 ])
 
+const DEFINITIVE_PREFLIGHT_CODES = new Set([
+  'COMMERCE_CREDENTIAL_INVALID',
+  'SHOPIFY_ORDER_WEBHOOK_DISCOVERY_INVALID',
+  'SHOPIFY_PROBE_INVALID',
+  'SHOPIFY_RESPONSE_INVALID',
+  'SHOPIFY_TOKEN_RESPONSE_INVALID',
+])
+
 export function shouldRetainShopifyOrderWebhookRecoveryKey(
   result: ShopifyOrderWebhookRecoveryHttpResult,
 ) {
   if (result.transportError || result.malformed) return true
   if (result.code && RETAINED_CODES.has(result.code)) return true
+  if (result.code && DEFINITIVE_PREFLIGHT_CODES.has(result.code)) return false
   return result.status === 408
     || result.status === 425
     || result.status === 429
