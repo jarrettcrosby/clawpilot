@@ -228,8 +228,8 @@ assert.doesNotMatch(
 )
 assert.match(
   panel,
-  /const packDisposition = retainedPackReceiptDisposition\(state, packCommand\)[\s\S]*?if \(packDisposition !== 'pending'\) \{[\s\S]*?clearPackCommand\(\)/,
-  'Mount/status reconciliation must automatically retire K1 only after terminal receipt proof',
+  /if \(state\?\.orderGlobalId !== orderGlobalId\) return[\s\S]*?const packDisposition = retainedPackReceiptDisposition\([\s\S]*?state,[\s\S]*?packCommand,[\s\S]*?orderGlobalId,[\s\S]*?\)[\s\S]*?if \(packDisposition !== 'pending'\) \{[\s\S]*?clearPackCommand\(\)/,
+  'Mount/status reconciliation must bind state and command to the current prop before retiring K1',
 )
 assert.match(projection, /standalone_one_off_pack_eligible/)
 assert.match(projection, /source_order\.status = 'planned'/)
@@ -384,12 +384,20 @@ const firstMountK1 = recovery.readShippingOneOffRetainedCommand(
 )
 assert.deepEqual(JSON.parse(JSON.stringify(firstMountK1)), retainedPack)
 assert.equal(
-  panelModule.retainedPackReceiptDisposition(null, firstMountK1),
+  panelModule.retainedPackReceiptDisposition(
+    null,
+    firstMountK1,
+    'gor0000001',
+  ),
   'pending',
   'Mount before an authoritative GET must preserve ambiguous K1',
 )
 assert.equal(
-  panelModule.retainedPackReceiptDisposition(plannedPackState, firstMountK1),
+  panelModule.retainedPackReceiptDisposition(
+    plannedPackState,
+    firstMountK1,
+    'gor0000001',
+  ),
   'pending',
   'A nonterminal same-order state must preserve ambiguous K1',
 )
@@ -403,7 +411,11 @@ const remountedK1 = recovery.readShippingOneOffRetainedCommand(
 assert.deepEqual(JSON.parse(JSON.stringify(remountedK1)), retainedPack)
 assert.equal(remountedK1.body, retainedPack.body)
 assert.equal(
-  panelModule.retainedPackReceiptDisposition(exactK1PackState, remountedK1),
+  panelModule.retainedPackReceiptDisposition(
+    exactK1PackState,
+    remountedK1,
+    'gor0000001',
+  ),
   'exact',
   'The original immutable K1 receipt remains an exact durable success',
 )
@@ -420,6 +432,7 @@ assert.equal(
       },
     },
     remountedK1,
+    'gor0000001',
   ),
   'pending',
   'A same-key receipt with mismatched evidence cannot retire K1',
@@ -428,6 +441,7 @@ assert.equal(
   panelModule.retainedPackReceiptDisposition(
     { ...terminalCompetingPackState, orderGlobalId: 'gor0000002' },
     remountedK1,
+    'gor0000001',
   ),
   'pending',
   'A different-order terminal receipt cannot retire K1',
@@ -436,6 +450,7 @@ assert.equal(
   panelModule.retainedPackReceiptDisposition(
     terminalCompetingPackState,
     remountedK1,
+    'gor0000001',
   ),
   'superseded',
   'An immutable same-order terminal K2 receipt may retire ambiguous K1',
@@ -458,6 +473,87 @@ assert.equal(
   null,
   'Remount after exact terminal K2 proof must not restore retired K1',
 )
+
+const propSwitchOrderGlobalId = 'gor0000002'
+const propSwitchStorageKey = 'pack-storage-b'
+const retainedPackB = {
+  key: 'shipping-one-off-pack:gor0000002:stable-request-b',
+  body: JSON.stringify({
+    action: 'confirm-pack',
+    orderGlobalId: propSwitchOrderGlobalId,
+    expectedRowVersion: 3,
+    expectedReviewSnapshotHash: evidenceHashB,
+  }),
+}
+assert.equal(
+  recovery.writeShippingOneOffRetainedCommand(
+    storage,
+    propSwitchStorageKey,
+    retainedPackB,
+  ),
+  true,
+)
+const propSwitchBBytes = storageValues.get(propSwitchStorageKey)
+let propSwitchNotice = ''
+const staleADispositionForB = panelModule.retainedPackReceiptDisposition(
+  terminalCompetingPackState,
+  remountedK1,
+  propSwitchOrderGlobalId,
+)
+if (staleADispositionForB !== 'pending') {
+  recovery.writeShippingOneOffRetainedCommand(
+    storage,
+    propSwitchStorageKey,
+    null,
+  )
+  if (staleADispositionForB === 'superseded') {
+    propSwitchNotice = 'Another immutable physical pack receipt completed this order.'
+  }
+}
+assert.equal(staleADispositionForB, 'pending')
+assert.equal(
+  storageValues.get(propSwitchStorageKey),
+  propSwitchBBytes,
+  'An A terminal-state effect flush must preserve the exact retained B K1 bytes',
+)
+assert.equal(
+  propSwitchNotice,
+  '',
+  'An A terminal-state effect flush must not show an A receipt notice on B',
+)
+const terminalCompetingPackStateB = {
+  ...terminalCompetingPackState,
+  orderGlobalId: propSwitchOrderGlobalId,
+  packReview: {
+    ...terminalCompetingPackState.packReview,
+    receipt: {
+      ...terminalCompetingPackState.packReview.receipt,
+      requestIdempotencyKey:
+        'shipping-one-off-pack:gor0000002:competing-terminal-k2',
+    },
+  },
+}
+const remountedK1B = recovery.readShippingOneOffRetainedCommand(
+  storage,
+  'pack',
+  propSwitchOrderGlobalId,
+  propSwitchStorageKey,
+)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(
+    terminalCompetingPackStateB,
+    remountedK1B,
+    propSwitchOrderGlobalId,
+  ),
+  'superseded',
+  'A same-order terminal K2 must still retire B K1 after the prop transition',
+)
+recovery.writeShippingOneOffRetainedCommand(
+  storage,
+  propSwitchStorageKey,
+  null,
+)
+assert.equal(storageValues.has(propSwitchStorageKey), false)
 
 let canCreate = true
 let packCalls = 0

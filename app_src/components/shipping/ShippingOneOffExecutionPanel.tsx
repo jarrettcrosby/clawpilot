@@ -160,14 +160,16 @@ export type RetainedPackReceiptDisposition = 'pending' | 'exact' | 'superseded'
 export function retainedPackReceiptDisposition(
   state: OneOffShipmentExecutionState | null,
   command: RetainedCommand | null,
+  currentOrderGlobalId: string,
 ): RetainedPackReceiptDisposition {
   const body = parsedCommandBody<PackBody>(command)
   const receipt = state?.packReview.receipt
   if (
     !state
     || !command
+    || state.orderGlobalId !== currentOrderGlobalId
     || body?.action !== 'confirm-pack'
-    || body.orderGlobalId !== state.orderGlobalId
+    || body.orderGlobalId !== currentOrderGlobalId
     || !/^[a-f0-9]{64}$/.test(body.expectedReviewSnapshotHash)
     || state.orderStatus !== 'packed'
     || state.packReview.state !== 'packed'
@@ -232,8 +234,13 @@ function refreshIsDurable(
 function packIsDurable(
   state: OneOffShipmentExecutionState | null,
   command: RetainedCommand | null,
+  currentOrderGlobalId: string,
 ) {
-  return retainedPackReceiptDisposition(state, command) === 'exact'
+  return retainedPackReceiptDisposition(
+    state,
+    command,
+    currentOrderGlobalId,
+  ) === 'exact'
 }
 
 function purchaseIsDurable(
@@ -391,7 +398,12 @@ export default function ShippingOneOffExecutionPanel({
   }, [loadState, orderGlobalId])
 
   useEffect(() => {
-    const packDisposition = retainedPackReceiptDisposition(state, packCommand)
+    if (state?.orderGlobalId !== orderGlobalId) return
+    const packDisposition = retainedPackReceiptDisposition(
+      state,
+      packCommand,
+      orderGlobalId,
+    )
     if (packDisposition !== 'pending') {
       clearPackCommand()
       if (packDisposition === 'superseded') {
@@ -409,6 +421,7 @@ export default function ShippingOneOffExecutionPanel({
     clearPurchaseCommand,
     clearRefreshCommand,
     clearVoidCommand,
+    orderGlobalId,
     packCommand,
     purchaseCommand,
     refreshCommand,
@@ -525,14 +538,20 @@ export default function ShippingOneOffExecutionPanel({
           if (!durable) {
             throw new Error('The rejected pack confirmation could not be reconciled to durable status')
           }
-          if (packIsDurable(durable, command)) {
+          if (packIsDurable(durable, command, orderGlobalId)) {
             clearPackCommand()
             setPackConfirmedEvidenceHash(null)
             setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
             await onUpdated()
             return
           }
-          if (retainedPackReceiptDisposition(durable, command) === 'superseded') {
+          if (
+            retainedPackReceiptDisposition(
+              durable,
+              command,
+              orderGlobalId,
+            ) === 'superseded'
+          ) {
             clearPackCommand()
             setError('')
             setNotice(
@@ -554,7 +573,7 @@ export default function ShippingOneOffExecutionPanel({
       const result = payload.result as OneOffShippingPackCommandResult
       const durable = await loadState()
       if (
-        !packIsDurable(durable, command)
+        !packIsDurable(durable, command, orderGlobalId)
         || durable?.packReview.receipt?.reviewSnapshotHash
           !== result.reviewSnapshotHash
       ) {
@@ -569,12 +588,18 @@ export default function ShippingOneOffExecutionPanel({
       await onUpdated()
     } catch (caught) {
       const durable = await loadState()
-      if (packIsDurable(durable, command)) {
+      if (packIsDurable(durable, command, orderGlobalId)) {
         clearPackCommand()
         setPackConfirmedEvidenceHash(null)
         setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
         await onUpdated()
-      } else if (retainedPackReceiptDisposition(durable, command) === 'superseded') {
+      } else if (
+        retainedPackReceiptDisposition(
+          durable,
+          command,
+          orderGlobalId,
+        ) === 'superseded'
+      ) {
         clearPackCommand()
         setError('')
         setNotice(
