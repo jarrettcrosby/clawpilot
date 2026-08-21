@@ -359,7 +359,8 @@ assert.match(
   /key === 'viewShipping' && !enabled[\s\S]*next\.purchaseLivePostage = false/,
 )
 for (const fragment of [
-  'Documents or one-time contents · no Product or inventory',
+  'One-off shipment',
+  'For paperwork, samples, vendor materials, or other contents that do not belong in Products or inventory.',
   'Use documents-only',
   'No CRM customer · direct recipient',
   'no CRM customer is created',
