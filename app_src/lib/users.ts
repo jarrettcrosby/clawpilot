@@ -363,9 +363,9 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     ? value as Record<string, unknown>
     : {}
   const permissions = normalizePermissions(value)
+  const legacyCanCreateShipments = permissions.manageOperations === true
+    && permissions.executeWarehouse === true
   if (role === 'admin') {
-    const legacyCanCreateShipments = permissions.manageOperations === true
-      && permissions.executeWarehouse === true
     if (!Object.hasOwn(raw, 'viewShipping')) {
       permissions.viewShipping = permissions.viewOperations === true
     }
@@ -379,7 +379,9 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     if (!Object.hasOwn(raw, 'viewShipping')) {
       permissions.viewShipping = permissions.viewOperations === true
     }
-    if (!Object.hasOwn(raw, 'createShipments')) permissions.createShipments = false
+    if (!Object.hasOwn(raw, 'createShipments')) {
+      permissions.createShipments = legacyCanCreateShipments
+    }
     if (!Object.hasOwn(raw, 'purchaseLivePostage')) permissions.purchaseLivePostage = false
   }
   if (role === 'member') {

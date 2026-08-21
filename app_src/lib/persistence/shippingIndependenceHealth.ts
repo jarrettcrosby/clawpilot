@@ -7,7 +7,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
     FROM public.schema_migrations
     WHERE filename = '0301_shipping_independent_one_off_items.sql'
       AND checksum =
-        'd799807b84f614633a4898c5f05c801512b80ebdfb05871361d1201bb6c5975a'
+        '21d58421f998e503f16c1f4ebc4c95dee9c986c0e5049a2dedb18df686058f53'
   )
   AND (
     WITH required_function(signature) AS (

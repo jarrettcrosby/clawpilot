@@ -450,7 +450,7 @@ export default function ShippingSection({
                   Create parcel shipment
                 </Button>
                 <Alert severity="info">
-                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products keep the physical pick-and-pack boundary in Operations.
+                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products keep physical pick-and-pack in Operations, then return here for rates, labels, and cancellation once packed.
                 </Alert>
               </Stack>
             ) : (

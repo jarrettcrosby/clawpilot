@@ -41,7 +41,7 @@ SET permissions = COALESCE(app_user.permissions, '{}'::jsonb)
       'createShipments',
       app_user.role = 'owner'
         OR (
-          app_user.role = 'admin'
+          app_user.role IN ('admin', 'member')
           AND COALESCE(
             COALESCE(app_user.permissions, '{}'::jsonb)->'manageOperations',
             'false'::jsonb
@@ -87,7 +87,7 @@ SET permissions = COALESCE(membership.permissions, '{}'::jsonb)
       'createShipments',
       membership.role = 'owner'
         OR (
-          membership.role = 'admin'
+          membership.role IN ('admin', 'member')
           AND COALESCE(
             COALESCE(membership.permissions, '{}'::jsonb)->'manageOperations',
             'false'::jsonb

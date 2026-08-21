@@ -69,8 +69,27 @@ export async function readShippingWorkspaceFromPostgres(input: {
                 source_order.source_provider = 'clawpilot_native'
                 AND source_order.order_type = 'one_off'
                 AND source_order.status = 'packed'
-                AND operations_one_off_lines_are_pure_ad_hoc(
-                  quote.lines_snapshot
+                AND quote.execution_mode IS NOT NULL
+                AND operations_one_off_plan_execution_is_exact(
+                  source_order.organization_id,
+                  plan.id,
+                  quote.execution_mode
+                )
+                AND (
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM operations_packages package_state
+                    WHERE package_state.organization_id = source_order.organization_id
+                      AND package_state.plan_id = plan.id
+                      AND package_state.status <> 'packed'
+                  )
+                  OR NOT EXISTS (
+                    SELECT 1
+                    FROM operations_packages package_state
+                    WHERE package_state.organization_id = source_order.organization_id
+                      AND package_state.plan_id = plan.id
+                      AND package_state.status <> 'labeled'
+                  )
                 )
               ) AS standalone_one_off_execution_eligible,
               plan.id AS plan_id,

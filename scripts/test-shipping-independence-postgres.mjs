@@ -213,6 +213,12 @@ async function exercisePermissionBackfill(client) {
       viewOperations: true,
       manageOperations: true,
       executeWarehouse: true,
+    }, [true, true, false]],
+    ['member-explicit-deny', 'member', {
+      viewOperations: true,
+      manageOperations: true,
+      executeWarehouse: true,
+      createShipments: false,
     }, [true, false, false]],
     ['admin-explicit-deny', 'admin', {
       viewOperations: true,

@@ -21,6 +21,13 @@ import type {
   OneOffShipmentExecutionState,
 } from '@/lib/operations/oneOffShipments'
 import { ONE_OFF_LIVE_POSTAGE_CONFIRMATION } from '@/lib/operations/oneOffShipmentConstants'
+import {
+  readShippingOneOffRetainedCommand,
+  shippingOneOffResponseIsDefinitiveClientRejection,
+  type ShippingOneOffCommandAction,
+  type ShippingOneOffRetainedCommand,
+  writeShippingOneOffRetainedCommand,
+} from '@/lib/operations/shippingOneOffRecovery'
 
 type ExecutionPayload = {
   ok?: boolean
@@ -30,8 +37,8 @@ type ExecutionPayload = {
   result?: OneOffPackedRateRefresh | OneOffCarrierGroupCommandResult
 }
 
-type CommandAction = 'packed-rate' | 'purchase' | 'void'
-type RetainedCommand = { key: string; body: string }
+type CommandAction = ShippingOneOffCommandAction
+type RetainedCommand = ShippingOneOffRetainedCommand
 type RefreshBody = {
   action: 'refresh-packed-rates'
   orderGlobalId: string
@@ -63,24 +70,15 @@ function readRetainedCommand(
 ): RetainedCommand | null {
   const storageKey = retainedCommandName(action, orderGlobalId)
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(storageKey) || 'null') as {
-      key?: unknown
-      body?: unknown
-    } | null
-    if (
-      parsed
-      && typeof parsed.key === 'string'
-      && parsed.key.length >= 8
-      && typeof parsed.body === 'string'
-    ) {
-      JSON.parse(parsed.body)
-      return { key: parsed.key, body: parsed.body }
-    }
+    return readShippingOneOffRetainedCommand(
+      window.sessionStorage,
+      action,
+      orderGlobalId,
+      storageKey,
+    )
   } catch {
-    // Invalid browser-local retry evidence must never be sent to a provider.
+    return null
   }
-  sessionStorage.removeItem(storageKey)
-  return null
 }
 
 function retainCommand(
@@ -89,8 +87,15 @@ function retainCommand(
   command: RetainedCommand | null,
 ) {
   const storageKey = retainedCommandName(action, orderGlobalId)
-  if (command) sessionStorage.setItem(storageKey, JSON.stringify(command))
-  else sessionStorage.removeItem(storageKey)
+  try {
+    return writeShippingOneOffRetainedCommand(
+      window.sessionStorage,
+      storageKey,
+      command,
+    )
+  } catch {
+    return false
+  }
 }
 
 function newCommand(
@@ -126,11 +131,10 @@ async function readPayload(response: Response) {
 }
 
 function definitiveClientRejection(response: Response, malformed: boolean) {
-  return !malformed
-    && response.status >= 400
-    && response.status < 500
-    && response.status !== 408
-    && response.status !== 429
+  return shippingOneOffResponseIsDefinitiveClientRejection(
+    response.status,
+    malformed,
+  )
 }
 
 function payloadMessage(payload: ExecutionPayload, fallback: string) {
@@ -162,6 +166,14 @@ function purchaseIsDurable(
   state: OneOffShipmentExecutionState | null,
   command: RetainedCommand | null,
 ) {
+  return purchaseIsBoundToGroup(state, command)
+    && state?.carrierGroup?.state === 'succeeded'
+}
+
+function purchaseIsBoundToGroup(
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+) {
   const body = parsedCommandBody<PurchaseBody>(command)
   const group = state?.carrierGroup
   return Boolean(
@@ -169,14 +181,21 @@ function purchaseIsDurable(
     && command
     && body?.action === 'purchase-group'
     && body.orderGlobalId === state.orderGlobalId
-    && group?.state === 'succeeded'
-    && group.createRequestIdempotencyKey === command.key
+    && group?.createRequestIdempotencyKey === command.key
     && group.purchaseQuoteGlobalId === body.purchaseQuoteGlobalId
     && group.purchaseOfferGlobalId === body.selectedOfferGlobalId,
   )
 }
 
 function voidIsDurable(
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+) {
+  return voidIsBoundToGroup(state, command)
+    && state?.carrierGroup?.voidState === 'succeeded'
+}
+
+function voidIsBoundToGroup(
   state: OneOffShipmentExecutionState | null,
   command: RetainedCommand | null,
 ) {
@@ -187,8 +206,7 @@ function voidIsDurable(
     && command
     && body?.action === 'void-group'
     && body.orderGlobalId === state.orderGlobalId
-    && group?.voidState === 'succeeded'
-    && group.voidRequestIdempotencyKey === command.key,
+    && group?.voidRequestIdempotencyKey === command.key,
   )
 }
 
@@ -240,7 +258,13 @@ export default function ShippingOneOffExecutionPanel({
         { cache: 'no-store' },
       )
       const { malformed, payload } = await readPayload(response)
-      if (malformed || !response.ok || !payload.ok || !payload.state) {
+      if (
+        malformed
+        || !response.ok
+        || !payload.ok
+        || !payload.state
+        || payload.state.orderGlobalId !== orderGlobalId
+      ) {
         throw new Error(payloadMessage(payload, 'One-off postage status is unavailable'))
       }
       setState(payload.state)
@@ -318,12 +342,12 @@ export default function ShippingOneOffExecutionPanel({
   const liveAllowed = !live || canPurchaseLivePostage
   const unresolved = group?.unresolved === true
   const retryingUnresolvedPurchase = Boolean(
-    purchaseCommand
+    purchaseIsBoundToGroup(state, purchaseCommand)
     && group
     && (group.state === 'prepared' || group.state === 'unknown'),
   )
   const retryingUnresolvedVoid = Boolean(
-    voidCommand
+    voidIsBoundToGroup(state, voidCommand)
     && group
     && (group.voidState === 'prepared' || group.voidState === 'unknown'),
   )
@@ -349,7 +373,11 @@ export default function ShippingOneOffExecutionPanel({
       expectedRowVersion: state.rowVersion,
     })
     setRefreshCommand(command)
-    retainCommand('packed-rate', orderGlobalId, command)
+    if (!retainCommand('packed-rate', orderGlobalId, command)) {
+      setRefreshCommand(null)
+      setError('Browser retry storage is unavailable. No carrier rate request was sent.')
+      return
+    }
     setBusy('refresh')
     setError('')
     setNotice('')
@@ -372,8 +400,16 @@ export default function ShippingOneOffExecutionPanel({
       )
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
+          const durable = await loadState()
+          if (!durable) {
+            throw new Error('The rejected packed-rate request could not be reconciled to durable status')
+          }
+          if (refreshIsDurable(durable, command)) {
+            clearRefreshCommand()
+            setNotice('The prior exact packed-rate request succeeded; durable rates are current.')
+            return
+          }
           clearRefreshCommand()
-          await loadState()
           setError(
             `${payloadMessage(payload, 'Current packed rates were rejected')} `
             + 'The rejected request was not retained; review the current status before trying again.',
@@ -433,7 +469,11 @@ export default function ShippingOneOffExecutionPanel({
       ...(live ? { confirmation: ONE_OFF_LIVE_POSTAGE_CONFIRMATION } : {}),
     })
     setPurchaseCommand(command)
-    retainCommand('purchase', orderGlobalId, command)
+    if (!retainCommand('purchase', orderGlobalId, command)) {
+      setPurchaseCommand(null)
+      setError('Browser retry storage is unavailable. No carrier label request was sent.')
+      return
+    }
     setBusy('purchase')
     setError('')
     setNotice('')
@@ -457,8 +497,18 @@ export default function ShippingOneOffExecutionPanel({
       )
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
+          const durable = await loadState()
+          if (!durable) {
+            throw new Error('The rejected label request could not be reconciled to durable status')
+          }
+          if (purchaseIsDurable(durable, command)) {
+            clearPurchaseCommand()
+            setLiveConfirmed(false)
+            setNotice('The prior exact label request succeeded; its durable labels are shown below.')
+            await onUpdated()
+            return
+          }
           clearPurchaseCommand()
-          await loadState()
           setError(
             `${payloadMessage(payload, 'The carrier label request was rejected')} `
             + 'The rejected request was not retained; review the current quote and status before trying again.',
@@ -517,7 +567,11 @@ export default function ShippingOneOffExecutionPanel({
       reason: voidReason.trim(),
     })
     setVoidCommand(command)
-    retainCommand('void', orderGlobalId, command)
+    if (!retainCommand('void', orderGlobalId, command)) {
+      setVoidCommand(null)
+      setError('Browser retry storage is unavailable. No carrier cancellation was sent.')
+      return
+    }
     setBusy('void')
     setError('')
     setNotice('')
@@ -541,8 +595,17 @@ export default function ShippingOneOffExecutionPanel({
       )
       if (!validResult) {
         if (definitiveClientRejection(response, malformed)) {
+          const durable = await loadState()
+          if (!durable) {
+            throw new Error('The rejected cancellation could not be reconciled to durable status')
+          }
+          if (voidIsDurable(durable, command)) {
+            clearVoidCommand()
+            setNotice('The prior exact cancellation succeeded; durable status is current.')
+            await onUpdated()
+            return
+          }
           clearVoidCommand()
-          await loadState()
           setError(
             `${payloadMessage(payload, 'The carrier cancellation was rejected')} `
             + 'The rejected request was not retained; review the current group before trying again.',

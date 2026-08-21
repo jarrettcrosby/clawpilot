@@ -94,8 +94,17 @@ assert.equal(users.permissionsForRole('member', { viewOperations: true }).viewSh
 assert.equal(users.permissionsForRole('member', {
   manageOperations: true,
   executeWarehouse: true,
+}).createShipments, true)
+assert.equal(users.permissionsForRole('member', {
+  manageOperations: true,
+  executeWarehouse: true,
+  createShipments: false,
 }).createShipments, false)
 assert.equal(users.permissionsForRole('member', {}).purchaseLivePostage, false)
+assert.equal(users.permissionsForRole('member', {
+  manageOperations: true,
+  executeWarehouse: true,
+}).purchaseLivePostage, false)
 assert.equal(users.permissionsForRole('member', { purchaseLivePostage: true }).purchaseLivePostage, true)
 
 const grantedMember = authorization.shippingCapabilities(actor('member', {
@@ -195,7 +204,9 @@ const healthContract = read('app_src/lib/persistence/shippingIndependenceHealth.
 const ui = read('app_src/components/operations/OneOffShipmentDialog.tsx')
 const shippingUi = read('app_src/components/shipping/ShippingSection.tsx')
 const shippingExecutionUi = read('app_src/components/shipping/ShippingOneOffExecutionPanel.tsx')
+const shippingProjection = read('app_src/lib/persistence/shipping.ts')
 const accessUi = read('app_src/components/settings/UserAccessDialog.tsx')
+const recovery = runTypeScript('app_src/lib/operations/shippingOneOffRecovery.ts', {})
 
 assert.doesNotMatch(route, /operationsCapabilities|operations_activation_scopes/)
 assert.doesNotMatch(persistence, /operations_activation_scopes/)
@@ -304,10 +315,36 @@ for (const fragment of [
   'canCreateShipments={Boolean(workspace?.capabilities.canCreate)}',
   'Create shipments permission is required to refresh rates',
   'one-time ad-hoc item can be rated, labeled, and cancelled here',
-  'Existing inventory and deliberately created products keep the physical pick-and-pack boundary in Operations',
+  'Existing inventory and deliberately created products keep physical pick-and-pack in Operations',
+  'then return here for rates, labels, and cancellation once packed',
 ]) {
   assert.ok(shippingUi.includes(fragment), `Standalone Shipping UI is missing ${fragment}`)
 }
+const standaloneEligibility = shippingProjection.slice(
+  shippingProjection.indexOf('source_order.source_provider ='),
+  shippingProjection.indexOf(') AS standalone_one_off_execution_eligible'),
+)
+assert.match(standaloneEligibility, /source_order\.status = 'packed'/)
+assert.match(standaloneEligibility, /quote\.execution_mode IS NOT NULL/)
+assert.match(standaloneEligibility, /operations_one_off_plan_execution_is_exact/)
+assert.match(standaloneEligibility, /package_state\.status <> 'packed'/)
+assert.match(standaloneEligibility, /package_state\.status <> 'labeled'/)
+assert.doesNotMatch(
+  standaloneEligibility,
+  /operations_one_off_lines_are_pure_ad_hoc/,
+  'Every exactly sealed and physically packed native one-off must finish in Shipping',
+)
+assert.match(
+  persistence.slice(
+    persistence.indexOf('const pureAdHoc = quote.lines_snapshot.length'),
+    persistence.indexOf(
+      'const result: OneOffShipmentCreateResult',
+      persistence.indexOf('const pureAdHoc = quote.lines_snapshot.length'),
+    ),
+  ),
+  /CASE WHEN \$8::boolean THEN 'packed' ELSE 'planned'[\s\S]*pureAdHoc[\s\S]*SET status = CASE WHEN \$5::boolean THEN 'packed' ELSE 'planned'[\s\S]*pureAdHoc/,
+  'Only pure ad-hoc creation may auto-pack; inventory and new-product lines retain Operations pick/pack',
+)
 for (const fragment of [
   "action: 'refresh-packed-rates'",
   "action: 'purchase-group'",
@@ -318,7 +355,6 @@ for (const fragment of [
   'sessionStorage',
   'command.body',
   'definitiveClientRejection',
-  'response.status !== 429',
   'The rejected request was not retained',
   'retained byte-identical request',
   'createRequestIdempotencyKey',
@@ -337,29 +373,128 @@ const rejectionClassifier = shippingExecutionUi.slice(
   shippingExecutionUi.indexOf('function definitiveClientRejection'),
   shippingExecutionUi.indexOf('function payloadMessage'),
 )
-assert.match(rejectionClassifier, /response\.status >= 400/)
-assert.match(rejectionClassifier, /response\.status < 500/)
-assert.match(rejectionClassifier, /response\.status !== 408/)
-assert.match(rejectionClassifier, /response\.status !== 429/)
+assert.match(rejectionClassifier, /shippingOneOffResponseIsDefinitiveClientRejection/)
+for (const [status, malformed, expected] of [
+  [400, false, true],
+  [409, false, true],
+  [408, false, false],
+  [425, false, false],
+  [429, false, false],
+  [500, false, false],
+  [409, true, false],
+]) {
+  assert.equal(
+    recovery.shippingOneOffResponseIsDefinitiveClientRejection(status, malformed),
+    expected,
+    `HTTP ${status}${malformed ? ' malformed' : ''} recovery classification drifted`,
+  )
+}
+const throwingStorage = {
+  getItem() { throw new Error('storage unavailable') },
+  setItem() { throw new Error('storage unavailable') },
+  removeItem() { throw new Error('storage unavailable') },
+}
+assert.equal(
+  recovery.readShippingOneOffRetainedCommand(
+    throwingStorage,
+    'purchase',
+    'order-1',
+    'storage-key',
+  ),
+  null,
+)
+const storageValues = new Map()
+const workingStorage = {
+  getItem(key) { return storageValues.get(key) || null },
+  setItem(key, value) { storageValues.set(key, value) },
+  removeItem(key) { storageValues.delete(key) },
+}
+const exactRetained = {
+  key: 'shipping-one-off-purchase:order-1:request-1',
+  body: JSON.stringify({
+    action: 'purchase-group',
+    orderGlobalId: 'order-1',
+  }),
+}
+assert.equal(
+  recovery.writeShippingOneOffRetainedCommand(
+    workingStorage,
+    'storage-key',
+    exactRetained,
+  ),
+  true,
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(recovery.readShippingOneOffRetainedCommand(
+    workingStorage,
+    'purchase',
+    'order-1',
+    'storage-key',
+  ))),
+  exactRetained,
+)
+storageValues.set('storage-key', JSON.stringify({
+  ...exactRetained,
+  body: JSON.stringify({ action: 'purchase-group', orderGlobalId: 'other-order' }),
+}))
+assert.equal(
+  recovery.readShippingOneOffRetainedCommand(
+    workingStorage,
+    'purchase',
+    'order-1',
+    'storage-key',
+  ),
+  null,
+  'Cross-order retained evidence must be discarded before any request',
+)
+let simulatedProviderCalls = 0
+if (recovery.writeShippingOneOffRetainedCommand(
+  throwingStorage,
+  'storage-key',
+  { key: 'shipping-one-off-purchase:order-1:request-1', body: '{}' },
+)) simulatedProviderCalls += 1
+assert.equal(simulatedProviderCalls, 0, 'Storage exceptions must cause zero provider work')
 const purchaseUi = shippingExecutionUi.slice(
   shippingExecutionUi.indexOf('const purchaseLabels = async'),
   shippingExecutionUi.indexOf('const voidLabels = async'),
 )
 assert.match(
   purchaseUi,
-  /definitiveClientRejection\(response, malformed\)[\s\S]*clearPurchaseCommand\(\)[\s\S]*The rejected request was not retained/,
-  'Deterministic purchase conflicts must clear the command and require review',
+  /definitiveClientRejection\(response, malformed\)[\s\S]*const durable = await loadState\(\)[\s\S]*purchaseIsDurable\(durable, command\)[\s\S]*clearPurchaseCommand\(\)[\s\S]*The rejected request was not retained/,
+  'Deterministic purchase conflicts must reconcile durable state before clearing',
 )
 assert.match(
   purchaseUi,
   /catch \(caught\)[\s\S]*purchaseIsDurable\(durable, command\)[\s\S]*retained byte-identical request/,
   'Lost or malformed purchase responses must reconcile exact lineage or retain the exact command',
 )
+for (const [start, end, retainedCall] of [
+  ['const refreshRates = async', 'const purchaseLabels = async', "retainCommand('packed-rate'"],
+  ['const purchaseLabels = async', 'const voidLabels = async', "retainCommand('purchase'"],
+  ['const voidLabels = async', 'if (loading && !state)', "retainCommand('void'"],
+]) {
+  const action = shippingExecutionUi.slice(
+    shippingExecutionUi.indexOf(start),
+    shippingExecutionUi.indexOf(end),
+  )
+  assert.ok(action.indexOf(retainedCall) < action.indexOf("fetch('/api/operations/one-off-shipments'"))
+  assert.match(action, /if \(!retainCommand\([\s\S]*No carrier[\s\S]*return/)
+}
+assert.match(shippingExecutionUi, /Carrier outcome is unresolved[\s\S]*a new provider request is fenced/)
+assert.match(shippingExecutionUi, /\|\| unresolved/)
+assert.match(shippingExecutionUi, /unresolved && !retryingUnresolvedPurchase/)
+assert.match(shippingExecutionUi, /purchaseIsBoundToGroup\(state, purchaseCommand\)/)
+assert.match(shippingExecutionUi, /voidIsBoundToGroup\(state, voidCommand\)/)
+assert.match(
+  shippingExecutionUi,
+  /payload\.state\.orderGlobalId !== orderGlobalId/,
+  'Durable GET reconciliation must reject cross-order response state',
+)
 assert.match(health, /SHIPPING_INDEPENDENCE_HEALTH_SQL/)
 assert.match(health, /shipping_independence_applied/)
 for (const fragment of [
   '0301_shipping_independent_one_off_items.sql',
-  'd799807b84f614633a4898c5f05c801512b80ebdfb05871361d1201bb6c5975a',
+  '21d58421f998e503f16c1f4ebc4c95dee9c986c0e5049a2dedb18df686058f53',
   "installed_namespace.nspname = 'public'",
   'installed_function.prosrc',
   'installed_trigger.tgfoid',
