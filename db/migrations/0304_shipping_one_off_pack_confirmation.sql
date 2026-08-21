@@ -390,19 +390,94 @@ FOR EACH ROW
 EXECUTE FUNCTION protect_operations_shipping_one_off_pack_receipt();
 
 -- Rows reviewed by a pack receipt cannot be changed or appended after a
--- concurrent writer waits on the pack transaction's parent/row locks. Package
--- and reservation lifecycle state may continue through label/ship/void; the
--- exact line, content, and allocation identities remain sealed.
+-- concurrent writer waits on the pack transaction's parent/row locks.
+-- Reservation identity, quantity, and authority evidence remain sealed while
+-- an active reservation may still become consumed or released during the
+-- intended shipment/cancel lifecycle.
 CREATE OR REPLACE FUNCTION protect_operations_shipping_one_off_pack_evidence()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  linked_scope record;
   linked_organization_id uuid;
   linked_order_id uuid;
   linked_plan_id uuid;
   linked_order_global_id text;
+  sealed_reservation_evidence boolean := false;
 BEGIN
+  IF TG_TABLE_NAME = 'operations_reservations' THEN
+    -- Reservation updates can attempt to move between orders. Fence both the
+    -- OLD and NEW scopes in deterministic order so neither side of a sealed
+    -- one-off receipt can be bypassed by rebinding the row.
+    FOR linked_scope IN
+      SELECT DISTINCT scope.organization_id, scope.order_id,
+             source_order.global_id,
+             scope.organization_id::text AS organization_sort
+      FROM (
+        VALUES
+          (OLD.organization_id, OLD.order_id),
+          (NEW.organization_id, NEW.order_id)
+      ) AS scope(organization_id, order_id)
+      JOIN operations_orders source_order
+        ON source_order.organization_id = scope.organization_id
+       AND source_order.id = scope.order_id
+      WHERE scope.organization_id IS NOT NULL
+        AND scope.order_id IS NOT NULL
+      ORDER BY organization_sort, source_order.global_id, scope.order_id
+    LOOP
+      PERFORM pg_advisory_xact_lock(hashtextextended(
+        'shipping:one-off-pack:'
+          || linked_scope.organization_id::text || ':'
+          || linked_scope.global_id,
+        0
+      ));
+      PERFORM 1
+      FROM operations_orders source_order
+      WHERE source_order.organization_id = linked_scope.organization_id
+        AND source_order.id = linked_scope.order_id
+      FOR UPDATE;
+
+      IF EXISTS (
+        SELECT 1
+        FROM operations_shipping_one_off_pack_receipts receipt
+        WHERE receipt.organization_id = linked_scope.organization_id
+          AND receipt.order_id = linked_scope.order_id
+      ) THEN
+        sealed_reservation_evidence := true;
+      END IF;
+    END LOOP;
+
+    IF NOT sealed_reservation_evidence THEN
+      RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    -- Every field other than the explicit lifecycle pair is immutable after
+    -- pack. No-op status revalidation remains valid, as do the two intended
+    -- active terminal transitions used by shipment and cancellation.
+    IF TG_OP = 'UPDATE'
+       AND (to_jsonb(NEW) - ARRAY['status', 'released_at'])
+         IS NOT DISTINCT FROM
+           (to_jsonb(OLD) - ARRAY['status', 'released_at'])
+       AND (
+         (
+           NEW.status IS NOT DISTINCT FROM OLD.status
+           AND NEW.released_at IS NOT DISTINCT FROM OLD.released_at
+         )
+         OR (
+           OLD.status = 'active'
+           AND NEW.status IN ('consumed', 'released')
+           AND NEW.released_at IS NOT NULL
+         )
+       )
+    THEN
+      RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION
+      'Shipping one-off pack reservation evidence is sealed; only active-to-consumed or active-to-released lifecycle transitions are allowed';
+  END IF;
+
   linked_organization_id := COALESCE(NEW.organization_id, OLD.organization_id);
   IF TG_TABLE_NAME IN (
     'operations_order_lines',
@@ -464,6 +539,11 @@ EXECUTE FUNCTION protect_operations_shipping_one_off_pack_evidence();
 
 CREATE TRIGGER protect_shipping_pack_allocation_evidence
 BEFORE INSERT OR UPDATE OR DELETE ON operations_fulfillment_allocations
+FOR EACH ROW
+EXECUTE FUNCTION protect_operations_shipping_one_off_pack_evidence();
+
+CREATE TRIGGER protect_shipping_pack_reservation_evidence
+BEFORE INSERT OR UPDATE OR DELETE ON operations_reservations
 FOR EACH ROW
 EXECUTE FUNCTION protect_operations_shipping_one_off_pack_evidence();
 

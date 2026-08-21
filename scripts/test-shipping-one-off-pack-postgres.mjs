@@ -245,6 +245,31 @@ async function exerciseHealthTamper() {
            DISABLE TRIGGER protect_shipping_pack_allocation_evidence`,
         )
       }],
+      ['reservation evidence body replacement', async () => {
+        await client.query(
+          `CREATE OR REPLACE FUNCTION
+             protect_operations_shipping_one_off_pack_evidence()
+           RETURNS trigger LANGUAGE plpgsql AS $health$
+           BEGIN
+             IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+             RETURN NEW;
+           END;
+           $health$`,
+        )
+      }],
+      ['reservation fence WHEN false', async () => {
+        await client.query(
+          `DROP TRIGGER protect_shipping_pack_reservation_evidence
+           ON operations_reservations`,
+        )
+        await client.query(
+          `CREATE TRIGGER protect_shipping_pack_reservation_evidence
+           BEFORE INSERT OR UPDATE OR DELETE ON operations_reservations
+           FOR EACH ROW WHEN (false)
+           EXECUTE FUNCTION
+             protect_operations_shipping_one_off_pack_evidence()`,
+        )
+      }],
       ['extra protected-table trigger', async () => {
         await client.query(
           `CREATE FUNCTION shipping_pack_health_extra_trigger()
@@ -254,7 +279,7 @@ async function exerciseHealthTamper() {
         )
         await client.query(
           `CREATE TRIGGER shipping_pack_health_extra_trigger
-           BEFORE INSERT ON operations_shipping_one_off_pack_receipts
+           BEFORE INSERT ON operations_reservations
            FOR EACH ROW
            EXECUTE FUNCTION shipping_pack_health_extra_trigger()`,
         )
@@ -366,6 +391,7 @@ const labeled = fixture(3, 'existing', 'labeled')
 const shipped = fixture(4, 'existing', 'shipped')
 const unresolved = fixture(5, 'existing')
 const adHoc = fixture(6, 'ad_hoc', 'packed')
+const writerFirst = fixture(7, 'existing')
 
 async function seedBase(client) {
   await client.query('SET LOCAL session_replication_role = replica')
@@ -846,6 +872,35 @@ async function snapshotReservation(item) {
   return JSON.parse(JSON.stringify(result.rows))
 }
 
+async function insertAdditionalPosition(client, item, lotCode) {
+  const result = await client.query(
+    `INSERT INTO operations_inventory_positions (
+       id, organization_id, pipeline_id, warehouse_id, location_id,
+       pool_id, product_id, lot_code, on_hand_quantity,
+       reserved_quantity, damaged_quantity, version
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 10, 1, 0, 11)
+     RETURNING id::text, global_id`,
+    [
+      randomUUID(), ids.organization, ids.pipeline, ids.warehouse,
+      ids.receivingLocation, ids.inventoryPool, item.product, lotCode,
+    ],
+  )
+  return result.rows[0]
+}
+
+async function insertAdditionalReservation(client, item, position, key) {
+  return client.query(
+    `INSERT INTO operations_reservations (
+       organization_id, order_id, order_line_id, position_id, quantity,
+       status, idempotency_key, created_by
+     ) VALUES ($1, $2, $3, $4, 1, 'active', $5, $6)
+     RETURNING id::text, global_id`,
+    [
+      ids.organization, item.order, item.line, position.id, key, actorEmail,
+    ],
+  )
+}
+
 function commandInput(item, review, key) {
   return {
     organizationId: ids.organization,
@@ -863,7 +918,9 @@ const setup = await pool.connect()
 try {
   await setup.query('BEGIN')
   await seedBase(setup)
-  for (const item of [existing, createdProduct, labeled, shipped, unresolved, adHoc]) {
+  for (const item of [
+    existing, createdProduct, labeled, shipped, unresolved, adHoc, writerFirst,
+  ]) {
     await seedFixture(setup, item, { unresolvedGroup: item === unresolved })
   }
   await setup.query(
@@ -899,9 +956,9 @@ try {
     console.log('SHIPPING_PACK_HEALTH_FINGERPRINT', healthFingerprint.rows[0])
   }
   assert.deepEqual(healthFingerprint.rows[0], {
-    artifact_count: 70,
+    artifact_count: 74,
     artifact_hash:
-      '88cecabe3a6128e12aa24ba62ca5f2a481cac6b42c790cca23975a7a468c2ff2',
+      '5d71b800d0d90facb36d7e18cb398818aac1255e3f4d71ab139eac0fe2dec73e',
   })
   await exerciseHealthTamper()
   const exact = await pool.query(
@@ -922,10 +979,10 @@ try {
     [ids.organization, [
       existing.orderGlobalId, createdProduct.orderGlobalId,
       labeled.orderGlobalId, shipped.orderGlobalId, unresolved.orderGlobalId,
-      adHoc.orderGlobalId,
+      adHoc.orderGlobalId, writerFirst.orderGlobalId,
     ]],
   )
-  assert.equal(exact.rowCount, 6)
+  assert.equal(exact.rowCount, 7)
   assert.ok(exact.rows.every((row) => row.exact_execution && row.exact_packages))
 
   await expectCode(
@@ -999,6 +1056,63 @@ try {
     'Pure ad-hoc auto-pack must not re-enter physical inventory pack',
   )
 
+  const writerFirstReview =
+    await persistence.readShippingOneOffPackReviewFromPostgres({
+      organizationId: ids.organization,
+      orderGlobalId: writerFirst.orderGlobalId,
+    })
+  assert.equal(writerFirstReview.blocker, null)
+  const reservationWriter = await pool.connect()
+  let writerFirstPackAttempt = null
+  try {
+    await reservationWriter.query('BEGIN')
+    const extraPosition = await insertAdditionalPosition(
+      reservationWriter,
+      writerFirst,
+      'writer-before-pack',
+    )
+    await insertAdditionalReservation(
+      reservationWriter,
+      writerFirst,
+      extraPosition,
+      'shipping-pack-writer-before-pack',
+    )
+    let packSettled = false
+    writerFirstPackAttempt = persistence.packShippingOneOffShipmentInPostgres(
+      commandInput(
+        writerFirst,
+        writerFirstReview,
+        'writer-before-pack-must-be-visible',
+      ),
+    ).then(
+      (result) => { packSettled = true; return { result, error: null } },
+      (error) => { packSettled = true; return { result: null, error } },
+    )
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 125))
+    assert.equal(
+      packSettled,
+      false,
+      'Pack must wait behind a reservation writer that owns its order fence',
+    )
+    await reservationWriter.query('COMMIT')
+    const outcome = await writerFirstPackAttempt
+    assert.ok(outcome.error, 'Writer-first reservation drift must reject pack')
+    assert.equal(
+      outcome.error.code,
+      'OPERATIONS_ONE_OFF_PACK_EVIDENCE_STALE',
+    )
+    assert.match(
+      String(outcome.error.message || outcome.error),
+      /active inventory reservations no longer exactly cover/i,
+    )
+  } catch (error) {
+    await reservationWriter.query('ROLLBACK').catch(() => undefined)
+    if (writerFirstPackAttempt) await writerFirstPackAttempt
+    throw error
+  } finally {
+    reservationWriter.release()
+  }
+
   const existingReview = await persistence.readShippingOneOffPackReviewFromPostgres({
     organizationId: ids.organization,
     orderGlobalId: existing.orderGlobalId,
@@ -1010,9 +1124,14 @@ try {
   const exactExistingInput = commandInput(
     existing, existingReview, 'existing-pack-concurrent-stable',
   )
+  const packFirstPosition = await insertAdditionalPosition(
+    pool,
+    existing,
+    'pack-before-writer',
+  )
   let concurrentEvidenceWrites = null
   beforeTransactionCommit = async () => {
-    const settled = [false, false, false]
+    const settled = [false, false, false, false]
     const attempts = [
       pool.query(
         `UPDATE operations_order_lines SET description = 'Concurrent drift'
@@ -1034,6 +1153,12 @@ try {
           existing.package, existing.line, actorEmail,
         ],
       ),
+      insertAdditionalReservation(
+        pool,
+        existing,
+        packFirstPosition,
+        'shipping-pack-pack-before-writer',
+      ),
     ].map((attempt, index) => attempt.then(
       () => { settled[index] = true; return null },
       (error) => { settled[index] = true; return error },
@@ -1042,8 +1167,8 @@ try {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 125))
     assert.deepEqual(
       settled,
-      [false, false, false],
-      'Line, allocation, and package-content writers must wait on pack locks',
+      [false, false, false, false],
+      'Line, allocation, content, and reservation writers must wait on pack locks',
     )
   }
   const concurrentResults = await Promise.all([
@@ -1064,14 +1189,77 @@ try {
   )))
   assert.deepEqual(await snapshotReservation(existing), beforeReservation)
   const evidenceWriteOutcomes = await concurrentEvidenceWrites
-  assert.equal(evidenceWriteOutcomes.length, 3)
+  assert.equal(evidenceWriteOutcomes.length, 4)
   for (const outcome of evidenceWriteOutcomes) {
     assert.ok(outcome, 'Concurrent evidence writer must be rejected after pack')
     assert.match(
       String(outcome.message || outcome),
-      /pack line, content, and allocation evidence is sealed/i,
+      /pack (?:line, content, and allocation|reservation) evidence is sealed/i,
     )
   }
+  const postPackPosition = await insertAdditionalPosition(
+    pool,
+    existing,
+    'post-pack-new-position',
+  )
+  const postPackInsertError = await expectCode(
+    () => insertAdditionalReservation(
+      pool,
+      existing,
+      postPackPosition,
+      'shipping-pack-post-pack-new-position',
+    ),
+    undefined,
+    'A new-position reservation insert after pack must be rejected',
+  )
+  assert.match(
+    String(postPackInsertError.message || postPackInsertError),
+    /pack reservation evidence is sealed/i,
+  )
+  const sealedQuantityError = await expectCode(
+    () => pool.query(
+      `UPDATE operations_reservations
+       SET quantity = quantity + 1
+       WHERE organization_id = $1 AND id = $2`,
+      [ids.organization, existing.reservation],
+    ),
+    undefined,
+    'Packed reservation quantity evidence must be immutable',
+  )
+  assert.match(
+    String(sealedQuantityError.message || sealedQuantityError),
+    /pack reservation evidence is sealed/i,
+  )
+  const sealedIdentityError = await expectCode(
+    () => pool.query(
+      `UPDATE operations_reservations
+       SET position_id = $3
+       WHERE organization_id = $1 AND id = $2`,
+      [ids.organization, existing.reservation, postPackPosition.id],
+    ),
+    undefined,
+    'Packed reservation identity evidence must be immutable',
+  )
+  assert.match(
+    String(sealedIdentityError.message || sealedIdentityError),
+    /pack reservation evidence is sealed/i,
+  )
+  const sealedAuthorityEvidenceError = await expectCode(
+    () => pool.query(
+      `UPDATE operations_reservations
+       SET provider_inventory_sync_run_id = gen_random_uuid()
+       WHERE organization_id = $1 AND id = $2`,
+      [ids.organization, existing.reservation],
+    ),
+    undefined,
+    'Packed reservation authority evidence must be immutable',
+  )
+  assert.match(
+    String(
+      sealedAuthorityEvidenceError.message || sealedAuthorityEvidenceError,
+    ),
+    /pack reservation evidence is sealed/i,
+  )
   const existingReceipt = await pool.query(
     `SELECT count(*)::integer AS receipts,
             min(reservation_count)::integer AS reservations,
@@ -1159,6 +1347,29 @@ try {
   )
   assert.equal(newResult.replayed, false)
   assert.deepEqual(await snapshotReservation(createdProduct), newBeforeReservation)
+
+  const consumedLifecycle = await pool.query(
+    `UPDATE operations_reservations
+     SET status = 'consumed', released_at = now()
+     WHERE organization_id = $1 AND id = $2 AND status = 'active'
+     RETURNING status, released_at IS NOT NULL AS released_at_set`,
+    [ids.organization, existing.reservation],
+  )
+  assert.deepEqual(consumedLifecycle.rows[0], {
+    status: 'consumed',
+    released_at_set: true,
+  })
+  const releasedLifecycle = await pool.query(
+    `UPDATE operations_reservations
+     SET status = 'released', released_at = now()
+     WHERE organization_id = $1 AND id = $2 AND status = 'active'
+     RETURNING status, released_at IS NOT NULL AS released_at_set`,
+    [ids.organization, createdProduct.reservation],
+  )
+  assert.deepEqual(releasedLifecycle.rows[0], {
+    status: 'released',
+    released_at_set: true,
+  })
 
   const mutationCounts = await pool.query(
     `SELECT

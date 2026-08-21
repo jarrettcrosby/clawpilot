@@ -118,6 +118,7 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
       AND NOT installed_trigger.tgisinternal
       AND installed_table.relname IN (
         'operations_shipping_one_off_pack_receipts',
+        'operations_reservations',
         'operations_order_lines',
         'operations_fulfillment_allocations',
         'operations_package_contents',
@@ -128,7 +129,7 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
 `
 
 export const SHIPPING_ONE_OFF_PACK_MIGRATION_CHECKSUM =
-  'cd38b2c0551566cd82a5e0813032ace5825b139041ca890e7f8d4ad3571bc9c5'
+  '9df61a664422e0d80b5cdd87ebdc6fe75128cf028e0810d9c43ac10ad137ff09'
 
 export const SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL = String.raw`
   WITH ${SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL}
@@ -148,12 +149,12 @@ export const SHIPPING_ONE_OFF_PACK_HEALTH_SQL = String.raw`
   )
   AND (
     WITH ${SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL}
-    SELECT count(*) = 70
+    SELECT count(*) = 74
       AND encode(digest(convert_to(string_agg(
         kind || '|' || identity || '|' || definition,
         chr(10) ORDER BY kind, identity
       ), 'UTF8'), 'sha256'), 'hex') =
-        '88cecabe3a6128e12aa24ba62ca5f2a481cac6b42c790cca23975a7a468c2ff2'
+        '5d71b800d0d90facb36d7e18cb398818aac1255e3f4d71ab139eac0fe2dec73e'
     FROM artifact
   )
 `
