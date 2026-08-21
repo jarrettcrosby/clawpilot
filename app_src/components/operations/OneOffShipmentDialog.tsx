@@ -1557,8 +1557,13 @@ export default function OneOffShipmentDialog({
                       >
                         <MenuItem value="existing">Existing product and inventory</MenuItem>
                         <MenuItem value="new">Create a new product from physical units</MenuItem>
-                        <MenuItem value="ad_hoc">Documents or one-time contents · no Product or inventory</MenuItem>
+                        <MenuItem value="ad_hoc">One-off shipment</MenuItem>
                       </TextField>
+                      {line.kind === 'ad_hoc' && (
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: -1, mb: 2 }}>
+                          For paperwork, samples, vendor materials, or other contents that do not belong in Products or inventory.
+                        </Typography>
+                      )}
                       {line.kind === 'existing' ? (
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 150px' }, gap: 2 }}>
                           <FormControl fullWidth required>
