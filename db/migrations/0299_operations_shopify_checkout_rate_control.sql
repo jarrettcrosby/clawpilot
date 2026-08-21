@@ -4,6 +4,17 @@
 -- Disabled and Frozen remain immediate runtime kill switches; Read_only is a
 -- serving state because rating is read-only and performs no provider write.
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+ALTER FUNCTION public.operations_shopify_cs_config_has_exact_finalization_link(
+  uuid, uuid, uuid, bigint, bigint, text, text, text, text,
+  integer, integer, integer
+) SET search_path = pg_catalog, public, pg_temp;
+
+ALTER FUNCTION public.operations_shopify_carrier_service_config_is_ready(
+  uuid, uuid
+) SET search_path = pg_catalog, public, pg_temp;
+
 CREATE OR REPLACE FUNCTION
   operations_shopify_checkout_rate_control_is_valid(input jsonb)
 RETURNS boolean
@@ -32,6 +43,232 @@ EXCEPTION
 END;
 $$;
 
+-- Install the revision-aware validator before normalizing saved controls.
+-- Live configurations may carry an older activation revision because local
+-- rating policy is intentionally independent of that global display state.
+CREATE OR REPLACE FUNCTION
+  validate_operations_shopify_carrier_service_config()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+  account_provider text;
+  account_type text;
+  account_environment text;
+  account_generation integer;
+  activation_revision integer;
+  exact_finalization_link_exists boolean := false;
+  provider_authority_fields_changed boolean := false;
+BEGIN
+  SELECT
+    provider, integration_type, commerce_credential_generation
+    INTO
+      account_provider, account_type, account_generation
+  FROM operations_integration_accounts
+  WHERE organization_id = NEW.organization_id
+    AND id = NEW.integration_account_id;
+  SELECT revision INTO activation_revision
+  FROM operations_activation_scopes
+  WHERE organization_id = NEW.organization_id;
+
+  IF account_provider IS DISTINCT FROM 'shopify'
+     OR account_type IS DISTINCT FROM 'commerce' THEN
+    RAISE EXCEPTION
+      'Shopify carrier service configuration requires a Shopify commerce account';
+  END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF account_generation IS DISTINCT FROM NEW.credential_generation
+       OR activation_revision IS DISTINCT FROM NEW.activation_revision THEN
+      RAISE EXCEPTION
+        'Shopify carrier service configuration revision fence is stale';
+    END IF;
+    IF NEW.registration_state IS DISTINCT FROM 'unconfigured' THEN
+      RAISE EXCEPTION
+        'New Shopify CarrierService configuration must begin unconfigured';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF ROW(
+    NEW.id,
+    NEW.global_id,
+    NEW.organization_id,
+    NEW.integration_account_id,
+    NEW.created_by,
+    NEW.created_at
+  ) IS DISTINCT FROM ROW(
+    OLD.id,
+    OLD.global_id,
+    OLD.organization_id,
+    OLD.integration_account_id,
+    OLD.created_by,
+    OLD.created_at
+  ) THEN
+    RAISE EXCEPTION
+      'Shopify carrier service configuration identity is immutable';
+  END IF;
+  IF NEW.row_version <> OLD.row_version + 1 THEN
+    RAISE EXCEPTION
+      'Shopify carrier service configuration row version must advance once';
+  END IF;
+
+  provider_authority_fields_changed := ROW(
+    NEW.registration_state,
+    NEW.service_gid,
+    NEW.activation_revision,
+    NEW.credential_generation
+  ) IS DISTINCT FROM ROW(
+    OLD.registration_state,
+    OLD.service_gid,
+    OLD.activation_revision,
+    OLD.credential_generation
+  );
+
+  IF NEW.registration_state IN ('registered', 'disabled')
+     AND NEW.registration_state IS DISTINCT FROM OLD.registration_state THEN
+    exact_finalization_link_exists :=
+      public.operations_shopify_cs_config_has_exact_finalization_link(
+        NEW.organization_id,
+        NEW.id,
+        NEW.integration_account_id,
+        OLD.row_version,
+        NEW.row_version,
+        OLD.registration_state,
+        NEW.registration_state,
+        OLD.service_gid,
+        NEW.service_gid,
+        OLD.activation_revision,
+        NEW.activation_revision,
+        NEW.credential_generation
+      );
+    IF NOT exact_finalization_link_exists THEN
+      RAISE EXCEPTION
+        'Shopify CarrierService provider state transition requires exact resource-scoped one-time mutation evidence';
+    END IF;
+  END IF;
+
+  IF NOT exact_finalization_link_exists
+     AND provider_authority_fields_changed
+     AND (
+       account_generation IS DISTINCT FROM NEW.credential_generation
+       OR activation_revision IS DISTINCT FROM NEW.activation_revision
+     ) THEN
+    RAISE EXCEPTION
+      'Shopify carrier service configuration revision fence is stale';
+  END IF;
+  IF OLD.registration_state = 'registered'
+     AND NEW.registration_state NOT IN ('registered', 'disabled') THEN
+    RAISE EXCEPTION
+      'A registered Shopify CarrierService can leave registered state only through its exact one-time delete transition';
+  END IF;
+  IF OLD.registration_state = 'registered'
+     AND NEW.registration_state = 'registered'
+     AND NEW.service_gid IS DISTINCT FROM OLD.service_gid THEN
+    RAISE EXCEPTION
+      'A registered Shopify CarrierService identity is immutable outside its exact one-time mutation transition';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- The deferred callback-readiness trigger must make the same distinction.
+-- A policy-only update is local desired state and cannot mutate provider
+-- authority; every other update retains the legacy readiness/finalization
+-- requirement byte-for-byte.
+CREATE OR REPLACE FUNCTION
+  validate_operations_shopify_carrier_service_config_ready()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+  exact_finalization_link_exists boolean := false;
+  exact_name_finalization_exists boolean := false;
+  local_policy_only_update boolean := false;
+  name_finalization_only_update boolean := false;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    local_policy_only_update :=
+      (to_jsonb(NEW) - ARRAY[
+        'row_version', 'policy_snapshot', 'policy_hash', 'policy_revision',
+        'updated_by', 'updated_at'
+      ]::text[])
+      IS NOT DISTINCT FROM
+      (to_jsonb(OLD) - ARRAY[
+        'row_version', 'policy_snapshot', 'policy_hash', 'policy_revision',
+        'updated_by', 'updated_at'
+      ]::text[]);
+    name_finalization_only_update :=
+      NEW.registered_service_name IS DISTINCT FROM
+        OLD.registered_service_name
+      AND (
+        to_jsonb(NEW) - ARRAY[
+          'row_version', 'registered_service_name', 'updated_by', 'updated_at'
+        ]::text[]
+      ) IS NOT DISTINCT FROM (
+        to_jsonb(OLD) - ARRAY[
+          'row_version', 'registered_service_name', 'updated_by', 'updated_at'
+        ]::text[]
+      );
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND NEW.registration_state IN ('registered', 'disabled')
+     AND NEW.registration_state IS DISTINCT FROM OLD.registration_state THEN
+    exact_finalization_link_exists :=
+      public.operations_shopify_cs_config_has_exact_finalization_link(
+        NEW.organization_id,
+        NEW.id,
+        NEW.integration_account_id,
+        OLD.row_version,
+        NEW.row_version,
+        OLD.registration_state,
+        NEW.registration_state,
+        OLD.service_gid,
+        NEW.service_gid,
+        OLD.activation_revision,
+        NEW.activation_revision,
+        NEW.credential_generation
+      );
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND name_finalization_only_update
+     AND OLD.registration_state = 'registered'
+     AND NEW.registration_state = 'registered'
+     AND NEW.service_gid IS NOT DISTINCT FROM OLD.service_gid
+     AND NEW.registered_service_name IS DISTINCT FROM
+       OLD.registered_service_name THEN
+    exact_name_finalization_exists :=
+      public.operations_shopify_cs_name_has_exact_finalization_evidence(
+        NEW.organization_id,
+        NEW.id,
+        NEW.integration_account_id,
+        OLD.row_version,
+        NEW.row_version,
+        NEW.service_gid,
+        NEW.registered_service_name,
+        NEW.credential_generation
+      );
+  END IF;
+
+  IF NOT local_policy_only_update
+     AND NEW.registration_state IN ('shadow_simulated', 'registered')
+     AND NOT public.operations_shopify_carrier_service_config_is_ready(
+       NEW.organization_id,
+       NEW.id
+     )
+     AND NOT exact_finalization_link_exists
+     AND NOT exact_name_finalization_exists THEN
+    RAISE EXCEPTION
+      'Shopify carrier service configuration is not callback-ready';
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
 WITH normalized AS (
   SELECT
     config.organization_id,
@@ -55,7 +292,7 @@ WITH normalized AS (
         END
       )
     ) AS policy_snapshot
-  FROM operations_shopify_carrier_service_configs config
+  FROM public.operations_shopify_carrier_service_configs config
   JOIN operations_integration_accounts account
     ON account.organization_id = config.organization_id
    AND account.id = config.integration_account_id
@@ -110,9 +347,11 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   account_environment text;
+  activation_state text;
+  compatibility_control jsonb;
 BEGIN
   SELECT environment INTO account_environment
-  FROM operations_integration_accounts
+  FROM public.operations_integration_accounts
   WHERE organization_id = NEW.organization_id
     AND id = NEW.integration_account_id
     AND integration_type = 'commerce'
@@ -122,6 +361,56 @@ BEGIN
     RAISE EXCEPTION
       'Shopify checkout-rate control requires its exact Shopify account';
   END IF;
+
+  IF NOT (NEW.policy_snapshot ? 'checkoutRateControl') THEN
+    IF TG_OP = 'UPDATE' THEN
+      compatibility_control := OLD.policy_snapshot -> 'checkoutRateControl';
+      IF public.operations_shopify_checkout_rate_control_is_valid(
+           compatibility_control
+         ) IS NOT TRUE THEN
+        RAISE EXCEPTION
+          'Legacy Shopify config update requires an exact saved checkout-rate control';
+      END IF;
+    ELSE
+      SELECT activation.state INTO activation_state
+      FROM public.operations_activation_scopes activation
+      WHERE activation.organization_id = NEW.organization_id;
+      IF activation_state IS NULL THEN
+        RAISE EXCEPTION
+          'Legacy Shopify config insert requires its exact Operations activation';
+      END IF;
+      compatibility_control := jsonb_build_object(
+        'version', 'shopify-checkout-rate-control-v1',
+        'audience', CASE
+          WHEN public.operations_shopify_checkout_audience_policy_is_valid(
+            NEW.policy_snapshot -> 'shadowCheckoutAudience'
+          )
+          THEN NEW.policy_snapshot #>> '{shadowCheckoutAudience,mode}'
+          ELSE 'restricted_customers'
+        END,
+        'rateSource', CASE
+          WHEN account_environment = 'production'
+            OR activation_state = 'active'
+          THEN 'production'
+          ELSE 'sandbox'
+        END
+      );
+    END IF;
+
+    NEW.policy_snapshot := NEW.policy_snapshot || jsonb_build_object(
+      'checkoutRateControl', compatibility_control
+    );
+    NEW.policy_hash := encode(
+      digest(
+        public.canonical_operations_shopify_checkout_policy_jsonb(
+          NEW.policy_snapshot
+        ),
+        'sha256'
+      ),
+      'hex'
+    );
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -213,137 +502,6 @@ BEGIN
   THEN
     RAISE EXCEPTION
       'Only the Restricted TEST source may record a simulated customer policy';
-  END IF;
-
-  RETURN NEW;
-END;
-$$;
-
--- Local rating configuration remains editable when the global Operations
--- revision moves. Provider-facing identity/state fields retain the original
--- exact revision and finalization-link fences.
-CREATE OR REPLACE FUNCTION
-  validate_operations_shopify_carrier_service_config()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  account_provider text;
-  account_type text;
-  account_environment text;
-  account_generation integer;
-  activation_revision integer;
-  exact_finalization_link_exists boolean := false;
-  provider_authority_fields_changed boolean := false;
-BEGIN
-  SELECT
-    provider, integration_type, commerce_credential_generation
-    INTO
-      account_provider, account_type, account_generation
-  FROM operations_integration_accounts
-  WHERE organization_id = NEW.organization_id
-    AND id = NEW.integration_account_id;
-  SELECT revision INTO activation_revision
-  FROM operations_activation_scopes
-  WHERE organization_id = NEW.organization_id;
-
-  IF account_provider IS DISTINCT FROM 'shopify'
-     OR account_type IS DISTINCT FROM 'commerce' THEN
-    RAISE EXCEPTION
-      'Shopify carrier service configuration requires a Shopify commerce account';
-  END IF;
-  IF TG_OP = 'INSERT' THEN
-    IF account_generation IS DISTINCT FROM NEW.credential_generation
-       OR activation_revision IS DISTINCT FROM NEW.activation_revision THEN
-      RAISE EXCEPTION
-        'Shopify carrier service configuration revision fence is stale';
-    END IF;
-    IF NEW.registration_state IS DISTINCT FROM 'unconfigured' THEN
-      RAISE EXCEPTION
-        'New Shopify CarrierService configuration must begin unconfigured';
-    END IF;
-    RETURN NEW;
-  END IF;
-
-  IF ROW(
-    NEW.id,
-    NEW.global_id,
-    NEW.organization_id,
-    NEW.integration_account_id,
-    NEW.created_by,
-    NEW.created_at
-  ) IS DISTINCT FROM ROW(
-    OLD.id,
-    OLD.global_id,
-    OLD.organization_id,
-    OLD.integration_account_id,
-    OLD.created_by,
-    OLD.created_at
-  ) THEN
-    RAISE EXCEPTION
-      'Shopify carrier service configuration identity is immutable';
-  END IF;
-  IF NEW.row_version <> OLD.row_version + 1 THEN
-    RAISE EXCEPTION
-      'Shopify carrier service configuration row version must advance once';
-  END IF;
-
-  provider_authority_fields_changed := ROW(
-    NEW.registration_state,
-    NEW.service_gid,
-    NEW.registered_service_name,
-    NEW.activation_revision,
-    NEW.credential_generation
-  ) IS DISTINCT FROM ROW(
-    OLD.registration_state,
-    OLD.service_gid,
-    OLD.registered_service_name,
-    OLD.activation_revision,
-    OLD.credential_generation
-  );
-
-  IF NEW.registration_state IN ('registered', 'disabled')
-     AND NEW.registration_state IS DISTINCT FROM OLD.registration_state THEN
-    exact_finalization_link_exists :=
-      operations_shopify_cs_config_has_exact_finalization_link(
-        NEW.organization_id,
-        NEW.id,
-        NEW.integration_account_id,
-        OLD.row_version,
-        NEW.row_version,
-        OLD.registration_state,
-        NEW.registration_state,
-        OLD.service_gid,
-        NEW.service_gid,
-        OLD.activation_revision,
-        NEW.activation_revision,
-        NEW.credential_generation
-      );
-    IF NOT exact_finalization_link_exists THEN
-      RAISE EXCEPTION
-        'Shopify CarrierService provider state transition requires exact resource-scoped one-time mutation evidence';
-    END IF;
-  END IF;
-
-  IF NOT exact_finalization_link_exists
-     AND provider_authority_fields_changed
-     AND (
-       account_generation IS DISTINCT FROM NEW.credential_generation
-       OR activation_revision IS DISTINCT FROM NEW.activation_revision
-     ) THEN
-    RAISE EXCEPTION
-      'Shopify carrier service configuration revision fence is stale';
-  END IF;
-  IF OLD.registration_state = 'registered'
-     AND NEW.registration_state NOT IN ('registered', 'disabled') THEN
-    RAISE EXCEPTION
-      'A registered Shopify CarrierService can leave registered state only through its exact one-time delete transition';
-  END IF;
-  IF OLD.registration_state = 'registered'
-     AND NEW.registration_state = 'registered'
-     AND NEW.service_gid IS DISTINCT FROM OLD.service_gid THEN
-    RAISE EXCEPTION
-      'A registered Shopify CarrierService identity is immutable outside its exact one-time mutation transition';
   END IF;
 
   RETURN NEW;
@@ -630,6 +788,7 @@ CREATE OR REPLACE FUNCTION
 RETURNS boolean
 LANGUAGE sql
 STABLE
+SET search_path = pg_catalog, public, pg_temp
 AS $$
   SELECT requested_to_row_version = requested_from_row_version + 1
     AND EXISTS (
@@ -711,8 +870,22 @@ BEGIN
      AND NEW.service_gid IS NOT DISTINCT FROM OLD.service_gid
      AND NEW.registered_service_name IS DISTINCT FROM
        OLD.registered_service_name THEN
+    IF (
+         to_jsonb(NEW) - ARRAY[
+           ''row_version'', ''registered_service_name'',
+           ''updated_by'', ''updated_at''
+         ]::text[]
+       ) IS DISTINCT FROM (
+         to_jsonb(OLD) - ARRAY[
+           ''row_version'', ''registered_service_name'',
+           ''updated_by'', ''updated_at''
+         ]::text[]
+       ) THEN
+      RAISE EXCEPTION
+        ''Shopify CarrierService name finalization must be name-only'';
+    END IF;
     exact_name_finalization_exists :=
-      operations_shopify_cs_name_has_exact_finalization_evidence(
+      public.operations_shopify_cs_name_has_exact_finalization_evidence(
         NEW.organization_id,
         NEW.id,
         NEW.integration_account_id,
@@ -729,7 +902,6 @@ BEGIN
   END IF;
 
   IF NOT exact_finalization_link_exists
-     AND NOT exact_name_finalization_exists
      AND provider_authority_fields_changed'
   );
   IF definition = prior
@@ -1239,6 +1411,9 @@ BEGIN
       operations_shopify_checkout_rate_receipts_activation_state_check;
   ALTER TABLE operations_shopify_checkout_rate_receipts
     DROP CONSTRAINT IF EXISTS
+      operations_shopify_checkout_rate_receipt_activation_state_check;
+  ALTER TABLE operations_shopify_checkout_rate_receipts
+    DROP CONSTRAINT IF EXISTS
       operations_shopify_checkout_receipts_activation_state_valid;
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint
@@ -1260,6 +1435,61 @@ BEGIN
   END IF;
 END;
 $$;
+
+-- Expand-phase rolling compatibility: the previously deployed callback omits
+-- rate_source. Derive only the exact source already saved on the same current
+-- config identity; the existing receipt validator still enforces every
+-- configuration, activation, inventory, and rating-runtime fence afterward.
+CREATE OR REPLACE FUNCTION
+  derive_operations_shopify_checkout_rate_source_compat()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  derived_rate_source text;
+BEGIN
+  IF NEW.rate_source IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT config.policy_snapshot #>> '{checkoutRateControl,rateSource}'
+    INTO derived_rate_source
+  FROM public.operations_shopify_carrier_service_configs config
+  WHERE config.organization_id = NEW.organization_id
+    AND config.integration_account_id = NEW.integration_account_id
+    AND config.id = NEW.config_id
+    AND config.row_version = NEW.config_row_version
+    AND config.credential_generation = NEW.credential_generation
+    AND config.policy_revision = NEW.policy_revision
+    AND config.policy_hash = NEW.policy_hash
+  FOR SHARE;
+
+  IF derived_rate_source IS NULL
+     OR derived_rate_source NOT IN ('sandbox', 'production')
+     OR derived_rate_source IS DISTINCT FROM (
+       CASE NEW.activation_state
+         WHEN 'shadow' THEN 'sandbox'
+         WHEN 'active' THEN 'production'
+         ELSE NULL
+       END
+     ) THEN
+    RAISE EXCEPTION
+      'Shopify checkout receipt rate source compatibility fence is stale';
+  END IF;
+
+  NEW.rate_source := derived_rate_source;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS
+  derive_operations_shopify_checkout_rate_source_compat_write
+  ON public.operations_shopify_checkout_rate_receipts;
+CREATE TRIGGER derive_operations_shopify_checkout_rate_source_compat_write
+BEFORE INSERT
+ON public.operations_shopify_checkout_rate_receipts
+FOR EACH ROW EXECUTE FUNCTION
+  derive_operations_shopify_checkout_rate_source_compat();
 
 -- Keep the receipt's observed activation as audit evidence, but validate its
 -- irreversible rating lane against the saved source and rating-runtime facts.
@@ -1362,16 +1592,58 @@ BEGIN
     definition := regexp_replace(
       definition,
       activation_source_pattern,
-      'receipt.rate_source',
+      'receipt.rate_source /* rolling-health compatibility:'
+        || ' carrier_integration.environment = CASE receipt.activation_state */',
       'g'
     );
     IF definition = prior
-       OR position('CASE receipt.activation_state' IN definition) > 0 THEN
+       OR regexp_count(definition, activation_source_pattern) > 0 THEN
       RAISE EXCEPTION
         'Unable to bind % to receipt rate_source', function_name;
     END IF;
     EXECUTE definition;
   END LOOP;
+END;
+$$;
+
+-- Finalization must use the immutable receipt source as well. Two legacy
+-- activation-derived carrier-environment checks remain in the 0285 body.
+DO $$
+DECLARE
+  definition text;
+  activation_source_pattern text;
+  occurrence_count integer;
+BEGIN
+  SELECT pg_get_functiondef(
+    'validate_op_shopify_checkout_attempt_finalization()'::regprocedure
+  ) INTO definition;
+  activation_source_pattern :=
+    'CASE[[:space:]]+NEW[.]activation_state'
+    || '[[:space:]]+WHEN[[:space:]]+''shadow'''
+    || '[[:space:]]+THEN[[:space:]]+''sandbox'''
+    || '[[:space:]]+WHEN[[:space:]]+''active'''
+    || '[[:space:]]+THEN[[:space:]]+''production'''
+    || '[[:space:]]+ELSE[[:space:]]+''__invalid__'''
+    || '[[:space:]]+END';
+  occurrence_count := regexp_count(definition, activation_source_pattern);
+  IF occurrence_count <> 2 THEN
+    RAISE EXCEPTION
+      'Expected two activation-derived finalization sources, found %',
+      occurrence_count;
+  END IF;
+  definition := regexp_replace(
+    definition,
+    activation_source_pattern,
+    'NEW.rate_source /* rolling-health compatibility:'
+      || ' carrier_integration.environment = CASE NEW.activation_state */',
+    'g'
+  );
+  IF regexp_count(definition, activation_source_pattern) > 0
+     OR regexp_count(definition, 'NEW[.]rate_source') < 2 THEN
+    RAISE EXCEPTION
+      'Unable to bind checkout attempt finalization to receipt rate_source';
+  END IF;
+  EXECUTE definition;
 END;
 $$;
 
@@ -1421,6 +1693,62 @@ BEGIN
 END;
 $$;
 
+-- Every 0299 relation-reading authority function resolves system objects
+-- first, exact public application relations second, and the session temp
+-- schema last. This prevents caller-controlled schemas or temporary tables
+-- from substituting authorization/readiness evidence at runtime.
+DO $$
+DECLARE
+  function_signature text;
+BEGIN
+  FOREACH function_signature IN ARRAY ARRAY[
+    'operations_shopify_checkout_rate_control_is_valid(jsonb)',
+    'operations_shopify_checkout_rate_control_response_is_valid(jsonb)',
+    'validate_operations_shopify_checkout_rate_control_config()',
+    'validate_operations_shopify_customer_rate_policy_write()',
+    'validate_operations_shopify_carrier_service_config()',
+    'validate_operations_shopify_carrier_service_config_ready()',
+    'operations_shopify_cs_config_has_exact_finalization_link(uuid,uuid,uuid,bigint,bigint,text,text,text,text,integer,integer,integer)',
+    'protect_operations_commerce_external_effect_intent()',
+    'protect_ops_shopify_cs_mut_authorization()',
+    'protect_ops_shopify_cs_mut_attempt()',
+    'protect_ops_shopify_cs_attempt_authorization_lock()',
+    'protect_ops_shopify_cs_mut_outcome()',
+    'protect_ops_shopify_cs_mut_resolution()',
+    'protect_ops_shopify_cs_name_update_authorization()',
+    'protect_ops_shopify_cs_brand_override_update()',
+    'protect_ops_shopify_cs_config_mut_link()',
+    'operations_shopify_cs_name_has_exact_finalization_evidence(uuid,uuid,uuid,bigint,bigint,text,text,integer)',
+    'operations_shopify_carrier_configuration_allows_rating(jsonb,text)',
+    'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)',
+    'operations_shopify_carrier_service_config_is_ready(uuid,uuid)',
+    'operations_shopify_carrier_service_rating_environment_is_ready(uuid,uuid,text)',
+    'operations_shopify_carrier_service_rating_runtime_is_ready(uuid,uuid)',
+    'validate_operations_commerce_variant_pack_mapping()',
+    'validate_operations_shopify_checkout_rate_control_receipt()',
+    'protect_operations_shopify_checkout_rate_control_receipt()',
+    'validate_operations_shopify_checkout_rate_receipt_insert()',
+    'protect_operations_shopify_checkout_rate_receipt()',
+    'operations_legacy_shopify_config_carrier_account_id(uuid,text,text)',
+    'derive_operations_legacy_shopify_carrier_selection_key()',
+    'validate_one_off_rate_selection_key()',
+    'protect_op_shopify_checkout_provider_attempt()',
+    'validate_op_shopify_checkout_attempt_finalization()',
+    'validate_operations_pack_rate_run_complete()',
+    'derive_operations_shopify_checkout_rate_source_compat()'
+  ]::text[] LOOP
+    IF to_regprocedure('public.' || function_signature) IS NULL THEN
+      RAISE EXCEPTION
+        'Unable to pin missing 0299 authority function %', function_signature;
+    END IF;
+    EXECUTE format(
+      'ALTER FUNCTION public.%s SET search_path = pg_catalog, public, pg_temp',
+      function_signature
+    );
+  END LOOP;
+END;
+$$;
+
 COMMENT ON FUNCTION
   operations_shopify_checkout_rate_control_is_valid(jsonb) IS
   'Validates the exact account-level checkout audience and explicit TEST/LIVE carrier rate source.';
@@ -1431,3 +1759,5 @@ COMMENT ON TABLE operations_shopify_checkout_rate_control_receipts IS
   'Immutable idempotent administrator command evidence for zero-provider-write checkout audience/source changes.';
 COMMENT ON COLUMN operations_shopify_checkout_rate_receipts.rate_source IS
   'Exact saved sandbox or production carrier credential lane used for this receipt; independent of the observed Operations activation label.';
+COMMENT ON FUNCTION validate_op_shopify_checkout_attempt_finalization() IS
+  'Requires one immutable attempt per rate-source-applicable configured direct carrier account and exact succeeded account evidence for every public offer; successful losing accounts may have no deduplicated offer and the opposite configured environment is not executed.';

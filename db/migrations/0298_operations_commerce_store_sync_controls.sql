@@ -1,6 +1,8 @@
 -- Store synchronization is an account-scoped read control. It is deliberately
 -- independent from provider-write authority and from Shopify CarrierService.
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS operations_commerce_store_sync_controls (
   organization_id uuid NOT NULL,
   integration_account_id uuid NOT NULL,
@@ -152,11 +154,12 @@ WHERE released_at IS NULL;
 COMMENT ON TABLE operations_commerce_store_sync_read_leases IS
   'Durable bounded automatic/manual provider-read intent leases. Automatic active leases make an explicit Pause report draining; neither lease kind grants provider-write authority.';
 
+-- Expand phase: the previously deployed runtime omits these new columns.
+-- Retain the strict automatic defaults until a later migration contracts them
+-- after every serving runtime writes provider_read_authority explicitly.
 ALTER TABLE operations_commerce_intake_read_intents
-  ADD COLUMN IF NOT EXISTS provider_read_authority text;
-UPDATE operations_commerce_intake_read_intents
-SET provider_read_authority = 'automatic'
-WHERE provider_read_authority IS NULL;
+  ADD COLUMN IF NOT EXISTS provider_read_authority text
+  NOT NULL DEFAULT 'automatic';
 ALTER TABLE operations_commerce_intake_read_intents
   ALTER COLUMN provider_read_authority SET NOT NULL;
 ALTER TABLE operations_commerce_intake_read_intents
@@ -167,10 +170,8 @@ ALTER TABLE operations_commerce_intake_read_intents
   );
 
 ALTER TABLE operations_commerce_product_image_observation_sets
-  ADD COLUMN IF NOT EXISTS provider_read_authority text;
-UPDATE operations_commerce_product_image_observation_sets
-SET provider_read_authority = 'automatic'
-WHERE provider_read_authority IS NULL;
+  ADD COLUMN IF NOT EXISTS provider_read_authority text
+  NOT NULL DEFAULT 'automatic';
 ALTER TABLE operations_commerce_product_image_observation_sets
   ALTER COLUMN provider_read_authority SET NOT NULL;
 ALTER TABLE operations_commerce_product_image_observation_sets
@@ -181,22 +182,8 @@ ALTER TABLE operations_commerce_product_image_observation_sets
   );
 
 ALTER TABLE operations_commerce_product_image_import_jobs
-  ADD COLUMN IF NOT EXISTS provider_read_authority text;
-UPDATE operations_commerce_product_image_import_jobs job
-SET provider_read_authority = observation_set.provider_read_authority
-FROM operations_commerce_product_image_observations observation
-JOIN operations_commerce_product_image_observation_sets observation_set
-  ON observation_set.organization_id = observation.organization_id
- AND observation_set.integration_account_id =
-       observation.integration_account_id
- AND observation_set.id = observation.observation_set_id
-WHERE job.organization_id = observation.organization_id
-  AND job.integration_account_id = observation.integration_account_id
-  AND job.observation_id = observation.id
-  AND job.provider_read_authority IS NULL;
-UPDATE operations_commerce_product_image_import_jobs
-SET provider_read_authority = 'automatic'
-WHERE provider_read_authority IS NULL;
+  ADD COLUMN IF NOT EXISTS provider_read_authority text
+  NOT NULL DEFAULT 'automatic';
 ALTER TABLE operations_commerce_product_image_import_jobs
   ALTER COLUMN provider_read_authority SET NOT NULL;
 ALTER TABLE operations_commerce_product_image_import_jobs
@@ -1431,5 +1418,47 @@ BEGIN
     AND resolution.mapping_count IS NOT DISTINCT FROM job_row.mapping_count
     AND resolution.mapping_fingerprint_sha256
           IS NOT DISTINCT FROM job_row.mapping_fingerprint_sha256;
+END;
+$$;
+
+-- Store-sync authority/readiness functions resolve built-ins first, exact
+-- public application relations second, and temporary objects last. Pin every
+-- function covered by the 0298 rewritten-function health catalog.
+DO $$
+DECLARE
+  function_signature text;
+BEGIN
+  FOREACH function_signature IN ARRAY ARRAY[
+    'operations_commerce_store_sync_effective_reason(uuid,uuid)',
+    'operations_commerce_store_sync_is_running(uuid,uuid)',
+    'operations_commerce_provider_read_authority_is_current(uuid,uuid,text)',
+    'operations_commerce_product_image_read_authority_is_current(uuid,uuid,text,integer,text)',
+    'guard_operations_commerce_product_image_read_authority()',
+    'guard_operations_commerce_store_sync_read_lease()',
+    'seed_operations_commerce_store_sync_control()',
+    'protect_commerce_order_sync_session_lineage()',
+    'protect_commerce_order_observation_lineage()',
+    'commerce_order_observation_accepts_children(uuid,uuid)',
+    'protect_shopify_order_webhook_read()',
+    'protect_shopify_order_webhook_target()',
+    'guard_operations_commerce_product_image_binding()',
+    'protect_operations_commerce_store_sync_receipt()',
+    'validate_operations_commerce_store_sync_identity()',
+    'operations_shopify_inventory_read_config_is_ready(uuid,uuid)',
+    'operations_commerce_product_image_account_is_current(uuid,uuid,text,integer)',
+    'operations_commerce_product_image_account_lineage_is_current(uuid,uuid,text,integer)',
+    'operations_commerce_product_image_mapping_targets(uuid,uuid,text,text)',
+    'operations_commerce_product_image_job_fences_are_current(uuid,uuid)',
+    'operations_commerce_product_image_projection_fences_are_current(uuid,uuid)'
+  ]::text[] LOOP
+    IF to_regprocedure('public.' || function_signature) IS NULL THEN
+      RAISE EXCEPTION
+        'Unable to pin missing 0298 Store-sync function %', function_signature;
+    END IF;
+    EXECUTE format(
+      'ALTER FUNCTION public.%s SET search_path = pg_catalog, public, pg_temp',
+      function_signature
+    );
+  END LOOP;
 END;
 $$;

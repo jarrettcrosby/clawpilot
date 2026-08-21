@@ -1300,7 +1300,7 @@ async function assertStructure(client) {
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_op_shopify_checkout_attempt_finalization()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%carrier_integration.environment = CASE NEW.activation_state%'
+           LIKE '%carrier_integration.environment = NEW.rate_source%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
          'validate_op_shopify_checkout_attempt_finalization()'
        )), '[[:space:]]+', ' ', 'g')

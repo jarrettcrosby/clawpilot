@@ -778,6 +778,80 @@ async function seedProcessingReceipt(client, {
   return createdAt
 }
 
+async function runLegacyReceiptInsertCompatibilityAcceptance(client) {
+  const receiptId = '28500000-0000-4000-8000-000000000099'
+  const createdAt = new Date()
+  await client.query('SET session_replication_role = replica')
+  try {
+    await client.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET registration_state = 'registered',
+           service_gid = 'gid://shopify/DeliveryCarrierService/299'
+       WHERE organization_id =
+           '28500000-0000-4000-8000-000000000001'::uuid
+         AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+  }
+  try {
+    const inserted = await client.query(
+      `INSERT INTO operations_shopify_checkout_rate_receipts (
+         id, organization_id, integration_account_id, config_id,
+         config_row_version, credential_generation, activation_revision,
+         activation_state, policy_revision, policy_hash, warehouse_id,
+         algorithm_version, request_fingerprint, destination_fingerprint,
+         carrier_destination_fingerprint, line_quantity_fingerprint,
+         request_evidence_hash, redacted_request_snapshot, currency,
+         idempotency_key, status, lease_token, lease_expires_at, claimed_by,
+         line_count, inventory_snapshot_hash, inventory_snapshot_at,
+         reconciliation_window_seconds, reconciliation_deadline_at,
+         created_at, updated_at
+       ) VALUES (
+         $1::uuid, '28500000-0000-4000-8000-000000000001'::uuid,
+         '28500000-0000-4000-8000-000000000010'::uuid,
+         '28500000-0000-4000-8000-000000000090'::uuid,
+         1, 1, 1, 'shadow', 1, repeat('f', 64),
+         '28500000-0000-4000-8000-000000000040'::uuid,
+         'disposable-one-or-two-carriers-v1', repeat('1', 64),
+         repeat('2', 64), repeat('9', 64), repeat('3', 64), repeat('4', 64),
+         '{}'::jsonb, 'USD', 'configured-carrier-legacy-writer-receipt',
+         'processing', gen_random_uuid(),
+         $2::timestamptz + interval '5 minutes',
+         'legacy-disposable-postgres-acceptance', 1, repeat('5', 64),
+         $2::timestamptz, 86400,
+         $2::timestamptz + interval '86400 seconds',
+         $2::timestamptz, $2::timestamptz
+       )
+       RETURNING rate_source, status`,
+      [receiptId, createdAt],
+    )
+    assert.deepEqual(
+      inserted.rows,
+      [{ rate_source: 'sandbox', status: 'processing' }],
+      'The actual receipt table must accept an old callback shape and derive the exact saved TEST source',
+    )
+  } finally {
+    await client.query('SET session_replication_role = replica')
+    try {
+      await client.query(
+        `DELETE FROM operations_shopify_checkout_rate_receipts
+         WHERE id = $1::uuid`,
+        [receiptId],
+      )
+      await client.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET registration_state = 'shadow_simulated', service_gid = NULL
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+      )
+    } finally {
+      await client.query('SET session_replication_role = origin')
+    }
+  }
+}
+
 async function insertCallbackRateEvidence(client, {
   provider = 'ups_rest',
   environment,
@@ -841,6 +915,7 @@ async function runReceiptAttemptAcceptance(client, {
   receiptId,
   receiptGlobalId,
   activationState,
+  rateSource,
   environment,
   integrationAccountId,
   carrierAccountId,
@@ -857,6 +932,7 @@ async function runReceiptAttemptAcceptance(client, {
     id: receiptId,
     globalId: receiptGlobalId,
     activationState,
+    rateSource,
     carrierDestinationFingerprint: destinationFingerprint,
     idempotencyKey,
   })
@@ -1491,7 +1567,6 @@ async function runRollingMigrationAcceptance(databaseUrl) {
         migration,
         diagnosticMigration,
         registeredRateSourceMigration,
-        checkoutRateControlMigration,
       ]],
     )
   } finally {
@@ -1503,8 +1578,146 @@ async function runRollingMigrationAcceptance(databaseUrl) {
     timeout: 240_000,
   })
 
+  const preRateControl = await legacyPool.connect()
+  let preRateControlConfig = null
+  try {
+    await preRateControl.query('BEGIN')
+    await preRateControl.query('SET LOCAL session_replication_role = replica')
+    await preRateControl.query(
+      `UPDATE operations_activation_scopes
+       SET revision = revision + 1
+       WHERE organization_id =
+         '28500000-0000-4000-8000-000000000001'::uuid`,
+    )
+    await preRateControl.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_snapshot = policy_snapshot - 'checkoutRateControl',
+           policy_hash = encode(
+             digest(
+               canonical_operations_shopify_checkout_policy_jsonb(
+                 policy_snapshot - 'checkoutRateControl'
+               ),
+               'sha256'
+             ),
+             'hex'
+           )
+       WHERE organization_id =
+         '28500000-0000-4000-8000-000000000001'::uuid
+         AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+    )
+    const snapshot = await preRateControl.query(
+      `SELECT to_jsonb(config) - ARRAY[
+         'row_version', 'policy_snapshot', 'policy_hash', 'policy_revision',
+         'updated_by', 'updated_at'
+       ]::text[] AS provider_authority,
+       row_version::text AS row_version,
+       policy_revision AS policy_revision
+       FROM operations_shopify_carrier_service_configs config
+       WHERE organization_id =
+         '28500000-0000-4000-8000-000000000001'::uuid
+         AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+    )
+    preRateControlConfig = snapshot.rows[0]
+    await preRateControl.query(
+      `DELETE FROM schema_migrations WHERE filename = $1`,
+      [checkoutRateControlMigration],
+    )
+    await preRateControl.query('COMMIT')
+  } catch (error) {
+    await preRateControl.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    preRateControl.release()
+  }
+
+  command('node', ['scripts/db-migrate.mjs'], {
+    env: { ...process.env, DATABASE_URL: databaseUrl, PGSSLMODE: 'disable' },
+    timeout: 240_000,
+  })
+
   const migrated = await legacyPool.connect()
   try {
+    const migratedRateControlConfig = await migrated.query(
+      `SELECT to_jsonb(config) - ARRAY[
+         'row_version', 'policy_snapshot', 'policy_hash', 'policy_revision',
+         'updated_by', 'updated_at'
+       ]::text[] AS provider_authority,
+       row_version::text AS row_version,
+       policy_revision AS policy_revision,
+       policy_snapshot #>> '{checkoutRateControl,rateSource}' AS rate_source
+       FROM operations_shopify_carrier_service_configs config
+       WHERE organization_id =
+         '28500000-0000-4000-8000-000000000001'::uuid
+         AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+    )
+    assert.deepEqual(
+      migratedRateControlConfig.rows[0]?.provider_authority,
+      preRateControlConfig?.provider_authority,
+      '0299 must preserve every provider-authority field while backfilling a stale config',
+    )
+    assert.equal(
+      migratedRateControlConfig.rows[0]?.row_version,
+      String(Number(preRateControlConfig?.row_version || '0') + 1),
+      '0299 must advance the config row version exactly once',
+    )
+    assert.equal(
+      migratedRateControlConfig.rows[0]?.policy_revision,
+      String(Number(preRateControlConfig?.policy_revision || '0') + 1),
+      '0299 must advance the policy revision exactly once',
+    )
+    assert.equal(
+      migratedRateControlConfig.rows[0]?.rate_source,
+      'sandbox',
+      '0299 must derive the legacy Shadow config sandbox source despite activation-revision drift',
+    )
+
+    const savedPolicy = await migrated.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_snapshot = jsonb_set(
+             policy_snapshot,
+             '{checkoutRateControl,audience}',
+             '"off"'::jsonb
+           ),
+           policy_hash = encode(
+             digest(
+               canonical_operations_shopify_checkout_policy_jsonb(
+                 jsonb_set(
+                   policy_snapshot,
+                   '{checkoutRateControl,audience}',
+                   '"off"'::jsonb
+                 )
+               ),
+               'sha256'
+             ),
+             'hex'
+           ),
+           policy_revision = policy_revision + 1,
+           row_version = row_version + 1,
+           updated_at = now()
+       WHERE organization_id =
+         '28500000-0000-4000-8000-000000000001'::uuid
+         AND id = '28500000-0000-4000-8000-000000000090'::uuid
+       RETURNING policy_snapshot #>> '{checkoutRateControl,audience}' AS audience`,
+    )
+    assert.equal(
+      savedPolicy.rows[0]?.audience,
+      'off',
+      'a strictly local policy update must remain editable while activation evidence is stale',
+    )
+    await assert.rejects(
+      migrated.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET service_gid = 'gid://shopify/CarrierService/drifted',
+             row_version = row_version + 1,
+             updated_at = now()
+         WHERE organization_id =
+           '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+      ),
+      /not callback-ready|revision fence is stale/u,
+      'a non-policy config mutation must retain the stale readiness fence',
+    )
+
     const historicalRuns = await migrated.query(
       `SELECT id::text, selected_carrier_account_id::text
        FROM operations_pack_rate_runs
@@ -1921,8 +2134,8 @@ async function main() {
     )
     assert.match(
       finalizer.rows[0]?.definition || '',
-      /CASE new\.activation_state[\s\S]*WHEN 'shadow' THEN 'sandbox'[\s\S]*WHEN 'active' THEN 'production'/iu,
-      'attempt finalization must select only the receipt activation environment',
+      /new\.rate_source/iu,
+      'attempt finalization must select only the immutable receipt rate source',
     )
     assert.doesNotMatch(
       finalizer.rows[0]?.definition || '',
@@ -1938,6 +2151,7 @@ async function main() {
         true,
         'one verified UPS binding must be callback-ready',
       )
+      await runLegacyReceiptInsertCompatibilityAcceptance(client)
 
       await client.query('SET session_replication_role = replica')
       await client.query(
@@ -2132,6 +2346,23 @@ async function main() {
         amountMinor: 1000,
         destinationFingerprint: repeatHex('8'),
         idempotencyKey: 'configured-carrier-full-shadow',
+      })
+      await runReceiptAttemptAcceptance(client, {
+        receiptId: '28500000-0000-4000-8000-000000000096',
+        receiptGlobalId: 'gsqr2850006',
+        activationState: 'active',
+        rateSource: 'sandbox',
+        environment: 'sandbox',
+        integrationAccountId: '28500000-0000-4000-8000-000000000020',
+        carrierAccountId: '28500000-0000-4000-8000-000000000070',
+        carrierAccountGlobalId: 'gach00000000001',
+        provider: 'ups_rest',
+        packageCode: '02',
+        serviceCode: '03',
+        serviceName: 'UPS Ground',
+        amountMinor: 1000,
+        destinationFingerprint: repeatHex('d'),
+        idempotencyKey: 'configured-carrier-decoupled-sandbox-source',
       })
 
       await client.query('SET session_replication_role = replica')

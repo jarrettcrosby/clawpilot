@@ -63,13 +63,13 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
           'plpgsql', 'v', 'trigger'
         )
     )
-    SELECT count(*) = 10
-      AND count(installed_function.oid) = 10
-      AND bool_and(COALESCE(
-        encode(
-          digest(
-            convert_to(
-              btrim(regexp_replace(
+    SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 10
+      AND pg_catalog.count(installed_function.oid) OPERATOR(pg_catalog.=) 10
+      AND pg_catalog.bool_and(COALESCE(
+        pg_catalog.encode(
+          public.digest(
+            pg_catalog.convert_to(
+              pg_catalog.btrim(pg_catalog.regexp_replace(
                 installed_function.prosrc,
                 '[[:space:]]+', ' ', 'g'
               )),
@@ -78,26 +78,33 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
             'sha256'
           ),
           'hex'
-        ) = required_function.body_sha256
-        AND installed_language.lanname = required_function.language_name
-        AND installed_function.provolatile = required_function.volatility
-        AND pg_get_function_result(installed_function.oid) =
+        ) OPERATOR(pg_catalog.=) required_function.body_sha256
+        AND installed_language.lanname OPERATOR(pg_catalog.=)
+              required_function.language_name
+        AND installed_function.provolatile OPERATOR(pg_catalog.=)
+              required_function.volatility
+        AND pg_catalog.pg_get_function_result(installed_function.oid)
+              OPERATOR(pg_catalog.=)
               required_function.result_type
-        AND installed_function.prokind = 'f'
+        AND installed_function.prokind OPERATOR(pg_catalog.=) 'f'
         AND NOT installed_function.proisstrict
         AND NOT installed_function.prosecdef
         AND NOT installed_function.proleakproof
-        AND installed_function.proparallel = 'u'
-        AND installed_function.proconfig IS NULL,
+        AND installed_function.proparallel OPERATOR(pg_catalog.=) 'u'
+        AND installed_function.proconfig OPERATOR(pg_catalog.=) ARRAY[
+          'search_path=pg_catalog, public, pg_temp'
+        ]::text[],
         false
       ))
     FROM required_function
-    LEFT JOIN pg_proc installed_function
-      ON installed_function.oid = to_regprocedure(
+    LEFT JOIN pg_catalog.pg_proc installed_function
+      ON installed_function.oid OPERATOR(pg_catalog.=)
+        pg_catalog.to_regprocedure(
         required_function.signature
       )
-    LEFT JOIN pg_language installed_language
-      ON installed_language.oid = installed_function.prolang
+    LEFT JOIN pg_catalog.pg_language installed_language
+      ON installed_language.oid OPERATOR(pg_catalog.=)
+        installed_function.prolang
   )
 `
 
@@ -132,16 +139,16 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
         ('public.operations_commerce_product_image_job_fences_are_current(uuid,uuid)'),
         ('public.operations_commerce_product_image_projection_fences_are_current(uuid,uuid)')
     )
-    SELECT count(*) = 21
-      AND count(installed_function.oid) = 21
-      AND encode(
-        digest(
-          convert_to(
-            string_agg(
-              concat_ws(
+    SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 21
+      AND pg_catalog.count(installed_function.oid) OPERATOR(pg_catalog.=) 21
+      AND pg_catalog.encode(
+        public.digest(
+          pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              pg_catalog.concat_ws(
                 '|',
                 required_function.signature,
-                btrim(regexp_replace(
+                pg_catalog.btrim(pg_catalog.regexp_replace(
                   installed_function.prosrc,
                   '[[:space:]]+', ' ', 'g'
                 )),
@@ -152,26 +159,32 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
                 installed_function.proleakproof::text,
                 installed_function.proparallel::text,
                 COALESCE(
-                  array_to_string(installed_function.proconfig, ','),
+                  pg_catalog.array_to_string(
+                    installed_function.proconfig,
+                    ','
+                  ),
                   ''
                 ),
-                pg_get_function_result(installed_function.oid)
+                pg_catalog.pg_get_function_result(installed_function.oid)
               ),
-              chr(10) ORDER BY required_function.signature
+              pg_catalog.chr(10) ORDER BY required_function.signature
             ),
             'UTF8'
           ),
           'sha256'
         ),
         'hex'
-      ) = '4b2c6336c67d022571a0086f47a60cacb0ebd02b6582b1104d96a99fa76be959'
+      ) OPERATOR(pg_catalog.=)
+        'bb66159fdec700a84c7dccd76088b9052f107f78cf604bb43dbd95163513e2b6'
     FROM required_function
-    LEFT JOIN pg_proc installed_function
-      ON installed_function.oid = to_regprocedure(
+    LEFT JOIN pg_catalog.pg_proc installed_function
+      ON installed_function.oid OPERATOR(pg_catalog.=)
+        pg_catalog.to_regprocedure(
         required_function.signature
       )
-    LEFT JOIN pg_language installed_language
-      ON installed_language.oid = installed_function.prolang
+    LEFT JOIN pg_catalog.pg_language installed_language
+      ON installed_language.oid OPERATOR(pg_catalog.=)
+        installed_function.prolang
   )
 `
 
@@ -181,11 +194,11 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
 export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
   (
     (
-      SELECT encode(
-        digest(
-          convert_to(
-            string_agg(
-              concat_ws(
+      SELECT pg_catalog.encode(
+        public.digest(
+          pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              pg_catalog.concat_ws(
                 '|',
                 installed_table.relname,
                 installed_constraint.conname,
@@ -193,9 +206,9 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
                 installed_constraint.convalidated::text,
                 installed_constraint.confdeltype::text,
                 installed_constraint.confupdtype::text,
-                pg_get_constraintdef(installed_constraint.oid)
+                canonical_constraint.definition
               ),
-              chr(10) ORDER BY
+              pg_catalog.chr(10) ORDER BY
                 installed_table.relname,
                 installed_constraint.conname
             ),
@@ -205,47 +218,329 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
         ),
         'hex'
       )
-      FROM pg_constraint installed_constraint
-      JOIN pg_class installed_table
-        ON installed_table.oid = installed_constraint.conrelid
-      JOIN pg_namespace installed_namespace
-        ON installed_namespace.oid = installed_table.relnamespace
-      WHERE installed_namespace.nspname = 'public'
+      FROM pg_catalog.pg_constraint installed_constraint
+      JOIN pg_catalog.pg_class installed_table
+        ON installed_table.oid OPERATOR(pg_catalog.=)
+          installed_constraint.conrelid
+      JOIN pg_catalog.pg_namespace installed_namespace
+        ON installed_namespace.oid OPERATOR(pg_catalog.=)
+          installed_table.relnamespace
+      CROSS JOIN LATERAL (
+        SELECT pg_catalog.pg_get_constraintdef(
+          installed_constraint.oid
+        ) AS definition
+      ) raw_constraint
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN installed_constraint.conname OPERATOR(pg_catalog.=)
+                 'operations_commerce_store_sync_controls_account_fkey'
+           AND COALESCE(
+                 installed_constraint.confrelid OPERATOR(pg_catalog.=)
+                   pg_catalog.to_regclass(
+                     'public.operations_integration_accounts'
+                   ),
+                 false
+               ) IS NOT TRUE
+            THEN '<unexpected-reference-binding>' OPERATOR(pg_catalog.||)
+              raw_constraint.definition
+          WHEN installed_constraint.conname OPERATOR(pg_catalog.=) ANY (
+                 ARRAY[
+                   'operations_commerce_store_sync_receipts_account_fkey',
+                   'operations_commerce_store_sync_read_leases_account_fkey'
+                 ]::pg_catalog.text[]
+               )
+           AND COALESCE(
+                 installed_constraint.confrelid OPERATOR(pg_catalog.=)
+                   pg_catalog.to_regclass(
+                     'public.operations_commerce_store_sync_controls'
+                   ),
+                 false
+               ) IS NOT TRUE
+            THEN '<unexpected-reference-binding>' OPERATOR(pg_catalog.||)
+              raw_constraint.definition
+          WHEN installed_constraint.conname OPERATOR(pg_catalog.=)
+                 'operations_commerce_store_sync_controls_account_fkey'
+            THEN pg_catalog.replace(
+              raw_constraint.definition,
+              'REFERENCES public.operations_integration_accounts',
+              'REFERENCES operations_integration_accounts'
+            )
+          WHEN installed_constraint.conname OPERATOR(pg_catalog.=) ANY (
+                 ARRAY[
+                   'operations_commerce_store_sync_receipts_account_fkey',
+                   'operations_commerce_store_sync_read_leases_account_fkey'
+                 ]::pg_catalog.text[]
+               )
+            THEN pg_catalog.replace(
+              raw_constraint.definition,
+              'REFERENCES public.operations_commerce_store_sync_controls',
+              'REFERENCES operations_commerce_store_sync_controls'
+            )
+          ELSE raw_constraint.definition
+        END AS definition
+      ) reference_normalized_constraint
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN pg_catalog.strpos(
+                 reference_normalized_constraint.definition,
+                 'length('
+               ) OPERATOR(pg_catalog.>) 0
+            THEN CASE
+              WHEN pg_catalog.strpos(
+                     installed_constraint.conbin::pg_catalog.text,
+                     ':funcid '
+                       OPERATOR(pg_catalog.||) pg_catalog.to_regprocedure(
+                         'pg_catalog.length(text)'
+                       )::pg_catalog.oid::pg_catalog.text
+                       OPERATOR(pg_catalog.||) ' '
+                   ) OPERATOR(pg_catalog.>) 0
+                THEN pg_catalog.replace(
+                  reference_normalized_constraint.definition,
+                  'pg_catalog.length(',
+                  'length('
+                )
+              ELSE '<unexpected-length-binding>' OPERATOR(pg_catalog.||)
+                reference_normalized_constraint.definition
+            END
+          ELSE reference_normalized_constraint.definition
+        END AS definition
+      ) length_normalized_constraint
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN pg_catalog.strpos(
+                 length_normalized_constraint.definition,
+                 'btrim('
+               ) OPERATOR(pg_catalog.>) 0
+            THEN CASE
+              WHEN pg_catalog.strpos(
+                     installed_constraint.conbin::pg_catalog.text,
+                     ':funcid '
+                       OPERATOR(pg_catalog.||) pg_catalog.to_regprocedure(
+                         'pg_catalog.btrim(text)'
+                       )::pg_catalog.oid::pg_catalog.text
+                       OPERATOR(pg_catalog.||) ' '
+                   ) OPERATOR(pg_catalog.>) 0
+                THEN pg_catalog.replace(
+                  length_normalized_constraint.definition,
+                  'pg_catalog.btrim(',
+                  'btrim('
+                )
+              ELSE '<unexpected-btrim-binding>' OPERATOR(pg_catalog.||)
+                length_normalized_constraint.definition
+            END
+          ELSE length_normalized_constraint.definition
+        END AS definition
+      ) btrim_normalized_constraint
+      CROSS JOIN LATERAL (
+        SELECT CASE
+          WHEN pg_catalog.strpos(
+                 btrim_normalized_constraint.definition,
+                 'jsonb_typeof('
+               ) OPERATOR(pg_catalog.>) 0
+            THEN CASE
+              WHEN pg_catalog.strpos(
+                     installed_constraint.conbin::pg_catalog.text,
+                     ':funcid '
+                       OPERATOR(pg_catalog.||) pg_catalog.to_regprocedure(
+                         'pg_catalog.jsonb_typeof(jsonb)'
+                       )::pg_catalog.oid::pg_catalog.text
+                       OPERATOR(pg_catalog.||) ' '
+                   ) OPERATOR(pg_catalog.>) 0
+                THEN pg_catalog.replace(
+                  btrim_normalized_constraint.definition,
+                  'pg_catalog.jsonb_typeof(',
+                  'jsonb_typeof('
+                )
+              ELSE '<unexpected-jsonb-typeof-binding>'
+                OPERATOR(pg_catalog.||) btrim_normalized_constraint.definition
+            END
+          ELSE btrim_normalized_constraint.definition
+        END AS definition
+      ) canonical_constraint
+      WHERE installed_namespace.nspname OPERATOR(pg_catalog.=) 'public'
         AND (
-          installed_constraint.conrelid IN (
-            to_regclass('public.operations_commerce_store_sync_controls'),
-            to_regclass('public.operations_commerce_store_sync_change_receipts'),
-            to_regclass('public.operations_commerce_store_sync_read_leases')
+          installed_constraint.conrelid OPERATOR(pg_catalog.=) ANY (
+            ARRAY[
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_controls'
+              ),
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_change_receipts'
+              ),
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_read_leases'
+              )
+            ]::pg_catalog.oid[]
           )
           OR (
-            installed_constraint.conrelid = to_regclass(
-              'public.operations_commerce_intake_read_intents'
+            installed_constraint.conrelid OPERATOR(pg_catalog.=) ANY (
+              ARRAY[
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_intake_read_intents'
+                ),
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_product_image_observation_sets'
+                ),
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_product_image_import_jobs'
+                )
+              ]::pg_catalog.oid[]
             )
-            AND installed_constraint.conname =
-              'commerce_intake_read_intents_authority_valid'
-          )
-          OR (
-            installed_constraint.conrelid = to_regclass(
-              'public.operations_commerce_product_image_observation_sets'
-            )
-            AND installed_constraint.conname =
-              'ops_commerce_image_set_authority_valid'
-          )
-          OR (
-            installed_constraint.conrelid = to_regclass(
-              'public.operations_commerce_product_image_import_jobs'
-            )
-            AND installed_constraint.conname =
-              'ops_commerce_image_job_authority_valid'
+            AND installed_constraint.contype OPERATOR(pg_catalog.=) 'c'
+            AND position(
+              'provider_read_authority'
+              IN raw_constraint.definition
+            ) OPERATOR(pg_catalog.>) 0
           )
         )
-    ) = 'a28138f13bf3b2eaf60624e9efb6e7fff669032bcf27043adff648b2d82528da'
+    ) OPERATOR(pg_catalog.=)
+      'a28138f13bf3b2eaf60624e9efb6e7fff669032bcf27043adff648b2d82528da'
+    -- pg_get_constraintdef() is intentionally human-readable and does not
+    -- expose bound operator OIDs. Resolve every parsed CHECK operator to stable
+    -- namespace/type/procedure identities, so byte-identical text rebound to
+    -- an attacker operator fails closed without pinning cluster-local OIDs.
     AND (
-      SELECT encode(
-        digest(
-          convert_to(
-            string_agg(
-              concat_ws(
+      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 37
+        AND pg_catalog.encode(
+          public.digest(
+            pg_catalog.convert_to(
+              pg_catalog.string_agg(
+                pg_catalog.concat_ws(
+                  '|',
+                  installed_table.relname,
+                  installed_constraint.conname,
+                  bound_operator.binding_ordinal::pg_catalog.text,
+                  operator_namespace.nspname,
+                  installed_operator.oprname,
+                  installed_operator.oprkind::pg_catalog.text,
+                  COALESCE(
+                    pg_catalog.concat(
+                      left_type_namespace.nspname,
+                      '.',
+                      left_type.typname
+                    ),
+                    '<none>'
+                  ),
+                  COALESCE(
+                    pg_catalog.concat(
+                      right_type_namespace.nspname,
+                      '.',
+                      right_type.typname
+                    ),
+                    '<none>'
+                  ),
+                  pg_catalog.concat(
+                    result_type_namespace.nspname,
+                    '.',
+                    result_type.typname
+                  ),
+                  pg_catalog.concat(
+                    procedure_namespace.nspname,
+                    '.',
+                    installed_procedure.proname
+                  ),
+                  installed_operator.oprcanmerge::pg_catalog.text,
+                  installed_operator.oprcanhash::pg_catalog.text
+                ),
+                pg_catalog.chr(10) ORDER BY
+                  installed_table.relname,
+                  installed_constraint.conname,
+                  bound_operator.binding_ordinal
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
+        ) OPERATOR(pg_catalog.=)
+          '724e0c8f03f49d3f9664948070f811a28a9dbeea2b6a60bd6c12d28d8c33b3bc'
+      FROM pg_catalog.pg_constraint installed_constraint
+      JOIN pg_catalog.pg_class installed_table
+        ON installed_table.oid OPERATOR(pg_catalog.=)
+          installed_constraint.conrelid
+      JOIN pg_catalog.pg_namespace installed_namespace
+        ON installed_namespace.oid OPERATOR(pg_catalog.=)
+          installed_table.relnamespace
+      CROSS JOIN LATERAL pg_catalog.regexp_matches(
+        installed_constraint.conbin::pg_catalog.text,
+        ':opno ([0-9]+)',
+        'g'
+      ) WITH ORDINALITY AS bound_operator(oid_match, binding_ordinal)
+      JOIN pg_catalog.pg_operator installed_operator
+        ON installed_operator.oid OPERATOR(pg_catalog.=)
+             bound_operator.oid_match[1]::pg_catalog.oid
+      JOIN pg_catalog.pg_namespace operator_namespace
+        ON operator_namespace.oid OPERATOR(pg_catalog.=)
+          installed_operator.oprnamespace
+      LEFT JOIN pg_catalog.pg_type left_type
+        ON left_type.oid OPERATOR(pg_catalog.=) installed_operator.oprleft
+       AND installed_operator.oprleft OPERATOR(pg_catalog.<>) 0
+      LEFT JOIN pg_catalog.pg_namespace left_type_namespace
+        ON left_type_namespace.oid OPERATOR(pg_catalog.=)
+          left_type.typnamespace
+      LEFT JOIN pg_catalog.pg_type right_type
+        ON right_type.oid OPERATOR(pg_catalog.=) installed_operator.oprright
+       AND installed_operator.oprright OPERATOR(pg_catalog.<>) 0
+      LEFT JOIN pg_catalog.pg_namespace right_type_namespace
+        ON right_type_namespace.oid OPERATOR(pg_catalog.=)
+          right_type.typnamespace
+      JOIN pg_catalog.pg_type result_type
+        ON result_type.oid OPERATOR(pg_catalog.=)
+          installed_operator.oprresult
+      JOIN pg_catalog.pg_namespace result_type_namespace
+        ON result_type_namespace.oid OPERATOR(pg_catalog.=)
+          result_type.typnamespace
+      JOIN pg_catalog.pg_proc installed_procedure
+        ON installed_procedure.oid OPERATOR(pg_catalog.=)
+          installed_operator.oprcode
+      JOIN pg_catalog.pg_namespace procedure_namespace
+        ON procedure_namespace.oid OPERATOR(pg_catalog.=)
+          installed_procedure.pronamespace
+      WHERE installed_namespace.nspname OPERATOR(pg_catalog.=) 'public'
+        AND installed_constraint.contype OPERATOR(pg_catalog.=) 'c'
+        AND (
+          installed_constraint.conrelid OPERATOR(pg_catalog.=) ANY (
+            ARRAY[
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_controls'
+              ),
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_change_receipts'
+              ),
+              pg_catalog.to_regclass(
+                'public.operations_commerce_store_sync_read_leases'
+              )
+            ]::pg_catalog.oid[]
+          )
+          OR (
+            installed_constraint.conrelid OPERATOR(pg_catalog.=) ANY (
+              ARRAY[
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_intake_read_intents'
+                ),
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_product_image_observation_sets'
+                ),
+                pg_catalog.to_regclass(
+                  'public.operations_commerce_product_image_import_jobs'
+                )
+              ]::pg_catalog.oid[]
+            )
+            AND pg_catalog.strpos(
+                  pg_catalog.pg_get_constraintdef(
+                    installed_constraint.oid
+                  ),
+                  'provider_read_authority'
+                ) OPERATOR(pg_catalog.>) 0
+          )
+        )
+    )
+    AND (
+      SELECT pg_catalog.encode(
+        public.digest(
+          pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              pg_catalog.concat_ws(
                 '|',
                 installed_table.relname,
                 installed_index_class.relname,
@@ -254,9 +549,9 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
                 installed_index.indisvalid::text,
                 installed_index.indisready::text,
                 installed_index.indkey::text,
-                pg_get_indexdef(installed_index.indexrelid)
+                pg_catalog.pg_get_indexdef(installed_index.indexrelid)
               ),
-              chr(10) ORDER BY
+              pg_catalog.chr(10) ORDER BY
                 installed_table.relname,
                 installed_index_class.relname
             ),
@@ -266,26 +561,41 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
         ),
         'hex'
       )
-      FROM pg_index installed_index
-      JOIN pg_class installed_table
-        ON installed_table.oid = installed_index.indrelid
-      JOIN pg_class installed_index_class
-        ON installed_index_class.oid = installed_index.indexrelid
-      JOIN pg_namespace installed_namespace
-        ON installed_namespace.oid = installed_table.relnamespace
-      WHERE installed_namespace.nspname = 'public'
-        AND installed_index.indrelid IN (
-          to_regclass('public.operations_commerce_store_sync_controls'),
-          to_regclass('public.operations_commerce_store_sync_change_receipts'),
-          to_regclass('public.operations_commerce_store_sync_read_leases')
+      FROM pg_catalog.pg_index installed_index
+      JOIN pg_catalog.pg_class installed_table
+        ON installed_table.oid OPERATOR(pg_catalog.=)
+          installed_index.indrelid
+      JOIN pg_catalog.pg_class installed_index_class
+        ON installed_index_class.oid OPERATOR(pg_catalog.=)
+          installed_index.indexrelid
+      JOIN pg_catalog.pg_namespace installed_namespace
+        ON installed_namespace.oid OPERATOR(pg_catalog.=)
+          installed_table.relnamespace
+      WHERE installed_namespace.nspname OPERATOR(pg_catalog.=) 'public'
+        AND installed_index.indrelid OPERATOR(pg_catalog.=) ANY (
+          ARRAY[
+            pg_catalog.to_regclass(
+              'public.operations_commerce_store_sync_controls'
+            ),
+            pg_catalog.to_regclass(
+              'public.operations_commerce_store_sync_change_receipts'
+            ),
+            pg_catalog.to_regclass(
+              'public.operations_commerce_store_sync_read_leases'
+            )
+          ]::pg_catalog.oid[]
         )
-    ) = '05e6f2a2a4ea7612265a6063c89670f73aa5030a26ddffe80601ba24fd310498'
+    ) OPERATOR(pg_catalog.=)
+      '05e6f2a2a4ea7612265a6063c89670f73aa5030a26ddffe80601ba24fd310498'
+    -- The first rollout retains automatic defaults for old-runtime inserts;
+    -- the next rollout removes all three together. No mixed state is healthy.
     AND (
-      SELECT encode(
-        digest(
-          convert_to(
-            string_agg(
-              concat_ws(
+      (
+        SELECT pg_catalog.encode(
+        public.digest(
+          pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              pg_catalog.concat_ws(
                 '|',
                 table_name,
                 column_name,
@@ -294,7 +604,77 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
                 udt_schema,
                 udt_name,
                 is_nullable,
-                COALESCE(column_default, '<null>'),
+                COALESCE(
+                  CASE
+                    WHEN table_name OPERATOR(pg_catalog.=)
+                           'operations_commerce_store_sync_change_receipts'
+                     AND column_name OPERATOR(pg_catalog.=) 'id'
+                     AND column_default OPERATOR(pg_catalog.=) ANY (
+                       ARRAY[
+                         'gen_random_uuid()',
+                         'public.gen_random_uuid()'
+                       ]::pg_catalog.text[]
+                     )
+                      THEN CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_attrdef installed_default
+                          WHERE installed_default.adrelid
+                                  OPERATOR(pg_catalog.=)
+                                  pg_catalog.to_regclass(
+                                    pg_catalog.concat('public.', table_name)
+                                  )
+                            AND installed_default.adnum OPERATOR(pg_catalog.=)
+                                  ordinal_position
+                            AND pg_catalog.strpos(
+                                  installed_default.adbin::pg_catalog.text,
+                                  ':funcid '
+                                    OPERATOR(pg_catalog.||)
+                                      pg_catalog.to_regprocedure(
+                                      'public.gen_random_uuid()'
+                                    )::pg_catalog.oid::pg_catalog.text
+                                    OPERATOR(pg_catalog.||) ' '
+                                ) OPERATOR(pg_catalog.>) 0
+                        )
+                          THEN 'public.gen_random_uuid()'
+                        ELSE '<unexpected-gen-random-binding>'
+                          OPERATOR(pg_catalog.||) column_default
+                      END
+                    WHEN column_default OPERATOR(pg_catalog.=) ANY (
+                           ARRAY[
+                             'now()',
+                             'pg_catalog.now()'
+                           ]::pg_catalog.text[]
+                         )
+                      THEN CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_attrdef installed_default
+                          WHERE installed_default.adrelid
+                                  OPERATOR(pg_catalog.=)
+                                  pg_catalog.to_regclass(
+                                    pg_catalog.concat('public.', table_name)
+                                  )
+                            AND installed_default.adnum OPERATOR(pg_catalog.=)
+                                  ordinal_position
+                            AND pg_catalog.strpos(
+                                  installed_default.adbin::pg_catalog.text,
+                                  ':funcid '
+                                    OPERATOR(pg_catalog.||)
+                                      pg_catalog.to_regprocedure(
+                                      'pg_catalog.now()'
+                                    )::pg_catalog.oid::pg_catalog.text
+                                    OPERATOR(pg_catalog.||) ' '
+                                ) OPERATOR(pg_catalog.>) 0
+                        )
+                          THEN 'now()'
+                        ELSE '<unexpected-now-binding>'
+                          OPERATOR(pg_catalog.||) column_default
+                      END
+                    ELSE column_default
+                  END,
+                  '<null>'
+                ),
                 is_identity,
                 COALESCE(identity_generation, '<null>'),
                 is_generated,
@@ -306,7 +686,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
                 COALESCE(numeric_scale::text, '<null>'),
                 COALESCE(datetime_precision::text, '<null>')
               ),
-              chr(10) ORDER BY table_name, column_name
+              pg_catalog.chr(10) ORDER BY table_name, column_name
             ),
             'UTF8'
           ),
@@ -315,86 +695,381 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
         'hex'
       )
       FROM information_schema.columns
-      WHERE table_schema = 'public'
+      WHERE table_schema OPERATOR(pg_catalog.=) 'public'
         AND (
-          table_name IN (
-            'operations_commerce_store_sync_controls',
-            'operations_commerce_store_sync_change_receipts',
-            'operations_commerce_store_sync_read_leases'
+          table_name OPERATOR(pg_catalog.=) ANY (
+            ARRAY[
+              'operations_commerce_store_sync_controls',
+              'operations_commerce_store_sync_change_receipts',
+              'operations_commerce_store_sync_read_leases'
+            ]::pg_catalog.text[]
           )
           OR (
-            table_name IN (
-              'operations_commerce_intake_read_intents',
-              'operations_commerce_product_image_observation_sets',
-              'operations_commerce_product_image_import_jobs'
+            table_name OPERATOR(pg_catalog.=) ANY (
+              ARRAY[
+                'operations_commerce_intake_read_intents',
+                'operations_commerce_product_image_observation_sets',
+                'operations_commerce_product_image_import_jobs'
+              ]::pg_catalog.text[]
             )
-            AND column_name = 'provider_read_authority'
+            AND column_name OPERATOR(pg_catalog.=)
+                  'provider_read_authority'
           )
         )
-    ) = '11af8d59cf42933abe8fd264e69d9714d0fe2d83e455cc1f1096393cac066eb1'
-    AND (
-      SELECT string_agg(
-        concat_ws(
-          '|',
-          trigger_table.relname,
-          installed_trigger.tgname,
-          installed_trigger.tgfoid::regprocedure::text,
-          installed_trigger.tgenabled,
-          installed_trigger.tgtype::text,
-          installed_trigger.tgisinternal::text,
-          COALESCE(pg_get_expr(
-            installed_trigger.tgqual,
-            installed_trigger.tgrelid
-          ), '')
-        ),
-        chr(10) ORDER BY trigger_table.relname, installed_trigger.tgname
+      ) OPERATOR(pg_catalog.=)
+        'd8a27f153b77f54154bc82a5f28dbcb97c064d915500bdb6fcbff643b1608a66'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.schema_migrations
+        WHERE filename OPERATOR(pg_catalog.=)
+          '0305_operations_commerce_rollout_contract.sql'
       )
-      FROM pg_trigger installed_trigger
-      JOIN pg_class trigger_table
-        ON trigger_table.oid = installed_trigger.tgrelid
-      JOIN pg_namespace trigger_namespace
-        ON trigger_namespace.oid = trigger_table.relnamespace
-      WHERE trigger_namespace.nspname = 'public'
-        AND (
-          (installed_trigger.tgrelid = to_regclass(
-             'public.operations_commerce_store_sync_read_leases'
-           ) AND installed_trigger.tgname =
-             'guard_operations_commerce_store_sync_read_lease_write')
-          OR (installed_trigger.tgrelid = to_regclass(
-             'public.operations_commerce_store_sync_controls'
-           ) AND installed_trigger.tgname =
-             'validate_operations_commerce_store_sync_identity_write')
-          OR (installed_trigger.tgrelid = to_regclass(
-             'public.operations_commerce_store_sync_change_receipts'
-           ) AND installed_trigger.tgname =
-             'protect_operations_commerce_store_sync_receipt_write')
-          OR (installed_trigger.tgrelid = to_regclass(
-             'public.operations_integration_accounts'
-           ) AND installed_trigger.tgname =
-             'seed_operations_commerce_store_sync_control_write')
-          OR (installed_trigger.tgrelid = to_regclass(
-             'public.operations_commerce_product_image_observation_sets'
-           ) AND installed_trigger.tgname =
-             'guard_operations_commerce_image_set_authority_write')
-          OR (installed_trigger.tgrelid = to_regclass(
-             'public.operations_commerce_product_image_import_jobs'
-           ) AND installed_trigger.tgname =
-             'guard_operations_commerce_image_job_authority_write')
+      OR (
+        (
+        SELECT pg_catalog.encode(
+          public.digest(
+            pg_catalog.convert_to(
+              pg_catalog.string_agg(
+                pg_catalog.concat_ws(
+                  '|',
+                  table_name,
+                  column_name,
+                  ordinal_position::text,
+                  data_type,
+                  udt_schema,
+                  udt_name,
+                  is_nullable,
+                  COALESCE(
+                    CASE
+                      WHEN table_name OPERATOR(pg_catalog.=)
+                             'operations_commerce_store_sync_change_receipts'
+                       AND column_name OPERATOR(pg_catalog.=) 'id'
+                       AND column_default OPERATOR(pg_catalog.=) ANY (
+                         ARRAY[
+                           'gen_random_uuid()',
+                           'public.gen_random_uuid()'
+                         ]::pg_catalog.text[]
+                       )
+                        THEN CASE
+                          WHEN EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_attrdef installed_default
+                            WHERE installed_default.adrelid
+                                    OPERATOR(pg_catalog.=)
+                                    pg_catalog.to_regclass(
+                                      pg_catalog.concat('public.', table_name)
+                                    )
+                              AND installed_default.adnum
+                                    OPERATOR(pg_catalog.=) ordinal_position
+                              AND pg_catalog.strpos(
+                                    installed_default.adbin::pg_catalog.text,
+                                    ':funcid '
+                                      OPERATOR(pg_catalog.||)
+                                        pg_catalog.to_regprocedure(
+                                        'public.gen_random_uuid()'
+                                      )::pg_catalog.oid::pg_catalog.text
+                                      OPERATOR(pg_catalog.||) ' '
+                                  ) OPERATOR(pg_catalog.>) 0
+                          )
+                            THEN 'public.gen_random_uuid()'
+                          ELSE '<unexpected-gen-random-binding>'
+                            OPERATOR(pg_catalog.||) column_default
+                        END
+                      WHEN column_default OPERATOR(pg_catalog.=) ANY (
+                             ARRAY[
+                               'now()',
+                               'pg_catalog.now()'
+                             ]::pg_catalog.text[]
+                           )
+                        THEN CASE
+                          WHEN EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_attrdef installed_default
+                            WHERE installed_default.adrelid
+                                    OPERATOR(pg_catalog.=)
+                                    pg_catalog.to_regclass(
+                                      pg_catalog.concat('public.', table_name)
+                                    )
+                              AND installed_default.adnum
+                                    OPERATOR(pg_catalog.=) ordinal_position
+                              AND pg_catalog.strpos(
+                                    installed_default.adbin::pg_catalog.text,
+                                    ':funcid '
+                                      OPERATOR(pg_catalog.||)
+                                        pg_catalog.to_regprocedure(
+                                        'pg_catalog.now()'
+                                      )::pg_catalog.oid::pg_catalog.text
+                                      OPERATOR(pg_catalog.||) ' '
+                                  ) OPERATOR(pg_catalog.>) 0
+                          )
+                            THEN 'now()'
+                          ELSE '<unexpected-now-binding>'
+                            OPERATOR(pg_catalog.||) column_default
+                        END
+                      ELSE column_default
+                    END,
+                    '<null>'
+                  ),
+                  is_identity,
+                  COALESCE(identity_generation, '<null>'),
+                  is_generated,
+                  COALESCE(generation_expression, '<null>'),
+                  COALESCE(collation_schema, '<null>'),
+                  COALESCE(collation_name, '<null>'),
+                  COALESCE(character_maximum_length::text, '<null>'),
+                  COALESCE(numeric_precision::text, '<null>'),
+                  COALESCE(numeric_scale::text, '<null>'),
+                  COALESCE(datetime_precision::text, '<null>')
+                ),
+                pg_catalog.chr(10) ORDER BY table_name, column_name
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
         )
-    ) = concat_ws(
-      chr(10),
-      'operations_commerce_product_image_import_jobs|guard_operations_commerce_image_job_authority_write|guard_operations_commerce_product_image_read_authority()|O|19|false|',
-      'operations_commerce_product_image_observation_sets|guard_operations_commerce_image_set_authority_write|guard_operations_commerce_product_image_read_authority()|O|19|false|',
-      'operations_commerce_store_sync_change_receipts|protect_operations_commerce_store_sync_receipt_write|protect_operations_commerce_store_sync_receipt()|O|27|false|',
-      'operations_commerce_store_sync_controls|validate_operations_commerce_store_sync_identity_write|validate_operations_commerce_store_sync_identity()|O|23|false|',
-      'operations_commerce_store_sync_read_leases|guard_operations_commerce_store_sync_read_lease_write|guard_operations_commerce_store_sync_read_lease()|O|31|false|',
-      'operations_integration_accounts|seed_operations_commerce_store_sync_control_write|seed_operations_commerce_store_sync_control()|O|5|false|'
+        FROM information_schema.columns
+        WHERE table_schema OPERATOR(pg_catalog.=) 'public'
+          AND (
+            table_name OPERATOR(pg_catalog.=) ANY (
+              ARRAY[
+                'operations_commerce_store_sync_controls',
+                'operations_commerce_store_sync_change_receipts',
+                'operations_commerce_store_sync_read_leases'
+              ]::pg_catalog.text[]
+            )
+            OR (
+              table_name OPERATOR(pg_catalog.=) ANY (
+                ARRAY[
+                  'operations_commerce_intake_read_intents',
+                  'operations_commerce_product_image_observation_sets',
+                  'operations_commerce_product_image_import_jobs'
+                ]::pg_catalog.text[]
+              )
+              AND column_name OPERATOR(pg_catalog.=)
+                    'provider_read_authority'
+            )
+          )
+        ) OPERATOR(pg_catalog.=)
+          '4abf9b4700d86b2cd84eab60bd59ca5935531dad5ee7566979d93a0612c3ef71'
+        AND EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename OPERATOR(pg_catalog.=)
+              '0305_operations_commerce_rollout_contract.sql'
+            AND checksum OPERATOR(pg_catalog.=)
+              '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+        )
+      )
+    )
+    AND (
+      SELECT pg_catalog.count(*) OPERATOR(pg_catalog.=) 11
+        AND pg_catalog.encode(
+          public.digest(
+            pg_catalog.convert_to(
+              pg_catalog.string_agg(
+                pg_catalog.concat_ws(
+                  '|',
+                  trigger_namespace.nspname,
+                  trigger_table.relname,
+                  installed_trigger.tgname,
+                  installed_trigger.tgtype::text,
+                  installed_trigger.tgenabled::text,
+                  installed_trigger.tgisinternal::text,
+                  (
+                    installed_trigger.tgconstraint
+                      OPERATOR(pg_catalog.<>) 0
+                  )::text,
+                  installed_trigger.tgdeferrable::text,
+                  installed_trigger.tginitdeferred::text,
+                  pg_catalog.concat(
+                    procedure_namespace.nspname,
+                    '.',
+                    installed_procedure.proname,
+                    '(',
+                    pg_catalog.pg_get_function_identity_arguments(
+                      installed_procedure.oid
+                    ),
+                    ')'
+                  ),
+                  COALESCE(pg_catalog.pg_get_expr(
+                    installed_trigger.tgqual,
+                    installed_trigger.tgrelid
+                  ), ''),
+                  installed_trigger.tgattr::text
+                ),
+                pg_catalog.chr(10) ORDER BY
+                  trigger_namespace.nspname,
+                  trigger_table.relname,
+                  installed_trigger.tgname
+              ),
+              'UTF8'
+            ),
+            'sha256'
+          ),
+          'hex'
+        ) OPERATOR(pg_catalog.=)
+          '6a4c29744ed7377933b90739df8d35d30b8d168d4f195b1014ded507f0a5010a'
+      FROM pg_catalog.pg_trigger installed_trigger
+      JOIN pg_catalog.pg_class trigger_table
+        ON trigger_table.oid OPERATOR(pg_catalog.=)
+          installed_trigger.tgrelid
+      JOIN pg_catalog.pg_namespace trigger_namespace
+        ON trigger_namespace.oid OPERATOR(pg_catalog.=)
+          trigger_table.relnamespace
+      JOIN pg_catalog.pg_proc installed_procedure
+        ON installed_procedure.oid OPERATOR(pg_catalog.=)
+          installed_trigger.tgfoid
+      JOIN pg_catalog.pg_namespace procedure_namespace
+        ON procedure_namespace.oid OPERATOR(pg_catalog.=)
+          installed_procedure.pronamespace
+      WHERE NOT installed_trigger.tgisinternal
+        AND installed_trigger.tgfoid OPERATOR(pg_catalog.=) ANY (
+          ARRAY[
+            pg_catalog.to_regprocedure(
+              'public.guard_operations_commerce_product_image_read_authority()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.guard_operations_commerce_store_sync_read_lease()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.seed_operations_commerce_store_sync_control()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.protect_commerce_order_sync_session_lineage()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.protect_commerce_order_observation_lineage()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.protect_shopify_order_webhook_read()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.protect_shopify_order_webhook_target()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.guard_operations_commerce_product_image_binding()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.protect_operations_commerce_store_sync_receipt()'
+            ),
+            pg_catalog.to_regprocedure(
+              'public.validate_operations_commerce_store_sync_identity()'
+            )
+          ]::pg_catalog.oid[]
+        )
     )
     AND NOT EXISTS (
       SELECT 1
-      FROM operations_commerce_store_sync_read_leases lease
+      FROM public.operations_commerce_store_sync_read_leases lease
       WHERE lease.released_at IS NULL
-        AND lease.expires_at <= clock_timestamp()
+        AND lease.expires_at OPERATOR(pg_catalog.<=)
+              pg_catalog.clock_timestamp()
     )
+  )
+`
+
+// The authority-column rollout phase is safe to expose only when the complete
+// Store-sync function and structure contracts agree with the exact migration
+// ledger. Checking defaults alone would advertise a healthy overlap after a
+// function, trigger, constraint, or metadata tamper.
+export const OPERATIONS_COMMERCE_STORE_SYNC_AUTHORITY_CONTRACT_SQL = String.raw`
+  (
+    WITH store_sync_health AS (
+      SELECT
+        ${OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL}
+          AS function_healthy,
+        ${OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL}
+          AS rewritten_function_healthy,
+        ${OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL}
+          AS structure_healthy
+    ), authority_default_catalog AS (
+      SELECT
+        pg_catalog.count(
+          installed_attribute.attrelid
+        ) AS installed_column_count,
+        pg_catalog.count(installed_default.oid) AS installed_default_count,
+        pg_catalog.bool_and(COALESCE(
+          pg_catalog.pg_get_expr(
+            installed_default.adbin,
+            installed_default.adrelid
+          ) OPERATOR(pg_catalog.=) '''automatic''::text',
+          false
+        )) AS exact_automatic_defaults
+      FROM (VALUES
+        ('operations_commerce_intake_read_intents',
+          'provider_read_authority'),
+        ('operations_commerce_product_image_observation_sets',
+          'provider_read_authority'),
+        ('operations_commerce_product_image_import_jobs',
+          'provider_read_authority')
+      ) AS required_default(table_name, column_name)
+      LEFT JOIN pg_catalog.pg_class installed_table
+        ON installed_table.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass(
+          pg_catalog.concat('public.', required_default.table_name)
+        )
+      LEFT JOIN pg_catalog.pg_namespace installed_namespace
+        ON installed_namespace.oid OPERATOR(pg_catalog.=)
+          installed_table.relnamespace
+       AND installed_namespace.nspname OPERATOR(pg_catalog.=) 'public'
+      LEFT JOIN pg_catalog.pg_attribute installed_attribute
+        ON installed_attribute.attrelid OPERATOR(pg_catalog.=)
+          installed_table.oid
+       AND installed_namespace.oid IS NOT NULL
+       AND installed_attribute.attname OPERATOR(pg_catalog.=)
+          required_default.column_name
+       AND installed_attribute.attnum OPERATOR(pg_catalog.>) 0
+       AND NOT installed_attribute.attisdropped
+      LEFT JOIN pg_catalog.pg_attrdef installed_default
+        ON installed_default.adrelid OPERATOR(pg_catalog.=)
+          installed_attribute.attrelid
+       AND installed_default.adnum OPERATOR(pg_catalog.=)
+          installed_attribute.attnum
+    )
+    SELECT CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM public.schema_migrations
+        WHERE filename OPERATOR(pg_catalog.=)
+          '0298_operations_commerce_store_sync_controls.sql'
+          AND checksum OPERATOR(pg_catalog.=)
+            'e3eb479cc613479a09081bb6f22d2344ce74540f86595a020dfdbd711cfb1abd'
+      )
+        AND store_sync_health.function_healthy
+        AND store_sync_health.rewritten_function_healthy
+        AND store_sync_health.structure_healthy
+        AND authority_default_catalog.installed_column_count
+              OPERATOR(pg_catalog.=) 3
+        AND authority_default_catalog.installed_default_count
+              OPERATOR(pg_catalog.=) 3
+        AND authority_default_catalog.exact_automatic_defaults
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename OPERATOR(pg_catalog.=)
+            '0305_operations_commerce_rollout_contract.sql'
+        )
+        THEN 'legacy-writer-compatible'
+      WHEN EXISTS (
+        SELECT 1
+        FROM public.schema_migrations
+        WHERE filename OPERATOR(pg_catalog.=)
+          '0305_operations_commerce_rollout_contract.sql'
+          AND checksum OPERATOR(pg_catalog.=)
+            '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+      )
+        AND store_sync_health.function_healthy
+        AND store_sync_health.rewritten_function_healthy
+        AND store_sync_health.structure_healthy
+        AND authority_default_catalog.installed_column_count
+              OPERATOR(pg_catalog.=) 3
+        AND authority_default_catalog.installed_default_count
+              OPERATOR(pg_catalog.=) 0
+        THEN 'strict-explicit'
+      ELSE 'invalid'
+    END
+    FROM store_sync_health
+    CROSS JOIN authority_default_catalog
   )
 `

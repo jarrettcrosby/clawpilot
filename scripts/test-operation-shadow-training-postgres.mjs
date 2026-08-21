@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   actorEmail,
@@ -24,6 +25,45 @@ const root = process.cwd()
 
 function sha(value) {
   return createHash('sha256').update(String(value)).digest('hex')
+}
+
+const futureIndependentControlContract = readFileSync(
+  resolve(
+    root,
+    'scripts/fixtures/0306_operations_order_training_independent_control_contract.sql',
+  ),
+  'utf8',
+)
+const futureIndependentControlChecksum =
+  '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+assert.equal(
+  sha(futureIndependentControlContract),
+  futureIndependentControlChecksum,
+  'The frozen 0306 independent-control contract must remain byte-exact',
+)
+
+async function installFutureIndependentControl(databaseUrl) {
+  const pool = new Pool({ connectionString: databaseUrl, max: 1 })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(futureIndependentControlContract)
+    await client.query(
+      `INSERT INTO schema_migrations (filename, checksum)
+       VALUES (
+         '0306_operations_order_training_independent_control_contract.sql',
+         $1
+       )`,
+      [futureIndependentControlChecksum],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    client.release()
+    await pool.end()
+  }
 }
 
 async function rejected(work, pattern, label) {
@@ -2130,6 +2170,7 @@ async function main() {
       },
       timeout: 300_000,
     })
+    await installFutureIndependentControl(databaseUrl)
     await verify(databaseUrl)
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
