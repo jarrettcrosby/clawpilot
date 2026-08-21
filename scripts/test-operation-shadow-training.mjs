@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 const [
   migration,
-  independentControlMigration,
+  compatibilityMarkerMigration,
+  independentControlContract,
   domain,
   persistence,
   runtime,
@@ -20,6 +23,7 @@ const [
 ] = await Promise.all([
   read('db/migrations/0290_operations_shadow_training_runs.sql'),
   read('db/migrations/0300_operations_order_training_independent_control.sql'),
+  read('scripts/fixtures/0306_operations_order_training_independent_control_contract.sql'),
   read('app_src/lib/operations/shadowTraining.ts'),
   read('app_src/lib/persistence/operationShadowTraining.ts'),
   read('app_src/lib/integrations/shadowTrainingRuntime.ts'),
@@ -32,6 +36,44 @@ const [
   read('app_src/lib/persistence/cartonizationRateEvidence.ts'),
   read('app_src/lib/operations/operationalGeometryCartonization.ts'),
 ])
+
+assert.equal(
+  createHash('sha256').update(independentControlContract).digest('hex'),
+  '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7',
+  'The frozen 0306 independent-control contract must remain byte-exact',
+)
+assert.equal(
+  existsSync(
+    new URL(
+      '../db/migrations/0306_operations_order_training_independent_control_contract.sql',
+      import.meta.url,
+    ),
+  ),
+  false,
+  'Release A must not contain the executable 0306 migration',
+)
+assert.equal(
+  createHash('sha256').update(compatibilityMarkerMigration).digest('hex'),
+  '1369a29d818c56f8bfdfa1ee1340c2e6902af9445ca8f00c8dc184b9685d4b84',
+  'The executable Release A 0300 compatibility marker must remain byte-exact',
+)
+for (const fragment of [
+  'Rolling-deployment compatibility marker for exact-order training',
+  'leaves the 0290 safety-profile-bound trigger',
+  '0306_operations_order_training_independent_control_contract.sql',
+  'DO $compatibility_marker$',
+  'NULL;',
+]) {
+  assert.ok(
+    compatibilityMarkerMigration.includes(fragment),
+    `0300 compatibility marker is missing ${fragment}`,
+  )
+}
+assert.equal(
+  compatibilityMarkerMigration.includes('CREATE OR REPLACE FUNCTION'),
+  false,
+  'Release A 0300 must not replace any 0290 function body',
+)
 
 for (const fragment of [
   "CHECK (account_environment IN ('sandbox', 'production'))",
@@ -70,23 +112,48 @@ assert.equal(
 )
 
 for (const fragment of [
+  'Order Training contract requires exact 0290 and 0300 predecessors',
+  'Order Training contract requires exact profile-bound predecessors',
+  'Order Training contract requires exact predecessor trigger bindings',
   "activation.state IN (",
   "'disabled', 'shadow', 'read_only', 'active', 'frozen'",
   'activation.revision = NEW.authorization_activation_revision',
   'Order training requires an exact current safety profile',
   'pg_advisory_xact_lock(',
   "'operations:activation:' || NEW.organization_id::text",
-  'CREATE OR REPLACE FUNCTION guard_shadow_commerce_canonical_write()',
+  'CREATE OR REPLACE FUNCTION public.guard_shadow_commerce_canonical_write()',
+  'ALTER FUNCTION public.validate_operations_shadow_training_package_fact()',
+  'ALTER FUNCTION public.validate_operations_shadow_training_pick_fact()',
+  'ALTER FUNCTION public.validate_operations_shadow_training_plan_coverage()',
+  'ALTER FUNCTION public.protect_operations_shadow_training_run()',
+  'ALTER FUNCTION public.validate_operations_shadow_training_run_identity()',
+  'ALTER FUNCTION public.protect_operations_shadow_training_package()',
+  'ALTER FUNCTION public.protect_operations_shadow_training_pick_task()',
+  'ALTER FUNCTION public.protect_operations_shadow_training_event()',
+  'ALTER FUNCTION public.validate_operations_shadow_training_label_link()',
+  'ALTER FUNCTION public.guard_shadow_commerce_canonical_write()',
+  'ALTER FUNCTION public.guard_shadow_training_activation_change()',
+  'SET search_path = pg_catalog, public, pg_temp',
+  ') <> 16',
   "IF TG_OP = 'DELETE'",
   'OPERATIONS_ORDER_TRAINING_SAFETY_PROFILE_REQUIRED',
 ]) {
   assert.ok(
-    independentControlMigration.includes(fragment),
-    `0300 independent training control is missing ${fragment}`,
+    independentControlContract.includes(fragment),
+    `Frozen 0306 independent training control is missing ${fragment}`,
   )
 }
 assert.equal(
-  independentControlMigration.includes("NEW.state = 'active'"),
+  (
+    independentControlContract.match(
+      /ALTER FUNCTION public\.[a-z_]+\(\)\n  SET search_path = pg_catalog, public, pg_temp;/gu,
+    ) || []
+  ).length,
+  11,
+  'Strict 0306 must pin every attested trigger function search path',
+)
+assert.equal(
+  independentControlContract.includes("NEW.state = 'active'"),
   false,
   'Order training must not block switching the advanced safety profile to Active',
 )

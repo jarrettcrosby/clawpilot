@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
@@ -17,6 +17,17 @@ import {
 } from './test-commerce-order-revisions-postgres.mjs'
 
 const root = process.cwd()
+const futureCommerceRolloutContractMigration = readFileSync(
+  resolve(
+    root,
+    'scripts/fixtures/0305_operations_commerce_rollout_contract.sql',
+  ),
+  'utf8',
+)
+const futureCommerceRolloutContractChecksum =
+  createHash('sha256')
+    .update(futureCommerceRolloutContractMigration)
+    .digest('hex')
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
@@ -24,6 +35,7 @@ const { Pool } = requireFromApp('pg')
 const ts = requireFromApp('typescript')
 
 const {
+  OPERATIONS_COMMERCE_STORE_SYNC_AUTHORITY_CONTRACT_SQL,
   OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL,
   OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL,
   OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL,
@@ -124,6 +136,128 @@ async function storeSyncRewrittenFunctionHealth(client) {
   return result.rows[0]?.healthy === true
 }
 
+async function storeSyncAuthorityContract(client) {
+  const result = await client.query(
+    `SELECT ${OPERATIONS_COMMERCE_STORE_SYNC_AUTHORITY_CONTRACT_SQL}
+       AS phase`,
+  )
+  return result.rows[0]?.phase
+}
+
+async function readStoreSyncOperatorBindingCatalog(client) {
+  const result = await client.query(
+    `SELECT pg_catalog.count(*)::integer AS binding_count,
+            pg_catalog.encode(
+              public.digest(
+                pg_catalog.convert_to(
+                  pg_catalog.string_agg(
+                    pg_catalog.concat_ws(
+                      '|',
+                      installed_table.relname,
+                      installed_constraint.conname,
+                      bound_operator.binding_ordinal::pg_catalog.text,
+                      operator_namespace.nspname,
+                      installed_operator.oprname,
+                      installed_operator.oprkind::pg_catalog.text,
+                      COALESCE(
+                        left_type_namespace.nspname || '.'
+                          || left_type.typname,
+                        '<none>'
+                      ),
+                      COALESCE(
+                        right_type_namespace.nspname || '.'
+                          || right_type.typname,
+                        '<none>'
+                      ),
+                      result_type_namespace.nspname || '.'
+                        || result_type.typname,
+                      procedure_namespace.nspname || '.'
+                        || installed_procedure.proname,
+                      installed_operator.oprcanmerge::pg_catalog.text,
+                      installed_operator.oprcanhash::pg_catalog.text
+                    ),
+                    pg_catalog.chr(10) ORDER BY
+                      installed_table.relname,
+                      installed_constraint.conname,
+                      bound_operator.binding_ordinal
+                  ),
+                  'UTF8'
+                ),
+                'sha256'
+              ),
+              'hex'
+            ) AS binding_hash
+     FROM pg_catalog.pg_constraint installed_constraint
+     JOIN pg_catalog.pg_class installed_table
+       ON installed_table.oid = installed_constraint.conrelid
+     JOIN pg_catalog.pg_namespace installed_namespace
+       ON installed_namespace.oid = installed_table.relnamespace
+     CROSS JOIN LATERAL pg_catalog.regexp_matches(
+       installed_constraint.conbin::pg_catalog.text,
+       ':opno ([0-9]+)',
+       'g'
+     ) WITH ORDINALITY AS bound_operator(oid_match, binding_ordinal)
+     JOIN pg_catalog.pg_operator installed_operator
+       ON installed_operator.oid =
+            bound_operator.oid_match[1]::pg_catalog.oid
+     JOIN pg_catalog.pg_namespace operator_namespace
+       ON operator_namespace.oid = installed_operator.oprnamespace
+     LEFT JOIN pg_catalog.pg_type left_type
+       ON left_type.oid = installed_operator.oprleft
+      AND installed_operator.oprleft <> 0
+     LEFT JOIN pg_catalog.pg_namespace left_type_namespace
+       ON left_type_namespace.oid = left_type.typnamespace
+     LEFT JOIN pg_catalog.pg_type right_type
+       ON right_type.oid = installed_operator.oprright
+      AND installed_operator.oprright <> 0
+     LEFT JOIN pg_catalog.pg_namespace right_type_namespace
+       ON right_type_namespace.oid = right_type.typnamespace
+     JOIN pg_catalog.pg_type result_type
+       ON result_type.oid = installed_operator.oprresult
+     JOIN pg_catalog.pg_namespace result_type_namespace
+       ON result_type_namespace.oid = result_type.typnamespace
+     JOIN pg_catalog.pg_proc installed_procedure
+       ON installed_procedure.oid = installed_operator.oprcode
+     JOIN pg_catalog.pg_namespace procedure_namespace
+       ON procedure_namespace.oid = installed_procedure.pronamespace
+     WHERE installed_namespace.nspname = 'public'
+       AND installed_constraint.contype = 'c'
+       AND (
+         installed_constraint.conrelid IN (
+           pg_catalog.to_regclass(
+             'public.operations_commerce_store_sync_controls'
+           ),
+           pg_catalog.to_regclass(
+             'public.operations_commerce_store_sync_change_receipts'
+           ),
+           pg_catalog.to_regclass(
+             'public.operations_commerce_store_sync_read_leases'
+           )
+         )
+         OR (
+           installed_constraint.conrelid IN (
+             pg_catalog.to_regclass(
+               'public.operations_commerce_intake_read_intents'
+             ),
+             pg_catalog.to_regclass(
+               'public.operations_commerce_product_image_observation_sets'
+             ),
+             pg_catalog.to_regclass(
+               'public.operations_commerce_product_image_import_jobs'
+             )
+           )
+           AND pg_catalog.strpos(
+                 pg_catalog.pg_get_constraintdef(
+                   installed_constraint.oid
+                 ),
+                 'provider_read_authority'
+               ) > 0
+         )
+       )`,
+  )
+  return result.rows[0]
+}
+
 async function readStoreSyncHealthCatalog(client) {
   const signatures = [
     'public.operations_commerce_store_sync_effective_reason(uuid,uuid)',
@@ -205,15 +339,38 @@ async function readStoreSyncHealthCatalog(client) {
         FROM pg_constraint installed_constraint
         JOIN pg_class installed_table
           ON installed_table.oid = installed_constraint.conrelid
-        WHERE installed_constraint.conrelid IN (
-          to_regclass('operations_commerce_store_sync_controls'),
-          to_regclass('operations_commerce_store_sync_change_receipts'),
-          to_regclass('operations_commerce_store_sync_read_leases')
-        ) OR installed_constraint.conname IN (
-          'commerce_intake_read_intents_authority_valid',
-          'ops_commerce_image_set_authority_valid',
-          'ops_commerce_image_job_authority_valid'
-        )) AS constraint_hash,
+        JOIN pg_namespace installed_namespace
+          ON installed_namespace.oid = installed_table.relnamespace
+        WHERE installed_namespace.nspname = 'public'
+          AND (
+            installed_constraint.conrelid IN (
+              to_regclass('public.operations_commerce_store_sync_controls'),
+              to_regclass(
+                'public.operations_commerce_store_sync_change_receipts'
+              ),
+              to_regclass(
+                'public.operations_commerce_store_sync_read_leases'
+              )
+            )
+            OR (
+              installed_constraint.conrelid IN (
+                to_regclass(
+                  'public.operations_commerce_intake_read_intents'
+                ),
+                to_regclass(
+                  'public.operations_commerce_product_image_observation_sets'
+                ),
+                to_regclass(
+                  'public.operations_commerce_product_image_import_jobs'
+                )
+              )
+              AND installed_constraint.contype = 'c'
+              AND position(
+                'provider_read_authority'
+                IN pg_get_constraintdef(installed_constraint.oid)
+              ) > 0
+            )
+          )) AS constraint_hash,
        (SELECT encode(digest(convert_to(string_agg(concat_ws(
          '|', installed_table.relname, installed_index_class.relname,
          installed_index.indisprimary::text,
@@ -237,7 +394,36 @@ async function readStoreSyncHealthCatalog(client) {
        (SELECT encode(digest(convert_to(string_agg(concat_ws(
          '|', table_name, column_name, ordinal_position::text,
          data_type, udt_schema, udt_name, is_nullable,
-         COALESCE(column_default, '<null>'), is_identity,
+         COALESCE(
+           CASE
+             WHEN table_name =
+                    'operations_commerce_store_sync_change_receipts'
+              AND column_name = 'id'
+              AND column_default = 'gen_random_uuid()'
+              AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_attrdef installed_default
+                JOIN pg_catalog.pg_depend default_dependency
+                  ON default_dependency.classid =
+                       'pg_catalog.pg_attrdef'::regclass
+                 AND default_dependency.objid = installed_default.oid
+                 AND default_dependency.refclassid =
+                       'pg_catalog.pg_proc'::regclass
+                 AND default_dependency.refobjid =
+                       pg_catalog.to_regprocedure(
+                         'public.gen_random_uuid()'
+                       )
+                 AND default_dependency.deptype = 'n'
+                WHERE installed_default.adrelid = pg_catalog.to_regclass(
+                        'public.' || table_name
+                      )
+                  AND installed_default.adnum = ordinal_position
+              )
+               THEN 'public.gen_random_uuid()'
+             ELSE column_default
+           END,
+           '<null>'
+         ), is_identity,
          COALESCE(identity_generation, '<null>'), is_generated,
          COALESCE(generation_expression, '<null>'),
          COALESCE(collation_schema, '<null>'),
@@ -273,13 +459,22 @@ async function assertFunctionTamperDetected(pool, tamperSql) {
   try {
     await client.query('BEGIN')
     assert.equal(await storeSyncFunctionHealth(client), true)
+    assert.equal(
+      await storeSyncAuthorityContract(client),
+      'legacy-writer-compatible',
+    )
     await client.query(tamperSql)
     assert.equal(await storeSyncFunctionHealth(client), false)
+    assert.equal(await storeSyncAuthorityContract(client), 'invalid')
   } finally {
     await client.query('ROLLBACK').catch(() => {})
     client.release()
   }
   assert.equal(await storeSyncFunctionHealth(pool), true)
+  assert.equal(
+    await storeSyncAuthorityContract(pool),
+    'legacy-writer-compatible',
+  )
 }
 
 async function assertStructureTamperDetected(pool, tamperSql) {
@@ -287,13 +482,22 @@ async function assertStructureTamperDetected(pool, tamperSql) {
   try {
     await client.query('BEGIN')
     assert.equal(await storeSyncStructureHealth(client), true)
+    assert.equal(
+      await storeSyncAuthorityContract(client),
+      'legacy-writer-compatible',
+    )
     await client.query(tamperSql)
     assert.equal(await storeSyncStructureHealth(client), false)
+    assert.equal(await storeSyncAuthorityContract(client), 'invalid')
   } finally {
     await client.query('ROLLBACK').catch(() => {})
     client.release()
   }
   assert.equal(await storeSyncStructureHealth(pool), true)
+  assert.equal(
+    await storeSyncAuthorityContract(pool),
+    'legacy-writer-compatible',
+  )
 }
 
 async function assertRewrittenFunctionTamperDetected(pool, tamperSql) {
@@ -301,13 +505,42 @@ async function assertRewrittenFunctionTamperDetected(pool, tamperSql) {
   try {
     await client.query('BEGIN')
     assert.equal(await storeSyncRewrittenFunctionHealth(client), true)
+    assert.equal(
+      await storeSyncAuthorityContract(client),
+      'legacy-writer-compatible',
+    )
     await client.query(tamperSql)
     assert.equal(await storeSyncRewrittenFunctionHealth(client), false)
+    assert.equal(await storeSyncAuthorityContract(client), 'invalid')
   } finally {
     await client.query('ROLLBACK').catch(() => {})
     client.release()
   }
   assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
+  assert.equal(
+    await storeSyncAuthorityContract(pool),
+    'legacy-writer-compatible',
+  )
+}
+
+async function assertAuthorityContractTamperDetected(pool, tamperSql) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    assert.equal(
+      await storeSyncAuthorityContract(client),
+      'legacy-writer-compatible',
+    )
+    await client.query(tamperSql)
+    assert.equal(await storeSyncAuthorityContract(client), 'invalid')
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+    client.release()
+  }
+  assert.equal(
+    await storeSyncAuthorityContract(pool),
+    'legacy-writer-compatible',
+  )
 }
 
 async function withReplicaFixture(pool, work) {
@@ -401,6 +634,163 @@ async function seedAccount(client, value) {
   )
 }
 
+async function seedLegacyProviderReadAuthorityEvidence(client, value) {
+  value.legacyReadIntentId = randomUUID()
+  value.legacyObservationSetId = randomUUID()
+  value.legacyObservationId = randomUUID()
+  value.legacyImageJobId = randomUUID()
+  const externalProductId = `legacy-store-sync-${value.globalId}`
+  const providerImageId = `legacy-image-${value.globalId}`
+  const identity = await client.query(
+    `SELECT encode(
+       digest(convert_to('provider-id:' || $1::text, 'UTF8'), 'sha256'),
+       'hex'
+     ) AS value`,
+    [providerImageId],
+  )
+  value.legacyImageIdentity = identity.rows[0].value
+
+  await client.query(
+    `INSERT INTO operations_commerce_intake_read_intents (
+       id, organization_id, integration_account_id, pipeline_id,
+       provider, resource, intake_action, idempotency_key, request_hash,
+       credential_version, target_kind, session_id, batch_number,
+       window_end, query_hash, created_by, updated_by, expires_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'shopify', 'orders', 'fetch', $5, repeat('1', 64),
+       1, 'none', $6::uuid, 1,
+       clock_timestamp(), repeat('2', 64), $7, $7,
+       clock_timestamp() + interval '1 day'
+     )`,
+    [
+      value.legacyReadIntentId,
+      value.organizationId,
+      value.accountId,
+      value.pipelineId,
+      `legacy-store-sync-intent:${value.globalId}`,
+      randomUUID(),
+      actorEmail,
+    ],
+  )
+  await client.query('BEGIN')
+  try {
+    await client.query(
+      `INSERT INTO operations_commerce_product_image_observation_sets (
+         id, organization_id, integration_account_id, provider,
+         credential_generation, external_product_id, product_source_hash,
+         image_set_complete, image_identity_count,
+         image_identity_set_sha256, snapshot_sha256, observed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         1, $4, repeat('3', 64), true, 1,
+         encode(digest(convert_to(
+           'commerce-product-image-identity-set-v1' || chr(31) || $5::text,
+           'UTF8'
+         ), 'sha256'), 'hex'),
+         repeat('5', 64), clock_timestamp(), $6
+       )`,
+      [
+        value.legacyObservationSetId,
+        value.organizationId,
+        value.accountId,
+        externalProductId,
+        value.legacyImageIdentity,
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_product_image_observations (
+         id, organization_id, integration_account_id, provider,
+         credential_generation, observation_set_id, external_product_id,
+         provider_image_id, locator_sha256, image_identity_sha256,
+         image_sequence, lifecycle_state, source_hash, observation_revision,
+         observed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         1, $4::uuid, $5, $6, repeat('6', 64), $7,
+         0, 'active', repeat('7', 64), 1, clock_timestamp(), $8
+       )`,
+      [
+        value.legacyObservationId,
+        value.organizationId,
+        value.accountId,
+        value.legacyObservationSetId,
+        externalProductId,
+        providerImageId,
+        value.legacyImageIdentity,
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_product_image_observation_set_memberships (
+         organization_id, integration_account_id, provider,
+         credential_generation, external_product_id, observation_set_id,
+         image_identity_sha256, observation_id, observation_revision,
+         locator_sha256, observation_source_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify', 1, $3, $4::uuid,
+         $5, $6::uuid, 1, repeat('6', 64), repeat('7', 64)
+       )`,
+      [
+        value.organizationId,
+        value.accountId,
+        externalProductId,
+        value.legacyObservationSetId,
+        value.legacyImageIdentity,
+        value.legacyObservationId,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_product_image_import_jobs (
+         id, organization_id, integration_account_id, provider,
+         credential_generation, observation_id, observation_revision,
+         external_product_id, image_identity_sha256, locator_sha256,
+         observation_source_hash, state, wait_reason, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         1, $4::uuid, 1,
+         $5, $6, repeat('6', 64),
+         repeat('7', 64), 'waiting_mapping', 'unmapped', $7, $7
+       )`,
+      [
+        value.legacyImageJobId,
+        value.organizationId,
+        value.accountId,
+        value.legacyObservationId,
+        externalProductId,
+        value.legacyImageIdentity,
+        actorEmail,
+      ],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  }
+
+  const snapshots = await client.query(
+    `SELECT
+       (SELECT to_jsonb(intent) - 'provider_read_authority'
+        FROM operations_commerce_intake_read_intents intent
+        WHERE intent.id = $1::uuid) AS read_intent,
+       (SELECT to_jsonb(observation_set) - 'provider_read_authority'
+        FROM operations_commerce_product_image_observation_sets observation_set
+        WHERE observation_set.id = $2::uuid) AS observation_set,
+       (SELECT to_jsonb(job) - 'provider_read_authority'
+        FROM operations_commerce_product_image_import_jobs job
+        WHERE job.id = $3::uuid) AS image_job`,
+    [
+      value.legacyReadIntentId,
+      value.legacyObservationSetId,
+      value.legacyImageJobId,
+    ],
+  )
+  value.legacyReadIntentSnapshot = snapshots.rows[0].read_intent
+  value.legacyObservationSetSnapshot = snapshots.rows[0].observation_set
+  value.legacyImageJobSnapshot = snapshots.rows[0].image_job
+}
+
 async function verify(databaseUrl, fixtures) {
   const pool = new Pool({ connectionString: databaseUrl, max: 6 })
   const domain = loadTypeScript(
@@ -434,6 +824,50 @@ async function verify(databaseUrl, fixtures) {
       )
       assert.equal(row.explicit_choice, false)
       assert.equal(Number(row.revision), 1)
+    }
+
+    const legacyFixtures = fixtures.filter((value) => value.legacyReadIntentId)
+    assert.equal(legacyFixtures.length, 2)
+    for (const legacy of legacyFixtures) {
+      const legacyEvidence = await pool.query(
+        `SELECT
+         (SELECT intent.provider_read_authority
+          FROM operations_commerce_intake_read_intents intent
+          WHERE intent.id = $1::uuid) AS read_intent_authority,
+         (SELECT to_jsonb(intent) - 'provider_read_authority'
+          FROM operations_commerce_intake_read_intents intent
+          WHERE intent.id = $1::uuid) AS read_intent_snapshot,
+         (SELECT observation_set.provider_read_authority
+          FROM operations_commerce_product_image_observation_sets observation_set
+          WHERE observation_set.id = $2::uuid) AS observation_set_authority,
+         (SELECT to_jsonb(observation_set) - 'provider_read_authority'
+          FROM operations_commerce_product_image_observation_sets observation_set
+          WHERE observation_set.id = $2::uuid) AS observation_set_snapshot,
+         (SELECT job.provider_read_authority
+          FROM operations_commerce_product_image_import_jobs job
+          WHERE job.id = $3::uuid) AS image_job_authority,
+         (SELECT to_jsonb(job) - 'provider_read_authority'
+          FROM operations_commerce_product_image_import_jobs job
+          WHERE job.id = $3::uuid) AS image_job_snapshot,
+         EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE filename = '0298_operations_commerce_store_sync_controls.sql'
+         ) AS migration_recorded`,
+        [
+          legacy.legacyReadIntentId,
+          legacy.legacyObservationSetId,
+          legacy.legacyImageJobId,
+        ],
+      )
+      assert.deepEqual(legacyEvidence.rows[0], {
+        read_intent_authority: 'automatic',
+        read_intent_snapshot: legacy.legacyReadIntentSnapshot,
+        observation_set_authority: 'automatic',
+        observation_set_snapshot: legacy.legacyObservationSetSnapshot,
+        image_job_authority: 'automatic',
+        image_job_snapshot: legacy.legacyImageJobSnapshot,
+        migration_recorded: true,
+      })
     }
 
     const active = fixtures.find((value) => value.state === 'active')
@@ -1064,6 +1498,35 @@ async function verify(databaseUrl, fixtures) {
       /append-only/i,
     )
 
+    assert.deepEqual(
+      await readStoreSyncOperatorBindingCatalog(pool),
+      {
+        binding_count: 37,
+        binding_hash:
+          '724e0c8f03f49d3f9664948070f811a28a9dbeea2b6a60bd6c12d28d8c33b3bc',
+      },
+    )
+    assert.equal(
+      await storeSyncFunctionHealth(pool),
+      true,
+      'Store sync function health starts exact',
+    )
+    assert.equal(
+      await storeSyncRewrittenFunctionHealth(pool),
+      true,
+      'Store sync rewritten-function health starts exact',
+    )
+    assert.equal(
+      await storeSyncStructureHealth(pool),
+      true,
+      'Store sync structure health starts exact',
+    )
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+      'Store sync authority phase starts legacy-writer-compatible',
+    )
+
     const functionBodyTampers = [
       `CREATE OR REPLACE FUNCTION
          operations_commerce_store_sync_effective_reason(
@@ -1124,6 +1587,12 @@ async function verify(databaseUrl, fixtures) {
     for (const tamperSql of functionBodyTampers) {
       await assertFunctionTamperDetected(pool, tamperSql)
     }
+    await assertFunctionTamperDetected(
+      pool,
+      `ALTER FUNCTION
+         operations_commerce_store_sync_effective_reason(uuid, uuid)
+       RESET ALL`,
+    )
 
     await assertRewrittenFunctionTamperDetected(
       pool,
@@ -1167,7 +1636,307 @@ async function verify(databaseUrl, fixtures) {
     await assertStructureTamperDetected(
       pool,
       `ALTER TABLE operations_commerce_intake_read_intents
-         ALTER COLUMN provider_read_authority SET DEFAULT 'automatic'`,
+         ADD CONSTRAINT store_sync_test_extra_authority_check
+         CHECK (provider_read_authority = 'automatic')`,
+    )
+    const contractClient = await pool.connect()
+    try {
+      await contractClient.query('BEGIN')
+      await contractClient.query(
+        `INSERT INTO schema_migrations (filename, checksum)
+         VALUES (
+           '0305_operations_commerce_rollout_contract.sql',
+           $1
+         )`,
+        [futureCommerceRolloutContractChecksum],
+      )
+      for (const table of [
+        'operations_commerce_intake_read_intents',
+        'operations_commerce_product_image_observation_sets',
+        'operations_commerce_product_image_import_jobs',
+      ]) {
+        await contractClient.query(
+          `ALTER TABLE ${table}
+             ALTER COLUMN provider_read_authority DROP DEFAULT`,
+        )
+      }
+      assert.equal(await storeSyncStructureHealth(contractClient), true)
+      assert.equal(
+        await storeSyncAuthorityContract(contractClient),
+        'strict-explicit',
+      )
+      await contractClient.query('SAVEPOINT strict_ledger_tamper')
+      await contractClient.query(
+        `UPDATE schema_migrations
+         SET checksum = repeat('0', 64)
+         WHERE filename =
+           '0305_operations_commerce_rollout_contract.sql'`,
+      )
+      assert.equal(await storeSyncStructureHealth(contractClient), false)
+      assert.equal(await storeSyncAuthorityContract(contractClient), 'invalid')
+      await contractClient.query('ROLLBACK TO SAVEPOINT strict_ledger_tamper')
+      assert.equal(
+        await storeSyncAuthorityContract(contractClient),
+        'strict-explicit',
+      )
+    } finally {
+      await contractClient.query('ROLLBACK').catch(() => {})
+      contractClient.release()
+    }
+    assert.equal(await storeSyncStructureHealth(pool), true)
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+    )
+    await assertAuthorityContractTamperDetected(
+      pool,
+      `UPDATE schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0298_operations_commerce_store_sync_controls.sql'`,
+    )
+    const foreignFirstClient = await pool.connect()
+    try {
+      await foreignFirstClient.query('BEGIN')
+      await foreignFirstClient.query(
+        `CREATE SCHEMA store_sync_health_shadow;
+         CREATE TABLE store_sync_health_shadow.schema_migrations (
+           filename text PRIMARY KEY,
+           checksum text NOT NULL
+         );
+         CREATE TABLE
+           store_sync_health_shadow.operations_integration_accounts (
+             organization_id uuid,
+             id uuid
+           );
+         CREATE TABLE
+           store_sync_health_shadow.operations_commerce_store_sync_controls (
+             organization_id uuid,
+             integration_account_id uuid
+           );
+         CREATE FUNCTION store_sync_health_shadow.digest(bytea, text)
+         RETURNS bytea LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT $1 $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.encode(bytea, text)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT 'spoofed'::text $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.convert_to(text, name)
+         RETURNS bytea LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT ''::bytea $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.to_regprocedure(text)
+         RETURNS pg_catalog.regprocedure LANGUAGE sql STABLE
+         AS $shadow$ SELECT NULL::pg_catalog.regprocedure $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.to_regclass(text)
+         RETURNS pg_catalog.regclass LANGUAGE sql STABLE
+         AS $shadow$ SELECT NULL::pg_catalog.regclass $shadow$;
+         CREATE FUNCTION
+           store_sync_health_shadow.pg_get_function_result(pg_catalog.oid)
+         RETURNS text LANGUAGE sql STABLE
+         AS $shadow$ SELECT 'spoofed'::text $shadow$;
+         CREATE FUNCTION
+           store_sync_health_shadow.pg_get_constraintdef(pg_catalog.oid)
+         RETURNS text LANGUAGE sql STABLE
+         AS $shadow$ SELECT 'CHECK (true)'::text $shadow$;
+         CREATE FUNCTION
+           store_sync_health_shadow.pg_get_indexdef(pg_catalog.oid)
+         RETURNS text LANGUAGE sql STABLE
+         AS $shadow$ SELECT 'CREATE INDEX spoofed'::text $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.btrim(text)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT $1 $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.length(text)
+         RETURNS integer LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT 0 $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.jsonb_typeof(jsonb)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT 'object'::text $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.now()
+         RETURNS timestamptz LANGUAGE sql STABLE
+         AS $shadow$ SELECT '2000-01-01Z'::timestamptz $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.gen_random_uuid()
+         RETURNS uuid LANGUAGE sql VOLATILE
+         AS $shadow$ SELECT NULL::uuid $shadow$;
+         CREATE FUNCTION
+           store_sync_health_shadow.regexp_replace(text, text, text, text)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT $1 $shadow$;
+         CREATE FUNCTION
+           store_sync_health_shadow.array_to_string(text[], text)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT 'spoofed'::text $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.chr(integer)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT ''::text $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.replace(text, text, text)
+         RETURNS text LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT $1 $shadow$;
+         CREATE FUNCTION store_sync_health_shadow.strpos(text, text)
+         RETURNS integer LANGUAGE sql IMMUTABLE
+         AS $shadow$ SELECT 0 $shadow$;
+         INSERT INTO store_sync_health_shadow.schema_migrations (
+           filename, checksum
+         ) VALUES (
+           '0298_operations_commerce_store_sync_controls.sql',
+           repeat('0', 64)
+         );
+         SET LOCAL search_path =
+           store_sync_health_shadow, public, pg_catalog, pg_temp`,
+      )
+      assert.equal(await storeSyncFunctionHealth(foreignFirstClient), true)
+      assert.equal(
+        await storeSyncRewrittenFunctionHealth(foreignFirstClient),
+        true,
+      )
+      assert.equal(await storeSyncStructureHealth(foreignFirstClient), true)
+      assert.equal(
+        await storeSyncAuthorityContract(foreignFirstClient),
+        'legacy-writer-compatible',
+      )
+    } finally {
+      await foreignFirstClient.query('ROLLBACK').catch(() => {})
+      foreignFirstClient.release()
+    }
+    const spoofedDigestClient = await pool.connect()
+    try {
+      await spoofedDigestClient.query('BEGIN')
+      await spoofedDigestClient.query(
+        `CREATE SCHEMA store_sync_digest_shadow;
+         CREATE FUNCTION store_sync_digest_shadow.digest(bytea, text)
+         RETURNS bytea LANGUAGE sql IMMUTABLE
+         AS $spoof$
+           SELECT CASE
+             WHEN pg_catalog.convert_from($1, 'UTF8') LIKE
+                    '%public.protect_commerce_order_sync_session_lineage()%'
+               THEN pg_catalog.decode(
+                 'bb66159fdec700a84c7dccd76088b9052f107f78cf604bb43dbd95163513e2b6',
+                 'hex'
+               )
+             ELSE public.digest($1, $2)
+           END
+         $spoof$;
+         CREATE OR REPLACE FUNCTION
+           public.protect_commerce_order_sync_session_lineage()
+         RETURNS trigger LANGUAGE plpgsql
+         AS $weakened$
+         BEGIN
+           RETURN NEW;
+         END
+         $weakened$;
+         SET LOCAL search_path =
+           store_sync_digest_shadow, public, pg_catalog, pg_temp`,
+      )
+      assert.equal(await storeSyncFunctionHealth(spoofedDigestClient), true)
+      assert.equal(
+        await storeSyncStructureHealth(spoofedDigestClient),
+        true,
+      )
+      assert.equal(
+        await storeSyncRewrittenFunctionHealth(spoofedDigestClient),
+        false,
+      )
+      assert.equal(
+        await storeSyncAuthorityContract(spoofedDigestClient),
+        'invalid',
+      )
+    } finally {
+      await spoofedDigestClient.query('ROLLBACK').catch(() => {})
+      spoofedDigestClient.release()
+    }
+    assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_intake_read_intents
+         ALTER COLUMN provider_read_authority DROP DEFAULT`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `ALTER TABLE operations_commerce_intake_read_intents
+         ALTER COLUMN provider_read_authority SET DEFAULT 'manual_read_only'`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_default_shadow;
+       CREATE FUNCTION store_sync_default_shadow.now()
+       RETURNS timestamptz LANGUAGE sql STABLE
+       AS $shadow$ SELECT pg_catalog.now() $shadow$;
+       SET LOCAL search_path =
+         store_sync_default_shadow, public, pg_catalog, pg_temp;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         ALTER COLUMN created_at SET DEFAULT now()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_constraint_shadow;
+       CREATE FUNCTION store_sync_constraint_shadow.btrim(text)
+       RETURNS text LANGUAGE sql IMMUTABLE
+       AS $shadow$ SELECT pg_catalog.btrim($1) $shadow$;
+       CREATE FUNCTION store_sync_constraint_shadow.length(text)
+       RETURNS integer LANGUAGE sql IMMUTABLE
+       AS $shadow$ SELECT pg_catalog.length($1) $shadow$;
+       SET LOCAL search_path =
+         store_sync_constraint_shadow, public, pg_catalog, pg_temp;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         DROP CONSTRAINT
+           operations_commerce_store_sync_controls_reason_check;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         ADD CONSTRAINT
+           operations_commerce_store_sync_controls_reason_check
+         CHECK (
+           length(btrim(reason)) BETWEEN 1 AND 500
+           AND reason !~ '[[:cntrl:]]'
+         )`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_operator_shadow;
+       CREATE FUNCTION store_sync_operator_shadow.text_eq(text, text)
+       RETURNS boolean LANGUAGE sql IMMUTABLE
+       AS $shadow$ SELECT true $shadow$;
+       CREATE OPERATOR store_sync_operator_shadow.= (
+         LEFTARG = text,
+         RIGHTARG = text,
+         FUNCTION = store_sync_operator_shadow.text_eq
+       );
+       SET LOCAL search_path =
+         store_sync_operator_shadow, public, pg_catalog, pg_temp;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         DROP CONSTRAINT
+           operations_commerce_store_sync_controls_desired_state_check;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         ADD CONSTRAINT
+           operations_commerce_store_sync_controls_desired_state_check
+         CHECK (desired_state IN ('running', 'paused'))`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE SCHEMA store_sync_reference_shadow;
+       CREATE TABLE
+         store_sync_reference_shadow.operations_integration_accounts (
+           organization_id uuid NOT NULL,
+           id uuid NOT NULL,
+           UNIQUE (organization_id, id)
+         );
+       INSERT INTO
+         store_sync_reference_shadow.operations_integration_accounts (
+           organization_id, id
+         )
+       SELECT organization_id, id
+       FROM public.operations_integration_accounts;
+       SET LOCAL search_path =
+         store_sync_reference_shadow, public, pg_catalog, pg_temp;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         DROP CONSTRAINT
+           operations_commerce_store_sync_controls_account_fkey;
+       ALTER TABLE public.operations_commerce_store_sync_controls
+         ADD CONSTRAINT
+           operations_commerce_store_sync_controls_account_fkey
+         FOREIGN KEY (organization_id, integration_account_id)
+         REFERENCES operations_integration_accounts(organization_id, id)
+         ON DELETE RESTRICT`,
     )
     await assertStructureTamperDetected(
       pool,
@@ -1184,6 +1953,24 @@ async function verify(databaseUrl, fixtures) {
       `ALTER TABLE operations_commerce_store_sync_read_leases
          DISABLE TRIGGER
            guard_operations_commerce_store_sync_read_lease_write`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `CREATE TRIGGER store_sync_test_extra_receipt_guard
+         BEFORE UPDATE
+         ON operations_commerce_store_sync_change_receipts
+         FOR EACH ROW EXECUTE FUNCTION
+           protect_operations_commerce_store_sync_receipt()`,
+    )
+    await assertStructureTamperDetected(
+      pool,
+      `DROP TRIGGER commerce_order_sync_session_lineage_guard
+         ON operations_commerce_order_backfill_sessions;
+       CREATE TRIGGER commerce_order_sync_session_lineage_guard
+         BEFORE INSERT OR UPDATE
+         ON operations_commerce_order_backfill_sessions
+         FOR EACH ROW EXECUTE FUNCTION
+           protect_commerce_order_sync_session_lineage()`,
     )
     await assertStructureTamperDetected(
       pool,
@@ -1330,6 +2117,99 @@ async function verify(databaseUrl, fixtures) {
 }
 
 async function main() {
+  const migrationSource = readFileSync(
+    resolve(root, 'db/migrations/0298_operations_commerce_store_sync_controls.sql'),
+    'utf8',
+  )
+  const migrationSha256 = createHash('sha256')
+    .update(migrationSource)
+    .digest('hex')
+  const storeSyncHealthSource = readFileSync(
+    resolve(root, 'app_src/lib/persistence/commerceStoreSyncHealth.ts'),
+    'utf8',
+  )
+  const healthRouteSource = readFileSync(
+    resolve(root, 'app_src/app/api/health/route.ts'),
+    'utf8',
+  )
+  const outerHealthFilename = healthRouteSource.indexOf(
+    "'0298_operations_commerce_store_sync_controls.sql'",
+  )
+  const outerHealthStart = healthRouteSource.lastIndexOf(
+    'EXISTS (',
+    outerHealthFilename,
+  )
+  const outerHealthEnd = healthRouteSource.indexOf(
+    ') AS operations_commerce_store_sync_controls_applied',
+    outerHealthStart,
+  )
+  assert.ok(
+    outerHealthStart >= 0 && outerHealthEnd > outerHealthStart,
+    'The runtime health route must expose the Store sync applied gate',
+  )
+  const outerHealthSql = healthRouteSource.slice(
+    outerHealthStart,
+    outerHealthEnd,
+  )
+  for (const requiredFragment of [
+    'FROM public.schema_migrations',
+    "pg_catalog.to_regclass(\n                'public.operations_commerce_store_sync_controls'",
+    'FROM public.operations_integration_accounts account',
+    'LEFT JOIN public.operations_commerce_store_sync_controls control',
+    'public.operations_commerce_store_sync_effective_reason(',
+  ]) {
+    assert.ok(
+      outerHealthSql.includes(requiredFragment),
+      `The outer Store sync health gate must bind ${requiredFragment}`,
+    )
+  }
+  assert.doesNotMatch(
+    outerHealthSql,
+    /FROM\s+schema_migrations\b/u,
+    'The outer Store sync health gate must not resolve a caller-schema ledger',
+  )
+  assert.ok(
+    storeSyncHealthSource.includes(`'${migrationSha256}'`),
+    'Store sync health must pin the exact 0298 migration bytes',
+  )
+  for (const contract of [
+    'legacy-writer-compatible',
+    'strict-explicit',
+  ]) {
+    assert.ok(
+      storeSyncHealthSource.includes(`'${contract}'`),
+      `Store sync health must expose the ${contract} rollout phase`,
+    )
+  }
+  assert.ok(
+    storeSyncHealthSource.includes(`'${futureCommerceRolloutContractChecksum}'`),
+    'Release 1 health must recognize only the frozen 0305 contract migration',
+  )
+  assert.equal(
+    migrationSource.match(
+      /ADD COLUMN IF NOT EXISTS provider_read_authority text\s+NOT NULL DEFAULT 'automatic'/gu,
+    )?.length,
+    3,
+    '0298 must metadata-backfill all three legacy authority columns',
+  )
+  assert.equal(
+    migrationSource.match(
+      /ALTER COLUMN provider_read_authority DROP DEFAULT/gu,
+    )?.length || 0,
+    0,
+    '0298 must retain the automatic compatibility defaults for the first rollout',
+  )
+  for (const table of [
+    'operations_commerce_intake_read_intents',
+    'operations_commerce_product_image_observation_sets',
+    'operations_commerce_product_image_import_jobs',
+  ]) {
+    assert.doesNotMatch(
+      migrationSource,
+      new RegExp(`UPDATE\\s+(?:public\\.)?${table}\\b`, 'u'),
+      `0298 must not fire legacy row-update guards while backfilling ${table}`,
+    )
+  }
   command('docker', ['info'], { timeout: 30_000 })
   const container =
     `clawpilot-store-sync-${process.pid}-${randomUUID().slice(0, 8)}`
@@ -1352,6 +2232,11 @@ async function main() {
     const pool = new Pool({ connectionString: databaseUrl, max: 1 })
     const client = await pool.connect()
     const files = migrations()
+    assert.equal(
+      files.includes('0305_operations_commerce_rollout_contract.sql'),
+      false,
+      'The 0305 contract must ship only after Release 1 is live',
+    )
     const migration = '0298_operations_commerce_store_sync_controls.sql'
     const migrationIndex = files.indexOf(migration)
     assert.ok(migrationIndex > 0, '0298 Store sync migration is missing')
@@ -1372,7 +2257,18 @@ async function main() {
         [actorEmail],
       )
       for (const value of fixtures) await seedAccount(client, value)
+      const legacyFixture = fixtures.find((value) => value.state === 'active')
+      assert.ok(legacyFixture)
+      await seedLegacyProviderReadAuthorityEvidence(client, legacyFixture)
       await applyMigration(client, migration)
+      const oldRuntimeCompatibilityFixture = fixtures.find(
+        (value) => value.state === 'shadow',
+      )
+      assert.ok(oldRuntimeCompatibilityFixture)
+      await seedLegacyProviderReadAuthorityEvidence(
+        client,
+        oldRuntimeCompatibilityFixture,
+      )
     } finally {
       client.release()
       await pool.end()

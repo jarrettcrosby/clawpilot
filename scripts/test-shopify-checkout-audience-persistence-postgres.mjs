@@ -349,6 +349,340 @@ async function seedFixture(pool) {
   }
 }
 
+async function exerciseLegacyRateSourceWriterCompatibility(pool) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(
+      `CREATE TEMP TABLE legacy_checkout_receipt_writer_probe (
+         organization_id uuid NOT NULL,
+         integration_account_id uuid NOT NULL,
+         config_id uuid NOT NULL,
+         config_row_version bigint NOT NULL,
+         credential_generation integer NOT NULL,
+         policy_revision bigint NOT NULL,
+         policy_hash text NOT NULL,
+         activation_state text NOT NULL,
+         rate_source text NOT NULL
+       ) ON COMMIT DROP;
+       CREATE TRIGGER derive_legacy_checkout_receipt_writer_probe
+       BEFORE INSERT ON legacy_checkout_receipt_writer_probe
+       FOR EACH ROW EXECUTE FUNCTION
+         derive_operations_shopify_checkout_rate_source_compat()`,
+    )
+    const derived = await client.query(
+      `INSERT INTO legacy_checkout_receipt_writer_probe (
+         organization_id, integration_account_id, config_id,
+         config_row_version, credential_generation,
+         policy_revision, policy_hash, activation_state
+       )
+       SELECT organization_id, integration_account_id, id,
+              row_version, credential_generation,
+              policy_revision, policy_hash, 'shadow'
+       FROM operations_shopify_carrier_service_configs
+       WHERE organization_id = $1::uuid
+         AND id = '29300000-0000-4000-8000-000000000030'::uuid
+       RETURNING rate_source`,
+      [ORGANIZATION_ID],
+    )
+    assert.deepEqual(
+      derived.rows,
+      [{ rate_source: 'sandbox' }],
+      'An old callback insert must derive the exact saved TEST source',
+    )
+    await assert.rejects(
+      client.query(
+        `INSERT INTO legacy_checkout_receipt_writer_probe (
+           organization_id, integration_account_id, config_id,
+           config_row_version, credential_generation,
+           policy_revision, policy_hash, activation_state
+         )
+         SELECT organization_id, integration_account_id, id,
+                row_version, credential_generation,
+                policy_revision, policy_hash, 'active'
+         FROM operations_shopify_carrier_service_configs
+         WHERE organization_id = $1::uuid
+           AND id = '29300000-0000-4000-8000-000000000030'::uuid`,
+        [ORGANIZATION_ID],
+      ),
+      /rate source compatibility fence is stale/u,
+      'The bridge must reject a saved source that contradicts legacy activation semantics',
+    )
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined)
+    client.release()
+  }
+}
+
+async function exerciseLegacyConfigWriterCompatibility(pool) {
+  const legacyPolicyResult = await pool.query(
+    `SELECT
+       config.policy_snapshot - 'checkoutRateControl' AS policy_snapshot,
+       encode(
+         digest(
+           public.canonical_operations_shopify_checkout_policy_jsonb(
+             config.policy_snapshot - 'checkoutRateControl'
+           ),
+           'sha256'
+         ),
+         'hex'
+       ) AS policy_hash
+     FROM public.operations_shopify_carrier_service_configs config
+     WHERE config.organization_id = $1::uuid
+       AND config.id = '29300000-0000-4000-8000-000000000030'::uuid`,
+    [ORGANIZATION_ID],
+  )
+  assert.equal(legacyPolicyResult.rows.length, 1)
+  const legacyPolicy = legacyPolicyResult.rows[0].policy_snapshot
+  const legacyPolicyHash = legacyPolicyResult.rows[0].policy_hash
+
+  {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('SET LOCAL session_replication_role = replica')
+      await client.query(
+        `DELETE FROM public.operations_shopify_carrier_service_configs
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [ORGANIZATION_ID, PRODUCTION_ACCOUNT_ID],
+      )
+      await client.query('SET LOCAL session_replication_role = origin')
+
+      const inserted = await client.query(
+        `INSERT INTO operations_shopify_carrier_service_configs (
+           organization_id, integration_account_id, warehouse_id,
+           registration_state, credential_generation, activation_revision,
+           callback_token_version, callback_token_hash,
+           policy_revision, policy_hash, policy_snapshot,
+           inventory_max_age_seconds, quote_ttl_seconds,
+           order_reconciliation_window_seconds, algorithm_version,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'unconfigured', $4, $5,
+           $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $15
+         )
+         RETURNING
+           policy_snapshot -> 'checkoutRateControl' AS control,
+           policy_hash,
+           encode(
+             digest(
+               public.canonical_operations_shopify_checkout_policy_jsonb(
+                 policy_snapshot
+               ),
+               'sha256'
+             ),
+             'hex'
+           ) AS canonical_policy_hash`,
+        [
+          ORGANIZATION_ID,
+          PRODUCTION_ACCOUNT_ID,
+          '29300000-0000-4000-8000-000000000020',
+          1,
+          1,
+          9,
+          '9'.repeat(64),
+          1,
+          legacyPolicyHash,
+          JSON.stringify(legacyPolicy),
+          900,
+          900,
+          86400,
+          'legacy-14a-config-insert-v1',
+          ACTOR_EMAIL,
+        ],
+      )
+      assert.deepEqual(inserted.rows[0].control, {
+        audience: 'restricted_customers',
+        rateSource: 'production',
+        version: 'shopify-checkout-rate-control-v1',
+      })
+      assert.equal(
+        inserted.rows[0].policy_hash,
+        inserted.rows[0].canonical_policy_hash,
+        'The old config INSERT must receive a recomputed canonical hash',
+      )
+      assert.notEqual(
+        inserted.rows[0].policy_hash,
+        legacyPolicyHash,
+        'The old config INSERT hash must include the derived control',
+      )
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined)
+      client.release()
+    }
+  }
+
+  {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('SET LOCAL session_replication_role = replica')
+      await client.query(
+        `UPDATE public.operations_activation_scopes
+         SET state = 'active'
+         WHERE organization_id = $1::uuid`,
+        [ORGANIZATION_ID],
+      )
+      await client.query('SET LOCAL session_replication_role = origin')
+
+      const before = await client.query(
+        `SELECT
+           encode(
+             jsonb_send(policy_snapshot -> 'checkoutRateControl'),
+             'hex'
+           ) AS control_bytes,
+           policy_snapshot #>> '{checkoutRateControl,rateSource}'
+             AS rate_source
+         FROM public.operations_shopify_carrier_service_configs
+         WHERE organization_id = $1::uuid
+           AND id = '29300000-0000-4000-8000-000000000030'::uuid`,
+        [ORGANIZATION_ID],
+      )
+      assert.equal(before.rows[0].rate_source, 'sandbox')
+      const changedLegacyPolicy = {
+        ...legacyPolicy,
+        checkoutRateWarm: {
+          ...legacyPolicy.checkoutRateWarm,
+          debounceMs: 401,
+        },
+      }
+      const changedLegacyHash = await client.query(
+        `SELECT encode(
+           digest(
+             public.canonical_operations_shopify_checkout_policy_jsonb(
+               $1::jsonb
+             ),
+             'sha256'
+           ),
+           'hex'
+         ) AS policy_hash`,
+        [JSON.stringify(changedLegacyPolicy)],
+      )
+
+      const updated = await client.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET warehouse_id = $3::uuid,
+             registration_state = 'unconfigured',
+             service_gid = NULL,
+             registered_service_name = NULL,
+             credential_generation = $4,
+             activation_revision = $5,
+             callback_token_version = $6,
+             callback_token_hash = $7,
+             policy_revision = $8,
+             policy_hash = $9,
+             policy_snapshot = $10::jsonb,
+             inventory_max_age_seconds = $11,
+             quote_ttl_seconds = $12,
+             order_reconciliation_window_seconds = $13,
+             algorithm_version = $14,
+             last_error_code = NULL,
+             row_version = row_version + 1,
+             updated_by = $15,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+         RETURNING
+           encode(
+             jsonb_send(policy_snapshot -> 'checkoutRateControl'),
+             'hex'
+           ) AS control_bytes,
+           policy_snapshot #>> '{checkoutRateControl,rateSource}'
+             AS rate_source,
+           policy_hash,
+           encode(
+             digest(
+               public.canonical_operations_shopify_checkout_policy_jsonb(
+                 policy_snapshot
+               ),
+               'sha256'
+             ),
+             'hex'
+           ) AS canonical_policy_hash`,
+        [
+          ORGANIZATION_ID,
+          '29300000-0000-4000-8000-000000000030',
+          '29300000-0000-4000-8000-000000000020',
+          1,
+          1,
+          RETAINED_CALLBACK_TOKEN_VERSION,
+          RETAINED_CALLBACK_TOKEN_HASH,
+          2,
+          changedLegacyHash.rows[0].policy_hash,
+          JSON.stringify(changedLegacyPolicy),
+          900,
+          900,
+          86400,
+          'legacy-14a-config-update-v1',
+          ACTOR_EMAIL,
+        ],
+      )
+      assert.equal(
+        updated.rows[0].control_bytes,
+        before.rows[0].control_bytes,
+        'The old config UPDATE must preserve the saved control byte-exactly',
+      )
+      assert.equal(
+        updated.rows[0].rate_source,
+        'sandbox',
+        'The old config UPDATE must not couple TEST source to Active mode',
+      )
+      assert.equal(
+        updated.rows[0].policy_hash,
+        updated.rows[0].canonical_policy_hash,
+        'The old config UPDATE must receive a recomputed canonical hash',
+      )
+      assert.notEqual(
+        updated.rows[0].policy_hash,
+        changedLegacyHash.rows[0].policy_hash,
+        'The old config UPDATE hash must include the preserved control',
+      )
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined)
+      client.release()
+    }
+  }
+
+  {
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const malformedPolicy = {
+        ...legacyPolicy,
+        checkoutRateControl: {
+          version: 'shopify-checkout-rate-control-v1',
+          audience: 'restricted_customers',
+          rateSource: 'invalid',
+        },
+      }
+      await assert.rejects(
+        client.query(
+          `UPDATE operations_shopify_carrier_service_configs
+           SET policy_snapshot = $3::jsonb,
+               policy_hash = repeat('a', 64),
+               row_version = row_version + 1,
+               updated_by = $4,
+               updated_at = now()
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid`,
+          [
+            ORGANIZATION_ID,
+            '29300000-0000-4000-8000-000000000030',
+            JSON.stringify(malformedPolicy),
+            ACTOR_EMAIL,
+          ],
+        ),
+        /operations_shopify_configs_rate_control_valid/u,
+        'A present malformed control must never enter the omission bridge',
+      )
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined)
+      client.release()
+    }
+  }
+}
+
 async function exerciseCarrierServiceModeMatrix(pool) {
   const safeStates = new Set(['shadow', 'read_only', 'active'])
   const states = ['disabled', 'frozen', 'read_only', 'shadow', 'active']
@@ -565,6 +899,53 @@ async function exerciseCarrierServiceModeMatrix(pool) {
         )
 
         if (operation === 'update') {
+          await client.query(
+            `INSERT INTO operations_warehouses (
+               id, organization_id, code, name, address, status
+             ) VALUES (
+               '29300000-0000-4000-8000-000000000021'::uuid,
+               $1::uuid, 'AUDIENCE-INACTIVE', 'Inactive audience warehouse',
+               '{
+                 "line1":"6949 S 108th St",
+                 "city":"La Vista",
+                 "region":"NE",
+                 "postalCode":"68128",
+                 "countryCode":"US"
+               }'::jsonb,
+               'inactive'
+             )`,
+            [ORGANIZATION_ID],
+          )
+          await client.query('SAVEPOINT reject_name_evidence_piggyback')
+          await assert.rejects(
+            client.query(
+              `UPDATE operations_shopify_carrier_service_configs
+               SET registered_service_name = 'Audience sandbox store',
+                   warehouse_id =
+                     '29300000-0000-4000-8000-000000000021'::uuid,
+                   row_version = row_version + 1,
+                   updated_by = $3,
+                   updated_at = now()
+               WHERE organization_id = $1::uuid
+                 AND id = $2::uuid
+                 AND row_version = $4::bigint`,
+              [
+                ORGANIZATION_ID,
+                '29300000-0000-4000-8000-000000000030',
+                ACTOR_EMAIL,
+                configRowVersion,
+              ],
+            ),
+            /name finalization must be name-only/u,
+            `${state}/update must reject non-name readiness piggybacking`,
+          )
+          await client.query(
+            'ROLLBACK TO SAVEPOINT reject_name_evidence_piggyback',
+          )
+          await client.query(
+            'RELEASE SAVEPOINT reject_name_evidence_piggyback',
+          )
+
           const finalizedName = await client.query(
             `UPDATE operations_shopify_carrier_service_configs
              SET registered_service_name = 'Audience sandbox store',
@@ -650,11 +1031,270 @@ async function exerciseCarrierServiceModeMatrix(pool) {
             `${state}/${operation} must finalize exact provider state`,
           )
         }
+        await client.query('SET CONSTRAINTS ALL IMMEDIATE')
       } finally {
         await client.query('ROLLBACK')
         client.release()
       }
     }
+  }
+}
+
+async function exerciseProductionNameFinalization(pool) {
+  const configId = '29300000-0000-4000-8000-000000000031'
+  const serviceGid = 'gid://shopify/DeliveryCarrierService/2930002'
+  const configRowVersion = 900
+  const activationRevision = 900
+  const effectId = randomUUID()
+  const aggregateHash = 'a'.repeat(64)
+  const requestHash = 'b'.repeat(64)
+  const terminalHash = 'c'.repeat(64)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('SET CONSTRAINTS ALL DEFERRED')
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `UPDATE public.operations_activation_scopes
+       SET state = 'active', revision = $2
+       WHERE organization_id = $1::uuid`,
+      [ORGANIZATION_ID, activationRevision],
+    )
+    await client.query(
+      `UPDATE public.operations_shopify_carrier_service_configs
+       SET registration_state = 'registered',
+           service_gid = $3,
+           registered_service_name = 'Legacy production checkout name',
+           credential_generation = 1,
+           activation_revision = 1,
+           row_version = $4::bigint
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ORGANIZATION_ID, configId, serviceGid, configRowVersion],
+    )
+    await client.query('SET LOCAL session_replication_role = origin')
+
+    const readinessBefore = await client.query(
+      `SELECT
+         account.environment,
+         config.registration_state,
+         public.operations_shopify_carrier_service_config_is_ready(
+           config.organization_id,
+           config.id
+         ) AS ready
+       FROM public.operations_shopify_carrier_service_configs config
+       JOIN public.operations_integration_accounts account
+         ON account.organization_id = config.organization_id
+        AND account.id = config.integration_account_id
+       WHERE config.organization_id = $1::uuid
+         AND config.id = $2::uuid`,
+      [ORGANIZATION_ID, configId],
+    )
+    assert.deepEqual(readinessBefore.rows, [{
+      environment: 'production',
+      registration_state: 'registered',
+      ready: false,
+    }])
+
+    await client.query(
+      `INSERT INTO operations_commerce_external_effect_aggregate_fences (
+         organization_id, integration_account_id, provider,
+         aggregate_type, aggregate_id, aggregate_revision, aggregate_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify',
+         'shopify_carrier_service_configuration', 'gscf2930002',
+         $3::bigint, $4
+       )
+       ON CONFLICT (
+         organization_id, integration_account_id, provider,
+         aggregate_type, aggregate_id
+       ) DO UPDATE SET
+         aggregate_revision = EXCLUDED.aggregate_revision,
+         aggregate_hash = EXCLUDED.aggregate_hash`,
+      [
+        ORGANIZATION_ID,
+        PRODUCTION_ACCOUNT_ID,
+        configRowVersion,
+        aggregateHash,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_external_effect_intents (
+         id, organization_id, integration_account_id, provider, action,
+         desired_mode, credential_generation, activation_revision,
+         aggregate_type, aggregate_id, aggregate_revision,
+         aggregate_hash, idempotency_key, request_hash,
+         redacted_request, state, redacted_result,
+         terminal_evidence_hash, provider_write_count, completed_at,
+         created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify',
+         'shopify.carrier_service.update', 'shadow', 1, $4,
+         'shopify_carrier_service_configuration', 'gscf2930002',
+         $5::bigint, $6, 'production-name-simulation:v1', $7,
+         $8::jsonb, 'simulated', '{"providerWrites":0}'::jsonb,
+         $9, 0, now(), $10
+       )`,
+      [
+        effectId,
+        ORGANIZATION_ID,
+        PRODUCTION_ACCOUNT_ID,
+        activationRevision,
+        configRowVersion,
+        aggregateHash,
+        requestHash,
+        JSON.stringify({
+          mutation: {
+            operation: 'update',
+            carrierServiceId: serviceGid,
+            serviceName: 'Audience production store',
+          },
+        }),
+        terminalHash,
+        ACTOR_EMAIL,
+      ],
+    )
+    const authorization = await client.query(
+      `INSERT INTO
+         operations_shopify_carrier_service_mutation_authorizations (
+           organization_id, integration_account_id, config_id,
+           simulation_effect_id, operation, account_environment,
+           credential_generation, config_row_version, activation_state,
+           activation_revision, simulation_activation_revision,
+           provider_write_activation_revision, aggregate_hash,
+           request_hash, expected_service_gid, confirmation_hash,
+           confirmation_statement_version, idempotency_key,
+           authorized_by, authorized_role, expires_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'update',
+           'production', 1, $5::bigint, 'active', 1, $6, $6, $7, $8,
+           $9, repeat('e', 64),
+           'shopify-carrier-service-production-provider-write-v1',
+           'production-name-authorization:v1', $10, 'owner',
+           now() + interval '2 minutes'
+         )
+         RETURNING id::text`,
+      [
+        ORGANIZATION_ID,
+        PRODUCTION_ACCOUNT_ID,
+        configId,
+        effectId,
+        configRowVersion,
+        activationRevision,
+        aggregateHash,
+        requestHash,
+        serviceGid,
+        ACTOR_EMAIL,
+      ],
+    )
+    const leaseToken = randomUUID()
+    const attempt = await client.query(
+      `INSERT INTO operations_shopify_carrier_service_mutation_attempts (
+         organization_id, authorization_id, worker_id, adapter_version,
+         lease_token, lease_expires_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'production-name-fixture',
+         'production-name-fixture-v1', $3::uuid,
+         now() + interval '30 seconds'
+       ) RETURNING id::text`,
+      [ORGANIZATION_ID, authorization.rows[0].id, leaseToken],
+    )
+    await client.query(
+      `INSERT INTO operations_shopify_carrier_service_mutation_outcomes (
+         organization_id, attempt_id, lease_token, outcome,
+         redacted_result, result_hash, provider_reference, error_code,
+         provider_write_count, finalized_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'succeeded',
+         '{"providerMutationAttempted":true,"providerWrites":1}'::jsonb,
+         repeat('d', 64), $4, NULL, 1,
+         'production-name-fixture-v1'
+       )`,
+      [ORGANIZATION_ID, attempt.rows[0].id, leaseToken, serviceGid],
+    )
+    const exactNameEvidence = await client.query(
+      `SELECT
+         public.operations_shopify_cs_name_has_exact_finalization_evidence(
+           $1::uuid,
+           $2::uuid,
+           $3::uuid,
+           $4::bigint,
+           $4::bigint + 1,
+           $5,
+           'Audience production store',
+           1
+         ) AS exact`,
+      [
+        ORGANIZATION_ID,
+        configId,
+        PRODUCTION_ACCOUNT_ID,
+        configRowVersion,
+        serviceGid,
+      ],
+    )
+    assert.deepEqual(exactNameEvidence.rows, [{ exact: true }])
+
+    await client.query('SAVEPOINT reject_stale_production_name')
+    await assert.rejects(
+      client.query(
+        `UPDATE public.operations_shopify_carrier_service_configs
+         SET registered_service_name = 'Unauthorized production name',
+             row_version = row_version + 1,
+             updated_by = $3,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid
+           AND row_version = $4::bigint`,
+        [ORGANIZATION_ID, configId, ACTOR_EMAIL, configRowVersion],
+      ),
+      /requires exact applied one-time mutation evidence/u,
+      'Production name finalization must reject stale target evidence',
+    )
+    await client.query(
+      'ROLLBACK TO SAVEPOINT reject_stale_production_name',
+    )
+    await client.query(
+      'RELEASE SAVEPOINT reject_stale_production_name',
+    )
+
+    const finalized = await client.query(
+      `UPDATE public.operations_shopify_carrier_service_configs
+       SET registered_service_name = 'Audience production store',
+           row_version = row_version + 1,
+           updated_by = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND row_version = $4::bigint
+       RETURNING row_version::text, registered_service_name`,
+      [ORGANIZATION_ID, configId, ACTOR_EMAIL, configRowVersion],
+    )
+    assert.deepEqual(finalized.rows, [{
+      row_version: String(configRowVersion + 1),
+      registered_service_name: 'Audience production store',
+    }])
+    await client.query('SET CONSTRAINTS ALL IMMEDIATE')
+    const readinessAfter = await client.query(
+      `SELECT
+         row_version::text,
+         registered_service_name,
+         public.operations_shopify_carrier_service_config_is_ready(
+           organization_id,
+           id
+         ) AS ready
+       FROM public.operations_shopify_carrier_service_configs
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [ORGANIZATION_ID, configId],
+    )
+    assert.deepEqual(readinessAfter.rows, [{
+      row_version: String(configRowVersion + 1),
+      registered_service_name: 'Audience production store',
+      ready: false,
+    }])
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined)
+    client.release()
   }
 }
 
@@ -832,7 +1472,10 @@ async function exercise(databaseUrl) {
   let canActivate = true
   try {
     await seedFixture(pool)
+    await exerciseLegacyRateSourceWriterCompatibility(pool)
+    await exerciseLegacyConfigWriterCompatibility(pool)
     await exerciseCarrierServiceModeMatrix(pool)
+    await exerciseProductionNameFinalization(pool)
     const planPolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutPlanRatePolicy.ts',
       {
