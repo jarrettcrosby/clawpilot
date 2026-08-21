@@ -287,6 +287,142 @@ test('late malformed legacy detection fails closed and quiesces once', async () 
   assert.equal(stops, 1)
 })
 
+test('late legacy stop defers a job returned by an in-flight claim without local ownership', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-claim-'))
+  const zpl = '^XA^FO20,20^FDMust remain server-owned after stop^FS^XZ'
+  const actions = []
+  let printerBytes = 0
+  let releaseClaimResponse
+  const claimResponseRelease = new Promise((resolvePromise) => {
+    releaseClaimResponse = resolvePromise
+  })
+  let claimRequestObserved = false
+  let claimResponseSent = false
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      actions.push(body.action)
+      if (body.action !== 'claim') {
+        response.writeHead(409, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+        return
+      }
+      claimRequestObserved = true
+      await claimResponseRelease
+      const serverNow = new Date()
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        ok: true,
+        jobs: [{
+          globalId: 'gpj0000065',
+          claimToken: '00000000-0000-4000-8000-000000000065',
+          serverNow: serverNow.toISOString(),
+          claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+          printer: { globalId: 'gpr0000065' },
+          document: {
+            globalId: 'gpf0000065',
+            type: 'shipping_label',
+            format: 'ZPL',
+            encoding: 'utf8',
+            media: 'label_4x6',
+            inlinePayload: zpl,
+            byteLength: Buffer.byteLength(zpl),
+            contentSha256: createHash('sha256').update(zpl).digest('hex'),
+          },
+        }],
+      }))
+      claimResponseSent = true
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000065',
+    slug: 'instance-00000000-0000-4000-8000-000000000065',
+    displayName: 'In-flight claim migration fence',
+    serverAgentGlobalId: 'gpa_inflight_claim_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  const instanceDirectory = manager.pathsFor(instance).instanceDirectory
+  const ledgerPath = path.join(instanceDirectory, 'claim-ledger.json')
+  const emptyLedger = {
+    version: 1,
+    claims: {},
+    deliveries: {},
+    pendingResults: {},
+  }
+  mkdirSync(instanceDirectory, { recursive: true })
+  writeFileSync(ledgerPath, `${JSON.stringify(emptyLedger, null, 2)}\n`, { mode: 0o600 })
+  try {
+    manager.startEnabled()
+    await waitFor(
+      () => claimRequestObserved,
+      'The delayed claim request did not arrive',
+    )
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      'The claim-waiting worker did not latch its graceful stop signal',
+    )
+    releaseClaimResponse()
+    await quiesced
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_after_claim',
+      'The stopped worker did not report the post-claim response fence',
+    )
+    assert.equal(claimResponseSent, true)
+    assert.deepEqual(actions, ['claim'])
+    assert.equal(printerBytes, 0)
+    assert.deepEqual(JSON.parse(readFileSync(ledgerPath, 'utf8')), emptyLedger)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releaseClaimResponse()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
 test('late legacy stop lets an in-flight raw delivery and ACK finish before worker exit', {
   skip: !['darwin', 'linux'].includes(process.platform),
 }, async () => {
@@ -374,13 +510,17 @@ test('late legacy stop lets an in-flight raw delivery and ACK finish before work
     sharedLockDirectory: path.join(temporary, 'shared-locks'),
     startGuard: () => guard.assertReady(),
   })
+  const workerEvents = []
+  manager.on('status', ({ id, status }) => {
+    if (id === instance.id && status.lastEvent) workerEvents.push(status.lastEvent)
+  })
   try {
     manager.startEnabled()
     await waitFor(() => rawConnectionStarted, 'In-flight raw delivery never reached the printer')
     legacyPresent = true
     const quiesced = guard.checkNow()
     await waitFor(
-      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      () => workerEvents.includes('worker_stop_requested'),
       'The in-flight worker did not latch its graceful stop signal',
     )
     releasePrinter()

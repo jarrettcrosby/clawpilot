@@ -1058,6 +1058,13 @@ async function cycle(config, ledger, deviceReference) {
     })
   }
   const jobs = Array.isArray(response.jobs) ? response.jobs : []
+  if (stopping) {
+    log('worker_stop_after_claim', {
+      returnedJobCount: jobs.length,
+      localOwnershipCreated: false,
+    })
+    return 0
+  }
   if (jobs[0]) {
     registerClaimLease(jobs[0], response[REQUEST_ROUND_TRIP_MS], 120)
     await handleJob(config, ledger, jobs[0], deviceReference)
