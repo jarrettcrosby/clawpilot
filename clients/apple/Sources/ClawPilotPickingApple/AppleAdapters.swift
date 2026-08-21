@@ -845,7 +845,17 @@ public enum ManagerShopifyCheckoutEffectiveReason: String, Decodable, Equatable,
 }
 
 public struct ManagerShopifyCheckoutRateLastChange: Decodable, Equatable, Sendable {
+    public struct RequestedControl: Decodable, Equatable, Sendable {
+        public let version: String
+        public let audience: ManagerShopifyCheckoutAudience
+        public let rateSource: ManagerShopifyCheckoutRateSource
+    }
+
     public let configGlobalId: String
+    public let idempotencyKey: String
+    public let requestHash: String
+    public let actorEmail: String
+    public let requestedControl: RequestedControl
     public let resultingRowVersion: Int
     public let resultingPolicyRevision: Int
     public let reason: String
@@ -943,7 +953,8 @@ public struct ManagerShopifyCheckoutRateControl: Equatable, Identifiable, Sendab
               desiredAudience != nil,
               desiredRateSource != nil,
               effectiveState == effectiveReason.expectedState,
-              serving == (effectiveState == .serving) else {
+              serving == (effectiveState == .serving),
+              effectiveProjectionMatches0299 else {
             return false
         }
         if emergencyOverride != [
@@ -955,6 +966,27 @@ public struct ManagerShopifyCheckoutRateControl: Equatable, Identifiable, Sendab
         guard let lastChange else { return true }
         let reason = lastChange.reason.trimmingCharacters(in: .whitespacesAndNewlines)
         return lastChange.configGlobalId == configGlobalId
+            && lastChange.idempotencyKey.range(
+                of: #"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$"#,
+                options: .regularExpression
+            ) != nil
+            && lastChange.requestHash.range(
+                of: #"^[a-f0-9]{64}$"#,
+                options: .regularExpression
+            ) != nil
+            && lastChange.actorEmail
+                == lastChange.actorEmail.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+            && lastChange.actorEmail.contains("@")
+            && lastChange.actorEmail.utf8.count <= 320
+            && lastChange.actorEmail.unicodeScalars.allSatisfy({
+                !CharacterSet.controlCharacters.contains($0)
+            })
+            && lastChange.requestedControl.version
+                == "shopify-checkout-rate-control-v1"
+            && lastChange.requestedControl.audience == desiredAudience
+            && lastChange.requestedControl.rateSource == desiredRateSource
             && lastChange.resultingRowVersion >= 1
             && lastChange.resultingRowVersion <= rowVersion
             && lastChange.resultingPolicyRevision >= 1
@@ -964,6 +996,29 @@ public struct ManagerShopifyCheckoutRateControl: Equatable, Identifiable, Sendab
             && reason.unicodeScalars.allSatisfy {
                 !CharacterSet.controlCharacters.contains($0)
             }
+    }
+
+    private var effectiveProjectionMatches0299: Bool {
+        guard let desiredAudience, let desiredRateSource else { return false }
+        if emergencyOverride {
+            return effectiveReason == .emergencyDisabled
+                || effectiveReason == .emergencyFrozen
+        }
+        if effectiveReason == .emergencyDisabled
+            || effectiveReason == .emergencyFrozen {
+            return false
+        }
+        if desiredAudience == .off {
+            return effectiveReason == .configuredOff
+        }
+        if environment == "production" && desiredRateSource == .test {
+            return effectiveReason == .productionSourceRequired
+        }
+        if desiredAudience == .restrictedCustomers
+            && desiredRateSource == .live {
+            return effectiveReason == .restrictedLiveEnforcementRequired
+        }
+        return effectiveReason == .runtimeNotReady || effectiveReason == .serving
     }
 }
 
@@ -998,6 +1053,7 @@ extension ManagerShopifyCheckoutRateClientError: LocalizedError {
 public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
     public let authenticationGeneration: UInt64
     public let organizationId: String
+    public let actorEmail: String
     public let accountGlobalId: String
     public let configGlobalId: String
     public let expectedRowVersion: Int
@@ -1011,6 +1067,7 @@ public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
         control: ManagerShopifyCheckoutRateControl,
         authenticationGeneration: UInt64,
         organizationId: String,
+        actorEmail: String,
         desiredAudience: ManagerShopifyCheckoutAudience,
         desiredRateSource: ManagerShopifyCheckoutRateSource,
         reason: String,
@@ -1029,6 +1086,16 @@ public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
         guard UUID(uuidString: normalizedOrganizationId) != nil else {
             throw ManagerShopifyCheckoutRateClientError.invalidOrganization
         }
+        let normalizedActorEmail = actorEmail
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard normalizedActorEmail.contains("@"),
+              normalizedActorEmail.utf8.count <= 320,
+              normalizedActorEmail.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw ManagerShopifyCheckoutRateClientError.notAuthorized
+        }
         let normalizedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalizedReason.count >= 3,
               normalizedReason.count <= 500,
@@ -1045,6 +1112,7 @@ public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
         }
         self.authenticationGeneration = authenticationGeneration
         self.organizationId = normalizedOrganizationId
+        self.actorEmail = normalizedActorEmail
         accountGlobalId = control.accountGlobalId
         self.configGlobalId = configGlobalId
         expectedRowVersion = rowVersion
@@ -1071,6 +1139,7 @@ public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
         _ control: ManagerShopifyCheckoutRateControl
     ) -> Bool {
         control.isContractValid
+            && control.canEdit
             && control.accountGlobalId == accountGlobalId
             && control.configGlobalId == configGlobalId
             && control.rowVersion == expectedRowVersion
@@ -1090,17 +1159,27 @@ public struct ManagerShopifyCheckoutRateCommand: Equatable, Sendable {
             && control.lastChange?.resultingRowVersion == expectedRowVersion + 1
             && control.lastChange?.resultingPolicyRevision == expectedPolicyRevision + 1
             && control.lastChange?.reason == reason
+            && control.lastChange?.idempotencyKey == idempotencyKey
+            && control.lastChange?.actorEmail
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == actorEmail
+            && control.lastChange?.requestedControl.audience == desiredAudience
+            && control.lastChange?.requestedControl.rateSource == desiredRateSource
     }
 
     public func permitsStateMutation(
         currentAuthenticationGeneration: UInt64,
         currentOrganizationId: String?,
+        currentActorEmail: String?,
         currentAccountGlobalId: String?,
         isAuthenticated: Bool
     ) -> Bool {
         isAuthenticated
             && currentAuthenticationGeneration == authenticationGeneration
             && currentOrganizationId?.lowercased() == organizationId
+            && currentActorEmail?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() == actorEmail
             && currentAccountGlobalId == accountGlobalId
     }
 }
@@ -1122,12 +1201,14 @@ public struct ManagerShopifyCheckoutRateSubmissionFence: Equatable, Sendable {
         for responseCommand: ManagerShopifyCheckoutRateCommand,
         currentAuthenticationGeneration: UInt64,
         currentOrganizationId: String?,
+        currentActorEmail: String?,
         isAuthenticated: Bool
     ) -> Bool {
         command == responseCommand
             && command.permitsStateMutation(
                 currentAuthenticationGeneration: currentAuthenticationGeneration,
                 currentOrganizationId: currentOrganizationId,
+                currentActorEmail: currentActorEmail,
                 currentAccountGlobalId: responseCommand.accountGlobalId,
                 isAuthenticated: isAuthenticated
             )
@@ -1156,6 +1237,7 @@ public struct ManagerShopifyCheckoutRatePendingModel: Equatable, Sendable {
     public func resolve(
         currentAuthenticationGeneration: UInt64,
         currentOrganizationId: String?,
+        currentActorEmail: String?,
         currentAccountGlobalId: String?,
         isAuthenticated: Bool,
         failure: ManagerShopifyCheckoutRateModelFailure,
@@ -1164,6 +1246,7 @@ public struct ManagerShopifyCheckoutRatePendingModel: Equatable, Sendable {
         guard command.permitsStateMutation(
             currentAuthenticationGeneration: currentAuthenticationGeneration,
             currentOrganizationId: currentOrganizationId,
+            currentActorEmail: currentActorEmail,
             currentAccountGlobalId: currentAccountGlobalId,
             isAuthenticated: isAuthenticated
         ) else {
@@ -2303,13 +2386,17 @@ public actor PickingAPIClient {
 
         let action = "save-checkout-rate-control"
         let accountGlobalId: String
+        let expectedConfigGlobalId: String
         let expectedRowVersion: Int
+        let expectedPolicyRevision: Int
         let checkoutRateControl: SavedControl
         let reason: String
 
         init(command: ManagerShopifyCheckoutRateCommand) {
             accountGlobalId = command.accountGlobalId
+            expectedConfigGlobalId = command.configGlobalId
             expectedRowVersion = command.expectedRowVersion
+            expectedPolicyRevision = command.expectedPolicyRevision
             checkoutRateControl = SavedControl(
                 audience: command.desiredAudience,
                 rateSource: command.desiredRateSource

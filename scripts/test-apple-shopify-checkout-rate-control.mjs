@@ -17,6 +17,8 @@ for (const fragment of [
   'if (!capabilities.canManage)',
   'requireActivator(context.capabilities.canActivate)',
   'updateShopifyCarrierServiceRateControlInPostgres({',
+  'expectedConfigGlobalId: configGlobalId(',
+  'expectedPolicyRevision: integer(',
   'idempotencyKey: rateControlIdempotencyKey(req)',
   'return json({ ok: true, result })',
 ]) {
@@ -49,6 +51,10 @@ for (const fragment of [
   'export async function readShopifyCarrierServiceRateControlLastChangeFromPostgres',
   'operations_shopify_checkout_rate_control_receipts receipt',
   'receipt.resulting_policy_revision DESC',
+  'receipt.idempotency_key',
+  'receipt.request_hash',
+  'receipt.actor_email',
+  'receipt.requested_control',
   'receipt.reason',
   'providerWrites: 0',
 ]) {
@@ -69,12 +75,19 @@ for (const fragment of [
   'authenticationGeneration: UInt64',
   'expectedRowVersion: Int',
   'expectedPolicyRevision: Int',
+  'public let actorEmail: String',
+  'public let requestedControl: RequestedControl',
+  'private var effectiveProjectionMatches0299: Bool',
+  'control.canEdit',
+  'control.lastChange?.idempotencyKey == idempotencyKey',
+  'currentActorEmail: String?',
   'public func isConfirmedApplied(',
   'public func permitsStateMutation(',
   'public func fetchManagerShopifyCheckoutRateControl(',
   'public func updateManagerShopifyCheckoutRateControl(',
   '"/api/integrations/commerce/shopify/carrier-service"',
   'let action = "save-checkout-rate-control"',
+  'let expectedConfigGlobalId: String',
   'request.setValue(',
   'command.idempotencyKey,',
   'providerWrites == 0',
@@ -93,11 +106,14 @@ for (const fragment of [
   'pendingManagerShopifyCheckoutRateCommand',
   'activeManagerShopifyCheckoutRateSubmissionFence',
   'func updateManagerShopifyCheckoutRateControl(',
+  'managerShopifyCheckoutRateReviewIsCurrent(control)',
   'func retryPendingManagerShopifyCheckoutRateChange()',
   'reconcileAmbiguousManagerShopifyCheckoutRateCommand(',
   'command.isConfirmedApplied(by: control)',
   'quarantineManagerShopifyCheckoutRateCommand()',
   'managerShopifyCheckoutRateOperationIsCurrent(',
+  'supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(',
+  'invalidateManagerShopifyCheckoutRateControl(',
   'await waitForManagerShopifyCheckoutRateSubmissionToFinish()',
   'ownsCompletion(',
   'checkoutRateWaiters.forEach { $0.resume() }',
@@ -105,6 +121,25 @@ for (const fragment of [
 ]) {
   assert.ok(model.includes(fragment), `native manager model is missing ${fragment}`)
 }
+assert.ok(
+  model.indexOf('managerShopifyCheckoutRateReviewIsCurrent(control)')
+    < model.indexOf('pendingManagerShopifyCheckoutRateCommand = command'),
+  'current editable review must be proven before a pending command is created',
+)
+const unauthorizedStart = model.indexOf(
+  'private func supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(',
+)
+const unauthorizedEnd = model.indexOf(
+  'private func clearManagerStoreSyncState()',
+  unauthorizedStart,
+)
+const unauthorizedHandler = model.slice(unauthorizedStart, unauthorizedEnd)
+assert.ok(unauthorizedStart >= 0 && unauthorizedEnd > unauthorizedStart)
+assert.doesNotMatch(
+  unauthorizedHandler,
+  /await logout\(\)|waitForManagerShopifyCheckoutRateSubmissionToFinish/u,
+  '401 supersession must not wait on or log out through its own submission',
+)
 const finishStart = model.indexOf(
   'private func finishManagerShopifyCheckoutRateSubmission(',
 )
@@ -140,6 +175,8 @@ for (const fragment of [
   'zero Shopify or carrier provider writes',
   'View only. An organization owner or authorized administrator',
   'Retry exact pending checkout change',
+  'managerShopifyCheckoutRateReviewGeneration',
+  '!model.managerShopifyCheckoutRateReviewIsCurrent(',
   'Relaunching refreshes authoritative state without retaining the command',
 ]) {
   assert.ok(shell.includes(fragment), `native checkout-rate UI is missing ${fragment}`)
@@ -163,6 +200,7 @@ const tests = read(
 for (const fragment of [
   'decode production TEST as saved desired but effectively empty',
   'allow every desired state while overrides stay effective only',
+  'effective projection exhaustively matches 0299 precedence',
   'exact capabilities allow save while view-only produces zero POST',
   'classifies definitive 4xx and conflict separately',
   'retries transport 429 5xx and malformed responses byte identically',

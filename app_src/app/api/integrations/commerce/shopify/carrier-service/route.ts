@@ -107,6 +107,7 @@ export const maxDuration = 60
 
 const MAX_REQUEST_BYTES = 32 * 1024
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const CONFIG_GLOBAL_ID = /^gscf(?:[0-9]{7}|[0-9a-v]{12})$/
 const MUTATION_AUTHORIZATION_GLOBAL_ID = /^gsca(?:[0-9]{7}|[0-9a-v]{12})$/
 const CONFIRMATION_REQUEST_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -249,15 +250,36 @@ async function requestBody(req: NextRequest) {
   }
 }
 
+function strictString(value: unknown, label: string) {
+  if (typeof value !== 'string' || value.trim() !== value) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
+      `${label} is invalid`,
+    )
+  }
+  return value
+}
+
 function accountGlobalId(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (!ACCOUNT_GLOBAL_ID.test(normalized)) {
+  const exact = strictString(value, 'Shopify connection')
+  if (!ACCOUNT_GLOBAL_ID.test(exact)) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_ACCOUNT_INVALID',
       'A valid Shopify connection is required',
     )
   }
-  return normalizeCommerceAccountGlobalId(normalized)
+  return normalizeCommerceAccountGlobalId(exact)
+}
+
+function configGlobalId(value: unknown) {
+  const exact = strictString(value, 'Shopify CarrierService config Global ID')
+  if (!CONFIG_GLOBAL_ID.test(exact)) {
+    fail(
+      'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
+      'Shopify CarrierService config Global ID is invalid',
+    )
+  }
+  return exact
 }
 
 function integer(
@@ -266,18 +288,18 @@ function integer(
   minimum: number,
   maximum: number,
 ) {
-  const parsed = Number(value)
   if (
-    !Number.isSafeInteger(parsed)
-    || parsed < minimum
-    || parsed > maximum
+    typeof value !== 'number'
+    || !Number.isSafeInteger(value)
+    || value < minimum
+    || value > maximum
   ) {
     fail(
       'SHOPIFY_CARRIER_SERVICE_REQUEST_INVALID',
       `${label} is invalid`,
     )
   }
-  return parsed
+  return value
 }
 
 function record(value: unknown, label: string) {
@@ -674,6 +696,7 @@ function carrierServiceMutation(input: {
 async function setupState(input: {
   organizationId: string
   accountGlobalId: string
+  actorEmail: string
   canActivate: boolean
   canManage: boolean
 }) {
@@ -884,6 +907,7 @@ async function setupState(input: {
   )
   return {
     account,
+    actorEmail: input.actorEmail.trim().toLowerCase(),
     storeSync,
     config: publicConfig,
     namePreference,
@@ -1352,6 +1376,7 @@ export async function GET(req: NextRequest) {
       setup: await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       }),
@@ -1365,11 +1390,12 @@ export async function POST(req: NextRequest) {
   try {
     const context = await actorContext(req)
     const body = await requestBody(req)
-    const action = String(body.action || '').trim()
+    const action = strictString(body.action, 'Shopify setup action')
     const accountId = accountGlobalId(body.accountGlobalId)
     let current = await setupState({
       organizationId: context.organizationId,
       accountGlobalId: accountId,
+      actorEmail: context.actor.email,
       canActivate: context.capabilities.canActivate,
       canManage: context.capabilities.canManage,
     })
@@ -1382,6 +1408,7 @@ export async function POST(req: NextRequest) {
       current = await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       })
@@ -1477,24 +1504,17 @@ export async function POST(req: NextRequest) {
               current.config.shadowCheckoutAudience,
             )
           : normalizeShopifyCheckoutAudiencePolicy(undefined)
-      const checkoutRateControl = Object.prototype.hasOwnProperty.call(
-        body,
-        'checkoutRateControl',
-      )
-        ? normalizeShopifyCheckoutRateControl(body.checkoutRateControl)
-        : current.config
-          ? normalizeShopifyCheckoutRateControl(
-              current.config.checkoutRateControl,
-            )
-          : normalizeShopifyCheckoutRateControl({
-              version: SHOPIFY_CHECKOUT_RATE_CONTROL_VERSION,
-              audience: shadowCheckoutAudience.mode,
-              rateSource:
-                current.account.environment === 'production'
-                || current.reference.activation.state === 'active'
-                  ? 'production'
-                  : 'sandbox',
-            })
+      const checkoutRateControl = current.config
+        ? normalizeShopifyCheckoutRateControl(
+            current.config.checkoutRateControl,
+          )
+        : normalizeShopifyCheckoutRateControl({
+            version: SHOPIFY_CHECKOUT_RATE_CONTROL_VERSION,
+            audience: 'off',
+            rateSource: current.account.environment === 'production'
+              ? 'production'
+              : 'sandbox',
+          })
       const policySnapshot = {
         version: 'shopify-checkout-rating-policy-v1',
         ratingMode: 'whole_shipment',
@@ -1557,7 +1577,9 @@ export async function POST(req: NextRequest) {
       requireExactBodyFields(body, [
         'action',
         'accountGlobalId',
+        'expectedConfigGlobalId',
         'expectedRowVersion',
+        'expectedPolicyRevision',
         'checkoutRateControl',
         'reason',
       ])
@@ -1572,17 +1594,26 @@ export async function POST(req: NextRequest) {
         await updateShopifyCarrierServiceRateControlInPostgres({
           organizationId: context.organizationId,
           accountGlobalId: accountId,
+          expectedConfigGlobalId: configGlobalId(
+            body.expectedConfigGlobalId,
+          ),
           expectedRowVersion: integer(
             body.expectedRowVersion,
             'Configuration row version',
             0,
             Number.MAX_SAFE_INTEGER,
           ),
+          expectedPolicyRevision: integer(
+            body.expectedPolicyRevision,
+            'Configuration policy revision',
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
           checkoutRateControl: normalizeShopifyCheckoutRateControl(
             body.checkoutRateControl,
           ),
           idempotencyKey: rateControlIdempotencyKey(req),
-          reason: String(body.reason || ''),
+          reason: strictString(body.reason, 'Change reason'),
           actorEmail: context.actor.email,
         })
       return json({ ok: true, result })
@@ -2021,6 +2052,7 @@ export async function POST(req: NextRequest) {
       setup: await setupState({
         organizationId: context.organizationId,
         accountGlobalId: accountId,
+        actorEmail: context.actor.email,
         canActivate: context.capabilities.canActivate,
         canManage: context.capabilities.canManage,
       }),

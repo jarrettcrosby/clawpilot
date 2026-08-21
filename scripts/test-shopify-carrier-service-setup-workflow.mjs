@@ -255,6 +255,11 @@ requireAll(saveConfig, [
   'callbackTokenHash: tokenHash(token)',
   'actorEmail: context.actor.email',
 ], 'save-config action')
+assert.doesNotMatch(
+  saveConfig,
+  /body\.checkoutRateControl/u,
+  'save-config must not bypass the dedicated receipt-backed rate-control command',
+)
 
 const saveCheckoutRateControl = actionBranch(
   'save-checkout-rate-control',
@@ -263,10 +268,14 @@ const saveCheckoutRateControl = actionBranch(
 requireAll(saveCheckoutRateControl, [
   'requireActivator(context.capabilities.canActivate)',
   'requireExactBodyFields(body, [',
+  "'expectedConfigGlobalId'",
   "'expectedRowVersion'",
+  "'expectedPolicyRevision'",
   "'checkoutRateControl'",
   "'reason'",
   'updateShopifyCarrierServiceRateControlInPostgres({',
+  'expectedConfigGlobalId: configGlobalId(',
+  'expectedPolicyRevision: integer(',
   'normalizeShopifyCheckoutRateControl(',
   'rateControlIdempotencyKey(req)',
   'return json({ ok: true, result })',

@@ -771,7 +771,7 @@ private struct ManagerShopifyCheckoutRatePrompt: Identifiable {
     let control: ManagerShopifyCheckoutRateControl
 
     var id: String {
-        "\(control.accountGlobalId):\(control.configGlobalId ?? "unconfigured"):\(control.rowVersion ?? -1)"
+        "\(control.accountGlobalId):\(control.configGlobalId ?? "unconfigured"):\(control.rowVersion ?? -1):\(control.policyRevision ?? -1)"
     }
 }
 
@@ -872,6 +872,9 @@ private struct ManagerShopifyCheckoutRateConfirmationView: View {
                         normalizedReason.count < 3
                         || normalizedReason.count > 500
                         || model.isManagerShopifyCheckoutRateBusy
+                        || !model.managerShopifyCheckoutRateReviewIsCurrent(
+                            prompt.control
+                        )
                     )
                 }
             }
@@ -947,6 +950,9 @@ private struct ManagerShopifyCheckoutRateControlsView: View {
             )
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
+        }
+        .onChange(of: model.managerShopifyCheckoutRateReviewGeneration) { _, _ in
+            prompt = nil
         }
     }
 

@@ -72,11 +72,11 @@ export function normalizeShopifyCheckoutRateControl(
       'Checkout rate control version is unsupported',
     )
   }
-  if (![
+  if (typeof candidate.audience !== 'string' || ![
     'off',
     'restricted_customers',
     'all_eligible',
-  ].includes(String(candidate.audience))) {
+  ].includes(candidate.audience)) {
     throw new ShopifyCheckoutRateControlError(
       'Checkout rate audience is unsupported',
     )
@@ -113,8 +113,9 @@ export function legacyShopifyCheckoutRateControl(
       && Object.keys(rawAudience).sort().join('\n') === 'mode\nversion'
       && (rawAudience as { version?: unknown }).version
         === 'shopify-checkout-audience-v1'
+      && typeof (rawAudience as { mode?: unknown }).mode === 'string'
       && ['off', 'restricted_customers', 'all_eligible'].includes(
-        String((rawAudience as { mode?: unknown }).mode),
+        (rawAudience as { mode: string }).mode,
       )
       ? (rawAudience as { mode: ShopifyCheckoutAudienceMode }).mode
       : null

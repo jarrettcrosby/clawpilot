@@ -170,11 +170,10 @@ type RateControlCommandPayload = {
 }
 
 type ShopifyCarrierServiceSetup = {
+  actorEmail: string
   storeSync: CommerceStoreSyncControl
   account: {
     globalId: string
-    configGlobalId: string
-    configRowVersion: number
     environment: 'sandbox' | 'production'
     status: 'active' | 'disabled' | 'error'
     receiptIntakeEnabled: boolean
@@ -215,6 +214,16 @@ type ShopifyCarrierServiceSetup = {
       provider: Provider
       carrierAccountGlobalId: string
     }>
+  } | null
+  checkoutRateLastChange: {
+    configGlobalId: string
+    idempotencyKey: string
+    requestHash: string
+    actorEmail: string
+    requestedControl: CheckoutRateControl
+    resultingRowVersion: number
+    resultingPolicyRevision: number
+    reason: string
   } | null
   checkoutRateOperatingProfile: {
     desiredAudience: CheckoutAudienceMode | null
@@ -532,6 +541,8 @@ export default function ShopifyCarrierServiceSetupPanel({
     `clawpilot:shopify-rate-control:${accountGlobalId}`
   const activeAccountGlobalId = useRef(accountGlobalId)
   activeAccountGlobalId.current = accountGlobalId
+  const activeRateControlActorEmail = setup?.actorEmail
+    .trim().toLowerCase() ?? null
 
   const clearPendingRateControlCommand = useCallback(() => {
     try {
@@ -561,13 +572,41 @@ export default function ShopifyCarrierServiceSetupPanel({
         retainedPending
         && (
           retainedPending.accountGlobalId !== next.account.globalId
-          || retainedPending.configGlobalId !== next.account.configGlobalId
+          || retainedPending.actorEmail
+            !== next.actorEmail.trim().toLowerCase()
+          || retainedPending.configGlobalId !== next.config?.globalId
         )
       ) {
         throw new Error('Pending command account binding changed')
       }
+      if (retainedPending && next.config) {
+        const resolution = shopifyCheckoutRateControlPendingResolution({
+          state: {
+            accountGlobalId: next.account.globalId,
+            configGlobalId: next.config.globalId,
+            checkoutRateControl: next.config.checkoutRateControl,
+            rowVersion: next.config.rowVersion,
+            policyRevision: next.config.policyRevision,
+            canEdit: next.canActivate && next.canManage,
+            lastChange: next.checkoutRateLastChange,
+          },
+          command: retainedPending,
+          failure: new TypeError('Authoritative setup reconciliation'),
+        })
+        if (resolution !== 'retain_exact_retry') {
+          sessionStorage.removeItem(pendingRateControlStorageKey)
+          if (sessionStorage.getItem(pendingRateControlStorageKey) !== null) {
+            throw new Error('Pending command could not be quarantined')
+          }
+          retainedPending = null
+        }
+      }
     } catch {
-      sessionStorage.removeItem(pendingRateControlStorageKey)
+      try {
+        sessionStorage.removeItem(pendingRateControlStorageKey)
+      } catch {
+        // Browser storage can be unavailable; never let that expose stale UI.
+      }
       retainedPending = null
     }
     setSetup(next)
@@ -606,7 +645,8 @@ export default function ShopifyCarrierServiceSetupPanel({
     const rateControlForm = selectShopifyCheckoutRateControlFormState({
       pendingCommand: retainedPending,
       accountGlobalId: next.account.globalId,
-      configGlobalId: next.account.configGlobalId,
+      actorEmail: next.actorEmail,
+      configGlobalId: next.config?.globalId ?? '',
       serverControl: next.config?.checkoutRateControl ?? {
         ...DEFAULT_CHECKOUT_RATE_CONTROL,
         rateSource: next.account.environment === 'production'
@@ -660,16 +700,32 @@ export default function ShopifyCarrierServiceSetupPanel({
         pendingRateControlStorageKey,
       )
       if (!pending) return
-      if (pending.accountGlobalId !== accountGlobalId) {
+      if (
+        pending.accountGlobalId !== accountGlobalId
+        || (
+          activeRateControlActorEmail
+          && pending.actorEmail !== activeRateControlActorEmail
+        )
+      ) {
         throw new Error('Pending command account binding changed')
       }
       setPendingRateControlCommand(pending)
       setCheckoutRateControl(pending.body.checkoutRateControl)
       setCheckoutRateControlReason(pending.body.reason)
     } catch {
-      sessionStorage.removeItem(pendingRateControlStorageKey)
+      try {
+        sessionStorage.removeItem(pendingRateControlStorageKey)
+      } catch {
+        // Browser storage can be unavailable; pending UI stays fail-closed.
+      }
+      setPendingRateControlCommand(null)
+      setCheckoutRateControlReason('')
     }
-  }, [accountGlobalId, pendingRateControlStorageKey])
+  }, [
+    accountGlobalId,
+    activeRateControlActorEmail,
+    pendingRateControlStorageKey,
+  ])
 
   const run = async (
     action: string,
@@ -1045,7 +1101,6 @@ export default function ShopifyCarrierServiceSetupPanel({
     planRateOptimization,
     checkoutRateWarm,
     shadowCheckoutAudience,
-    checkoutRateControl,
   }, 'The exact warehouse, package, carrier, and inventory policy was saved.')
   const savePlanRatePolicy = () => run('save-plan-rate-policy', {
     planRateOptimization,
@@ -1057,21 +1112,26 @@ export default function ShopifyCarrierServiceSetupPanel({
     if (!setup?.config || setup.account.globalId !== accountGlobalId) return
     const reason = checkoutRateControlReason.trim()
     const desiredBody = {
+      expectedConfigGlobalId: setup.config.globalId,
       expectedRowVersion: setup.config.rowVersion,
+      expectedPolicyRevision: setup.config.policyRevision,
       checkoutRateControl,
       reason,
     }
     const exactPendingCommand = pendingRateControlCommand
       && pendingRateControlCommand.accountGlobalId === accountGlobalId
+      && pendingRateControlCommand.actorEmail
+        === setup.actorEmail.trim().toLowerCase()
       && pendingRateControlCommand.configGlobalId
-        === setup.account.configGlobalId
+        === setup.config.globalId
       ? pendingRateControlCommand
       : null
     const requestedCommand = exactPendingCommand
       ? exactPendingCommand
       : {
           accountGlobalId,
-          configGlobalId: setup.account.configGlobalId,
+          actorEmail: setup.actorEmail.trim().toLowerCase(),
+          configGlobalId: setup.config.globalId,
           idempotencyKey: `shopify-rate-control:${crypto.randomUUID()}`,
           expectedPolicyRevision: setup.config.policyRevision,
           body: desiredBody,
@@ -1118,7 +1178,7 @@ export default function ShopifyCarrierServiceSetupPanel({
         value: payload.result,
         command,
         accountGlobalId,
-        configGlobalId: setup.account.configGlobalId,
+        configGlobalId: setup.config.globalId,
       })
       if (!clearPendingRateControlCommand()) {
         throw new Error(
@@ -1128,6 +1188,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       setNotice(
         'Desired checkout audience and carrier-rate source were saved with zero provider writes.',
       )
+      setSetup(null)
       await load()
     } catch (caught) {
       const refreshed = await load()
@@ -1135,10 +1196,12 @@ export default function ShopifyCarrierServiceSetupPanel({
         state: refreshed?.config
           ? {
               accountGlobalId: refreshed.account.globalId,
-              configGlobalId: refreshed.account.configGlobalId,
+              configGlobalId: refreshed.config.globalId,
               checkoutRateControl: refreshed.config.checkoutRateControl,
               rowVersion: refreshed.config.rowVersion,
               policyRevision: refreshed.config.policyRevision,
+              canEdit: refreshed.canActivate && refreshed.canManage,
+              lastChange: refreshed.checkoutRateLastChange,
             }
           : null,
         command: requestedCommand,
@@ -1156,7 +1219,10 @@ export default function ShopifyCarrierServiceSetupPanel({
             'Desired checkout audience and carrier-rate source were saved with zero provider writes.',
           )
         }
-      } else if (resolution === 'definitive_rejection') {
+      } else if (
+        resolution === 'definitive_rejection'
+        || resolution === 'superseded'
+      ) {
         if (!clearPendingRateControlCommand()) {
           setError(
             'Checkout-rate control was rejected, but its stale browser retry record could not be cleared. Reload before trying again.',
@@ -1165,7 +1231,9 @@ export default function ShopifyCarrierServiceSetupPanel({
           if (refreshed) applySetup(refreshed)
           else setSetup(null)
           setError(
-            `${caught instanceof Error ? caught.message : 'Checkout-rate control save failed'} Current checkout-rate state was refreshed. Review it before trying again.`,
+            resolution === 'superseded'
+              ? 'Checkout-rate control or permission changed after review. The stale retry was quarantined; review current authoritative state before trying again.'
+              : `${caught instanceof Error ? caught.message : 'Checkout-rate control save failed'} Current checkout-rate state was refreshed. Review it before trying again.`,
           )
         }
       } else {
@@ -1497,7 +1565,11 @@ export default function ShopifyCarrierServiceSetupPanel({
       </Box>
       <Button
         variant="contained"
-        disabled={!bindingsReady || Boolean(busy)}
+        disabled={
+          !bindingsReady
+          || Boolean(busy)
+          || Boolean(pendingRateControlCommand)
+        }
         onClick={() => void saveConfig()}
       >
         {busy === 'save-config'

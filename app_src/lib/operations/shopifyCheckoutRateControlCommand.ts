@@ -12,11 +12,14 @@ const CONTROL_RESULT_VERSION =
 
 export type ShopifyCheckoutRateControlPendingCommand = {
   accountGlobalId: string
+  actorEmail: string
   configGlobalId: string
   idempotencyKey: string
   expectedPolicyRevision: number
   body: {
+    expectedConfigGlobalId: string
     expectedRowVersion: number
+    expectedPolicyRevision: number
     checkoutRateControl: ShopifyCheckoutRateControl
     reason: string
   }
@@ -40,6 +43,17 @@ export type ShopifyCheckoutRateControlCommandServerState = {
   checkoutRateControl: unknown
   rowVersion: number
   policyRevision: number
+  canEdit: boolean
+  lastChange: {
+    configGlobalId: string
+    idempotencyKey: string
+    requestHash: string
+    actorEmail: string
+    requestedControl: unknown
+    resultingRowVersion: number
+    resultingPolicyRevision: number
+    reason: string
+  } | null
 }
 
 export class ShopifyCheckoutRateControlHttpError extends Error {
@@ -57,6 +71,7 @@ export class ShopifyCheckoutRateControlHttpError extends Error {
 export type ShopifyCheckoutRateControlPendingResolution =
   | 'applied'
   | 'definitive_rejection'
+  | 'superseded'
   | 'retain_exact_retry'
 
 function exactKeys(value: Record<string, unknown>, expected: string[]) {
@@ -80,6 +95,7 @@ export function normalizeShopifyCheckoutRateControlPendingCommand(
     || !body
     || !exactKeys(command, [
       'accountGlobalId',
+      'actorEmail',
       'body',
       'configGlobalId',
       'expectedPolicyRevision',
@@ -87,6 +103,8 @@ export function normalizeShopifyCheckoutRateControlPendingCommand(
     ])
     || !exactKeys(body, [
       'checkoutRateControl',
+      'expectedConfigGlobalId',
+      'expectedPolicyRevision',
       'expectedRowVersion',
       'reason',
     ])
@@ -94,10 +112,19 @@ export function normalizeShopifyCheckoutRateControlPendingCommand(
     || !IDEMPOTENCY_KEY.test(command.idempotencyKey)
     || typeof command.accountGlobalId !== 'string'
     || !GLOBAL_ID.test(command.accountGlobalId)
+    || typeof command.actorEmail !== 'string'
+    || command.actorEmail !== command.actorEmail.trim().toLowerCase()
+    || command.actorEmail.length > 320
+    || !command.actorEmail.includes('@')
+    || /[\u0000-\u001f\u007f]/.test(command.actorEmail)
     || typeof command.configGlobalId !== 'string'
     || !GLOBAL_ID.test(command.configGlobalId)
+    || typeof body.expectedConfigGlobalId !== 'string'
+    || body.expectedConfigGlobalId !== command.configGlobalId
     || !Number.isSafeInteger(command.expectedPolicyRevision)
     || Number(command.expectedPolicyRevision) < 1
+    || !Number.isSafeInteger(body.expectedPolicyRevision)
+    || body.expectedPolicyRevision !== command.expectedPolicyRevision
     || !Number.isSafeInteger(body.expectedRowVersion)
     || Number(body.expectedRowVersion) < 0
     || typeof body.reason !== 'string'
@@ -110,11 +137,14 @@ export function normalizeShopifyCheckoutRateControlPendingCommand(
   }
   return {
     accountGlobalId: command.accountGlobalId,
+    actorEmail: command.actorEmail,
     configGlobalId: command.configGlobalId,
     idempotencyKey: command.idempotencyKey,
     expectedPolicyRevision: Number(command.expectedPolicyRevision),
     body: {
+      expectedConfigGlobalId: body.expectedConfigGlobalId,
       expectedRowVersion: Number(body.expectedRowVersion),
+      expectedPolicyRevision: Number(body.expectedPolicyRevision),
       checkoutRateControl: normalizeShopifyCheckoutRateControl(
         body.checkoutRateControl,
       ),
@@ -162,6 +192,7 @@ export function selectShopifyCheckoutRateControlFormState(input: {
   serverControl: unknown
   pendingCommand: ShopifyCheckoutRateControlPendingCommand | null
   accountGlobalId: string
+  actorEmail: string
   configGlobalId: string
 }) {
   const pending = input.pendingCommand
@@ -171,6 +202,7 @@ export function selectShopifyCheckoutRateControlFormState(input: {
     pending
     && (
       pending.accountGlobalId !== input.accountGlobalId
+      || pending.actorEmail !== input.actorEmail.trim().toLowerCase()
       || pending.configGlobalId !== input.configGlobalId
     )
   ) {
@@ -199,9 +231,23 @@ export function shopifyCheckoutRateControlCommandMatchesServerState(input: {
     || state.policyRevision !== command.expectedPolicyRevision + 1
   ) return false
   try {
+    const lastChange = state.lastChange
     return JSON.stringify(normalizeShopifyCheckoutRateControl(
       state.checkoutRateControl,
     )) === JSON.stringify(command.body.checkoutRateControl)
+      && lastChange !== null
+      && lastChange.configGlobalId === command.configGlobalId
+      && lastChange.idempotencyKey === command.idempotencyKey
+      && REQUEST_HASH.test(lastChange.requestHash)
+      && lastChange.actorEmail.trim().toLowerCase() === command.actorEmail
+      && JSON.stringify(normalizeShopifyCheckoutRateControl(
+        lastChange.requestedControl,
+      )) === JSON.stringify(command.body.checkoutRateControl)
+      && lastChange.resultingRowVersion
+        === command.body.expectedRowVersion + 1
+      && lastChange.resultingPolicyRevision
+        === command.expectedPolicyRevision + 1
+      && lastChange.reason === command.body.reason
   } catch {
     return false
   }
@@ -231,6 +277,17 @@ export function shopifyCheckoutRateControlPendingResolution(input: {
       input.failure.status,
     )
   ) return 'definitive_rejection'
+  if (
+    input.state
+    && (
+      input.state.accountGlobalId !== input.command.accountGlobalId
+      || input.state.configGlobalId !== input.command.configGlobalId
+      || input.state.rowVersion !== input.command.body.expectedRowVersion
+      || input.state.policyRevision
+        !== input.command.expectedPolicyRevision
+      || !input.state.canEdit
+    )
+  ) return 'superseded'
   return 'retain_exact_retry'
 }
 

@@ -106,6 +106,7 @@ final class PickingPhoneModel: ObservableObject {
     @Published private(set) var isManagerShopifyCheckoutRateBusy = false
     @Published private(set) var hasPendingManagerShopifyCheckoutRateChange = false
     @Published private(set) var managerShopifyCheckoutRateStatus: String?
+    @Published private(set) var managerShopifyCheckoutRateReviewGeneration: UInt64 = 0
     @Published var managerPickers: [ManagerPicker] = []
     @Published var pickerPerformance: [PickerPerformanceMetric] = []
     @Published var managerPickManagement: ManagerPickManagementWorkspace?
@@ -1330,6 +1331,14 @@ final class PickingPhoneModel: ObservableObject {
             managerShopifyCheckoutRateStatus = "Manager access is required to review Shopify checkout rates."
             return false
         }
+        guard managerShopifyCheckoutRateReviewIsCurrent(control),
+              let currentControl = managerShopifyCheckoutRateControls.first(
+                where: { $0.accountGlobalId == control.accountGlobalId }
+              ) else {
+            managerShopifyCheckoutRateReviewGeneration &+= 1
+            managerShopifyCheckoutRateStatus = "Shopify checkout-rate configuration or permission changed after review. Refresh and review the current control before saving."
+            return false
+        }
         let command: ManagerShopifyCheckoutRateCommand
         do {
             if let pendingManagerShopifyCheckoutRateCommand {
@@ -1338,16 +1347,17 @@ final class PickingPhoneModel: ObservableObject {
                     desiredAudience: desiredAudience,
                     desiredRateSource: desiredRateSource,
                     reason: reason
-                ), pendingManagerShopifyCheckoutRateCommand.isCurrentReview(control) else {
+                ), pendingManagerShopifyCheckoutRateCommand.isCurrentReview(currentControl) else {
                     managerShopifyCheckoutRateStatus = "Retry or refresh the exact pending Shopify checkout-rate change before starting another one."
                     return false
                 }
                 command = pendingManagerShopifyCheckoutRateCommand
             } else {
                 command = try ManagerShopifyCheckoutRateCommand(
-                    control: control,
+                    control: currentControl,
                     authenticationGeneration: authenticationGeneration,
                     organizationId: organizationId,
+                    actorEmail: sessionProfile?.effectiveUser.email ?? "",
                     desiredAudience: desiredAudience,
                     desiredRateSource: desiredRateSource,
                     reason: reason
@@ -1360,6 +1370,21 @@ final class PickingPhoneModel: ObservableObject {
             return false
         }
         return await submitManagerShopifyCheckoutRateControl(command)
+    }
+
+    func managerShopifyCheckoutRateReviewIsCurrent(
+        _ reviewed: ManagerShopifyCheckoutRateControl
+    ) -> Bool {
+        guard reviewed.isContractValid,
+              reviewed.canEdit,
+              let current = managerShopifyCheckoutRateControls.first(where: {
+                  $0.accountGlobalId == reviewed.accountGlobalId
+              }) else { return false }
+        return current.isContractValid
+            && current.canEdit
+            && current.configGlobalId == reviewed.configGlobalId
+            && current.rowVersion == reviewed.rowVersion
+            && current.policyRevision == reviewed.policyRevision
     }
 
     func retryPendingManagerShopifyCheckoutRateChange() async -> Bool {
@@ -1377,6 +1402,7 @@ final class PickingPhoneModel: ObservableObject {
               command.permitsStateMutation(
                 currentAuthenticationGeneration: authenticationGeneration,
                 currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+                currentActorEmail: sessionProfile?.effectiveUser.email,
                 currentAccountGlobalId: command.accountGlobalId,
                 isAuthenticated: isAuthenticated
               ),
@@ -1396,14 +1422,31 @@ final class PickingPhoneModel: ObservableObject {
             }
             pendingManagerShopifyCheckoutRateCommand = nil
             hasPendingManagerShopifyCheckoutRateChange = false
-            managerShopifyCheckoutRateStatus = "Desired checkout audience and saved carrier source were accepted with zero provider writes. Refreshing effective availability."
-            if let refreshed = try? await api.fetchManagerShopifyCheckoutRateControl(
+            invalidateManagerShopifyCheckoutRateControl(
                 accountGlobalId: command.accountGlobalId
-            ), managerShopifyCheckoutRateOperationIsCurrent(command) {
+            )
+            managerShopifyCheckoutRateStatus = "Desired checkout audience and saved carrier source were accepted with zero provider writes. Refreshing effective availability."
+            do {
+                let refreshed = try await api.fetchManagerShopifyCheckoutRateControl(
+                    accountGlobalId: command.accountGlobalId
+                )
+                guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                    return false
+                }
                 installManagerShopifyCheckoutRateControl(refreshed)
                 managerShopifyCheckoutRateStatus = command.isConfirmedApplied(by: refreshed)
                     ? refreshed.effectiveReason.label
                     : "The checkout-rate change was accepted, then its configuration changed again. Review the refreshed desired and effective state."
+            } catch PickingAPIError.unauthorized {
+                await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                    command
+                )
+                return false
+            } catch {
+                guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                    return false
+                }
+                managerShopifyCheckoutRateStatus = "The checkout-rate change was accepted, but authoritative refresh is unavailable. Refresh before reviewing or changing it again."
             }
             return true
         } catch PickingAPIError.conflict(let code, let message) {
@@ -1411,6 +1454,9 @@ final class PickingPhoneModel: ObservableObject {
                 return false
             }
             quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
             managerShopifyCheckoutRateStatus = "\(message) (\(code)) Review the refreshed control before trying again."
             await refreshManagerShopifyCheckoutRateControl(for: command)
             return false
@@ -1419,6 +1465,9 @@ final class PickingPhoneModel: ObservableObject {
                 return false
             }
             quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
             managerShopifyCheckoutRateStatus = "The checkout-rate change was definitively rejected: \(message) (\(code)). Review the refreshed control before trying again."
             await refreshManagerShopifyCheckoutRateControl(for: command)
             return false
@@ -1426,14 +1475,18 @@ final class PickingPhoneModel: ObservableObject {
             guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
                 return false
             }
-            quarantineManagerShopifyCheckoutRateCommand()
-            managerShopifyCheckoutRateStatus = "Your session expired before the checkout-rate result could be accepted. Sign in and review the current control."
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
             return false
         } catch PickingAPIError.invalidOrigin {
             guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
                 return false
             }
             quarantineManagerShopifyCheckoutRateCommand()
+            invalidateManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
             managerShopifyCheckoutRateStatus = "The configured ClawPilot server is invalid. The checkout-rate change was not sent or retained."
             return false
         } catch PickingAPIError.rateLimited(let seconds) {
@@ -1464,9 +1517,19 @@ final class PickingPhoneModel: ObservableObject {
     private func reconcileAmbiguousManagerShopifyCheckoutRateCommand(
         _ command: ManagerShopifyCheckoutRateCommand
     ) async -> Bool? {
-        let control = try? await api.fetchManagerShopifyCheckoutRateControl(
-            accountGlobalId: command.accountGlobalId
-        )
+        let control: ManagerShopifyCheckoutRateControl?
+        do {
+            control = try await api.fetchManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+        } catch PickingAPIError.unauthorized {
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
+            return false
+        } catch {
+            control = nil
+        }
         guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
             return false
         }
@@ -1475,6 +1538,7 @@ final class PickingPhoneModel: ObservableObject {
         ).resolve(
             currentAuthenticationGeneration: authenticationGeneration,
             currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            currentActorEmail: sessionProfile?.effectiveUser.email,
             currentAccountGlobalId: command.accountGlobalId,
             isAuthenticated: isAuthenticated,
             failure: .ambiguous,
@@ -1499,10 +1563,21 @@ final class PickingPhoneModel: ObservableObject {
     private func refreshManagerShopifyCheckoutRateControl(
         for command: ManagerShopifyCheckoutRateCommand
     ) async {
-        guard let control = try? await api.fetchManagerShopifyCheckoutRateControl(
-            accountGlobalId: command.accountGlobalId
-        ), managerShopifyCheckoutRateOperationIsCurrent(command) else { return }
-        installManagerShopifyCheckoutRateControl(control)
+        do {
+            let control = try await api.fetchManagerShopifyCheckoutRateControl(
+                accountGlobalId: command.accountGlobalId
+            )
+            guard managerShopifyCheckoutRateOperationIsCurrent(command) else {
+                return
+            }
+            installManagerShopifyCheckoutRateControl(control)
+        } catch PickingAPIError.unauthorized {
+            await supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+                command
+            )
+        } catch {
+            // The reviewed control remains invalidated until a later GET succeeds.
+        }
     }
 
     private func installManagerShopifyCheckoutRateControl(
@@ -1511,7 +1586,14 @@ final class PickingPhoneModel: ObservableObject {
         if let index = managerShopifyCheckoutRateControls.firstIndex(where: {
             $0.accountGlobalId == control.accountGlobalId
         }) {
+            let prior = managerShopifyCheckoutRateControls[index]
             managerShopifyCheckoutRateControls[index] = control
+            if prior.configGlobalId != control.configGlobalId
+                || prior.rowVersion != control.rowVersion
+                || prior.policyRevision != control.policyRevision
+                || prior.canEdit != control.canEdit {
+                managerShopifyCheckoutRateReviewGeneration &+= 1
+            }
         } else {
             managerShopifyCheckoutRateControls.append(control)
         }
@@ -1534,6 +1616,45 @@ final class PickingPhoneModel: ObservableObject {
     private func quarantineManagerShopifyCheckoutRateCommand() {
         pendingManagerShopifyCheckoutRateCommand = nil
         hasPendingManagerShopifyCheckoutRateChange = false
+        managerShopifyCheckoutRateReviewGeneration &+= 1
+    }
+
+    private func invalidateManagerShopifyCheckoutRateControl(
+        accountGlobalId: String
+    ) {
+        let priorCount = managerShopifyCheckoutRateControls.count
+        managerShopifyCheckoutRateControls.removeAll {
+            $0.accountGlobalId == accountGlobalId
+        }
+        if managerShopifyCheckoutRateControls.count != priorCount {
+            managerShopifyCheckoutRateReviewGeneration &+= 1
+        }
+    }
+
+    private func supersedeAuthenticationAfterUnauthorizedCheckoutRateCommand(
+        _ command: ManagerShopifyCheckoutRateCommand
+    ) async {
+        guard managerShopifyCheckoutRateOperationIsCurrent(command) else { return }
+        isAuthBusy = true
+        defer { isAuthBusy = false }
+        authenticationGeneration &+= 1
+        isAuthenticated = false
+        sessionProfile = nil
+        clearPublishedPickProjection()
+        managerOrders = []
+        clearManagerStoreSyncState()
+        managerPickers = []
+        pickerPerformance = []
+        managerPickManagement = nil
+        managerSelectedPickAssignment = nil
+        managerSelectedOrder = nil
+        googleAuthState = nil
+        GIDSignIn.sharedInstance.signOut()
+        biometrics.forgetAuthenticatedSession()
+        isLocallyLocked = false
+        await WebSessionBridge.clearCookies()
+        status = "Sign in to continue."
+        managerShopifyCheckoutRateStatus = nil
     }
 
     private func clearManagerStoreSyncState() {
@@ -1549,6 +1670,7 @@ final class PickingPhoneModel: ObservableObject {
         managerShopifyCheckoutRateStatus = nil
         pendingManagerShopifyCheckoutRateCommand = nil
         activeManagerShopifyCheckoutRateSubmissionFence = nil
+        managerShopifyCheckoutRateReviewGeneration &+= 1
         let checkoutRateWaiters = managerShopifyCheckoutRateCompletionWaiters
         managerShopifyCheckoutRateCompletionWaiters.removeAll()
         checkoutRateWaiters.forEach { $0.resume() }
@@ -2142,6 +2264,7 @@ final class PickingPhoneModel: ObservableObject {
             for: command,
             currentAuthenticationGeneration: authenticationGeneration,
             currentOrganizationId: sessionProfile?.activeWorkspace.organizationId,
+            currentActorEmail: sessionProfile?.effectiveUser.email,
             isAuthenticated: isAuthenticated
         ) == true
     }

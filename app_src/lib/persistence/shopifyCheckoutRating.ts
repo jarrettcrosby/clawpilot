@@ -161,7 +161,9 @@ export type ShopifyCarrierServiceAudiencePolicyWriteInput = {
 export type ShopifyCarrierServiceRateControlWriteInput = {
   organizationId: string
   accountGlobalId: string
+  expectedConfigGlobalId: string
   expectedRowVersion: number
+  expectedPolicyRevision: number
   checkoutRateControl: ShopifyCheckoutRateControl
   idempotencyKey: string
   reason: string
@@ -284,6 +286,10 @@ export type ShopifyCarrierServiceConfig = {
 
 export type ShopifyCarrierServiceRateControlLastChange = {
   configGlobalId: string
+  idempotencyKey: string
+  requestHash: string
+  actorEmail: string
+  requestedControl: ShopifyCheckoutRateControl
   resultingRowVersion: number
   resultingPolicyRevision: number
   reason: string
@@ -2464,12 +2470,20 @@ export async function readShopifyCarrierServiceRateControlLastChangeFromPostgres
   )
   const result = await query<{
     config_global_id: string
+    idempotency_key: string
+    request_hash: string
+    actor_email: string
+    requested_control: unknown
     resulting_row_version: string
     resulting_policy_revision: string
     reason: string
   }>(
     `SELECT
        config.global_id AS config_global_id,
+       receipt.idempotency_key,
+       receipt.request_hash,
+       receipt.actor_email,
+       receipt.requested_control,
        receipt.resulting_row_version::text,
        receipt.resulting_policy_revision::text,
        receipt.reason
@@ -2495,6 +2509,12 @@ export async function readShopifyCarrierServiceRateControlLastChangeFromPostgres
   return row
     ? {
         configGlobalId: row.config_global_id,
+        idempotencyKey: row.idempotency_key,
+        requestHash: row.request_hash,
+        actorEmail: row.actor_email,
+        requestedControl: normalizeShopifyCheckoutRateControl(
+          row.requested_control,
+        ),
         resultingRowVersion: Number(row.resulting_row_version),
         resultingPolicyRevision: Number(row.resulting_policy_revision),
         reason: row.reason,
@@ -4153,10 +4173,21 @@ export async function updateShopifyCarrierServiceRateControlInPostgres(
       ACCOUNT_GLOBAL_ID,
       'Shopify account Global ID',
     ),
+    expectedConfigGlobalId: matchValue(
+      rawInput.expectedConfigGlobalId,
+      CONFIG_GLOBAL_ID,
+      'Shopify CarrierService config Global ID',
+    ),
     expectedRowVersion: integer(
       rawInput.expectedRowVersion,
       'Configuration row version',
       0,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    expectedPolicyRevision: integer(
+      rawInput.expectedPolicyRevision,
+      'Configuration policy revision',
+      1,
       Number.MAX_SAFE_INTEGER,
     ),
     checkoutRateControl: normalizeShopifyCheckoutRateControl(
@@ -4186,10 +4217,12 @@ export async function updateShopifyCarrierServiceRateControlInPostgres(
     )
   }
   const requestHash = shopifyCheckoutRatingHash({
-    version: 'shopify-checkout-rate-control-command-v1',
+    version: 'shopify-checkout-rate-control-command-v2',
     organizationId: input.organizationId,
     accountGlobalId: input.accountGlobalId,
+    expectedConfigGlobalId: input.expectedConfigGlobalId,
     expectedRowVersion: input.expectedRowVersion,
+    expectedPolicyRevision: input.expectedPolicyRevision,
     checkoutRateControl: input.checkoutRateControl,
     reason: input.reason,
     actorEmail: input.actorEmail,
@@ -4287,10 +4320,24 @@ export async function updateShopifyCarrierServiceRateControlInPostgres(
         replay.rows[0].response_json,
       )
     }
+    if (current.global_id !== input.expectedConfigGlobalId) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_IDENTITY_CONFLICT',
+        'CarrierService configuration identity changed. Refresh and try again.',
+        409,
+      )
+    }
     if (Number(current.row_version) !== input.expectedRowVersion) {
       fail(
         'SHOPIFY_CHECKOUT_CONFIG_VERSION_CONFLICT',
         'CarrierService configuration changed. Refresh and try again.',
+        409,
+      )
+    }
+    if (Number(current.policy_revision) !== input.expectedPolicyRevision) {
+      fail(
+        'SHOPIFY_CHECKOUT_CONFIG_POLICY_REVISION_CONFLICT',
+        'CarrierService policy changed. Refresh and try again.',
         409,
       )
     }
@@ -4341,6 +4388,8 @@ export async function updateShopifyCarrierServiceRateControlInPostgres(
        WHERE organization_id = $1::uuid
          AND id = $2::uuid
          AND row_version = $6
+         AND global_id = $7
+         AND policy_revision = $8
        RETURNING row_version::text, policy_revision::text`,
       [
         input.organizationId,
@@ -4349,6 +4398,8 @@ export async function updateShopifyCarrierServiceRateControlInPostgres(
         JSON.stringify(policySnapshot),
         input.actorEmail,
         input.expectedRowVersion,
+        input.expectedConfigGlobalId,
+        input.expectedPolicyRevision,
       ],
     )
     if (!updated.rows[0]) {

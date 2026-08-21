@@ -13,6 +13,7 @@ import {
 import {
   ShopifyCheckoutRateControlHttpError,
   assertShopifyCheckoutRateControlCommandResult,
+  normalizeShopifyCheckoutRateControlPendingCommand,
   persistShopifyCheckoutRateControlPendingCommand,
   readShopifyCheckoutRateControlPendingCommand,
   selectShopifyCheckoutRateControlFormState,
@@ -55,6 +56,11 @@ test('rejects malformed, extended, and unsupported controls', () => {
     {
       version: 'shopify-checkout-rate-control-v1',
       audience: 'everyone',
+      rateSource: 'sandbox',
+    },
+    {
+      version: 'shopify-checkout-rate-control-v1',
+      audience: ['off'],
       rateSource: 'sandbox',
     },
     {
@@ -198,11 +204,14 @@ test('lost response recovery persists and reads back the exact retry command bef
   const key = 'checkout-rate-control:gia2930001'
   const command = {
     accountGlobalId: 'gia2930001',
+    actorEmail: 'owner@example.test',
     configGlobalId: 'gscf2930001',
     idempotencyKey: 'shopify-rate-control:11111111-1111-4111-8111-111111111111',
     expectedPolicyRevision: 4,
     body: {
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion: 7,
+      expectedPolicyRevision: 4,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1' as const,
         audience: 'restricted_customers' as const,
@@ -225,6 +234,7 @@ test('lost response recovery persists and reads back the exact retry command bef
   assert.deepEqual(
     selectShopifyCheckoutRateControlFormState({
       accountGlobalId: command.accountGlobalId,
+      actorEmail: command.actorEmail,
       configGlobalId: command.configGlobalId,
       serverControl: {
         version: 'shopify-checkout-rate-control-v1',
@@ -272,6 +282,7 @@ test('lost response recovery persists and reads back the exact retry command bef
 
   assert.throws(() => selectShopifyCheckoutRateControlFormState({
     accountGlobalId: 'gia2930002',
+    actorEmail: command.actorEmail,
     configGlobalId: 'gscf2930002',
     serverControl: {
       version: 'shopify-checkout-rate-control-v1',
@@ -282,6 +293,7 @@ test('lost response recovery persists and reads back the exact retry command bef
   }), /different Shopify account/u)
   assert.deepEqual(selectShopifyCheckoutRateControlFormState({
     accountGlobalId: 'gia2930002',
+    actorEmail: command.actorEmail,
     configGlobalId: 'gscf2930002',
     serverControl: {
       version: 'shopify-checkout-rate-control-v1',
@@ -311,11 +323,14 @@ test('pending command persistence fails before POST when durable read-back drift
     'checkout-rate-control:gia2930001',
     {
       accountGlobalId: 'gia2930001',
+      actorEmail: 'owner@example.test',
       configGlobalId: 'gscf2930001',
       idempotencyKey: 'shopify-rate-control:22222222-2222-4222-8222-222222222222',
       expectedPolicyRevision: 1,
       body: {
+        expectedConfigGlobalId: 'gscf2930001',
         expectedRowVersion: 1,
+        expectedPolicyRevision: 1,
         checkoutRateControl: {
           version: 'shopify-checkout-rate-control-v1',
           audience: 'off',
@@ -327,14 +342,58 @@ test('pending command persistence fails before POST when durable read-back drift
   ), /was not retained/u)
 })
 
+test('pending command rejects actor and expanded fence drift before POST', () => {
+  const command = {
+    accountGlobalId: 'gia2930001',
+    actorEmail: 'owner@example.test',
+    configGlobalId: 'gscf2930001',
+    idempotencyKey: 'shopify-rate-control:55555555-5555-4555-8555-555555555555',
+    expectedPolicyRevision: 4,
+    body: {
+      expectedConfigGlobalId: 'gscf2930001',
+      expectedRowVersion: 7,
+      expectedPolicyRevision: 4,
+      checkoutRateControl: {
+        version: 'shopify-checkout-rate-control-v1' as const,
+        audience: 'all_eligible' as const,
+        rateSource: 'production' as const,
+      },
+      reason: 'Bind exact actor and configuration fences',
+    },
+  }
+  assert.deepEqual(
+    normalizeShopifyCheckoutRateControlPendingCommand(command),
+    command,
+  )
+  for (const malformed of [
+    { ...command, actorEmail: 'Replacement@Example.test' },
+    {
+      ...command,
+      body: { ...command.body, expectedConfigGlobalId: 'gscf2930002' },
+    },
+    {
+      ...command,
+      body: { ...command.body, expectedPolicyRevision: 5 },
+    },
+  ]) {
+    assert.throws(
+      () => normalizeShopifyCheckoutRateControlPendingCommand(malformed),
+      /invalid/u,
+    )
+  }
+})
+
 test('checkout-rate pending recovery distinguishes applied, definitive, and ambiguous outcomes', () => {
   const command = {
     accountGlobalId: 'gia2930001',
+    actorEmail: 'owner@example.test',
     configGlobalId: 'gscf2930001',
     idempotencyKey: 'shopify-rate-control:33333333-3333-4333-8333-333333333333',
     expectedPolicyRevision: 4,
     body: {
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion: 7,
+      expectedPolicyRevision: 4,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1' as const,
         audience: 'all_eligible' as const,
@@ -349,6 +408,17 @@ test('checkout-rate pending recovery distinguishes applied, definitive, and ambi
     checkoutRateControl: command.body.checkoutRateControl,
     rowVersion: command.body.expectedRowVersion + 1,
     policyRevision: command.expectedPolicyRevision + 1,
+    canEdit: true,
+    lastChange: {
+      configGlobalId: command.configGlobalId,
+      idempotencyKey: command.idempotencyKey,
+      requestHash: 'b'.repeat(64),
+      actorEmail: command.actorEmail,
+      requestedControl: command.body.checkoutRateControl,
+      resultingRowVersion: command.body.expectedRowVersion + 1,
+      resultingPolicyRevision: command.expectedPolicyRevision + 1,
+      reason: command.body.reason,
+    },
   }
   assert.equal(shopifyCheckoutRateControlPendingResolution({
     state: appliedState,
@@ -360,6 +430,7 @@ test('checkout-rate pending recovery distinguishes applied, definitive, and ambi
     ...appliedState,
     rowVersion: command.body.expectedRowVersion,
     policyRevision: command.expectedPolicyRevision,
+    lastChange: null,
   }
   for (const failure of [
     new TypeError('fetch failed'),
@@ -373,6 +444,19 @@ test('checkout-rate pending recovery distinguishes applied, definitive, and ambi
       failure,
     }), 'retain_exact_retry')
   }
+
+  assert.equal(shopifyCheckoutRateControlPendingResolution({
+    state: {
+      ...appliedState,
+      lastChange: {
+        ...appliedState.lastChange,
+        idempotencyKey:
+          'shopify-rate-control:44444444-4444-4444-8444-444444444444',
+      },
+    },
+    command,
+    failure: new TypeError('fetch failed'),
+  }), 'superseded', 'matching values without exact receipt lineage must quarantine the retry')
 
   for (const status of [400, 401, 403, 404, 409, 410, 422]) {
     assert.equal(shopifyCheckoutRateControlPendingResolution({

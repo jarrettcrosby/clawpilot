@@ -1298,7 +1298,9 @@ async function exercise(databaseUrl) {
     const unauthorized = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion: 1,
+      expectedPolicyRevision: 1,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'off',
@@ -1330,7 +1332,9 @@ async function exercise(databaseUrl) {
       const requestBody = {
         action: 'save-checkout-rate-control',
         accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+        expectedConfigGlobalId: 'gscf2930001',
         expectedRowVersion,
+        expectedPolicyRevision,
         checkoutRateControl: {
           version: 'shopify-checkout-rate-control-v1',
           audience,
@@ -1407,12 +1411,34 @@ async function exercise(databaseUrl) {
         conflictingReplay.body.code,
         'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_CONFLICT',
       )
+      for (const changedFence of [
+        {
+          ...requestBody,
+          expectedConfigGlobalId: 'gscf2930999',
+        },
+        {
+          ...requestBody,
+          expectedPolicyRevision: requestBody.expectedPolicyRevision + 1,
+        },
+      ]) {
+        const fenceConflict = await route.POST(apiRequest(
+          changedFence,
+          idempotencyKey,
+        ))
+        assert.equal(fenceConflict.status, 409)
+        assert.equal(
+          fenceConflict.body.code,
+          'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_CONFLICT',
+        )
+      }
     }
 
     const extraField = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion,
+      expectedPolicyRevision,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'off',
@@ -1427,10 +1453,86 @@ async function exercise(databaseUrl) {
       'SHOPIFY_CHECKOUT_RATE_CONTROL_REQUEST_INVALID',
     )
 
+    const strictBase = {
+      action: 'save-checkout-rate-control',
+      accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
+      expectedRowVersion,
+      expectedPolicyRevision,
+      checkoutRateControl: {
+        version: 'shopify-checkout-rate-control-v1',
+        audience: 'off',
+        rateSource: 'sandbox',
+      },
+      reason: 'Strict JSON type acceptance proof',
+    }
+    const beforeStrictFailures = await configRow(
+      pool,
+      SANDBOX_ACCOUNT_GLOBAL_ID,
+    )
+    for (const [label, body] of [
+      ['numeric-action', { ...strictBase, action: 7 }],
+      ['array-account', {
+        ...strictBase,
+        accountGlobalId: [SANDBOX_ACCOUNT_GLOBAL_ID],
+      }],
+      ['numeric-config', { ...strictBase, expectedConfigGlobalId: 7 }],
+      ['string-row', { ...strictBase, expectedRowVersion: `${expectedRowVersion}` }],
+      ['string-policy', {
+        ...strictBase,
+        expectedPolicyRevision: `${expectedPolicyRevision}`,
+      }],
+      ['numeric-reason', { ...strictBase, reason: 7 }],
+      ['array-audience', {
+        ...strictBase,
+        checkoutRateControl: {
+          ...strictBase.checkoutRateControl,
+          audience: ['off'],
+        },
+      }],
+    ]) {
+      const rejected = await route.POST(apiRequest(
+        body,
+        `checkout-control:strict-${label}:v1`,
+      ))
+      assert.equal(rejected.status, 400, `${label}: ${JSON.stringify(rejected.body)}`)
+    }
+    assert.deepEqual(
+      await configRow(pool, SANDBOX_ACCOUNT_GLOBAL_ID),
+      beforeStrictFailures,
+      'strict JSON rejection changed the configuration',
+    )
+
+    const wrongConfigIdentity = await route.POST(apiRequest({
+      ...strictBase,
+      expectedConfigGlobalId: 'gscf2930999',
+    }, 'checkout-control:wrong-config:v1'))
+    assert.equal(wrongConfigIdentity.status, 409)
+    assert.equal(
+      wrongConfigIdentity.body.code,
+      'SHOPIFY_CHECKOUT_CONFIG_IDENTITY_CONFLICT',
+    )
+    const stalePolicy = await route.POST(apiRequest({
+      ...strictBase,
+      expectedPolicyRevision: expectedPolicyRevision - 1,
+    }, 'checkout-control:stale-policy:v1'))
+    assert.equal(stalePolicy.status, 409)
+    assert.equal(
+      stalePolicy.body.code,
+      'SHOPIFY_CHECKOUT_CONFIG_POLICY_REVISION_CONFLICT',
+    )
+    assert.deepEqual(
+      await configRow(pool, SANDBOX_ACCOUNT_GLOBAL_ID),
+      beforeStrictFailures,
+      'config or policy fence rejection changed the configuration',
+    )
+
     const sameKeyBody = {
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion,
+      expectedPolicyRevision,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'off',
@@ -1460,6 +1562,7 @@ async function exercise(databaseUrl) {
       route.POST(apiRequest({
         ...sameKeyBody,
         expectedRowVersion,
+        expectedPolicyRevision,
         checkoutRateControl: {
           ...sameKeyBody.checkoutRateControl,
           audience: 'restricted_customers',
@@ -1469,6 +1572,7 @@ async function exercise(databaseUrl) {
       route.POST(apiRequest({
         ...sameKeyBody,
         expectedRowVersion,
+        expectedPolicyRevision,
         checkoutRateControl: {
           ...sameKeyBody.checkoutRateControl,
           audience: 'all_eligible',
@@ -1490,7 +1594,9 @@ async function exercise(databaseUrl) {
     const liveRestricted = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion,
+      expectedPolicyRevision,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'restricted_customers',
@@ -1527,7 +1633,9 @@ async function exercise(databaseUrl) {
     const testRestricted = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion,
+      expectedPolicyRevision,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'restricted_customers',
@@ -1577,7 +1685,9 @@ async function exercise(databaseUrl) {
     const stale = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: SANDBOX_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930001',
       expectedRowVersion: expectedRowVersion - 1,
+      expectedPolicyRevision,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'off',
@@ -1610,7 +1720,9 @@ async function exercise(databaseUrl) {
     const production = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: PRODUCTION_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930002',
       expectedRowVersion: 1,
+      expectedPolicyRevision: 1,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'restricted_customers',
@@ -1626,9 +1738,17 @@ async function exercise(databaseUrl) {
         accountGlobalId: PRODUCTION_ACCOUNT_GLOBAL_ID,
       })
     assert.deepEqual(
-      { ...productionLastChange },
+      JSON.parse(JSON.stringify(productionLastChange)),
       {
         configGlobalId: 'gscf2930002',
+        idempotencyKey: 'checkout-control:production-test-desired:v1',
+        requestHash: production.body.result.requestHash,
+        actorEmail: ACTOR_EMAIL,
+        requestedControl: {
+          version: 'shopify-checkout-rate-control-v1',
+          audience: 'restricted_customers',
+          rateSource: 'sandbox',
+        },
         resultingRowVersion: 2,
         resultingPolicyRevision: 2,
         reason:
@@ -1701,7 +1821,9 @@ async function exercise(databaseUrl) {
     const frozenOff = await route.POST(apiRequest({
       action: 'save-checkout-rate-control',
       accountGlobalId: PRODUCTION_ACCOUNT_GLOBAL_ID,
+      expectedConfigGlobalId: 'gscf2930002',
       expectedRowVersion: 2,
+      expectedPolicyRevision: 2,
       checkoutRateControl: {
         version: 'shopify-checkout-rate-control-v1',
         audience: 'off',

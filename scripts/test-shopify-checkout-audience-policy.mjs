@@ -88,11 +88,15 @@ requireAll(rateControl, [
   'shopifyCheckoutRateControlCanServe',
   'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED',
   'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN',
+  "typeof candidate.audience !== 'string'",
 ], 'explicit checkout-rate control')
 
 requireAll(pendingCommand, [
   'accountGlobalId: string',
+  'actorEmail: string',
   'configGlobalId: string',
+  'expectedConfigGlobalId: string',
+  'expectedPolicyRevision: number',
   'persistShopifyCheckoutRateControlPendingCommand',
   'storage.setItem(key, encoded)',
   'const retained = storage.getItem(key)',
@@ -102,6 +106,8 @@ requireAll(pendingCommand, [
   'input.command.configGlobalId !== input.configGlobalId',
   'result.idempotencyKey !== input.command.idempotencyKey',
   'result.providerWrites !== 0',
+  'lastChange.idempotencyKey === command.idempotencyKey',
+  "return 'superseded'",
 ], 'durable browser-session command replay')
 
 requireAll(callback, [
@@ -168,22 +174,37 @@ requireAll(route, [
   "action === 'save-checkout-rate-control'",
   'requireActivator(context.capabilities.canActivate)',
   'normalizeShopifyCheckoutRateControl(',
+  "strictString(body.reason, 'Change reason')",
+  'expectedConfigGlobalId: configGlobalId(',
+  'expectedPolicyRevision: integer(',
   'updateShopifyCarrierServiceRateControlInPostgres({',
   'SHOPIFY_CHECKOUT_RATE_CONTROL_MIGRATION_REQUIRED',
   'customerPolicySummary.checkoutEligibleCount',
 ], 'authenticated audience API')
+const broadRouteSave = route.slice(
+  route.indexOf("if (action === 'save-config')"),
+  route.indexOf("} else if (action === 'save-checkout-rate-control')"),
+)
+assert.doesNotMatch(
+  broadRouteSave,
+  /body\.checkoutRateControl/u,
+  'Broad setup route must preserve rather than rewrite checkout-rate control',
+)
 
 requireAll(persistence, [
   'lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres(',
   "config.callback_token_hash = $2",
   'updateShopifyCarrierServiceRateControlInPostgres(',
   'expectedRowVersion:',
+  'expectedConfigGlobalId:',
+  'expectedPolicyRevision:',
   'input.checkoutRateControl',
   'SHOPIFY_CHECKOUT_RATE_CONTROL_IDEMPOTENCY_CONFLICT',
   'response_json',
   'SET policy_revision = policy_revision + 1',
   'row_version = row_version + 1',
   'operations.shopify_carrier_service.checkout_rate_control_updated',
+  "version: 'shopify-checkout-rate-control-command-v2'",
   'providerRegistrationRetained: true',
   'providerWrites: 0',
 ], 'optimistic zero-provider-write audience persistence')
@@ -212,6 +233,9 @@ requireAll(panel, [
   'setPendingRateControlCommand(retainedPending)',
   "setCheckoutRateControlReason(rateControlForm.reason ?? '')",
   'pendingRateControlCommand.accountGlobalId === accountGlobalId',
+  'setup.config.globalId',
+  'setup.actorEmail.trim().toLowerCase()',
+  'setSetup(null)',
   'Retry exact pending save',
   'Eligible restricted customers',
   'const callbackServingReady = Boolean(',
@@ -219,6 +243,20 @@ requireAll(panel, [
   'prior successful customer-neutral rate response for up to 15 minutes',
   'exactly mapped shippable item',
 ], 'checkout-audience UI')
+assert.doesNotMatch(
+  panel,
+  /account\.configGlobalId/u,
+  'Checkout-rate commands must use the authoritative config object identity',
+)
+const broadSave = panel.slice(
+  panel.indexOf("const saveConfig = () => run('save-config'"),
+  panel.indexOf('const savePlanRatePolicy'),
+)
+assert.doesNotMatch(
+  broadSave,
+  /checkoutRateControl/u,
+  'Broad setup save must not bypass the dedicated receipt-backed command',
+)
 assert.doesNotMatch(
   panel,
   /checkout-rate kill switch|isolated allowlisted item/u,

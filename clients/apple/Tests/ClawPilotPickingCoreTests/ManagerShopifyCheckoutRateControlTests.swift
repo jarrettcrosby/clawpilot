@@ -3,6 +3,7 @@ import Testing
 @testable import ClawPilotPickingApple
 
 private let checkoutOrganizationId = "11111111-1111-4111-8111-111111111111"
+private let checkoutActorEmail = "owner@example.test"
 
 private func checkoutSetupJSON(
     environment: String = "production",
@@ -19,7 +20,11 @@ private func checkoutSetupJSON(
         + audience
         + #"","rateSource":""#
         + rateSource
-        + #""}},"checkoutRateLastChange":{"configGlobalId":"gscf0009801","resultingRowVersion":12,"resultingPolicyRevision":9,"reason":"Keep the reviewed checkout lane"},"checkoutRateOperatingProfile":{"desiredAudience":""#
+        + #""}},"checkoutRateLastChange":{"configGlobalId":"gscf0009801","idempotencyKey":"shopify-rate-control:prior-command","requestHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","actorEmail":"owner@example.test","requestedControl":{"version":"shopify-checkout-rate-control-v1","audience":""#
+        + audience
+        + #"","rateSource":""#
+        + rateSource
+        + #""},"resultingRowVersion":12,"resultingPolicyRevision":9,"reason":"Keep the reviewed checkout lane"},"checkoutRateOperatingProfile":{"desiredAudience":""#
         + audience
         + #"","desiredRateSource":""#
         + rateSource
@@ -304,6 +309,14 @@ private func editableCheckoutControl(
         canManage: canManage,
         lastChange: ManagerShopifyCheckoutRateLastChange(
             configGlobalId: "gscf0009801",
+            idempotencyKey: "shopify-rate-control:prior-command",
+            requestHash: String(repeating: "a", count: 64),
+            actorEmail: checkoutActorEmail,
+            requestedControl: .init(
+                version: "shopify-checkout-rate-control-v1",
+                audience: audience,
+                rateSource: rateSource
+            ),
             resultingRowVersion: 12,
             resultingPolicyRevision: 9,
             reason: "Keep the reviewed checkout lane"
@@ -333,6 +346,7 @@ func nativeCheckoutRatesAllowDormantDesiredStates() throws {
         control: productionTest,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .test,
         reason: "Keep TEST desired on production for later review"
@@ -348,6 +362,7 @@ func nativeCheckoutRatesAllowDormantDesiredStates() throws {
         control: restrictedLive,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .restrictedCustomers,
         desiredRateSource: .live,
         reason: "Save Restricted LIVE pending provider enforcement"
@@ -361,6 +376,7 @@ func nativeCheckoutRatesAllowDormantDesiredStates() throws {
         control: frozen,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .off,
         desiredRateSource: .live,
         reason: "Change desired state while Frozen remains effective"
@@ -374,10 +390,65 @@ func nativeCheckoutRatesAllowDormantDesiredStates() throws {
         control: disabled,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .test,
         reason: "Change desired state while Disabled remains effective"
     )
+}
+
+@Test("native checkout rate effective projection exhaustively matches 0299 precedence")
+func nativeCheckoutRateProjectionMatchesEvery0299Combination() {
+    let allReasons: [ManagerShopifyCheckoutEffectiveReason] = [
+        .emergencyDisabled,
+        .emergencyFrozen,
+        .configuredOff,
+        .productionSourceRequired,
+        .restrictedLiveEnforcementRequired,
+        .runtimeNotReady,
+        .serving,
+    ]
+    for environment in ["mock", "sandbox", "production"] {
+        for audience in ManagerShopifyCheckoutAudience.allCases {
+            for source in ManagerShopifyCheckoutRateSource.allCases {
+                let allowedReasons: [ManagerShopifyCheckoutEffectiveReason]
+                if audience == .off {
+                    allowedReasons = [.configuredOff]
+                } else if environment == "production" && source == .test {
+                    allowedReasons = [.productionSourceRequired]
+                } else if audience == .restrictedCustomers && source == .live {
+                    allowedReasons = [.restrictedLiveEnforcementRequired]
+                } else {
+                    allowedReasons = [.runtimeNotReady, .serving]
+                }
+                for reason in allReasons {
+                    let control = editableCheckoutControl(
+                        environment: environment,
+                        audience: audience,
+                        rateSource: source,
+                        effectiveReason: reason
+                    )
+                    #expect(
+                        control.isContractValid == allowedReasons.contains(reason),
+                        "\(environment)/\(audience.rawValue)/\(source.rawValue)/\(reason.rawValue)"
+                    )
+                }
+                for emergencyReason in [
+                    ManagerShopifyCheckoutEffectiveReason.emergencyDisabled,
+                    .emergencyFrozen,
+                ] {
+                    let emergency = editableCheckoutControl(
+                        environment: environment,
+                        audience: audience,
+                        rateSource: source,
+                        effectiveReason: emergencyReason,
+                        emergencyOverride: true
+                    )
+                    #expect(emergency.isContractValid)
+                }
+            }
+        }
+    }
 }
 
 @Test("native checkout rate exact capabilities allow save while view-only produces zero POST")
@@ -389,6 +460,7 @@ func nativeCheckoutRateCapabilitiesGateEveryPost() async throws {
         control: authorized,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "An owner or authorized administrator may save this control"
@@ -409,6 +481,7 @@ func nativeCheckoutRateCapabilitiesGateEveryPost() async throws {
             control: viewOnly,
             authenticationGeneration: 4,
             organizationId: checkoutOrganizationId,
+            actorEmail: checkoutActorEmail,
             desiredAudience: .allEligible,
             desiredRateSource: .live,
             reason: "A view-only user must never produce a command"
@@ -426,6 +499,7 @@ func nativeCheckoutRateCapabilitiesGateEveryPost() async throws {
             control: cannotManage,
             authenticationGeneration: 4,
             organizationId: checkoutOrganizationId,
+            actorEmail: checkoutActorEmail,
             desiredAudience: .allEligible,
             desiredRateSource: .live,
             reason: "Both exact capabilities are required"
@@ -440,6 +514,7 @@ func nativeCheckoutRateClientClassifiesDefinitiveFailures() async throws {
         control: editableCheckoutControl(),
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "Classify definitive failures before retry"
@@ -482,6 +557,7 @@ func nativeCheckoutRateRetriesEveryAmbiguousOutcomeExactly() async throws {
             control: editableCheckoutControl(),
             authenticationGeneration: 4,
             organizationId: checkoutOrganizationId,
+            actorEmail: checkoutActorEmail,
             desiredAudience: .allEligible,
             desiredRateSource: .live,
             reason: "Serve all eligible customers from LIVE",
@@ -509,11 +585,15 @@ func nativeCheckoutRateRetriesEveryAmbiguousOutcomeExactly() async throws {
             "accountGlobalId",
             "action",
             "checkoutRateControl",
+            "expectedConfigGlobalId",
+            "expectedPolicyRevision",
             "expectedRowVersion",
             "reason",
         ]))
         #expect(decoded["action"] as? String == "save-checkout-rate-control")
+        #expect(decoded["expectedConfigGlobalId"] as? String == "gscf0009801")
         #expect(decoded["expectedRowVersion"] as? Int == 12)
+        #expect(decoded["expectedPolicyRevision"] as? Int == 9)
     }
 }
 
@@ -524,33 +604,51 @@ func nativeCheckoutRateFencesExactIdentityAndLateState() throws {
         control: control,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "Serve all eligible customers from LIVE",
         idempotencyKey: "shopify-rate-control:fixed-command"
     )
     #expect(command.isCurrentReview(control))
+    #expect(!command.isCurrentReview(
+        editableCheckoutControl(canActivate: false)
+    ))
+    #expect(!command.isCurrentReview(
+        editableCheckoutControl(canManage: false)
+    ))
     #expect(command.permitsStateMutation(
         currentAuthenticationGeneration: 4,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: "gia0009801",
         isAuthenticated: true
     ))
     #expect(!command.permitsStateMutation(
         currentAuthenticationGeneration: 5,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: "gia0009801",
         isAuthenticated: false
     ))
     #expect(!command.permitsStateMutation(
         currentAuthenticationGeneration: 4,
         currentOrganizationId: "22222222-2222-4222-8222-222222222222",
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: "gia0009801",
         isAuthenticated: true
     ))
     #expect(!command.permitsStateMutation(
         currentAuthenticationGeneration: 4,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: "replacement@example.test",
+        currentAccountGlobalId: "gia0009801",
+        isAuthenticated: true
+    ))
+    #expect(!command.permitsStateMutation(
+        currentAuthenticationGeneration: 4,
+        currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: "gia0009802",
         isAuthenticated: true
     ))
@@ -583,6 +681,7 @@ func nativeCheckoutRateResponseBindsEveryCommandField() throws {
         control: editableCheckoutControl(),
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "Serve all eligible customers from LIVE",
@@ -613,6 +712,7 @@ func nativeCheckoutRateSubmissionFenceRejectsStaleDeferOverlap() throws {
         control: editableCheckoutControl(),
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .restrictedCustomers,
         desiredRateSource: .test,
         reason: "Old in-flight save",
@@ -629,6 +729,7 @@ func nativeCheckoutRateSubmissionFenceRejectsStaleDeferOverlap() throws {
         control: editableCheckoutControl(),
         authenticationGeneration: 5,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "New replacement-session save",
@@ -643,6 +744,7 @@ func nativeCheckoutRateSubmissionFenceRejectsStaleDeferOverlap() throws {
         for: oldCommand,
         currentAuthenticationGeneration: 5,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         isAuthenticated: true
     ) == false)
     #expect(activeFence?.ownsCompletion(of: newCommand) == true)
@@ -650,6 +752,7 @@ func nativeCheckoutRateSubmissionFenceRejectsStaleDeferOverlap() throws {
         for: newCommand,
         currentAuthenticationGeneration: 5,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         isAuthenticated: true
     ) == true)
 }
@@ -660,6 +763,7 @@ func nativeCheckoutRateModelRejectsEveryLatePresentationContext() throws {
         control: editableCheckoutControl(),
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "Serve all eligible customers from LIVE"
@@ -668,6 +772,7 @@ func nativeCheckoutRateModelRejectsEveryLatePresentationContext() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: 5,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: command.accountGlobalId,
         isAuthenticated: false,
         failure: .ambiguous,
@@ -676,6 +781,7 @@ func nativeCheckoutRateModelRejectsEveryLatePresentationContext() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: 4,
         currentOrganizationId: "22222222-2222-4222-8222-222222222222",
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: command.accountGlobalId,
         isAuthenticated: true,
         failure: .ambiguous,
@@ -684,6 +790,7 @@ func nativeCheckoutRateModelRejectsEveryLatePresentationContext() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: 4,
         currentOrganizationId: checkoutOrganizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: "gia0009802",
         isAuthenticated: true,
         failure: .ambiguous,
@@ -698,6 +805,7 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
         control: original,
         authenticationGeneration: 4,
         organizationId: checkoutOrganizationId,
+        actorEmail: checkoutActorEmail,
         desiredAudience: .allEligible,
         desiredRateSource: .live,
         reason: "Serve all eligible customers from LIVE"
@@ -711,6 +819,7 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: context.generation,
         currentOrganizationId: context.organizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: context.accountGlobalId,
         isAuthenticated: true,
         failure: .definitive,
@@ -719,6 +828,7 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: context.generation,
         currentOrganizationId: context.organizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: context.accountGlobalId,
         isAuthenticated: true,
         failure: .ambiguous,
@@ -744,6 +854,14 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
         canManage: true,
         lastChange: ManagerShopifyCheckoutRateLastChange(
             configGlobalId: command.configGlobalId,
+            idempotencyKey: command.idempotencyKey,
+            requestHash: String(repeating: "b", count: 64),
+            actorEmail: command.actorEmail,
+            requestedControl: .init(
+                version: "shopify-checkout-rate-control-v1",
+                audience: command.desiredAudience,
+                rateSource: command.desiredRateSource
+            ),
             resultingRowVersion: command.expectedRowVersion + 1,
             resultingPolicyRevision: command.expectedPolicyRevision + 1,
             reason: command.reason
@@ -752,11 +870,54 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: context.generation,
         currentOrganizationId: context.organizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: context.accountGlobalId,
         isAuthenticated: true,
         failure: .ambiguous,
         refreshedControl: applied
     ) == .applied)
+
+    let identicalChangeFromAnotherReceipt = ManagerShopifyCheckoutRateControl(
+        accountGlobalId: applied.accountGlobalId,
+        provider: applied.provider,
+        environment: applied.environment,
+        displayName: applied.displayName,
+        accountStatus: applied.accountStatus,
+        configGlobalId: applied.configGlobalId,
+        rowVersion: applied.rowVersion,
+        policyRevision: applied.policyRevision,
+        desiredAudience: applied.desiredAudience,
+        desiredRateSource: applied.desiredRateSource,
+        effectiveState: applied.effectiveState,
+        effectiveReason: applied.effectiveReason,
+        serving: applied.serving,
+        emergencyOverride: applied.emergencyOverride,
+        canActivate: applied.canActivate,
+        canManage: applied.canManage,
+        lastChange: ManagerShopifyCheckoutRateLastChange(
+            configGlobalId: command.configGlobalId,
+            idempotencyKey: "shopify-rate-control:different-command",
+            requestHash: String(repeating: "d", count: 64),
+            actorEmail: command.actorEmail,
+            requestedControl: .init(
+                version: "shopify-checkout-rate-control-v1",
+                audience: command.desiredAudience,
+                rateSource: command.desiredRateSource
+            ),
+            resultingRowVersion: command.expectedRowVersion + 1,
+            resultingPolicyRevision: command.expectedPolicyRevision + 1,
+            reason: command.reason
+        )
+    )
+    #expect(pending.resolve(
+        currentAuthenticationGeneration: context.generation,
+        currentOrganizationId: context.organizationId,
+        currentActorEmail: checkoutActorEmail,
+        currentAccountGlobalId: context.accountGlobalId,
+        isAuthenticated: true,
+        failure: .ambiguous,
+        refreshedControl: identicalChangeFromAnotherReceipt
+    ) == .quarantineAndRefresh)
 
     let drifted = ManagerShopifyCheckoutRateControl(
         accountGlobalId: original.accountGlobalId,
@@ -777,6 +938,14 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
         canManage: true,
         lastChange: ManagerShopifyCheckoutRateLastChange(
             configGlobalId: command.configGlobalId,
+            idempotencyKey: "shopify-rate-control:different-command",
+            requestHash: String(repeating: "c", count: 64),
+            actorEmail: command.actorEmail,
+            requestedControl: .init(
+                version: "shopify-checkout-rate-control-v1",
+                audience: .off,
+                rateSource: .test
+            ),
             resultingRowVersion: command.expectedRowVersion + 1,
             resultingPolicyRevision: command.expectedPolicyRevision + 1,
             reason: "Another administrator changed this control"
@@ -785,6 +954,7 @@ func nativeCheckoutRateModelSeparatesDefinitiveAndAmbiguousFailures() throws {
     #expect(pending.resolve(
         currentAuthenticationGeneration: context.generation,
         currentOrganizationId: context.organizationId,
+        currentActorEmail: checkoutActorEmail,
         currentAccountGlobalId: context.accountGlobalId,
         isAuthenticated: true,
         failure: .ambiguous,
