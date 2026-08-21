@@ -4015,11 +4015,12 @@ export default function OperationsSection({
     setError('')
     setNotice('')
     try {
+      const requestIdempotencyKey = `operations-one-off-packed-rate:${detail.globalId}:${crypto.randomUUID()}`
       const response = await fetch('/api/operations/one-off-shipments', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': `operations-one-off-packed-rate:${detail.globalId}:${crypto.randomUUID()}`,
+          'Idempotency-Key': requestIdempotencyKey,
         },
         body: JSON.stringify({
           action: 'refresh-packed-rates',
@@ -4043,6 +4044,7 @@ export default function OperationsSection({
           rowVersion: result.rowVersion,
           packedRate: {
             quoteGlobalId: result.quote.globalId,
+            requestIdempotencyKey,
             expiresAt: result.quote.expiresAt,
             status: result.quote.status,
             consumed: false,

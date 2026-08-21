@@ -955,6 +955,7 @@ async function shippingScope(
   client: PoolClient,
   organizationId: string,
   lock = false,
+  actorEmail?: string,
 ): Promise<ShippingScopeRow> {
   const read = () => client.query<ShippingScopeRow>(
     `SELECT scope.data_pipeline_id::text AS pipeline_id
@@ -972,6 +973,8 @@ async function shippingScope(
     client,
     `shipping:scope:${organizationId}`,
   )
+  const lockedExisting = await read()
+  if (lockedExisting.rows[0]) return lockedExisting.rows[0]
   const selected = await client.query<{ id: string }>(
     `SELECT pipeline.id::text
      FROM pipeline_spaces pipeline
@@ -992,10 +995,59 @@ async function shippingScope(
      LIMIT 1`,
     [organizationId],
   )
-  if (!selected.rows[0]) {
+  let selectedPipelineId = selected.rows[0]?.id || null
+  if (!selectedPipelineId && actorEmail) {
+    const pipelineOwner = await client.query<{ user_email: string }>(
+      `SELECT membership.user_email
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $1::uuid
+         AND membership.status = 'active'
+       ORDER BY
+         CASE membership.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+         (membership.user_email = $2) DESC,
+         membership.created_at,
+         membership.user_email
+       LIMIT 1
+       FOR SHARE`,
+      [organizationId, actorEmail],
+    )
+    if (!pipelineOwner.rows[0]) {
+      requestError(
+        'SHIPPING_SCOPE_UNAVAILABLE',
+        'Shipping could not establish an internal workspace scope',
+        409,
+      )
+    }
+    const createdPipeline = await client.query<{ id: string }>(
+      `INSERT INTO pipeline_spaces (
+         name, owner_email, workspace_organization_id,
+         is_default, sheet_id, sync_enabled
+       ) VALUES (
+         'Shipping records', $1, $2::uuid, false, NULL, false
+       )
+       RETURNING id::text`,
+      [pipelineOwner.rows[0].user_email, organizationId],
+    )
+    selectedPipelineId = createdPipeline.rows[0]?.id || null
+    if (selectedPipelineId) {
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'shipping.scope.created',
+        aggregateType: 'pipeline_space',
+        aggregateId: selectedPipelineId,
+        organizationId,
+        eventKey: `shipping:scope:${organizationId}:pipeline:${selectedPipelineId}`,
+        payload: {
+          purpose: 'one_off_shipping_internal_scope',
+          operatorSetupRequired: false,
+        },
+      }, client)
+    }
+  }
+  if (!selectedPipelineId) {
     requestError(
-      'SHIPPING_PIPELINE_REQUIRED',
-      'Create a workspace pipeline before creating a shipment',
+      'SHIPPING_SCOPE_UNAVAILABLE',
+      'Shipping could not establish an internal workspace scope',
       409,
     )
   }
@@ -1004,7 +1056,7 @@ async function shippingScope(
        organization_id, data_pipeline_id
      ) VALUES ($1::uuid, $2::uuid)
      ON CONFLICT (organization_id) DO NOTHING`,
-    [organizationId, selected.rows[0].id],
+    [organizationId, selectedPipelineId],
   )
   const created = await read()
   if (!created.rows[0]) {
@@ -1186,11 +1238,12 @@ function workspaceAddress(value: unknown): Address {
 
 export async function readOneOffShipmentWorkspaceFromPostgres(input: {
   organizationId: string
+  actorEmail: string
   canPurchaseLivePostage?: boolean
 }): Promise<OneOffShipmentWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
   const resolvedShippingScope = await withTransaction((client) => (
-    shippingScope(client, organizationId)
+    shippingScope(client, organizationId, false, input.actorEmail)
   ))
   const [customers, warehouses, pools, locations, products, sandboxCarriers, productionCarriers] = await Promise.all([
     query<{ global_id: string; name: string }>(
@@ -1429,9 +1482,15 @@ async function resolveQuoteScope(
   client: PoolClient,
   organizationId: string,
   quote: OneOffShipmentQuoteInput,
+  actorEmail: string,
   inventoryReservationOrderGlobalId: string | null = null,
 ): Promise<ResolvedQuoteScope> {
-  const resolvedShippingScope = await shippingScope(client, organizationId)
+  const resolvedShippingScope = await shippingScope(
+    client,
+    organizationId,
+    false,
+    actorEmail,
+  )
   const customer = quote.customerGlobalId ? await client.query<{ id: string }>(
     `SELECT id::text
      FROM crm_organizations
@@ -2888,6 +2947,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
         client,
         organizationId,
         quote,
+        input.actorEmail,
         inventoryReservationOrderGlobalId,
       )),
       enabledOneOffRateSources(

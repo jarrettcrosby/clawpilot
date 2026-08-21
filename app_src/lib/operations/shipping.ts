@@ -21,6 +21,7 @@ export type ShippingRecord = {
   trackingNumbers: string[]
   handlingUnitCount: number
   executionMode: 'test' | 'live' | null
+  standaloneOneOffExecutionEligible: boolean
   occurredAt: string
 }
 

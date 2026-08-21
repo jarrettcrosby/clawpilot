@@ -22,6 +22,7 @@ type ShippingRecordRow = QueryResultRow & {
   tracking_numbers: string[]
   handling_unit_count: string
   execution_mode: 'test' | 'live' | null
+  standalone_one_off_execution_eligible: boolean
   occurred_at: Date
 }
 
@@ -42,6 +43,8 @@ function record(row: ShippingRecordRow): ShippingRecord {
     trackingNumbers: row.tracking_numbers,
     handlingUnitCount: Number(row.handling_unit_count),
     executionMode: row.execution_mode,
+    standaloneOneOffExecutionEligible:
+      row.standalone_one_off_execution_eligible,
     occurredAt: row.occurred_at.toISOString(),
   }
 }
@@ -62,6 +65,14 @@ export async function readShippingWorkspaceFromPostgres(input: {
               source_order.order_type,
               COALESCE(customer.name, source_order.ship_to->>'name') AS customer_name,
               quote.execution_mode,
+              (
+                source_order.source_provider = 'clawpilot_native'
+                AND source_order.order_type = 'one_off'
+                AND source_order.status = 'packed'
+                AND operations_one_off_lines_are_pure_ad_hoc(
+                  quote.lines_snapshot
+                )
+              ) AS standalone_one_off_execution_eligible,
               plan.id AS plan_id,
               COALESCE((
                 SELECT count(*)
@@ -131,6 +142,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
             COALESCE(parcel.tracking_numbers, ARRAY[]::text[]) AS tracking_numbers,
             COALESCE(parcel.shipment_count, shipping_order.package_count) AS handling_unit_count,
             shipping_order.execution_mode,
+            shipping_order.standalone_one_off_execution_eligible,
             COALESCE(parcel.occurred_at, shipping_order.updated_at) AS occurred_at
      FROM shipping_orders shipping_order
      LEFT JOIN parcel_shipments parcel ON parcel.order_id = shipping_order.id
@@ -163,6 +175,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
             handling_plan.handling_unit_count::text,
             CASE tender.environment
               WHEN 'sandbox' THEN 'test' ELSE 'live' END AS execution_mode,
+            false AS standalone_one_off_execution_eligible,
             COALESCE(tender.completed_at, tender.requested_at) AS occurred_at
      FROM operations_freight_tender_attempts tender
      JOIN operations_orders source_order

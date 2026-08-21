@@ -179,6 +179,7 @@ export type OneOffShipmentExecutionState = {
   }
   packedRate: null | {
     quoteGlobalId: string
+    requestIdempotencyKey: string
     expiresAt: string
     status: 'succeeded' | 'partial' | 'failed'
     consumed: boolean
@@ -186,6 +187,9 @@ export type OneOffShipmentExecutionState = {
   }
   carrierGroup: null | {
     createAttemptGlobalId: string
+    createRequestIdempotencyKey: string
+    purchaseQuoteGlobalId: string
+    purchaseOfferGlobalId: string
     state: 'prepared' | 'succeeded' | 'failed' | 'unknown'
     provider: OneOffCarrierProvider
     serviceCode: string
@@ -201,6 +205,7 @@ export type OneOffShipmentExecutionState = {
     unresolved: boolean
     active: boolean
     voidAttemptGlobalId: string | null
+    voidRequestIdempotencyKey: string | null
     voidAction: 'void' | 'close_sample' | null
     voidState: 'prepared' | 'succeeded' | 'failed' | 'unknown' | null
     labels: Array<{

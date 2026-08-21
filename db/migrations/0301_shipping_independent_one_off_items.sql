@@ -22,6 +22,101 @@ SELECT activation.organization_id, activation.data_pipeline_id
 FROM operations_activation_scopes activation
 ON CONFLICT (organization_id) DO NOTHING;
 
+-- New Shipping permissions must preserve each legacy actor's effective
+-- authority. Missing keys are backfilled from the exact pre-0301 route gates;
+-- explicit grants and denials remain untouched.
+UPDATE app_users app_user
+SET permissions = COALESCE(app_user.permissions, '{}'::jsonb)
+  || CASE WHEN NOT COALESCE(app_user.permissions, '{}'::jsonb) ? 'viewShipping'
+    THEN jsonb_build_object(
+      'viewShipping',
+      app_user.role = 'owner'
+        OR COALESCE(
+          COALESCE(app_user.permissions, '{}'::jsonb)->'viewOperations',
+          'false'::jsonb
+        ) = 'true'::jsonb
+    ) ELSE '{}'::jsonb END
+  || CASE WHEN NOT COALESCE(app_user.permissions, '{}'::jsonb) ? 'createShipments'
+    THEN jsonb_build_object(
+      'createShipments',
+      app_user.role = 'owner'
+        OR (
+          app_user.role = 'admin'
+          AND COALESCE(
+            COALESCE(app_user.permissions, '{}'::jsonb)->'manageOperations',
+            'false'::jsonb
+          ) = 'true'::jsonb
+          AND COALESCE(
+            COALESCE(app_user.permissions, '{}'::jsonb)->'executeWarehouse',
+            'false'::jsonb
+          ) = 'true'::jsonb
+        )
+    ) ELSE '{}'::jsonb END
+  || CASE WHEN NOT COALESCE(app_user.permissions, '{}'::jsonb) ? 'purchaseLivePostage'
+    THEN jsonb_build_object(
+      'purchaseLivePostage',
+      app_user.role = 'owner'
+        OR (
+          app_user.role = 'admin'
+          AND COALESCE(
+            COALESCE(app_user.permissions, '{}'::jsonb)->'manageOperations',
+            'false'::jsonb
+          ) = 'true'::jsonb
+          AND COALESCE(
+            COALESCE(app_user.permissions, '{}'::jsonb)->'executeWarehouse',
+            'false'::jsonb
+          ) = 'true'::jsonb
+        )
+    ) ELSE '{}'::jsonb END
+WHERE NOT COALESCE(app_user.permissions, '{}'::jsonb)
+  ?& ARRAY['viewShipping', 'createShipments', 'purchaseLivePostage'];
+
+UPDATE app_user_organization_memberships membership
+SET permissions = COALESCE(membership.permissions, '{}'::jsonb)
+  || CASE WHEN NOT COALESCE(membership.permissions, '{}'::jsonb) ? 'viewShipping'
+    THEN jsonb_build_object(
+      'viewShipping',
+      membership.role = 'owner'
+        OR COALESCE(
+          COALESCE(membership.permissions, '{}'::jsonb)->'viewOperations',
+          'false'::jsonb
+        ) = 'true'::jsonb
+    ) ELSE '{}'::jsonb END
+  || CASE WHEN NOT COALESCE(membership.permissions, '{}'::jsonb) ? 'createShipments'
+    THEN jsonb_build_object(
+      'createShipments',
+      membership.role = 'owner'
+        OR (
+          membership.role = 'admin'
+          AND COALESCE(
+            COALESCE(membership.permissions, '{}'::jsonb)->'manageOperations',
+            'false'::jsonb
+          ) = 'true'::jsonb
+          AND COALESCE(
+            COALESCE(membership.permissions, '{}'::jsonb)->'executeWarehouse',
+            'false'::jsonb
+          ) = 'true'::jsonb
+        )
+    ) ELSE '{}'::jsonb END
+  || CASE WHEN NOT COALESCE(membership.permissions, '{}'::jsonb) ? 'purchaseLivePostage'
+    THEN jsonb_build_object(
+      'purchaseLivePostage',
+      membership.role = 'owner'
+        OR (
+          membership.role = 'admin'
+          AND COALESCE(
+            COALESCE(membership.permissions, '{}'::jsonb)->'manageOperations',
+            'false'::jsonb
+          ) = 'true'::jsonb
+          AND COALESCE(
+            COALESCE(membership.permissions, '{}'::jsonb)->'executeWarehouse',
+            'false'::jsonb
+          ) = 'true'::jsonb
+        )
+    ) ELSE '{}'::jsonb END
+WHERE NOT COALESCE(membership.permissions, '{}'::jsonb)
+  ?& ARRAY['viewShipping', 'createShipments', 'purchaseLivePostage'];
+
 CREATE OR REPLACE FUNCTION operations_one_off_lines_are_pure_ad_hoc(
   lines_snapshot jsonb
 )

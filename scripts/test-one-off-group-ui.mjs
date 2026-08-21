@@ -38,6 +38,8 @@ const voidRoute = route.slice(
   route.indexOf("throw new OneOffShipmentPersistenceError(\n      'OPERATIONS_ONE_OFF_ACTION_INVALID'"),
 )
 assert.doesNotMatch(voidRoute, /canActivate|LIVE_VOID_PERMISSION_REQUIRED/)
+assert.match(voidRoute, /executionMode === 'live' && !capabilities\.canPurchaseLivePostage/)
+assert.match(voidRoute, /canPurchaseLivePostage: capabilities\.canPurchaseLivePostage/)
 
 assert.match(panel, /one-off-group-shipping-execution/)
 assert.match(panel, /complete label set/i)

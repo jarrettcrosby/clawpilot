@@ -38,6 +38,7 @@ import {
 
 import LtlFreightClassAssessmentPanel from '@/components/operations/LtlFreightClassAssessmentPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
+import ShippingOneOffExecutionPanel from '@/components/shipping/ShippingOneOffExecutionPanel'
 import type { OneOffShipmentCreateResult } from '@/lib/operations/oneOffShipments'
 import type {
   ShippingRecord,
@@ -249,9 +250,15 @@ function ShipmentRecords({
 function RecordDialog({
   record,
   onClose,
+  canCreateShipments,
+  canPurchaseLivePostage,
+  onUpdated,
 }: {
   record: ShippingRecord | null
   onClose: () => void
+  canCreateShipments: boolean
+  canPurchaseLivePostage: boolean
+  onUpdated: () => void | Promise<void>
 }) {
   return (
     <Dialog open={Boolean(record)} onClose={onClose} fullWidth maxWidth="sm">
@@ -294,6 +301,29 @@ function RecordDialog({
                 <Typography key={tracking}>{tracking}</Typography>
               )) : <Typography>None — this is a plan, not a carrier-confirmed shipment.</Typography>}
             </Box>
+            {record.standaloneOneOffExecutionEligible && canCreateShipments ? (
+              <>
+                <Divider />
+                <Box>
+                  <Typography fontWeight={750} sx={{ mb: 1 }}>
+                    Standalone postage
+                  </Typography>
+                  <ShippingOneOffExecutionPanel
+                    orderGlobalId={record.orderGlobalId}
+                    canPurchaseLivePostage={canPurchaseLivePostage}
+                    onUpdated={onUpdated}
+                  />
+                </Box>
+              </>
+            ) : record.standaloneOneOffExecutionEligible ? (
+              <Alert severity="info">
+                Create shipments permission is required to refresh rates, create labels, or cancel this standalone shipment.
+              </Alert>
+            ) : record.kind === 'shipment_plan' && record.executionMode ? (
+              <Alert severity="info">
+                Existing inventory and newly created products retain their canonical reservation and physical-control evidence. Complete their pick and pack in Operations; the resulting packed shipment can then use exact carrier postage controls.
+              </Alert>
+            ) : null}
           </Stack>
         </DialogContent>
       )}
@@ -419,6 +449,9 @@ export default function ShippingSection({
                 >
                   Create parcel shipment
                 </Button>
+                <Alert severity="info">
+                  A one-time ad-hoc item can be rated, labeled, and cancelled here without CRM product or inventory setup. Existing inventory and deliberately created products keep the physical pick-and-pack boundary in Operations.
+                </Alert>
               </Stack>
             ) : (
               <Stack spacing={2}>
@@ -474,7 +507,13 @@ export default function ShippingSection({
         onClose={() => setParcelDialogOpen(false)}
         onCreated={onCreated}
       />
-      <RecordDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} />
+      <RecordDialog
+        record={selectedRecord}
+        onClose={() => setSelectedRecord(null)}
+        canCreateShipments={Boolean(workspace?.capabilities.canCreate)}
+        canPurchaseLivePostage={Boolean(workspace?.capabilities.canPurchaseLivePostage)}
+        onUpdated={loadWorkspace}
+      />
     </Box>
   )
 }

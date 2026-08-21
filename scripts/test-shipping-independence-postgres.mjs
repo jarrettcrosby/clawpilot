@@ -92,13 +92,17 @@ const pool = new Pool({
   connectionString: parsed.toString(),
   ssl: parsed.hostname.endsWith('rlwy.net') ? { rejectUnauthorized: false } : undefined,
   application_name: 'clawpilot-shipping-independence-rollback-acceptance',
-  max: 1,
+  max: 4,
   connectionTimeoutMillis: 15_000,
   query_timeout: 120_000,
 })
 const migrationSql = readFileSync(fileURLToPath(
   new URL(`../db/migrations/${TARGET_MIGRATION}`, import.meta.url),
 ), 'utf8')
+const permissionBackfillSql = migrationSql.slice(
+  migrationSql.indexOf('-- New Shipping permissions must preserve'),
+  migrationSql.indexOf('CREATE OR REPLACE FUNCTION operations_one_off_lines_are_pure_ad_hoc'),
+)
 
 async function shippingIndependenceIsHealthy(client) {
   const result = await client.query(
@@ -191,6 +195,199 @@ async function exerciseHealthTamperEvidence(client) {
       `SET LOCAL search_path = shipping_health_lookalike, public`,
     )
   })
+}
+
+async function exercisePermissionBackfill(client) {
+  const organizationId = randomUUID()
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 8)
+  const cases = [
+    ['owner', 'owner', {}, [true, true, true]],
+    ['admin-none', 'admin', {}, [false, false, false]],
+    ['admin-view', 'admin', { viewOperations: true }, [true, false, false]],
+    ['admin-execute', 'admin', {
+      viewOperations: true,
+      manageOperations: true,
+      executeWarehouse: true,
+    }, [true, true, true]],
+    ['member-view', 'member', {
+      viewOperations: true,
+      manageOperations: true,
+      executeWarehouse: true,
+    }, [true, false, false]],
+    ['admin-explicit-deny', 'admin', {
+      viewOperations: true,
+      manageOperations: true,
+      executeWarehouse: true,
+      viewShipping: false,
+      createShipments: false,
+      purchaseLivePostage: false,
+    }, [false, false, false]],
+    ['member-explicit-grant', 'member', {
+      viewShipping: true,
+      createShipments: true,
+      purchaseLivePostage: true,
+    }, [true, true, true]],
+  ]
+  await client.query('SET LOCAL session_replication_role = replica')
+  await client.query(
+    `INSERT INTO workspace_organizations (
+       id, name, organization_type
+     ) VALUES ($1, 'Shipping permission backfill fixture', 'member')`,
+    [organizationId],
+  )
+  for (const [name, role, permissions] of cases) {
+    const email = `shipping-backfill-${name}-${suffix}@example.test`
+    await client.query(
+      `INSERT INTO app_users (
+         email, role, permissions, status
+       ) VALUES ($1, $2, $3::jsonb, 'active')`,
+      [email, role, JSON.stringify(permissions)],
+    )
+    await client.query(
+      `INSERT INTO app_user_organization_memberships (
+         user_email, organization_id, role, permissions, status
+       ) VALUES ($1, $2, $3, $4::jsonb, 'active')`,
+      [email, organizationId, role, JSON.stringify(permissions)],
+    )
+  }
+  await client.query('SET LOCAL session_replication_role = origin')
+  await client.query(permissionBackfillSql)
+
+  for (const table of ['app_users', 'app_user_organization_memberships']) {
+    const rows = await client.query(
+      `SELECT user_record.email,
+              ARRAY[
+                (user_record.permissions->>'viewShipping')::boolean,
+                (user_record.permissions->>'createShipments')::boolean,
+                (user_record.permissions->>'purchaseLivePostage')::boolean
+              ] AS shipping_permissions
+       FROM (
+         SELECT app_user.email, app_user.permissions
+         FROM app_users app_user
+         WHERE $1 = 'app_users'
+           AND app_user.email LIKE $2
+         UNION ALL
+         SELECT membership.user_email AS email, membership.permissions
+         FROM app_user_organization_memberships membership
+         WHERE $1 = 'app_user_organization_memberships'
+           AND membership.organization_id = $3::uuid
+       ) user_record`,
+      [table, `shipping-backfill-%-${suffix}@example.test`, organizationId],
+    )
+    const byEmail = new Map(rows.rows.map((row) => [row.email, row.shipping_permissions]))
+    for (const [name, , , expected] of cases) {
+      assert.deepEqual(
+        byEmail.get(`shipping-backfill-${name}-${suffix}@example.test`),
+        expected,
+        `${table} ${name} must preserve its exact legacy Shipping authority`,
+      )
+    }
+  }
+}
+
+async function exerciseFirstUseScopeConcurrency() {
+  const organizationId = randomUUID()
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 10)
+  const actor = `shipping-scope-${suffix}@example.test`
+  const setup = await pool.connect()
+  try {
+    await setup.query('BEGIN')
+    await setup.query('SET LOCAL session_replication_role = replica')
+    await setup.query(
+      `INSERT INTO app_users (email, role, status)
+       VALUES ($1, 'owner', 'active')`,
+      [actor],
+    )
+    await setup.query(
+      `INSERT INTO workspace_organizations (
+         id, name, organization_type
+       ) VALUES ($1, 'Concurrent Shipping scope fixture', 'member')`,
+      [organizationId],
+    )
+    await setup.query(
+      `INSERT INTO app_user_organization_memberships (
+         user_email, organization_id, role, permissions, status
+       ) VALUES ($1, $2, 'owner', '{}'::jsonb, 'active')`,
+      [actor, organizationId],
+    )
+    await setup.query('COMMIT')
+  } catch (error) {
+    await setup.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    setup.release()
+  }
+
+  const provision = async () => {
+    const connection = await pool.connect()
+    try {
+      await connection.query('BEGIN')
+      await connection.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [`shipping:scope:${organizationId}`],
+      )
+      const existing = await connection.query(
+        `SELECT data_pipeline_id::text AS pipeline_id
+         FROM operations_shipping_scopes
+         WHERE organization_id = $1::uuid
+         FOR UPDATE`,
+        [organizationId],
+      )
+      let pipelineId = existing.rows[0]?.pipeline_id || null
+      if (!pipelineId) {
+        const pipeline = await connection.query(
+          `SELECT id::text
+           FROM pipeline_spaces
+           WHERE workspace_organization_id = $1::uuid
+           ORDER BY updated_at DESC, id
+           LIMIT 1`,
+          [organizationId],
+        )
+        pipelineId = pipeline.rows[0]?.id || null
+      }
+      if (!pipelineId) {
+        const created = await connection.query(
+          `INSERT INTO pipeline_spaces (
+             name, owner_email, workspace_organization_id,
+             is_default, sheet_id, sync_enabled
+           ) VALUES ('Shipping records', $1, $2::uuid, false, NULL, false)
+           RETURNING id::text`,
+          [actor, organizationId],
+        )
+        pipelineId = created.rows[0].id
+      }
+      await connection.query(
+        `INSERT INTO operations_shipping_scopes (
+           organization_id, data_pipeline_id
+         ) VALUES ($1::uuid, $2::uuid)
+         ON CONFLICT (organization_id) DO NOTHING`,
+        [organizationId, pipelineId],
+      )
+      await connection.query('COMMIT')
+    } catch (error) {
+      await connection.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      connection.release()
+    }
+  }
+
+  await Promise.all([provision(), provision()])
+  const evidence = await pool.query(
+    `SELECT
+       (SELECT count(*)::integer
+        FROM operations_shipping_scopes
+        WHERE organization_id = $1::uuid) AS scopes,
+       (SELECT count(*)::integer
+        FROM pipeline_spaces
+        WHERE workspace_organization_id = $1::uuid
+          AND name = 'Shipping records') AS internal_pipelines`,
+    [organizationId],
+  )
+  assert.deepEqual(evidence.rows[0], {
+    scopes: 1,
+    internal_pipelines: 1,
+  }, 'Concurrent first-use Shipping loads must create one scope and one internal pipeline')
 }
 
 async function exerciseAdHocEvidence(client) {
@@ -457,6 +654,8 @@ try {
   )
   assert.equal(prerequisites.rows[0]?.ready, true, '0300 prerequisite must be applied')
 
+  if (!remote) await exerciseFirstUseScopeConcurrency()
+
   await client.query('BEGIN')
   if (!prerequisites.rows[0]?.target_applied) await client.query(migrationSql)
 
@@ -530,6 +729,7 @@ try {
     exact_package_set: true,
   })
   await exerciseHealthTamperEvidence(client)
+  await exercisePermissionBackfill(client)
   await exerciseAdHocEvidence(client)
   await client.query('ROLLBACK')
   console.log('Shipping independence disposable Postgres checks passed.')

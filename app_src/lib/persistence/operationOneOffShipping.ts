@@ -624,6 +624,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
   )
   const packedRateRows = await query<{
     quote_global_id: string
+    idempotency_key: string
     expires_at: Date
     status: 'succeeded' | 'partial' | 'failed'
     consumed: boolean
@@ -642,6 +643,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     credential_version: number
   }>(
     `SELECT packed_quote.global_id AS quote_global_id,
+            packed_quote.idempotency_key,
             packed_quote.expires_at, packed_quote.status,
             EXISTS (
               SELECT 1
@@ -699,7 +701,11 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     ],
   )
   const group = await query<GroupAttemptRow & {
+    create_idempotency_key: string
+    purchase_quote_global_id: string
+    purchase_offer_global_id: string
     void_global_id: string | null
+    void_idempotency_key: string | null
     void_action: 'void' | 'close_sample' | null
     void_state: GroupState | null
   }>(
@@ -717,12 +723,17 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
             create_attempt.package_count, create_attempt.environment,
             create_attempt.provider, create_attempt.service_code,
             create_attempt.error_code,
+            create_attempt.idempotency_key AS create_idempotency_key,
+            purchase_quote.global_id AS purchase_quote_global_id,
+            purchase_offer.global_id AS purchase_offer_global_id,
             close_attempt.global_id AS void_global_id,
+            close_attempt.idempotency_key AS void_idempotency_key,
             close_attempt.action AS void_action,
             close_attempt.state AS void_state
      FROM operations_one_off_carrier_group_attempts create_attempt
      LEFT JOIN LATERAL (
-       SELECT candidate.global_id, candidate.action, candidate.state
+       SELECT candidate.global_id, candidate.idempotency_key,
+              candidate.action, candidate.state
        FROM operations_one_off_carrier_group_attempts candidate
        WHERE candidate.organization_id = create_attempt.organization_id
          AND candidate.create_attempt_id = create_attempt.id
@@ -730,6 +741,13 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
        ORDER BY candidate.created_at DESC, candidate.id DESC
        LIMIT 1
      ) close_attempt ON true
+     JOIN operations_one_off_shipment_quotes purchase_quote
+       ON purchase_quote.organization_id = create_attempt.organization_id
+      AND purchase_quote.id = create_attempt.purchase_quote_id
+     JOIN operations_one_off_shipment_quote_offers purchase_offer
+       ON purchase_offer.organization_id = create_attempt.organization_id
+      AND purchase_offer.quote_id = create_attempt.purchase_quote_id
+      AND purchase_offer.id = create_attempt.purchase_offer_id
      WHERE create_attempt.organization_id = $1::uuid
        AND create_attempt.order_id = $2::uuid
        AND create_attempt.plan_id = $3::uuid
@@ -808,6 +826,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     },
     packedRate: latestQuote ? {
       quoteGlobalId: latestQuote.quote_global_id,
+      requestIdempotencyKey: latestQuote.idempotency_key,
       expiresAt: new Date(latestQuote.expires_at).toISOString(),
       status: latestQuote.status,
       consumed: latestQuote.consumed,
@@ -835,6 +854,9 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
     } : null,
     carrierGroup: create ? {
       createAttemptGlobalId: create.global_id,
+      createRequestIdempotencyKey: create.create_idempotency_key,
+      purchaseQuoteGlobalId: create.purchase_quote_global_id,
+      purchaseOfferGlobalId: create.purchase_offer_global_id,
       state: create.state,
       provider: create.provider,
       serviceCode: create.service_code,
@@ -856,6 +878,7 @@ export async function readOneOffShipmentExecutionStateFromPostgres(input: {
         && create.void_state !== 'succeeded'
         && create.void_state !== 'unknown',
       voidAttemptGlobalId: create.void_global_id,
+      voidRequestIdempotencyKey: create.void_idempotency_key,
       voidAction: create.void_action,
       voidState: create.void_state,
       labels: labels.rows.map((label) => ({
@@ -2397,6 +2420,7 @@ async function readVoidCreateAttempt(
 export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
   organizationId: string
   actorEmail: string
+  canPurchaseLivePostage: boolean
   idempotencyKey: string
   orderGlobalId: string
   expectedRowVersion: number
@@ -2409,6 +2433,13 @@ export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
   const expectedRowVersion = requiredVersion(input.expectedRowVersion)
   const reason = requiredText(input.reason, 'Whole-shipment void reason', 500)
   const initial = await readGroupContext(organizationId, orderGlobalId, null, false)
+  if (initial.execution_mode === 'live' && !input.canPurchaseLivePostage) {
+    fail(
+      'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+      'Live carrier cancellation requires live-postage permission',
+      403,
+    )
+  }
   const replay = await readVoidReplay(organizationId, idempotencyKey)
   if (replay) {
     assertVoidReplayRequest({
@@ -2508,6 +2539,13 @@ export async function voidOperationsOneOffCarrierGroupInPostgres(input: {
       client,
       true,
     )
+    if (context.execution_mode === 'live' && !input.canPurchaseLivePostage) {
+      fail(
+        'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+        'Live carrier cancellation requires live-postage permission',
+        403,
+      )
+    }
     const racedReplay = await readVoidReplay(
       organizationId,
       idempotencyKey,

@@ -364,9 +364,23 @@ export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPe
     : {}
   const permissions = normalizePermissions(value)
   if (role === 'admin') {
-    if (!Object.hasOwn(raw, 'viewShipping')) permissions.viewShipping = true
-    if (!Object.hasOwn(raw, 'createShipments')) permissions.createShipments = true
-    if (!Object.hasOwn(raw, 'purchaseLivePostage')) permissions.purchaseLivePostage = true
+    const legacyCanCreateShipments = permissions.manageOperations === true
+      && permissions.executeWarehouse === true
+    if (!Object.hasOwn(raw, 'viewShipping')) {
+      permissions.viewShipping = permissions.viewOperations === true
+    }
+    if (!Object.hasOwn(raw, 'createShipments')) {
+      permissions.createShipments = legacyCanCreateShipments
+    }
+    if (!Object.hasOwn(raw, 'purchaseLivePostage')) {
+      permissions.purchaseLivePostage = legacyCanCreateShipments
+    }
+  } else {
+    if (!Object.hasOwn(raw, 'viewShipping')) {
+      permissions.viewShipping = permissions.viewOperations === true
+    }
+    if (!Object.hasOwn(raw, 'createShipments')) permissions.createShipments = false
+    if (!Object.hasOwn(raw, 'purchaseLivePostage')) permissions.purchaseLivePostage = false
   }
   if (role === 'member') {
     permissions.inviteUsers = false

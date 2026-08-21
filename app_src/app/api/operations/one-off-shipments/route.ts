@@ -144,6 +144,7 @@ export async function GET(req: NextRequest) {
     }
     const workspace = await readOneOffShipmentWorkspaceFromPostgres({
       organizationId,
+      actorEmail: actor.email,
       canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
     })
     return json({ ok: true, workspace })
@@ -310,9 +311,20 @@ export async function POST(req: NextRequest) {
         )
       }
       const orderGlobalId = String(body.orderGlobalId || '')
+      const executionMode = await readOneOffCarrierGroupExecutionModeInPostgres({
+        organizationId,
+        orderGlobalId,
+      })
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
+        return forbidden(
+          'Live carrier cancellation requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
+        )
+      }
       const result = await voidOperationsOneOffCarrierGroupInPostgres({
         organizationId,
         actorEmail: actor.email,
+        canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
         idempotencyKey: idempotencyKey(req),
         orderGlobalId,
         expectedRowVersion: Number(body.expectedRowVersion),
