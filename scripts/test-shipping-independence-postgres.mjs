@@ -12,6 +12,15 @@ import {
 
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const { Pool } = requireFromApp('pg')
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18'].includes(
+    disposablePostgresImage,
+  ),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 const TARGET_MIGRATION = '0301_shipping_independent_one_off_items.sql'
 const TRUSTED_PROJECT_ID = 'b5169ebd-8166-4b96-9a81-7cc8adaa9270'
 const TRUSTED_ENVIRONMENT_ID = 'e4abd95f-825c-4242-b37b-825a92597e98'
@@ -67,7 +76,7 @@ if (!databaseUrl) {
       '-e', 'POSTGRES_PASSWORD=clawpilot_shipping',
       '-e', 'POSTGRES_DB=clawpilot_shipping',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { stdio: 'ignore', timeout: 180_000 })
     const portOutput = execFileSync('docker', ['port', container, '5432/tcp'], {
       encoding: 'utf8',

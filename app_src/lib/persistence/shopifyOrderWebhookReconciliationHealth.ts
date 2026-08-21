@@ -184,6 +184,7 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
     LEFT JOIN pg_catalog.pg_namespace referenced_namespace
       ON referenced_namespace.oid = referenced_table.relnamespace
     WHERE installed_namespace.nspname = 'public'
+      AND installed_constraint.contype <> 'n'
       AND installed_table.relname IN (
         'operations_shopify_order_webhook_commands',
         'operations_shopify_order_webhook_attempts',

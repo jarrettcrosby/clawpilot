@@ -17,6 +17,16 @@ import {
 } from './test-commerce-order-revisions-postgres.mjs'
 
 const root = process.cwd()
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  [
+    'pgvector/pgvector:pg16',
+    'pgvector/pgvector:pg18',
+  ].includes(disposablePostgresImage),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 const futureCommerceRolloutContractMigration = readFileSync(
   resolve(
     root,
@@ -805,6 +815,47 @@ async function verify(databaseUrl, fixtures) {
     },
   )
   try {
+    const notNullConstraintCatalog = await pool.query(
+      `SELECT current_setting('server_version_num')::integer
+                AS server_version_num,
+              (
+                SELECT count(*)::integer
+                FROM pg_catalog.pg_constraint installed_constraint
+                JOIN pg_catalog.pg_class installed_table
+                  ON installed_table.oid = installed_constraint.conrelid
+                JOIN pg_catalog.pg_namespace installed_namespace
+                  ON installed_namespace.oid = installed_table.relnamespace
+                WHERE installed_namespace.nspname = 'public'
+                  AND installed_constraint.contype = 'n'
+                  AND installed_constraint.conrelid IN (
+                    pg_catalog.to_regclass(
+                      'public.operations_commerce_store_sync_controls'
+                    ),
+                    pg_catalog.to_regclass(
+                      'public.operations_commerce_store_sync_change_receipts'
+                    ),
+                    pg_catalog.to_regclass(
+                      'public.operations_commerce_store_sync_read_leases'
+                    )
+                  )
+              ) AS not_null_constraint_count`,
+    )
+    const serverVersionNum = Number(
+      notNullConstraintCatalog.rows[0]?.server_version_num,
+    )
+    const notNullConstraintCount = Number(
+      notNullConstraintCatalog.rows[0]?.not_null_constraint_count,
+    )
+    assert.equal(
+      notNullConstraintCount > 0,
+      serverVersionNum >= 180_000,
+      'Only PostgreSQL 18+ should expose NOT NULL rows in this constraint catalog',
+    )
+    assert.equal(
+      await storeSyncStructureHealth(pool),
+      true,
+      'Store sync health must exclude PostgreSQL 18 NOT NULL catalog rows',
+    )
     const controls = await pool.query(
       `SELECT account.global_id, activation.state, control.desired_state,
               control.explicit_choice, control.revision
@@ -2186,6 +2237,24 @@ async function main() {
     'Release 1 health must recognize only the frozen 0305 contract migration',
   )
   assert.equal(
+    (
+      storeSyncHealthSource.match(
+        /installed_constraint\.contype OPERATOR\(pg_catalog\.<>\) 'n'/gu,
+      ) || []
+    ).length,
+    1,
+    'Store sync health must exclude PostgreSQL 18 NOT NULL constraint rows exactly once',
+  )
+  assert.equal(
+    (
+      futureCommerceRolloutContractMigration.match(
+        /installed_constraint\.contype <> 'n'/gu,
+      ) || []
+    ).length,
+    2,
+    'The frozen 0305 precondition and postcondition must both exclude PostgreSQL 18 NOT NULL rows',
+  )
+  assert.equal(
     migrationSource.match(
       /ADD COLUMN IF NOT EXISTS provider_read_authority text\s+NOT NULL DEFAULT 'automatic'/gu,
     )?.length,
@@ -2219,7 +2288,7 @@ async function main() {
       '-e', 'POSTGRES_PASSWORD=clawpilot_store_sync',
       '-e', 'POSTGRES_DB=clawpilot_store_sync',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
