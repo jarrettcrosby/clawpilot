@@ -8,6 +8,16 @@ import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  [
+    'pgvector/pgvector:pg16',
+    'pgvector/pgvector:pg18',
+  ].includes(disposablePostgresImage),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 const futureCommerceRolloutContractMigration = readFileSync(
   resolve(
     root,
@@ -19,7 +29,7 @@ assert.equal(
   createHash('sha256')
     .update(futureCommerceRolloutContractMigration)
     .digest('hex'),
-  '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53',
+  'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b',
   'The exact combined 0305 contract bytes must match Release 1 health',
 )
 assert.equal(
@@ -49,6 +59,11 @@ const rateControlSqlMatch = healthSource.match(
 )
 assert.ok(rateControlSqlMatch, 'Health route must contain exact 0299 attestation SQL')
 const rateControlAttestationSql = rateControlSqlMatch[1]
+assert.match(
+  rateControlAttestationSql,
+  /WHERE extra_table_namespace\.nspname = 'public'\s+--[^\n]*\n\s+--[^\n]*\n\s+--[^\n]*\n\s+AND extra\.contype OPERATOR\(pg_catalog\.<>\) 'n'\s+AND \(/u,
+  '0299 health must exclude PostgreSQL 18 NOT NULL constraint rows',
+)
 const writerContractSqlMatch = healthSource.match(
   /const SHOPIFY_CHECKOUT_RATE_SOURCE_WRITER_CONTRACT_SQL = String\.raw`([\s\S]*?)`\n/u,
 )
@@ -116,7 +131,7 @@ for (const fragment of [
   'derive_operations_shopify_checkout_rate_source_compat_write',
   '35818f8af90aa04cc95a7fecbf10f3af0fcb31f708e14c374db7e4521b01c698',
   '055e248fcf32fa04416ba9048da9d9b261669706c17dbc926206952d214fb13c',
-  '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53',
+  'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b',
   '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64',
   'b28b6980199f9e2fd9af0e43f84b825570fcdda1bed1b35ba1a0891bb5f65ae0',
   'df473e7836235c04c828539deb912ecb65c57709b489d07458d09f0b7bbcf490',
@@ -313,6 +328,29 @@ async function rejectCommerceContractPredecessor(
 }
 
 async function exercise(pool) {
+  const notNullConstraintCatalog = await pool.query(
+    `SELECT current_setting('server_version_num')::integer
+              AS server_version_num,
+            (
+              SELECT count(*)::integer
+              FROM pg_catalog.pg_constraint installed_constraint
+              WHERE installed_constraint.conrelid = pg_catalog.to_regclass(
+                      'public.operations_shopify_checkout_rate_control_receipts'
+                    )
+                AND installed_constraint.contype = 'n'
+            ) AS not_null_constraint_count`,
+  )
+  const serverVersionNum = Number(
+    notNullConstraintCatalog.rows[0]?.server_version_num,
+  )
+  const notNullConstraintCount = Number(
+    notNullConstraintCatalog.rows[0]?.not_null_constraint_count,
+  )
+  assert.equal(
+    notNullConstraintCount > 0,
+    serverVersionNum >= 180_000,
+    'Only PostgreSQL 18+ should expose checkout NOT NULL constraint rows',
+  )
   assert.equal(
     await attest(pool),
     true,
@@ -1038,7 +1076,7 @@ async function exercise(pool) {
       `INSERT INTO public.schema_migrations (filename, checksum)
        VALUES (
          '0305_operations_commerce_rollout_contract.sql',
-         '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+         'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
        )`,
     )
     const contractedDefaults = await contractClient.query(
@@ -1376,7 +1414,7 @@ async function main() {
       '-e', 'POSTGRES_PASSWORD=checkout_audience_health',
       '-e', 'POSTGRES_DB=checkout_audience_health',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { timeout: 180_000 })
     containerStarted = true
     const portOutput = command('docker', ['port', container, '5432/tcp'])

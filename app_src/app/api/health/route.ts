@@ -429,7 +429,7 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
           WHERE filename =
             '0305_operations_commerce_rollout_contract.sql'
             AND checksum =
-              '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+              'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
         )
         THEN 'b28b6980199f9e2fd9af0e43f84b825570fcdda1bed1b35ba1a0891bb5f65ae0'
         ELSE '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64'
@@ -499,7 +499,7 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
         FROM public.schema_migrations
         WHERE filename = '0305_operations_commerce_rollout_contract.sql'
           AND checksum =
-            '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+            'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
       )
     )
     OR (
@@ -773,6 +773,10 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
     JOIN pg_catalog.pg_namespace extra_table_namespace
       ON extra_table_namespace.oid = extra_table.relnamespace
     WHERE extra_table_namespace.nspname = 'public'
+      -- PostgreSQL 18 represents NOT NULL column metadata as contype = 'n'
+      -- constraints. The exact column hash below already pins attnotnull, so
+      -- these catalog-generated rows are not unexpected 0299 constraints.
+      AND extra.contype OPERATOR(pg_catalog.<>) 'n'
       AND (
         extra.conrelid = pg_catalog.to_regclass(
           'public.operations_shopify_checkout_rate_control_receipts'
@@ -1043,7 +1047,7 @@ const SHOPIFY_CHECKOUT_RATE_SOURCE_WRITER_CONTRACT_SQL = String.raw`
       FROM public.schema_migrations
       WHERE filename = '0305_operations_commerce_rollout_contract.sql'
         AND checksum =
-          '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+          'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
     )
       AND pg_catalog.to_regprocedure(
         'public.derive_operations_shopify_checkout_rate_source_compat()'

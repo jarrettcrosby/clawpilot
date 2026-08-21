@@ -145,6 +145,7 @@ BEGIN
   JOIN pg_catalog.pg_namespace installed_namespace
     ON installed_namespace.oid = installed_table.relnamespace
   WHERE installed_namespace.nspname = 'public'
+    AND installed_constraint.contype <> 'n'
     AND (
       installed_constraint.conrelid IN (
         to_regclass('public.operations_commerce_store_sync_controls'),
@@ -704,6 +705,7 @@ BEGIN
   JOIN pg_catalog.pg_namespace installed_namespace
     ON installed_namespace.oid = installed_table.relnamespace
   WHERE installed_namespace.nspname = 'public'
+    AND installed_constraint.contype <> 'n'
     AND (
       installed_constraint.conrelid IN (
         to_regclass('public.operations_commerce_store_sync_controls'),

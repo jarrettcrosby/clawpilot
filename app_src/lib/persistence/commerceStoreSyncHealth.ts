@@ -358,6 +358,11 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
         END AS definition
       ) canonical_constraint
       WHERE installed_namespace.nspname OPERATOR(pg_catalog.=) 'public'
+        -- PostgreSQL 18 exposes NOT NULL column metadata as contype = 'n'
+        -- rows in pg_constraint. Nullability is pinned independently by the
+        -- exact column catalog below, so keep this cross-version constraint
+        -- hash scoped to the table constraints it was designed to attest.
+        AND installed_constraint.contype OPERATOR(pg_catalog.<>) 'n'
         AND (
           installed_constraint.conrelid OPERATOR(pg_catalog.=) ANY (
             ARRAY[
@@ -859,7 +864,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL = String.raw`
           WHERE filename OPERATOR(pg_catalog.=)
               '0305_operations_commerce_rollout_contract.sql'
             AND checksum OPERATOR(pg_catalog.=)
-              '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+              'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
         )
       )
     )
@@ -1057,7 +1062,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_AUTHORITY_CONTRACT_SQL = String.raw`
         WHERE filename OPERATOR(pg_catalog.=)
           '0305_operations_commerce_rollout_contract.sql'
           AND checksum OPERATOR(pg_catalog.=)
-            '0dfc652fd07c7a3403f6489ece596e4cd4b2cb084b4c48dc18f924d6ccaa9e53'
+            'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
       )
         AND store_sync_health.function_healthy
         AND store_sync_health.rewritten_function_healthy
