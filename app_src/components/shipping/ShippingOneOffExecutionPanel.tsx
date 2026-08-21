@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import {
   Alert,
@@ -72,6 +72,29 @@ type VoidBody = {
   orderGlobalId: string
   expectedRowVersion: number
   reason: string
+}
+
+export function reconcilePackEvidenceAcknowledgment(
+  acknowledgedEvidenceHash: string | null,
+  previousEvidenceHash: string | null,
+  nextEvidenceHash: string | null,
+) {
+  if (
+    !acknowledgedEvidenceHash
+    || acknowledgedEvidenceHash !== previousEvidenceHash
+    || acknowledgedEvidenceHash !== nextEvidenceHash
+  ) return null
+  return acknowledgedEvidenceHash
+}
+
+export function packEvidenceIsAcknowledged(
+  acknowledgedEvidenceHash: string | null,
+  currentEvidenceHash: string | null,
+) {
+  return Boolean(
+    currentEvidenceHash
+    && acknowledgedEvidenceHash === currentEvidenceHash,
+  )
 }
 
 function retainedCommandName(action: CommandAction, orderGlobalId: string) {
@@ -262,7 +285,8 @@ export default function ShippingOneOffExecutionPanel({
   const [packReason, setPackReason] = useState(
     'Physically reviewed every item and confirmed the exact package contents',
   )
-  const [packConfirmed, setPackConfirmed] = useState(false)
+  const [packConfirmedEvidenceHash, setPackConfirmedEvidenceHash] =
+    useState<string | null>(null)
   const [voidReason, setVoidReason] = useState(
     'Cancel the exact complete one-off carrier shipment before shipment confirmation',
   )
@@ -272,6 +296,7 @@ export default function ShippingOneOffExecutionPanel({
   const [purchaseCommand, setPurchaseCommand] = useState<RetainedCommand | null>(null)
   const [voidCommand, setVoidCommand] = useState<RetainedCommand | null>(null)
   const [clock, setClock] = useState(() => Date.now())
+  const packEvidenceHashRef = useRef<string | null>(null)
 
   const clearPackCommand = useCallback(() => {
     setPackCommand(null)
@@ -308,6 +333,15 @@ export default function ShippingOneOffExecutionPanel({
       ) {
         throw new Error(payloadMessage(payload, 'One-off postage status is unavailable'))
       }
+      const nextEvidenceHash = payload.state.packReview.evidenceHash || null
+      setPackConfirmedEvidenceHash((acknowledgedEvidenceHash) => (
+        reconcilePackEvidenceAcknowledgment(
+          acknowledgedEvidenceHash,
+          packEvidenceHashRef.current,
+          nextEvidenceHash,
+        )
+      ))
+      packEvidenceHashRef.current = nextEvidenceHash
       setState(payload.state)
       setClock(Date.now())
       return payload.state
@@ -326,7 +360,8 @@ export default function ShippingOneOffExecutionPanel({
     setError('')
     setNotice('')
     setSelectedOfferGlobalId('')
-    setPackConfirmed(false)
+    setPackConfirmedEvidenceHash(null)
+    packEvidenceHashRef.current = null
     setLiveConfirmed(false)
     setPackCommand(readRetainedCommand('pack', orderGlobalId))
     setRefreshCommand(readRetainedCommand('packed-rate', orderGlobalId))
@@ -403,6 +438,11 @@ export default function ShippingOneOffExecutionPanel({
     && state.packedRate.status !== 'failed'
     && expiresAt > clock,
   )
+  const packEvidenceHash = state?.packReview.evidenceHash || null
+  const packConfirmed = packEvidenceIsAcknowledged(
+    packConfirmedEvidenceHash,
+    packEvidenceHash,
+  )
 
   const confirmPack = async () => {
     if (
@@ -458,7 +498,7 @@ export default function ShippingOneOffExecutionPanel({
           }
           if (packIsDurable(durable, command)) {
             clearPackCommand()
-            setPackConfirmed(false)
+            setPackConfirmedEvidenceHash(null)
             setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
             await onUpdated()
             return
@@ -482,7 +522,7 @@ export default function ShippingOneOffExecutionPanel({
         throw new Error('The pack response is not yet bound to the exact durable review receipt')
       }
       clearPackCommand()
-      setPackConfirmed(false)
+      setPackConfirmedEvidenceHash(null)
       setNotice(
         `${result.packageCount} ${result.packageCount === 1 ? 'parcel is' : 'parcels are'} `
         + 'packed with reservations retained and zero carrier or label writes.',
@@ -492,7 +532,7 @@ export default function ShippingOneOffExecutionPanel({
       const durable = await loadState()
       if (packIsDurable(durable, command)) {
         clearPackCommand()
-        setPackConfirmed(false)
+        setPackConfirmedEvidenceHash(null)
         setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
         await onUpdated()
       } else {
@@ -905,7 +945,9 @@ export default function ShippingOneOffExecutionPanel({
               <Checkbox
                 checked={packConfirmed}
                 disabled={Boolean(packCommand) || Boolean(state.packReview.blocker)}
-                onChange={(event) => setPackConfirmed(event.target.checked)}
+                onChange={(event) => setPackConfirmedEvidenceHash(
+                  event.target.checked ? packEvidenceHash : null,
+                )}
               />
             )}
             label="I physically verified every exact item is in its assigned parcel."

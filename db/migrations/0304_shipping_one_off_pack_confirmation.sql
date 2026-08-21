@@ -389,8 +389,10 @@ BEFORE UPDATE OR DELETE ON operations_shipping_one_off_pack_receipts
 FOR EACH ROW
 EXECUTE FUNCTION protect_operations_shipping_one_off_pack_receipt();
 
--- Rows reviewed by a pack receipt cannot be changed or appended after a
--- concurrent writer waits on the pack transaction's parent/row locks.
+-- Rows reviewed by a pack receipt cannot be changed or appended. A row trigger
+-- may already own its target tuple, so it never waits while acquiring the pack
+-- advisory lock: pack-first writes receive a stable lock-conflict signal instead
+-- of forming a tuple/advisory deadlock, while writer-first work owns the fence.
 -- Reservation identity, quantity, and authority evidence remain sealed while
 -- an active reservation may still become consumed or released during the
 -- intended shipment/cancel lifecycle.
@@ -426,12 +428,16 @@ BEGIN
         AND scope.order_id IS NOT NULL
       ORDER BY organization_sort, source_order.global_id, scope.order_id
     LOOP
-      PERFORM pg_advisory_xact_lock(hashtextextended(
+      IF NOT pg_try_advisory_xact_lock(hashtextextended(
         'shipping:one-off-pack:'
           || linked_scope.organization_id::text || ':'
           || linked_scope.global_id,
         0
-      ));
+      )) THEN
+        RAISE EXCEPTION
+          'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+          USING ERRCODE = '55P03';
+      END IF;
       PERFORM 1
       FROM operations_orders source_order
       WHERE source_order.organization_id = linked_scope.organization_id
@@ -502,14 +508,17 @@ BEGIN
     RETURN COALESCE(NEW, OLD);
   END IF;
 
-  -- Use the same lock order as the pack command. A writer that starts first is
-  -- visible to pack review; a writer that starts second resumes after commit,
-  -- refreshes its READ COMMITTED snapshot below, and sees the new receipt.
-  PERFORM pg_advisory_xact_lock(hashtextextended(
+  -- A BEFORE ROW trigger already owns its target tuple. Never wait here while
+  -- pack holds the advisory lock, because pack may be waiting on that tuple.
+  IF NOT pg_try_advisory_xact_lock(hashtextextended(
     'shipping:one-off-pack:' || linked_organization_id::text || ':'
       || linked_order_global_id,
     0
-  ));
+  )) THEN
+    RAISE EXCEPTION
+      'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+      USING ERRCODE = '55P03';
+  END IF;
   PERFORM 1
   FROM operations_orders source_order
   WHERE source_order.organization_id = linked_organization_id

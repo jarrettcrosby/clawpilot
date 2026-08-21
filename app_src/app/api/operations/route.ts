@@ -991,6 +991,20 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && 'status' in error
+    && error.code === 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+    && error.status === 409
+  ) {
+    return json({
+      ok: false,
+      error: 'Pack confirmation is using this exact evidence; retry after refreshing status',
+      code: error.code,
+    }, error.status)
+  }
   if (error instanceof CommerceStoreSyncPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }

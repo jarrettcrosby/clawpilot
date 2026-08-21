@@ -1321,6 +1321,7 @@ async function verifyRouteBehavior() {
     activeTransitions: [],
     productionRerates: [],
   }
+  let proofWriteError = null
   let productionRerateError = null
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
@@ -1495,6 +1496,7 @@ async function verifyRouteBehavior() {
           return { organizationId: input.organizationId, orders: [], capabilities: input.capabilities }
         },
         runMockOperationsProofFromPostgres: async (input) => {
+          if (proofWriteError) throw proofWriteError
           calls.proofs.push(input)
           return {
             orderGlobalId: 'gor1234567',
@@ -1687,6 +1689,35 @@ async function verifyRouteBehavior() {
     quantity: 2,
     openingQuantity: 12,
   }])
+
+  proofWriteError = Object.assign(
+    new Error('OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'),
+    {
+      code: 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+      status: 409,
+    },
+  )
+  const packEvidenceConflict = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'run-proof-order',
+        proof: {
+          ...proof,
+          externalOrderId: 'route-proof-pack-evidence-conflict',
+          orderNumber: 'ROUTE-PACK-CONFLICT',
+        },
+      }),
+    },
+  ))
+  assert.equal(packEvidenceConflict.status, 409)
+  assert.equal(
+    (await payload(packEvidenceConflict)).code,
+    'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+  )
+  assert.equal(calls.proofs.length, 1, 'Conflicted writer must have zero transition')
+  proofWriteError = null
 
   const { productGlobalId: _productGlobalId, quantity: _quantity, openingQuantity: _openingQuantity, ...proofBase } = proof
   const multiLineWrite = await route.POST(request('http://localhost/api/operations', {

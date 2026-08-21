@@ -99,6 +99,7 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
       AND installed_function.proname IN (
         'operations_transport_canonical_json',
         'operations_transport_json_sha256',
+        'operations_one_off_plan_execution_is_exact',
         'operations_shipping_one_off_pack_review_snapshot',
         'protect_operations_shipping_one_off_pack_evidence',
         'protect_operations_shipping_one_off_pack_receipt',
@@ -129,7 +130,7 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
 `
 
 export const SHIPPING_ONE_OFF_PACK_MIGRATION_CHECKSUM =
-  '9df61a664422e0d80b5cdd87ebdc6fe75128cf028e0810d9c43ac10ad137ff09'
+  '8a844c03da549100d1da669d0ba12c2cbab24f31337f37fcd0d0071ecf80b84b'
 
 export const SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL = String.raw`
   WITH ${SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL}
@@ -149,12 +150,12 @@ export const SHIPPING_ONE_OFF_PACK_HEALTH_SQL = String.raw`
   )
   AND (
     WITH ${SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL}
-    SELECT count(*) = 74
+    SELECT count(*) = 75
       AND encode(digest(convert_to(string_agg(
         kind || '|' || identity || '|' || definition,
         chr(10) ORDER BY kind, identity
       ), 'UTF8'), 'sha256'), 'hex') =
-        '5d71b800d0d90facb36d7e18cb398818aac1255e3f4d71ab139eac0fe2dec73e'
+        'b463547928148723e9f5b35d92b310992c57e8dfc6a646a5bb3221898ba2c992'
     FROM artifact
   )
 `

@@ -853,7 +853,7 @@ export async function packShippingOneOffShipmentInPostgres(input: {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
-      `shipping:one-off-pack:${organizationId}:${orderGlobalId}`,
+      `shipping:one-off-pack:idempotency:${organizationId}:${idempotencyKey}`,
     )
     const replay = await readPackReceipt(
       organizationId,
@@ -874,6 +874,10 @@ export async function packShippingOneOffShipmentInPostgres(input: {
       }
       return resultFromReceipt(replay, true)
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shipping:one-off-pack:${organizationId}:${orderGlobalId}`,
+    )
 
     const evidence = await readPackEvidence(
       organizationId,

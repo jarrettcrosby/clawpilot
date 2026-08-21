@@ -61,22 +61,31 @@ const healthRoute = read('app_src/app/api/health/route.ts')
 const healthContract = read(
   'app_src/lib/persistence/shippingOneOffPackHealth.ts',
 )
+const postgresSource = read('app_src/lib/persistence/postgres.ts')
+const operationsRouteSource = read('app_src/app/api/operations/route.ts')
 const recovery = loadTypeScript(
   'app_src/lib/operations/shippingOneOffRecovery.ts',
 )
+const postgresModule = loadTypeScript(
+  'app_src/lib/persistence/postgres.ts',
+  { pg: { Pool: class {} } },
+)
 
-loadTypeScript('app_src/components/shipping/ShippingOneOffExecutionPanel.tsx', {
-  react: requireFromApp('react'),
-  '@mui/material': requireFromApp('@mui/material'),
-  '@mui/icons-material/RefreshRounded': requireFromApp('@mui/icons-material/RefreshRounded'),
-  '@/lib/operations/oneOffShipmentConstants': {
-    ONE_OFF_LIVE_POSTAGE_CONFIRMATION: 'AUTHORIZE THIS LIVE POSTAGE PURCHASE',
-    ONE_OFF_PACK_CONFIRMATION:
-      'I CONFIRM THESE EXACT ITEMS ARE PHYSICALLY IN THESE PACKAGES',
+const panelModule = loadTypeScript(
+  'app_src/components/shipping/ShippingOneOffExecutionPanel.tsx',
+  {
+    react: requireFromApp('react'),
+    '@mui/material': requireFromApp('@mui/material'),
+    '@mui/icons-material/RefreshRounded': requireFromApp('@mui/icons-material/RefreshRounded'),
+    '@/lib/operations/oneOffShipmentConstants': {
+      ONE_OFF_LIVE_POSTAGE_CONFIRMATION: 'AUTHORIZE THIS LIVE POSTAGE PURCHASE',
+      ONE_OFF_PACK_CONFIRMATION:
+        'I CONFIRM THESE EXACT ITEMS ARE PHYSICALLY IN THESE PACKAGES',
+    },
+    '@/lib/operations/shippingOneOffRecovery': recovery,
+    'react/jsx-runtime': requireFromApp('react/jsx-runtime'),
   },
-  '@/lib/operations/shippingOneOffRecovery': recovery,
-  'react/jsx-runtime': requireFromApp('react/jsx-runtime'),
-})
+)
 
 for (const fragment of [
   "action === 'confirm-pack'",
@@ -156,6 +165,36 @@ assert.match(healthContract, /pg_get_triggerdef/)
 assert.match(healthRoute, /SHIPPING_ONE_OFF_PACK_HEALTH_SQL/)
 assert.match(healthRoute, /shipping_one_off_pack_applied/)
 assert.match(healthRoute, /shippingOneOffPack/)
+assert.match(
+  healthContract,
+  /operations_one_off_plan_execution_is_exact/,
+  'Health must fingerprint the exact TEST/LIVE plan authority function',
+)
+assert.match(
+  operationsRouteSource,
+  /OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY/,
+  'Operations writers must expose the pack evidence conflict as a route conflict',
+)
+assert.equal(
+  postgresSource.match(/throw normalizePostgresPersistenceError\(error\)/gu)?.length,
+  2,
+  'Direct query and transactional app writers must normalize the DB lock conflict',
+)
+const rawEvidenceBusy = Object.assign(new Error(
+  postgresModule.SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY_CODE,
+), { code: '55P03' })
+const normalizedEvidenceBusy = postgresModule.normalizePostgresPersistenceError(
+  rawEvidenceBusy,
+)
+assert.equal(normalizedEvidenceBusy.code, 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY')
+assert.equal(normalizedEvidenceBusy.status, 409)
+assert.notEqual(normalizedEvidenceBusy, rawEvidenceBusy)
+assert.equal(
+  postgresModule.normalizePostgresPersistenceError(
+    Object.assign(new Error('unrelated lock'), { code: '55P03' }),
+  ).message,
+  'unrelated lock',
+)
 
 for (const fragment of [
   'standaloneOneOffPackEligible',
@@ -176,6 +215,8 @@ for (const fragment of [
   'zero carrier, postage, label, shipment, or inventory writes',
   "retainCommand('pack'",
   'packIsDurable',
+  'packConfirmedEvidenceHash',
+  'reconcilePackEvidenceAcknowledgment',
 ]) {
   assert.ok(panel.includes(fragment), `Pack review UI is missing ${fragment}`)
 }
@@ -204,6 +245,48 @@ const retainedPack = {
     expectedReviewSnapshotHash: 'a'.repeat(64),
   }),
 }
+const evidenceHashA = 'a'.repeat(64)
+const evidenceHashB = 'b'.repeat(64)
+assert.equal(
+  panelModule.reconcilePackEvidenceAcknowledgment(
+    evidenceHashA,
+    evidenceHashA,
+    evidenceHashA,
+  ),
+  evidenceHashA,
+  'A same-evidence manual status refresh may retain its exact acknowledgment',
+)
+assert.equal(
+  panelModule.reconcilePackEvidenceAcknowledgment(
+    evidenceHashA,
+    evidenceHashA,
+    evidenceHashB,
+  ),
+  null,
+  'Manual Check status must clear acknowledgment when evidence drifts',
+)
+assert.equal(
+  panelModule.reconcilePackEvidenceAcknowledgment(
+    evidenceHashA,
+    evidenceHashA,
+    evidenceHashB,
+  ),
+  null,
+  'Stale 409 reconciliation GET must require acknowledgment of new evidence',
+)
+assert.equal(
+  panelModule.packEvidenceIsAcknowledged(evidenceHashA, evidenceHashB),
+  false,
+)
+assert.equal(
+  panelModule.reconcilePackEvidenceAcknowledgment(
+    evidenceHashA,
+    null,
+    evidenceHashA,
+  ),
+  null,
+  'An acknowledgment cannot cross an order/loading boundary even if hashes match',
+)
 assert.equal(
   recovery.writeShippingOneOffRetainedCommand(
     storage,
@@ -221,10 +304,35 @@ assert.deepEqual(
   ))),
   retainedPack,
 )
+const retainedPackBeforeDrift = JSON.stringify(retainedPack)
+assert.equal(
+  panelModule.reconcilePackEvidenceAcknowledgment(
+    evidenceHashA,
+    evidenceHashA,
+    evidenceHashB,
+  ),
+  null,
+)
+assert.equal(
+  JSON.stringify(recovery.readShippingOneOffRetainedCommand(
+    storage,
+    'pack',
+    'gor0000001',
+    'pack-storage',
+  )),
+  retainedPackBeforeDrift,
+  'Evidence drift must not rewrite a byte-identical retained pending command',
+)
+assert.match(
+  panel,
+  /const command = packCommand \|\| newCommand/,
+  'Pending retries must keep the exact retained command despite new acknowledgment state',
+)
 
 let canCreate = true
 let packCalls = 0
 let packInput = null
+let packFailure = null
 const route = loadTypeScript(
   'app_src/app/api/operations/one-off-shipments/route.ts',
   {
@@ -258,6 +366,7 @@ const route = loadTypeScript(
     '@/lib/persistence/shippingOneOffPack': {
       packShippingOneOffShipmentInPostgres: async (input) => {
         packCalls += 1
+        if (packFailure) throw packFailure
         packInput = input
         return {
           orderGlobalId: input.orderGlobalId,
@@ -318,5 +427,24 @@ const forbidden = await route.POST(request)
 assert.equal(forbidden.status, 403)
 assert.equal(forbidden.payload.code, 'SHIPPING_CREATE_REQUIRED')
 assert.equal(packCalls, 1, 'Denied Shipping actor must cause zero pack work')
+canCreate = true
+packFailure = new TestPersistenceError(
+  'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+  'This key belongs to different pack evidence',
+  409,
+)
+const idempotencyConflict = await route.POST(request)
+assert.equal(idempotencyConflict.status, 409)
+assert.equal(
+  idempotencyConflict.payload.code,
+  'OPERATIONS_IDEMPOTENCY_KEY_REUSED',
+)
+packFailure = normalizedEvidenceBusy
+const evidenceConflict = await route.POST(request)
+assert.equal(evidenceConflict.status, 409)
+assert.equal(
+  evidenceConflict.payload.code,
+  'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+)
 
 console.log('Shipping-only one-off pack API and UI contracts passed.')

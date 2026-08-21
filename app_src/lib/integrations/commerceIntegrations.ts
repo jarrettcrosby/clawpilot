@@ -182,6 +182,20 @@ export class CommerceIntegrationRequestError extends Error {
 
 function sanitize(error: unknown): CommerceIntegrationRequestError {
   if (error instanceof CommerceIntegrationRequestError) return error
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && 'status' in error
+    && error.code === 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+    && error.status === 409
+  ) {
+    return new CommerceIntegrationRequestError(
+      'Pack confirmation is using this exact evidence; retry after refreshing status',
+      error.status,
+      error.code,
+    )
+  }
   if (error instanceof ShopifyFulfillmentNotificationPolicyError) {
     return new CommerceIntegrationRequestError(
       error.message,
