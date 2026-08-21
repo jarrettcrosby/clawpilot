@@ -35,7 +35,9 @@ import {
 } from './lib/renderer-security.mjs'
 import {
   assertLegacyMacMigrationComplete,
-  legacyMacPrintAgentInstances,
+  legacyMacMigrationIsBlocked,
+  legacyMacMigrationMessage,
+  legacyMacPrintAgentDetection,
 } from './lib/legacy-macos-agent.mjs'
 import {
   assertStableGatewayInstall,
@@ -57,7 +59,11 @@ let store
 let workers
 let pendingPairingContext = null
 let quitting = false
-let legacyMacInstances = []
+let legacyMacDetection = {
+  clawPilotInstances: [],
+  tauriLaunchAgentPresent: false,
+  tauriProcessRunning: false,
+}
 let installLocationStatus = { ready: true, status: 'initializing', warning: null }
 let shutdownInProgress = false
 let shutdownComplete = false
@@ -80,7 +86,7 @@ function runtimePath(relativePath) {
 }
 
 function publicSnapshot() {
-  legacyMacInstances = legacyMacPrintAgentInstances()
+  legacyMacDetection = legacyMacPrintAgentDetection()
   const publicState = store.publicState()
   return {
     ...publicState,
@@ -91,15 +97,21 @@ function publicSnapshot() {
     appVersion: app.getVersion(),
     pairingContext: pendingPairingContext,
     localDevelopmentAllowed: localDevelopmentIsAllowed(),
-    legacyMacInstances,
+    legacyMacInstances: legacyMacDetection.clawPilotInstances,
+    legacyMacTauriAgent: {
+      launchAgentPresent: legacyMacDetection.tauriLaunchAgentPresent,
+      processRunning: legacyMacDetection.tauriProcessRunning,
+    },
+    legacyMacMigrationBlocked: legacyMacMigrationIsBlocked(legacyMacDetection),
+    legacyMacMigrationMessage: legacyMacMigrationMessage(legacyMacDetection),
     installLocationStatus,
   }
 }
 
 function assertGatewayOperationReady() {
   assertStableGatewayInstall(installLocationStatus)
-  legacyMacInstances = legacyMacPrintAgentInstances()
-  assertLegacyMacMigrationComplete(legacyMacInstances)
+  legacyMacDetection = legacyMacPrintAgentDetection()
+  assertLegacyMacMigrationComplete(legacyMacDetection)
 }
 
 function showWindow() {
@@ -284,6 +296,7 @@ function installIpcHandlers() {
       const instance = await pairGatewayInstance({
         input,
         store,
+        operationGuard: assertGatewayOperationReady,
         probe: probeRawPrinter,
         pairingCodeHash: pairingModule.printAgentPairingCodeHash,
         createRecovery: pairingModule.createPrintAgentPairingRecovery,
@@ -491,7 +504,7 @@ app.whenReady().then(() => runProtectedGatewayStartup({
         || app.isInApplicationsFolder(),
       executablePath: process.execPath,
     })
-    legacyMacInstances = legacyMacPrintAgentInstances()
+    legacyMacDetection = legacyMacPrintAgentDetection()
     workers = new WorkerManager({
       store,
       dataDirectory,
@@ -501,7 +514,8 @@ app.whenReady().then(() => runProtectedGatewayStartup({
     })
     workers.on('status', (payload) => mainWindow?.webContents.send('gateway:status', payload))
     installIpcHandlers()
-    const operationReady = installLocationStatus.ready && legacyMacInstances.length === 0
+    const operationReady = installLocationStatus.ready
+      && !legacyMacMigrationIsBlocked(legacyMacDetection)
     if (operationReady) applyLoginItem(store.publicState().autoStart)
     createWindow(process.argv.includes('--hidden') && operationReady)
     createTray()

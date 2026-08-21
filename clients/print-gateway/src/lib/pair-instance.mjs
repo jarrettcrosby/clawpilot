@@ -3,12 +3,14 @@ import { normalizedPairingInput } from './validation.mjs'
 export async function pairGatewayInstance({
   input,
   store,
+  operationGuard = () => undefined,
   probe,
   redeem,
   createRecovery,
   pairingCodeHash,
   allowLocalDevelopment = false,
 }) {
+  await operationGuard()
   const pairing = normalizedPairingInput(input, { allowLocalDevelopment })
   store.preflightPairingPersistence()
   const codeHash = pairingCodeHash(pairing.pairingCode)

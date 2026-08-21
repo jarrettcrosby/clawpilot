@@ -39,23 +39,40 @@ A `clawpilot-print-gateway://pair` link may carry display-only `organization`,
 code, runtime credential, or authoritative ClawPilot URL. The operator confirms
 the URL in the native app.
 
-Every workspace uses a unique local instance and an independent credential,
-ledger, and device key. Instances may target the same Zebra. macOS serializes
-the endpoint with `lockf` at the exact legacy shared root
+Every organization/workspace uses a unique local instance and an independent,
+organization-scoped credential, claim ledger, and device key. Multiple
+instances may intentionally target the same physical Zebra; there is no local
+printer-endpoint uniqueness requirement. The workers poll and acknowledge only
+through their own credentials, while raw delivery is serialized at the shared
+physical endpoint. Removing one local instance never removes another
+instance's protected state. macOS serializes the endpoint with `lockf` at the
+exact legacy shared root
 `~/Library/Application Support/ClawPilot/print-agent/device-locks`; Windows uses
 a stable per-user ClawPilot root plus an operating-system named mutex
 whose abandoned-lock behavior is released by the kernel if a delivery process
 dies.
 
-On macOS the app detects legacy `com.clawpilot.print-agent.*` LaunchAgents and
-hard-blocks pairing and worker start because those historical installed runtimes
-do not carry this app's duplicate-print fences. It does not stop or delete them.
-Migrate one at a time: drain and verify no pending/in-flight work; use the old
-manager's `3. Stop and uninstall an instance` action (which retains its Keychain
-credential, device key, and ledger for rollback); pair the same private Zebra IP
-and port in this app; run the no-print probe; send exactly one controlled UPS
-sandbox label; verify its acknowledgement; only then revoke the old server
-enrollment. Roll back before permitting a new native claim if that proof fails.
+On macOS the app hard-blocks pairing, worker start, and enabling start-at-login
+while either legacy family is present:
+
+- For a `com.clawpilot.print-agent.*` LaunchAgent, drain and verify no
+  pending/in-flight work, then use the old command manager's
+  `3. Stop and uninstall an instance` action. It retains that instance's
+  Keychain credential, device key, and ledger for rollback.
+- For the older Tauri `/Applications/Print Agent.app`, the exact
+  `~/Library/LaunchAgents/com.printagent.app.plist` or the exact running
+  `/Applications/Print Agent.app/Contents/MacOS/print-agent` process is enough
+  to block. In that old tray app, turn off auto-start and then Quit. Preserve
+  both the app and `~/Library/Application Support/print-agent` configuration for
+  rollback; do not manually delete its LaunchAgent or configuration.
+
+The Electron app only reads this legacy state; it does not stop, delete,
+uninstall, or revoke either older runtime. Once the old auto-start entries are
+disabled and processes have quit, reopen this app, pair the same private Zebra
+IP and port, run the no-print probe, send exactly one controlled UPS sandbox
+label, and verify its acknowledgement. Only then revoke the old server
+enrollment. Roll back before permitting a new Electron claim if that proof
+fails.
 
 ## Local validation
 

@@ -43,7 +43,7 @@ function setBusy(busy) {
 
 function operationBlocked() {
   return snapshot?.installLocationStatus?.ready === false
-    || Boolean(snapshot?.legacyMacInstances?.length)
+    || snapshot?.legacyMacMigrationBlocked === true
 }
 
 function formatDate(value) {
@@ -174,8 +174,8 @@ function render(nextSnapshot) {
   } else {
     elements.installLocationWarning.classList.add('hidden')
   }
-  if (snapshot.legacyMacInstances?.length) {
-    elements.legacyWarning.textContent = `Legacy Mac print-agent service${snapshot.legacyMacInstances.length === 1 ? '' : 's'} detected (${snapshot.legacyMacInstances.join(', ')}). Its older runtime does not share this app’s duplicate-print fences, so Pair and Start are blocked. First verify in ClawPilot that there is no in-flight or pending work. Then reopen the older “ClawPilot Print Agent.command” manager and choose “3. Stop and uninstall an instance” for each listed service. That retains its Keychain credential, device key, and delivery ledger for rollback while removing the LaunchAgent property list this app detects. Reopen this app, pair the same Zebra private LAN IP and port, run the no-print connection test, and print exactly one controlled UPS sandbox label. Do not revoke the old server enrollment until this app acknowledges that label. Before any native claim, rollback remains available through the retained legacy state. This app will not stop, uninstall, or revoke legacy services automatically.`
+  if (snapshot.legacyMacMigrationBlocked && snapshot.legacyMacMigrationMessage) {
+    elements.legacyWarning.textContent = snapshot.legacyMacMigrationMessage
     elements.legacyWarning.classList.remove('hidden')
   } else {
     elements.legacyWarning.classList.add('hidden')

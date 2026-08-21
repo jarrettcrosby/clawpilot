@@ -1005,9 +1005,17 @@ test('mounted or translocated mac app blocks login registration, pairing, and wo
     path.join(repositoryRoot, 'clients/print-gateway/src/main.mjs'),
     'utf8',
   )
+  const rendererSource = readFileSync(
+    path.join(repositoryRoot, 'clients/print-gateway/src/renderer/app.js'),
+    'utf8',
+  )
   assert.match(mainSource, /if \(operationReady\) applyLoginItem/)
   assert.match(mainSource, /if \(operationReady\) workers\.startEnabled/)
   assert.match(mainSource, /if \(input\.enabled === true\) assertGatewayOperationReady/)
+  assert.match(mainSource, /operationGuard: assertGatewayOperationReady/)
+  assert.match(mainSource, /!legacyMacMigrationIsBlocked\(legacyMacDetection\)/)
+  assert.match(rendererSource, /snapshot\?\.legacyMacMigrationBlocked === true/)
+  assert.match(rendererSource, /elements\.autoStart\.disabled = operationBlocked\(\)/)
   assert.equal(
     mainSource.indexOf('if (operationReady) applyLoginItem')
       < mainSource.indexOf('if (operationReady) workers.startEnabled'),
