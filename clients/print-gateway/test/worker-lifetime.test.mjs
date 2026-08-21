@@ -21,10 +21,14 @@ import {
   legacyMacMigrationMessage,
   legacyMacPrintAgentDetection,
 } from '../src/lib/legacy-macos-agent.mjs'
+import { LegacyMacMigrationGuard } from '../src/lib/legacy-macos-migration-guard.mjs'
 
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..')
 const runtimeCredential = `cpprint.v1.00000000-0000-4000-8000-000000000001.${'A'.repeat(43)}`
 const tauriExecutable = '/Applications/Print Agent.app/Contents/MacOS/print-agent'
+const lsofTextFixture = (pid, executablePath) => (
+  `p${pid}\nftxt\nn${executablePath}\nftxt\nn/usr/lib/libSystem.B.dylib\n`
+)
 
 function gatewaySafeStorageMock() {
   return {
@@ -47,7 +51,7 @@ test('legacy Mac detection covers exact Tauri plist/process and avoids command f
     const plistOnly = legacyMacPrintAgentDetection({
       platform: 'darwin',
       homeDirectory: temporary,
-      listProcesses: () => '/usr/bin/login\n',
+      listProcesses: () => '1 /sbin/launchd\n',
     })
     assert.deepEqual(plistOnly, {
       clawPilotInstances: [],
@@ -56,16 +60,29 @@ test('legacy Mac detection covers exact Tauri plist/process and avoids command f
     })
 
     rmSync(path.join(launchAgents, 'com.printagent.app.plist'))
-    const processOnly = legacyMacPrintAgentDetection({
-      platform: 'darwin',
-      homeDirectory: temporary,
-      listProcesses: () => `${tauriExecutable}\n`,
-    })
-    assert.deepEqual(processOnly, {
-      clawPilotInstances: [],
-      tauriLaunchAgentPresent: false,
-      tauriProcessRunning: true,
-    })
+    for (const [index, executablePath] of [
+      tauriExecutable,
+      '/Users/operator/Applications/Print Agent.app/Contents/MacOS/print-agent',
+      '/Volumes/Print Agent Installer/Print Agent.app/Contents/MacOS/print-agent',
+      '/private/var/folders/ab/cd/T/AppTranslocation/123/d/Print Agent.app/Contents/MacOS/print-agent',
+      '/private/tmp/rollback/Print Agent.app/Contents/MacOS/print-agent',
+    ].entries()) {
+      const pid = 1_500 + index
+      const processOnly = legacyMacPrintAgentDetection({
+        platform: 'darwin',
+        homeDirectory: temporary,
+        listProcesses: () => `${pid} ${executablePath}\n`,
+        listProcessTextFiles: (candidatePids) => {
+          assert.deepEqual(candidatePids, [pid])
+          return lsofTextFixture(pid, executablePath)
+        },
+      })
+      assert.deepEqual(processOnly, {
+        clawPilotInstances: [],
+        tauriLaunchAgentPresent: false,
+        tauriProcessRunning: true,
+      })
+    }
 
     writeFileSync(path.join(launchAgents, 'com.printagent.app.plist'), '<plist/>')
     writeFileSync(path.join(launchAgents, 'com.clawpilot.print-agent.zebra-west.plist'), '<plist/>')
@@ -73,7 +90,8 @@ test('legacy Mac detection covers exact Tauri plist/process and avoids command f
     const bothFamilies = legacyMacPrintAgentDetection({
       platform: 'darwin',
       homeDirectory: temporary,
-      listProcesses: () => `${tauriExecutable} --hidden\n`,
+      listProcesses: () => `1556 ${tauriExecutable}\n`,
+      listProcessTextFiles: (pids) => lsofTextFixture(pids[0], tauriExecutable),
     })
     assert.deepEqual(bothFamilies, {
       clawPilotInstances: ['ag-alchemy', 'zebra-west'],
@@ -90,31 +108,66 @@ test('legacy Mac detection covers exact Tauri plist/process and avoids command f
     assert.match(message, /will not stop, delete, uninstall, or revoke/i)
 
     const falsePositiveListing = [
-      `/usr/bin/grep ${tauriExecutable}`,
-      `/bin/sh -c ${tauriExecutable}`,
-      `${tauriExecutable}-helper`,
-      `/tmp${tauriExecutable}`,
-      `/Applications/Print Agent.app/Contents/MacOS/print-agent-old --hidden`,
+      `2001 /usr/bin/grep ${tauriExecutable}`,
+      `2002 /bin/sh -c ${tauriExecutable}`,
+      `2003 ${tauriExecutable}-helper`,
+      `2004 ${tauriExecutable} --hidden`,
+      '2005 /Applications/Print Agent.app/Contents/MacOS/print-agent-old --hidden',
+      '2006 /usr/bin/grep',
+      '2007 /bin/sh',
     ].join('\n')
+    const falseExecutableByPid = new Map([
+      [2001, '/usr/bin/grep'],
+      [2002, '/bin/sh'],
+      [2003, '/Applications/Print Agent.app/Contents/MacOS/print-agent-helper'],
+      [2004, '/usr/bin/env'],
+      [2005, '/Applications/Print Agent.app/Contents/MacOS/print-agent-old'],
+    ])
     rmSync(path.join(launchAgents, 'com.printagent.app.plist'))
     const falsePositives = legacyMacPrintAgentDetection({
       platform: 'darwin',
       homeDirectory: temporary,
       listProcesses: () => falsePositiveListing,
+      listProcessTextFiles: (pids) => pids.map((pid) => lsofTextFixture(
+        pid,
+        falseExecutableByPid.get(pid),
+      )).join(''),
     })
     assert.equal(falsePositives.tauriProcessRunning, false)
 
+    let truncatedCommExecutableListings = 0
+    const truncatedComm = legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => '1556 /Applications/Pr\n',
+      listProcessTextFiles: () => {
+        truncatedCommExecutableListings += 1
+        throw new Error('a truncated comm field must not nominate a PID')
+      },
+    })
+    assert.equal(truncatedComm.tauriProcessRunning, false)
+    assert.equal(truncatedCommExecutableListings, 0)
+    assert.throws(() => legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => `1556 ${tauriExecutable}\n`,
+      listProcessTextFiles: () => 'p1556\nftxt\n',
+    }), /executable detection returned invalid state/)
+
     let processListings = 0
+    let executableListings = 0
     assert.deepEqual(legacyMacPrintAgentDetection({
       platform: 'win32',
       homeDirectory: 'not-an-absolute-path',
       listProcesses: () => { processListings += 1; throw new Error('must not list') },
+      listProcessTextFiles: () => { executableListings += 1; throw new Error('must not list') },
     }), {
       clawPilotInstances: [],
       tauriLaunchAgentPresent: false,
       tauriProcessRunning: false,
     })
     assert.equal(processListings, 0)
+    assert.equal(executableListings, 0)
     assert.throws(() => legacyMacPrintAgentDetection({
       platform: 'darwin',
       homeDirectory: temporary,
@@ -126,6 +179,217 @@ test('legacy Mac detection covers exact Tauri plist/process and avoids command f
       tauriProcessRunning: false,
     }), /invalid state/)
   } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy appearance gracefully quiesces workers and latches zero further claims or bytes', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-stop-'))
+  let claims = 0
+  let printerBytes = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') claims += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, jobs: [] }))
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000019',
+    slug: 'instance-00000000-0000-4000-8000-000000000019',
+    displayName: 'Late legacy fence',
+    serverAgentGlobalId: 'gpa_late_legacy_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+    intervalMs: 250,
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  try {
+    guard.start()
+    manager.startEnabled()
+    await waitFor(() => claims >= 1, 'Electron worker never reached its first claim')
+    legacyPresent = true
+    await waitFor(
+      () => guard.snapshot().quiesced && manager.statusFor(instance.id).state === 'stopped',
+      'Recurring legacy guard did not stop the Electron worker safely',
+      12_000,
+    )
+    const claimsAfterQuiesce = claims
+    const bytesAfterQuiesce = printerBytes
+    manager.resume(instance.id)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.match(manager.statusFor(instance.id).lastError, /Legacy local printing/)
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_250))
+    assert.equal(claims, claimsAfterQuiesce)
+    assert.equal(printerBytes, bytesAfterQuiesce)
+    assert.equal(printerBytes, 0)
+    assert.equal(guard.snapshot().blocked, true)
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    guard.stop()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late malformed legacy detection fails closed and quiesces once', async () => {
+  let stops = 0
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => { throw new Error('malformed ps evidence') },
+    stopWorkers: async () => { stops += 1 },
+  })
+  const snapshot = await guard.checkNow()
+  assert.equal(snapshot.blocked, true)
+  assert.equal(snapshot.quiesced, true)
+  assert.match(snapshot.message, /could not be verified.*stopped safely/i)
+  assert.throws(() => guard.assertReady(), /could not be verified/i)
+  await guard.checkNow()
+  assert.equal(stops, 1)
+})
+
+test('late legacy stop lets an in-flight raw delivery and ACK finish before worker exit', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-raw-'))
+  const zpl = `^XA${'A'.repeat(2 * 1024 * 1024)}^XZ`
+  let claims = 0
+  let acknowledgements = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') claims += 1
+      if (body.action === 'acknowledge') acknowledgements += 1
+      const jobs = body.action === 'claim' && acknowledgements === 0 ? [{
+        globalId: 'gpj0000061',
+        claimToken: '00000000-0000-4000-8000-000000000061',
+        serverNow: new Date().toISOString(),
+        claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+        printer: { globalId: 'gpr0000061' },
+        document: {
+          globalId: 'gpf0000061',
+          type: 'shipping_label',
+          format: 'ZPL',
+          encoding: 'utf8',
+          media: 'label_4x6',
+          inlinePayload: zpl,
+          byteLength: Buffer.byteLength(zpl),
+          contentSha256: createHash('sha256').update(zpl).digest('hex'),
+        },
+      }] : []
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, jobs }))
+    })
+  })
+  const rawChunks = []
+  let releasePrinter
+  const printerRelease = new Promise((resolvePromise) => { releasePrinter = resolvePromise })
+  let rawConnectionStarted = false
+  const printer = net.createServer((socket) => {
+    socket.pause()
+    rawConnectionStarted = true
+    void printerRelease.then(() => socket.resume())
+    socket.on('data', (chunk) => rawChunks.push(chunk))
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000020',
+    slug: 'instance-00000000-0000-4000-8000-000000000020',
+    displayName: 'In-flight migration fence',
+    serverAgentGlobalId: 'gpa_inflight_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(15_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  try {
+    manager.startEnabled()
+    await waitFor(() => rawConnectionStarted, 'In-flight raw delivery never reached the printer')
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+    releasePrinter()
+    await quiesced
+    await waitFor(() => acknowledgements === 1, 'In-flight delivery did not ACK before exit')
+    assert.equal(Buffer.concat(rawChunks).equals(Buffer.from(zpl)), true)
+    assert.equal(claims, 1)
+    assert.equal(acknowledgements, 1)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releasePrinter()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
     rmSync(temporary, { recursive: true, force: true })
   }
 })
@@ -197,7 +461,8 @@ test('Tauri migration guard blocks pairing and worker start before local side ef
   const processDetection = legacyMacPrintAgentDetection({
     platform: 'darwin',
     homeDirectory: temporary,
-    listProcesses: () => `${tauriExecutable}\n`,
+    listProcesses: () => `1556 ${tauriExecutable}\n`,
+    listProcessTextFiles: (pids) => lsofTextFixture(pids[0], tauriExecutable),
   })
   const launchAgents = path.join(temporary, 'Library', 'LaunchAgents')
   mkdirSync(launchAgents, { recursive: true })

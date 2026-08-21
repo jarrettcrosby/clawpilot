@@ -68,6 +68,7 @@
             <button id="pair-button" class="primary" type="submit">Pair and start gateway</button>
           </div>
           <p class="fine-print">The connection test opens and closes TCP 9100 without sending label bytes or claiming a job. Pairing redeems the code only after that test passes. The pairing code is sent only to the trusted deployment selected above.</p>
+          <p class="fine-print">One physical Zebra may serve multiple organizations. Add and pair one workspace instance per organization using the same printer IP and port; raw delivery is serialized while each credential, claim ledger, and acknowledgement stays isolated.</p>
           <p id="form-result" class="result" aria-live="polite"></p>
         </form>
       </section>

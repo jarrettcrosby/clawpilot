@@ -41,10 +41,11 @@ the URL in the native app.
 
 Every organization/workspace uses a unique local instance and an independent,
 organization-scoped credential, claim ledger, and device key. Multiple
-instances may intentionally target the same physical Zebra; there is no local
-printer-endpoint uniqueness requirement. The workers poll and acknowledge only
-through their own credentials, while raw delivery is serialized at the shared
-physical endpoint. Removing one local instance never removes another
+instances may intentionally target the same physical Zebra: pair each workspace
+or organization separately, reusing the same printer IP and port. There is no
+local printer-endpoint uniqueness requirement. The workers poll and acknowledge
+only through their own credentials, while raw delivery is serialized at the
+shared physical endpoint. Removing one local instance never removes another
 instance's protected state. macOS serializes the endpoint with `lockf` at the
 exact legacy shared root
 `~/Library/Application Support/ClawPilot/print-agent/device-locks`; Windows uses
@@ -59,20 +60,31 @@ while either legacy family is present:
   pending/in-flight work, then use the old command manager's
   `3. Stop and uninstall an instance` action. It retains that instance's
   Keychain credential, device key, and ledger for rollback.
-- For the older Tauri `/Applications/Print Agent.app`, the exact
-  `~/Library/LaunchAgents/com.printagent.app.plist` or the exact running
-  `/Applications/Print Agent.app/Contents/MacOS/print-agent` process is enough
-  to block. In that old tray app, turn off auto-start and then Quit. Preserve
-  both the app and `~/Library/Application Support/print-agent` configuration for
-  rollback; do not manually delete its LaunchAgent or configuration.
+- For the older Tauri `Print Agent.app`, the exact
+  `~/Library/LaunchAgents/com.printagent.app.plist` or a running executable whose
+  exact app-bundle identity ends in
+  `/Print Agent.app/Contents/MacOS/print-agent` is enough to block. The process
+  check uses the full `ps` command only to nominate PIDs, then uses `lsof` to
+  verify the executable identity rather than trusting shell/grep command text.
+  It therefore also covers an app launched from `/Applications`,
+  `~/Applications`, a mounted DMG, or macOS App Translocation without treating
+  helper commands as the app.
+  In that old tray app, turn off auto-start and then Quit. Preserve the installed
+  app and `~/Library/Application Support/print-agent` configuration for rollback;
+  do not manually delete its LaunchAgent or configuration.
 
 The Electron app only reads this legacy state; it does not stop, delete,
-uninstall, or revoke either older runtime. Once the old auto-start entries are
-disabled and processes have quit, reopen this app, pair the same private Zebra
-IP and port, run the no-print probe, send exactly one controlled UPS sandbox
-label, and verify its acknowledgement. Only then revoke the old server
-enrollment. Roll back before permitting a new Electron claim if that proof
-fails.
+uninstall, or revoke either older runtime. It checks at startup, while running,
+and when brought to the foreground. If legacy printing appears after Electron
+workers start, they finish any current raw delivery and acknowledgement through
+the existing graceful shutdown path, then all stop before another claim. The
+block remains latched until this app is reopened. A previously enabled Electron
+start-at-login setting remains available only so the operator can turn it off.
+Once the old auto-start entries are disabled and processes have quit, reopen
+this app, pair the same private Zebra IP and port, run the no-print probe, send
+exactly one controlled UPS sandbox label, and verify its acknowledgement. Only
+then revoke the old server enrollment. Roll back before permitting a new
+Electron claim if that proof fails.
 
 ## Local validation
 

@@ -5,12 +5,13 @@ import path from 'node:path'
 
 const CLAWPILOT_LAUNCH_AGENT_PATTERN = /^com\.clawpilot\.print-agent\.([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.plist$/
 const TAURI_LAUNCH_AGENT_NAME = 'com.printagent.app.plist'
-const TAURI_EXECUTABLE_PATH = '/Applications/Print Agent.app/Contents/MacOS/print-agent'
+const TAURI_EXECUTABLE_SUFFIX = '/Print Agent.app/Contents/MacOS/print-agent'
 const MAX_PROCESS_LISTING_BYTES = 1_048_576
 const MAX_PROCESS_LISTING_LINES = 65_536
+const MAX_PROCESS_CANDIDATES = 32
 
 function systemMacProcessListing() {
-  const result = spawnSync('/bin/ps', ['-axo', 'command='], {
+  const result = spawnSync('/bin/ps', ['-ww', '-axo', 'pid=,command='], {
     encoding: 'utf8',
     maxBuffer: MAX_PROCESS_LISTING_BYTES,
     timeout: 2_000,
@@ -25,7 +26,25 @@ function systemMacProcessListing() {
   return result.stdout
 }
 
-function normalizedProcessCommands(processListing) {
+function systemMacProcessTextFiles(pids) {
+  const result = spawnSync('/usr/sbin/lsof', [
+    '-nP', '-a', '-p', pids.join(','), '-d', 'txt', '-Fpn',
+  ], {
+    encoding: 'utf8',
+    maxBuffer: MAX_PROCESS_LISTING_BYTES,
+    timeout: 2_000,
+    windowsHide: true,
+  })
+  if (result.error) {
+    throw new Error(`Legacy Mac print-agent executable detection failed: ${result.error.code || 'lsof error'}`)
+  }
+  if (result.signal || result.status !== 0) {
+    throw new Error('Legacy Mac print-agent executable detection failed')
+  }
+  return result.stdout
+}
+
+function normalizedListingLines(processListing) {
   if (typeof processListing !== 'string') {
     throw new Error('Legacy Mac print-agent process detection returned invalid state')
   }
@@ -42,11 +61,90 @@ function normalizedProcessCommands(processListing) {
   return commands.map((command) => command.trim()).filter(Boolean)
 }
 
-function exactTauriProcessIsRunning(processListing) {
-  return normalizedProcessCommands(processListing).some((command) => (
-    command === TAURI_EXECUTABLE_PATH
-    || command.startsWith(`${TAURI_EXECUTABLE_PATH} `)
-  ))
+function exactTauriExecutablePath(executablePath) {
+  if (
+    typeof executablePath !== 'string'
+    || !executablePath.startsWith('/')
+    || !executablePath.endsWith(TAURI_EXECUTABLE_SUFFIX)
+  ) return false
+  return path.posix.normalize(executablePath) === executablePath
+}
+
+function candidateProcessIds(processListing) {
+  const candidates = []
+  for (const line of normalizedListingLines(processListing)) {
+    const match = /^(\d{1,10})\s+(.+)$/u.exec(line)
+    if (!match) {
+      throw new Error('Legacy Mac print-agent process detection returned invalid state')
+    }
+    const pid = Number(match[1])
+    if (!Number.isSafeInteger(pid) || pid < 1) {
+      throw new Error('Legacy Mac print-agent process detection returned invalid state')
+    }
+    if (match[2].includes(TAURI_EXECUTABLE_SUFFIX)) candidates.push(pid)
+  }
+  const unique = [...new Set(candidates)]
+  if (unique.length > MAX_PROCESS_CANDIDATES) {
+    throw new Error('Legacy Mac print-agent process detection returned invalid state')
+  }
+  return unique
+}
+
+function processTextExecutableIsTauri(candidatePids, textFilesListing) {
+  const lines = normalizedListingLines(textFilesListing)
+  const requested = new Set(candidatePids)
+  const firstTextPathByPid = new Map()
+  let currentPid = null
+  let expectingTextPath = false
+  for (const line of lines) {
+    const processMatch = /^p(\d{1,10})$/u.exec(line)
+    if (processMatch) {
+      const pid = Number(processMatch[1])
+      if (
+        expectingTextPath
+        || !requested.has(pid)
+        || firstTextPathByPid.has(pid)
+      ) {
+        throw new Error('Legacy Mac print-agent executable detection returned invalid state')
+      }
+      currentPid = pid
+      firstTextPathByPid.set(pid, null)
+      continue
+    }
+    if (line === 'ftxt') {
+      if (currentPid === null || expectingTextPath) {
+        throw new Error('Legacy Mac print-agent executable detection returned invalid state')
+      }
+      expectingTextPath = true
+      continue
+    }
+    if (line.startsWith('n')) {
+      const textPath = line.slice(1)
+      if (!expectingTextPath || !textPath.startsWith('/')) {
+        throw new Error('Legacy Mac print-agent executable detection returned invalid state')
+      }
+      if (firstTextPathByPid.get(currentPid) === null) {
+        firstTextPathByPid.set(currentPid, textPath)
+      }
+      expectingTextPath = false
+      continue
+    }
+    throw new Error('Legacy Mac print-agent executable detection returned invalid state')
+  }
+  if (
+    expectingTextPath
+    || firstTextPathByPid.size !== requested.size
+    || [...firstTextPathByPid.values()].some((textPath) => textPath === null)
+  ) {
+    throw new Error('Legacy Mac print-agent executable detection returned invalid state')
+  }
+  return candidatePids.some((pid) => exactTauriExecutablePath(firstTextPathByPid.get(pid)))
+}
+
+function exactTauriProcessIsRunning(processListing, listProcessTextFiles) {
+  const candidates = candidateProcessIds(processListing)
+  if (candidates.length === 0) return false
+  return processTextExecutableIsTauri(candidates, listProcessTextFiles(candidates))
 }
 
 function assertLegacyMacPrintAgentDetection(detection) {
@@ -72,6 +170,7 @@ export function legacyMacPrintAgentDetection({
   platform = process.platform,
   homeDirectory = os.homedir(),
   listProcesses = systemMacProcessListing,
+  listProcessTextFiles = systemMacProcessTextFiles,
 } = {}) {
   if (platform !== 'darwin') {
     return {
@@ -85,6 +184,9 @@ export function legacyMacPrintAgentDetection({
   }
   if (typeof listProcesses !== 'function') {
     throw new Error('Legacy Mac print-agent process detection returned invalid state')
+  }
+  if (typeof listProcessTextFiles !== 'function') {
+    throw new Error('Legacy Mac print-agent executable detection returned invalid state')
   }
 
   const launchAgentsDirectory = path.join(homeDirectory, 'Library', 'LaunchAgents')
@@ -100,7 +202,10 @@ export function legacyMacPrintAgentDetection({
   const detection = {
     clawPilotInstances,
     tauriLaunchAgentPresent: existsSync(path.join(launchAgentsDirectory, TAURI_LAUNCH_AGENT_NAME)),
-    tauriProcessRunning: exactTauriProcessIsRunning(listProcesses()),
+    tauriProcessRunning: exactTauriProcessIsRunning(
+      listProcesses(),
+      listProcessTextFiles,
+    ),
   }
   return assertLegacyMacPrintAgentDetection(detection)
 }
@@ -129,7 +234,7 @@ export function legacyMacMigrationMessage(detection) {
     ].filter(Boolean).join(' and ')
     detected.push(`the older Tauri “Print Agent” app (${evidence})`)
     instructions.push(
-      'For the older Tauri tray app, first turn off its auto-start setting, then Quit the app. Preserve “/Applications/Print Agent.app” and “~/Library/Application Support/print-agent” with its configuration for rollback. Do not delete its LaunchAgent or configuration manually.',
+      'For the older Tauri tray app, first turn off its auto-start setting, then Quit the app. Preserve the installed “Print Agent.app” (normally “/Applications/Print Agent.app”) and “~/Library/Application Support/print-agent” with its configuration for rollback. Do not delete its LaunchAgent or configuration manually.',
     )
   }
   if (state.clawPilotInstances.length > 0) {

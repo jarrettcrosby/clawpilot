@@ -35,10 +35,9 @@ import {
 } from './lib/renderer-security.mjs'
 import {
   assertLegacyMacMigrationComplete,
-  legacyMacMigrationIsBlocked,
-  legacyMacMigrationMessage,
   legacyMacPrintAgentDetection,
 } from './lib/legacy-macos-agent.mjs'
+import { LegacyMacMigrationGuard } from './lib/legacy-macos-migration-guard.mjs'
 import {
   assertStableGatewayInstall,
   gatewayInstallLocationStatus,
@@ -57,13 +56,9 @@ let mainWindow
 let tray
 let store
 let workers
+let legacyMacMigrationGuard
 let pendingPairingContext = null
 let quitting = false
-let legacyMacDetection = {
-  clawPilotInstances: [],
-  tauriLaunchAgentPresent: false,
-  tauriProcessRunning: false,
-}
 let installLocationStatus = { ready: true, status: 'initializing', warning: null }
 let shutdownInProgress = false
 let shutdownComplete = false
@@ -86,7 +81,16 @@ function runtimePath(relativePath) {
 }
 
 function publicSnapshot() {
-  legacyMacDetection = legacyMacPrintAgentDetection()
+  const migration = legacyMacMigrationGuard?.snapshot() || {
+    detection: {
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: false,
+      tauriProcessRunning: false,
+    },
+    blocked: false,
+    message: null,
+    quiesced: false,
+  }
   const publicState = store.publicState()
   return {
     ...publicState,
@@ -97,25 +101,33 @@ function publicSnapshot() {
     appVersion: app.getVersion(),
     pairingContext: pendingPairingContext,
     localDevelopmentAllowed: localDevelopmentIsAllowed(),
-    legacyMacInstances: legacyMacDetection.clawPilotInstances,
+    legacyMacInstances: migration.detection.clawPilotInstances,
     legacyMacTauriAgent: {
-      launchAgentPresent: legacyMacDetection.tauriLaunchAgentPresent,
-      processRunning: legacyMacDetection.tauriProcessRunning,
+      launchAgentPresent: migration.detection.tauriLaunchAgentPresent,
+      processRunning: migration.detection.tauriProcessRunning,
     },
-    legacyMacMigrationBlocked: legacyMacMigrationIsBlocked(legacyMacDetection),
-    legacyMacMigrationMessage: legacyMacMigrationMessage(legacyMacDetection),
+    legacyMacMigrationBlocked: migration.blocked,
+    legacyMacMigrationQuiesced: migration.quiesced,
+    legacyMacMigrationMessage: migration.message,
     installLocationStatus,
   }
 }
 
 function assertGatewayOperationReady() {
   assertStableGatewayInstall(installLocationStatus)
-  legacyMacDetection = legacyMacPrintAgentDetection()
-  assertLegacyMacMigrationComplete(legacyMacDetection)
+  if (legacyMacMigrationGuard) legacyMacMigrationGuard.assertReady()
+  else assertLegacyMacMigrationComplete(legacyMacPrintAgentDetection())
+}
+
+function reportLegacyMacGuardError(error) {
+  mainWindow?.webContents.send('gateway:status', {
+    gatewayError: `Legacy migration safety stop is still completing. ${safeError(error)}`,
+  })
 }
 
 function showWindow() {
   if (!mainWindow) return
+  void legacyMacMigrationGuard?.checkNow().catch(reportLegacyMacGuardError)
   mainWindow.show()
   mainWindow.focus()
 }
@@ -275,7 +287,10 @@ function installIpcHandlers() {
     assertTrustedRendererIpc(event, mainWindow, rendererUrl)
     return handler(event, ...args)
   })
-  trustedHandle('gateway:snapshot', () => publicSnapshot())
+  trustedHandle('gateway:snapshot', async () => {
+    await legacyMacMigrationGuard?.checkNow()
+    return publicSnapshot()
+  })
   trustedHandle('gateway:probe', async (_event, input = {}) => {
     try {
       const host = normalizePrinterHost(input.printerHost, {
@@ -441,6 +456,7 @@ function installIpcHandlers() {
     }
   })
   trustedHandle('gateway:export-diagnostics', async () => {
+    await legacyMacMigrationGuard?.checkNow()
     const result = await dialog.showSaveDialog(mainWindow, {
       title: 'Export redacted gateway diagnostics',
       defaultPath: `ClawPilot-Gateway-Diagnostics-${new Date().toISOString().slice(0, 10)}.json`,
@@ -458,6 +474,7 @@ app.on('open-url', (event, url) => {
 })
 app.on('second-instance', (_event, argv) => receiveDeepLink(argv))
 app.on('before-quit', (event) => {
+  legacyMacMigrationGuard?.stop()
   if (shutdownComplete || !workers) return
   event.preventDefault()
   if (shutdownInProgress) return
@@ -470,6 +487,7 @@ app.on('before-quit', (event) => {
     quitting = false
     shutdownInProgress = false
     workers.quitting = false
+    legacyMacMigrationGuard?.start()
     workers.startEnabled()
     dialog.showErrorBox(
       'ClawPilot Print Agent is still stopping',
@@ -479,7 +497,7 @@ app.on('before-quit', (event) => {
 })
 
 app.whenReady().then(() => runProtectedGatewayStartup({
-  initialize: () => {
+  initialize: async () => {
     app.setAppUserModelId('com.clawpilot.site-print-gateway')
     if (runWindowsLoginItemReleaseSmoke()) return
     if (app.isPackaged && process.env.CLAWPILOT_GATEWAY_TEST_MODE !== '1') {
@@ -504,7 +522,6 @@ app.whenReady().then(() => runProtectedGatewayStartup({
         || app.isInApplicationsFolder(),
       executablePath: process.execPath,
     })
-    legacyMacDetection = legacyMacPrintAgentDetection()
     workers = new WorkerManager({
       store,
       dataDirectory,
@@ -512,14 +529,24 @@ app.whenReady().then(() => runProtectedGatewayStartup({
       allowLocalDevelopment: localDevelopmentIsAllowed(),
       startGuard: assertGatewayOperationReady,
     })
+    legacyMacMigrationGuard = new LegacyMacMigrationGuard({
+      detect: () => legacyMacPrintAgentDetection(),
+      stopWorkers: () => workers.stopAllAndWait(),
+      onQuiesced: () => {
+        mainWindow?.webContents.send('gateway:status', { snapshot: publicSnapshot() })
+      },
+      onError: reportLegacyMacGuardError,
+    })
+    const migration = await legacyMacMigrationGuard.checkNow()
     workers.on('status', (payload) => mainWindow?.webContents.send('gateway:status', payload))
     installIpcHandlers()
     const operationReady = installLocationStatus.ready
-      && !legacyMacMigrationIsBlocked(legacyMacDetection)
+      && !migration.blocked
     if (operationReady) applyLoginItem(store.publicState().autoStart)
     createWindow(process.argv.includes('--hidden') && operationReady)
     createTray()
     if (operationReady) workers.startEnabled()
+    legacyMacMigrationGuard.start()
   },
   showError: (title, message) => dialog.showErrorBox(title, message),
   exit: (code) => app.exit(code),

@@ -188,7 +188,7 @@ function render(nextSnapshot) {
     elements.baseUrl.append(option)
   }
   elements.autoStart.checked = snapshot.autoStart === true
-  elements.autoStart.disabled = operationBlocked()
+  elements.autoStart.disabled = operationBlocked() && snapshot.autoStart !== true
   elements.pairButton.disabled = operationBlocked()
   elements.autoStartStatus.textContent = snapshot.autoStartStatus?.warning
     || (snapshot.autoStartStatus?.effective
@@ -284,6 +284,14 @@ elements.exportDiagnostics.addEventListener('click', async () => {
 })
 
 api.onStatus((update) => {
+  if (update.snapshot) {
+    render(update.snapshot)
+    return
+  }
+  if (update.gatewayError) {
+    showResult(update.gatewayError, 'error')
+    return
+  }
   if (update.pairingContext) {
     snapshot.pairingContext = update.pairingContext
     renderPairingContext(update.pairingContext)

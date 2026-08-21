@@ -334,8 +334,10 @@ export class WorkerManager extends EventEmitter {
 
   async stopAndWait(id, timeoutMs = 35_000) {
     const state = this.workers.get(id)
-    if (!state?.child) {
-      if (state) state.state = 'stopped'
+    if (!state) return
+    if (!state.child) {
+      this.stop(id)
+      state.state = 'stopped'
       return
     }
     const child = state.child
@@ -353,6 +355,14 @@ export class WorkerManager extends EventEmitter {
     })
     this.stop(id)
     await stopped
+  }
+
+  async stopAllAndWait(timeoutMs = 70_000) {
+    const results = await Promise.allSettled(
+      [...this.workers.keys()].map((id) => this.stopAndWait(id, timeoutMs)),
+    )
+    const failure = results.find((result) => result.status === 'rejected')
+    if (failure) throw failure.reason
   }
 
   async setEnabled(id, enabled) {

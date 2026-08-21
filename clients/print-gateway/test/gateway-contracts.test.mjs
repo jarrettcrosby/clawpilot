@@ -1009,13 +1009,39 @@ test('mounted or translocated mac app blocks login registration, pairing, and wo
     path.join(repositoryRoot, 'clients/print-gateway/src/renderer/app.js'),
     'utf8',
   )
+  const rendererHtml = readFileSync(
+    path.join(repositoryRoot, 'clients/print-gateway/src/renderer/index.html'),
+    'utf8',
+  )
+  const gatewayReadme = readFileSync(
+    path.join(repositoryRoot, 'clients/print-gateway/README.md'),
+    'utf8',
+  )
   assert.match(mainSource, /if \(operationReady\) applyLoginItem/)
   assert.match(mainSource, /if \(operationReady\) workers\.startEnabled/)
   assert.match(mainSource, /if \(input\.enabled === true\) assertGatewayOperationReady/)
   assert.match(mainSource, /operationGuard: assertGatewayOperationReady/)
-  assert.match(mainSource, /!legacyMacMigrationIsBlocked\(legacyMacDetection\)/)
+  assert.match(mainSource, /stopWorkers: \(\) => workers\.stopAllAndWait\(\)/)
+  assert.match(mainSource, /legacyMacMigrationGuard\.start\(\)/)
+  assert.match(mainSource, /showWindow[\s\S]*legacyMacMigrationGuard\?\.checkNow\(\)/)
   assert.match(rendererSource, /snapshot\?\.legacyMacMigrationBlocked === true/)
-  assert.match(rendererSource, /elements\.autoStart\.disabled = operationBlocked\(\)/)
+  assert.match(
+    rendererSource,
+    /elements\.autoStart\.disabled = operationBlocked\(\) && snapshot\.autoStart !== true/,
+  )
+  assert.match(rendererSource, /if \(update\.snapshot\)[\s\S]*render\(update\.snapshot\)/)
+  assert.match(
+    rendererHtml,
+    /One physical Zebra may serve multiple organizations[\s\S]*one workspace instance per organization[\s\S]*credential, claim ledger, and acknowledgement stays isolated/,
+  )
+  assert.match(
+    gatewayReadme,
+    /pair each workspace[\s\S]*reusing the same printer IP and port[\s\S]*raw delivery is serialized/,
+  )
+  assert.match(
+    gatewayReadme,
+    /checks at startup, while running,[\s\S]*foreground[\s\S]*graceful shutdown path[\s\S]*before another claim/,
+  )
   assert.equal(
     mainSource.indexOf('if (operationReady) applyLoginItem')
       < mainSource.indexOf('if (operationReady) workers.startEnabled'),
