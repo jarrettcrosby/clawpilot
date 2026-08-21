@@ -5,6 +5,8 @@ import { hasEffectiveShopifyScope } from '@/lib/integrations/commerceCapabilitie
 import {
   executeShopifyOrderManagementAction,
   inspectShopifyOrderManagementTarget,
+  requestedShopifyOrderSaveProjectionHash,
+  shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
   type ShopifyOrderManagementPreview,
 } from '@/lib/integrations/shopifyOrderManagement'
@@ -38,6 +40,19 @@ export type ShopifyOrderManagementMutation =
       lineItemId: string
       quantity: number
     }>
+  | Readonly<{
+      kind: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemId: string
+        quantity: number
+      }>
+    }>
 
 export class ShopifyOrderManagementCommandError extends Error {
   constructor(
@@ -70,6 +85,21 @@ function providerAction(
       type: 'cancel',
       reason: 'STAFF',
       staffNote: staffNote(reason),
+    }
+  }
+  if (mutation.kind === 'save_order') {
+    return {
+      type: 'save_order',
+      email: mutation.email,
+      phone: mutation.phone,
+      poNumber: mutation.poNumber,
+      note: mutation.note,
+      tagAdds: mutation.tagAdds,
+      tagRemoves: mutation.tagRemoves,
+      lineQuantities: mutation.lineQuantities.map((line) => ({
+        lineItemGid: line.lineItemId,
+        quantity: line.quantity,
+      })),
     }
   }
   return {
@@ -260,6 +290,9 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     orderCurrencyCode: 'XXX',
     currentTotalPrice: { amount: '0.00', currencyCode: 'XXX' },
     totalOutstanding: { amount: '0.00', currencyCode: 'XXX' },
+    email: null,
+    phone: null,
+    poNumber: null,
     note: null,
     tags: [],
     lines: [],
@@ -326,6 +359,9 @@ function publicState(input: {
     'write_order_edits',
   )
   const addTagReason = baseReason || (!writeOrders
+    ? 'The Shopify connection is missing write_orders'
+    : null)
+  const ordinarySaveReason = baseReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
   const destructiveCurrent = exactCurrentSource(input.target)
@@ -395,6 +431,10 @@ function publicState(input: {
       financialStatus: input.preview.displayFinancialStatus,
       fulfillmentStatus: input.preview.displayFulfillmentStatus,
       merchantEditable: input.preview.merchantEditable,
+      email: input.preview.email,
+      phone: input.preview.phone,
+      poNumber: input.preview.poNumber,
+      note: input.preview.note,
       tags: Object.freeze([...input.preview.tags]),
       lines: Object.freeze(input.preview.lines.map((line) => Object.freeze({
         lineItemId: line.id,
@@ -409,6 +449,10 @@ function publicState(input: {
     }),
     eligibility: Object.freeze({
       addTag: Object.freeze({ allowed: addTagReason === null, reason: addTagReason }),
+      ordinarySave: Object.freeze({
+        allowed: ordinarySaveReason === null,
+        reason: ordinarySaveReason,
+      }),
       cancel: Object.freeze({
         allowed: cancellationReason === null,
         reason: cancellationReason,
@@ -508,6 +552,40 @@ function assertPreparedMutation(input: {
     }
     return
   }
+  if (input.mutation.kind === 'save_order') {
+    if (!input.management.eligibility.ordinarySave.allowed) {
+      fail(
+        'SHOPIFY_ORDER_SAVE_NOT_ELIGIBLE',
+        input.management.eligibility.ordinarySave.reason
+          || 'Shopify order save is unavailable',
+      )
+    }
+    if (
+      input.mutation.tagAdds.some((tag) => input.preview.tags.includes(tag))
+      || input.mutation.tagRemoves.some((tag) => !input.preview.tags.includes(tag))
+    ) {
+      fail(
+        'SHOPIFY_ORDER_TAG_STALE',
+        'Shopify tags changed before this order save',
+      )
+    }
+    for (const lineMutation of input.mutation.lineQuantities) {
+      const eligibility = input.management.eligibility.lineEdits.find(
+        (line) => line.lineItemId === lineMutation.lineItemId,
+      )
+      if (
+        !eligibility?.allowed
+        || lineMutation.quantity < eligibility.minQuantity
+        || lineMutation.quantity > eligibility.maxQuantity
+      ) {
+        fail(
+          'SHOPIFY_ORDER_EDIT_NOT_ELIGIBLE',
+          eligibility?.reason || 'A Shopify line quantity is unavailable',
+        )
+      }
+    }
+    return
+  }
   const lineMutation = input.mutation
   const eligibility = input.management.eligibility.lineEdits.find(
     (line) => line.lineItemId === lineMutation.lineItemId,
@@ -545,7 +623,14 @@ export async function prepareShopifyOrderManagementCommand(input: {
   const live = await inspect({
     organizationId: input.organizationId,
     target,
-    requiredActions: [action.type],
+    requiredActions: action.type === 'save_order'
+      ? [
+          'save_order',
+          ...(action.lineQuantities.length > 0
+            ? ['set_line_quantity' as const]
+            : []),
+        ]
+      : [action.type],
   })
   const management = publicState({
     target,
@@ -566,6 +651,12 @@ export async function prepareShopifyOrderManagementCommand(input: {
       (line) => line.id === lineItemId,
     )?.currentQuantity
   }
+  const requestedProjectionHash = action.type === 'save_order'
+    ? requestedShopifyOrderSaveProjectionHash(
+        live.inspected.preview,
+        action,
+      )
+    : undefined
   const authorization = await prepareShopifyOrderManagementInPostgres({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,
@@ -577,6 +668,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
     providerOrderObservedAt: live.observedAt,
     providerOrderTest: live.inspected.preview.test,
     expectedLineQuantity,
+    requestedProjectionHash,
     action,
     reason: input.reason,
     idempotencyKey: input.idempotencyKey,
@@ -606,6 +698,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
 function automaticSaveReason(mutation: ShopifyOrderManagementMutation) {
   if (mutation.kind === 'add_tag') return 'Saved Shopify order tag in ClawPilot'
   if (mutation.kind === 'cancel') return 'Saved Shopify order cancellation in ClawPilot'
+  if (mutation.kind === 'save_order') return 'Saved Shopify order changes in ClawPilot'
   return 'Saved Shopify order line quantity in ClawPilot'
 }
 
@@ -651,6 +744,10 @@ function actionMatchesMutation(
         schema: 'shopify-order-management-staff-note-v1',
         staffNote: action.staffNote,
       })
+  }
+  if (action.type === 'save_order') {
+    return authorization.requestedProjectionHash !== null
+      && authorization.requestedProjectionHash.length === 64
   }
   return authorization.lineItemGid === action.lineItemGid
     && authorization.requestedQuantity === action.quantity
@@ -968,6 +1065,13 @@ export async function reconcileShopifyOrderManagementCommand(input: {
       }) === authorization.tagHash
     ))
     if (present) resolution = 'applied'
+  } else if (
+    authorization.action === 'save_order'
+    && authorization.requestedProjectionHash
+    && shopifyOrderManagementProjectionHash(live.inspected.preview)
+      === authorization.requestedProjectionHash
+  ) {
+    resolution = 'applied'
   } else if (authorization.action === 'cancel') {
     if (live.inspected.preview.cancelledAt) resolution = 'applied'
   } else if (
@@ -1013,6 +1117,10 @@ export async function reconcileShopifyOrderManagementCommand(input: {
       providerOrderUpdatedAt: live.inspected.preview.updatedAt,
       cancelledAt: live.inspected.preview.cancelledAt,
       requestedQuantity: authorization.requestedQuantity,
+      requestedProjectionHash: authorization.requestedProjectionHash,
+      observedProjectionHash: authorization.action === 'save_order'
+        ? shopifyOrderManagementProjectionHash(live.inspected.preview)
+        : null,
       observedQuantity: authorization.lineItemGid
         ? live.inspected.preview.lines.find(
             (line) => line.id === authorization.lineItemGid,

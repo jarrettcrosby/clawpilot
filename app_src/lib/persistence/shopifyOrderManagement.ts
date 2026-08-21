@@ -25,6 +25,19 @@ export type ShopifyOrderManagementAction =
       quantity: number
       staffNote?: string
     }
+  | {
+      type: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemGid: string
+        quantity: number
+      }>
+    }
 
 export type ShopifyOrderManagementStatus =
   | 'prepared'
@@ -66,6 +79,8 @@ export type ShopifyOrderManagementAuthorization = {
   tagHash: string | null
   cancelReason: 'STAFF' | 'OTHER' | null
   staffNoteHash: string | null
+  requestedProjectionHash: string | null
+  requiresOrderEdits: boolean
   authorizationReason: string
   intentHash: string
   idempotencyKey: string
@@ -147,6 +162,7 @@ export type PrepareShopifyOrderManagementInput = {
   providerOrderTest: unknown
   action: unknown
   expectedLineQuantity?: unknown
+  requestedProjectionHash?: unknown
   reason: unknown
   idempotencyKey: unknown
 }
@@ -242,6 +258,8 @@ type AuthorizationRow = {
   tag_hash: string | null
   cancel_reason: 'STAFF' | 'OTHER' | null
   staff_note_hash: string | null
+  requested_projection_hash: string | null
+  requires_order_edits: boolean
   authorization_reason: string
   intent_hash: string
   idempotency_key: string
@@ -289,6 +307,7 @@ type BindingRow = {
   provider_write_requested_mode: 'off' | 'on'
   provider_write_binding_current: boolean
   provider_write_scope_digest: string | null
+  provider_write_bound_scopes: string[] | null
   order_id: string
   order_global_id: string
   external_order_id: string
@@ -519,6 +538,65 @@ function optionalText(
   return normalized
 }
 
+function nullableActionText(
+  value: unknown,
+  label: string,
+  maximum: number,
+  allowEmpty = false,
+): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  const normalized = value.trim()
+  if (
+    normalized !== value
+    || normalized.length > maximum
+    || (!allowEmpty && normalized.length < 1)
+    || (normalized.length > 0 && !SAFE_TEXT.test(normalized))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized
+}
+
+function normalizedTags(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > 250) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} are invalid`,
+      400,
+    )
+  }
+  const tags = value.map((entry) => {
+    const tag = nullableActionText(entry, label, 255)
+    if (!tag || tag.includes(',')) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        `${label} are invalid`,
+        400,
+      )
+    }
+    return tag
+  }).sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+  if (new Set(tags).size !== tags.length) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} contain duplicates`,
+      400,
+    )
+  }
+  return tags
+}
+
 export function normalizeShopifyOrderManagementAction(
   value: unknown,
 ): ShopifyOrderManagementAction {
@@ -582,9 +660,83 @@ export function normalizeShopifyOrderManagementAction(
       ...(staffNote ? { staffNote } : {}),
     }
   }
+  if (input.type === 'save_order') {
+    const tagAdds = normalizedTags(input.tagAdds, 'Shopify tags to add')
+    const tagRemoves = normalizedTags(
+      input.tagRemoves,
+      'Shopify tags to remove',
+    )
+    if (tagAdds.some((tag) => tagRemoves.includes(tag))) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify tag changes are contradictory',
+        400,
+      )
+    }
+    if (!Array.isArray(input.lineQuantities) || input.lineQuantities.length > 250) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify order line changes are invalid',
+        400,
+      )
+    }
+    const lineQuantities = input.lineQuantities.map((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+          'Shopify order line changes are invalid',
+          400,
+        )
+      }
+      const line = value as Record<string, unknown>
+      const lineItemGid = String(line.lineItemGid || '').trim()
+      if (!SHOPIFY_LINE_ITEM_GID.test(lineItemGid)) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+          'A valid Shopify LineItem GID is required',
+          400,
+        )
+      }
+      return {
+        lineItemGid,
+        quantity: integer(line.quantity, 'Shopify line quantity'),
+      }
+    }).sort((left, right) => (
+      left.lineItemGid < right.lineItemGid
+        ? -1
+        : left.lineItemGid > right.lineItemGid ? 1 : 0
+    ))
+    if (new Set(lineQuantities.map((line) => line.lineItemGid)).size
+      !== lineQuantities.length) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify order line changes contain duplicates',
+        400,
+      )
+    }
+    return {
+      type: 'save_order',
+      email: nullableActionText(input.email, 'Shopify order email', 254),
+      phone: nullableActionText(input.phone, 'Shopify order phone', 64),
+      poNumber: nullableActionText(
+        input.poNumber,
+        'Shopify order PO number',
+        255,
+      ),
+      note: nullableActionText(
+        input.note,
+        'Shopify order note',
+        5_000,
+        true,
+      ),
+      tagAdds,
+      tagRemoves,
+      lineQuantities,
+    }
+  }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
-    'Supported actions are add_tag, cancel, and set_line_quantity',
+    'Supported actions are add_tag, cancel, set_line_quantity, and save_order',
     400,
   )
 }
@@ -618,6 +770,16 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
         : null,
     }
   }
+  if (action.type === 'save_order') {
+    return {
+      action: action.type,
+      lineItemGid: null,
+      requestedQuantity: null,
+      tagHash: null,
+      cancelReason: null,
+      staffNoteHash: null,
+    }
+  }
   return {
     action: action.type,
     lineItemGid: action.lineItemGid,
@@ -631,6 +793,21 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
         })
       : null,
   }
+}
+
+function projectionHash(value: unknown, required: boolean) {
+  if (!required && (value === undefined || value === null || value === '')) {
+    return null
+  }
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!SHA256.test(normalized)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'A valid requested Shopify order projection hash is required',
+      400,
+    )
+  }
+  return normalized
 }
 
 function expectedLineQuantity(
@@ -747,6 +924,8 @@ function authorization(
     tagHash: row.tag_hash,
     cancelReason: row.cancel_reason,
     staffNoteHash: row.staff_note_hash,
+    requestedProjectionHash: row.requested_projection_hash || null,
+    requiresOrderEdits: row.requires_order_edits === true,
     authorizationReason: row.authorization_reason,
     intentHash: row.intent_hash,
     idempotencyKey: row.idempotency_key,
@@ -856,6 +1035,8 @@ async function readBinding(
        provider_control.requested_mode AS provider_write_requested_mode,
        provider_control.bound_granted_scope_digest
          AS provider_write_scope_digest,
+       provider_control.bound_granted_scopes
+         AS provider_write_bound_scopes,
        (
          provider_control.requested_mode = 'on'
          AND provider_control.row_version > 0
@@ -938,6 +1119,7 @@ function assertCurrentBinding(
     expectedSourceHash: string
     action: ShopifyOrderManagementAction['type']
     providerOrderUpdatedAt: string
+    requiresOrderEdits?: boolean
   },
 ) {
   if (
@@ -962,6 +1144,8 @@ function assertCurrentBinding(
     || Number(row.provider_write_control_row_version) < 1
     || !row.provider_write_scope_digest
     || !SHA256.test(row.provider_write_scope_digest)
+    || (input.requiresOrderEdits
+      && !row.provider_write_bound_scopes?.includes('write_order_edits'))
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
@@ -1024,6 +1208,19 @@ export async function prepareShopifyOrderManagementInPostgres(
   )
   const expectedSourceHash = sourceHash(input.expectedSourceHash)
   const action = normalizeShopifyOrderManagementAction(input.action)
+  const requestedProjectionHash = projectionHash(
+    input.requestedProjectionHash,
+    action.type === 'save_order',
+  )
+  if (action.type !== 'save_order' && requestedProjectionHash !== null) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Requested order projection applies only to a combined order save',
+      400,
+    )
+  }
+  const requiresOrderEdits = action.type === 'save_order'
+    && action.lineQuantities.length > 0
   const expectedLineQuantityValue = expectedLineQuantity(
     input.expectedLineQuantity,
     action,
@@ -1043,8 +1240,9 @@ export async function prepareShopifyOrderManagementInPostgres(
     accountGlobalId,
     orderGlobalId,
     expectedOrderRowVersion,
-    expectedSourceHash,
-    intentHash: exactIntentHash,
+      expectedSourceHash,
+      intentHash: exactIntentHash,
+      requestedProjectionHash,
   })
 
   return withTransaction(async (client) => {
@@ -1090,10 +1288,17 @@ export async function prepareShopifyOrderManagementInPostgres(
       )
     }
     const providerOrderTest = input.providerOrderTest
-    if (action.type !== 'add_tag' && !providerOrderTest) {
+    if (
+      (
+        action.type === 'cancel'
+        || action.type === 'set_line_quantity'
+        || requiresOrderEdits
+      )
+      && !providerOrderTest
+    ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
-        'Cancellation and quantity changes require a Shopify test order',
+        'Cancellation and line quantity changes require a Shopify test order',
         409,
       )
     }
@@ -1105,6 +1310,8 @@ export async function prepareShopifyOrderManagementInPostgres(
       providerOrderObservedAt,
       providerOrderTest,
       expectedLineQuantity: expectedLineQuantityValue,
+      requestedProjectionHash,
+      requiresOrderEdits,
     })
 
     await acquireTransactionAdvisoryLock(
@@ -1137,6 +1344,7 @@ export async function prepareShopifyOrderManagementInPostgres(
       expectedSourceHash,
       action: action.type,
       providerOrderUpdatedAt,
+      requiresOrderEdits,
     })
     const acceptedObservationId = action.type === 'add_tag'
       ? null : binding.accepted_observation_id
@@ -1158,7 +1366,9 @@ export async function prepareShopifyOrderManagementInPostgres(
          provider_order_observed_at, provider_order_test,
          provider_snapshot_hash, action, line_item_id,
          expected_line_quantity, requested_quantity,
-         tag_hash, cancel_reason, staff_note_hash, authorization_reason,
+         tag_hash, cancel_reason, staff_note_hash,
+         requested_projection_hash, requires_order_edits,
+         authorization_reason,
          intent_hash,
          idempotency_key, request_hash, status, authorized_by,
          authorized_role, accepted_observation_id,
@@ -1168,8 +1378,8 @@ export async function prepareShopifyOrderManagementInPostgres(
          $1::uuid, $2::uuid, $3, 'shopify', $4, $5, $6, $7,
          $8, $9, $10::uuid, $11, $12, $13, $14::bigint, $15,
          $16::timestamptz, $17::timestamptz, $18, $19, $20, $21,
-         $22, $23, $24, $25, $26, $27, $28, $29, $30, 'prepared',
-         $31, $32, $33::uuid, $34::timestamptz,
+         $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
+         $32, 'prepared', $33, $34, $35::uuid, $36::timestamptz,
          prepared_clock.prepared_at,
          prepared_clock.prepared_at + interval '5 minutes'
        FROM prepared_clock
@@ -1201,6 +1411,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         actionFacts.tagHash,
         actionFacts.cancelReason,
         actionFacts.staffNoteHash,
+        requestedProjectionHash,
+        requiresOrderEdits,
         reason,
         exactIntentHash,
         key,
@@ -1237,6 +1449,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         intentHash: exactIntentHash,
         authorizationReason: reason,
         expectedLineQuantity: expectedLineQuantityValue,
+        requestedProjectionHash,
+        requiresOrderEdits,
         expiresAt: iso(row.expires_at),
         providerWrites: 0,
       },
@@ -1301,6 +1515,12 @@ export async function claimShopifyOrderManagementInPostgres(
       || row.authorized_role !== role
       || row.authorization_reason !== reason
       || row.expected_line_quantity !== expectedLineQuantityValue
+      || row.requires_order_edits !== (
+        action.type === 'save_order' && action.lineQuantities.length > 0
+      )
+      || (action.type === 'save_order') !== Boolean(
+        row.requested_projection_hash,
+      )
       || row.intent_hash !== exactIntentHash
     ) {
       fail(
@@ -1373,6 +1593,8 @@ export async function claimShopifyOrderManagementInPostgres(
         iso(row.accepted_provider_order_updated_at),
       providerSnapshotHash: row.provider_snapshot_hash,
       expectedLineQuantity: row.expected_line_quantity,
+      requestedProjectionHash: row.requested_projection_hash,
+      requiresOrderEdits: row.requires_order_edits,
       intentHash: row.intent_hash,
     })
     const attempted = await client.query<{
@@ -1391,13 +1613,14 @@ export async function claimShopifyOrderManagementInPostgres(
          provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
          expected_source_hash, provider_snapshot_hash, action, intent_hash,
-         expected_line_quantity, attempt_hash, dispatch_state, claimed_by,
+         expected_line_quantity, requested_projection_hash,
+         requires_order_edits, attempt_hash, dispatch_state, claimed_by,
          accepted_observation_id, accepted_provider_order_updated_at,
          claimed_at, processing_lease_expires_at
        ) SELECT
          $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
          $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15, $16,
-         $17, $18, 'authorized', $19, $20::uuid, $21::timestamptz,
+         $17, $18, $19, $20, 'authorized', $21, $22::uuid, $23::timestamptz,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -1421,6 +1644,8 @@ export async function claimShopifyOrderManagementInPostgres(
         row.action,
         row.intent_hash,
         row.expected_line_quantity,
+        row.requested_projection_hash,
+        row.requires_order_edits,
         attemptHash,
         claimedBy,
         row.accepted_observation_id,
@@ -1469,6 +1694,8 @@ export async function claimShopifyOrderManagementInPostgres(
           iso(row.accepted_provider_order_updated_at),
         providerSnapshotHash: row.provider_snapshot_hash,
         expectedLineQuantity: row.expected_line_quantity,
+        requestedProjectionHash: row.requested_projection_hash,
+        requiresOrderEdits: row.requires_order_edits,
         intentHash: row.intent_hash,
         authorizationReason: row.authorization_reason,
         attemptHash,
@@ -1560,10 +1787,10 @@ function providerWriteCount(
     )
   }
   const normalized = Number(value)
-  if (!Number.isSafeInteger(normalized) || normalized < 0 || normalized > 3) {
+  if (!Number.isSafeInteger(normalized) || normalized < 0 || normalized > 253) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
-      'Provider write count must be an integer from zero through three',
+      'Provider write count must be an integer from zero through 253',
       400,
     )
   }

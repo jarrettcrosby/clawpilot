@@ -58,7 +58,14 @@ assert.match(
   /Edit this order here\. Changes save to Shopify when Provider writes is On\./,
 )
 assert.match(source.panel, /\{state\.accountLabel\} · \{state\.shopDomain\}/)
-assert.match(source.panel, />Tags</)
+assert.match(source.panel, />Order details</)
+for (const field of [
+  'label="Email"',
+  'label="Phone"',
+  'label="PO number"',
+  'label="Tags"',
+  'label="Order note"',
+]) assert.ok(source.panel.includes(field), `ordinary Save is missing ${field}`)
 assert.match(source.panel, />Line quantities</)
 assert.match(source.panel, />Cancel order</)
 assert.match(source.panel, /if \(!canManage\) return/)
@@ -106,11 +113,20 @@ for (const saveField of [
 }
 assert.match(source.panel, /action: 'reconcile' as const/)
 assert.match(source.panel, /attemptGlobalId: attempt\.attemptGlobalId/)
-assert.match(source.panel, />\s*Save tag\s*</)
-assert.match(source.panel, />\s*Save quantity\s*</)
+assert.match(source.panel, />\s*Save order\s*</)
 assert.match(source.panel, />\s*Cancel Shopify order\s*</)
-assert.match(source.panel, /save\(\{ kind: 'add_tag'/)
-assert.match(source.panel, /save\(\{[\s\S]{0,120}kind: 'set_line_quantity'/)
+assert.match(source.panel, /kind: 'save_order'/)
+assert.match(source.panel, /tagAdds,/)
+assert.match(source.panel, /tagRemoves,/)
+assert.match(source.panel, /lineQuantities: changedLineQuantities/)
+assert.match(source.panel, /position: 'sticky'/)
+assert.equal(
+  (source.panel.match(/>\s*Save order\s*</g) || []).length,
+  1,
+  'ordinary Shopify fields must use one Save button',
+)
+assert.doesNotMatch(source.panel, />\s*Save tag\s*</)
+assert.doesNotMatch(source.panel, />\s*Save quantity\s*</)
 assert.match(source.panel, /save\(\{ kind: 'cancel' \}\)/)
 
 for (const retiredCeremony of [
@@ -145,18 +161,23 @@ assert.doesNotMatch(
   'unknown outcomes must not expose an execution retry control',
 )
 
-assert.match(source.panel, /state\.eligibility\.addTag\.reason/)
+assert.match(source.panel, /state\.eligibility\.ordinarySave\.reason/)
 assert.match(source.panel, /state\.eligibility\.cancel\.reason/)
 assert.match(source.panel, /eligibility\.reason \|\| 'Shopify does not allow this line edit\.'/)
-assert.match(source.panel, /!state\.eligibility\.addTag\.allowed/)
+assert.match(source.panel, /!state\.eligibility\.ordinarySave\.allowed/)
 assert.match(source.panel, /!state\.eligibility\.cancel\.allowed/)
+assert.match(
+  source.panel,
+  /disabled=\{busy \|\| Boolean\(retainedAttempt\)\}/,
+  'Provider writes Off must not prevent drafting ordinary fields locally',
+)
 assert.match(source.panel, /providerWrites === null/)
 assert.ok(source.panel.includes('const AUTHORIZATION_GLOBAL_ID = /^gsom'))
 assert.ok(source.panel.includes('const ATTEMPT_GLOBAL_ID = /^gsoa'))
 assert.ok(source.panel.includes('const SHA256 = /^[a-f0-9]{64}$/'))
 
 assert.ok(
-  (source.panel.match(/minHeight: 44/g) || []).length >= 5,
+  (source.panel.match(/minHeight: 4[48]/g) || []).length >= 3,
   'all provider-write controls must retain mobile touch targets',
 )
 assert.match(source.panel, /direction=\{\{ xs: 'column', sm: 'row' \}\}/)
@@ -164,7 +185,7 @@ assert.match(source.panel, /alignSelf: \{ xs: 'stretch', sm: 'flex-start' \}/)
 assert.match(source.panel, /gridTemplateColumns: \{[\s\S]{0,100}xs: 'minmax\(0, 1fr\)'/)
 assert.match(source.panel, /overflowWrap: 'anywhere'/)
 assert.ok(
-  (source.panel.match(/component="span" sx=\{\{ display: 'block' \}\}/g) || []).length >= 3,
+  (source.panel.match(/component="span" sx=\{\{ display: 'block' \}\}/g) || []).length >= 2,
   'tooltip wrappers must not collapse full-width mobile actions',
 )
 

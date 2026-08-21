@@ -102,6 +102,9 @@ function previewFixture(overrides = {}) {
     orderCurrencyCode: 'USD',
     currentTotalPrice: { amount: '40.00', currencyCode: 'USD' },
     totalOutstanding: { amount: '40.00', currencyCode: 'USD' },
+    email: 'buyer@example.com',
+    phone: '+15555550100',
+    poNumber: 'PO-6600',
     note: null,
     tags: [],
     lines: [{
@@ -202,8 +205,12 @@ function authorizationFixture({
       ? evidenceHash({
           schema: 'shopify-order-management-staff-note-v1',
           staffNote: action.staffNote,
-        })
+      })
       : null,
+    requestedProjectionHash: action.type === 'save_order'
+      ? '9'.repeat(64) : null,
+    requiresOrderEdits: action.type === 'save_order'
+      && action.lineQuantities.length > 0,
     authorizationReason,
     intentHash,
     idempotencyKey,
@@ -342,6 +349,12 @@ function loadCommands() {
       if (specifier === '@/lib/integrations/shopifyOrderManagement') {
         return {
           ShopifyOrderManagementError: MockAdapterError,
+          requestedShopifyOrderSaveProjectionHash() {
+            return '9'.repeat(64)
+          },
+          shopifyOrderManagementProjectionHash() {
+            return '9'.repeat(64)
+          },
           async inspectShopifyOrderManagementTarget(input) {
             events.push(['inspect', input])
             return inspection
@@ -605,6 +618,47 @@ for (const secret of [
 ]) {
   assert.equal(JSON.stringify(prepared).includes(secret), false)
 }
+
+// Combined ordinary Save binds one desired-projection hash and asks the live
+// inspection for both write_orders and write_order_edits when quantities are
+// included. Plaintext fields reach only the short-lived action input.
+reset()
+const combinedMutation = {
+  kind: 'save_order',
+  email: 'receiving@example.com',
+  phone: '+15555550199',
+  poNumber: 'PO-UPDATED',
+  note: 'Handle together',
+  tagAdds: ['priority'],
+  tagRemoves: [],
+  lineQuantities: [{ lineItemId: lineItemGid, quantity: 1 }],
+}
+prepared = await commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: combinedMutation,
+  reason: 'Save ordinary Shopify order changes together',
+  idempotencyKey: 'shopify-combined-save-0001',
+})
+assert.equal(lastPrepareInput.requestedProjectionHash, '9'.repeat(64))
+assert.deepEqual(plain(lastPrepareInput.action), {
+  type: 'save_order',
+  email: combinedMutation.email,
+  phone: combinedMutation.phone,
+  poNumber: combinedMutation.poNumber,
+  note: combinedMutation.note,
+  tagAdds: ['priority'],
+  tagRemoves: [],
+  lineQuantities: [{ lineItemGid, quantity: 1 }],
+})
+const combinedInspection = events.find(([event]) => event === 'inspect')[1]
+assert.deepEqual(plain(combinedInspection.requiredActions), [
+  'save_order',
+  'set_line_quantity',
+])
+assert.equal(prepared.providerWrites, 0)
 
 // Provider writes Off rejects before credential access, inspection, durable
 // intent, or any provider call.
@@ -1007,6 +1061,38 @@ assert.equal(providerExecutionCount, 0)
 assert.deepEqual(events.map(([event]) => event), [
   'authorization-read', 'target-read',
 ])
+
+// A combined Save unknown outcome reconciles only when the complete current
+// provider projection hashes to the retained desired projection. No plaintext
+// draft is needed for this read-only decision and no second write is sent.
+reset()
+const combinedAction = {
+  type: 'save_order',
+  email: 'receiving@example.com',
+  phone: '+15555550199',
+  poNumber: 'PO-UPDATED',
+  note: 'Handle together',
+  tagAdds: ['priority'],
+  tagRemoves: [],
+  lineQuantities: [{ lineItemGid, quantity: 1 }],
+}
+currentAuthorization = authorizationFixture({
+  action: combinedAction,
+  status: 'unknown',
+  providerAttemptGlobalId: attemptGlobalId,
+  providerWriteCount: null,
+})
+result = await commands.reconcileShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  attemptGlobalId,
+  idempotencyKey: 'shopify-combined-save-reconcile-0001',
+})
+assert.equal(result.state, 'reconciled')
+assert.equal(lastReconcileInput.resolution, 'applied')
+assert.equal(lastReconcileInput.evidence.requestedProjectionHash, '9'.repeat(64))
+assert.equal(lastReconcileInput.evidence.observedProjectionHash, '9'.repeat(64))
+assert.equal(providerExecutionCount, 0)
 
 // Reconciliation is an exact-tenant, read-only observation. It records a
 // resolution when the hashed tag is observed and never invokes the mutation

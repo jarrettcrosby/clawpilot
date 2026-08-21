@@ -20,11 +20,11 @@ import {
 } from '@mui/material'
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import EditRounded from '@mui/icons-material/EditRounded'
-import LocalOfferRounded from '@mui/icons-material/LocalOfferRounded'
+import SaveRounded from '@mui/icons-material/SaveRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 
-type MutationKind = 'add_tag' | 'cancel' | 'set_line_quantity'
+type MutationKind = 'add_tag' | 'cancel' | 'set_line_quantity' | 'save_order'
 type ShopifyLine = Readonly<{
   lineItemId: string
   title: string
@@ -67,11 +67,16 @@ type ShopifyManagement = Readonly<{
     financialStatus: string | null
     fulfillmentStatus: string | null
     merchantEditable: boolean
+    email: string | null
+    phone: string | null
+    poNumber: string | null
+    note: string | null
     tags: string[]
     lines: ShopifyLine[]
   }>
   eligibility: Readonly<{
     addTag: Readonly<{ allowed: boolean; reason: string | null }>
+    ordinarySave: Readonly<{ allowed: boolean; reason: string | null }>
     cancel: Readonly<{ allowed: boolean; reason: string | null }>
     lineEdits: LineEligibility[]
   }>
@@ -83,6 +88,19 @@ type ShopifyMutation = Readonly<{ kind: 'add_tag'; tag: string }>
       kind: 'set_line_quantity'
       lineItemId: string
       quantity: number
+    }>
+  | Readonly<{
+      kind: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemId: string
+        quantity: number
+      }>
     }>
 type ManagementResult = Readonly<{
   authorizationGlobalId: string
@@ -172,7 +190,7 @@ function openAttempt(value: unknown): value is OpenAttempt {
     && AUTHORIZATION_GLOBAL_ID.test(item.authorizationGlobalId)
     && typeof item.intentHash === 'string' && SHA256.test(item.intentHash)
     && (item.state === 'processing' || item.state === 'unknown')
-    && ['add_tag', 'cancel', 'set_line_quantity'].includes(item.actionKind || '')
+    && ['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(item.actionKind || '')
     && optionalText(item.providerReference)
     && optionalText(item.errorCode)
     && text(item.createdAt) && !Number.isNaN(Date.parse(item.createdAt))
@@ -180,7 +198,7 @@ function openAttempt(value: unknown): value is OpenAttempt {
     && (item.providerWrites === null || (
       integer(item.providerWrites)
       && item.providerWrites >= 0
-      && item.providerWrites <= 3
+      && item.providerWrites <= 253
     ))
 }
 function management(value: unknown, orderGlobalId: string): value is ShopifyManagement {
@@ -208,10 +226,16 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && optionalText(order.financialStatus)
     && optionalText(order.fulfillmentStatus)
     && typeof order.merchantEditable === 'boolean'
+    && (order.email === null || typeof order.email === 'string')
+    && (order.phone === null || typeof order.phone === 'string')
+    && (order.poNumber === null || typeof order.poNumber === 'string')
+    && (order.note === null || typeof order.note === 'string')
     && Array.isArray(order.tags) && order.tags.every(text)
     && lines.every(line)
     && typeof eligibility?.addTag?.allowed === 'boolean'
     && optionalText(eligibility.addTag.reason)
+    && typeof eligibility?.ordinarySave?.allowed === 'boolean'
+    && optionalText(eligibility.ordinarySave.reason)
     && typeof eligibility?.cancel?.allowed === 'boolean'
     && optionalText(eligibility.cancel.reason)
     && edits.every(lineEligibility)
@@ -243,7 +267,7 @@ function result(
     || !(item.providerWrites === null || (
       integer(item.providerWrites)
       && item.providerWrites >= 0
-      && item.providerWrites <= 3
+      && item.providerWrites <= 253
     ))
     || !management(item.management, orderGlobalId)
   ) return null
@@ -278,7 +302,11 @@ export default function ShopifyOrderManagementPanel({
   const [action, setAction] = useState<'save' | 'reconcile' | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
-  const [tag, setTag] = useState('')
+  const [email, setEmail] = useState('')
+  const [phone, setPhone] = useState('')
+  const [poNumber, setPoNumber] = useState('')
+  const [note, setNote] = useState('')
+  const [tags, setTags] = useState('')
   const [quantities, setQuantities] = useState<Record<string, string>>({})
   const [lastResult, setLastResult] = useState<ManagementResult | null>(null)
   const [ambiguousSave, setAmbiguousSave] = useState(false)
@@ -304,10 +332,15 @@ export default function ShopifyOrderManagementPanel({
       }
       setState(payload.management)
       setAmbiguousSave(false)
-      setQuantities((current) => Object.fromEntries(
+      setEmail(payload.management.order.email || '')
+      setPhone(payload.management.order.phone || '')
+      setPoNumber(payload.management.order.poNumber || '')
+      setNote(payload.management.order.note || '')
+      setTags(payload.management.order.tags.join(', '))
+      setQuantities(Object.fromEntries(
         payload.management!.order.lines.map((item) => [
           item.lineItemId,
-          current[item.lineItemId] ?? String(Math.max(0, item.quantity - 1)),
+          String(item.quantity),
         ]),
       ))
     } catch (caught) {
@@ -354,8 +387,63 @@ export default function ShopifyOrderManagementPanel({
             ? `Attempt ${retainedAttempt.attemptGlobalId} is ${retainedAttempt.state}. Resolve it before saving another change.`
             : null
   const busy = disabled || loading || action !== null
-  const normalizedTag = tag.trim()
-  const tagValid = normalizedTag.length > 0 && !normalizedTag.includes(',')
+  const desiredTags = [...new Set(tags.split(',')
+    .map((value) => value.trim())
+    .filter(Boolean))]
+  const tagsValid = desiredTags.length <= 250
+    && desiredTags.every((value) => value.length <= 255 && !value.includes(','))
+  const existingTags = state?.order.tags || []
+  const tagAdds = desiredTags.filter((value) => !existingTags.includes(value))
+  const tagRemoves = existingTags.filter((value) => !desiredTags.includes(value))
+  const changedLineQuantities = state?.order.lines.flatMap((item) => {
+    const value = quantities[item.lineItemId] ?? ''
+    const entered = Number(value)
+    return /^[0-9]+$/.test(value)
+      && Number.isSafeInteger(entered)
+      && entered !== item.quantity
+      ? [{ lineItemId: item.lineItemId, quantity: entered }]
+      : []
+  }) || []
+  const ordinaryDirty = Boolean(state) && (
+    email !== (state?.order.email || '')
+    || phone !== (state?.order.phone || '')
+    || poNumber !== (state?.order.poNumber || '')
+    || note !== (state?.order.note || '')
+    || tagAdds.length > 0
+    || tagRemoves.length > 0
+    || changedLineQuantities.length > 0
+  )
+  const changedLinesValid = changedLineQuantities.every((change) => {
+    const eligibility = state?.eligibility.lineEdits.find(
+      (candidate) => candidate.lineItemId === change.lineItemId,
+    )
+    return Boolean(
+      eligibility?.allowed
+      && change.quantity >= eligibility.minQuantity
+      && change.quantity <= eligibility.maxQuantity,
+    )
+  })
+  const allLineDraftsValid = state?.order.lines.every((item) => {
+    const value = quantities[item.lineItemId] ?? ''
+    const entered = Number(value)
+    if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(entered)) return false
+    if (entered === item.quantity) return true
+    const eligibility = state.eligibility.lineEdits.find(
+      (candidate) => candidate.lineItemId === item.lineItemId,
+    )
+    return Boolean(
+      eligibility?.allowed
+      && entered >= eligibility.minQuantity
+      && entered <= eligibility.maxQuantity,
+    )
+  }) ?? false
+  const ordinaryDraftValid = email.length <= 254
+    && phone.length <= 64
+    && poNumber.length <= 255
+    && note.length <= 5_000
+    && tagsValid
+    && changedLinesValid
+    && allLineDraftsValid
 
   const save = async (mutation: ShopifyMutation) => {
     if (!state || blocker || busy) return
@@ -404,7 +492,17 @@ export default function ShopifyOrderManagementPanel({
         setError('Shopify rejected the change. Review the current order and try a new save.')
       } else {
         saveAttempt.current = null
-        setTag('')
+        setEmail(saved.management.order.email || '')
+        setPhone(saved.management.order.phone || '')
+        setPoNumber(saved.management.order.poNumber || '')
+        setNote(saved.management.order.note || '')
+        setTags(saved.management.order.tags.join(', '))
+        setQuantities(Object.fromEntries(
+          saved.management.order.lines.map((item) => [
+            item.lineItemId,
+            String(item.quantity),
+          ]),
+        ))
         setNotice(saved.replayed
           ? 'The already-completed Shopify save was loaded.'
           : 'Saved to Shopify.')
@@ -580,53 +678,74 @@ export default function ShopifyOrderManagementPanel({
 
           <Box sx={{ p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1.5 }}>
             <Stack spacing={1.25}>
-              <Stack direction="row" spacing={1} alignItems="center">
-                <LocalOfferRounded fontSize="small" />
-                <Typography fontWeight={700}>Tags</Typography>
-              </Stack>
-              {state.order.tags.length > 0 && (
-                <Typography variant="body2" color="text.secondary">
-                  {state.order.tags.join(', ')}
-                </Typography>
-              )}
+              <Typography fontWeight={700}>Order details</Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: {
+                    xs: 'minmax(0, 1fr)',
+                    sm: 'repeat(2, minmax(0, 1fr))',
+                  },
+                  gap: 1.25,
+                }}
+              >
+                <TextField
+                  label="Email"
+                  value={email}
+                  onChange={(event) => {
+                    setEmail(event.target.value)
+                    saveAttempt.current = null
+                  }}
+                  inputProps={{ maxLength: 254 }}
+                  disabled={busy || Boolean(retainedAttempt)}
+                />
+                <TextField
+                  label="Phone"
+                  value={phone}
+                  onChange={(event) => {
+                    setPhone(event.target.value)
+                    saveAttempt.current = null
+                  }}
+                  inputProps={{ maxLength: 64 }}
+                  disabled={busy || Boolean(retainedAttempt)}
+                />
+                <TextField
+                  label="PO number"
+                  value={poNumber}
+                  onChange={(event) => {
+                    setPoNumber(event.target.value)
+                    saveAttempt.current = null
+                  }}
+                  inputProps={{ maxLength: 255 }}
+                  disabled={busy || Boolean(retainedAttempt)}
+                />
+                <TextField
+                  label="Tags"
+                  value={tags}
+                  onChange={(event) => {
+                    setTags(event.target.value)
+                    saveAttempt.current = null
+                  }}
+                  inputProps={{ maxLength: 4_096 }}
+                  error={!tagsValid}
+                  helperText="Separate tags with commas. Remove a tag here to remove it in Shopify."
+                  disabled={busy || Boolean(retainedAttempt)}
+                />
+              </Box>
               <TextField
                 fullWidth
-                label="Add a tag"
-                value={tag}
+                multiline
+                minRows={3}
+                label="Order note"
+                value={note}
                 onChange={(event) => {
-                  setTag(event.target.value)
+                  setNote(event.target.value)
                   saveAttempt.current = null
                 }}
-                inputProps={{ maxLength: 255 }}
-                error={tag.length > 0 && !tagValid}
-                helperText={tag.length > 0 && !tagValid
-                  ? 'Enter one tag without commas.'
-                  : 'Existing tags stay in place.'}
+                inputProps={{ maxLength: 5_000 }}
+                helperText={`${note.length}/5000`}
                 disabled={busy || Boolean(retainedAttempt)}
               />
-              <Tooltip title={blocker || state.eligibility.addTag.reason || ''}>
-                <Box component="span" sx={{ display: 'block' }}>
-                  <Button
-                    fullWidth
-                    variant="contained"
-                    startIcon={action === 'save'
-                      ? <CircularProgress size={16} />
-                      : <LocalOfferRounded />}
-                    disabled={busy
-                      || Boolean(blocker)
-                      || !state.eligibility.addTag.allowed
-                      || !tagValid}
-                    onClick={() => void save({ kind: 'add_tag', tag: normalizedTag })}
-                    sx={{ minHeight: 44 }}
-                    data-testid="save-shopify-add-tag"
-                  >
-                    Save tag
-                  </Button>
-                </Box>
-              </Tooltip>
-              <DisabledReason value={state.eligibility.addTag.allowed
-                ? null
-                : state.eligibility.addTag.reason} />
             </Stack>
           </Box>
 
@@ -644,8 +763,13 @@ export default function ShopifyOrderManagementPanel({
                 const entered = Number(quantityText)
                 const quantityValid = /^[0-9]+$/.test(quantityText)
                   && Number.isSafeInteger(entered)
-                  && entered >= (eligibility?.minQuantity ?? 0)
-                  && entered <= (eligibility?.maxQuantity ?? -1)
+                  && (
+                    entered === item.quantity
+                    || (
+                      entered >= (eligibility?.minQuantity ?? 0)
+                      && entered <= (eligibility?.maxQuantity ?? -1)
+                    )
+                  )
                 const disabledReason = !eligibility
                   ? 'Shopify did not return edit eligibility for this line.'
                   : eligibility.allowed
@@ -689,43 +813,66 @@ export default function ShopifyOrderManagementPanel({
                         }}
                         inputProps={{
                           min: eligibility?.minQuantity ?? 0,
-                          max: eligibility?.maxQuantity ?? 0,
+                          max: item.quantity,
                           step: 1,
                         }}
                         error={quantityText.length > 0 && !quantityValid}
                         disabled={busy
-                          || Boolean(retainedAttempt)
-                          || Boolean(disabledReason)}
+                          || Boolean(retainedAttempt)}
                       />
-                      <Tooltip title={blocker || disabledReason || ''}>
-                        <Box component="span" sx={{ display: 'block' }}>
-                          <Button
-                            fullWidth
-                            variant="contained"
-                            startIcon={action === 'save'
-                              ? <CircularProgress size={16} />
-                              : <EditRounded />}
-                            disabled={busy
-                              || Boolean(blocker)
-                              || Boolean(disabledReason)
-                              || !quantityValid}
-                            onClick={() => void save({
-                              kind: 'set_line_quantity',
-                              lineItemId: item.lineItemId,
-                              quantity: entered,
-                            })}
-                            sx={{ minHeight: 44 }}
-                            data-testid={`save-shopify-line-${item.lineItemId}`}
-                          >
-                            Save quantity
-                          </Button>
-                        </Box>
-                      </Tooltip>
                     </Stack>
                   </Box>
                 )
               })}
             </Stack>
+          </Box>
+
+          <Box
+            sx={{
+              position: 'sticky',
+              bottom: 8,
+              zIndex: 2,
+              p: 1.25,
+              bgcolor: 'background.paper',
+              border: 1,
+              borderColor: 'divider',
+              borderRadius: 1.5,
+              boxShadow: 3,
+            }}
+          >
+            <Tooltip title={blocker || state.eligibility.ordinarySave.reason || ''}>
+              <Box component="span" sx={{ display: 'block' }}>
+                <Button
+                  fullWidth
+                  variant="contained"
+                  startIcon={action === 'save'
+                    ? <CircularProgress size={16} />
+                    : <SaveRounded />}
+                  disabled={busy
+                    || Boolean(blocker)
+                    || !state.eligibility.ordinarySave.allowed
+                    || !ordinaryDirty
+                    || !ordinaryDraftValid}
+                  onClick={() => void save({
+                    kind: 'save_order',
+                    email: email || null,
+                    phone: phone || null,
+                    poNumber: poNumber || null,
+                    note: note || null,
+                    tagAdds,
+                    tagRemoves,
+                    lineQuantities: changedLineQuantities,
+                  })}
+                  sx={{ minHeight: 48 }}
+                  data-testid="save-shopify-order"
+                >
+                  Save order
+                </Button>
+              </Box>
+            </Tooltip>
+            <DisabledReason value={state.eligibility.ordinarySave.allowed
+              ? null
+              : state.eligibility.ordinarySave.reason} />
           </Box>
 
           <Box sx={{ p: 1.5, border: 1, borderColor: 'error.dark', borderRadius: 1.5 }}>

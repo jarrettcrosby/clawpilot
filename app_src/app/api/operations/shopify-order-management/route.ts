@@ -20,7 +20,7 @@ export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
 
-const MAX_REQUEST_BYTES = 32 * 1024
+const MAX_REQUEST_BYTES = 128 * 1024
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u
 const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/u
 const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/u
@@ -128,6 +128,45 @@ function reason(value: unknown) {
   return boundedText(value, 'Authorization reason', 500, 10)
 }
 
+function nullableField(
+  value: unknown,
+  label: string,
+  maximum: number,
+  options: { allowNewlines?: boolean; allowEmpty?: boolean } = {},
+) {
+  if (value === null) return null
+  if (typeof value !== 'string' || value !== value.trim()) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} is invalid`)
+  }
+  if (
+    value.length > maximum
+    || (!options.allowEmpty && value.length < 1)
+    || (options.allowNewlines
+      ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+      : /[\u0000-\u001f\u007f]/u.test(value))
+  ) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return value
+}
+
+function tagList(value: unknown, label: string) {
+  if (!Array.isArray(value) || value.length > 250) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} are invalid`)
+  }
+  const tags = value.map((tag) => {
+    const normalized = nullableField(tag, label, 255)
+    if (!normalized || normalized.includes(',')) {
+      fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} are invalid`)
+    }
+    return normalized
+  })
+  if (new Set(tags).size !== tags.length) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} contain duplicates`)
+  }
+  return tags
+}
+
 function mutation(value: unknown) {
   const input = record(value)
   const kind = boundedText(input.kind, 'Shopify mutation', 40)
@@ -165,9 +204,67 @@ function mutation(value: unknown) {
       quantity: Number(input.quantity),
     })
   }
+  if (kind === 'save_order') {
+    exactFields(input, [
+      'kind', 'email', 'phone', 'poNumber', 'note',
+      'tagAdds', 'tagRemoves', 'lineQuantities',
+    ])
+    const tagAdds = tagList(input.tagAdds, 'Shopify tags to add')
+    const tagRemoves = tagList(input.tagRemoves, 'Shopify tags to remove')
+    if (tagAdds.some((tag) => tagRemoves.includes(tag))) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify tag changes are contradictory',
+      )
+    }
+    if (!Array.isArray(input.lineQuantities) || input.lineQuantities.length > 250) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify order line changes are invalid',
+      )
+    }
+    const lineQuantities = input.lineQuantities.map((value) => {
+      const line = record(value)
+      exactFields(line, ['lineItemId', 'quantity'])
+      if (!Number.isSafeInteger(line.quantity) || Number(line.quantity) < 0) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+          'Shopify order line quantity is invalid',
+        )
+      }
+      return Object.freeze({
+        lineItemId: exactId(
+          line.lineItemId,
+          'Shopify order line',
+          LINE_ITEM_GID,
+        ),
+        quantity: Number(line.quantity),
+      })
+    })
+    if (new Set(lineQuantities.map((line) => line.lineItemId)).size
+      !== lineQuantities.length) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify order line changes contain duplicates',
+      )
+    }
+    return Object.freeze({
+      kind,
+      email: nullableField(input.email, 'Shopify order email', 254),
+      phone: nullableField(input.phone, 'Shopify order phone', 64),
+      poNumber: nullableField(input.poNumber, 'Shopify order PO number', 255),
+      note: nullableField(input.note, 'Shopify order note', 5_000, {
+        allowNewlines: true,
+        allowEmpty: true,
+      }),
+      tagAdds,
+      tagRemoves,
+      lineQuantities,
+    })
+  }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
-    'Supported Shopify actions are add tag, cancel, and decrease quantity',
+    'Supported Shopify actions are save order, add tag, cancel, and decrease quantity',
   )
 }
 
@@ -210,6 +307,23 @@ function resultNullableText(value: unknown, maximum = 512) {
   return resultText(value, maximum)
 }
 
+function resultNullableField(
+  value: unknown,
+  maximum: number,
+  options: { allowEmpty?: boolean; allowNewlines?: boolean } = {},
+) {
+  if (value === null) return null
+  if (
+    typeof value !== 'string'
+    || value.length > maximum
+    || (!options.allowEmpty && value.length < 1)
+    || (options.allowNewlines
+      ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+      : /[\u0000-\u001f\u007f]/u.test(value))
+  ) resultInvalid()
+  return value
+}
+
 function resultInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > maximum) {
     resultInvalid()
@@ -229,13 +343,13 @@ function publicOpenAttempt(value: unknown) {
   const state = resultText(source.state, 32)
   const actionKind = resultText(source.actionKind, 40)
   if (!['processing', 'unknown'].includes(state)) resultInvalid()
-  if (!['add_tag', 'cancel', 'set_line_quantity'].includes(actionKind)) {
+  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(actionKind)) {
     resultInvalid()
   }
   const intentHash = resultText(source.intentHash, 64)
   if (!SHA256.test(intentHash)) resultInvalid()
   const providerWrites = source.providerWrites === null
-    ? null : resultInteger(source.providerWrites, 3)
+    ? null : resultInteger(source.providerWrites, 253)
   return Object.freeze({
     attemptGlobalId: resultId(source.attemptGlobalId, ATTEMPT_GLOBAL_ID),
     authorizationGlobalId: resultId(
@@ -258,6 +372,7 @@ function publicManagement(value: unknown) {
   const order = resultRecord(source.order)
   const eligibility = resultRecord(source.eligibility)
   const addTag = resultRecord(eligibility.addTag)
+  const ordinarySave = resultRecord(eligibility.ordinarySave)
   const cancel = resultRecord(eligibility.cancel)
   if (
     typeof source.runtimeAvailable !== 'boolean'
@@ -265,6 +380,7 @@ function publicManagement(value: unknown) {
     || typeof order.closed !== 'boolean'
     || typeof order.merchantEditable !== 'boolean'
     || typeof addTag.allowed !== 'boolean'
+    || typeof ordinarySave.allowed !== 'boolean'
     || typeof cancel.allowed !== 'boolean'
     || !Array.isArray(order.tags)
     || order.tags.length > 250
@@ -319,6 +435,13 @@ function publicManagement(value: unknown) {
       financialStatus: resultNullableText(order.financialStatus, 64),
       fulfillmentStatus: resultNullableText(order.fulfillmentStatus, 64),
       merchantEditable: order.merchantEditable,
+      email: resultNullableText(order.email, 254),
+      phone: resultNullableText(order.phone, 64),
+      poNumber: resultNullableText(order.poNumber, 255),
+      note: resultNullableField(order.note, 5_000, {
+        allowEmpty: true,
+        allowNewlines: true,
+      }),
       tags: Object.freeze(tags),
       lines: Object.freeze(lines),
     }),
@@ -326,6 +449,10 @@ function publicManagement(value: unknown) {
       addTag: Object.freeze({
         allowed: addTag.allowed,
         reason: resultNullableText(addTag.reason, 512),
+      }),
+      ordinarySave: Object.freeze({
+        allowed: ordinarySave.allowed,
+        reason: resultNullableText(ordinarySave.reason, 512),
       }),
       cancel: Object.freeze({
         allowed: cancel.allowed,
@@ -347,7 +474,7 @@ function publicAuthorization(value: unknown) {
   ) resultInvalid()
   const preview = resultRecord(source.preview)
   const action = resultText(preview.action, 40)
-  if (!['add_tag', 'cancel', 'set_line_quantity'].includes(action)) {
+  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(action)) {
     resultInvalid()
   }
   return Object.freeze({
@@ -397,7 +524,7 @@ function publicResult(value: unknown) {
     replayed: source.replayed,
     providerReads: resultInteger(source.providerReads, 20),
     providerWrites: source.providerWrites === null
-      ? null : resultInteger(source.providerWrites, 3),
+      ? null : resultInteger(source.providerWrites, 253),
     management: publicManagement(source.management),
   })
 }

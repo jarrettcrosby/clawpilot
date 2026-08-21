@@ -636,6 +636,32 @@ async function verify(databaseUrl) {
       'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
       'Provider writes Off must reject before authorization',
     )
+    await expectRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(true),
+        action: {
+          type: 'save_order',
+          email: 'draft@example.com',
+          phone: null,
+          poNumber: null,
+          note: null,
+          tagAdds: [],
+          tagRemoves: [],
+          lineQuantities: [],
+        },
+        requestedProjectionHash: '6'.repeat(64),
+        reason: 'Provider writes Off must block combined order Save',
+        idempotencyKey: 'shopify-order-combined-save-off',
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Provider writes Off must reject combined Save before authorization',
+    )
     const afterOffAuthorizationCount = await pool.query(
       `SELECT count(*)::integer AS count
        FROM operations_shopify_order_management_authorizations
@@ -2172,6 +2198,108 @@ async function verify(databaseUrl) {
       ),
       /authorization is not current or permitted/i,
       'member cannot fabricate the legacy rolling-runtime shape',
+    )
+
+    // 0312 retains one exact combined ordinary Save without retaining any
+    // email, phone, PO, note, or tag plaintext. The same pre-network claim
+    // fence binds write_orders plus write_order_edits for multi-line edits.
+    const ordinarySaveProjectionHash = '7'.repeat(64)
+    const ordinarySaveAction = {
+      type: 'save_order',
+      email: 'private-buyer@example.com',
+      phone: '+15555550199',
+      poNumber: 'PRIVATE-PO-6601',
+      note: 'Private handling note',
+      tagAdds: ['private-priority'],
+      tagRemoves: [],
+      lineQuantities: [
+        { lineItemGid: 'gid://shopify/LineItem/6600000201', quantity: 1 },
+        { lineItemGid: 'gid://shopify/LineItem/6600000202', quantity: 2 },
+      ],
+    }
+    const ordinarySaveReason = 'Save ordinary Shopify order fields together'
+    const ordinaryPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        accountGlobalId: independentFixture.accountGlobalId,
+        orderGlobalId: independentFixture.current.global_id,
+        expectedOrderRowVersion: Number(
+          independentFixture.current.row_version,
+        ),
+        expectedSourceHash: independentFixture.currentSourceHash,
+        ...snapshot(
+          true,
+          independentFixture.currentAcceptedProviderUpdatedAt,
+        ),
+        action: ordinarySaveAction,
+        requestedProjectionHash: ordinarySaveProjectionHash,
+        reason: ordinarySaveReason,
+        idempotencyKey: 'shopify-order-combined-save-0312',
+      })
+    assert.equal(
+      ordinaryPrepared.requestedProjectionHash,
+      ordinarySaveProjectionHash,
+    )
+    assert.equal(ordinaryPrepared.requiresOrderEdits, true)
+    const ordinaryClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        authorizationGlobalId: ordinaryPrepared.authorizationGlobalId,
+        action: ordinarySaveAction,
+        reason: ordinarySaveReason,
+      })
+    assert.equal(
+      ordinaryClaimed.requestedProjectionHash,
+      ordinarySaveProjectionHash,
+    )
+    assert.equal(ordinaryClaimed.requiresOrderEdits, true)
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: independentFixture.organizationId,
+      actorEmail: independentFixture.ownerEmail,
+      authorizationGlobalId: ordinaryPrepared.authorizationGlobalId,
+      providerAttemptGlobalId: ordinaryClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: {
+        schema: 'shopify-order-management-combined-save-test-v1',
+        requestedProjectionHash: ordinarySaveProjectionHash,
+      },
+      providerReference: independentFixture.current.external_order_id,
+      providerWriteCount: 5,
+    })
+    const ordinaryStored = await pool.query(
+      `SELECT authz.*, attempt.*
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       WHERE authz.organization_id = $1::uuid
+         AND authz.global_id = $2`,
+      [
+        independentFixture.organizationId,
+        ordinaryPrepared.authorizationGlobalId,
+      ],
+    )
+    const ordinarySerialized = JSON.stringify(ordinaryStored.rows)
+    for (const privateValue of [
+      ordinarySaveAction.email,
+      ordinarySaveAction.phone,
+      ordinarySaveAction.poNumber,
+      ordinarySaveAction.note,
+      ordinarySaveAction.tagAdds[0],
+    ]) {
+      assert.equal(ordinarySerialized.includes(privateValue), false)
+      assert.equal(
+        JSON.stringify(audits.filter((event) => (
+          event.aggregateId === ordinaryPrepared.authorizationGlobalId
+        ))).includes(privateValue),
+        false,
+      )
+    }
+    assert.equal(
+      ordinaryStored.rows[0].requested_projection_hash,
+      ordinarySaveProjectionHash,
     )
 
     const health = await persistence

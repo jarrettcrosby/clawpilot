@@ -38,6 +38,10 @@ function managementFixture(globalId = 'gor1234567') {
       financialStatus: 'PENDING',
       fulfillmentStatus: 'UNFULFILLED',
       merchantEditable: true,
+      email: 'buyer@example.com',
+      phone: '+15555550100',
+      poNumber: 'PO-6600',
+      note: null,
       tags: [],
       lines: [{
         lineItemId: 'gid://shopify/LineItem/123',
@@ -49,6 +53,7 @@ function managementFixture(globalId = 'gor1234567') {
     },
     eligibility: {
       addTag: { allowed: true, reason: null },
+      ordinarySave: { allowed: true, reason: null },
       cancel: { allowed: true, reason: null },
       lineEdits: [{
         lineItemId: 'gid://shopify/LineItem/123',
@@ -397,6 +402,36 @@ assert.deepEqual(plain(calls), [['save', {
 }]])
 assert.equal(JSON.stringify(result.payload).includes(organizationB), false)
 
+const ordinarySaveMutation = Object.freeze({
+  kind: 'save_order',
+  email: 'receiving@example.com',
+  phone: '+15555550199',
+  poNumber: 'PO-UPDATED',
+  note: 'Handle together',
+  tagAdds: ['priority'],
+  tagRemoves: ['old-tag'],
+  lineQuantities: [
+    { lineItemId: 'gid://shopify/LineItem/123', quantity: 1 },
+    { lineItemId: 'gid://shopify/LineItem/124', quantity: 2 },
+  ],
+})
+reset()
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: ordinarySaveMutation,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls[0]), ['save', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: ordinarySaveMutation,
+  idempotencyKey: idempotency,
+}])
+
 // Legacy prepare/execute actions remain accepted only for rolling-runtime
 // compatibility; the normal UI uses the single save action above.
 reset({ actor: { activeOrganizationId: organizationB } })
@@ -472,6 +507,14 @@ for (const [body, expectedCode] of [
   [{
     action: 'prepare', orderGlobalId, expectedRowVersion: 7,
     mutation: { kind: 'cancel', restock: true }, reason,
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...ordinarySaveMutation,
+      tagAdds: ['priority'],
+      tagRemoves: ['priority'],
+    },
   }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
   [{
     action: 'execute', authorizationGlobalId, intentHash,

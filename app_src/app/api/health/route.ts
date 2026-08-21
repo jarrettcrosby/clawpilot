@@ -5501,6 +5501,131 @@ export async function GET() {
                       )
                   )
                   AND (
+                    NOT EXISTS (
+                      SELECT 1
+                      FROM public.schema_migrations
+                      WHERE filename =
+                        '0312_operations_shopify_order_single_save.sql'
+                    )
+                    OR (
+                      EXISTS (
+                        SELECT 1
+                        FROM public.schema_migrations
+                        WHERE filename =
+                          '0312_operations_shopify_order_single_save.sql'
+                          AND checksum =
+                            'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978'
+                      )
+                      AND (
+                        SELECT pg_catalog.count(*) = 4
+                          AND pg_catalog.encode(public.digest(
+                            pg_catalog.convert_to(pg_catalog.string_agg(
+                              pg_catalog.concat_ws('|',
+                                installed.table_schema,
+                                installed.table_name,
+                                installed.column_name,
+                                installed.ordinal_position::text,
+                                installed.data_type,
+                                installed.udt_schema,
+                                installed.udt_name,
+                                installed.is_nullable,
+                                COALESCE(installed.column_default, '')
+                              ), E'\n' ORDER BY installed.table_name,
+                                installed.column_name
+                            ), 'UTF8'), 'sha256'
+                          ), 'hex') =
+                            '656bf1da59cb5f5f282fd1f37173df02cf79a77bdcfa7449032970cb283241e7'
+                        FROM information_schema.columns installed
+                        WHERE installed.table_schema = 'public'
+                          AND (
+                            installed.table_name,
+                            installed.column_name
+                          ) IN (
+                            (
+                              'operations_shopify_order_management_authorizations',
+                              'requested_projection_hash'
+                            ),
+                            (
+                              'operations_shopify_order_management_authorizations',
+                              'requires_order_edits'
+                            ),
+                            (
+                              'operations_shopify_order_management_attempts',
+                              'requested_projection_hash'
+                            ),
+                            (
+                              'operations_shopify_order_management_attempts',
+                              'requires_order_edits'
+                            )
+                          )
+                      )
+                      AND (
+                        SELECT pg_catalog.count(installed.oid) = 8
+                          AND pg_catalog.encode(public.digest(
+                            pg_catalog.convert_to(pg_catalog.string_agg(
+                              pg_catalog.concat_ws('|',
+                                required.table_name,
+                                table_namespace.nspname,
+                                installed.conname,
+                                installed.contype::text,
+                                installed.convalidated::text,
+                                installed.condeferrable::text,
+                                installed.condeferred::text,
+                                pg_catalog.pg_get_constraintdef(
+                                  installed.oid, false
+                                )
+                              ), E'\n' ORDER BY required.table_name,
+                                required.constraint_name
+                            ), 'UTF8'), 'sha256'
+                          ), 'hex') =
+                            'acf4d37a8b2d32bbd2b5731994bccf86f1b5549ce69fe9e4060d24e79c28c650'
+                        FROM (VALUES
+                          (
+                            'operations_shopify_order_management_authorizations',
+                            'operations_shopify_order_management_authorizations_action_check'
+                          ),
+                          (
+                            'operations_shopify_order_management_authorizations',
+                            'ops_shopify_order_mgmt_auth_action_valid'
+                          ),
+                          (
+                            'operations_shopify_order_management_authorizations',
+                            'ops_shopify_order_mgmt_auth_projection_hash_valid'
+                          ),
+                          (
+                            'operations_shopify_order_management_attempts',
+                            'operations_shopify_order_management_attempts_action_check'
+                          ),
+                          (
+                            'operations_shopify_order_management_attempts',
+                            'ops_shopify_order_mgmt_attempt_identity_valid'
+                          ),
+                          (
+                            'operations_shopify_order_management_attempts',
+                            'ops_shopify_order_mgmt_attempt_projection_hash_valid'
+                          ),
+                          (
+                            'operations_shopify_order_management_outcomes',
+                            'ops_shopify_order_mgmt_outcome_state_valid'
+                          ),
+                          (
+                            'operations_shopify_order_management_outcomes',
+                            'ops_shopify_order_mgmt_outcome_write_count_valid'
+                          )
+                        ) required(table_name, constraint_name)
+                        LEFT JOIN pg_catalog.pg_class table_row
+                          ON table_row.oid = pg_catalog.to_regclass(
+                            'public.' || required.table_name
+                          )
+                        LEFT JOIN pg_catalog.pg_namespace table_namespace
+                          ON table_namespace.oid = table_row.relnamespace
+                        LEFT JOIN pg_catalog.pg_constraint installed
+                          ON installed.conrelid = table_row.oid
+                         AND installed.conname = required.constraint_name
+                      )
+                    )
+                  )
+                  AND (
                     SELECT pg_catalog.count(installed.oid) = 15
                       AND pg_catalog.encode(public.digest(
                         pg_catalog.convert_to(pg_catalog.string_agg(
@@ -5651,8 +5776,19 @@ export async function GET() {
                             ))
                           ), E'\n' ORDER BY required.signature
                         ), 'UTF8'), 'sha256'
-                      ), 'hex') =
-                        '98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b'
+                      ), 'hex') = CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM public.schema_migrations
+                          WHERE filename =
+                            '0312_operations_shopify_order_single_save.sql'
+                            AND checksum =
+                              'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978'
+                        ) THEN
+                          'c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7'
+                        ELSE
+                          '98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b'
+                      END
                     FROM (VALUES
                       ('operations_commerce_granted_scope_snapshot(jsonb)'),
                       ('operations_commerce_granted_scope_digest(text[])'),

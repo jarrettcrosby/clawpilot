@@ -128,6 +128,9 @@ function providerOrder(overrides = {}) {
     totalOutstandingSet: {
       shopMoney: { amount: '150.00', currencyCode: 'USD' },
     },
+    email: 'buyer@example.com',
+    phone: '+15555550100',
+    poNumber: 'PO-6600',
     note: null,
     tags: ['warehouse-test'],
     lineItems: {
@@ -659,6 +662,9 @@ for (const testCase of [
           id: orderGid,
           name: '#6600',
           updatedAt: afterUpdatedAt,
+          email: 'buyer@example.com',
+          phone: '+15555550100',
+          poNumber: 'PO-6600',
           note: 'Warehouse test note',
           tags: ['warehouse-test'],
         },
@@ -1192,6 +1198,159 @@ for (const testCase of [
   assert.equal(result.providerWritesKnown, false)
   assert.equal(result.providerWrites, null)
   assert.equal(h.calls.graphql.length, 2)
+}
+
+// One ordinary Save can update contact/order metadata, exact tag deltas, and
+// multiple eligible line decreases. Quantities share one Shopify order-edit
+// session and the commit hardcodes notifyCustomer=false.
+{
+  const secondLineGid = 'gid://shopify/LineItem/6600000002'
+  const before = providerOrder({
+    lineItems: {
+      nodes: [
+        providerOrder().lineItems.nodes[0],
+        {
+          id: secondLineGid,
+          name: 'Second test line',
+          sku: 'SECOND',
+          currentQuantity: 2,
+          unfulfilledQuantity: 2,
+          nonFulfillableQuantity: 0,
+          merchantEditable: true,
+        },
+      ],
+      pageInfo: { hasNextPage: false },
+    },
+  })
+  const after = providerOrder({
+    updatedAt: afterUpdatedAt,
+    email: 'receiving@example.com',
+    phone: '+15555550199',
+    poNumber: 'PO-UPDATED',
+    note: 'Handle together',
+    tags: ['priority'],
+    currentTotalPriceSet: {
+      shopMoney: { amount: '75.00', currencyCode: 'USD' },
+    },
+    totalOutstandingSet: {
+      shopMoney: { amount: '75.00', currencyCode: 'USD' },
+    },
+    lineItems: {
+      nodes: [
+        {
+          ...providerOrder().lineItems.nodes[0],
+          currentQuantity: 1,
+          unfulfilledQuantity: 1,
+        },
+        {
+          id: secondLineGid,
+          name: 'Second test line',
+          sku: 'SECOND',
+          currentQuantity: 1,
+          unfulfilledQuantity: 1,
+          nonFulfillableQuantity: 0,
+          merchantEditable: true,
+        },
+      ],
+      pageInfo: { hasNextPage: false },
+    },
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderMetadataUpdate',
+      response: {
+        orderUpdate: {
+          order: {
+            id: orderGid,
+            name: '#6600',
+            updatedAt: afterUpdatedAt,
+            email: 'receiving@example.com',
+            phone: '+15555550199',
+            poNumber: 'PO-UPDATED',
+            note: 'Handle together',
+            tags: ['priority'],
+          },
+          userErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderEditBegin',
+      response: {
+        orderEditBegin: {
+          calculatedOrder: { id: calculatedOrderGid },
+          orderEditSession: { id: orderEditSessionGid },
+          userErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderEditSetQuantity',
+      response: stagedQuantityResponse(),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderEditSetQuantity',
+      response: stagedQuantityResponse({
+        calculatedLineItem: { quantity: 1 },
+      }),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderEditCommit',
+      response: {
+        orderEditCommit: {
+          order: { id: orderGid, name: '#6600', updatedAt: afterUpdatedAt },
+          successMessages: ['Order edited'],
+          userErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({
+      type: 'save_order',
+      email: 'receiving@example.com',
+      phone: '+15555550199',
+      poNumber: 'PO-UPDATED',
+      note: 'Handle together',
+      tagAdds: ['priority'],
+      tagRemoves: ['warehouse-test'],
+      lineQuantities: [
+        { lineItemGid: lineGid, quantity: 1 },
+        { lineItemGid: secondLineGid, quantity: 1 },
+      ],
+    }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'succeeded')
+  assert.equal(result.providerWrites, 5)
+  assert.equal(result.providerReads, 3)
+  assert.equal(result.result.changedLineCount, 2)
+  assert.deepEqual(
+    plain(h.calls.graphql[1].request.variables.input),
+    {
+      id: orderGid,
+      email: 'receiving@example.com',
+      phone: '+15555550199',
+      poNumber: 'PO-UPDATED',
+      note: 'Handle together',
+      tags: ['priority'],
+    },
+  )
+  assert.equal(h.calls.graphql[5].request.variables.notifyCustomer, false)
+  assert.equal(
+    h.calls.graphql.filter((call) => (
+      call.request.operationName === 'ClawPilotShopifyOrderEditBegin'
+    )).length,
+    1,
+  )
 }
 
 console.log('Shopify order-management adapter tests passed')

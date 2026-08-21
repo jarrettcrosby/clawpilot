@@ -92,6 +92,16 @@ for (const fragment of [
   '98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b',
   '9d0946bfb810bd7be8b859e8643b1fa51a946dd98c32b5e781b573c163cdbaf5',
   '442a1b8a8cac37652c6f193d5ab07ae3325891dcfa98f80593603e8166ac97d6',
+  "'0312_operations_shopify_order_single_save.sql'",
+  'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978',
+  'c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7',
+  '656bf1da59cb5f5f282fd1f37173df02cf79a77bdcfa7449032970cb283241e7',
+  'acf4d37a8b2d32bbd2b5731994bccf86f1b5549ce69fe9e4060d24e79c28c650',
+  "'requested_projection_hash'",
+  "'requires_order_edits'",
+  "'ops_shopify_order_mgmt_auth_projection_hash_valid'",
+  "'ops_shopify_order_mgmt_attempt_projection_hash_valid'",
+  "'ops_shopify_order_mgmt_outcome_write_count_valid'",
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -134,6 +144,16 @@ assert.match(
   routeSource,
   /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0308_operations_commerce_provider_write_controls\.sql[\s\S]{0,180}OR \(/u,
   'Health readiness must accept the old phase only while 0308 is absent',
+)
+assert.match(
+  routeSource,
+  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0312_operations_shopify_order_single_save\.sql[\s\S]{0,180}OR \(/u,
+  'Health readiness must accept the 0308 function bodies only while 0312 is absent',
+)
+assert.match(
+  routeSource,
+  /CASE[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
+  'Function attestation must select the exact 0312 or frozen 0308 aggregate',
 )
 assert.match(
   routeSource,
@@ -575,6 +595,43 @@ if (liveDatabaseUrl) {
   }
   try {
     assert.equal(await structuralReady(), true)
+
+    await client.query('BEGIN')
+    await client.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0312_operations_shopify_order_single_save.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0312_operations_shopify_order_single_save.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_attempts
+       ALTER COLUMN requires_order_edits SET DEFAULT true`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_outcomes
+       DROP CONSTRAINT ops_shopify_order_mgmt_outcome_write_count_valid`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
 
     await client.query('BEGIN')
     await client.query(
