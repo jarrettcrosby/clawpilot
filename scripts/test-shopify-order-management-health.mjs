@@ -122,9 +122,15 @@ assert.match(
   /installed_shopify_order_management_trigger\.tgenabled\s*=\s*'O'/u,
   'Health structural query must require normally enabled triggers',
 )
-assert.match(
-  routeSource,
-  /!row\?\.operations_shopify_order_management_applied[\s\S]{0,180}errors\.push\('Required database migrations are not applied\.'\)/u,
+const migrationError = "errors.push('Required database migrations are not applied.')"
+const migrationErrorIndex = routeSource.indexOf(migrationError)
+const migrationConditionStart = routeSource.lastIndexOf('if (', migrationErrorIndex)
+assert.ok(
+  migrationErrorIndex >= 0
+    && migrationConditionStart >= 0
+    && routeSource
+      .slice(migrationConditionStart, migrationErrorIndex + migrationError.length)
+      .includes('!row?.operations_shopify_order_management_applied'),
   'Missing order-management structure must enter the global migration error',
 )
 
