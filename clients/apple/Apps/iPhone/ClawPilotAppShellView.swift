@@ -616,6 +616,7 @@ private struct ManagerModuleView: View {
         ManagerModule(id: "accounting", title: "Accounting", detail: "Financial workflows", icon: "building.columns.fill"),
         ManagerModule(id: "pos", title: "POS", detail: "Point-of-sale workspace", icon: "creditcard.fill"),
         ManagerModule(id: "agents", title: "Agents", detail: "Agent work and status", icon: "sparkles"),
+        ManagerModule(id: "settings", title: "Settings", detail: "Store controls and integrations", icon: "gearshape.fill"),
     ]
 
     var body: some View {
@@ -658,6 +659,8 @@ private struct ManagerModuleView: View {
         .navigationDestination(for: ManagerModule.self) { module in
             if module.id == "operations" {
                 ManagerPickingOperationsView(model: model)
+            } else if module.id == "settings" {
+                ManagerShopifyCheckoutRateSettingsView(model: model)
             } else {
                 ManagerWebModuleView(module: module, origin: model.webOrigin)
             }
@@ -764,6 +767,329 @@ private struct ManagerStoreSyncConfirmationView: View {
     }
 }
 
+private struct ManagerShopifyCheckoutRatePrompt: Identifiable {
+    let control: ManagerShopifyCheckoutRateControl
+
+    var id: String {
+        "\(control.accountGlobalId):\(control.configGlobalId ?? "unconfigured"):\(control.rowVersion ?? -1)"
+    }
+}
+
+private struct ManagerShopifyCheckoutRateConfirmationView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: PickingPhoneModel
+    let prompt: ManagerShopifyCheckoutRatePrompt
+    @State private var audience: ManagerShopifyCheckoutAudience
+    @State private var rateSource: ManagerShopifyCheckoutRateSource
+    @State private var reason = ""
+
+    init(
+        model: PickingPhoneModel,
+        prompt: ManagerShopifyCheckoutRatePrompt
+    ) {
+        self.model = model
+        self.prompt = prompt
+        _audience = State(initialValue: prompt.control.desiredAudience ?? .off)
+        _rateSource = State(initialValue: prompt.control.desiredRateSource ?? .test)
+    }
+
+    private var normalizedReason: String {
+        reason.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Reviewed Shopify account") {
+                    LabeledContent("Connection", value: prompt.control.displayName)
+                    LabeledContent(
+                        "Account ID",
+                        value: prompt.control.accountGlobalId
+                    )
+                    LabeledContent(
+                        "Provider",
+                        value: prompt.control.provider.capitalized
+                    )
+                    LabeledContent(
+                        "Environment",
+                        value: prompt.control.environment.capitalized
+                    )
+                    LabeledContent(
+                        "Account status",
+                        value: prompt.control.accountStatus.capitalized
+                    )
+                    LabeledContent(
+                        "Current effective",
+                        value: prompt.control.effectiveState.label
+                    )
+                    Text(prompt.control.effectiveReason.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Desired checkout behavior") {
+                    Picker("Desired audience", selection: $audience) {
+                        ForEach(ManagerShopifyCheckoutAudience.allCases, id: \.self) {
+                            Text($0.label).tag($0)
+                        }
+                    }
+                    Picker("Saved carrier source", selection: $rateSource) {
+                        ForEach(ManagerShopifyCheckoutRateSource.allCases, id: \.self) {
+                            Text($0.label).tag($0)
+                        }
+                    }
+                    Text("Desired and Effective remain separate. Disabled or Frozen overrides availability without erasing this choice. A production store may save TEST and Restricted may save LIVE; those combinations remain effectively empty until their exact safety requirement is met.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Required reason") {
+                    TextField(
+                        "Why should checkout availability change?",
+                        text: $reason,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...6)
+                    Text("This saves only ClawPilot's desired audience and TEST/LIVE source. It performs zero Shopify or carrier provider writes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button("Save desired checkout setting") {
+                        Task {
+                            if await model.updateManagerShopifyCheckoutRateControl(
+                                control: prompt.control,
+                                desiredAudience: audience,
+                                desiredRateSource: rateSource,
+                                reason: normalizedReason
+                            ) {
+                                dismiss()
+                            }
+                        }
+                    }
+                    .disabled(
+                        normalizedReason.count < 3
+                        || normalizedReason.count > 500
+                        || model.isManagerShopifyCheckoutRateBusy
+                    )
+                }
+            }
+            .navigationTitle("Checkout rates")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private struct ManagerShopifyCheckoutRateControlsView: View {
+    @ObservedObject var model: PickingPhoneModel
+    @State private var prompt: ManagerShopifyCheckoutRatePrompt?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Shopify checkout rates")
+                        .font(.headline)
+                        .foregroundStyle(AppShellTheme.text)
+                    Text("Account-level audience and TEST/LIVE carrier source")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                if model.isManagerShopifyCheckoutRateBusy {
+                    ProgressView().tint(AppShellTheme.primary)
+                }
+            }
+
+            if model.managerShopifyCheckoutRateControls.isEmpty {
+                Text("No Shopify checkout-rate controls are available in this organization.")
+                    .font(.subheadline)
+                    .foregroundStyle(AppShellTheme.muted)
+            } else {
+                ForEach(model.managerShopifyCheckoutRateControls) { control in
+                    checkoutRateCard(control)
+                }
+            }
+
+            if model.hasPendingManagerShopifyCheckoutRateChange {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.managerShopifyCheckoutRateStatus
+                        ?? "The exact checkout-rate change is retained for retry in this signed-in app session. Relaunching refreshes authoritative state without retaining the command.")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.amber)
+                    Button("Retry exact pending checkout change") {
+                        Task {
+                            _ = await model.retryPendingManagerShopifyCheckoutRateChange()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.isManagerShopifyCheckoutRateBusy)
+                }
+            } else if let status = model.managerShopifyCheckoutRateStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppShellTheme.surface, in: RoundedRectangle(cornerRadius: 18))
+        .sheet(item: $prompt) { prompt in
+            ManagerShopifyCheckoutRateConfirmationView(
+                model: model,
+                prompt: prompt
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
+    }
+
+    @ViewBuilder
+    private func checkoutRateCard(
+        _ control: ManagerShopifyCheckoutRateControl
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(control.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AppShellTheme.text)
+                    Text(control.accountGlobalId)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(AppShellTheme.muted)
+                    Text("Shopify · \(control.environment.capitalized) · \(control.accountStatus.capitalized)")
+                        .font(.caption)
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+                Spacer()
+                if let policyRevision = control.policyRevision,
+                   let rowVersion = control.rowVersion {
+                    Text("policy v\(policyRevision) · row v\(rowVersion)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(AppShellTheme.muted)
+                }
+            }
+
+            HStack(spacing: 8) {
+                checkoutRateBadge(
+                    label: "Desired audience",
+                    value: control.desiredAudience?.label ?? "Not configured",
+                    active: control.desiredAudience == .restrictedCustomers
+                        || control.desiredAudience == .allEligible
+                )
+                checkoutRateBadge(
+                    label: "Saved source",
+                    value: control.desiredRateSource?.label ?? "None",
+                    active: control.desiredRateSource == .live
+                )
+            }
+            checkoutRateBadge(
+                label: "Effective availability",
+                value: control.effectiveState.label,
+                active: control.effectiveState == .serving
+            )
+
+            Text(control.effectiveReason.label)
+                .font(.caption)
+                .foregroundStyle(
+                    control.effectiveState == .serving
+                        ? AppShellTheme.mint : AppShellTheme.muted
+                )
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let lastChange = control.lastChange {
+                Text("Last reason (control policy v\(lastChange.resultingPolicyRevision)): \(lastChange.reason)")
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if control.isConfigured {
+                Text("No checkout-rate control change has been recorded yet.")
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+
+            if control.canEdit {
+                Button("Change desired checkout setting") {
+                    prompt = ManagerShopifyCheckoutRatePrompt(control: control)
+                }
+                .buttonStyle(.bordered)
+                .disabled(
+                    model.isManagerShopifyCheckoutRateBusy
+                    || model.hasPendingManagerShopifyCheckoutRateChange
+                )
+            } else if !control.isConfigured {
+                Text("Complete this Shopify account's base checkout-rating configuration before selecting its audience and carrier source.")
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.amber)
+            } else {
+                Text("View only. An organization owner or authorized administrator with exact activation and management capability can change this setting.")
+                    .font(.caption)
+                    .foregroundStyle(AppShellTheme.muted)
+            }
+        }
+        .padding(12)
+        .background(
+            AppShellTheme.canvas.opacity(0.6),
+            in: RoundedRectangle(cornerRadius: 14)
+        )
+    }
+
+    private func checkoutRateBadge(
+        label: String,
+        value: String,
+        active: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.semibold))
+            Text(value)
+                .font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(active ? AppShellTheme.mint : AppShellTheme.muted)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            (active ? AppShellTheme.mint : AppShellTheme.muted).opacity(0.1),
+            in: RoundedRectangle(cornerRadius: 10)
+        )
+    }
+}
+
+private struct ManagerShopifyCheckoutRateSettingsView: View {
+    @ObservedObject var model: PickingPhoneModel
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 13) {
+                WorkspaceSwitcherCard(model: model, compact: true)
+                ManagerShopifyCheckoutRateControlsView(model: model)
+            }
+            .padding(18)
+            .padding(.bottom, 30)
+        }
+        .background(AppShellTheme.canvas)
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await model.loadManagerOperations() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(model.isManagerBusy)
+            }
+        }
+        .task { await model.loadManagerOperations() }
+    }
+}
+
 private struct ManagerPickingOperationsView: View {
     @ObservedObject var model: PickingPhoneModel
     @State private var storeSyncPrompt: ManagerStoreSyncPrompt?
@@ -773,6 +1099,7 @@ private struct ManagerPickingOperationsView: View {
             LazyVStack(spacing: 13) {
                 WorkspaceSwitcherCard(model: model, compact: true)
                 storeSyncControls
+                ManagerShopifyCheckoutRateControlsView(model: model)
                 currentAssignments
                 completedPickHistory
                 pickerPerformance

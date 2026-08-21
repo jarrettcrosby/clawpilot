@@ -65,6 +65,7 @@ import {
 import {
   finalizeShopifyCarrierServiceRegistrationInPostgres,
   readShopifyCarrierServiceConfigFromPostgres,
+  readShopifyCarrierServiceRateControlLastChangeFromPostgres,
   shopifyCheckoutRatingHash,
   ShopifyCheckoutRatingPersistenceError,
   updateShopifyCarrierServiceBrandNameOverrideInPostgres,
@@ -695,6 +696,7 @@ async function setupState(input: {
     mutationAuthorizations,
     customerPolicySummary,
     storeSyncControls,
+    checkoutRateLastChange,
   ] = await Promise.all([
     readShopifyCarrierServiceConfigFromPostgres({
       organizationId: input.organizationId,
@@ -714,6 +716,10 @@ async function setupState(input: {
       accountGlobalId: input.accountGlobalId,
     }),
     readCommerceStoreSyncControlsFromPostgres(input.organizationId),
+    readShopifyCarrierServiceRateControlLastChangeFromPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    }),
   ])
   const storeSync = storeSyncControls.find(
     (control) => control.accountGlobalId === input.accountGlobalId,
@@ -899,6 +905,7 @@ async function setupState(input: {
     callbackUrl: publicCallbackUrl,
     canActivate: input.canActivate,
     canManage: input.canManage,
+    checkoutRateLastChange,
     checkoutRateOperatingProfile: {
       desiredAudience:
         publicConfig?.checkoutRateControl.audience || null,

@@ -1620,6 +1620,22 @@ async function exercise(databaseUrl) {
     }, 'checkout-control:production-test-desired:v1'))
     assert.equal(production.status, 200, JSON.stringify(production.body))
     assert.equal(production.body.result.providerWrites, 0)
+    const productionLastChange = await persistence
+      .readShopifyCarrierServiceRateControlLastChangeFromPostgres({
+        organizationId: ORGANIZATION_ID,
+        accountGlobalId: PRODUCTION_ACCOUNT_GLOBAL_ID,
+      })
+    assert.deepEqual(
+      { ...productionLastChange },
+      {
+        configGlobalId: 'gscf2930002',
+        resultingRowVersion: 2,
+        resultingPolicyRevision: 2,
+        reason:
+          'Save desired TEST source while production serving stays empty',
+      },
+      'native last-reason projection did not bind the immutable 0299 receipt',
+    )
     assert.equal(
       (await configRow(pool, PRODUCTION_ACCOUNT_GLOBAL_ID))
         .policy_snapshot.checkoutRateControl.rateSource,

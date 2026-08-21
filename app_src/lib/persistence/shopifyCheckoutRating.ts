@@ -282,6 +282,13 @@ export type ShopifyCarrierServiceConfig = {
   updatedAt: string
 }
 
+export type ShopifyCarrierServiceRateControlLastChange = {
+  configGlobalId: string
+  resultingRowVersion: number
+  resultingPolicyRevision: number
+  reason: string
+}
+
 export type ShopifyCheckoutRatingMaterial = {
   selectionSequence: number
   materialId: string
@@ -2432,6 +2439,67 @@ export async function readShopifyCarrierServiceConfigFromPostgres(input: {
       'Shopify account Global ID',
     ),
   })
+}
+
+/**
+ * Projects the most recent immutable 0299 command receipt for presentation.
+ * The receipt remains the authority for the reason; configuration rows do not
+ * duplicate mutable "last reason" state.
+ */
+export async function readShopifyCarrierServiceRateControlLastChangeFromPostgres(
+  input: {
+    organizationId: string
+    accountGlobalId: string
+  },
+): Promise<ShopifyCarrierServiceRateControlLastChange | null> {
+  const organizationId = matchValue(
+    input.organizationId,
+    UUID,
+    'Organization ID',
+  )
+  const accountGlobalId = matchValue(
+    input.accountGlobalId,
+    ACCOUNT_GLOBAL_ID,
+    'Shopify account Global ID',
+  )
+  const result = await query<{
+    config_global_id: string
+    resulting_row_version: string
+    resulting_policy_revision: string
+    reason: string
+  }>(
+    `SELECT
+       config.global_id AS config_global_id,
+       receipt.resulting_row_version::text,
+       receipt.resulting_policy_revision::text,
+       receipt.reason
+     FROM operations_shopify_checkout_rate_control_receipts receipt
+     JOIN operations_integration_accounts account
+       ON account.organization_id = receipt.organization_id
+      AND account.id = receipt.integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider = 'shopify'
+     JOIN operations_shopify_carrier_service_configs config
+       ON config.organization_id = receipt.organization_id
+      AND config.id = receipt.config_id
+      AND config.integration_account_id = receipt.integration_account_id
+     WHERE receipt.organization_id = $1::uuid
+       AND account.global_id = $2
+     ORDER BY receipt.resulting_policy_revision DESC,
+              receipt.created_at DESC,
+              receipt.id DESC
+     LIMIT 1`,
+    [organizationId, accountGlobalId],
+  )
+  const row = result.rows[0]
+  return row
+    ? {
+        configGlobalId: row.config_global_id,
+        resultingRowVersion: Number(row.resulting_row_version),
+        resultingPolicyRevision: Number(row.resulting_policy_revision),
+        reason: row.reason,
+      }
+    : null
 }
 
 function checkoutBrandNameOverride(value: unknown) {
