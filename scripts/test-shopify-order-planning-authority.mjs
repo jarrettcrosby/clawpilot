@@ -501,7 +501,7 @@ providerAssignmentOrder = assignmentOrder({
   assignedLocationName: 'Snow City Warehouse',
   isFulfillmentService: true,
   fulfillmentService: {
-    id: 'gid://shopify/FulfillmentService/888',
+    id: 'gid://shopify/FulfillmentService/888?id=true',
     serviceName: 'Snow City App',
     type: 'THIRD_PARTY',
   },
@@ -520,6 +520,110 @@ assert.equal(providerManaged.selectedWarehouse, null)
 assert.equal(
   providerManaged.assignments[0].fulfillmentService.serviceName,
   'Snow City App',
+)
+assert.equal(
+  providerManaged.assignments[0].fulfillmentService.id,
+  'gid://shopify/FulfillmentService/888?id=true',
+)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/999',
+  assignedLocationName: 'Snow City Warehouse',
+  isFulfillmentService: true,
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+})
+const providerManagedBaseId = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(providerManagedBaseId.status, 'provider_managed')
+assert.equal(
+  providerManagedBaseId.assignments[0].fulfillmentService.id,
+  'gid://shopify/FulfillmentService/888',
+)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/999',
+  assignedLocationName: 'Unreadable fulfillment-service location',
+  isFulfillmentService: true,
+  fulfillmentService: null,
+})
+const providerManagedWithoutDetails =
+  await module.inspectShopifyOrderPlanningAssignment(
+    {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      expectedCandidateRowVersion: 9,
+    },
+    assignmentDependencies(),
+  )
+assert.equal(providerManagedWithoutDetails.status, 'provider_managed')
+assert.equal(
+  providerManagedWithoutDetails.assignments[0].ownerType,
+  'fulfillment_service',
+)
+assert.equal(
+  providerManagedWithoutDetails.assignments[0].fulfillmentService,
+  null,
+)
+
+for (const invalidId of [
+  null,
+  'gid://shopify/FulfillmentService/888?id=false',
+  'gid://shopify/FulfillmentService/888?id=true&extra=1',
+]) {
+  providerAssignmentOrder = assignmentOrder({
+    assignedLocationId: 'gid://shopify/Location/999',
+    assignedLocationName: 'Snow City Warehouse',
+    isFulfillmentService: true,
+    fulfillmentService: {
+      id: invalidId,
+      serviceName: 'Snow City App',
+      type: 'THIRD_PARTY',
+    },
+  })
+  await assert.rejects(
+    () => module.inspectShopifyOrderPlanningAssignment(
+      {
+        organizationId,
+        accountGlobalId,
+        candidateGlobalId,
+        expectedCandidateRowVersion: 9,
+      },
+      assignmentDependencies(),
+    ),
+    (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+  )
+}
+
+providerAssignmentOrder = assignmentOrder({
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888?id=true',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+})
+await assert.rejects(
+  () => module.inspectShopifyOrderPlanningAssignment(
+    {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      expectedCandidateRowVersion: 9,
+    },
+    assignmentDependencies(),
+  ),
+  (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
 )
 
 providerAssignmentOrder = assignmentOrder({
