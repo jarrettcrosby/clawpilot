@@ -105,6 +105,21 @@ if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
 }
 
 if (
+  String(rootPackage?.scripts?.['test:shipping-independence-postgres'] || '')
+    !== 'node scripts/test-shipping-independence-postgres.mjs && node scripts/test-shipping-one-off-pack-postgres.mjs'
+) {
+  fail(
+    'test:shipping-independence-postgres must run the Shipping scope and '
+    + 'one-off pack disposable PostgreSQL acceptances',
+  )
+}
+if (
+  !ciWorkflow.includes('run: npm run test:shipping-independence-postgres')
+) {
+  fail('CI must run the Shipping independence disposable PostgreSQL acceptance')
+}
+
+if (
   String(rootPackage?.scripts?.['test:shopify-order-webhook-reconciliation'] || '')
     !== 'node scripts/test-shopify-order-webhook-reconciliation.mjs && node scripts/test-shopify-order-webhook-reconciliation-postgres.mjs && node scripts/test-shopify-order-webhook-reconciliation-health.mjs'
 ) {
