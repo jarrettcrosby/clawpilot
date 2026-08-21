@@ -11,6 +11,7 @@ import {
   registerShopifyCatalogWebhookSubscriptions,
   registerShopifyInventoryWebhookSubscriptions,
   registerShopifyScopeWebhookSubscriptions,
+  recoverShopifyOrderWebhookCommandKey,
   reconcileShopifyOrderWebhookSetup,
   sanitizedCommerceIntegrationError,
   setCommerceIntegrationEnabled,
@@ -464,6 +465,22 @@ export async function PATCH(req: NextRequest) {
         canActivate: true,
         integrations,
         catalog: capabilityCatalog(),
+      })
+    }
+
+    if (action === 'recover-shopify-order-webhook-command') {
+      only(body, ['action', 'accountGlobalId', 'confirmation'])
+      requireShopifyOrderWebhookReconciler(actor)
+      const recoveryIdempotencyKey =
+        await recoverShopifyOrderWebhookCommandKey({
+          organizationId: organization,
+          accountGlobalId: body.accountGlobalId,
+          actorEmail: actor.email,
+          confirmation: body.confirmation,
+        })
+      return json({
+        ok: true,
+        recoveryIdempotencyKey,
       })
     }
 

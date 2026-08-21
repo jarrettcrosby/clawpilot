@@ -112,6 +112,7 @@ import {
   finalizeShopifyOrderWebhookReconciliationInPostgres,
   markStaleShopifyOrderWebhookAttemptUnknownInPostgres,
   prepareShopifyOrderWebhookReconciliationInPostgres,
+  readOpenShopifyOrderWebhookRecoveryKeyInPostgres,
   readShopifyOrderWebhookAttemptIdInPostgres,
   ShopifyOrderWebhookReconciliationPersistenceError,
 } from '@/lib/persistence/shopifyOrderWebhookReconciliation'
@@ -1727,6 +1728,51 @@ function orderWebhookResultSnapshot(input: {
   }
 }
 
+export async function recoverShopifyOrderWebhookCommandKey(input: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  actorEmail: string
+  confirmation: unknown
+}) {
+  try {
+    const runtime = await storedRuntime(input)
+    if (runtime.provider !== 'shopify') {
+      throw new CommerceIntegrationRequestError(
+        'Order webhook recovery requires a Shopify sales channel',
+        400,
+        'SHOPIFY_ORDER_WEBHOOK_PROVIDER_REQUIRED',
+      )
+    }
+    if (runtime.status !== 'active' || runtime.verificationStatus !== 'verified') {
+      throw new CommerceIntegrationRequestError(
+        'Verify and enable the Shopify connection before recovering an open order webhook command',
+        409,
+        'SHOPIFY_ORDER_WEBHOOK_VERIFICATION_REQUIRED',
+      )
+    }
+    const expectedConfirmation = shopifyOrderWebhookReconciliationConfirmation(
+      runtime.globalId,
+    )
+    if (input.confirmation !== expectedConfirmation) {
+      throw new CommerceIntegrationRequestError(
+        `Type exactly: ${expectedConfirmation}`,
+        400,
+        'SHOPIFY_ORDER_WEBHOOK_CONFIRMATION_REQUIRED',
+      )
+    }
+    return readOpenShopifyOrderWebhookRecoveryKeyInPostgres({
+      organizationId: runtime.organizationId,
+      accountGlobalId: runtime.globalId,
+      confirmationHash: createHash('sha256')
+        .update(expectedConfirmation)
+        .digest('hex'),
+      actorEmail: input.actorEmail,
+    })
+  } catch (error) {
+    throw sanitize(error)
+  }
+}
+
 /**
  * Explicit owner/admin reconciliation of only the seven payload-minimized
  * Shopify order signal subscriptions. The durable command and immutable
@@ -1821,6 +1867,9 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
       })
       command = { ...command, status: 'unknown' }
     }
+    const recoveryDesiredUri = command.status === 'unknown'
+      ? command.callbackUri
+      : desiredUri
 
     const stored = decryptStoredCredential(runtime)
     if (stored.provider !== 'shopify') {
@@ -1859,7 +1908,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
 
     const readiness = await discoverShopifyOrderWebhookSubscriptions(
       providerCredential,
-      { desiredUri },
+      { desiredUri: recoveryDesiredUri },
     )
     const recovery = decideShopifyOrderWebhookRecovery(
       command.status === 'recoverable'
@@ -1913,6 +1962,13 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
         }),
         readiness,
       })
+      if (recoveryDesiredUri !== desiredUri) {
+        throw new CommerceIntegrationRequestError(
+          'The prior ambiguous callback is now reconciled read-only. Confirm again to move the exact subscriptions to the current public callback.',
+          409,
+          'SHOPIFY_ORDER_WEBHOOK_CALLBACK_DRIFT_RESTART_REQUIRED',
+        )
+      }
       return readCommerceIntegrationsStateFromPostgres(runtime.organizationId)
     }
     const plan = recovery.plan
@@ -1933,7 +1989,7 @@ export async function reconcileShopifyOrderWebhookSetup(input: {
       || normalizeShopifyShopDomain(revalidated.configuration.shopDomain)
         !== shopDomain
       || webhookUrl(revalidated.globalId) !== desiredUri
-      || attempt.requestHash !== requestHash
+      || attempt.requestHash !== command.requestHash
     ) {
       await finalizeShopifyOrderWebhookReconciliationInPostgres({
         organizationId: runtime.organizationId,

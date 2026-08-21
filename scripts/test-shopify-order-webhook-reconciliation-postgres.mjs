@@ -35,6 +35,23 @@ function sha(value) {
   return createHash('sha256').update(String(value)).digest('hex')
 }
 
+function requestHash(input) {
+  return createHash('sha256').update(JSON.stringify({
+    schema: 'shopify-order-webhooks-reconcile-v1',
+    organizationId: input.organizationId,
+    accountGlobalId: input.accountGlobalId,
+    integrationAccountId: input.integrationAccountId,
+    credentialGeneration: input.credentialGeneration,
+    externalAccountId: input.externalAccountId,
+    shopDomain: input.shopDomain,
+    desiredUri: input.desiredUri || input.callbackUri,
+    topics,
+    format: 'JSON',
+    includeFields,
+    actorEmail: input.actorEmail,
+  })).digest('hex')
+}
+
 async function expectCode(work, code, label) {
   await assert.rejects(
     work,
@@ -46,17 +63,48 @@ async function expectCode(work, code, label) {
   )
 }
 
+async function healthApplied(client, healthSql) {
+  const result = await client.query(`SELECT (${healthSql}) AS applied`)
+  return result.rows[0]?.applied === true
+}
+
+async function expectHealthTamper(pool, healthSql, sql, label) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(sql)
+    assert.equal(
+      await healthApplied(client, healthSql),
+      false,
+      `${label} must fail exact reconciliation health`,
+    )
+    await client.query('ROLLBACK')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+  assert.equal(
+    await healthApplied(pool, healthSql),
+    true,
+    `${label} rollback must restore exact reconciliation health`,
+  )
+}
+
 async function seed(pool) {
   const organizationId = '03030000-0000-4000-8000-000000000001'
   const accountId = '03030000-0000-4000-8000-000000000002'
   const accountGlobalId = 'gia0303001'
   const memberEmail = 'member-order-webhooks@clawpilot.test'
+  const successorEmail = 'admin-order-webhooks@clawpilot.test'
   await pool.query('SET session_replication_role = replica')
   try {
     await pool.query(
       `INSERT INTO app_users (email, role, status)
-       VALUES ($1, 'owner', 'active'), ($2, 'member', 'active')`,
-      [actorEmail, memberEmail],
+       VALUES ($1, 'owner', 'active'), ($2, 'member', 'active'),
+         ($3, 'admin', 'active')`,
+      [actorEmail, memberEmail, successorEmail],
     )
     await pool.query(
       `INSERT INTO workspace_organizations (
@@ -72,9 +120,10 @@ async function seed(pool) {
          user_email, organization_id, role, status, is_default,
          created_by, updated_by
        ) VALUES
-         ($1, $3::uuid, 'owner', 'active', true, $1, $1),
-         ($2, $3::uuid, 'member', 'active', false, $1, $1)`,
-      [actorEmail, memberEmail, organizationId],
+         ($1, $4::uuid, 'owner', 'active', true, $1, $1),
+         ($2, $4::uuid, 'member', 'active', false, $1, $1),
+         ($3, $4::uuid, 'admin', 'active', false, $1, $1)`,
+      [actorEmail, memberEmail, successorEmail, organizationId],
     )
     await pool.query(
       `INSERT INTO operations_integration_accounts (
@@ -113,6 +162,7 @@ async function seed(pool) {
     accountId,
     accountGlobalId,
     memberEmail,
+    successorEmail,
     callbackUri: (
       'https://development.clawpilot.test/api/integrations/commerce/'
       + `shopify/webhooks/${accountGlobalId}`
@@ -144,7 +194,7 @@ function readiness(fixture) {
 }
 
 function prepareInput(fixture, overrides = {}) {
-  return {
+  const input = {
     organizationId: fixture.organizationId,
     accountGlobalId: fixture.accountGlobalId,
     integrationAccountId: fixture.accountId,
@@ -153,12 +203,15 @@ function prepareInput(fixture, overrides = {}) {
     shopDomain: 'pro-bakery-bites.myshopify.com',
     callbackUri: fixture.callbackUri,
     idempotencyKey: 'order-webhook-reconcile-03030001',
-    requestHash: sha('order-webhook-request-03030001'),
     confirmationHash: sha(
       `RECONCILE 7 ORDER WEBHOOKS FOR ${fixture.accountGlobalId}`,
     ),
     actorEmail,
     ...overrides,
+  }
+  return {
+    ...input,
+    requestHash: overrides.requestHash || requestHash(input),
   }
 }
 
@@ -172,18 +225,80 @@ async function exercise(pool) {
        AS applied`,
   )
   assert.equal(healthyMigration.rows[0].applied, true)
-  await pool.query(
-    `ALTER TABLE operations_shopify_order_webhook_attempts
-     DISABLE TRIGGER protect_shopify_order_webhook_attempt_write`,
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `CREATE OR REPLACE FUNCTION
+       public.operations_shopify_order_webhook_plan_is_valid(candidate jsonb)
+     RETURNS boolean LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+     AS 'SELECT true'`,
+    'weakened CREATE OR REPLACE function body',
   )
-  const disabledTrigger = await pool.query(
-    `SELECT (${health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL})
-       AS applied`,
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `ALTER TABLE public.operations_shopify_order_webhook_commands
+       DROP CONSTRAINT ops_shopify_order_webhook_command_profile_valid;
+     ALTER TABLE public.operations_shopify_order_webhook_commands
+       ADD CONSTRAINT ops_shopify_order_webhook_command_profile_valid
+       CHECK (true)`,
+    'same-named CHECK(true)',
   )
-  assert.equal(disabledTrigger.rows[0].applied, false)
-  await pool.query(
-    `ALTER TABLE operations_shopify_order_webhook_attempts
-     ENABLE TRIGGER protect_shopify_order_webhook_attempt_write`,
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `ALTER TABLE public.operations_shopify_order_webhook_attempts
+       DISABLE TRIGGER protect_shopify_order_webhook_attempt_write`,
+    'disabled provider-attempt trigger',
+  )
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `DROP TRIGGER protect_shopify_order_webhook_command_write
+       ON public.operations_shopify_order_webhook_commands;
+     CREATE TRIGGER protect_shopify_order_webhook_command_write
+       BEFORE INSERT OR UPDATE
+       ON public.operations_shopify_order_webhook_commands
+       FOR EACH ROW WHEN (false)
+       EXECUTE FUNCTION public.protect_shopify_order_webhook_command()`,
+    'WHEN(false) command trigger',
+  )
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `CREATE FUNCTION public.tampered_shopify_order_webhook_command()
+       RETURNS trigger LANGUAGE plpgsql
+       AS 'BEGIN RETURN NEW; END';
+     DROP TRIGGER protect_shopify_order_webhook_command_write
+       ON public.operations_shopify_order_webhook_commands;
+     CREATE TRIGGER protect_shopify_order_webhook_command_write
+       BEFORE INSERT OR UPDATE
+       ON public.operations_shopify_order_webhook_commands
+       FOR EACH ROW EXECUTE FUNCTION
+         public.tampered_shopify_order_webhook_command()`,
+    'same-named trigger rebound to a different function OID',
+  )
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `DROP INDEX public.ops_shopify_order_webhook_one_open_idx;
+     CREATE UNIQUE INDEX ops_shopify_order_webhook_one_open_idx
+       ON public.operations_shopify_order_webhook_commands (
+         organization_id, integration_account_id
+       ) WHERE status = 'prepared'`,
+    'one-open unique-index predicate drift',
+  )
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `CREATE SCHEMA health_lookalike;
+     CREATE TABLE health_lookalike.operations_shopify_order_webhook_commands (
+       id uuid PRIMARY KEY
+     );
+     ALTER TABLE public.operations_shopify_order_webhook_commands
+       RENAME TO operations_shopify_order_webhook_commands_displaced;
+     SET LOCAL search_path = health_lookalike, public`,
+    'foreign-schema table lookalike',
   )
   const persistence = loadTypeScriptModule(
     'app_src/lib/persistence/shopifyOrderWebhookReconciliation.ts',
@@ -191,6 +306,7 @@ async function exercise(pool) {
       '@/lib/integrations/shopifyOrderWebhook': {
         SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS: topics,
         SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS: includeFields,
+        shopifyOrderWebhookReconciliationRequestHash: requestHash,
       },
       '@/lib/persistence/postgres': postgresAdapter(pool),
     },
@@ -204,10 +320,64 @@ async function exercise(pool) {
     'member authorization',
   )
 
-  const prepared = await persistence
-    .prepareShopifyOrderWebhookReconciliationInPostgres(prepareInput(fixture))
+  const concurrentlyPrepared = await Promise.all([
+    persistence.prepareShopifyOrderWebhookReconciliationInPostgres(
+      prepareInput(fixture),
+    ),
+    persistence.prepareShopifyOrderWebhookReconciliationInPostgres(
+      prepareInput(fixture),
+    ),
+  ])
+  const prepared = concurrentlyPrepared[0]
   assert.equal(prepared.status, 'prepared')
-  assert.equal(prepared.replayed, false)
+  assert.equal(concurrentlyPrepared[1].commandId, prepared.commandId)
+  assert.deepEqual(
+    concurrentlyPrepared.map((state) => state.replayed).sort(),
+    [false, true],
+    'concurrent same-key preparation must create exactly one durable command',
+  )
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+         configuration, '{shopDomain}', '"drifted.myshopify.com"'::jsonb
+       )
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId],
+    ),
+    /dispatch binding cannot drift/u,
+    'prepared commands must fence account binding drift',
+  )
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_integration_accounts
+       SET global_id = 'gia0303099'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId],
+    ),
+    /dispatch binding cannot drift/u,
+    'prepared commands must fence the public account/callback identity',
+  )
+  await assert.rejects(
+    () => pool.query(
+      `DELETE FROM operations_commerce_credentials
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId],
+    ),
+    /credential cannot rotate/u,
+    'prepared commands must fence credential deletion',
+  )
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_shopify_order_webhook_commands
+       SET updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, prepared.commandId],
+    ),
+    /command transition is invalid/u,
+    'same-status open-command evidence must be immutable',
+  )
   const preparedReplay = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(prepareInput(fixture))
   assert.equal(preparedReplay.commandId, prepared.commandId)
@@ -286,6 +456,17 @@ async function exercise(pool) {
       readiness: ready,
     })
   assert.equal(completed.status, 'succeeded')
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_shopify_order_webhook_commands
+       SET completed_at = completed_at + interval '1 second',
+           error_code = 'SHOPIFY_ORDER_WEBHOOK_AUDIT_TAMPER'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, prepared.commandId],
+    ),
+    /command transition is invalid/u,
+    'same-status terminal timestamps and errors must be immutable',
+  )
   const terminalReplay = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(prepareInput(fixture))
   assert.equal(terminalReplay.status, 'succeeded')
@@ -304,7 +485,6 @@ async function exercise(pool) {
 
   const recoverableInput = prepareInput(fixture, {
     idempotencyKey: 'order-webhook-reconcile-03030002',
-    requestHash: sha('order-webhook-request-03030002'),
   })
   const recoverablePrepared = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(recoverableInput)
@@ -344,6 +524,17 @@ async function exercise(pool) {
     .prepareShopifyOrderWebhookReconciliationInPostgres(recoverableInput)
   assert.equal(remountedReplay.status, 'recoverable')
   assert.equal(remountedReplay.commandId, recoverablePrepared.commandId)
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_commerce_credentials
+       SET last_error_code = 'TEST_RECOVERABLE_CREDENTIAL_DRIFT'
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId],
+    ),
+    /credential cannot rotate/u,
+    'deterministic residual authority must fence credential drift',
+  )
   const deterministicReceipt = await pool.query(
     `SELECT provider_write_count,
             jsonb_array_length(completed_mutations) AS completed,
@@ -363,11 +554,51 @@ async function exercise(pool) {
     provider_references: 3,
   })
   const residualPlan = plan.slice(3)
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE app_user_organization_memberships
+       SET role = 'member', updated_by = $3
+       WHERE organization_id = $1::uuid AND user_email = $2`,
+      [fixture.organizationId, actorEmail, fixture.successorEmail],
+    ),
+    /command author cannot lose authority/u,
+    'the browser-key holder cannot lose authority while recovery is open',
+  )
+  const successorRecoveredKey = await persistence
+    .readOpenShopifyOrderWebhookRecoveryKeyInPostgres({
+      organizationId: fixture.organizationId,
+      accountGlobalId: fixture.accountGlobalId,
+      confirmationHash: recoverableInput.confirmationHash,
+      actorEmail: fixture.successorEmail,
+    })
+  assert.equal(
+    successorRecoveredKey,
+    recoverableInput.idempotencyKey,
+    'a current successor administrator must recover the exact open key read-only',
+  )
+  await expectCode(
+    () => persistence.readOpenShopifyOrderWebhookRecoveryKeyInPostgres({
+      organizationId: fixture.organizationId,
+      accountGlobalId: fixture.accountGlobalId,
+      confirmationHash: recoverableInput.confirmationHash,
+      actorEmail: fixture.memberEmail,
+    }),
+    'SHOPIFY_ORDER_WEBHOOK_ACCOUNT_FORBIDDEN',
+    'members cannot read open reconciliation keys',
+  )
+  const successorInput = prepareInput(fixture, {
+    idempotencyKey: recoverableInput.idempotencyKey,
+    actorEmail: fixture.successorEmail,
+  })
+  const successorReplay = await persistence
+    .prepareShopifyOrderWebhookReconciliationInPostgres(successorInput)
+  assert.equal(successorReplay.commandId, recoverablePrepared.commandId)
+  assert.equal(successorReplay.status, 'recoverable')
   const residualClaim = await persistence
     .claimShopifyOrderWebhookReconciliationInPostgres({
       organizationId: fixture.organizationId,
       commandId: recoverablePrepared.commandId,
-      actorEmail,
+      actorEmail: fixture.successorEmail,
       currentCallbackUri: fixture.callbackUri,
       mutationPlan: residualPlan,
     })
@@ -391,7 +622,7 @@ async function exercise(pool) {
     organizationId: fixture.organizationId,
     commandId: recoverablePrepared.commandId,
     attemptId: residualClaim.attemptId,
-    actorEmail,
+    actorEmail: fixture.successorEmail,
     outcome: 'succeeded',
     providerWriteCount: 4,
     providerReferences: residualCompletions.map((item) => item.providerId),
@@ -402,10 +633,22 @@ async function exercise(pool) {
     resultSnapshot: { ready: true, providerWrites: 4, deletionWrites: 0 },
     readiness: ready,
   })
-
+  const successorAudit = await pool.query(
+    `SELECT attempt.claimed_by, outcome.completed_by
+     FROM operations_shopify_order_webhook_attempts attempt
+     JOIN operations_shopify_order_webhook_outcomes outcome
+       ON outcome.organization_id = attempt.organization_id
+      AND outcome.provider_attempt_id = attempt.id
+     WHERE attempt.organization_id = $1::uuid AND attempt.id = $2::uuid
+       AND outcome.outcome_state = 'succeeded'`,
+    [fixture.organizationId, residualClaim.attemptId],
+  )
+  assert.deepEqual(successorAudit.rows[0], {
+    claimed_by: fixture.successorEmail,
+    completed_by: fixture.successorEmail,
+  })
   const uncertainInput = prepareInput(fixture, {
     idempotencyKey: 'order-webhook-reconcile-03030003',
-    requestHash: sha('order-webhook-request-03030003'),
   })
   const uncertainPrepared = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(uncertainInput)
@@ -439,6 +682,21 @@ async function exercise(pool) {
   const ambiguousRemount = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(uncertainInput)
   assert.equal(ambiguousRemount.status, 'unknown')
+  const movedCallbackUri = (
+    'https://moved.clawpilot.test/api/integrations/commerce/'
+    + `shopify/webhooks/${fixture.accountGlobalId}`
+  )
+  const callbackDriftUnknown = await persistence
+    .prepareShopifyOrderWebhookReconciliationInPostgres(prepareInput(fixture, {
+      idempotencyKey: uncertainInput.idempotencyKey,
+      callbackUri: movedCallbackUri,
+    }))
+  assert.equal(callbackDriftUnknown.status, 'unknown')
+  assert.equal(
+    callbackDriftUnknown.callbackUri,
+    fixture.callbackUri,
+    'an ambiguous prior command may only reconcile its original callback read-only',
+  )
   await expectCode(
     () => persistence.claimShopifyOrderWebhookReconciliationInPostgres({
       organizationId: fixture.organizationId,
@@ -468,7 +726,6 @@ async function exercise(pool) {
 
   const expiredInput = prepareInput(fixture, {
     idempotencyKey: 'order-webhook-reconcile-03030004',
-    requestHash: sha('order-webhook-request-03030004'),
   })
   const expiredPrepared = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(expiredInput)
@@ -480,13 +737,32 @@ async function exercise(pool) {
       currentCallbackUri: fixture.callbackUri,
       mutationPlan: [plan[0]],
     })
-  await pool.query(
-    `UPDATE operations_shopify_order_webhook_commands
-     SET processing_at = now() - interval '3 minutes',
-         processing_lease_expires_at = now() - interval '1 minute'
-     WHERE organization_id = $1::uuid AND id = $2::uuid`,
-    [fixture.organizationId, expiredPrepared.commandId],
+  await assert.rejects(
+    () => pool.query(
+      `UPDATE operations_shopify_order_webhook_commands
+       SET processing_at = now() - interval '3 minutes',
+           processing_lease_expires_at = now() - interval '1 minute'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, expiredPrepared.commandId],
+    ),
+    /command transition is invalid/u,
+    'same-status processing leases must be immutable',
   )
+  const clockClient = await pool.connect()
+  try {
+    await clockClient.query('SET session_replication_role = replica')
+    await clockClient.query(
+      `UPDATE operations_shopify_order_webhook_commands
+       SET processing_at = now() - interval '3 minutes',
+           processing_lease_expires_at = now() - interval '1 minute'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, expiredPrepared.commandId],
+    )
+  } finally {
+    await clockClient.query('SET session_replication_role = origin')
+      .catch(() => {})
+    clockClient.release()
+  }
   const expiredRemount = await persistence
     .prepareShopifyOrderWebhookReconciliationInPostgres(expiredInput)
   assert.equal(expiredRemount.status, 'processing')
@@ -516,6 +792,22 @@ async function exercise(pool) {
     resultSnapshot: { ready: true, providerWrites: 0, deletionWrites: 0 },
     readiness: ready,
   })
+  const callbackPreparedInput = prepareInput(fixture, {
+    idempotencyKey: 'order-webhook-reconcile-03030005',
+  })
+  const callbackPrepared = await persistence
+    .prepareShopifyOrderWebhookReconciliationInPostgres(callbackPreparedInput)
+  assert.equal(callbackPrepared.status, 'prepared')
+  const callbackClosed = await persistence
+    .prepareShopifyOrderWebhookReconciliationInPostgres(prepareInput(fixture, {
+      idempotencyKey: callbackPreparedInput.idempotencyKey,
+      callbackUri: movedCallbackUri,
+    }))
+  assert.equal(callbackClosed.status, 'failed')
+  assert.equal(
+    callbackClosed.errorCode,
+    'SHOPIFY_ORDER_WEBHOOK_CALLBACK_DRIFT_RESTART_REQUIRED',
+  )
   const outcomeCounts = await pool.query(
     `SELECT outcome_state, count(*)::integer AS count
      FROM operations_shopify_order_webhook_outcomes

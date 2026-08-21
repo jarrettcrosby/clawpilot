@@ -41,8 +41,25 @@ for (const required of [
   'protect_shopify_order_webhook_outcome_write',
   'protect_shopify_order_webhook_account_drift',
   'protect_shopify_order_webhook_credential_drift',
-  'ops_shopify_order_webhook_one_open_idx',
+  'protect_shopify_order_webhook_membership_drift',
 ]) assert.match(health, new RegExp(required, 'u'))
+for (const exactCatalogEvidence of [
+  'public.schema_migrations',
+  'public.operations_shopify_order_webhook_plan_is_valid(jsonb)',
+  'information_schema.columns',
+  'pg_get_function_result',
+  'pg_get_constraintdef',
+  'pg_get_indexdef',
+  'installed_index.indpred',
+  'installed_trigger.tgqual',
+  'installed_trigger.tgfoid =',
+  'pg_get_triggerdef',
+]) assert.match(health, new RegExp(
+  exactCatalogEvidence.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'),
+  'u',
+))
+assert.match(migration, /ops_shopify_order_webhook_one_open_idx/u)
+assert.doesNotMatch(health, /to_regclass\(required_table\.name\)/u)
 
 assert.match(route, /SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL/u)
 assert.match(

@@ -64,7 +64,9 @@ import { resolveCommerceSetupPermissionGuidance }
   from '@/lib/integrations/commerceSetupGuidance'
 import {
   clearShopifyOrderWebhookRecoveryDraft,
+  isShopifyOrderWebhookRecoveryKey,
   loadShopifyOrderWebhookRecoveryDraft,
+  resolveShopifyOrderWebhookRecovery,
   saveShopifyOrderWebhookRecoveryDraft,
 } from '@/lib/integrations/shopifyOrderWebhookRecovery'
 
@@ -267,6 +269,7 @@ type CommercePayload = {
   expiresAt?: string
   requestedScopes?: string[]
   credential?: RevealedCommerceCredential
+  recoveryIdempotencyKey?: string | null
 }
 
 type RevealedCommerceCredential = {
@@ -686,6 +689,7 @@ export default function CommerceIntegrationPanel({
   const [revealedCredential, setRevealedCredential] =
     useState<RevealedCommerceCredential | null>(null)
   const organizationIdRef = useRef(integrations.organizationId)
+  const orderWebhookRequestRef = useRef('')
   const [shopifyPreviews, setShopifyPreviews] = useState<
     Record<string, ShopifyOrderPreviewState>
   >({})
@@ -810,13 +814,19 @@ export default function CommerceIntegrationPanel({
 
   useEffect(() => {
     if (!integrations.organizationId || typeof window === 'undefined') return
+    let recoveryStorage: Storage
+    try {
+      recoveryStorage = window.sessionStorage
+    } catch {
+      return
+    }
     setOrderWebhookDrafts((current) => {
       const next = { ...current }
       let changed = false
       for (const account of integrations.accounts) {
         if (account.provider !== 'shopify' || next[account.globalId]) continue
         const recovered = loadShopifyOrderWebhookRecoveryDraft(
-          window.sessionStorage,
+          recoveryStorage,
           {
             organizationId: integrations.organizationId,
             accountGlobalId: account.globalId,
@@ -1147,6 +1157,10 @@ export default function CommerceIntegrationPanel({
 
   async function reconcileOrderWebhooks(account: CommerceAccount) {
     if (!canRevealCredentials || pendingAction) return
+    if (!account.webhookUrl) {
+      setError('The exact public Shopify callback is not available.')
+      return
+    }
     const expected = `RECONCILE 7 ORDER WEBHOOKS FOR ${account.globalId}`
     const draft = orderWebhookDrafts[account.globalId]
       || { confirmation: '', idempotencyKey: null }
@@ -1154,9 +1168,61 @@ export default function CommerceIntegrationPanel({
       setError(`Type exactly: ${expected}`)
       return
     }
-    const stableKey = draft.idempotencyKey || crypto.randomUUID()
+    if (orderWebhookRequestRef.current) return
+    orderWebhookRequestRef.current = account.globalId
+    const finishPending = () => {
+      orderWebhookRequestRef.current = ''
+      setPendingAction('')
+    }
+    let recoveredKey: string | null = null
+    if (!draft.idempotencyKey) {
+      setPendingAction(`reconcile-order-webhooks:${account.globalId}`)
+      setError('')
+      setNotice('')
+      try {
+        const recovery = await requestCommerce({
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'recover-shopify-order-webhook-command',
+            accountGlobalId: account.globalId,
+            confirmation: draft.confirmation,
+          }),
+        })
+        if (
+          recovery.recoveryIdempotencyKey !== null
+          && recovery.recoveryIdempotencyKey !== undefined
+          && !isShopifyOrderWebhookRecoveryKey(
+            recovery.recoveryIdempotencyKey,
+          )
+        ) {
+          throw new CommerceRequestError(
+            'ClawPilot received an invalid open-command recovery key.',
+            'SHOPIFY_ORDER_WEBHOOK_RECOVERY_KEY_INVALID',
+          )
+        }
+        recoveredKey = recovery.recoveryIdempotencyKey || null
+      } catch (requestError) {
+        finishPending()
+        setError(actionableCommerceError(requestError))
+        return
+      }
+    }
+    const stableKey = draft.idempotencyKey
+      || recoveredKey
+      || crypto.randomUUID()
+    let recoveryStorage: Storage
+    try {
+      recoveryStorage = window.sessionStorage
+    } catch {
+      finishPending()
+      setError(
+        'ClawPilot could not access safe retry storage for this tab; order webhooks were not changed.',
+      )
+      return
+    }
     const storedForRecovery = saveShopifyOrderWebhookRecoveryDraft(
-      window.sessionStorage,
+      recoveryStorage,
       {
         organizationId: integrations.organizationId,
         accountGlobalId: account.globalId,
@@ -1165,6 +1231,7 @@ export default function CommerceIntegrationPanel({
       },
     )
     if (!storedForRecovery) {
+      finishPending()
       setError(
         'ClawPilot could not store the safe retry key for this tab; order webhooks were not changed.',
       )
@@ -1174,27 +1241,111 @@ export default function CommerceIntegrationPanel({
       ...current,
       [account.globalId]: { ...draft, idempotencyKey: stableKey },
     }))
-    const saved = await action(
-      `reconcile-order-webhooks:${account.globalId}`,
-      {
-        action: 'reconcile-shopify-order-webhooks',
-        accountGlobalId: account.globalId,
-        confirmation: draft.confirmation,
+    const organizationId = integrations.organizationId
+    const recoveryIdentity = {
+      organizationId,
+      accountGlobalId: account.globalId,
+      credentialGeneration: account.credentialVersion,
+      callbackUri: account.webhookUrl,
+    }
+    setPendingAction(`reconcile-order-webhooks:${account.globalId}`)
+    setError('')
+    setNotice('')
+    const outcome = await resolveShopifyOrderWebhookRecovery({
+      identity: recoveryIdentity,
+      patch: async () => {
+        let response: Response
+        try {
+          response = await fetch('/api/integrations/commerce', {
+            cache: 'no-store',
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key': stableKey,
+            },
+            body: JSON.stringify({
+              action: 'reconcile-shopify-order-webhooks',
+              accountGlobalId: account.globalId,
+              confirmation: draft.confirmation,
+            }),
+          })
+        } catch (requestError) {
+          return {
+            status: null,
+            code: null,
+            message: requestError instanceof Error
+              ? requestError.message
+              : 'The reconciliation response was lost.',
+            payload: null,
+            transportError: true,
+            malformed: false,
+          }
+        }
+        let decoded: unknown
+        let malformed = false
+        try {
+          decoded = await response.json()
+        } catch {
+          decoded = null
+          malformed = true
+        }
+        const payload = decoded
+          && typeof decoded === 'object'
+          && !Array.isArray(decoded)
+          ? decoded as CommercePayload
+          : null
+        if (!payload || typeof payload.ok !== 'boolean') malformed = true
+        return {
+          status: response.status,
+          code: typeof payload?.code === 'string' ? payload.code : null,
+          message: typeof payload?.error === 'string'
+            ? payload.error
+            : response.ok
+              ? 'ClawPilot received an incomplete reconciliation response.'
+              : 'Shopify order webhook reconciliation failed.',
+          payload,
+          transportError: false,
+          malformed,
+        }
       },
-      `${account.displayName} order webhooks are registered with the minimized two-field JSON profile.`,
-      { 'Idempotency-Key': stableKey },
-    )
-    if (saved) {
-      clearShopifyOrderWebhookRecoveryDraft(window.sessionStorage, {
-        organizationId: integrations.organizationId,
+      refresh: () => requestCommerce(),
+    })
+    finishPending()
+    if (outcome.payload) applyPayload(outcome.payload as CommercePayload)
+    if (outcome.disposition === 'retain') {
+      setError(actionableCommerceError(new CommerceRequestError(
+        outcome.message,
+        outcome.code,
+      )))
+      return
+    }
+    const cleared = clearShopifyOrderWebhookRecoveryDraft(
+      recoveryStorage,
+      {
+        organizationId,
         accountGlobalId: account.globalId,
-      })
+      },
+    )
+    if (outcome.disposition === 'succeeded') {
       setOrderWebhookDrafts((current) => {
         const next = { ...current }
         delete next[account.globalId]
         return next
       })
+      setNotice(
+        `${account.displayName} order webhooks are registered with the exact minimized two-field JSON profile.${cleared ? '' : ' Browser recovery storage could not be cleared; close this tab before another attempt.'}`,
+      )
+      return
     }
+    setOrderWebhookDrafts((current) => {
+      const next = { ...current }
+      delete next[account.globalId]
+      return next
+    })
+    setError(actionableCommerceError(new CommerceRequestError(
+      `${outcome.message} The rejected command was released; review the refreshed account state and confirm again.${cleared ? '' : ' Browser recovery storage could not be cleared; close this tab before another attempt.'}`,
+      outcome.code,
+    )))
   }
 
   async function revealCredential(account: CommerceAccount) {

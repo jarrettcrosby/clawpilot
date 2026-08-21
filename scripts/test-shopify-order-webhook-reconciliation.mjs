@@ -91,9 +91,16 @@ for (const required of [
 ]) assert.match(source, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'))
 assert.doesNotMatch(source, /webhookSubscriptionDelete|deleteShopify/u)
 assert.match(route, /reconcile-shopify-order-webhooks/u)
+assert.match(route, /recover-shopify-order-webhook-command/u)
 assert.match(route, /requireShopifyOrderWebhookReconciler\(actor\)/u)
 assert.match(route, /requireIdempotencyKey\(req\)/u)
 assert.match(integration, /SHOPIFY_ORDER_WEBHOOK_OUTCOME_UNKNOWN/u)
+assert.match(integration, /recoveryDesiredUri = command\.status === 'unknown'/u)
+assert.match(integration, /\? command\.callbackUri/u)
+assert.match(
+  integration,
+  /SHOPIFY_ORDER_WEBHOOK_CALLBACK_DRIFT_RESTART_REQUIRED/u,
+)
 assert.match(integration, /markStaleShopifyOrderWebhookAttemptUnknownInPostgres/u)
 assert.match(integration, /revalidated\.credentialVersion !== runtime\.credentialVersion/u)
 assert.match(integration, /probe\.shopId !== runtime\.externalAccountId/u)
@@ -105,6 +112,11 @@ assert.match(integration, /read-only discovery/u)
 assert.match(migration, /attempts are immutable/u)
 assert.match(migration, /outcomes are immutable/u)
 assert.match(migration, /credential cannot rotate during dispatch/u)
+assert.match(migration, /command author cannot lose authority while recovery is open/u)
+assert.match(
+  migration,
+  /command\.status IN \('prepared', 'processing', 'recoverable', 'unknown'\)/u,
+)
 assert.doesNotMatch(migration, /DELETE FROM operations_shopify_order_webhook/u)
 for (const label of ['Desired ·', 'Current ·', 'Effective ·']) {
   assert.match(ui, new RegExp(label, 'u'))
@@ -155,6 +167,211 @@ assert.equal(recovery.loadShopifyOrderWebhookRecoveryDraft(
   sessionStorage,
   recoveryIdentity,
 ), null)
+assert.equal(recovery.saveShopifyOrderWebhookRecoveryDraft({
+  getItem() { return null },
+  setItem() { throw new Error('storage disabled') },
+  removeItem() {},
+}, {
+  ...recoveryIdentity,
+  confirmation: recoveryConfirmation,
+  idempotencyKey: 'order-webhooks-storage-error-0303',
+}), false, 'sessionStorage write exceptions must fail closed before dispatch')
+assert.equal(recovery.clearShopifyOrderWebhookRecoveryDraft({
+  getItem() { return null },
+  setItem() {},
+  removeItem() { throw new Error('storage disabled') },
+}, recoveryIdentity), false, 'sessionStorage removal exceptions must not escape')
+
+const exactRecoveryIdentity = {
+  ...recoveryIdentity,
+  credentialGeneration: 3,
+  callbackUri: (
+    'https://development.clawpilot.test/api/integrations/commerce/'
+    + `shopify/webhooks/${recoveryIdentity.accountGlobalId}`
+  ),
+}
+const exactRecoveryPayload = {
+  ok: true,
+  integrations: {
+    organizationId: recoveryIdentity.organizationId,
+    accounts: [{
+      globalId: recoveryIdentity.accountGlobalId,
+      provider: 'shopify',
+      status: 'active',
+      configured: true,
+      verificationStatus: 'verified',
+      credentialVersion: 3,
+      webhookUrl: exactRecoveryIdentity.callbackUri,
+      configuration: {
+        orderWebhookSubscriptions: {
+          accountGlobalId: recoveryIdentity.accountGlobalId,
+          credentialGeneration: 3,
+          desiredUri: exactRecoveryIdentity.callbackUri,
+          requiredTopics: [...recovery.SHOPIFY_ORDER_WEBHOOK_RECOVERY_TOPICS],
+          requiredIncludeFields: [
+            ...recovery.SHOPIFY_ORDER_WEBHOOK_RECOVERY_FIELDS,
+          ],
+          observedCount: 7,
+          matchingCount: 7,
+          missingTopics: [],
+          conflictingTopics: [],
+          subscriptionReady: true,
+          processorState: 'available',
+          exactReadProcessorReady: true,
+          scheduledPollBackstop: true,
+          discoveryState: 'succeeded',
+          discoveryErrorCode: null,
+          providerWrites: 0,
+          observedAt: new Date().toISOString(),
+          ready: true,
+        },
+      },
+    }],
+  },
+}
+assert.equal(
+  recovery.hasExactShopifyOrderWebhookRecoveryReadiness(
+    exactRecoveryPayload,
+    exactRecoveryIdentity,
+  ),
+  true,
+)
+for (const [label, mutate] of [
+  ['organization', (payload) => {
+    payload.integrations.organizationId = '03030000-0000-4000-8000-000000000099'
+  }],
+  ['credential', (payload) => {
+    payload.integrations.accounts[0].credentialVersion = 4
+  }],
+  ['callback', (payload) => {
+    payload.integrations.accounts[0].webhookUrl = 'https://wrong.test/webhook'
+  }],
+  ['seven-topic profile', (payload) => {
+    payload.integrations.accounts[0].configuration
+      .orderWebhookSubscriptions.requiredTopics.pop()
+  }],
+]) {
+  const changed = JSON.parse(JSON.stringify(exactRecoveryPayload))
+  mutate(changed)
+  assert.equal(
+    recovery.hasExactShopifyOrderWebhookRecoveryReadiness(
+      changed,
+      exactRecoveryIdentity,
+    ),
+    false,
+    `fresh readiness must remain bound to the exact ${label}`,
+  )
+}
+
+let refreshCalls = 0
+const controller = (patch, refreshed = { ok: true, integrations: {
+  organizationId: recoveryIdentity.organizationId,
+  accounts: [],
+} }) => recovery.resolveShopifyOrderWebhookRecovery({
+  identity: exactRecoveryIdentity,
+  patch: async () => patch,
+  refresh: async () => {
+    refreshCalls += 1
+    return refreshed
+  },
+})
+const deterministicConflict = await controller({
+  status: 409,
+  code: 'SHOPIFY_ORDER_WEBHOOK_IDEMPOTENCY_CONFLICT',
+  message: 'The key belongs to a different command.',
+  payload: { ok: false },
+  transportError: false,
+  malformed: false,
+})
+assert.equal(deterministicConflict.disposition, 'rejected')
+assert.equal(refreshCalls, 1, 'a definitive conflict must still reload state')
+const lostResponseRecovered = await controller({
+  status: null,
+  code: null,
+  message: 'connection reset after dispatch',
+  payload: null,
+  transportError: true,
+  malformed: false,
+}, exactRecoveryPayload)
+assert.equal(lostResponseRecovered.disposition, 'succeeded')
+assert.equal(refreshCalls, 2)
+for (const patch of [
+  {
+    status: 503,
+    code: 'COMMERCE_TEMPORARILY_UNAVAILABLE',
+    message: 'temporary failure',
+    payload: { ok: false },
+    transportError: false,
+    malformed: false,
+  },
+  {
+    status: 422,
+    code: 'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED',
+    message: 'three writes completed before deterministic rejection',
+    payload: { ok: false },
+    transportError: false,
+    malformed: false,
+  },
+  {
+    status: 400,
+    code: null,
+    message: 'malformed response',
+    payload: null,
+    transportError: false,
+    malformed: true,
+  },
+  {
+    status: 200,
+    code: null,
+    message: 'accepted without bound readiness',
+    payload: { ok: true },
+    transportError: false,
+    malformed: false,
+  },
+]) {
+  const retained = await controller(patch)
+  assert.equal(retained.disposition, 'retain')
+}
+const forbiddenBeforeDispatch = await controller({
+  status: 403,
+  code: 'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_FORBIDDEN',
+  message: 'Owner or administrator access is required.',
+  payload: { ok: false },
+  transportError: false,
+  malformed: false,
+})
+assert.equal(forbiddenBeforeDispatch.disposition, 'rejected')
+const forbiddenWithPreviouslyReadyProjection = await controller({
+  status: 403,
+  code: 'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_FORBIDDEN',
+  message: 'Owner or administrator access is required.',
+  payload: { ok: false },
+  transportError: false,
+  malformed: false,
+}, exactRecoveryPayload)
+assert.equal(
+  forbiddenWithPreviouslyReadyProjection.disposition,
+  'rejected',
+  'a definitive non-applied 4xx must require review even if prior state is ready',
+)
+const partialWithPreviouslyReadyProjection = await controller({
+  status: 422,
+  code: 'SHOPIFY_ORDER_WEBHOOK_MUTATION_REJECTED',
+  message: 'A deterministic residual command remains open.',
+  payload: { ok: false },
+  transportError: false,
+  malformed: false,
+}, exactRecoveryPayload)
+assert.equal(
+  partialWithPreviouslyReadyProjection.disposition,
+  'retain',
+  'a deterministic partial command keeps its exact key until server success',
+)
+assert.match(ui, /resolveShopifyOrderWebhookRecovery/u)
+assert.match(ui, /isShopifyOrderWebhookRecoveryKey/u)
+assert.match(ui, /recovery\.recoveryIdempotencyKey/u)
+assert.match(ui, /outcome\.disposition === 'retain'/u)
+assert.match(ui, /The rejected command was released/u)
 
 class MockCommerceRequestError extends Error {
   constructor(message, status = 400, code = 'COMMERCE_REQUEST_INVALID') {
@@ -165,6 +382,7 @@ class MockCommerceRequestError extends Error {
 }
 let apiActorRole = 'owner'
 const apiCalls = []
+const recoveryApiCalls = []
 const apiRoute = loadTypeScriptModule(
   'app_src/app/api/integrations/commerce/route.ts',
   {
@@ -187,6 +405,10 @@ const apiRoute = loadTypeScriptModule(
       async reconcileShopifyOrderWebhookSetup(input) {
         apiCalls.push(JSON.parse(JSON.stringify(input)))
         return { accounts: [], organizationId: input.organizationId }
+      },
+      async recoverShopifyOrderWebhookCommandKey(input) {
+        recoveryApiCalls.push(JSON.parse(JSON.stringify(input)))
+        return 'api-order-webhooks-existing-03030001'
       },
     },
     '@/lib/integrations/commerceCapabilities': {
@@ -259,6 +481,22 @@ const apiBody = {
   accountGlobalId: recoveryIdentity.accountGlobalId,
   confirmation: recoveryConfirmation,
 }
+const recoveredCommand = await apiRoute.PATCH(patchRequest({
+  action: 'recover-shopify-order-webhook-command',
+  accountGlobalId: recoveryIdentity.accountGlobalId,
+  confirmation: recoveryConfirmation,
+}))
+assert.equal(recoveredCommand.status, 200)
+assert.equal(
+  recoveredCommand.payload.recoveryIdempotencyKey,
+  'api-order-webhooks-existing-03030001',
+)
+assert.deepEqual(recoveryApiCalls[0], {
+  organizationId: recoveryIdentity.organizationId,
+  accountGlobalId: recoveryIdentity.accountGlobalId,
+  actorEmail: 'owner@clawpilot.test',
+  confirmation: recoveryConfirmation,
+})
 const apiSuccess = await apiRoute.PATCH(patchRequest(apiBody))
 assert.equal(apiSuccess.status, 200)
 assert.deepEqual(apiCalls[0], {

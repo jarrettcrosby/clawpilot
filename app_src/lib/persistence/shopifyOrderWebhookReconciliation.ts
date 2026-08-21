@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg'
 import {
   SHOPIFY_ORDER_SIGNAL_INCLUDE_FIELDS,
   SHOPIFY_ORDER_SIGNAL_WEBHOOK_TOPICS,
+  shopifyOrderWebhookReconciliationRequestHash,
   type ShopifyOrderWebhookMutationCompletion,
   type ShopifyOrderWebhookMutationPlanItem,
   type ShopifyOrderWebhookSubscriptionReadiness,
@@ -76,6 +77,8 @@ type BindingRow = {
 export type ShopifyOrderWebhookCommandState = Readonly<{
   commandId: string
   status: CommandStatus
+  requestHash: string
+  callbackUri: string
   processingLeaseExpired: boolean
   replayed: boolean
   resultSnapshot: Readonly<Record<string, unknown>> | null
@@ -154,6 +157,8 @@ function commandState(row: CommandRow, replayed: boolean): ShopifyOrderWebhookCo
   return Object.freeze({
     commandId: row.id,
     status: row.status,
+    requestHash: row.request_hash,
+    callbackUri: row.callback_uri,
     processingLeaseExpired: lease !== null
       && Number.isFinite(lease)
       && lease <= Date.now(),
@@ -345,18 +350,67 @@ export async function prepareShopifyOrderWebhookReconciliationInPostgres(
     )
     if (existing.rows[0]) {
       const row = existing.rows[0]
+      const originalRequestHash = shopifyOrderWebhookReconciliationRequestHash({
+        organizationId: row.organization_id,
+        accountGlobalId: row.integration_account_global_id,
+        integrationAccountId: row.integration_account_id,
+        credentialGeneration: row.credential_generation,
+        externalAccountId: row.external_account_id,
+        shopDomain: row.shop_domain,
+        desiredUri: row.callback_uri,
+        actorEmail: row.authorized_by,
+      })
+      const successorRequestHash = shopifyOrderWebhookReconciliationRequestHash({
+        organizationId,
+        accountGlobalId,
+        integrationAccountId,
+        credentialGeneration,
+        externalAccountId,
+        shopDomain,
+        desiredUri: callbackUri,
+        actorEmail: authorizedBy,
+      })
+      const callbackDrift = row.callback_uri !== callbackUri
       if (
-        row.request_hash !== requestHash
+        row.request_hash !== originalRequestHash
+        || requestHash !== successorRequestHash
         || row.confirmation_hash !== confirmationHash
-        || row.authorized_by !== authorizedBy
         || row.credential_generation !== credentialGeneration
         || row.external_account_id !== externalAccountId
         || row.shop_domain !== shopDomain
-        || row.callback_uri !== callbackUri
       ) {
         fail(
           'SHOPIFY_ORDER_WEBHOOK_IDEMPOTENCY_CONFLICT',
           'This Idempotency-Key was already used for different Shopify webhook authority',
+          409,
+        )
+      }
+      if (
+        callbackDrift
+        && (row.status === 'prepared' || row.status === 'recoverable')
+      ) {
+        const failed = await client.query<CommandRow>(
+          `UPDATE public.operations_shopify_order_webhook_commands
+           SET status = 'failed',
+               completed_at = clock_timestamp(),
+               error_code =
+                 'SHOPIFY_ORDER_WEBHOOK_CALLBACK_DRIFT_RESTART_REQUIRED',
+               updated_at = clock_timestamp()
+           WHERE organization_id = $1::uuid AND id = $2::uuid
+           RETURNING *, NULL::jsonb AS result_snapshot,
+             NULL::text AS outcome_state`,
+          [organizationId, row.id],
+        )
+        return commandState(failed.rows[0], true)
+      }
+      if (
+        callbackDrift
+        && row.status !== 'processing'
+        && row.status !== 'unknown'
+      ) {
+        fail(
+          'SHOPIFY_ORDER_WEBHOOK_IDEMPOTENCY_CONFLICT',
+          'This Idempotency-Key was already used for a different Shopify callback',
           409,
         )
       }
@@ -410,6 +464,61 @@ export async function prepareShopifyOrderWebhookReconciliationInPostgres(
       ],
     )
     return commandState(inserted.rows[0], false)
+  })
+}
+
+/**
+ * Read-only recovery of the one durable open-command key. The caller must be
+ * a current owner/admin on the exact active, verified Shopify binding. This
+ * lets a remounted tab or successor administrator resume the existing command
+ * instead of creating a blind second provider attempt.
+ */
+export async function readOpenShopifyOrderWebhookRecoveryKeyInPostgres(raw: {
+  organizationId: unknown
+  accountGlobalId: unknown
+  confirmationHash: unknown
+  actorEmail: unknown
+}) {
+  const organizationId = exactText(raw.organizationId, 'Organization', UUID, 64)
+  const accountGlobalId = exactText(
+    raw.accountGlobalId,
+    'Shopify account',
+    ACCOUNT_GLOBAL_ID,
+    32,
+  )
+  const confirmationHash = exactText(
+    raw.confirmationHash,
+    'Confirmation hash',
+    SHA256,
+    64,
+  )
+  const authorizedBy = actorEmail(raw.actorEmail)
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `shopify-order-webhook:${organizationId}:${accountGlobalId}`,
+    )
+    await binding(client, {
+      organizationId,
+      accountGlobalId,
+      actorEmail: authorizedBy,
+      lock: true,
+    })
+    const open = await client.query<{ idempotency_key: string }>(
+      `SELECT command.idempotency_key
+       FROM public.operations_shopify_order_webhook_commands command
+       WHERE command.organization_id = $1::uuid
+         AND command.integration_account_global_id = $2
+         AND command.confirmation_hash = $3
+         AND command.status IN (
+           'prepared', 'processing', 'recoverable', 'unknown'
+         )
+       ORDER BY command.prepared_at DESC, command.id DESC
+       LIMIT 1
+       FOR SHARE`,
+      [organizationId, accountGlobalId, confirmationHash],
+    )
+    return open.rows[0]?.idempotency_key || null
   })
 }
 
@@ -494,17 +603,17 @@ export async function claimShopifyOrderWebhookReconciliationInPostgres(input: {
         input.actorEmail,
       ],
     )
-    const processingAt = new Date()
     await client.query(
       `UPDATE operations_shopify_order_webhook_commands
        SET status = 'processing',
-           processing_at = $3::timestamptz,
-           processing_lease_expires_at = $3::timestamptz + interval '2 minutes',
+           processing_at = statement_timestamp(),
+           processing_lease_expires_at =
+             statement_timestamp() + interval '2 minutes',
            completed_at = NULL,
            error_code = NULL,
            updated_at = clock_timestamp()
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
-      [command.organization_id, command.id, processingAt.toISOString()],
+      [command.organization_id, command.id],
     )
     return Object.freeze({
       commandId: command.id,
@@ -651,22 +760,22 @@ export async function finalizeShopifyOrderWebhookReconciliationInPostgres(input:
         input.actorEmail,
       ],
     )
-    const completedAt = new Date().toISOString()
-    await client.query(
+    const completed = await client.query<{ completed_at: string | Date }>(
       `UPDATE operations_shopify_order_webhook_commands
        SET status = $3,
-           completed_at = $4::timestamptz,
-           error_code = $5,
+           completed_at = statement_timestamp(),
+           error_code = $4,
            updated_at = clock_timestamp()
-       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       RETURNING completed_at`,
       [
         input.organizationId,
         input.commandId,
         input.outcome,
-        completedAt,
         input.errorCode,
       ],
     )
+    const completedAt = new Date(completed.rows[0].completed_at).toISOString()
     if (
       (input.outcome === 'succeeded' || input.outcome === 'reconciled')
       && input.readiness?.ready === true

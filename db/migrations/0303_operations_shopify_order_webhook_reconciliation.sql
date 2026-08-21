@@ -5,7 +5,7 @@
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
 
-CREATE OR REPLACE FUNCTION operations_shopify_order_webhook_plan_is_valid(
+CREATE OR REPLACE FUNCTION public.operations_shopify_order_webhook_plan_is_valid(
   candidate jsonb
 )
 RETURNS boolean
@@ -53,10 +53,10 @@ AS $$
     );
 $$;
 
-CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_commands (
+CREATE TABLE IF NOT EXISTS public.operations_shopify_order_webhook_commands (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL
-    REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+    REFERENCES public.workspace_organizations(id) ON DELETE RESTRICT,
   integration_account_id uuid NOT NULL,
   integration_account_global_id text NOT NULL,
   credential_generation integer NOT NULL CHECK (credential_generation > 0),
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_commands (
       'unknown', 'reconciled'
     )
   ),
-  authorized_by text NOT NULL REFERENCES app_users(email) ON DELETE RESTRICT,
+  authorized_by text NOT NULL REFERENCES public.app_users(email) ON DELETE RESTRICT,
   authorized_role text NOT NULL CHECK (authorized_role IN ('owner', 'admin')),
   prepared_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   processing_at timestamptz,
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_commands (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT ops_shopify_order_webhook_command_account_fkey
     FOREIGN KEY (organization_id, integration_account_id)
-    REFERENCES operations_integration_accounts(organization_id, id)
+    REFERENCES public.operations_integration_accounts(organization_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT ops_shopify_order_webhook_command_org_id_unique
     UNIQUE (organization_id, id),
@@ -166,20 +166,20 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_commands (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS ops_shopify_order_webhook_one_open_idx
-  ON operations_shopify_order_webhook_commands (
+  ON public.operations_shopify_order_webhook_commands (
     organization_id, integration_account_id
   )
   WHERE status IN ('prepared', 'processing', 'recoverable', 'unknown');
 
 CREATE INDEX IF NOT EXISTS ops_shopify_order_webhook_command_recent_idx
-  ON operations_shopify_order_webhook_commands (
+  ON public.operations_shopify_order_webhook_commands (
     organization_id, prepared_at DESC, id DESC
   );
 
-CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_attempts (
+CREATE TABLE IF NOT EXISTS public.operations_shopify_order_webhook_attempts (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL
-    REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+    REFERENCES public.workspace_organizations(id) ON DELETE RESTRICT,
   command_id uuid NOT NULL,
   integration_account_id uuid NOT NULL,
   credential_generation integer NOT NULL CHECK (credential_generation > 0),
@@ -190,20 +190,20 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_attempts (
   attempt_number integer NOT NULL CHECK (attempt_number BETWEEN 1 AND 32),
   plan_hash text NOT NULL CHECK (plan_hash ~ '^[a-f0-9]{64}$'),
   mutation_plan jsonb NOT NULL CHECK (
-    operations_shopify_order_webhook_plan_is_valid(mutation_plan)
+    public.operations_shopify_order_webhook_plan_is_valid(mutation_plan)
   ),
   dispatch_state text NOT NULL DEFAULT 'authorized'
     CHECK (dispatch_state = 'authorized'),
-  claimed_by text NOT NULL REFERENCES app_users(email) ON DELETE RESTRICT,
+  claimed_by text NOT NULL REFERENCES public.app_users(email) ON DELETE RESTRICT,
   claimed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT ops_shopify_order_webhook_attempt_command_fkey
     FOREIGN KEY (organization_id, command_id)
-    REFERENCES operations_shopify_order_webhook_commands(organization_id, id)
+    REFERENCES public.operations_shopify_order_webhook_commands(organization_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT ops_shopify_order_webhook_attempt_account_fkey
     FOREIGN KEY (organization_id, integration_account_id)
-    REFERENCES operations_integration_accounts(organization_id, id)
+    REFERENCES public.operations_integration_accounts(organization_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT ops_shopify_order_webhook_attempt_number_unique
     UNIQUE (organization_id, command_id, attempt_number),
@@ -215,11 +215,11 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_attempts (
   )
 );
 
-ALTER TABLE operations_shopify_order_webhook_attempts
+ALTER TABLE public.operations_shopify_order_webhook_attempts
   ADD CONSTRAINT ops_shopify_order_webhook_attempt_org_id_unique
   UNIQUE (organization_id, id);
 
-CREATE OR REPLACE FUNCTION operations_shopify_order_webhook_refs_are_valid(
+CREATE OR REPLACE FUNCTION public.operations_shopify_order_webhook_refs_are_valid(
   candidate text[]
 )
 RETURNS boolean
@@ -236,7 +236,7 @@ AS $$
     );
 $$;
 
-CREATE OR REPLACE FUNCTION operations_shopify_order_webhook_completions_are_valid(
+CREATE OR REPLACE FUNCTION public.operations_shopify_order_webhook_completions_are_valid(
   candidate jsonb
 )
 RETURNS boolean
@@ -277,10 +277,10 @@ AS $$
     );
 $$;
 
-CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_outcomes (
+CREATE TABLE IF NOT EXISTS public.operations_shopify_order_webhook_outcomes (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id uuid NOT NULL
-    REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+    REFERENCES public.workspace_organizations(id) ON DELETE RESTRICT,
   command_id uuid NOT NULL,
   provider_attempt_id uuid NOT NULL,
   outcome_state text NOT NULL CHECK (
@@ -293,13 +293,13 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_outcomes (
   ),
   provider_references text[] NOT NULL DEFAULT '{}'::text[],
   completed_mutations jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (
-    operations_shopify_order_webhook_completions_are_valid(
+    public.operations_shopify_order_webhook_completions_are_valid(
       completed_mutations
     )
   ),
   stopped_mutation jsonb CHECK (
     stopped_mutation IS NULL
-    OR operations_shopify_order_webhook_plan_is_valid(
+    OR public.operations_shopify_order_webhook_plan_is_valid(
       jsonb_build_array(stopped_mutation)
     )
   ),
@@ -310,16 +310,16 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_outcomes (
   result_hash text NOT NULL CHECK (result_hash ~ '^[a-f0-9]{64}$'),
   result_snapshot jsonb NOT NULL CHECK (jsonb_typeof(result_snapshot) = 'object'),
   error_code text,
-  completed_by text NOT NULL REFERENCES app_users(email) ON DELETE RESTRICT,
+  completed_by text NOT NULL REFERENCES public.app_users(email) ON DELETE RESTRICT,
   completed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT ops_shopify_order_webhook_outcome_command_fkey
     FOREIGN KEY (organization_id, command_id)
-    REFERENCES operations_shopify_order_webhook_commands(organization_id, id)
+    REFERENCES public.operations_shopify_order_webhook_commands(organization_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT ops_shopify_order_webhook_outcome_attempt_fkey
     FOREIGN KEY (organization_id, provider_attempt_id)
-    REFERENCES operations_shopify_order_webhook_attempts(organization_id, id)
+    REFERENCES public.operations_shopify_order_webhook_attempts(organization_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT ops_shopify_order_webhook_outcome_attempt_state_unique
     UNIQUE (organization_id, provider_attempt_id, outcome_state),
@@ -357,13 +357,13 @@ CREATE TABLE IF NOT EXISTS operations_shopify_order_webhook_outcomes (
     )
   ),
   CONSTRAINT ops_shopify_order_webhook_outcome_references_valid CHECK (
-    operations_shopify_order_webhook_refs_are_valid(provider_references)
+    public.operations_shopify_order_webhook_refs_are_valid(provider_references)
     AND cardinality(provider_references) =
       jsonb_array_length(completed_mutations)
   )
 );
 
-CREATE OR REPLACE FUNCTION protect_shopify_order_webhook_command()
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_command()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -372,11 +372,11 @@ DECLARE
 BEGIN
   IF TG_OP = 'INSERT' THEN
     SELECT count(*) INTO binding_count
-    FROM operations_integration_accounts account
-    JOIN operations_commerce_credentials credential
+    FROM public.operations_integration_accounts account
+    JOIN public.operations_commerce_credentials credential
       ON credential.organization_id = account.organization_id
      AND credential.integration_account_id = account.id
-    JOIN app_user_organization_memberships membership
+    JOIN public.app_user_organization_memberships membership
       ON membership.organization_id = account.organization_id
      AND membership.user_email = NEW.authorized_by
      AND membership.status = 'active'
@@ -418,27 +418,67 @@ BEGIN
     RAISE EXCEPTION 'Shopify order webhook command identity is immutable';
   END IF;
   IF NOT (
-    (NEW.status = OLD.status)
-    OR (OLD.status = 'prepared' AND NEW.status IN ('processing', 'failed'))
+    (OLD.status = 'prepared' AND NEW.status IN ('processing', 'failed'))
     OR (OLD.status = 'processing' AND NEW.status IN (
       'recoverable', 'succeeded', 'failed', 'unknown'
     ))
     OR (OLD.status IN ('recoverable', 'unknown') AND NEW.status = 'processing')
     OR (OLD.status IN ('recoverable', 'unknown') AND NEW.status = 'reconciled')
+    OR (OLD.status = 'recoverable' AND NEW.status = 'failed')
   ) THEN
     RAISE EXCEPTION 'Shopify order webhook command transition is invalid';
+  END IF;
+  IF NEW.updated_at < OLD.updated_at
+     OR NEW.updated_at > clock_timestamp() + interval '5 minutes' THEN
+    RAISE EXCEPTION 'Shopify order webhook command audit time is invalid';
+  END IF;
+  IF OLD.status = 'prepared' AND NEW.status = 'processing' AND (
+    NEW.processing_at < OLD.prepared_at
+    OR NEW.processing_at > clock_timestamp() + interval '5 minutes'
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook processing evidence is invalid';
+  END IF;
+  IF OLD.status = 'prepared' AND NEW.status = 'failed' AND (
+    NEW.processing_at IS NOT NULL
+    OR NEW.processing_lease_expires_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook pre-dispatch failure is invalid';
+  END IF;
+  IF OLD.status = 'processing' AND ROW(
+    NEW.processing_at, NEW.processing_lease_expires_at
+  ) IS DISTINCT FROM ROW(
+    OLD.processing_at, OLD.processing_lease_expires_at
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook dispatch evidence is immutable';
+  END IF;
+  IF OLD.status IN ('recoverable', 'unknown')
+     AND NEW.status = 'reconciled'
+     AND ROW(
+       NEW.processing_at, NEW.processing_lease_expires_at
+     ) IS DISTINCT FROM ROW(
+       OLD.processing_at, OLD.processing_lease_expires_at
+     ) THEN
+    RAISE EXCEPTION 'Shopify order webhook recovery evidence is immutable';
+  END IF;
+  IF NEW.status IN (
+    'recoverable', 'succeeded', 'failed', 'unknown', 'reconciled'
+  ) AND (
+    NEW.completed_at < OLD.updated_at
+    OR NEW.completed_at > clock_timestamp() + interval '5 minutes'
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook completion evidence is invalid';
   END IF;
   RETURN NEW;
 END;
 $$;
 
 DROP TRIGGER IF EXISTS protect_shopify_order_webhook_command_write
-  ON operations_shopify_order_webhook_commands;
+  ON public.operations_shopify_order_webhook_commands;
 CREATE TRIGGER protect_shopify_order_webhook_command_write
-BEFORE INSERT OR UPDATE ON operations_shopify_order_webhook_commands
-FOR EACH ROW EXECUTE FUNCTION protect_shopify_order_webhook_command();
+BEFORE INSERT OR UPDATE ON public.operations_shopify_order_webhook_commands
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_command();
 
-CREATE OR REPLACE FUNCTION protect_shopify_order_webhook_attempt()
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_attempt()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -449,18 +489,17 @@ BEGIN
     RAISE EXCEPTION 'Shopify order webhook attempts are immutable';
   END IF;
   SELECT count(*) INTO command_count
-  FROM operations_shopify_order_webhook_commands command
-  JOIN operations_integration_accounts account
+  FROM public.operations_shopify_order_webhook_commands command
+  JOIN public.operations_integration_accounts account
     ON account.organization_id = command.organization_id
    AND account.id = command.integration_account_id
-  JOIN operations_commerce_credentials credential
+  JOIN public.operations_commerce_credentials credential
     ON credential.organization_id = account.organization_id
    AND credential.integration_account_id = account.id
-  JOIN app_user_organization_memberships membership
+  JOIN public.app_user_organization_memberships membership
     ON membership.organization_id = command.organization_id
    AND membership.user_email = NEW.claimed_by
    AND membership.status = 'active'
-   AND membership.role = command.authorized_role
    AND membership.role IN ('owner', 'admin')
   WHERE command.organization_id = NEW.organization_id
     AND command.id = NEW.command_id
@@ -471,10 +510,9 @@ BEGIN
     AND command.shop_domain = NEW.shop_domain
     AND command.callback_uri = NEW.callback_uri
     AND command.request_hash = NEW.request_hash
-    AND command.authorized_by = NEW.claimed_by
     AND NEW.attempt_number = (
       SELECT count(*) + 1
-      FROM operations_shopify_order_webhook_attempts existing
+      FROM public.operations_shopify_order_webhook_attempts existing
       WHERE existing.organization_id = NEW.organization_id
         AND existing.command_id = NEW.command_id
     )
@@ -493,12 +531,12 @@ END;
 $$;
 
 DROP TRIGGER IF EXISTS protect_shopify_order_webhook_attempt_write
-  ON operations_shopify_order_webhook_attempts;
+  ON public.operations_shopify_order_webhook_attempts;
 CREATE TRIGGER protect_shopify_order_webhook_attempt_write
-BEFORE INSERT OR UPDATE OR DELETE ON operations_shopify_order_webhook_attempts
-FOR EACH ROW EXECUTE FUNCTION protect_shopify_order_webhook_attempt();
+BEFORE INSERT OR UPDATE OR DELETE ON public.operations_shopify_order_webhook_attempts
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_attempt();
 
-CREATE OR REPLACE FUNCTION protect_shopify_order_webhook_outcome()
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_outcome()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -509,8 +547,8 @@ BEGIN
     RAISE EXCEPTION 'Shopify order webhook outcomes are immutable';
   END IF;
   SELECT count(*) INTO linked_count
-  FROM operations_shopify_order_webhook_commands command
-  JOIN operations_shopify_order_webhook_attempts attempt
+  FROM public.operations_shopify_order_webhook_commands command
+  JOIN public.operations_shopify_order_webhook_attempts attempt
     ON attempt.organization_id = command.organization_id
    AND attempt.command_id = command.id
   WHERE command.organization_id = NEW.organization_id
@@ -518,7 +556,7 @@ BEGIN
     AND attempt.id = NEW.provider_attempt_id
     AND NOT EXISTS (
       SELECT 1
-      FROM operations_shopify_order_webhook_attempts later
+      FROM public.operations_shopify_order_webhook_attempts later
       WHERE later.organization_id = attempt.organization_id
         AND later.command_id = attempt.command_id
         AND later.attempt_number > attempt.attempt_number
@@ -530,6 +568,16 @@ BEGIN
       OR (command.status IN ('recoverable', 'unknown')
           AND NEW.outcome_state = 'reconciled')
     );
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.app_user_organization_memberships membership
+    WHERE membership.organization_id = NEW.organization_id
+      AND membership.user_email = NEW.completed_by
+      AND membership.status = 'active'
+      AND membership.role IN ('owner', 'admin')
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook outcome lost current authority';
+  END IF;
   IF linked_count <> 1 THEN
     RAISE EXCEPTION 'Shopify order webhook outcome is not linked to authority';
   END IF;
@@ -538,27 +586,31 @@ END;
 $$;
 
 DROP TRIGGER IF EXISTS protect_shopify_order_webhook_outcome_write
-  ON operations_shopify_order_webhook_outcomes;
+  ON public.operations_shopify_order_webhook_outcomes;
 CREATE TRIGGER protect_shopify_order_webhook_outcome_write
-BEFORE INSERT OR UPDATE OR DELETE ON operations_shopify_order_webhook_outcomes
-FOR EACH ROW EXECUTE FUNCTION protect_shopify_order_webhook_outcome();
+BEFORE INSERT OR UPDATE OR DELETE ON public.operations_shopify_order_webhook_outcomes
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_outcome();
 
-CREATE OR REPLACE FUNCTION protect_shopify_order_webhook_binding_drift()
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_binding_drift()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM operations_shopify_order_webhook_commands command
+    FROM public.operations_shopify_order_webhook_commands command
     WHERE command.organization_id = OLD.organization_id
       AND command.integration_account_id = OLD.id
-      AND command.status = 'processing'
+      AND command.status IN ('prepared', 'processing', 'recoverable', 'unknown')
   ) AND ROW(
+    NEW.id, NEW.organization_id, NEW.global_id,
+    NEW.integration_type, NEW.provider,
     NEW.status, NEW.external_account_id,
     NEW.commerce_credential_generation,
     NEW.configuration->>'shopDomain'
   ) IS DISTINCT FROM ROW(
+    OLD.id, OLD.organization_id, OLD.global_id,
+    OLD.integration_type, OLD.provider,
     OLD.status, OLD.external_account_id,
     OLD.commerce_credential_generation,
     OLD.configuration->>'shopDomain'
@@ -570,38 +622,74 @@ END;
 $$;
 
 DROP TRIGGER IF EXISTS protect_shopify_order_webhook_account_drift
-  ON operations_integration_accounts;
+  ON public.operations_integration_accounts;
 CREATE TRIGGER protect_shopify_order_webhook_account_drift
-BEFORE UPDATE ON operations_integration_accounts
-FOR EACH ROW EXECUTE FUNCTION protect_shopify_order_webhook_binding_drift();
+BEFORE UPDATE ON public.operations_integration_accounts
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_binding_drift();
 
-CREATE OR REPLACE FUNCTION protect_shopify_order_webhook_credential_drift()
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_credential_drift()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM operations_shopify_order_webhook_commands command
+    FROM public.operations_shopify_order_webhook_commands command
     WHERE command.organization_id = OLD.organization_id
       AND command.integration_account_id = OLD.integration_account_id
-      AND command.status = 'processing'
-  ) AND NEW IS DISTINCT FROM OLD THEN
+      AND command.status IN ('prepared', 'processing', 'recoverable', 'unknown')
+  ) AND (TG_OP = 'DELETE' OR NEW IS DISTINCT FROM OLD) THEN
     RAISE EXCEPTION 'Shopify order webhook credential cannot rotate during dispatch';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
   END IF;
   RETURN NEW;
 END;
 $$;
 
 DROP TRIGGER IF EXISTS protect_shopify_order_webhook_credential_drift
-  ON operations_commerce_credentials;
+  ON public.operations_commerce_credentials;
 CREATE TRIGGER protect_shopify_order_webhook_credential_drift
-BEFORE UPDATE ON operations_commerce_credentials
-FOR EACH ROW EXECUTE FUNCTION protect_shopify_order_webhook_credential_drift();
+BEFORE UPDATE OR DELETE ON public.operations_commerce_credentials
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_credential_drift();
 
-COMMENT ON TABLE operations_shopify_order_webhook_commands IS
+CREATE OR REPLACE FUNCTION public.protect_shopify_order_webhook_membership_drift()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_order_webhook_commands command
+    WHERE command.organization_id = OLD.organization_id
+      AND command.authorized_by = OLD.user_email
+      AND command.status IN ('prepared', 'processing', 'recoverable', 'unknown')
+  ) AND (
+    TG_OP = 'DELETE'
+    OR NEW.organization_id IS DISTINCT FROM OLD.organization_id
+    OR NEW.user_email IS DISTINCT FROM OLD.user_email
+    OR NEW.status <> 'active'
+    OR NEW.role NOT IN ('owner', 'admin')
+  ) THEN
+    RAISE EXCEPTION 'Shopify order webhook command author cannot lose authority while recovery is open';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS protect_shopify_order_webhook_membership_drift
+  ON public.app_user_organization_memberships;
+CREATE TRIGGER protect_shopify_order_webhook_membership_drift
+BEFORE UPDATE OR DELETE ON public.app_user_organization_memberships
+FOR EACH ROW EXECUTE FUNCTION public.protect_shopify_order_webhook_membership_drift();
+
+COMMENT ON TABLE public.operations_shopify_order_webhook_commands IS
   'Durable idempotent owner/admin receipts for exact seven-topic Shopify order webhook reconciliation.';
-COMMENT ON TABLE operations_shopify_order_webhook_attempts IS
+COMMENT ON TABLE public.operations_shopify_order_webhook_attempts IS
   'Immutable initial and deterministic-residual provider mutation plans committed before Shopify dispatch; no delete action is representable.';
-COMMENT ON TABLE operations_shopify_order_webhook_outcomes IS
+COMMENT ON TABLE public.operations_shopify_order_webhook_outcomes IS
   'Append-only provider outcomes with completed mutation references and deterministic versus ambiguous stop classification.';
