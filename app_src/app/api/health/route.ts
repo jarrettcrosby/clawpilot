@@ -127,6 +127,204 @@ const FAIRE_SCOPE_CURRENT_PROSRC_SHA256 =
 const FAIRE_SCOPE_TRIGGER_PROSRC_SHA256 =
   '022f71dfd366bf18bc263d8dcfee07d96e9c4e199f797c25b085403105906a03'
 
+// Exact structural attestation for the development-only canonical Shopify
+// test-store lane. The migration checksum pins the DDL, while the function,
+// trigger, freshness, and single-active-workspace checks detect runtime drift.
+const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String.raw`
+  EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0302_operations_shopify_test_store_canonical_e2e.sql'
+      AND checksum =
+        '2e4a2d7b74322bcc4b2a8f5565c9e14da0c2d41961e25bbfd56edfd8c8e2d6cb'
+  )
+  AND (
+    SELECT count(installed.oid) = 2
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, installed_namespace.nspname,
+        installed.relkind::text, installed.relpersistence::text,
+        installed.relrowsecurity::text, installed.relforcerowsecurity::text
+      ), E'\n' ORDER BY required.table_name), 'UTF8'), 'sha256'), 'hex') =
+        'af98d5867718c9891b17d168f37b6358e7f1fbddd72fc5c8f378673c4497f830'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence'),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations')
+    ) required(table_name)
+    LEFT JOIN pg_catalog.pg_class installed
+      ON installed.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.relnamespace
+  )
+  AND (
+    SELECT count(*) = 38
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        table_row.relname, table_namespace.nspname,
+        installed.attname, installed.attnum::text,
+        pg_catalog.format_type(installed.atttypid, installed.atttypmod),
+        installed.attnotnull::text, installed.attidentity::text,
+        installed.attgenerated::text,
+        COALESCE(pg_catalog.pg_get_expr(
+          installed_default.adbin, installed_default.adrelid
+        ), ''),
+        COALESCE(installed_collation.collname, '')
+      ), E'\n' ORDER BY table_row.relname, installed.attnum),
+      'UTF8'), 'sha256'), 'hex') =
+        'f27b77a5a6f350dec333adb8ac04d5aafcf0bf1e8cb99f891ea4f56e581b62e0'
+    FROM pg_catalog.pg_attribute installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.attrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef installed_default
+      ON installed_default.adrelid = installed.attrelid
+     AND installed_default.adnum = installed.attnum
+    LEFT JOIN pg_catalog.pg_collation installed_collation
+      ON installed_collation.oid = installed.attcollation
+    WHERE installed.attnum > 0
+      AND NOT installed.attisdropped
+      AND installed.attrelid IN (
+        pg_catalog.to_regclass(
+          'public.operations_shopify_test_store_e2e_evidence'
+        ),
+        pg_catalog.to_regclass(
+          'public.operations_shopify_test_store_e2e_fulfillment_confirmations'
+        )
+      )
+  )
+  AND (
+    SELECT count(installed.oid) = 35
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, table_namespace.nspname,
+        installed.conname, installed.contype::text,
+        installed.convalidated::text, installed.condeferrable::text,
+        installed.condeferred::text,
+        trim(regexp_replace(pg_catalog.pg_get_constraintdef(installed.oid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.table_name, installed.conname),
+      'UTF8'), 'sha256'), 'hex') =
+        '59d38d75ae50f7f0de62639c1e82f8e04429e48ca72e3a6253297821f0c4c638'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence', NULL::text),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations', NULL::text),
+      ('operations_sandbox_commerce_e2e_authorizations',
+       'operations_sandbox_e2e_confirm_version_check')
+    ) required(table_name, constraint_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_constraint installed
+      ON installed.conrelid = table_row.oid
+     AND (
+       required.constraint_name IS NULL
+       OR installed.conname = required.constraint_name
+     )
+  )
+  AND (
+    SELECT count(installed.indexrelid) = 7
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        table_row.relname, table_namespace.nspname,
+        index_row.relname, index_namespace.nspname,
+        installed.indisunique::text, installed.indisprimary::text,
+        installed.indisvalid::text, installed.indisready::text,
+        trim(regexp_replace(pg_catalog.pg_get_indexdef(installed.indexrelid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY table_row.relname, index_row.relname),
+      'UTF8'), 'sha256'), 'hex') =
+        'e46f58b04972cbcaf0741c2a62b3ac1fc5d248f087eda1b85dce621b5a70c66d'
+    FROM pg_catalog.pg_index installed
+    JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = installed.indrelid
+    JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    JOIN pg_catalog.pg_class index_row
+      ON index_row.oid = installed.indexrelid
+    JOIN pg_catalog.pg_namespace index_namespace
+      ON index_namespace.oid = index_row.relnamespace
+    WHERE installed.indrelid IN (
+      pg_catalog.to_regclass(
+        'public.operations_shopify_test_store_e2e_evidence'
+      ),
+      pg_catalog.to_regclass(
+        'public.operations_shopify_test_store_e2e_fulfillment_confirmations'
+      )
+    ) OR installed.indexrelid = pg_catalog.to_regclass(
+      'public.operations_shopify_test_store_e2e_active_org_unique'
+    )
+  )
+  AND (
+    SELECT count(installed.oid) = 3
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.signature, installed_namespace.nspname,
+        language.lanname, installed.prokind::text,
+        installed.provolatile::text, installed.proparallel::text,
+        installed.proisstrict::text, installed.prosecdef::text,
+        installed.proleakproof::text,
+        pg_catalog.format_type(installed.prorettype, NULL),
+        installed.pronargs::text, installed.pronargdefaults::text,
+        COALESCE(array_to_string(installed.proconfig, ','), ''),
+        trim(regexp_replace(installed.prosrc, '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.signature),
+      'UTF8'), 'sha256'), 'hex') =
+        '7916b6b3bea6c7ded0f480fa653f7b21b2ae31f3e217f4520dc1493483bc429a'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_is_current(uuid,uuid,uuid)'),
+      ('protect_shopify_test_store_e2e_confirmation()'),
+      ('protect_shopify_test_store_e2e_evidence()')
+    ) required(signature)
+    LEFT JOIN pg_catalog.pg_proc installed
+      ON installed.oid = pg_catalog.to_regprocedure(
+        'public.' || required.signature
+      )
+    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed.pronamespace
+    LEFT JOIN pg_catalog.pg_language language
+      ON language.oid = installed.prolang
+  )
+  AND (
+    SELECT count(installed.oid) = 2
+      AND encode(digest(convert_to(string_agg(concat_ws('|',
+        required.table_name, table_namespace.nspname,
+        installed.tgname, installed.tgtype::text,
+        installed.tgenabled::text, installed.tgisinternal::text,
+        function_namespace.nspname || '.' || trigger_function.proname
+          || '(' || pg_catalog.pg_get_function_identity_arguments(
+            trigger_function.oid
+          ) || ')',
+        COALESCE(pg_catalog.pg_get_expr(
+          installed.tgqual, installed.tgrelid
+        ), ''),
+        trim(regexp_replace(pg_catalog.pg_get_triggerdef(installed.oid),
+          '[[:space:]]+', ' ', 'g'))
+      ), E'\n' ORDER BY required.table_name, installed.tgname),
+      'UTF8'), 'sha256'), 'hex') =
+        'fb376ea9ea5eedac159dc234b5f399e9b95d3e5e605b70491e4643d930afcf9d'
+    FROM (VALUES
+      ('operations_shopify_test_store_e2e_evidence',
+       'protect_shopify_test_store_e2e_evidence_write'),
+      ('operations_shopify_test_store_e2e_fulfillment_confirmations',
+       'protect_shopify_test_store_e2e_confirmation_write')
+    ) required(table_name, trigger_name)
+    LEFT JOIN pg_catalog.pg_class table_row
+      ON table_row.oid = pg_catalog.to_regclass(
+        'public.' || required.table_name
+      )
+    LEFT JOIN pg_catalog.pg_namespace table_namespace
+      ON table_namespace.oid = table_row.relnamespace
+    LEFT JOIN pg_catalog.pg_trigger installed
+      ON installed.tgrelid = table_row.oid
+     AND installed.tgname = required.trigger_name
+    LEFT JOIN pg_catalog.pg_proc trigger_function
+      ON trigger_function.oid = installed.tgfoid
+    LEFT JOIN pg_catalog.pg_namespace function_namespace
+      ON function_namespace.oid = trigger_function.pronamespace
+  )
+`
+
 // Exact structural attestation for 0293. The migration checksum pins the
 // backfill, the pg_proc hash pins strict policy validation, and the catalog
 // constraint hash prevents a same-named but weakened CHECK from passing.
@@ -2316,6 +2514,7 @@ export async function GET() {
           operations_shopify_shadow_test_subsidy_applied: boolean
           operations_shopify_quote_match_families_applied: boolean
           operations_sandbox_commerce_e2e_authorization_applied: boolean
+          operations_shopify_test_store_canonical_e2e_applied: boolean
           operations_commerce_active_canonical_collation_applied: boolean
           operations_sandbox_commerce_e2e_active_guards_applied: boolean
           operations_faire_sandbox_commerce_e2e_applied: boolean
@@ -3166,6 +3365,9 @@ export async function GET() {
                 WHERE filename =
                   '0198_operations_sandbox_commerce_e2e_authorization.sql'
               ) AS operations_sandbox_commerce_e2e_authorization_applied,
+              (
+                ${SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL}
+              ) AS operations_shopify_test_store_canonical_e2e_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -6066,6 +6268,7 @@ export async function GET() {
             && row?.operations_shopify_shadow_test_subsidy_applied
             && row?.operations_shopify_quote_match_families_applied
             && row?.operations_sandbox_commerce_e2e_authorization_applied
+            && row?.operations_shopify_test_store_canonical_e2e_applied
             && row?.operations_commerce_active_canonical_collation_applied
             && row?.operations_sandbox_commerce_e2e_active_guards_applied
             && row?.operations_faire_sandbox_commerce_e2e_applied
@@ -6137,6 +6340,14 @@ export async function GET() {
             status: row?.shopify_checkout_rate_control_applied
               ? 'ready'
               : 'migration-or-structure-pending',
+          },
+          shopifyTestStoreCanonicalE2e: {
+            status: row?.operations_shopify_test_store_canonical_e2e_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+            environment: 'development-only',
+            productionPostageAuthorized: false,
+            customerNotificationAuthorized: false,
           },
           shopifyLocationRouting: {
             status: row?.operations_shopify_location_routing_applied
@@ -6543,6 +6754,7 @@ export async function GET() {
           || !row?.operations_shopify_shadow_test_subsidy_applied
           || !row?.operations_shopify_quote_match_families_applied
           || !row?.operations_sandbox_commerce_e2e_authorization_applied
+          || !row?.operations_shopify_test_store_canonical_e2e_applied
           || !row?.operations_commerce_active_canonical_collation_applied
           || !row?.operations_sandbox_commerce_e2e_active_guards_applied
           || !row?.operations_faire_sandbox_commerce_e2e_applied

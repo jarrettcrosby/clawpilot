@@ -27,6 +27,9 @@ import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
 import {
+  requireActiveShopifyTestStoreCanonicalE2eAuthorization,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
+import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
@@ -478,7 +481,13 @@ function assertCreateContext(
   expectedRowVersion: number,
   authorizedSandboxE2e = false,
 ) {
-  if (context.order.activation_state !== 'active') {
+  if (
+    context.order.activation_state !== 'active'
+    && !(
+      context.order.activation_state === 'read_only'
+      && authorizedSandboxE2e
+    )
+  ) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
       'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
@@ -902,13 +911,26 @@ async function prepareAttempt(input: {
         context.order.id,
       )
       if (input.sandboxE2eAuthorizationGlobalId) {
-        await requireActiveSandboxCommerceE2eAuthorization(client, {
+        const authority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId: input.organizationId,
           authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
           orderGlobalId: input.orderGlobalId,
           actorEmail: input.actorEmail,
           packageGlobalId: input.packageGlobalId,
         })
+        if (
+          authority.confirmation_statement_version
+            === 'shopify-test-store-canonical-e2e-v1'
+        ) {
+          await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+            organizationId: input.organizationId,
+            authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
+            orderGlobalId: input.orderGlobalId,
+            actorEmail: input.actorEmail,
+            expectedOrderRowVersion: input.expectedRowVersion,
+            expectedOrderStatus: 'packed',
+          })
+        }
       }
       assertCreateContext(
         context,

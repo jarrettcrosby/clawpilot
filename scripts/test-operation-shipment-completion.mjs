@@ -918,12 +918,31 @@ async function verifyShipmentCompletion(databaseUrl) {
     const sandboxCommerceE2e = loadTypeScriptModule(
       'app_src/lib/operations/sandboxCommerceE2e.ts',
     )
+    const shopifyTestStoreConstants = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyTestStoreCanonicalE2e.ts',
+    )
+    const shopifyTestStorePersistence = loadTypeScriptModule(
+      'app_src/lib/persistence/shopifyTestStoreCanonicalE2e.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/shopifyOrderManagementRuntime': {
+            shopifyOrderManagementAccountAllowed: () => true,
+          },
+          '@/lib/operations/shopifyTestStoreCanonicalE2e':
+            shopifyTestStoreConstants,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const sandboxAuthorization = loadTypeScriptModule(
       'app_src/lib/persistence/sandboxCommerceE2eAuthorization.ts',
       {
         mocks: {
           '@/lib/auditWriter': auditWriter,
           '@/lib/operations/sandboxCommerceE2e': sandboxCommerceE2e,
+          '@/lib/persistence/shopifyTestStoreCanonicalE2e':
+            shopifyTestStorePersistence,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -1157,6 +1176,8 @@ async function verifyShipmentCompletion(databaseUrl) {
             async () => {},
         },
         '@/lib/persistence/sandboxCommerceE2eAuthorization': sandboxAuthorization,
+        '@/lib/persistence/shopifyTestStoreCanonicalE2e':
+          shopifyTestStorePersistence,
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,
@@ -1316,6 +1337,976 @@ async function verifyShipmentCompletion(databaseUrl) {
         revision,
       }
     }
+
+    const createCanonicalShopifyTestFixture = async (scenario) => {
+      const fixture = await createFixture(scenario, { unitsPerPackage: 1 })
+      const order = await advanceOrderToPacked(persistence, fixture, scenario)
+      await splitPackedOrderIntoTwoPackagesForFixture(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+      )
+      await addPackagingClaim(pool, fixture, order.planned.orderGlobalId)
+      await addSandboxLabelsForAllPackages(
+        pool,
+        fixture,
+        order.planned.orderGlobalId,
+      )
+      const context = await pool.query(
+        `SELECT source_order.id::text AS order_id,
+                source_order.row_version::text AS order_row_version,
+                source_order.pipeline_id::text AS pipeline_id,
+                source_order.integration_account_id::text AS account_id,
+                integration.global_id AS account_global_id,
+                plan.id::text AS plan_id,
+                plan.warehouse_id::text AS warehouse_id
+         FROM operations_orders source_order
+         JOIN operations_integration_accounts integration
+           ON integration.organization_id = source_order.organization_id
+          AND integration.id = source_order.integration_account_id
+         JOIN operations_fulfillment_plans plan
+           ON plan.organization_id = source_order.organization_id
+          AND plan.order_id = source_order.id
+         WHERE source_order.organization_id = $1::uuid
+           AND source_order.global_id = $2`,
+        [fixture.organizationId, order.planned.orderGlobalId],
+      )
+      assert.equal(context.rowCount, 1)
+      const source = context.rows[0]
+      const externalShopId = `gid://shopify/Shop/${Date.now()}1`
+      const externalOrderId = `gid://shopify/Order/${Date.now()}2`
+      const candidateSourceHash = 'c'.repeat(64)
+      const setup = await pool.connect()
+      let candidate
+      let activationRevision
+      try {
+        await setup.query('BEGIN')
+        await setup.query('SET LOCAL session_replication_role = replica')
+        await setup.query(
+          `UPDATE operations_integration_accounts
+           SET provider = 'shopify', integration_type = 'commerce',
+               environment = 'sandbox', status = 'active',
+               external_account_id = $3,
+               commerce_credential_generation = 1,
+               configuration = jsonb_build_object(
+                 'shopDomain', 'canonical-test.myshopify.com'
+               ),
+               updated_by = $4, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            externalShopId,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `INSERT INTO operations_commerce_credentials (
+             organization_id, integration_account_id, external_account_id,
+             auth_mode, credential_ciphertext, credential_iv, credential_tag,
+             credential_version, credential_identifier_last_four,
+             verification_status, verified_at, webhook_verification_status,
+             created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, 'shopify_client_credentials',
+             decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
+             decode(repeat('00', 16), 'hex'), 1, '0001', 'verified', now(),
+             'unverified', $4, $4
+           )`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            externalShopId,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `UPDATE operations_orders
+           SET source_provider = 'shopify', external_order_id = $3,
+               updated_by = $4, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            fixture.organizationId,
+            source.order_id,
+            externalOrderId,
+            fixture.email,
+          ],
+        )
+        const activation = await setup.query(
+          `UPDATE operations_activation_scopes
+           SET state = 'read_only', revision = revision + 1,
+               reason = 'Exact canonical Shopify test-store acceptance',
+               updated_by = $2, updated_at = now()
+           WHERE organization_id = $1::uuid
+           RETURNING revision`,
+          [fixture.organizationId, fixture.email],
+        )
+        activationRevision = activation.rows[0].revision
+        const run = await setup.query(
+          `INSERT INTO operations_commerce_intake_runs (
+             organization_id, integration_account_id, pipeline_id,
+             provider, resource, credential_version, provider_api_version,
+             normalizer_version, idempotency_key, request_hash, window_end,
+             workflow_state, records_seen, records_staged, records_ready,
+             records_promoted, canonical_orders_created,
+             provider_write_count, inventory_write_count,
+             reservation_write_count, fulfillment_write_count,
+             shipment_write_count, commerce_export_write_count,
+             completed_at, created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, 'shopify', 'orders', 1,
+             '2026-07', 'canonical-test-fixture-v1', $4, $5, now(),
+             'promoted', 1, 1, 0, 1, 1,
+             0, 0, 0, 0, 0, 0, now(), $6, $6
+           ) RETURNING id::text`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            source.pipeline_id,
+            `canonical-test-intake-${randomUUID()}`,
+            'a'.repeat(64),
+            fixture.email,
+          ],
+        )
+        const promotionReceipt = await setup.query(
+          `INSERT INTO operations_command_receipts (
+             organization_id, command_type, idempotency_key, request_hash,
+             actor_email, status, correlation_id, result_global_id,
+             result_payload, completed_at
+           ) VALUES (
+             $1::uuid, 'promote_commerce_order', $2, $3,
+             $4, 'succeeded', $5::uuid, $6,
+             jsonb_build_object('orderGlobalId', $6::text), now()
+           ) RETURNING id::text`,
+          [
+            fixture.organizationId,
+            `canonical-test-promote-${randomUUID()}`,
+            'b'.repeat(64),
+            fixture.email,
+            randomUUID(),
+            order.planned.orderGlobalId,
+          ],
+        )
+        candidate = (await setup.query(
+          `INSERT INTO operations_commerce_order_candidates (
+             organization_id, integration_account_id, pipeline_id, run_id,
+             provider, external_order_id, order_number_snapshot,
+             provider_order_status_raw, provider_financial_status_raw,
+             provider_fulfillment_status_raw, provider_return_status_raw,
+             normalized_order_status, normalized_payment_status,
+             normalized_fulfillment_status, normalized_return_status,
+             test_order, requires_shipping, currency_code, subtotal_minor,
+             shipping_minor, tax_minor, other_adjustment_minor, total_minor,
+             party_kind, party_snapshot_state, customer_resolution_state,
+             customer_match_method, customer_id,
+             ship_to_snapshot_state, ship_to_snapshot_source,
+             ship_to_snapshot_ciphertext, ship_to_snapshot_iv,
+             ship_to_snapshot_tag, ship_to_snapshot_hash,
+             ship_to_snapshot_encryption_version,
+             delivery_resolution_state, requested_delivery_at,
+             observed_at, source_revision,
+             source_hash, provider_api_version, normalizer_version,
+             workflow_state, blocking_codes, canonical_order_id,
+             promotion_command_receipt_id, promotion_idempotency_key,
+             promotion_request_hash, promoted_at,
+             row_version, created_by, updated_by, expires_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+             'shopify', $5, '#CANONICAL-TEST',
+             'open', 'paid', 'unfulfilled', 'none',
+             'open', 'paid', 'unfulfilled', 'none',
+             true, true, 'USD', 4900,
+             0, 0, 0, 4900,
+             'consumer', 'missing', 'resolved', 'exact_email', $9::uuid,
+             'confirmed', 'manual', decode('0102', 'hex'),
+             decode(repeat('01', 12), 'hex'), decode(repeat('02', 16), 'hex'),
+             repeat('f', 64), 1,
+             'manual', now() + interval '7 days',
+             now(), 'canonical-test-source-v1',
+             $6, '2026-07', 'canonical-test-fixture-v1',
+             'promoted', '{}'::text[], $7::uuid,
+             $10::uuid, 'canonical-test-promote', repeat('b', 64), now(),
+             1, $8, $8, now() + interval '1 day'
+           ) RETURNING id::text, global_id, row_version::text`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            source.pipeline_id,
+            run.rows[0].id,
+            externalOrderId,
+            candidateSourceHash,
+            source.order_id,
+            fixture.email,
+            fixture.customer.id,
+            promotionReceipt.rows[0].id,
+          ],
+        )).rows[0]
+        const cartonization = await setup.query(
+          `INSERT INTO operations_cartonization_rate_evidence (
+             organization_id, integration_account_id, order_candidate_id,
+             candidate_row_version, candidate_source_hash, warehouse_id,
+             destination_fingerprint,
+             evidence_mode, policy_version, algorithm_version,
+             request_hash, plan_input_hash, plan_result_hash,
+             plan_snapshot, assumption_snapshot, status,
+             idempotency_key, actor_email, write_token_hash, sealed_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid,
+             $4::bigint, $5, $6::uuid,
+             repeat('5', 64),
+             'operational', 'canonical-test-policy-v1',
+             'canonical-test-algorithm-v1',
+             repeat('1', 64), repeat('2', 64), repeat('3', 64),
+             jsonb_build_object('carrierReadEnvironment', 'sandbox'),
+             '{}'::jsonb, 'succeeded', $7, $8, repeat('4', 64), now()
+           ) RETURNING id::text`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            candidate.id,
+            candidate.row_version,
+            candidateSourceHash,
+            source.warehouse_id,
+            `canonical-test-evidence-${randomUUID()}`,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `UPDATE operations_fulfillment_plans
+           SET cartonization_evidence_id = $3::uuid
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [fixture.organizationId, source.plan_id, cartonization.rows[0].id],
+        )
+        await setup.query('COMMIT')
+      } catch (error) {
+        await setup.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        setup.release()
+      }
+      await postgres.withTransaction((client) => (
+        fulfillmentNotificationPolicy
+          .ensureShopifyFulfillmentNotificationPolicyWithClient(client, {
+            organizationId: fixture.organizationId,
+            integrationAccountId: source.account_id,
+            actorEmail: fixture.email,
+          })
+      ))
+      const proof = {
+        version:
+          shopifyTestStoreConstants.SHOPIFY_TEST_STORE_CANONICAL_E2E_PROOF_VERSION,
+        activationRevision,
+        accountGlobalId: source.account_global_id,
+        externalAccountId: externalShopId,
+        credentialGeneration: 1,
+        orderGlobalId: order.planned.orderGlobalId,
+        orderRowVersion: Number(source.order_row_version),
+        externalOrderId,
+        candidateGlobalId: candidate.global_id,
+        candidateRowVersion: Number(candidate.row_version),
+        candidateSourceRevision: 'canonical-test-source-v1',
+        candidateSourceHash,
+        providerOrderUpdatedAt: new Date(Date.now() - 60_000).toISOString(),
+        providerVerifiedAt: new Date().toISOString(),
+        test: true,
+      }
+      const authorizationInput = {
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.email,
+        idempotencyKey: `canonical-authorize-${randomUUID()}`,
+        confirmationStatement:
+          shopifyTestStoreConstants.SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
+        reason: 'Exact canonical Shopify test-store acceptance',
+        lifetimeMinutes: 120,
+        proof,
+      }
+      await assert.rejects(
+        () => shopifyTestStorePersistence
+          .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres(
+            authorizationInput,
+          ),
+        (error) => error?.code === 'SHOPIFY_TEST_E2E_RESUME_AUTHORITY_INVALID',
+        'A progressed order without prior exact authority must not enter the lane',
+      )
+      const rejectedResumeWrites = await pool.query(
+        `SELECT (
+           (SELECT count(*)
+            FROM operations_sandbox_commerce_e2e_authorizations auth
+            WHERE auth.organization_id = $1::uuid
+              AND auth.order_id = $2::uuid)
+           + (SELECT count(*)
+              FROM operations_shopify_test_store_e2e_evidence evidence
+              WHERE evidence.organization_id = $1::uuid
+                AND evidence.order_id = $2::uuid)
+         )::text AS write_count`,
+        [fixture.organizationId, source.order_id],
+      )
+      assert.equal(
+        Number(rejectedResumeWrites.rows[0].write_count),
+        0,
+        'Rejected progressed-order entry must create zero authorization writes',
+      )
+      const predecessor = await pool.connect()
+      try {
+        await predecessor.query('BEGIN')
+        await predecessor.query('SET LOCAL session_replication_role = replica')
+        await predecessor.query(
+          `WITH prior_authority AS (
+             INSERT INTO operations_sandbox_commerce_e2e_authorizations (
+               organization_id, order_id, external_order_id, state,
+               confirmation_statement_version, confirmation_hash, reason,
+               authorized_by, authorized_at, expires_at
+             ) VALUES (
+               $1::uuid, $2::uuid, $3, 'expired',
+               'shopify-test-store-canonical-e2e-v1', repeat('d', 64),
+               'Prior exact authorization for canonical resume acceptance',
+               $4, now() - interval '10 minutes', now() - interval '5 minutes'
+             )
+             RETURNING id, organization_id, order_id, confirmation_hash
+           )
+           INSERT INTO operations_shopify_test_store_e2e_evidence (
+             authorization_id, organization_id, confirmation_hash,
+             integration_account_id, account_global_id, external_account_id,
+             credential_generation, activation_revision,
+             order_id, order_global_id, external_order_id,
+             initial_order_row_version,
+             order_candidate_id, order_candidate_global_id,
+             order_candidate_row_version, order_candidate_source_revision,
+             order_candidate_source_hash, provider_proof_version,
+             provider_proof_hash, provider_order_updated_at,
+             provider_verified_at, provider_test,
+             authorization_idempotency_key, authorization_request_hash,
+             created_by
+           )
+           SELECT prior_authority.id, prior_authority.organization_id,
+                  prior_authority.confirmation_hash,
+                  $5::uuid, $6, $7, 1, $8::integer,
+                  prior_authority.order_id, $9, $3,
+                  $10::bigint,
+                  $11::uuid, $12, $13::bigint, $14, $15,
+                  'shopify-test-store-canonical-e2e-proof-v1', $16,
+                  $17::timestamptz, $18::timestamptz, true,
+                  'prior-canonical-authority-key', repeat('e', 64), $4
+           FROM prior_authority`,
+          [
+            fixture.organizationId,
+            source.order_id,
+            externalOrderId,
+            fixture.email,
+            source.account_id,
+            source.account_global_id,
+            externalShopId,
+            activationRevision,
+            order.planned.orderGlobalId,
+            source.order_row_version,
+            candidate.id,
+            candidate.global_id,
+            candidate.row_version,
+            'canonical-test-source-v1',
+            candidateSourceHash,
+            shopifyTestStorePersistence
+              .shopifyTestStoreCanonicalE2eProofHash(proof),
+            proof.providerOrderUpdatedAt,
+            proof.providerVerifiedAt,
+          ],
+        )
+        await predecessor.query('COMMIT')
+      } catch (error) {
+        await predecessor.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        predecessor.release()
+      }
+      const [authorization, replay] = await Promise.all([
+        shopifyTestStorePersistence
+          .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres(
+            authorizationInput,
+          ),
+        shopifyTestStorePersistence
+          .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres(
+            authorizationInput,
+          ),
+      ])
+      assert.equal(replay.authorizationGlobalId, authorization.authorizationGlobalId)
+      assert.deepEqual(
+        [authorization.replayed, replay.replayed].sort(),
+        [false, true],
+        'Concurrent exact authorization must create once and replay once',
+      )
+      await assert.rejects(
+        () => shopifyTestStorePersistence
+          .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+            ...authorizationInput,
+            reason: 'Conflicting semantics under a reused authorization key',
+          }),
+        (error) => error?.code === 'SHOPIFY_TEST_E2E_IDEMPOTENCY_CONFLICT',
+        'A reused authorization key with different semantics must fail closed',
+      )
+      const authorizationRow = await pool.query(
+        `SELECT auth.id::text, auth.global_id,
+                evidence.authorization_idempotency_key,
+                evidence.authorization_request_hash
+         FROM operations_sandbox_commerce_e2e_authorizations auth
+         JOIN operations_shopify_test_store_e2e_evidence evidence
+           ON evidence.organization_id = auth.organization_id
+          AND evidence.authorization_id = auth.id
+         WHERE auth.organization_id = $1::uuid AND auth.global_id = $2`,
+        [fixture.organizationId, authorization.authorizationGlobalId],
+      )
+      assert.equal(authorizationRow.rowCount, 1)
+      assert.equal(
+        authorizationRow.rows[0].authorization_idempotency_key,
+        authorizationInput.idempotencyKey,
+      )
+      assert.match(
+        authorizationRow.rows[0].authorization_request_hash,
+        /^[a-f0-9]{64}$/,
+      )
+      return {
+        fixture,
+        order,
+        source,
+        target: {
+          externalShopId,
+          externalOrderId,
+          activationRevision,
+          candidate,
+          candidateSourceHash,
+          proof,
+          authorizationInput,
+        },
+        authorization: authorizationRow.rows[0],
+      }
+    }
+
+    const canonical = await createCanonicalShopifyTestFixture(
+      'canonical-shopify-test-store',
+    )
+    const authorizationProviderPreparationBaseline =
+      shopifyFulfillmentPreparationCalls
+    const authorizationProviderExecutionBaseline =
+      shopifyFulfillmentExecutionCalls
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          ...canonical.target.authorizationInput,
+          proof: {
+            ...canonical.target.proof,
+            providerVerifiedAt: new Date(Date.now() - 6 * 60_000).toISOString(),
+            providerOrderUpdatedAt:
+              new Date(Date.now() - 7 * 60_000).toISOString(),
+          },
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_PROOF_STALE',
+      'Authorization must reject stale positive provider proof',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          ...canonical.target.authorizationInput,
+          proof: { ...canonical.target.proof, test: false },
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_PROVIDER_TEST_REQUIRED',
+      'Authorization must reject any proof other than exact test=true',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          ...canonical.target.authorizationInput,
+          reason: 'A different concurrent authorization must not coexist',
+          idempotencyKey: `canonical-authorize-conflict-${randomUUID()}`,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_ALREADY_ACTIVE',
+      'Only one exact canonical Shopify test-store authorization may be active',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: randomUUID(),
+          actorEmail: canonical.fixture.email,
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+      'Cross-organization authority must fail closed',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: canonical.fixture.email,
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: 'gor0000000',
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+      'Cross-order authority must fail closed',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: 'different-owner@example.com',
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
+      'Authorization must remain bound to the exact owner/admin actor',
+    )
+
+    const mutateCanonicalContext = async (sql, params = []) => {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(sql, params)
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    }
+    for (const activationState of ['disabled', 'frozen']) {
+      await mutateCanonicalContext(
+        `UPDATE operations_activation_scopes
+         SET state = $2
+         WHERE organization_id = $1::uuid`,
+        [canonical.fixture.organizationId, activationState],
+      )
+      await assert.rejects(
+        () => shopifyTestStorePersistence
+          .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+            organizationId: canonical.fixture.organizationId,
+            actorEmail: canonical.fixture.email,
+            authorizationGlobalId: canonical.authorization.global_id,
+            orderGlobalId: canonical.order.planned.orderGlobalId,
+            expectedOrderRowVersion: canonical.order.packed.rowVersion,
+          }),
+        (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_STALE',
+        `${activationState} must immediately invalidate exact Read-only authority`,
+      )
+      await mutateCanonicalContext(
+        `UPDATE operations_activation_scopes
+         SET state = 'read_only'
+         WHERE organization_id = $1::uuid`,
+        [canonical.fixture.organizationId],
+      )
+    }
+    await mutateCanonicalContext(
+      `WITH updated_account AS (
+         UPDATE operations_integration_accounts
+         SET commerce_credential_generation = 2
+         WHERE organization_id = $1::uuid AND id = $2::uuid
+         RETURNING id
+       )
+       UPDATE operations_commerce_credentials
+       SET credential_version = 2
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND EXISTS (SELECT 1 FROM updated_account)`,
+      [canonical.fixture.organizationId, canonical.source.account_id],
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: canonical.fixture.email,
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_STALE',
+      'Credential-generation drift must invalidate authority',
+    )
+    await mutateCanonicalContext(
+      `WITH updated_account AS (
+         UPDATE operations_integration_accounts
+         SET commerce_credential_generation = 1
+         WHERE organization_id = $1::uuid AND id = $2::uuid
+         RETURNING id
+       )
+       UPDATE operations_commerce_credentials
+       SET credential_version = 1
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND EXISTS (SELECT 1 FROM updated_account)`,
+      [canonical.fixture.organizationId, canonical.source.account_id],
+    )
+    await mutateCanonicalContext(
+      `UPDATE operations_commerce_order_candidates
+       SET source_hash = repeat('9', 64)
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [canonical.fixture.organizationId, canonical.target.candidate.id],
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: canonical.fixture.email,
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_STALE',
+      'Candidate-source drift must invalidate authority',
+    )
+    await mutateCanonicalContext(
+      `UPDATE operations_commerce_order_candidates
+       SET source_hash = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        canonical.fixture.organizationId,
+        canonical.target.candidate.id,
+        canonical.target.candidateSourceHash,
+      ],
+    )
+
+    const expireAndRenewCanonical = async (stage) => {
+      await mutateCanonicalContext(
+        `WITH expired_authorization AS (
+           UPDATE operations_sandbox_commerce_e2e_authorizations
+           SET authorized_at = now() - interval '10 minutes',
+               expires_at = now() - interval '5 minutes'
+           WHERE organization_id = $1::uuid AND id = $2::uuid
+           RETURNING id
+         ), updated_order AS (
+           UPDATE operations_orders
+           SET status = $3
+           WHERE organization_id = $1::uuid AND id = $4::uuid
+             AND EXISTS (SELECT 1 FROM expired_authorization)
+           RETURNING id
+         )
+         UPDATE operations_fulfillment_plans
+         SET status = CASE WHEN $3 = 'planned' THEN 'planned' ELSE 'released' END
+         WHERE organization_id = $1::uuid AND id = $5::uuid
+           AND EXISTS (SELECT 1 FROM updated_order)`,
+        [
+          canonical.fixture.organizationId,
+          canonical.authorization.id,
+          stage,
+          canonical.source.order_id,
+          canonical.source.plan_id,
+        ],
+      )
+      await assert.rejects(
+        () => shopifyTestStorePersistence
+          .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+            organizationId: canonical.fixture.organizationId,
+            actorEmail: canonical.fixture.email,
+            authorizationGlobalId: canonical.authorization.global_id,
+            orderGlobalId: canonical.order.planned.orderGlobalId,
+            expectedOrderRowVersion: canonical.order.packed.rowVersion,
+          }),
+        (error) => error?.code === 'SHOPIFY_TEST_E2E_AUTHORIZATION_EXPIRED',
+        `Expired ${stage} authority must fail closed before renewal`,
+      )
+      const verifiedAt = new Date()
+      const renewed = await shopifyTestStorePersistence
+        .persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          ...canonical.target.authorizationInput,
+          idempotencyKey: `canonical-renew-${stage}-${randomUUID()}`,
+          proof: {
+            ...canonical.target.proof,
+            providerVerifiedAt: verifiedAt.toISOString(),
+          },
+        })
+      const renewedRow = await pool.query(
+        `SELECT id::text, global_id
+         FROM operations_sandbox_commerce_e2e_authorizations
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [canonical.fixture.organizationId, renewed.authorizationGlobalId],
+      )
+      assert.equal(renewedRow.rowCount, 1)
+      canonical.authorization = renewedRow.rows[0]
+      await shopifyTestStorePersistence
+        .assertActiveShopifyTestStoreCanonicalE2eAuthorizationInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: canonical.fixture.email,
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+          expectedOrderStatus: stage,
+        })
+    }
+    await expireAndRenewCanonical('planned')
+    await expireAndRenewCanonical('released')
+    await expireAndRenewCanonical('packed')
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      authorizationProviderPreparationBaseline,
+      'Authorization, expiry, and renewal must not prepare a provider write',
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      authorizationProviderExecutionBaseline,
+      'Authorization, expiry, and renewal must not execute a provider write',
+    )
+    const canonicalConfirmation = await shopifyTestStorePersistence
+      .confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres({
+        organizationId: canonical.fixture.organizationId,
+        actorEmail: canonical.fixture.email,
+        idempotencyKey: 'canonical-fulfillment-confirmation-lost-response',
+        authorizationGlobalId: canonical.authorization.global_id,
+        orderGlobalId: canonical.order.planned.orderGlobalId,
+        expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        confirmationStatement:
+          shopifyTestStoreConstants.SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
+        reason: 'Reviewed exact sandbox labels for canonical acceptance',
+      })
+    assert.equal(canonicalConfirmation.notifyCustomer, false)
+    assert.equal(canonicalConfirmation.replayed, false)
+    const canonicalConfirmationReplay = await shopifyTestStorePersistence
+      .confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres({
+        organizationId: canonical.fixture.organizationId,
+        actorEmail: canonical.fixture.email,
+        idempotencyKey: 'canonical-fulfillment-confirmation-lost-response',
+        authorizationGlobalId: canonical.authorization.global_id,
+        orderGlobalId: canonical.order.planned.orderGlobalId,
+        expectedOrderRowVersion: canonical.order.packed.rowVersion,
+        confirmationStatement:
+          shopifyTestStoreConstants.SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
+        reason: 'Reviewed exact sandbox labels for canonical acceptance',
+      })
+    assert.equal(canonicalConfirmationReplay.replayed, true)
+    assert.equal(
+      canonicalConfirmationReplay.confirmationHash,
+      canonicalConfirmation.confirmationHash,
+      'An exact lost-response retry must replay the immutable confirmation',
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          actorEmail: canonical.fixture.email,
+          idempotencyKey: 'canonical-fulfillment-confirmation-lost-response',
+          authorizationGlobalId: canonical.authorization.global_id,
+          orderGlobalId: canonical.order.planned.orderGlobalId,
+          expectedOrderRowVersion: canonical.order.packed.rowVersion,
+          confirmationStatement:
+            shopifyTestStoreConstants.SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
+          reason: 'Conflicting semantics under the retained fulfillment key',
+        }),
+      (error) => error?.code
+        === 'SHOPIFY_TEST_E2E_FULFILLMENT_IDEMPOTENCY_CONFLICT',
+      'A retained fulfillment key must reject changed semantics',
+    )
+    const confirmedSnapshot = await pool.query(
+      `SELECT confirmation.label_evidence,
+              confirmation.label_evidence_hash,
+              confirmation.idempotency_key,
+              confirmation.request_hash
+       FROM operations_shopify_test_store_e2e_fulfillment_confirmations
+         confirmation
+       WHERE confirmation.organization_id = $1::uuid
+         AND confirmation.authorization_id = $2::uuid`,
+      [canonical.fixture.organizationId, canonical.authorization.id],
+    )
+    assert.equal(confirmedSnapshot.rowCount, 1)
+    assert.equal(
+      confirmedSnapshot.rows[0].idempotency_key,
+      'canonical-fulfillment-confirmation-lost-response',
+    )
+    assert.match(confirmedSnapshot.rows[0].request_hash, /^[a-f0-9]{64}$/)
+    const exactLabels = await pool.query(
+      `SELECT package.global_id AS "packageGlobalId",
+              label.global_id AS "labelGlobalId",
+              label.tracking_number AS "trackingNumber"
+       FROM operations_orders source_order
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = source_order.organization_id
+        AND plan.order_id = source_order.id
+       JOIN operations_packages package
+         ON package.organization_id = plan.organization_id
+        AND package.plan_id = plan.id
+       JOIN operations_labels label
+         ON label.organization_id = package.organization_id
+        AND label.package_id = package.id
+        AND label.status = 'created'
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2
+       ORDER BY package.package_number, package.id`,
+      [canonical.fixture.organizationId, canonical.order.planned.orderGlobalId],
+    )
+    assert.deepEqual(
+      confirmedSnapshot.rows[0].label_evidence,
+      exactLabels.rows,
+      'Second confirmation persists the exact package, label, and tracking snapshot',
+    )
+    const beforeDrift = await orderEvidence(
+      pool,
+      canonical.fixture,
+      canonical.order.planned.orderGlobalId,
+    )
+    const providerPreparationBeforeDrift = shopifyFulfillmentPreparationCalls
+    const providerExecutionBeforeDrift = shopifyFulfillmentExecutionCalls
+    const drift = await pool.connect()
+    let replacementLabelId
+    try {
+      await drift.query('BEGIN')
+      await drift.query('SET LOCAL session_replication_role = replica')
+      const replaced = await drift.query(
+        `UPDATE operations_labels
+         SET status = 'voided', voided_at = now(), voided_by = $3
+         WHERE organization_id = $1::uuid AND global_id = $2
+         RETURNING organization_id::text, package_id::text,
+                   carrier_rate_id::text, carrier, service_code,
+                   format, label_payload, redacted_provider_evidence`,
+        [
+          canonical.fixture.organizationId,
+          exactLabels.rows[0].labelGlobalId,
+          canonical.fixture.email,
+        ],
+      )
+      const old = replaced.rows[0]
+      const replacement = await drift.query(
+        `INSERT INTO operations_labels (
+           organization_id, package_id, carrier_rate_id, carrier,
+           service_code, tracking_number, format, label_payload,
+           provider_label_id, idempotency_key, status, environment,
+           redacted_provider_evidence
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4, $5,
+           'SANDBOX-REPLACED-AFTER-CONFIRMATION', $6, $7,
+           'replacement-provider-label', $8, 'created', 'sandbox', $9::jsonb
+         ) RETURNING id::text`,
+        [
+          canonical.fixture.organizationId,
+          old.package_id,
+          old.carrier_rate_id,
+          old.carrier,
+          old.service_code,
+          old.format,
+          old.label_payload,
+          `canonical-replacement-${randomUUID()}`,
+          JSON.stringify(old.redacted_provider_evidence),
+        ],
+      )
+      replacementLabelId = replacement.rows[0].id
+      await drift.query('COMMIT')
+    } catch (error) {
+      await drift.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      drift.release()
+    }
+    await assert.rejects(
+      () => persistence.confirmOperationsOrderShipmentFromPostgres({
+        organizationId: canonical.fixture.organizationId,
+        actorEmail: canonical.fixture.email,
+        orderGlobalId: canonical.order.planned.orderGlobalId,
+        expectedRowVersion: canonical.order.packed.rowVersion,
+        reason: 'Reject replacement after exact fulfillment confirmation',
+        idempotencyKey: `canonical-label-drift-${randomUUID()}`,
+        sandboxE2eAuthorizationGlobalId:
+          canonical.authorization.global_id,
+        expectedNotificationPolicyRevision: 1,
+      }),
+      (error) => (
+        error?.code === 'SHOPIFY_TEST_E2E_CONFIRMED_LABEL_EVIDENCE_CHANGED'
+      ),
+    )
+    const afterDrift = await orderEvidence(
+      pool,
+      canonical.fixture,
+      canonical.order.planned.orderGlobalId,
+    )
+    assert.deepEqual(
+      afterDrift,
+      beforeDrift,
+      'Label drift must produce zero order, shipment, inventory, or export mutation',
+    )
+    assert.equal(shopifyFulfillmentPreparationCalls, providerPreparationBeforeDrift)
+    assert.equal(shopifyFulfillmentExecutionCalls, providerExecutionBeforeDrift)
+    const restore = await pool.connect()
+    try {
+      await restore.query('BEGIN')
+      await restore.query('SET LOCAL session_replication_role = replica')
+      await restore.query(
+        `DELETE FROM operations_labels
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [canonical.fixture.organizationId, replacementLabelId],
+      )
+      await restore.query(
+        `UPDATE operations_labels
+         SET status = 'created', voided_at = NULL, voided_by = NULL
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [
+          canonical.fixture.organizationId,
+          exactLabels.rows[0].labelGlobalId,
+        ],
+      )
+      await restore.query('COMMIT')
+    } catch (error) {
+      await restore.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      restore.release()
+    }
+    const canonicalShipment = await persistence
+      .confirmOperationsOrderShipmentFromPostgres({
+        organizationId: canonical.fixture.organizationId,
+        actorEmail: canonical.fixture.email,
+        orderGlobalId: canonical.order.planned.orderGlobalId,
+        expectedRowVersion: canonical.order.packed.rowVersion,
+        reason: 'Confirm exact matched canonical Shopify test shipment',
+        idempotencyKey: `canonical-exact-shipment-${randomUUID()}`,
+        sandboxE2eAuthorizationGlobalId:
+          canonical.authorization.global_id,
+        expectedNotificationPolicyRevision: 1,
+      })
+    assert.equal(canonicalShipment.orderStatus, 'shipped')
+    assert.equal(canonicalShipment.customerNotification.notifyCustomer, false)
+    assert.equal(shopifyFulfillmentExecutionCalls, providerExecutionBeforeDrift + 1)
+    await mutateCanonicalContext(
+      `UPDATE operations_commerce_fulfillment_exports
+       SET state = 'processing', completed_at = NULL,
+           provider_reference = NULL, error_code = NULL, error_message = NULL
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        canonical.fixture.organizationId,
+        canonicalShipment.commerceExportGlobalId,
+      ],
+    )
+    const exactProviderClaim = await shopifyTestStorePersistence
+      .requireShopifyTestStoreFulfillmentWriteClaimInPostgres({
+        organizationId: canonical.fixture.organizationId,
+        accountGlobalId: canonical.source.account_global_id,
+        externalOrderId: canonical.target.externalOrderId,
+        authorizationGlobalId: canonical.authorization.global_id,
+        commerceExportGlobalId: canonicalShipment.commerceExportGlobalId,
+      })
+    assert.equal(exactProviderClaim.notifyCustomer, false)
+    assert.equal(exactProviderClaim.credentialGeneration, 1)
+    const providerClaimPreparationBaseline = shopifyFulfillmentPreparationCalls
+    const providerClaimExecutionBaseline = shopifyFulfillmentExecutionCalls
+    await mutateCanonicalContext(
+      `UPDATE operations_labels
+       SET status = 'voided', voided_at = now(), voided_by = $3
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        canonical.fixture.organizationId,
+        exactLabels.rows[0].labelGlobalId,
+        canonical.fixture.email,
+      ],
+    )
+    await assert.rejects(
+      () => shopifyTestStorePersistence
+        .requireShopifyTestStoreFulfillmentWriteClaimInPostgres({
+          organizationId: canonical.fixture.organizationId,
+          accountGlobalId: canonical.source.account_global_id,
+          externalOrderId: canonical.target.externalOrderId,
+          authorizationGlobalId: canonical.authorization.global_id,
+          commerceExportGlobalId: canonicalShipment.commerceExportGlobalId,
+        }),
+      (error) => error?.code === 'SHOPIFY_TEST_E2E_FULFILLMENT_CLAIM_INVALID',
+      'Voiding a confirmed label must invalidate the pre-provider claim',
+    )
+    assert.equal(shopifyFulfillmentPreparationCalls, providerClaimPreparationBaseline)
+    assert.equal(shopifyFulfillmentExecutionCalls, providerClaimExecutionBaseline)
 
     const policyFixture = await seedWorkspace(pool, 'notification-policy')
     const shopifyAccount = await pool.query(
@@ -2295,13 +3286,21 @@ async function verifyShipmentCompletion(databaseUrl) {
       sandboxE2eAuthorizationGlobalId: authorizationGlobalId,
       expectedNotificationPolicyRevision: 0,
     }
+    const authorizedPreparationCallsBefore = shopifyFulfillmentPreparationCalls
+    const authorizedExecutionCallsBefore = shopifyFulfillmentExecutionCalls
     const authorizedResult = await persistence.confirmOperationsOrderShipmentFromPostgres(
       authorizedInput,
     )
     assert.equal(authorizedResult.orderStatus, 'shipped')
     assert.equal(authorizedResult.replayed, false)
-    assert.equal(shopifyFulfillmentPreparationCalls, 1)
-    assert.equal(shopifyFulfillmentExecutionCalls, 1)
+    assert.equal(
+      shopifyFulfillmentPreparationCalls,
+      authorizedPreparationCallsBefore + 1,
+    )
+    assert.equal(
+      shopifyFulfillmentExecutionCalls,
+      authorizedExecutionCallsBefore + 1,
+    )
     const authorizedProviderAttempt = await pool.query(
       `SELECT state, attempt_number, external_object_id, redacted_request,
               provider_reference, error_code

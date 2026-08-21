@@ -85,6 +85,16 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           },
         }
       }
+      if (specifier === '@/lib/persistence/shopifyTestStoreCanonicalE2e') {
+        return {
+          async requireActiveShopifyTestStoreCanonicalE2eAuthorization() {
+            throw new Error('Unexpected Shopify test-store authorization')
+          },
+          async requireExactShopifyTestStoreConfirmedLabelSnapshot() {
+            throw new Error('Unexpected Shopify test-store label confirmation')
+          },
+        }
+      }
       if (
         specifier
         === '@/lib/integrations/commerceFaireAutomaticPromotion'

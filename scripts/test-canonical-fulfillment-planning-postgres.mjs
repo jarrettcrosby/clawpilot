@@ -3275,6 +3275,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/persistence/commerceStoreSync': {
             readCommerceStoreSyncControlsFromPostgres: async () => [],
           },
+          '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+            requireActiveShopifyTestStoreCanonicalE2eAuthorization: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize a Shopify test-store E2E lane',
+              )
+            },
+            requireExactShopifyTestStoreConfirmedLabelSnapshot: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not confirm Shopify test-store labels',
+              )
+            },
+          },
           '@/lib/persistence/crm': {
             stageCrmRecordWithClient: async () => {
               throw new Error(

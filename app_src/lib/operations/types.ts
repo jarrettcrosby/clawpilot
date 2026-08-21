@@ -763,6 +763,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     authorizationGlobalId: string
     authorizedAt: string
     expiresAt: string
+    authorityKind: 'legacy_packed' | 'shopify_test_store_canonical'
+    fulfillmentConfirmedAt: string | null
   } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
   planningPreparation: {

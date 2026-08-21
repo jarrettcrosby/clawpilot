@@ -125,6 +125,10 @@ import {
   type CommerceActiveInitialSelection,
 } from '@/lib/operations/commerceActiveSelection'
 import { SANDBOX_COMMERCE_E2E_CONFIRMATION } from '@/lib/operations/sandboxCommerceE2e'
+import {
+  SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
+  SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
+} from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import type {
   PackagingMaterial,
@@ -142,6 +146,36 @@ type SandboxCommerceE2eAuthorizationResult = {
   expiresAt: string
   consumedAt: string | null
   consumedBy: string | null
+}
+
+type ShopifyTestStoreAuthorizationCommand = {
+  orderGlobalId: string
+  expectedRowVersion: number
+  confirmationStatement:
+    typeof SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
+  reason: string
+  lifetimeMinutes: 120
+  idempotencyKey: string
+}
+
+type ShopifyTestStoreFulfillmentCommand = {
+  authorizationGlobalId: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  confirmationStatement: typeof SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+  reason: string
+  idempotencyKey: string
+}
+
+class ShopifyTestStoreCommandHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+  ) {
+    super(message)
+    this.name = 'ShopifyTestStoreCommandHttpError'
+  }
 }
 
 type ProviderOrderCancellationCommand = {
@@ -1003,6 +1037,7 @@ function OrderDetailDrawer({
   onConfirmShipment,
   onRetryCommerceExport,
   onAuthorizeSandboxE2e,
+  onConfirmShopifyTestFulfillment,
   onCreateSandboxLabel,
   onVoidSandboxLabel,
   onRefreshOneOffPackedRates,
@@ -1044,6 +1079,7 @@ function OrderDetailDrawer({
     reconciliationPending: boolean,
   ) => void
   onAuthorizeSandboxE2e: () => void
+  onConfirmShopifyTestFulfillment: () => void
   onCreateSandboxLabel: (packageGlobalId?: string) => void
   onVoidSandboxLabel: () => void
   onRefreshOneOffPackedRates: () => void
@@ -1070,11 +1106,24 @@ function OrderDetailDrawer({
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
   const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
+  const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
+  const canonicalShopifyTestLane = Boolean(
+    activationState === 'read_only'
+    && order?.sourceProvider === 'shopify',
+  )
+  const canonicalShopifyAuthorization =
+    sandboxE2eAuthorization?.authorityKind === 'shopify_test_store_canonical'
+      ? sandboxE2eAuthorization
+      : null
   const canPlanImportedOrder = Boolean(
     activationState !== 'shadow'
     && order?.status === 'imported'
     && order.sourceProvider
-    && order.sourceProvider !== 'mock-commerce',
+    && order.sourceProvider !== 'mock-commerce'
+    && (
+      activationState !== 'read_only'
+      || Boolean(canonicalShopifyAuthorization)
+    ),
   )
   const shadowProviderOrder = Boolean(
     activationState === 'shadow'
@@ -1123,13 +1172,13 @@ function OrderDetailDrawer({
   const activeLabel = order?.packages
     .map((item) => item.latestLabel)
     .find((label) => label?.status === 'created') || null
-  const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
   const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
     && Boolean(order.oneOffShippingMode)
   const activeExecutionRequiredReason = activationState !== 'active'
+    && !(activationState === 'read_only' && canonicalShopifyAuthorization)
     ? 'Order label create and void actions require Operations Active mode. To test a sandbox carrier account and printer while this workspace is in Shadow, use Shipping Settings → Sandbox / Developer; that diagnostic does not ship or update this order.'
     : null
   const createBlockedReason = activeExecutionRequiredReason
@@ -1169,11 +1218,24 @@ function OrderDetailDrawer({
     : !order?.sourceProvider
       || !['shopify', 'faire'].includes(order.sourceProvider)
       ? 'Sandbox commerce E2E authorization requires a Shopify or Faire order.'
-      : order.status !== 'packed'
-        ? 'Verify every package before authorizing the test.'
+      : canonicalShopifyTestLane
+        && !['imported', 'planned', 'released', 'picking', 'packed'].includes(order.status)
+        ? 'This Shopify test order is no longer at a resumable local stage.'
+        : !canonicalShopifyTestLane && order.status !== 'packed'
+          ? 'Verify every package before authorizing the test.'
         : shipments.length > 0
           ? 'This order already has shipment evidence.'
           : null
+  const canonicalLabelsReady = Boolean(
+    canonicalShopifyAuthorization
+    && order?.status === 'packed'
+    && order.packages.length > 0
+    && order.packages.every((item) => (
+      item.latestLabel?.status === 'created'
+      && item.latestLabel.environment === 'sandbox'
+      && Boolean(item.latestLabel.trackingNumber)
+    )),
+  )
   const voidBlockedReason = activeExecutionRequiredReason
     || (!canExecute
       ? 'You do not have permission to void carrier labels.'
@@ -1640,42 +1702,87 @@ function OrderDetailDrawer({
               </Stack> : <Typography variant="body2" color="text.secondary">No carrier rates have been recorded.</Typography>}
             </DetailSection>
 
-            {['shopify', 'faire'].includes(order.sourceProvider || '')
-              && order.status === 'packed' && (
-              <DetailSection title="Authorized sandbox commerce E2E">
+            {(
+              canonicalShopifyTestLane
+              || (
+                ['shopify', 'faire'].includes(order.sourceProvider || '')
+                && order.status === 'packed'
+              )
+            ) && (
+              <DetailSection title={canonicalShopifyTestLane
+                ? 'Verified Shopify test-store workflow'
+                : 'Authorized sandbox commerce E2E'}>
                 {sandboxE2eAuthorization ? (
-                  <Alert
-                    severity="success"
-                    data-testid="sandbox-commerce-e2e-authorization-active"
-                  >
-                    Exact-order authorization{' '}
-                    {sandboxE2eAuthorization.authorizationGlobalId} is active until{' '}
-                    {formatUserDateTime(
-                      sandboxE2eAuthorization.expiresAt,
-                      dateTime,
-                      {
-                        year: 'numeric',
-                        month: 'short',
-                        day: 'numeric',
-                        hour: 'numeric',
-                        minute: '2-digit',
-                        fallback: sandboxE2eAuthorization.expiresAt,
-                      },
-                    )}. It permits only this order&apos;s package-specific sandbox
-                    labels, reserved-inventory consumption, and {order.sourceProvider === 'faire'
-                      ? 'Faire'
-                      : 'Shopify'}
-                    fulfillment/tracking writeback.
-                  </Alert>
+                  <Stack spacing={1.25}>
+                    <Alert
+                      severity="success"
+                      data-testid="sandbox-commerce-e2e-authorization-active"
+                    >
+                      Exact-order authorization{' '}
+                      {sandboxE2eAuthorization.authorizationGlobalId} is current until{' '}
+                      {formatUserDateTime(
+                        sandboxE2eAuthorization.expiresAt,
+                        dateTime,
+                        {
+                          year: 'numeric',
+                          month: 'short',
+                          day: 'numeric',
+                          hour: 'numeric',
+                          minute: '2-digit',
+                          fallback: sandboxE2eAuthorization.expiresAt,
+                        },
+                      )}. {canonicalShopifyAuthorization
+                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order while Operations remains Read only.'
+                        : `It permits only this order's package-specific sandbox labels, reserved-inventory consumption, and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback.`}
+                    </Alert>
+                    {canonicalShopifyAuthorization && order.status === 'packed' && (
+                      canonicalShopifyAuthorization.fulfillmentConfirmedAt ? (
+                        <Alert
+                          severity="success"
+                          data-testid="shopify-test-store-fulfillment-confirmed"
+                        >
+                          The exact sandbox label and tracking snapshot was confirmed at{' '}
+                          {formatUserDateTime(
+                            canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                            dateTime,
+                            {
+                              year: 'numeric',
+                              month: 'short',
+                              day: 'numeric',
+                              hour: 'numeric',
+                              minute: '2-digit',
+                              fallback:
+                                canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                            },
+                          )}. Shopify customer notification is locked off.
+                        </Alert>
+                      ) : (
+                        <Tooltip title={canonicalLabelsReady
+                          ? 'Review the exact sandbox labels and explicitly confirm Shopify fulfillment'
+                          : 'Create one current sandbox label for every exact package first'}>
+                          <span>
+                            <Button
+                              fullWidth
+                              variant="contained"
+                              color="warning"
+                              startIcon={<WarningAmberRounded />}
+                              disabled={busy || !canonicalLabelsReady}
+                              onClick={onConfirmShopifyTestFulfillment}
+                              data-testid="review-shopify-test-store-fulfillment"
+                            >
+                              Review and confirm Shopify fulfillment
+                            </Button>
+                          </span>
+                        </Tooltip>
+                      )
+                    )}
+                  </Stack>
                 ) : (
                   <Stack spacing={1.25}>
                     <Alert severity="warning">
-                      This test path creates non-tracking sandbox labels and then
-                      performs real ClawPilot inventory and {order.sourceProvider === 'faire'
-                        ? 'Faire'
-                        : 'Shopify'} fulfillment
-                      writes for this exact order. It does not authorize any
-                      other order or production carrier purchase.
+                      {canonicalShopifyTestLane
+                        ? `Authorize this exact provider-verified Shopify test order before starting or resuming its ${displayStatus(order.status)} local workflow. This does not enable unrelated orders, production postage, or customer notification.`
+                        : `This test path creates non-tracking sandbox labels and then performs real ClawPilot inventory and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment writes for this exact order. It does not authorize any other order or production carrier purchase.`}
                     </Alert>
                     <Tooltip
                       title={authorizeSandboxE2eBlockedReason
@@ -1689,9 +1796,15 @@ function OrderDetailDrawer({
                           startIcon={<WarningAmberRounded />}
                           disabled={busy || Boolean(authorizeSandboxE2eBlockedReason)}
                           onClick={onAuthorizeSandboxE2e}
-                          data-testid="authorize-sandbox-commerce-e2e"
+                          data-testid={canonicalShopifyTestLane
+                            ? 'authorize-shopify-test-store-canonical-e2e'
+                            : 'authorize-sandbox-commerce-e2e'}
                         >
-                          Authorize exact-order E2E test
+                          {canonicalShopifyTestLane && order.status !== 'imported'
+                            ? 'Renew or resume verified test order'
+                            : canonicalShopifyTestLane
+                              ? 'Authorize verified test order'
+                              : 'Authorize exact-order E2E test'}
                         </Button>
                       </span>
                     </Tooltip>
@@ -2541,10 +2654,22 @@ export default function OperationsSection({
   const [retryingCommerceExport, setRetryingCommerceExport] = useState(false)
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
+  const [sandboxE2eConfirmationText, setSandboxE2eConfirmationText] = useState('')
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
     'Authorized end-to-end validation for this exact commerce test order',
   )
   const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
+  const pendingShopifyTestStoreAuthorization =
+    useRef<ShopifyTestStoreAuthorizationCommand | null>(null)
+  const [shopifyTestFulfillmentOpen, setShopifyTestFulfillmentOpen] = useState(false)
+  const [shopifyTestFulfillmentText, setShopifyTestFulfillmentText] = useState('')
+  const [shopifyTestFulfillmentReason, setShopifyTestFulfillmentReason] = useState(
+    'Reviewed the exact sandbox labels and tracking snapshot for Shopify test fulfillment',
+  )
+  const [confirmingShopifyTestFulfillment, setConfirmingShopifyTestFulfillment] =
+    useState(false)
+  const pendingShopifyTestStoreFulfillment =
+    useRef<ShopifyTestStoreFulfillmentCommand | null>(null)
   const [createLabelOpen, setCreateLabelOpen] = useState(false)
   const [createLabelReason, setCreateLabelReason] = useState('Purchase a sandbox label for pack-to-ship validation')
   const [createLabelIdempotencyKey, setCreateLabelIdempotencyKey] = useState('')
@@ -2983,6 +3108,11 @@ export default function OperationsSection({
               materialGlobalId: material.globalId,
               expectedRowVersion: material.rowVersion,
             })),
+            sandboxE2eAuthorizationGlobalId:
+              detail.sandboxCommerceE2eAuthorization?.authorityKind
+                === 'shopify_test_store_canonical'
+                ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+                : undefined,
             idempotencyKey: planEvidenceIdempotencyKey,
           }),
         },
@@ -3092,6 +3222,11 @@ export default function OperationsSection({
           cartonizationEvidenceGlobalId: evidenceGlobalId,
           expectedRowVersion: detail.rowVersion,
           reason: planReason.trim(),
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorityKind
+              === 'shopify_test_store_canonical'
+              ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+              : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -3213,6 +3348,11 @@ export default function OperationsSection({
           orderGlobalId: detail.globalId,
           expectedRowVersion: detail.rowVersion,
           reason: releaseReason.trim(),
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorityKind
+              === 'shopify_test_store_canonical'
+              ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+              : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -3351,6 +3491,11 @@ export default function OperationsSection({
           orderGlobalId: detail.globalId,
           expectedRowVersion: detail.rowVersion,
           reason: confirmPicksReason.trim(),
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorityKind
+              === 'shopify_test_store_canonical'
+              ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+              : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -3466,6 +3611,11 @@ export default function OperationsSection({
           orderGlobalId: detail.globalId,
           expectedRowVersion: detail.rowVersion,
           reason: verifyPackReason.trim(),
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorityKind
+              === 'shopify_test_store_canonical'
+              ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+              : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -3572,6 +3722,11 @@ export default function OperationsSection({
           orderGlobalId: detail.globalId,
           packageGlobalId,
           expectedRowVersion: detail.rowVersion,
+          sandboxE2eAuthorizationGlobalId:
+            detail.sandboxCommerceE2eAuthorization?.authorityKind
+              === 'shopify_test_store_canonical'
+              ? detail.sandboxCommerceE2eAuthorization.authorizationGlobalId
+              : undefined,
         }),
       })
       const payload = await response.json() as OperationsPayload
@@ -3800,7 +3955,9 @@ export default function OperationsSection({
 
   const openSandboxE2eAuthorization = () => {
     if (!detail) return
+    pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationConfirmed(false)
+    setSandboxE2eConfirmationText('')
     setSandboxE2eAuthorizationReason(
       `Authorized end-to-end validation for ${detail.sourceProvider === 'faire'
         ? 'Faire'
@@ -3811,25 +3968,63 @@ export default function OperationsSection({
 
   const closeSandboxE2eAuthorization = () => {
     if (authorizingSandboxE2e) return
+    pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationOpen(false)
     setSandboxE2eAuthorizationConfirmed(false)
+    setSandboxE2eConfirmationText('')
   }
 
   const authorizeSandboxE2e = async (event: FormEvent) => {
     event.preventDefault()
+    const canonicalShopifyTestLane = Boolean(
+      workspace?.activation.state === 'read_only'
+      && detail?.sourceProvider === 'shopify',
+    )
     if (
       !detail
-      || !sandboxE2eAuthorizationConfirmed
+      || (
+        canonicalShopifyTestLane
+          ? sandboxE2eConfirmationText
+            !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
+          : !sandboxE2eAuthorizationConfirmed
+      )
       || !sandboxE2eAuthorizationReason.trim()
     ) return
     setAuthorizingSandboxE2e(true)
     setError('')
     setNotice('')
+    const canonicalCommand = canonicalShopifyTestLane
+      ? pendingShopifyTestStoreAuthorization.current || {
+          orderGlobalId: detail.globalId,
+          expectedRowVersion: detail.rowVersion,
+          confirmationStatement:
+            SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
+          reason: sandboxE2eAuthorizationReason.trim(),
+          lifetimeMinutes: 120 as const,
+          idempotencyKey:
+            `shopify-test-store-authorize:${crypto.randomUUID()}`,
+        }
+      : null
+    if (canonicalCommand) {
+      pendingShopifyTestStoreAuthorization.current = canonicalCommand
+    }
     try {
       const response = await fetch('/api/operations', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        headers: {
+          'Content-Type': 'application/json',
+          ...(canonicalCommand
+            ? { 'Idempotency-Key': canonicalCommand.idempotencyKey }
+            : {}),
+        },
+        body: JSON.stringify(canonicalCommand ? {
+          action: 'authorize-shopify-test-store-canonical-e2e',
+          orderGlobalId: canonicalCommand.orderGlobalId,
+          expectedRowVersion: canonicalCommand.expectedRowVersion,
+          confirmationStatement: canonicalCommand.confirmationStatement,
+          reason: canonicalCommand.reason,
+          lifetimeMinutes: canonicalCommand.lifetimeMinutes,
+        } : {
           action: 'authorize-sandbox-commerce-e2e',
           orderGlobalId: detail.globalId,
           confirmationStatement: SANDBOX_COMMERCE_E2E_CONFIRMATION,
@@ -3837,27 +4032,178 @@ export default function OperationsSection({
           lifetimeMinutes: 120,
         }),
       })
-      const payload = await response.json() as OperationsPayload
+      const payload = await response.json().catch(() => ({})) as OperationsPayload
       if (
         !response.ok
         || !payload.result
         || !('authorizationGlobalId' in payload.result)
       ) {
-        throw new Error(payload.error || 'Sandbox commerce E2E authorization failed')
+        throw new ShopifyTestStoreCommandHttpError(
+          payload.error || 'Sandbox commerce E2E authorization failed',
+          response.status,
+          payload.code,
+        )
       }
       const result = payload.result
+      pendingShopifyTestStoreAuthorization.current = null
       setSandboxE2eAuthorizationOpen(false)
       setSandboxE2eAuthorizationConfirmed(false)
+      setSandboxE2eConfirmationText('')
       setNotice(
         `Exact-order sandbox E2E authorization ${result.authorizationGlobalId} is active until ${result.expiresAt}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
-      setError(caught instanceof Error
-        ? caught.message
-        : 'Sandbox commerce E2E authorization failed')
+      if (canonicalCommand) {
+        const message = caught instanceof Error
+          ? caught.message
+          : 'Shopify test-store authorization failed'
+        const refreshed = await loadWorkspace(canonicalCommand.orderGlobalId)
+          .catch(() => null)
+        const refreshedAuthorization =
+          refreshed?.selectedOrder?.sandboxCommerceE2eAuthorization
+        if (
+          refreshedAuthorization?.authorityKind
+            === 'shopify_test_store_canonical'
+        ) {
+          pendingShopifyTestStoreAuthorization.current = null
+          setSandboxE2eAuthorizationOpen(false)
+          setSandboxE2eConfirmationText('')
+          setNotice(
+            `The exact authorization response was reconciled. Authorization ${refreshedAuthorization.authorizationGlobalId} is current until ${refreshedAuthorization.expiresAt}.`,
+          )
+          setError('')
+        } else if (
+          caught instanceof ShopifyTestStoreCommandHttpError
+          && caught.status < 500
+        ) {
+          pendingShopifyTestStoreAuthorization.current = null
+          setError(
+            `${message}${caught.code ? ` [${caught.code}]` : ''} Current order state was refreshed. Review it before authorizing again.`,
+          )
+        } else {
+          setError(
+            `${message} The response is uncertain; the exact authorization command is retained for retry.`,
+          )
+        }
+      } else {
+        setError(caught instanceof Error
+          ? caught.message
+          : 'Sandbox commerce E2E authorization failed')
+      }
     } finally {
       setAuthorizingSandboxE2e(false)
+    }
+  }
+
+  const openShopifyTestFulfillment = () => {
+    if (!detail?.sandboxCommerceE2eAuthorization) return
+    pendingShopifyTestStoreFulfillment.current = null
+    setShopifyTestFulfillmentText('')
+    setShopifyTestFulfillmentReason(
+      `Reviewed the exact sandbox labels and tracking snapshot for Shopify test order ${detail.orderNumber}`,
+    )
+    setShopifyTestFulfillmentOpen(true)
+  }
+
+  const closeShopifyTestFulfillment = () => {
+    if (confirmingShopifyTestFulfillment) return
+    pendingShopifyTestStoreFulfillment.current = null
+    setShopifyTestFulfillmentOpen(false)
+    setShopifyTestFulfillmentText('')
+  }
+
+  const confirmShopifyTestFulfillment = async (event: FormEvent) => {
+    event.preventDefault()
+    const authorization = detail?.sandboxCommerceE2eAuthorization
+    if (
+      !detail
+      || authorization?.authorityKind !== 'shopify_test_store_canonical'
+      || shopifyTestFulfillmentText !== SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+      || shopifyTestFulfillmentReason.trim().length < 8
+    ) return
+    setConfirmingShopifyTestFulfillment(true)
+    setError('')
+    setNotice('')
+    const command = pendingShopifyTestStoreFulfillment.current || {
+      authorizationGlobalId: authorization.authorizationGlobalId,
+      orderGlobalId: detail.globalId,
+      expectedRowVersion: detail.rowVersion,
+      confirmationStatement: SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
+      reason: shopifyTestFulfillmentReason.trim(),
+      idempotencyKey: `shopify-test-store-fulfillment:${crypto.randomUUID()}`,
+    }
+    pendingShopifyTestStoreFulfillment.current = command
+    try {
+      const response = await fetch('/api/operations', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': command.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'confirm-shopify-test-store-e2e-fulfillment',
+          authorizationGlobalId: command.authorizationGlobalId,
+          orderGlobalId: command.orderGlobalId,
+          expectedRowVersion: command.expectedRowVersion,
+          confirmationStatement: command.confirmationStatement,
+          reason: command.reason,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as OperationsPayload
+      if (
+        !response.ok
+        || !payload.result
+        || !('authorizationGlobalId' in payload.result)
+      ) {
+        throw new ShopifyTestStoreCommandHttpError(
+          payload.error || 'Shopify test fulfillment confirmation failed',
+          response.status,
+          payload.code,
+        )
+      }
+      pendingShopifyTestStoreFulfillment.current = null
+      setShopifyTestFulfillmentOpen(false)
+      setShopifyTestFulfillmentText('')
+      setNotice(
+        'The exact sandbox label and tracking snapshot is confirmed. Shopify customer notification is locked off; Confirm shipment now requires this same evidence.',
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      const message = caught instanceof Error
+        ? caught.message
+        : 'Shopify test fulfillment confirmation failed'
+      const refreshed = await loadWorkspace(command.orderGlobalId)
+        .catch(() => null)
+      const refreshedAuthorization =
+        refreshed?.selectedOrder?.sandboxCommerceE2eAuthorization
+      if (
+        refreshedAuthorization?.authorityKind
+          === 'shopify_test_store_canonical'
+        && refreshedAuthorization.fulfillmentConfirmedAt
+      ) {
+        pendingShopifyTestStoreFulfillment.current = null
+        setShopifyTestFulfillmentOpen(false)
+        setShopifyTestFulfillmentText('')
+        setNotice(
+          'The exact fulfillment-confirmation response was reconciled. Customer notification remains locked off.',
+        )
+        setError('')
+      } else if (
+        caught instanceof ShopifyTestStoreCommandHttpError
+        && caught.status < 500
+      ) {
+        pendingShopifyTestStoreFulfillment.current = null
+        setError(
+          `${message}${caught.code ? ` [${caught.code}]` : ''} Current order state was refreshed. Review the exact labels before confirming again.`,
+        )
+      } else {
+        setError(
+          `${message} The response is uncertain; the exact fulfillment-confirmation command is retained for retry.`,
+        )
+      }
+    } finally {
+      setConfirmingShopifyTestFulfillment(false)
     }
   }
 
@@ -5371,6 +5717,7 @@ export default function OperationsSection({
           || confirmingShipment
           || retryingCommerceExport
           || authorizingSandboxE2e
+          || confirmingShopifyTestFulfillment
           || creatingLabel
           || voidingLabel
           || orderRevisionBusy
@@ -5398,6 +5745,7 @@ export default function OperationsSection({
         onConfirmShipment={openConfirmShipment}
         onRetryCommerceExport={openCommerceExportRetry}
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
+        onConfirmShopifyTestFulfillment={openShopifyTestFulfillment}
         onCreateSandboxLabel={openCreateLabel}
         onVoidSandboxLabel={openVoidLabel}
         onRefreshOneOffPackedRates={() => {
@@ -6423,24 +6771,26 @@ export default function OperationsSection({
       <Dialog
         open={sandboxE2eAuthorizationOpen}
         onClose={closeSandboxE2eAuthorization}
+        fullScreen={mobile}
         fullWidth
         maxWidth="sm"
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
-          <DialogTitle>Authorize exact-order sandbox E2E test</DialogTitle>
+          <DialogTitle>
+            {workspace?.activation.state === 'read_only'
+              && detail?.sourceProvider === 'shopify'
+              ? detail.status === 'imported'
+                ? 'Authorize verified Shopify test order'
+                : 'Renew or resume verified Shopify test order'
+              : 'Authorize exact-order sandbox E2E test'}
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="error">
-                This authority is limited to {detail?.sourceProvider === 'faire'
-                  ? 'Faire'
-                  : 'Shopify'} order{' '}
-                {detail?.orderNumber || 'this order'} ({detail?.globalId || 'unknown'}).
-                It permits non-tracking sandbox labels followed by real reserved
-                inventory consumption and {detail?.sourceProvider === 'faire'
-                  ? 'Faire'
-                  : 'Shopify'} fulfillment/tracking writeback.
-                The authorization expires after two hours and is consumed by a
-                successful shipment confirmation.
+                {workspace?.activation.state === 'read_only'
+                  && detail?.sourceProvider === 'shopify'
+                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, local order revision, and Read only activation revision. It expires after two hours and never permits production postage or customer notification.`
+                  : `This authority is limited to ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). It permits non-tracking sandbox labels followed by real reserved inventory consumption and ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback. The authorization expires after two hours and is consumed by a successful shipment confirmation.`}
               </Alert>
               <Box
                 sx={{
@@ -6450,21 +6800,43 @@ export default function OperationsSection({
                 }}
               >
                 <Typography variant="body2">
-                  {SANDBOX_COMMERCE_E2E_CONFIRMATION}
+                  {workspace?.activation.state === 'read_only'
+                    && detail?.sourceProvider === 'shopify'
+                    ? SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
+                    : SANDBOX_COMMERCE_E2E_CONFIRMATION}
                 </Typography>
               </Box>
-              <FormControlLabel
-                control={(
-                  <Checkbox
-                    checked={sandboxE2eAuthorizationConfirmed}
-                    onChange={(event) => {
-                      setSandboxE2eAuthorizationConfirmed(event.target.checked)
-                    }}
-                    data-testid="sandbox-commerce-e2e-confirmation"
-                  />
-                )}
-                label="I understand and explicitly authorize this exact order-bound test."
-              />
+              {workspace?.activation.state === 'read_only'
+                && detail?.sourceProvider === 'shopify' ? (
+                <TextField
+                  required
+                  multiline
+                  minRows={4}
+                  label="Type the exact authorization statement"
+                  value={sandboxE2eConfirmationText}
+                  onChange={(event) => setSandboxE2eConfirmationText(event.target.value)}
+                  helperText={sandboxE2eConfirmationText
+                    === SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
+                    ? 'Exact statement matched'
+                    : 'Copy the statement above exactly; whitespace and punctuation must match.'}
+                  inputProps={{
+                    'data-testid': 'shopify-test-store-authorization-statement',
+                  }}
+                />
+              ) : (
+                <FormControlLabel
+                  control={(
+                    <Checkbox
+                      checked={sandboxE2eAuthorizationConfirmed}
+                      onChange={(event) => {
+                        setSandboxE2eAuthorizationConfirmed(event.target.checked)
+                      }}
+                      data-testid="sandbox-commerce-e2e-confirmation"
+                    />
+                  )}
+                  label="I understand and explicitly authorize this exact order-bound test."
+                />
+              )}
               <TextField
                 required
                 multiline
@@ -6490,7 +6862,13 @@ export default function OperationsSection({
               color="warning"
               disabled={
                 authorizingSandboxE2e
-                || !sandboxE2eAuthorizationConfirmed
+                || (
+                  workspace?.activation.state === 'read_only'
+                    && detail?.sourceProvider === 'shopify'
+                    ? sandboxE2eConfirmationText
+                      !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
+                    : !sandboxE2eAuthorizationConfirmed
+                )
                 || !sandboxE2eAuthorizationReason.trim()
               }
               startIcon={authorizingSandboxE2e
@@ -6498,7 +6876,95 @@ export default function OperationsSection({
                 : <WarningAmberRounded />}
               data-testid="confirm-sandbox-commerce-e2e-authorization"
             >
-              {authorizingSandboxE2e ? 'Authorizing test' : 'Authorize this exact order'}
+              {authorizingSandboxE2e
+                ? 'Verifying with Shopify'
+                : 'Authorize this exact order'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={shopifyTestFulfillmentOpen}
+        onClose={closeShopifyTestFulfillment}
+        fullScreen={mobile}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={confirmShopifyTestFulfillment}>
+          <DialogTitle>Confirm exact Shopify test fulfillment</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="error">
+                This is the second owner/admin confirmation. ClawPilot will
+                freeze the exact sorted package, sandbox-label, and tracking
+                snapshot for {detail?.orderNumber || 'this order'}. Confirm
+                shipment will fail closed if a label is voided, replaced, or
+                changed. Shopify customer notification remains forcibly off.
+              </Alert>
+              <Box
+                sx={{
+                  p: 1.5,
+                  border: '1px solid rgba(255,255,255,0.16)',
+                  borderRadius: '8px',
+                }}
+              >
+                <Typography variant="body2">
+                  {SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION}
+                </Typography>
+              </Box>
+              <TextField
+                required
+                multiline
+                minRows={4}
+                label="Type the exact fulfillment statement"
+                value={shopifyTestFulfillmentText}
+                onChange={(event) => setShopifyTestFulfillmentText(event.target.value)}
+                helperText={shopifyTestFulfillmentText
+                  === SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+                  ? 'Exact statement matched'
+                  : 'Copy the statement above exactly; whitespace and punctuation must match.'}
+                inputProps={{
+                  'data-testid': 'shopify-test-store-fulfillment-statement',
+                }}
+              />
+              <TextField
+                required
+                multiline
+                minRows={3}
+                label="Fulfillment confirmation reason"
+                value={shopifyTestFulfillmentReason}
+                onChange={(event) => setShopifyTestFulfillmentReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText={`${shopifyTestFulfillmentReason.trim().length}/500 · Stored with the immutable label snapshot`}
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closeShopifyTestFulfillment}
+              disabled={confirmingShopifyTestFulfillment}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              color="warning"
+              disabled={
+                confirmingShopifyTestFulfillment
+                || shopifyTestFulfillmentText
+                  !== SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+                || shopifyTestFulfillmentReason.trim().length < 8
+              }
+              startIcon={confirmingShopifyTestFulfillment
+                ? <CircularProgress size={16} />
+                : <WarningAmberRounded />}
+              data-testid="confirm-shopify-test-store-fulfillment"
+            >
+              {confirmingShopifyTestFulfillment
+                ? 'Confirming exact evidence'
+                : 'Confirm exact sandbox tracking'}
             </Button>
           </DialogActions>
         </Box>

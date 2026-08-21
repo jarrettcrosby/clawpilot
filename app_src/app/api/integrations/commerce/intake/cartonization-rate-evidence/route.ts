@@ -66,6 +66,10 @@ import {
 import {
   assertOperationsShadowTrainingEvidenceRequestInPostgres,
 } from '@/lib/persistence/operationShadowTraining'
+import {
+  assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres,
+  ShopifyTestStoreCanonicalE2ePersistenceError,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -85,6 +89,7 @@ type NormalizedRateEvidenceRequestBase = {
   expectedCandidateRowVersion: number
   warehouseGlobalId: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId: string | null
   shadowTraining: null | {
     runGlobalId: string
     expectedRowVersion: number
@@ -358,6 +363,16 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       8,
       160,
     ),
+    sandboxE2eAuthorizationGlobalId:
+      input.sandboxE2eAuthorizationGlobalId === undefined
+        || input.sandboxE2eAuthorizationGlobalId === null
+        || input.sandboxE2eAuthorizationGlobalId === ''
+        ? null
+        : exactReference(
+            input.sandboxE2eAuthorizationGlobalId,
+            /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+            'Shopify test-store authorization Global ID',
+          ),
     shadowTraining: input.shadowTraining === undefined
       || input.shadowTraining === null
       ? null
@@ -389,6 +404,12 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
         'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
       )
     }
+    if (base.shadowTraining && base.sandboxE2eAuthorizationGlobalId) {
+      requestError(
+        'Shopify test-store authorization cannot be combined with a Shadow training run',
+        'SHOPIFY_TEST_E2E_SHADOW_TRAINING_FORBIDDEN',
+      )
+    }
     return {
       ...base,
       evidenceMode,
@@ -399,6 +420,12 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
     requestError(
       'Shadow training authorization is accepted only with factual operational evidence',
       'CARTONIZATION_RATE_EVIDENCE_SHADOW_TRAINING_MODE_INVALID',
+    )
+  }
+  if (base.sandboxE2eAuthorizationGlobalId) {
+    requestError(
+      'Shopify test-store authorization is accepted only with factual operational evidence',
+      'SHOPIFY_TEST_E2E_EVIDENCE_MODE_INVALID',
     )
   }
   if (!Array.isArray(input.assumedCommittedQuantities)) {
@@ -479,6 +506,8 @@ function cartonizationRateEvidenceCommandHash(
     warehouseGlobalId: request.warehouseGlobalId,
     evidenceMode: request.evidenceMode,
     shadowTraining: request.shadowTraining,
+    sandboxE2eAuthorizationGlobalId:
+      request.sandboxE2eAuthorizationGlobalId,
     selectedMaterials,
   }
   if (request.evidenceMode === 'operational') {
@@ -516,6 +545,12 @@ function errorResponse(error: unknown) {
     )
   }
   if (error instanceof CartonizationRateEvidencePersistenceError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      error.status,
+    )
+  }
+  if (error instanceof ShopifyTestStoreCanonicalE2ePersistenceError) {
     return json(
       { ok: false, error: error.message, code: error.code },
       error.status,
@@ -718,6 +753,39 @@ export async function POST(req: NextRequest) {
         warehouseGlobalId: request.warehouseGlobalId,
       })
     }
+    const operationalProvider = request.evidenceMode === 'operational'
+      ? await readOperationalOrderPlanningProviderFromPostgres({
+          organizationId,
+          accountGlobalId: request.accountGlobalId,
+          candidateGlobalId: request.candidateGlobalId,
+          expectedCandidateRowVersion:
+            request.expectedCandidateRowVersion,
+        })
+      : null
+    if (operationalProvider === 'shopify' && !request.shadowTraining) {
+      if (
+        request.sandboxE2eAuthorizationGlobalId
+        && (!capabilities.canActivate || !capabilities.canExecute)
+      ) {
+        return json(
+          {
+            ok: false,
+            error: 'Owner/admin warehouse-execution permission is required for the exact Shopify test-store lane',
+            code: 'SHOPIFY_TEST_E2E_PERMISSION_REQUIRED',
+          },
+          403,
+        )
+      }
+      await assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        accountGlobalId: request.accountGlobalId,
+        candidateGlobalId: request.candidateGlobalId,
+        expectedCandidateRowVersion: request.expectedCandidateRowVersion,
+        authorizationGlobalId:
+          request.sandboxE2eAuthorizationGlobalId,
+      })
+    }
     const semanticRequestHash =
       cartonizationRateEvidenceCommandHash(organizationId, request)
     const claim = await claimCartonizationRateEvidenceCommandInPostgres({
@@ -773,15 +841,6 @@ export async function POST(req: NextRequest) {
       idempotencyKey: request.idempotencyKey,
       semanticRequestHash,
     }
-    const operationalProvider = request.evidenceMode === 'operational'
-      ? await readOperationalOrderPlanningProviderFromPostgres({
-          organizationId,
-          accountGlobalId: request.accountGlobalId,
-          candidateGlobalId: request.candidateGlobalId,
-          expectedCandidateRowVersion:
-            request.expectedCandidateRowVersion,
-        })
-      : null
     const shopifyOrderPlanningAuthority =
       operationalProvider === 'shopify'
       && !request.shadowTraining
@@ -944,9 +1003,16 @@ export async function POST(req: NextRequest) {
       request.evidenceMode === 'operational'
       && plan.geometryFallbackLines.length > 0
     ) {
-      if (!request.shadowTraining && read.activationState !== 'shadow') {
+      if (
+        !request.shadowTraining
+        && read.activationState !== 'shadow'
+        && !(
+          read.activationState === 'read_only'
+          && request.sandboxE2eAuthorizationGlobalId
+        )
+      ) {
         throw new RateEvidenceRequestError(
-          'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow mode',
+          'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow or one exact authorized Shopify test order in Read only mode',
           422,
           'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
         )

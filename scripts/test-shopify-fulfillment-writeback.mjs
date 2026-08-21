@@ -19,6 +19,13 @@ function load(mocks) {
     exports: module.exports, module, process,
     require(specifier) {
       if (Object.prototype.hasOwnProperty.call(mocks, specifier)) return mocks[specifier]
+      if (specifier === '@/lib/persistence/shopifyTestStoreCanonicalE2e') {
+        return {
+          requireShopifyTestStoreFulfillmentWriteClaimInPostgres: async () => {
+            throw new Error('Unexpected Shopify test-store fulfillment claim')
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })

@@ -41,6 +41,7 @@ function persistenceFor(pool) {
     '@/lib/integrations/faireFulfillmentRuntime': {},
     '@/lib/commerceFulfillmentRecoveryPolicy': {},
     '@/lib/persistence/sandboxCommerceE2eAuthorization': {},
+    '@/lib/persistence/shopifyTestStoreCanonicalE2e': {},
     '@/lib/persistence/commerceOrderRevisions': {
       assertCommerceOrderRevisionExecutionCurrent: noOp,
       CommerceOrderRevisionGateError: RevisionGateError,

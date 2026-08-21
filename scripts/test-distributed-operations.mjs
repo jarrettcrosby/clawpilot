@@ -1459,6 +1459,22 @@ async function verifyRouteBehavior() {
           state: 'active',
         }),
       },
+      '@/lib/integrations/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2eError: class extends Error {},
+        authorizeShopifyTestStoreCanonicalE2e: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not authorize Shopify test-store E2E',
+          )
+        },
+      },
+      '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2ePersistenceError: class extends Error {},
+        confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not confirm Shopify test fulfillment',
+          )
+        },
+      },
       '@/lib/persistence/commerceOrderRevisions': {
         CommerceOrderRevisionDispositionError: class extends Error {},
         cancelUnstartedCommerceOrderFromProviderRevisionInPostgres:
@@ -1738,6 +1754,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 4,
     reason: 'Reviewed plan',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'release-route-proof-1',
   })
 
@@ -1783,6 +1800,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 5,
     reason: 'Picker verified every ready task',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-route-proof-1',
   })
 
@@ -1854,6 +1872,7 @@ async function verifyRouteBehavior() {
     reason: 'Picker verified the multi-unit count',
     countEvidenceIdempotencyKey: 'wearable-count-route-proof-1',
     countEvidence,
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-count-route-proof-1',
   })
 
@@ -1899,6 +1918,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 6,
     reason: 'Packer verified the carton',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'pack-route-proof-1',
   })
 
@@ -4040,6 +4060,18 @@ async function verifyPostgresAcceptance(databaseUrl) {
           consumeSandboxCommerceE2eAuthorization: async () => {
             throw new Error(
               'Distributed Operations acceptance has no sandbox E2E authorization',
+            )
+          },
+        },
+        '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+          requireActiveShopifyTestStoreCanonicalE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no Shopify test-store authorization',
+            )
+          },
+          requireExactShopifyTestStoreConfirmedLabelSnapshot: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no confirmed Shopify test labels',
             )
           },
         },

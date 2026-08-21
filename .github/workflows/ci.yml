@@ -52,6 +52,9 @@ jobs:
       - name: Tests
         run: npm run test
 
+      - name: Shopify test-store canonical E2E contract
+        run: npm run test:shopify-test-store-canonical-e2e
+
       - name: Store sync PostgreSQL acceptance
         run: npm run test:commerce-store-sync
 

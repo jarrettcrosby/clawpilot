@@ -634,6 +634,12 @@ function loadOperationalFaireRoute(
       ShopifyOrderPlanningAuthorityPersistenceError: PersistenceError,
       readOperationalOrderPlanningProviderFromPostgres: async () => sourceProvider,
     },
+    '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+      ShopifyTestStoreCanonicalE2ePersistenceError: PersistenceError,
+      assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres: async () => {
+        throw new Error('Unexpected Shopify test-store planning authorization')
+      },
+    },
     '@/lib/persistence/operationShadowTraining': {
       assertOperationsShadowTrainingEvidenceRequestInPostgres: async (input) => {
         if (!shadowTraining) {

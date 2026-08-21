@@ -42,6 +42,8 @@ type AuthorizationRow = {
   expires_at: Date | string
   consumed_at: Date | string | null
   consumed_by: string | null
+  confirmation_statement_version: string
+  fulfillment_confirmed_at: Date | string | null
 }
 
 export type SandboxCommerceE2eAuthorization = {
@@ -56,6 +58,8 @@ export type SandboxCommerceE2eAuthorization = {
   expiresAt: string
   consumedAt: string | null
   consumedBy: string | null
+  authorityKind: 'legacy_packed' | 'shopify_test_store_canonical'
+  fulfillmentConfirmedAt: string | null
 }
 
 function fail(code: string, message: string, status = 409): never {
@@ -97,6 +101,13 @@ function map(row: AuthorizationRow): SandboxCommerceE2eAuthorization {
     expiresAt: new Date(row.expires_at).toISOString(),
     consumedAt: row.consumed_at ? new Date(row.consumed_at).toISOString() : null,
     consumedBy: row.consumed_by,
+    authorityKind: row.confirmation_statement_version
+      === 'shopify-test-store-canonical-e2e-v1'
+      ? 'shopify_test_store_canonical'
+      : 'legacy_packed',
+    fulfillmentConfirmedAt: row.fulfillment_confirmed_at
+      ? new Date(row.fulfillment_confirmed_at).toISOString()
+      : null,
   }
 }
 
@@ -104,13 +115,18 @@ const SELECT = `SELECT auth.id::text, auth.global_id,
   auth.organization_id::text, auth.order_id::text,
   source_order.global_id AS order_global_id,
   auth.external_order_id, source_order.source_provider, auth.state,
-  auth.reason, auth.authorized_by,
+  auth.reason, auth.authorized_by, auth.confirmation_statement_version,
   auth.authorized_at, auth.expires_at,
-  auth.consumed_at, auth.consumed_by
+  auth.consumed_at, auth.consumed_by,
+  confirmation.confirmed_at AS fulfillment_confirmed_at
 FROM operations_sandbox_commerce_e2e_authorizations auth
 JOIN operations_orders source_order
   ON source_order.organization_id = auth.organization_id
- AND source_order.id = auth.order_id`
+ AND source_order.id = auth.order_id
+LEFT JOIN operations_shopify_test_store_e2e_fulfillment_confirmations
+  confirmation
+  ON confirmation.organization_id = auth.organization_id
+ AND confirmation.authorization_id = auth.id`
 
 type FaireEvidenceRow = {
   integration_account_id: string
@@ -1009,6 +1025,21 @@ export async function requireActiveSandboxCommerceE2eAuthorization(
   if (row.state !== 'active' || Date.parse(new Date(row.expires_at).toISOString()) <= Date.now()) {
     fail('SANDBOX_E2E_AUTHORIZATION_EXPIRED', 'Sandbox E2E authorization is no longer active', 403)
   }
+  if (row.confirmation_statement_version === 'shopify-test-store-canonical-e2e-v1') {
+    const current = await client.query<{ current: boolean }>(
+      `SELECT operations_shopify_test_store_e2e_is_current(
+         $1::uuid, $2::uuid, $3::uuid
+       ) AS current`,
+      [row.organization_id, row.id, row.order_id],
+    )
+    if (!current.rows[0]?.current) {
+      fail(
+        'SHOPIFY_TEST_E2E_AUTHORIZATION_STALE',
+        'Shopify test-store E2E authority no longer matches Read only activation or its exact source evidence',
+        403,
+      )
+    }
+  }
   if (
     row.source_provider === 'faire'
     && !options.allowCommittedFaireShipment
@@ -1057,12 +1088,18 @@ export async function consumeSandboxCommerceE2eAuthorization(
               source_order.global_id AS order_global_id,
               updated.external_order_id, source_order.source_provider,
               updated.state, updated.reason,
+              updated.confirmation_statement_version,
               updated.authorized_by, updated.authorized_at, updated.expires_at,
-              updated.consumed_at, updated.consumed_by
+              updated.consumed_at, updated.consumed_by,
+              confirmation.confirmed_at AS fulfillment_confirmed_at
        FROM updated
        JOIN operations_orders source_order
          ON source_order.organization_id = updated.organization_id
-        AND source_order.id = updated.order_id`,
+        AND source_order.id = updated.order_id
+       LEFT JOIN operations_shopify_test_store_e2e_fulfillment_confirmations
+         confirmation
+         ON confirmation.organization_id = updated.organization_id
+        AND confirmation.authorization_id = updated.id`,
     [row.organization_id, row.id, row.authorized_by],
   )
   if (!result.rows[0]) fail('SANDBOX_E2E_AUTHORIZATION_CHANGED', 'Sandbox E2E authorization changed')
@@ -1114,6 +1151,15 @@ export async function readActiveSandboxCommerceE2eAuthorizationForOrderInPostgre
       row.source_provider === 'faire'
       && !(await currentFaireEvidence(client, row))
     ) return null
+    if (row.confirmation_statement_version === 'shopify-test-store-canonical-e2e-v1') {
+      const current = await client.query<{ current: boolean }>(
+        `SELECT operations_shopify_test_store_e2e_is_current(
+           $1::uuid, $2::uuid, $3::uuid
+         ) AS current`,
+        [row.organization_id, row.id, row.order_id],
+      )
+      if (!current.rows[0]?.current) return null
+    }
     return map(row)
   })
 }

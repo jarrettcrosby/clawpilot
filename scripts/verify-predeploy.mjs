@@ -646,6 +646,12 @@ for (const requiredPath of [
   'app_src/lib/operations/activeCarrierDispatchSnapshot.ts',
   'app_src/lib/operations/productionFulfillmentRerates.ts',
   'app_src/lib/operations/sandboxCommerceE2e.ts',
+  'app_src/lib/operations/shopifyTestStoreCanonicalE2e.ts',
+  'app_src/lib/integrations/shopifyTestStoreCanonicalE2e.ts',
+  'app_src/lib/persistence/shopifyTestStoreCanonicalE2e.ts',
+  'db/migrations/0302_operations_shopify_test_store_canonical_e2e.sql',
+  'scripts/test-shopify-test-store-canonical-e2e.mjs',
+  'scripts/test-shopify-test-store-canonical-e2e-health.mjs',
   'app_src/lib/integrations/carrierWholeShipmentRateFoundation.ts',
   'app_src/tests/operations/canonical-fulfillment-planning.test.mts',
   'app_src/tests/operations/active-carrier-dispatch-snapshot.test.mts',
@@ -949,6 +955,8 @@ if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-
 }
 
 run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
+run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e.mjs'])
+run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e-health.mjs'])
 run('npm', ['run', 'build'])
 
 if (!existsSync(resolve(root, 'app_src/.next/BUILD_ID'))) {

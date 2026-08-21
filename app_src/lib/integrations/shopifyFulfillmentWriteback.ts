@@ -19,6 +19,9 @@ import {
 import {
   requireCommerceActiveCapabilityClaimInPostgres,
 } from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
+  requireShopifyTestStoreFulfillmentWriteClaimInPostgres,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_GID = /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
@@ -40,6 +43,8 @@ export type ShopifyFulfillmentWritebackInput = {
   notifyCustomer: unknown
   expectedLineItems: unknown
   attemptSignature?: unknown
+  sandboxE2eAuthorizationGlobalId?: unknown
+  commerceExportGlobalId?: unknown
 }
 
 export type ShopifyFulfillmentAttemptSignature = {
@@ -90,6 +95,8 @@ export class ShopifyFulfillmentWritebackError extends Error {
 type ShopifyFulfillmentWritebackDependencies = {
   readRuntimeCredential: typeof readCommerceRuntimeCredentialFromPostgres
   requireCapability: typeof requireCommerceActiveCapabilityClaimInPostgres
+  requireTestStoreClaim:
+    typeof requireShopifyTestStoreFulfillmentWriteClaimInPostgres
   decryptCredential: typeof decryptCommerceCredential
   requestAccessToken: typeof requestShopifyAccessToken
   probeConnection: typeof probeShopifyConnection
@@ -100,6 +107,8 @@ type ShopifyFulfillmentWritebackDependencies = {
 const DEFAULT_DEPENDENCIES: ShopifyFulfillmentWritebackDependencies = {
   readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
   requireCapability: requireCommerceActiveCapabilityClaimInPostgres,
+  requireTestStoreClaim:
+    requireShopifyTestStoreFulfillmentWriteClaimInPostgres,
   decryptCredential: decryptCommerceCredential,
   requestAccessToken: requestShopifyAccessToken,
   probeConnection: probeShopifyConnection,
@@ -163,20 +172,50 @@ async function authorizedShopifyFulfillmentWriteback(
   }
   const notifyCustomer = input.notifyCustomer
   const expectedLineItems = normalizeExpectedLineItems(input.expectedLineItems)
-
-  const [fulfillmentClaim, trackingClaim, runtime] = await Promise.all([
-    dependencies.requireCapability({
-      organizationId,
-      accountGlobalId,
-      capability: 'fulfillment_export',
-    }),
-    dependencies.requireCapability({
-      organizationId,
-      accountGlobalId,
-      capability: 'tracking_export',
-    }),
-    dependencies.readRuntimeCredential({ organizationId, accountGlobalId }),
-  ])
+  const authorizationGlobalId = String(
+    input.sandboxE2eAuthorizationGlobalId || '',
+  ).trim() || null
+  const commerceExportGlobalId = String(
+    input.commerceExportGlobalId || '',
+  ).trim() || null
+  if (Boolean(authorizationGlobalId) !== Boolean(commerceExportGlobalId)) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_TEST_E2E_FULFILLMENT_CLAIM_INVALID',
+      'Exact sandbox authorization and commerce export evidence are required together',
+    )
+  }
+  const runtimePromise = dependencies.readRuntimeCredential({
+    organizationId,
+    accountGlobalId,
+  })
+  const [fulfillmentClaim, trackingClaim, testStoreClaim, runtime] =
+    authorizationGlobalId && commerceExportGlobalId
+      ? await Promise.all([
+          Promise.resolve(null),
+          Promise.resolve(null),
+          dependencies.requireTestStoreClaim({
+            organizationId,
+            accountGlobalId,
+            externalOrderId,
+            authorizationGlobalId,
+            commerceExportGlobalId,
+          }),
+          runtimePromise,
+        ])
+      : await Promise.all([
+          dependencies.requireCapability({
+            organizationId,
+            accountGlobalId,
+            capability: 'fulfillment_export',
+          }),
+          dependencies.requireCapability({
+            organizationId,
+            accountGlobalId,
+            capability: 'tracking_export',
+          }),
+          Promise.resolve(null),
+          runtimePromise,
+        ])
   if (!runtime || runtime.provider !== 'shopify' || runtime.status !== 'active'
       || runtime.verificationStatus !== 'verified') {
     throw new ShopifyFulfillmentWritebackError(
@@ -184,8 +223,23 @@ async function authorizedShopifyFulfillmentWriteback(
       'A verified active Shopify connection is required',
     )
   }
-  if (
-    fulfillmentClaim.activationRevision !== trackingClaim.activationRevision
+  if (testStoreClaim) {
+    if (
+      notifyCustomer !== false
+      || runtime.environment !== 'sandbox'
+      || testStoreClaim.notifyCustomer !== false
+      || testStoreClaim.credentialGeneration !== runtime.credentialVersion
+      || testStoreClaim.externalAccountId !== runtime.externalAccountId
+    ) {
+      throw new ShopifyFulfillmentWritebackError(
+        'SHOPIFY_TEST_E2E_FULFILLMENT_AUTHORIZATION_STALE',
+        'Exact Shopify test-store fulfillment authority is stale or unsafe',
+      )
+    }
+  } else if (
+    !fulfillmentClaim
+    || !trackingClaim
+    || fulfillmentClaim.activationRevision !== trackingClaim.activationRevision
     || fulfillmentClaim.credentialGeneration !== runtime.credentialVersion
     || trackingClaim.credentialGeneration !== runtime.credentialVersion
   ) {
