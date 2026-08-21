@@ -48,6 +48,7 @@ type IntegrationAccount = {
 type Payload = {
   ok: boolean
   error?: string
+  canActivate?: boolean
   integrations?: {
     organizationId: string
     accounts: IntegrationAccount[]
@@ -89,7 +90,10 @@ async function requestTransport(init?: RequestInit) {
   if (!response.ok || !result.ok || !result.integrations) {
     throw new Error(result.error || 'Transport integration request failed')
   }
-  return result.integrations
+  return {
+    integrations: result.integrations,
+    canActivate: result.canActivate === true,
+  }
 }
 
 export type BrokeredTransportFocus = 'small_parcel' | 'ltl' | 'all'
@@ -110,6 +114,7 @@ export default function BrokeredTransportIntegrationPanel({
   const [verificationPostalCode, setVerificationPostalCode] = useState('')
   const [verificationCountryCode, setVerificationCountryCode] = useState<'USA' | 'CAN'>('USA')
   const [loading, setLoading] = useState(true)
+  const [canActivate, setCanActivate] = useState(false)
   const [pending, setPending] = useState('')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
@@ -121,7 +126,10 @@ export default function BrokeredTransportIntegrationPanel({
     let active = true
     void requestTransport()
       .then((result) => {
-        if (active) setAccounts(result.accounts)
+        if (active) {
+          setAccounts(result.integrations.accounts)
+          setCanActivate(result.canActivate)
+        }
       })
       .catch((caught) => {
         if (active) setError(caught instanceof Error ? caught.message : 'Unable to load transport integrations')
@@ -208,7 +216,8 @@ export default function BrokeredTransportIntegrationPanel({
           credential,
         }),
       })
-      setAccounts(result.accounts)
+      setAccounts(result.integrations.accounts)
+      setCanActivate(result.canActivate)
       setClientId('')
       setClientSecret('')
       setApiKey('')
@@ -232,7 +241,8 @@ export default function BrokeredTransportIntegrationPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'disconnect', provider, environment }),
       })
-      setAccounts(result.accounts)
+      setAccounts(result.integrations.accounts)
+      setCanActivate(result.canActivate)
       setConfirmDisconnect(false)
       setClientId('')
       setClientSecret('')
@@ -271,7 +281,8 @@ export default function BrokeredTransportIntegrationPanel({
           } : {}),
         }),
       })
-      setAccounts(result.accounts)
+      setAccounts(result.integrations.accounts)
+      setCanActivate(result.canActivate)
       setNotice(provider === 'wwex_speedship'
         ? `Worldwide Express sandbox authentication passed. ${focus === 'small_parcel' ? 'Small Parcel' : focus === 'ltl' ? 'LTL' : 'Small Parcel and LTL'} rating is active; any previously active mode was preserved and tendering remains disabled.`
         : 'R+L production authentication and service-point verification passed. LTL rating is active; BOL, pickup, and tendering remain disabled.')
@@ -300,6 +311,8 @@ export default function BrokeredTransportIntegrationPanel({
       : account.ratingActivation.ltl),
   )
   const canActivateRates = Boolean(
+    canActivate
+    &&
     account?.configured
     && (provider !== 'wwex_speedship' || environment === 'sandbox')
     && (provider !== 'rl_carriers'
@@ -573,6 +586,12 @@ export default function BrokeredTransportIntegrationPanel({
                   </Button>
                 ) : null}
               </Stack>
+
+              {account?.configured && !canActivate ? (
+                <Alert severity="warning" data-testid="brokered-activation-permission-warning">
+                  Your credentials are saved, but operations activation permission is required to verify and enable carrier rates.
+                </Alert>
+              ) : null}
 
               {confirmDisconnect ? (
                 <Alert severity="warning" sx={{ borderRadius: '8px' }}>

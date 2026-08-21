@@ -1012,7 +1012,7 @@ export default function CarrierIntegrationPanel({
           : {}),
         displayName: carrierAccountForm.displayName,
         senderName: carrierAccountForm.senderName,
-        ...(carrierAccountForm.accountNumber.trim()
+        ...(!editingCarrierAccountGlobalId && carrierAccountForm.accountNumber.trim()
           ? { accountNumber: carrierAccountForm.accountNumber }
           : {}),
         registeredAddress: {
@@ -1957,32 +1957,6 @@ export default function CarrierIntegrationPanel({
                       </Button>
                     </span>
                   </Tooltip>
-                  <Tooltip title="Delete unused carrier account">
-                    <span>
-                      <Button
-                        size="small"
-                        color="error"
-                        startIcon={<DeleteOutlineRounded />}
-                        disabled={busy || ratingOnlyDelegation}
-                        sx={{ minHeight: 44, minWidth: 44 }}
-                        onClick={() => {
-                          if (!window.confirm(`Delete ${entry.displayName}?`)) return
-                          void patch(
-                            `delete-${entry.globalId}`,
-                            {
-                              action: 'delete-account',
-                              provider,
-                              environment,
-                              carrierAccountGlobalId: entry.globalId,
-                            },
-                            'Carrier account deleted.',
-                          )
-                        }}
-                      >
-                        Delete
-                      </Button>
-                    </span>
-                  </Tooltip>
                 </Stack>
               </Box>
             ))}
@@ -2002,15 +1976,28 @@ export default function CarrierIntegrationPanel({
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
-              <TextField
-                required={!editingCarrierAccountGlobalId}
-                label={editingCarrierAccountGlobalId ? 'New account number (optional)' : 'Account number'}
-                value={carrierAccountForm.accountNumber}
-                onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
-                disabled={busy || ratingOnlyDelegation}
-                autoComplete="off"
-                sx={fieldSx}
-              />
+              {editingCarrierAccountGlobalId ? (
+                <TextField
+                  label="Account number"
+                  value={`••••${account?.carrierAccounts.find((entry) => (
+                    entry.globalId === editingCarrierAccountGlobalId
+                  ))?.accountNumberLastFour || ''}`}
+                  helperText="Account numbers cannot be changed after creation. Add a new account if the billing identity changes."
+                  InputProps={{ readOnly: true }}
+                  disabled={busy || ratingOnlyDelegation}
+                  sx={fieldSx}
+                />
+              ) : (
+                <TextField
+                  required
+                  label="Account number"
+                  value={carrierAccountForm.accountNumber}
+                  onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
+                  disabled={busy || ratingOnlyDelegation}
+                  autoComplete="off"
+                  sx={fieldSx}
+                />
+              )}
               <TextField
                 required
                 label="Sender name"

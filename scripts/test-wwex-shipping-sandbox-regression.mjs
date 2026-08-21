@@ -223,8 +223,8 @@ assert.ok(
   'Preparation-only LTL selector must contain only canonical handling units',
 )
 assert.ok(
-  settingsSource.includes('data-testid="shipping-integration-capability-tabs"'),
-  'Shipping capability tabs are not screenshot-addressable',
+  settingsSource.includes('<CarrierConnectionsPanel onNavigate={onNavigate} />'),
+  'Shipping settings must open on the carrier connections landing page',
 )
 
 for (const entryId of ['box', 'envelope', 'tube', 'crate', 'custom']) {
@@ -505,7 +505,7 @@ const evidence = Object.freeze({
     '[data-testid="shipping-mode-selector"]',
     '[data-testid="parcel-package-profile-1"]',
     '[data-testid="ltl-handling-unit-select"]',
-    '[data-testid="shipping-integration-capability-tabs"]',
+    '[data-testid="carrier-connections-landing"]',
   ]),
 })
 

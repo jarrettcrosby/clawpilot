@@ -476,7 +476,6 @@ for (const fragment of [
   'Used as the shipper name for carrier rating and labels.',
   'Registered address line 1',
   'set-account-status',
-  'delete-account',
   'Sandbox billing account',
   'carrierAccountGlobalId: selectedCarrierAccountGlobalId',
   'destination: rateDestination',
@@ -530,6 +529,15 @@ for (const fragment of [
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
 }
+assert.ok(
+  !panel.includes("action: 'delete-account'"),
+  'Carrier settings must not expose the account delete operation forbidden by database integrity rules',
+)
+assert.ok(
+  !panel.includes('New account number (optional)')
+    && panel.includes('Account numbers cannot be changed after creation.'),
+  'Carrier settings must keep an existing account number masked and immutable',
+)
 assert.ok(
   panel.includes("account.status !== 'active'"),
   'Sandbox rate UI must remain disabled until the verified credential is explicitly enabled',
