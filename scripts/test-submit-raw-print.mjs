@@ -73,6 +73,53 @@ assert.equal(preWrite.disposition.deliveryStarted, false)
 assert.equal(preWrite.disposition.retryable, true)
 assert.equal(preWrite.disposition.code, 'PRINTER_UNAVAILABLE')
 
+let stoppedBeforeConnectCalls = 0
+await assert.rejects(
+  submitRaw(
+    Buffer.from('^XA^FDSTOPPED BEFORE CONNECT^FS^XZ'),
+    'warehouse-zebra.local',
+    9_100,
+    123,
+    {
+      createConnection() {
+        stoppedBeforeConnectCalls += 1
+        return new FakeSocket()
+      },
+      shouldStop: () => true,
+    },
+  ),
+  (error) => (
+    error.code === 'PRINT_DELIVERY_STOPPED'
+    && error.acceptedBytes === 0
+    && error.deliveryStarted === false
+  ),
+)
+assert.equal(stoppedBeforeConnectCalls, 0)
+
+const stoppedWhileConnectingSocket = new FakeSocket()
+let stopWhileConnecting = false
+await assert.rejects(
+  submitRaw(
+    Buffer.from('^XA^FDSTOPPED WHILE CONNECTING^FS^XZ'),
+    'warehouse-zebra.local',
+    9_100,
+    123,
+    {
+      createConnection: injectedConnection(stoppedWhileConnectingSocket, (socket) => {
+        stopWhileConnecting = true
+        socket.emit('connect')
+      }),
+      shouldStop: () => stopWhileConnecting,
+    },
+  ),
+  (error) => (
+    error.code === 'PRINT_DELIVERY_STOPPED'
+    && error.acceptedBytes === 0
+    && error.deliveryStarted === false
+  ),
+)
+assert.equal(stoppedWhileConnectingSocket.writeCalls, 0)
+
 const timeoutSocket = new FakeSocket(({ socket }) => {
   queueMicrotask(() => socket.emit('timeout'))
 })
@@ -174,6 +221,7 @@ for (const socket of [
   callbackErrorSocket,
   successSocket,
   lockWaitSocket,
+  stoppedWhileConnectingSocket,
 ]) {
   assert.equal(socket.options.host, 'warehouse-zebra.local')
   assert.equal(socket.options.port, 9_100)

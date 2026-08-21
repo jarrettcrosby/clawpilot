@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import net from 'node:net'
 import { pathToFileURL } from 'node:url'
-import { normalizedLocalPrinterEndpoint } from './local-print-device.mjs'
+import {
+  LOCAL_PRINTER_LOCK_HOLDER_READY,
+  normalizedLocalPrinterEndpoint,
+} from './local-print-device.mjs'
 
 function positiveInteger(value, fallback) {
   const parsed = Number(value || fallback)
@@ -47,8 +50,16 @@ export async function submitRaw(
     claimMonotonicDeadlineNs = null,
     now = Date.now,
     monotonicNowNs = process.hrtime.bigint,
+    shouldStop = () => false,
   } = {},
 ) {
+  const stoppedBeforeDelivery = () => {
+    const error = new Error('The local print worker stopped before raw delivery began')
+    error.code = 'PRINT_DELIVERY_STOPPED'
+    error.acceptedBytes = 0
+    error.deliveryStarted = false
+    return error
+  }
   const assertLeaseRemaining = (minimumMs) => {
     const hasWallDeadline = claimExpiresAt !== null
       && claimExpiresAt !== undefined
@@ -82,6 +93,7 @@ export async function submitRaw(
     }
   }
   assertLeaseRemaining(timeoutMs + 2_000)
+  if (shouldStop()) throw stoppedBeforeDelivery()
   return new Promise((resolvePromise, reject) => {
     const socket = createConnection({ host, port })
     let acceptedBytes = 0
@@ -101,6 +113,10 @@ export async function submitRaw(
     }
     socket.setTimeout(timeoutMs)
     socket.once('connect', () => {
+      if (shouldStop()) {
+        finish(stoppedBeforeDelivery())
+        return
+      }
       try {
         assertLeaseRemaining(2_000)
       } catch (error) {
@@ -124,6 +140,21 @@ export async function submitRaw(
     socket.once('finish', () => finish())
     socket.once('timeout', () => finish(new Error('Local printer delivery timed out')))
     socket.once('error', finish)
+  })
+}
+
+async function holdEndpointLock() {
+  process.stdout.write(`${LOCAL_PRINTER_LOCK_HOLDER_READY}\n`)
+  process.stdin.resume()
+  await new Promise((resolvePromise) => {
+    let resolved = false
+    const finish = () => {
+      if (resolved) return
+      resolved = true
+      resolvePromise()
+    }
+    process.stdin.once('end', finish)
+    process.stdin.once('close', finish)
   })
 }
 
@@ -161,7 +192,10 @@ if (
   process.argv[1]
   && import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
-  main().catch(() => {
+  const execution = process.argv.includes('--hold-endpoint-lock')
+    ? holdEndpointLock()
+    : main()
+  execution.catch(() => {
     process.stdout.write(`${JSON.stringify({
       ok: false,
       acceptedBytes: 0,

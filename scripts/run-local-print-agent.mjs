@@ -5,14 +5,16 @@ import { promises as fs, readFileSync } from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import {
   opaqueLocalDeviceReference,
   readOrCreateLocalDeviceKey,
   runWithLocalPrinterKernelLock,
   normalizedLocalPrinterEndpoint,
 } from './lib/local-print-device.mjs'
-import { rawPrintFailureDisposition } from './lib/submit-raw-print.mjs'
+import {
+  rawPrintFailureDisposition,
+  submitRaw as submitRawToPrinter,
+} from './lib/submit-raw-print.mjs'
 
 const args = new Set(process.argv.slice(2))
 const once = args.has('--once')
@@ -51,11 +53,6 @@ const deviceKeyPath = expandHome(
 const deviceLockDirectory = expandHome(
   process.env.CLAWPILOT_PRINT_AGENT_DEVICE_LOCK_DIRECTORY
     || '~/Library/Application Support/ClawPilot/print-agent/device-locks',
-)
-const rawDeliveryHelperPath = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  'lib',
-  'submit-raw-print.mjs',
 )
 const MINIMUM_RAW_DELIVERY_LEASE_MS = 25_000
 const CLAIM_MONOTONIC_DEADLINE = Symbol('claimMonotonicDeadline')
@@ -300,17 +297,17 @@ async function submitRaw(payload, job, timeoutMs = 10_000) {
     host: printerHost,
     port: printerPort,
     timeoutMs,
-    command: process.execPath,
-    args: [rawDeliveryHelperPath],
-    env: {
-      CLAWPILOT_PRINTER_HOST: printerHost,
-      CLAWPILOT_PRINTER_PORT: String(printerPort),
-      CLAWPILOT_PRINT_CLAIM_EXPIRES_AT: claimExpiry(job),
-      CLAWPILOT_PRINT_CLAIM_MONOTONIC_DEADLINE_NS: String(
-        claimMonotonicDeadline(job),
-      ),
-    },
-    stdin: payload,
+    executeWhileLocked: () => submitRawToPrinter(
+      payload,
+      printerHost,
+      printerPort,
+      timeoutMs,
+      {
+        claimExpiresAt: claimExpiry(job),
+        claimMonotonicDeadlineNs: String(claimMonotonicDeadline(job)),
+        shouldStop: () => stopping,
+      },
+    ),
   })
   if (execution.lockTimedOut) {
     const error = new Error('The configured local printer is busy')
@@ -319,17 +316,8 @@ async function submitRaw(payload, job, timeoutMs = 10_000) {
     error.deliveryStarted = false
     throw error
   }
-  let result = null
-  try {
-    result = JSON.parse(execution.stdout)
-  } catch {
-    // A helper that exits without evidence may have delivered bytes.
-  }
-  if (
-    execution.code === 0
-    && result?.ok === true
-    && Number(result.acceptedBytes) === payload.byteLength
-  ) {
+  const result = execution.value
+  if (Number(result?.acceptedBytes) === payload.byteLength) {
     return { acceptedBytes: payload.byteLength }
   }
   const error = new Error('The configured local printer did not complete delivery')
@@ -727,6 +715,21 @@ async function recordSafePreDeliveryFailure(
   })
 }
 
+async function recordStoppedBeforeDelivery(
+  config,
+  ledger,
+  job,
+  key,
+  immutableKey,
+) {
+  await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey, {
+    errorCode: 'PRINT_DELIVERY_STOPPED',
+    errorMessage: 'The local print worker stopped before raw delivery began; zero bytes were sent',
+    retryAfterSeconds: 0,
+    event: 'job_stopped_before_delivery',
+  })
+}
+
 async function handleJob(config, ledger, job, deviceReference) {
   claimExpiry(job)
   let key
@@ -879,6 +882,11 @@ async function handleJob(config, ledger, job, deviceReference) {
     return
   }
 
+  if (stopping) {
+    await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+    return
+  }
+
   ledger.claims[key] = {
     ...deliveryRecord(job, 'sending', {
       claimToken: job.claimToken,
@@ -890,6 +898,11 @@ async function handleJob(config, ledger, job, deviceReference) {
     startedAt: ledger.claims[key].startedAt,
   })
   await writeLedger(ledger)
+
+  if (stopping) {
+    await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+    return
+  }
 
   applyTestClockAdvanceBeforeRaw()
   try {
@@ -905,6 +918,14 @@ async function handleJob(config, ledger, job, deviceReference) {
     result = await submitRaw(payload, job)
   } catch (error) {
     const disposition = rawPrintFailureDisposition(error)
+    if (
+      error?.code === 'PRINT_DELIVERY_STOPPED'
+      && disposition.acceptedBytes === 0
+      && disposition.deliveryStarted === false
+    ) {
+      await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+      return
+    }
     if (
       error?.code === 'PRINT_CLAIM_LEASE_TOO_SHORT'
       && disposition.acceptedBytes === 0
@@ -1058,7 +1079,8 @@ async function cycle(config, ledger, deviceReference) {
     })
   }
   const jobs = Array.isArray(response.jobs) ? response.jobs : []
-  if (stopping) {
+  const stoppedAfterClaim = stopping
+  if (stoppedAfterClaim && !jobs[0]) {
     log('worker_stop_after_claim', {
       returnedJobCount: jobs.length,
       localOwnershipCreated: false,
@@ -1068,6 +1090,14 @@ async function cycle(config, ledger, deviceReference) {
   if (jobs[0]) {
     registerClaimLease(jobs[0], response[REQUEST_ROUND_TRIP_MS], 120)
     await handleJob(config, ledger, jobs[0], deviceReference)
+    if (stoppedAfterClaim) {
+      log('worker_stop_after_claim', {
+        returnedJobCount: jobs.length,
+        localOwnershipCreated: true,
+        safeZeroByteDispositionRecorded: true,
+      })
+      return 0
+    }
   }
   return jobs.length
 }

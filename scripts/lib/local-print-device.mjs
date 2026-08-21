@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 const DEVICE_KEY_PATTERN = /^[a-f0-9]{64}$/
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000
+export const LOCAL_PRINTER_LOCK_HOLDER_READY = 'CLAWPILOT_ENDPOINT_LOCK_READY_V1'
 
 function expandHome(value) {
   return value.startsWith('~/') ? path.join(os.homedir(), value.slice(2)) : value
@@ -166,19 +167,120 @@ export async function runWithLocalPrinterKernelLock(input) {
   ) {
     throw new Error('The local printer lock timing is invalid')
   }
+  const executeWhileLocked = input.executeWhileLocked
   const command = String(input.command || '').trim()
-  if (!command || !Array.isArray(input.args)) {
+  if (
+    typeof executeWhileLocked !== 'function'
+    && (!command || !Array.isArray(input.args))
+  ) {
     throw new Error('A local printer delivery command is required')
   }
 
   await fs.mkdir(directory, { recursive: true, mode: 0o700 })
   const lockPath = path.join(directory, `${endpointLockName(input.host, input.port)}.lock`)
+  const lockHolderPath = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'submit-raw-print.mjs',
+  )
   const invocation = localPrinterLockInvocation({
     lockPath,
     timeoutSeconds: Math.max(1, Math.ceil(timeoutMs / 1_000)),
-    command,
-    args: input.args,
+    command: typeof executeWhileLocked === 'function' ? process.execPath : command,
+    args: typeof executeWhileLocked === 'function'
+      ? [lockHolderPath, '--hold-endpoint-lock']
+      : input.args,
   })
+  if (typeof executeWhileLocked === 'function') {
+    const child = spawn(invocation.command, invocation.args, {
+      env: {
+        PATH: process.env.PATH || '/usr/bin:/bin',
+        ELECTRON_RUN_AS_NODE: '1',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    let stdout = ''
+    let stderr = ''
+    let ready = false
+    let settled = false
+    let closeResult = null
+    let resolveReady
+    let rejectReady
+    let resolveClose
+    const readyOrClosed = new Promise((resolvePromise, rejectPromise) => {
+      resolveReady = resolvePromise
+      rejectReady = rejectPromise
+    })
+    const closed = new Promise((resolvePromise) => {
+      resolveClose = resolvePromise
+    })
+    const boundedAppend = (current, chunk) => `${current}${chunk}`.slice(-16 * 1024)
+    child.stdout.on('data', (chunk) => {
+      stdout = boundedAppend(stdout, chunk)
+      if (
+        !ready
+        && stdout.split(/\r?\n/).includes(LOCAL_PRINTER_LOCK_HOLDER_READY)
+      ) {
+        ready = true
+        resolveReady({ ready: true })
+      }
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr = boundedAppend(stderr, chunk)
+    })
+    child.once('error', (error) => {
+      if (!settled) {
+        settled = true
+        rejectReady(error)
+      }
+    })
+    child.once('close', (code, signal) => {
+      closeResult = {
+        code: Number(code),
+        signal,
+        stdout,
+        stderr,
+        lockTimedOut: Number(code) === 75,
+      }
+      if (!ready && !settled) {
+        settled = true
+        resolveReady({ ready: false, result: closeResult })
+      }
+      resolveClose(closeResult)
+    })
+    child.stdin.on('error', (error) => {
+      if (error?.code !== 'EPIPE' && !settled) {
+        settled = true
+        rejectReady(error)
+      }
+    })
+    const acquisition = await readyOrClosed
+    if (!acquisition.ready) return acquisition.result
+
+    let value
+    let executionError
+    try {
+      value = await executeWhileLocked()
+    } catch (error) {
+      executionError = error
+    } finally {
+      child.stdin.end()
+    }
+    const completion = closeResult || await closed
+    if (executionError) throw executionError
+    if (completion.code !== 0 || completion.signal) {
+      const error = new Error('The local printer endpoint lock holder exited unexpectedly')
+      error.code = 'LOCAL_PRINTER_LOCK_FAILED'
+      if (Number.isSafeInteger(Number(value?.acceptedBytes))) {
+        error.acceptedBytes = Number(value.acceptedBytes)
+        error.deliveryStarted = value.deliveryStarted === true
+          || error.acceptedBytes > 0
+      }
+      throw error
+    }
+    return { ...completion, lockTimedOut: false, value }
+  }
   return new Promise((resolvePromise, reject) => {
     const child = spawn(invocation.command, invocation.args, {
       env: {

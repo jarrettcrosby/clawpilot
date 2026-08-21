@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
@@ -22,6 +29,7 @@ import {
   legacyMacPrintAgentDetection,
 } from '../src/lib/legacy-macos-agent.mjs'
 import { LegacyMacMigrationGuard } from '../src/lib/legacy-macos-migration-guard.mjs'
+import { runWithLocalPrinterKernelLock } from '../../../scripts/lib/local-print-device.mjs'
 
 const repositoryRoot = path.resolve(import.meta.dirname, '../../..')
 const runtimeCredential = `cpprint.v1.00000000-0000-4000-8000-000000000001.${'A'.repeat(43)}`
@@ -287,12 +295,13 @@ test('late malformed legacy detection fails closed and quiesces once', async () 
   assert.equal(stops, 1)
 })
 
-test('late legacy stop defers a job returned by an in-flight claim without local ownership', {
+test('late legacy stop requeues a job returned by an in-flight claim with zero-byte proof', {
   skip: !['darwin', 'linux'].includes(process.platform),
 }, async () => {
   const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-claim-'))
-  const zpl = '^XA^FO20,20^FDMust remain server-owned after stop^FS^XZ'
+  const zpl = '^XA^FO20,20^FDMust be safely requeued after stop^FS^XZ'
   const actions = []
+  const commands = []
   let printerBytes = 0
   let releaseClaimResponse
   const claimResponseRelease = new Promise((resolvePromise) => {
@@ -306,6 +315,12 @@ test('late legacy stop defers a job returned by an in-flight claim without local
     request.on('end', async () => {
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       actions.push(body.action)
+      commands.push(body)
+      if (body.action === 'fail') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
       if (body.action !== 'claim') {
         response.writeHead(409, { 'content-type': 'application/json' })
         response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
@@ -408,13 +423,201 @@ test('late legacy stop defers a job returned by an in-flight claim without local
       'The stopped worker did not report the post-claim response fence',
     )
     assert.equal(claimResponseSent, true)
-    assert.deepEqual(actions, ['claim'])
+    assert.deepEqual(actions, ['claim', 'fail'])
+    assert.equal(commands[1].errorCode, 'PRINT_DELIVERY_STOPPED')
+    assert.equal(commands[1].retryable, true)
+    assert.equal(commands[1].printerUnavailable, false)
+    assert.equal(commands[1].retryAfterSeconds, 0)
     assert.equal(printerBytes, 0)
-    assert.deepEqual(JSON.parse(readFileSync(ledgerPath, 'utf8')), emptyLedger)
+    const stoppedLedger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+    assert.deepEqual(stoppedLedger.pendingResults, {})
+    assert.equal(Object.values(stoppedLedger.claims).length, 1)
+    assert.equal(Object.values(stoppedLedger.deliveries).length, 1)
+    for (const entry of [
+      ...Object.values(stoppedLedger.claims),
+      ...Object.values(stoppedLedger.deliveries),
+    ]) {
+      assert.equal(entry.state, 'delivery_failed')
+      assert.equal(entry.acceptedBytes, 0)
+      assert.equal(entry.deliveryStarted, false)
+      assert.equal(entry.serverResultConfirmed, true)
+    }
     assert.equal(manager.statusFor(instance.id).state, 'stopped')
     assert.equal(guard.snapshot().quiesced, true)
   } finally {
     releaseClaimResponse()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy stop while waiting for the shared endpoint lock requeues with zero raw bytes', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-lock-wait-'))
+  const sharedLockDirectory = path.join(temporary, 'shared-locks')
+  const lockReadyPath = path.join(temporary, 'lock-ready')
+  const releaseLockPath = path.join(temporary, 'release-lock')
+  const zpl = '^XA^FO20,20^FDMust stop before shared-lock delivery^FS^XZ'
+  const commands = []
+  let printerBytes = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      commands.push(body)
+      if (body.action === 'claim') {
+        const serverNow = new Date()
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          ok: true,
+          jobs: [{
+            globalId: 'gpj0000066',
+            claimToken: '00000000-0000-4000-8000-000000000066',
+            serverNow: serverNow.toISOString(),
+            claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+            printer: { globalId: 'gpr0000066' },
+            document: {
+              globalId: 'gpf0000066',
+              type: 'shipping_label',
+              format: 'ZPL',
+              encoding: 'utf8',
+              media: 'label_4x6',
+              inlinePayload: zpl,
+              byteLength: Buffer.byteLength(zpl),
+              contentSha256: createHash('sha256').update(zpl).digest('hex'),
+            },
+          }],
+        }))
+        return
+      }
+      if (body.action === 'fail') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
+      response.writeHead(409, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const priorTestMode = process.env.CLAWPILOT_GATEWAY_TEST_MODE
+  const priorLoopback = process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK
+  process.env.CLAWPILOT_GATEWAY_TEST_MODE = '1'
+  process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK = '1'
+  const lockHolder = runWithLocalPrinterKernelLock({
+    directory: sharedLockDirectory,
+    host: '127.0.0.1',
+    port: printer.address().port,
+    timeoutMs: 10_000,
+    command: process.execPath,
+    args: [
+      '--input-type=module',
+      '--eval',
+      `import { existsSync, writeFileSync } from 'node:fs';
+       writeFileSync(process.argv[1], 'ready');
+       const timer = setInterval(() => {
+         if (!existsSync(process.argv[2])) return;
+         clearInterval(timer);
+       }, 10);`,
+      lockReadyPath,
+      releaseLockPath,
+    ],
+  })
+  await waitFor(() => existsSync(lockReadyPath), 'The endpoint-lock fixture did not acquire the lock')
+  if (priorTestMode === undefined) delete process.env.CLAWPILOT_GATEWAY_TEST_MODE
+  else process.env.CLAWPILOT_GATEWAY_TEST_MODE = priorTestMode
+  if (priorLoopback === undefined) delete process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK
+  else process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK = priorLoopback
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000066',
+    slug: 'instance-00000000-0000-4000-8000-000000000066',
+    displayName: 'Shared-lock migration fence',
+    serverAgentGlobalId: 'gpa_shared_lock_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(15_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory,
+    startGuard: () => guard.assertReady(),
+  })
+  const workerEvents = []
+  manager.on('status', ({ id, status }) => {
+    if (id === instance.id && status.lastEvent) workerEvents.push(status.lastEvent)
+  })
+  const ledgerPath = path.join(manager.pathsFor(instance).instanceDirectory, 'claim-ledger.json')
+  try {
+    manager.startEnabled()
+    await waitFor(() => {
+      try {
+        return Object.values(JSON.parse(readFileSync(ledgerPath, 'utf8')).claims)
+          .some((entry) => entry.state === 'sending')
+      } catch {
+        return false
+      }
+    }, 'The claimed job did not reach the durable pre-delivery sending state')
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => workerEvents.includes('worker_stop_requested'),
+      'The shared-lock worker did not latch its graceful stop signal',
+    )
+    writeFileSync(releaseLockPath, 'release')
+    await lockHolder
+    await quiesced
+    assert.deepEqual(commands.map(({ action }) => action), ['claim', 'fail'])
+    assert.equal(commands[1].errorCode, 'PRINT_DELIVERY_STOPPED')
+    assert.equal(commands[1].retryable, true)
+    assert.equal(commands[1].printerUnavailable, false)
+    assert.equal(printerBytes, 0)
+    const stoppedLedger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+    assert.deepEqual(stoppedLedger.pendingResults, {})
+    for (const entry of [
+      ...Object.values(stoppedLedger.claims),
+      ...Object.values(stoppedLedger.deliveries),
+    ]) {
+      assert.equal(entry.state, 'delivery_failed')
+      assert.equal(entry.acceptedBytes, 0)
+      assert.equal(entry.deliveryStarted, false)
+      assert.equal(entry.serverResultConfirmed, true)
+    }
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    writeFileSync(releaseLockPath, 'release')
+    await lockHolder.catch(() => undefined)
     manager.shutdown()
     api.close()
     printer.close()
