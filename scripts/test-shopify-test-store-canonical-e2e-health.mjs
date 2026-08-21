@@ -21,6 +21,15 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const { Pool } = requireFromApp('pg')
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18'].includes(
+    disposablePostgresImage,
+  ),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 
 function command(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -400,7 +409,7 @@ async function main() {
       '-e', 'POSTGRES_PASSWORD=shopify_test_e2e_health',
       '-e', 'POSTGRES_DB=shopify_test_e2e_health',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { timeout: 180_000 })
     containerStarted = true
     const portOutput = command('docker', ['port', container, '5432/tcp'])

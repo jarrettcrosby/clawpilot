@@ -55,6 +55,7 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
     JOIN pg_catalog.pg_namespace installed_namespace
       ON installed_namespace.oid = installed_table.relnamespace
     WHERE installed_namespace.nspname = 'public'
+      AND installed_constraint.contype <> 'n'
       AND installed_table.relname =
         'operations_shipping_one_off_pack_receipts'
     UNION ALL

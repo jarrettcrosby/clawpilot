@@ -218,6 +218,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
     JOIN pg_catalog.pg_namespace installed_namespace
       ON installed_namespace.oid = installed_table.relnamespace
     WHERE installed_namespace.nspname = 'public'
+      AND installed_constraint.contype <> 'n'
       AND (
         installed_table.relname IN (
           'operations_shipping_scopes',

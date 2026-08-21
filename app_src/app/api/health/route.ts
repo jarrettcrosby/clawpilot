@@ -223,6 +223,7 @@ const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String.raw`
       ON table_namespace.oid = table_row.relnamespace
     LEFT JOIN pg_catalog.pg_constraint installed
       ON installed.conrelid = table_row.oid
+     AND installed.contype <> 'n'
      AND (
        required.constraint_name IS NULL
        OR installed.conname = required.constraint_name
@@ -5674,6 +5675,7 @@ export async function GET() {
                 WHERE conrelid = pg_catalog.to_regclass(
                   'public.operations_commerce_store_sync_controls'
                 )
+                  AND contype <> 'n'
                   AND convalidated
               )
               AND (
@@ -5686,6 +5688,7 @@ export async function GET() {
                 WHERE conrelid = pg_catalog.to_regclass(
                   'public.operations_commerce_store_sync_change_receipts'
                 )
+                  AND contype <> 'n'
                   AND convalidated
               )
               AND EXISTS (

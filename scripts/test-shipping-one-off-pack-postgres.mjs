@@ -18,6 +18,15 @@ const requireFromApp = createRequire(
 )
 const { Pool } = requireFromApp('pg')
 const ts = requireFromApp('typescript')
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18'].includes(
+    disposablePostgresImage,
+  ),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 const CONFIRMATION =
   'I CONFIRM THESE EXACT ITEMS ARE PHYSICALLY IN THESE PACKAGES'
 
@@ -69,7 +78,7 @@ if (!databaseUrl) {
       '-e', 'POSTGRES_PASSWORD=clawpilot_shipping_pack',
       '-e', 'POSTGRES_DB=clawpilot_shipping_pack',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { stdio: 'ignore', timeout: 180_000 })
     const portOutput = execFileSync('docker', ['port', container, '5432/tcp'], {
       encoding: 'utf8',

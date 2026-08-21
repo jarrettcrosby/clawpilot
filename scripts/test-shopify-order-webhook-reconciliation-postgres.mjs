@@ -19,6 +19,15 @@ const requireFromApp = createRequire(
 )
 const { Pool } = requireFromApp('pg')
 const root = process.cwd()
+const disposablePostgresImage = String(
+  process.env.CLAWPILOT_TEST_POSTGRES_IMAGE || 'pgvector/pgvector:pg16',
+).trim()
+assert.ok(
+  ['pgvector/pgvector:pg16', 'pgvector/pgvector:pg18'].includes(
+    disposablePostgresImage,
+  ),
+  'CLAWPILOT_TEST_POSTGRES_IMAGE must select the exact pg16 or pg18 image',
+)
 
 const topics = [
   'orders/create',
@@ -957,7 +966,7 @@ async function main() {
       '-e', 'POSTGRES_PASSWORD=order_webhook_0303',
       '-e', 'POSTGRES_DB=order_webhook_0303',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      disposablePostgresImage,
     ], { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
