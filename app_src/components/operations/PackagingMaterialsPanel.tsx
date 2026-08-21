@@ -36,14 +36,15 @@ import EditRounded from '@mui/icons-material/EditRounded'
 import FileUploadRounded from '@mui/icons-material/FileUploadRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
-import type {
-  PackagingMaterial,
-  PackagingMaterialStock,
-  PackagingMaterialsWorkspace,
-  PackagingDimensionBasis,
-  PackagingDimensionEvidenceType,
-  PackagingMaterialSource,
-  PackagingMaterialType,
+import {
+  packagingDimensionEvidenceReferenceRequired,
+  type PackagingMaterial,
+  type PackagingMaterialStock,
+  type PackagingMaterialsWorkspace,
+  type PackagingDimensionBasis,
+  type PackagingDimensionEvidenceType,
+  type PackagingMaterialSource,
+  type PackagingMaterialType,
 } from '@/lib/operations/packagingMaterials'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import {
@@ -670,15 +671,18 @@ export default function PackagingMaterialsPanel() {
 
   const materialMeasurementErrors = useMemo(() => {
     const activationRequired = editingMaterial?.status === 'active'
+    const innerMeasurementsRequired = activationRequired
+      || materialDraft.dimensionEvidenceType === 'measured'
     const validate = (
       displayValue: string,
       canonicalValue: string,
       label: string,
+      required = activationRequired,
     ) => {
       const numeric = Number(displayValue)
       const canonical = Number(canonicalValue)
       if (!displayValue.trim()) {
-        return activationRequired ? `${label} is required for activation` : ''
+        return required ? `${label} is required` : ''
       }
       if (!Number.isFinite(numeric) || numeric <= 0) {
         return `${label} must be greater than zero`
@@ -709,16 +713,19 @@ export default function PackagingMaterialsPanel() {
         materialMeasurementDraft.innerLength,
         materialDraft.innerLengthMm,
         'Inner length',
+        innerMeasurementsRequired,
       ),
       innerWidth: validate(
         materialMeasurementDraft.innerWidth,
         materialDraft.innerWidthMm,
         'Inner width',
+        innerMeasurementsRequired,
       ),
       innerHeight: validate(
         materialMeasurementDraft.innerHeight,
         materialDraft.innerHeightMm,
         'Inner height',
+        innerMeasurementsRequired,
       ),
       ratedOuterLength: validateOptional(
         materialMeasurementDraft.ratedOuterLength,
@@ -805,14 +812,19 @@ export default function PackagingMaterialsPanel() {
     if (!materialMeasurementsValid) return
     if (
       (
-        ['customer_confirmed', 'measured'].includes(
+        ['customer_confirmed', 'provider'].includes(
           materialDraft.dimensionEvidenceType,
         )
-        || editingMaterial?.status === 'active'
+        || (
+          editingMaterial?.status === 'active'
+          && packagingDimensionEvidenceReferenceRequired(
+            materialDraft.dimensionEvidenceType,
+          )
+        )
       )
       && !materialDraft.dimensionEvidenceReference.trim()
     ) {
-      setError('Describe the retained factual dimension evidence')
+      setError('Provide the retained evidence reference for these dimensions')
       return
     }
     setBusy(true)
@@ -1728,10 +1740,18 @@ export default function PackagingMaterialsPanel() {
                     ...materialDraft,
                     dimensionEvidenceReference: event.target.value,
                   })}
-                  helperText="Required before activation for every evidence source"
-                  required={editingMaterial?.status === 'active'
-                    || ['customer_confirmed', 'measured'].includes(
-                      materialDraft.dimensionEvidenceType,
+                  helperText={materialDraft.dimensionEvidenceType === 'measured'
+                    ? 'Optional note; exact measurements retain the confirming actor and time automatically'
+                    : 'Required for provider and customer-confirmed evidence, and before activation for legacy evidence'}
+                  required={[
+                    'customer_confirmed',
+                    'provider',
+                  ].includes(materialDraft.dimensionEvidenceType)
+                    || (
+                      editingMaterial?.status === 'active'
+                      && packagingDimensionEvidenceReferenceRequired(
+                        materialDraft.dimensionEvidenceType,
+                      )
                     )}
                 />
               </Box>

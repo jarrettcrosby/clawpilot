@@ -551,7 +551,10 @@ function mapMaterials(rows: MaterialRow[]) {
       || row.status !== 'active'
       || row.dimension_basis === 'unspecified'
       || row.dimension_evidence_type === 'unknown'
-      || !row.dimension_evidence_reference
+      || (
+        row.dimension_evidence_type !== 'measured'
+        && !row.dimension_evidence_reference?.trim()
+      )
       || row.dimension_confirmed_at === null
       || row.stock_is_available !== true
       || row.unit_cost_minor === null

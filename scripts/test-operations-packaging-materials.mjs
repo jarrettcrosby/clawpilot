@@ -78,6 +78,8 @@ const {
   PACKAGING_MATERIAL_SOURCES,
   PACKAGING_MATERIAL_TYPES,
   STARTER_PACKAGING_MATERIALS,
+  packagingDimensionEvidenceReady,
+  packagingDimensionEvidenceReferenceRequired,
   packagingMaterialReadiness,
 } = loadDomain()
 const {
@@ -102,6 +104,12 @@ assert.deepEqual(
   ['inner', 'outer', 'unspecified'],
 )
 assert.ok(PACKAGING_DIMENSION_EVIDENCE_TYPES.includes('customer_confirmed'))
+assert.equal(packagingDimensionEvidenceReferenceRequired('measured'), false)
+assert.equal(packagingDimensionEvidenceReferenceRequired('provider'), true)
+assert.equal(
+  packagingDimensionEvidenceReferenceRequired('customer_confirmed'),
+  true,
+)
 assert.ok(PACKAGING_MATERIAL_SOURCES.includes('customer_supplied'))
 assert.ok(PACKAGING_MATERIAL_SOURCES.includes('shopify_import'))
 assert.equal(STARTER_PACKAGING_MATERIALS.length, 6)
@@ -236,6 +244,45 @@ const providerEvidenceReadiness = {
     onHandQuantity: 100,
   }],
 }
+const measuredEvidenceReadiness = {
+  ...providerEvidenceReadiness,
+  dimensionEvidenceType: 'measured',
+  dimensionEvidenceReference: null,
+}
+assert.equal(
+  packagingDimensionEvidenceReady({
+    evidenceType: measuredEvidenceReadiness.dimensionEvidenceType,
+    evidenceReference: measuredEvidenceReadiness.dimensionEvidenceReference,
+    confirmedAt: measuredEvidenceReadiness.dimensionConfirmedAt,
+  }),
+  true,
+  'Exact measured evidence is retained by its dimensions, actor, and timestamp without a redundant note',
+)
+assert.equal(
+  packagingMaterialReadiness(measuredEvidenceReadiness)
+    .eligibleForCartonization,
+  true,
+  'Timestamped measured evidence must not require a free-form reference',
+)
+assert.equal(
+  packagingMaterialReadiness({
+    ...measuredEvidenceReadiness,
+    dimensionConfirmedAt: null,
+  }).eligibleForCartonization,
+  false,
+  'Measured evidence still requires its retained confirmation timestamp',
+)
+assert.equal(
+  packagingMaterialReadiness({
+    ...measuredEvidenceReadiness,
+    innerDimensionsMm: {
+      ...measuredEvidenceReadiness.innerDimensionsMm,
+      height: 0,
+    },
+  }).eligibleForCartonization,
+  false,
+  'Measured readiness still requires exact positive dimensions',
+)
 assert.equal(
   packagingMaterialReadiness(providerEvidenceReadiness)
     .eligibleForCartonization,
@@ -316,6 +363,9 @@ const packHierarchyMigration = read(
 const packRuntimeAssociationMigration = read(
   'db/migrations/0133_operations_pack_runtime_association.sql',
 )
+const measuredEvidenceMigration = read(
+  'db/migrations/0309_operations_measured_packaging_evidence.sql',
+)
 for (const fragment of [
   'ALTER COLUMN inner_length_mm DROP NOT NULL',
   "dimension_basis IN ('inner', 'outer', 'unspecified')",
@@ -328,6 +378,23 @@ for (const fragment of [
   assert.ok(
     packHierarchyMigration.includes(fragment),
     `Pack hierarchy migration missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'operations_packaging_materials_dimension_evidence_valid',
+  "dimension_evidence_type <> 'measured'",
+  "dimension_evidence_type NOT IN ('customer_confirmed', 'provider')",
+  "material.dimension_evidence_type = 'measured'",
+  'inner_length_mm > 0',
+  'dimension_confirmed_at IS NOT NULL',
+  'NOT VALID',
+  'CREATE OR REPLACE FUNCTION public.validate_operations_approved_pack_recipe()',
+  'SET search_path = pg_catalog, public, pg_temp',
+  'FROM public.operations_packaging_materials AS material',
+]) {
+  assert.ok(
+    measuredEvidenceMigration.includes(fragment),
+    `Measured evidence migration missing ${fragment}`,
   )
 }
 for (const fragment of [
@@ -432,6 +499,9 @@ for (const fragment of [
   'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
   'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
   'dimensionEvidenceReference',
+  "['customer_confirmed', 'provider'].includes(dimensionEvidenceType)",
+  "dimensionEvidenceType === 'measured'",
+  'Measured evidence requires exact positive length, width, and height',
   "action === 'remove-material'",
   'idempotencyKey: idempotencyKey(req)',
   'Use Remove material to retire a packaging material safely',
@@ -463,6 +533,8 @@ for (const fragment of [
   'Idempotency-Key',
   'Shopify default',
   'globalThis.crypto.randomUUID()',
+  "materialDraft.dimensionEvidenceType === 'measured'",
+  'exact measurements retain the confirming actor and time automatically',
   'const starterCommandKey = useRef<string | null>(null)',
   'if (terminalResponse) starterCommandKey.current = null',
   'if (terminalResponse) importCommandKey.current = null',
@@ -501,6 +573,45 @@ for (const fragment of [
     `Packaging lifecycle migration missing ${fragment}`,
   )
 }
+const measuredEvidenceConsumers = [
+  [
+    'app_src/lib/operations/hybridCartonization.ts',
+    [
+      "material.dimensionEvidenceType !== 'measured'",
+      'dimensionEvidenceReference: string | null',
+      'option.material.dimensionEvidenceReference,',
+    ],
+  ],
+  [
+    'app_src/lib/operations/sandboxCartonizationRatePlan.ts',
+    [
+      "material.dimensionEvidenceType !== 'measured'",
+      'materialDimensionEvidenceReference: string | null',
+      'selected.material.dimensionEvidenceReference,',
+    ],
+  ],
+  [
+    'app_src/lib/persistence/hybridCartonization.ts',
+    ["row.dimension_evidence_type !== 'measured'"],
+  ],
+  [
+    'app_src/lib/persistence/shopifyCheckoutContext.ts',
+    ["row.dimension_evidence_type !== 'measured'"],
+  ],
+  [
+    'app_src/lib/persistence/productPackManagement.ts',
+    ["material.dimension_evidence_type !== 'measured'"],
+  ],
+]
+for (const [path, fragments] of measuredEvidenceConsumers) {
+  const consumer = read(path)
+  for (const fragment of fragments) {
+    assert.ok(
+      consumer.includes(fragment),
+      `${path} is missing measured-evidence contract ${fragment}`,
+    )
+  }
+}
 const importRoute = read(
   'app_src/app/api/operations/packaging-materials/import/route.ts',
 )
@@ -525,10 +636,10 @@ const operationalMaterialBlocker = operationsSection.slice(
 for (const fragment of [
   'material.innerDimensionsMm',
   "material.dimensionBasis !== 'inner'",
-  "material.dimensionEvidenceType === 'unknown'",
-  '!material.dimensionEvidenceReference?.trim()',
-  '!material.dimensionConfirmedAt',
-  'Date.parse(material.dimensionConfirmedAt)',
+  'packagingDimensionEvidenceReady({',
+  'evidenceType: material.dimensionEvidenceType',
+  'evidenceReference: material.dimensionEvidenceReference',
+  'confirmedAt: material.dimensionConfirmedAt',
   "blockers.push('factual inner evidence missing')",
 ]) {
   assert.ok(

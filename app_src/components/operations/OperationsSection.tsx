@@ -134,9 +134,10 @@ import {
   SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
 } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
-import type {
-  PackagingMaterial,
-  PackagingMaterialsWorkspace,
+import {
+  packagingDimensionEvidenceReady,
+  type PackagingMaterial,
+  type PackagingMaterialsWorkspace,
 } from '@/lib/operations/packagingMaterials'
 import type { OrderShipToDraft } from '@/lib/operations/orderShipTo'
 
@@ -675,15 +676,23 @@ function operationalPlanningMaterialBlockers(
   const inner = material.innerDimensionsMm
   const ratedOuter = material.ratedOuterDimensionsMm
   if (material.status !== 'active') blockers.push('not active')
-  if (!inner.length || !inner.width || !inner.height) {
+  if (
+    !Number.isSafeInteger(inner.length)
+    || Number(inner.length) < 1
+    || !Number.isSafeInteger(inner.width)
+    || Number(inner.width) < 1
+    || !Number.isSafeInteger(inner.height)
+    || Number(inner.height) < 1
+  ) {
     blockers.push('usable inner dimensions missing')
   }
   if (
     material.dimensionBasis !== 'inner'
-    || material.dimensionEvidenceType === 'unknown'
-    || !material.dimensionEvidenceReference?.trim()
-    || !material.dimensionConfirmedAt
-    || !Number.isFinite(Date.parse(material.dimensionConfirmedAt))
+    || !packagingDimensionEvidenceReady({
+      evidenceType: material.dimensionEvidenceType,
+      evidenceReference: material.dimensionEvidenceReference,
+      confirmedAt: material.dimensionConfirmedAt,
+    })
   ) {
     blockers.push('factual inner evidence missing')
   }

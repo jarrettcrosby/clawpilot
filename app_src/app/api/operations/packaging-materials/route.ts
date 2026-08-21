@@ -9,6 +9,7 @@ import {
   PACKAGING_MATERIAL_SOURCES,
   PACKAGING_MATERIAL_STATUSES,
   PACKAGING_MATERIAL_TYPES,
+  packagingDimensionEvidenceReferenceRequired,
   type PackagingMaterialInput,
   type PackagingMaterialStockInput,
 } from '@/lib/operations/packagingMaterials'
@@ -321,14 +322,31 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   )
   if (
     (
-      ['customer_confirmed', 'measured'].includes(dimensionEvidenceType)
-      || status === 'active'
+      ['customer_confirmed', 'provider'].includes(dimensionEvidenceType)
+      || (
+        status === 'active'
+        && packagingDimensionEvidenceReferenceRequired(dimensionEvidenceType)
+      )
     )
     && dimensionEvidenceReference === null
   ) {
     fail(
       'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
-      'Describe the retained factual dimension evidence before activation',
+      'Provide the retained evidence reference for these dimensions',
+      409,
+    )
+  }
+  if (
+    dimensionEvidenceType === 'measured'
+    && (
+      innerLengthMm === null
+      || innerWidthMm === null
+      || innerHeightMm === null
+    )
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
+      'Measured evidence requires exact positive length, width, and height',
       409,
     )
   }

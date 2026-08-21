@@ -378,8 +378,14 @@ async function readiness(
            WHERE material.status = 'active'
              AND material.dimension_basis = 'inner'
              AND material.dimension_evidence_type <> 'unknown'
-             AND material.dimension_evidence_reference IS NOT NULL
-             AND length(btrim(material.dimension_evidence_reference)) BETWEEN 1 AND 500
+             AND (
+               material.dimension_evidence_type = 'measured'
+               OR (
+                 material.dimension_evidence_reference IS NOT NULL
+                 AND length(btrim(material.dimension_evidence_reference))
+                   BETWEEN 1 AND 500
+               )
+             )
              AND material.dimension_confirmed_at IS NOT NULL
              AND material.inner_length_mm IS NOT NULL
              AND material.inner_width_mm IS NOT NULL
@@ -552,6 +558,7 @@ async function assertActivationReady(
   client: PoolClient,
   organizationId: string,
   materialId: string,
+  evidenceType: PackagingMaterial['dimensionEvidenceType'],
 ) {
   const configured = await client.query<{
     evidence_ready: boolean
@@ -565,8 +572,14 @@ async function assertActivationReady(
            AND material.id = $2::uuid
            AND material.dimension_basis = 'inner'
            AND material.dimension_evidence_type <> 'unknown'
-           AND material.dimension_evidence_reference IS NOT NULL
-           AND length(btrim(material.dimension_evidence_reference)) BETWEEN 1 AND 500
+           AND (
+             material.dimension_evidence_type = 'measured'
+             OR (
+               material.dimension_evidence_reference IS NOT NULL
+               AND length(btrim(material.dimension_evidence_reference))
+                 BETWEEN 1 AND 500
+             )
+           )
            AND material.dimension_confirmed_at IS NOT NULL
        ) AS evidence_ready,
        EXISTS (
@@ -585,7 +598,9 @@ async function assertActivationReady(
   if (!configured.rows[0]?.evidence_ready) {
     throw new PackagingMaterialRequestError(
       'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
-      'Retain the factual dimension evidence, reference, and confirmation before activation',
+      evidenceType === 'measured'
+        ? 'Save exact positive measurements so ClawPilot can retain their confirmation before activation'
+        : 'Retain the factual dimension evidence reference and confirmation before activation',
       409,
     )
   }
@@ -854,7 +869,12 @@ export async function savePackagingMaterialInPostgres(input: {
       }
 
       if (input.material.status === 'active') {
-        await assertActivationReady(client, input.organizationId, materialId)
+        await assertActivationReady(
+          client,
+          input.organizationId,
+          materialId,
+          input.material.dimensionEvidenceType,
+        )
       }
 
       const eventType = previousStatus === null

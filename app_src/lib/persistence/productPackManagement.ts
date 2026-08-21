@@ -1635,7 +1635,10 @@ function assertActiveRecipeMaterial(material: MaterialRow) {
     material.status !== 'active'
     || material.dimension_basis !== 'inner'
     || material.dimension_evidence_type === 'unknown'
-    || !material.dimension_evidence_reference
+    || (
+      material.dimension_evidence_type !== 'measured'
+      && !material.dimension_evidence_reference?.trim()
+    )
     || material.dimension_confirmed_at === null
     || !Number.isSafeInteger(material.inner_length_mm)
     || Number(material.inner_length_mm) < 1

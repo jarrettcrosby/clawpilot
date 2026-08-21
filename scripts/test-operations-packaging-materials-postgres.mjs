@@ -58,6 +58,36 @@ async function verify(databaseUrl) {
   const auditEvents = []
   const { persistence, parser } = packagingModules(pool, auditEvents)
   try {
+    const evidenceConstraint = await pool.query(
+      `SELECT convalidated
+       FROM pg_constraint
+       WHERE conrelid = 'operations_packaging_materials'::regclass
+         AND conname =
+           'operations_packaging_materials_dimension_evidence_valid'`,
+    )
+    assert.equal(evidenceConstraint.rowCount, 1)
+    assert.equal(
+      evidenceConstraint.rows[0].convalidated,
+      false,
+      'Migration 0309 must enforce new writes without scanning or fabricating legacy evidence rows',
+    )
+    const recipeFunction = await pool.query(
+      `SELECT function.proconfig
+       FROM pg_proc AS function
+       JOIN pg_namespace AS namespace
+         ON namespace.oid = function.pronamespace
+       WHERE namespace.nspname = 'public'
+         AND function.proname =
+           'validate_operations_approved_pack_recipe'
+         AND pg_get_function_identity_arguments(function.oid) = ''`,
+    )
+    assert.equal(recipeFunction.rowCount, 1)
+    assert.ok(
+      recipeFunction.rows[0].proconfig?.includes(
+        'search_path=pg_catalog, public, pg_temp',
+      ),
+      'The replaced recipe trigger function must retain a pinned search path',
+    )
     await pool.query(
       `INSERT INTO app_users (email, role, status)
        VALUES ($1, 'owner', 'active')`,
@@ -266,83 +296,17 @@ async function verify(databaseUrl) {
       },
     })
 
-    await pool.query(
-      `UPDATE operations_packaging_materials
-       SET dimension_confirmed_at = NULL,
-           dimension_confirmed_by = NULL
-       WHERE organization_id = $1::uuid AND global_id = $2`,
-      [organizationId, createdProvider.globalId],
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_packaging_materials
+         SET dimension_confirmed_at = NULL,
+             dimension_confirmed_by = NULL
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [organizationId, createdProvider.globalId],
+      ),
+      (error) => error?.code === '23514',
+      'Provider evidence cannot lose its retained timestamp at the database boundary',
     )
-    const corruptedWorkspace = await persistence
-      .readPackagingMaterialsWorkspaceFromPostgres({
-        organizationId,
-        canView: true,
-        canManage: true,
-      })
-    const corruptedProvider = corruptedWorkspace.materials.find(
-      (material) => material.globalId === createdProvider.globalId,
-    )
-    assert.ok(corruptedProvider)
-    assert.equal(corruptedProvider.dimensionConfirmedAt, null)
-    assert.equal(corruptedProvider.readiness.eligibleForCartonization, false)
-    assert.deepEqual(
-      Array.from(corruptedProvider.readiness.missing),
-      ['dimension_evidence'],
-      'A provider row with a missing retained timestamp must not appear optimizer-ready',
-    )
-
-    const forceNullFunction = `force_null_dimension_confirmation_${suffix}`
-    const forceNullTrigger = `force_null_dimension_confirmation_${suffix}`
-    await pool.query(
-      `CREATE FUNCTION ${forceNullFunction}()
-       RETURNS trigger LANGUAGE plpgsql AS $$
-       BEGIN
-         IF NEW.code = '${providerMaterial.code}' THEN
-           NEW.dimension_confirmed_at := NULL;
-           NEW.dimension_confirmed_by := NULL;
-         END IF;
-         RETURN NEW;
-       END;
-       $$`,
-    )
-    await pool.query(
-      `CREATE TRIGGER ${forceNullTrigger}
-       BEFORE UPDATE ON operations_packaging_materials
-       FOR EACH ROW EXECUTE FUNCTION ${forceNullFunction}()`,
-    )
-    await rejected(
-      persistence.savePackagingMaterialInPostgres({
-        organizationId,
-        actorEmail,
-        material: {
-          ...providerMaterial,
-          globalId: createdProvider.globalId,
-          expectedRowVersion: createdProvider.rowVersion,
-          name: 'Provider evidence activation must roll back',
-          status: 'active',
-        },
-      }),
-      'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
-    )
-    const rejectedProviderRow = await pool.query(
-      `SELECT name, status, row_version::integer, dimension_confirmed_at
-       FROM operations_packaging_materials
-       WHERE organization_id = $1::uuid AND global_id = $2`,
-      [organizationId, createdProvider.globalId],
-    )
-    assert.equal(rejectedProviderRow.rows[0].name, providerMaterial.name)
-    assert.equal(rejectedProviderRow.rows[0].status, 'draft')
-    assert.equal(
-      rejectedProviderRow.rows[0].row_version,
-      createdProvider.rowVersion,
-      'Failed provider activation must roll back every material mutation',
-    )
-    assert.equal(rejectedProviderRow.rows[0].dimension_confirmed_at, null)
-    await pool.query(
-      `DROP TRIGGER ${forceNullTrigger}
-       ON operations_packaging_materials`,
-    )
-    await pool.query(`DROP FUNCTION ${forceNullFunction}()`)
 
     const activatedProvider = await persistence.savePackagingMaterialInPostgres({
       organizationId,
@@ -376,6 +340,212 @@ async function verify(databaseUrl) {
     assert.equal(eligibleProvider.dimensionConfirmedBy, actorEmail)
     assert.equal(eligibleProvider.readiness.eligibleForCartonization, true)
     assert.deepEqual(Array.from(eligibleProvider.readiness.missing), [])
+
+    for (const evidenceType of ['provider', 'customer_confirmed']) {
+      await assert.rejects(
+        pool.query(
+          `UPDATE operations_packaging_materials
+           SET dimension_evidence_type = $3,
+               dimension_evidence_reference = NULL
+           WHERE organization_id = $1::uuid AND global_id = $2`,
+          [organizationId, createdProvider.globalId, evidenceType],
+        ),
+        (error) => error?.code === '23514',
+        `${evidenceType} evidence must retain a nonblank reference`,
+      )
+    }
+
+    const measuredMaterial = {
+      code: `MEASURED-${suffix}`,
+      name: 'Exactly measured packaging acceptance',
+      materialType: 'carton',
+      innerLengthMm: 420,
+      innerWidthMm: 300,
+      innerHeightMm: 180,
+      ratedOuterLengthMm: 430,
+      ratedOuterWidthMm: 310,
+      ratedOuterHeightMm: 190,
+      ratedOuterDimensionEvidenceType: 'measured',
+      ratedOuterDimensionEvidenceReference:
+        'Measured rated exterior acceptance fixture',
+      dimensionBasis: 'inner',
+      dimensionEvidenceType: 'measured',
+      dimensionEvidenceReference: null,
+      tareWeightGrams: 300,
+      maxWeightGrams: 8_000,
+      unitCostMinor: 175,
+      currency: 'USD',
+      status: 'draft',
+      source: 'manual',
+    }
+    const createdMeasured = await persistence.savePackagingMaterialInPostgres({
+      organizationId,
+      actorEmail,
+      material: measuredMaterial,
+    })
+    const createdMeasuredRow = await pool.query(
+      `SELECT dimension_evidence_reference, dimension_confirmed_at,
+              dimension_confirmed_by
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdMeasured.globalId],
+    )
+    assert.equal(
+      createdMeasuredRow.rows[0].dimension_evidence_reference,
+      null,
+    )
+    assert.ok(createdMeasuredRow.rows[0].dimension_confirmed_at instanceof Date)
+    assert.equal(createdMeasuredRow.rows[0].dimension_confirmed_by, actorEmail)
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_packaging_materials
+         SET inner_height_mm = NULL
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [organizationId, createdMeasured.globalId],
+      ),
+      (error) => error?.code === '23514',
+      'Measured evidence must retain exact positive dimensions',
+    )
+    await persistence.savePackagingMaterialStockInPostgres({
+      organizationId,
+      actorEmail,
+      stock: {
+        materialGlobalId: createdMeasured.globalId,
+        warehouseId,
+        isAvailable: true,
+        onHandQuantity: 12,
+        reorderPointQuantity: 2,
+        reorderToQuantity: 12,
+      },
+    })
+    const activatedMeasured = await persistence.savePackagingMaterialInPostgres({
+      organizationId,
+      actorEmail,
+      material: {
+        ...measuredMaterial,
+        globalId: createdMeasured.globalId,
+        expectedRowVersion: createdMeasured.rowVersion,
+        status: 'active',
+      },
+    })
+    assert.equal(activatedMeasured.status, 'active')
+    const measuredWorkspace = await persistence
+      .readPackagingMaterialsWorkspaceFromPostgres({
+        organizationId,
+        canView: true,
+        canManage: true,
+      })
+    const eligibleMeasured = measuredWorkspace.materials.find(
+      (material) => material.globalId === createdMeasured.globalId,
+    )
+    assert.ok(eligibleMeasured)
+    assert.equal(eligibleMeasured.dimensionEvidenceReference, null)
+    assert.ok(eligibleMeasured.dimensionConfirmedAt)
+    assert.equal(eligibleMeasured.dimensionConfirmedBy, actorEmail)
+    assert.equal(eligibleMeasured.readiness.eligibleForCartonization, true)
+    assert.deepEqual(Array.from(eligibleMeasured.readiness.missing), [])
+
+    const legacyMaterial = {
+      ...measuredMaterial,
+      code: `LEGACY-${suffix}`,
+      name: 'Legacy evidence rollback acceptance',
+      dimensionEvidenceType: 'legacy',
+      dimensionEvidenceReference: 'Retained legacy packaging record',
+      status: 'draft',
+    }
+    const createdLegacy = await persistence.savePackagingMaterialInPostgres({
+      organizationId,
+      actorEmail,
+      material: legacyMaterial,
+    })
+    await persistence.savePackagingMaterialStockInPostgres({
+      organizationId,
+      actorEmail,
+      stock: {
+        materialGlobalId: createdLegacy.globalId,
+        warehouseId,
+        isAvailable: true,
+        onHandQuantity: 4,
+        reorderPointQuantity: 1,
+        reorderToQuantity: 4,
+      },
+    })
+    await pool.query(
+      `UPDATE operations_packaging_materials
+       SET dimension_confirmed_at = NULL,
+           dimension_confirmed_by = NULL
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdLegacy.globalId],
+    )
+    const legacyWorkspace = await persistence
+      .readPackagingMaterialsWorkspaceFromPostgres({
+        organizationId,
+        canView: true,
+        canManage: true,
+      })
+    const incompleteLegacy = legacyWorkspace.materials.find(
+      (material) => material.globalId === createdLegacy.globalId,
+    )
+    assert.ok(incompleteLegacy)
+    assert.equal(incompleteLegacy.readiness.eligibleForCartonization, false)
+    assert.deepEqual(
+      Array.from(incompleteLegacy.readiness.missing),
+      ['dimension_evidence'],
+      'A legacy row retained without fabricated timestamp evidence must remain fail-closed',
+    )
+
+    const forceNullFunction = `force_null_legacy_confirmation_${suffix}`
+    const forceNullTrigger = `force_null_legacy_confirmation_${suffix}`
+    await pool.query(
+      `CREATE FUNCTION ${forceNullFunction}()
+       RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN
+         IF NEW.code = '${legacyMaterial.code}' THEN
+           NEW.dimension_confirmed_at := NULL;
+           NEW.dimension_confirmed_by := NULL;
+         END IF;
+         RETURN NEW;
+       END;
+       $$`,
+    )
+    await pool.query(
+      `CREATE TRIGGER ${forceNullTrigger}
+       BEFORE UPDATE ON operations_packaging_materials
+       FOR EACH ROW EXECUTE FUNCTION ${forceNullFunction}()`,
+    )
+    await rejected(
+      persistence.savePackagingMaterialInPostgres({
+        organizationId,
+        actorEmail,
+        material: {
+          ...legacyMaterial,
+          globalId: createdLegacy.globalId,
+          expectedRowVersion: createdLegacy.rowVersion,
+          name: 'Legacy activation must roll back',
+          status: 'active',
+        },
+      }),
+      'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
+    )
+    const rejectedLegacyRow = await pool.query(
+      `SELECT name, status, row_version::integer, dimension_confirmed_at
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdLegacy.globalId],
+    )
+    assert.equal(rejectedLegacyRow.rows[0].name, legacyMaterial.name)
+    assert.equal(rejectedLegacyRow.rows[0].status, 'draft')
+    assert.equal(
+      rejectedLegacyRow.rows[0].row_version,
+      createdLegacy.rowVersion,
+      'Failed legacy activation must roll back every material mutation',
+    )
+    assert.equal(rejectedLegacyRow.rows[0].dimension_confirmed_at, null)
+    await pool.query(
+      `DROP TRIGGER ${forceNullTrigger}
+       ON operations_packaging_materials`,
+    )
+    await pool.query(`DROP FUNCTION ${forceNullFunction}()`)
 
     const editableMaterial = {
       code: `EDIT-${suffix}`,
