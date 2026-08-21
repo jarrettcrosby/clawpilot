@@ -62,6 +62,26 @@ async function waitForPostgres(databaseUrl) {
   throw lastError || new Error('Disposable PostgreSQL did not become ready')
 }
 
+async function endPoolAfterClientsClose(pool) {
+  const clientCount = pool.totalCount
+  if (clientCount === 0) {
+    await pool.end()
+    return
+  }
+  let removedCount = 0
+  const clientsClosed = new Promise((resolvePromise) => {
+    const onRemove = () => {
+      removedCount += 1
+      if (removedCount < clientCount) return
+      pool.off('remove', onRemove)
+      resolvePromise()
+    }
+    pool.on('remove', onRemove)
+  })
+  await pool.end()
+  await clientsClosed
+}
+
 function loadTypeScriptModule(path, mocks = {}) {
   const output = ts.transpileModule(read(path), {
     compilerOptions: {
@@ -1452,7 +1472,7 @@ async function exerciseHistoricalReceiptMigration(databaseUrl) {
       /checkout rate receipts are immutable/u,
     )
   } finally {
-    await pool.end().catch(() => undefined)
+    await endPoolAfterClientsClose(pool).catch(() => undefined)
     await adminPool.query(
       `DROP DATABASE IF EXISTS ${historyDatabaseName} WITH (FORCE)`,
     ).catch(() => undefined)
