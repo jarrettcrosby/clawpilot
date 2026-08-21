@@ -298,6 +298,7 @@ const ids = {
   legacySuccessLock: '28800000-0000-4000-8000-000000000052',
 }
 const actorEmail = null
+const pipelineOwnerEmail = 'shopify-multilocation-refresh@example.invalid'
 
 async function seedPreMigration(client) {
   await client.query('SET session_replication_role = replica')
@@ -306,6 +307,20 @@ async function seedPreMigration(client) {
       `INSERT INTO workspace_organizations (id, name)
        VALUES ($1::uuid, 'Shopify multi-location refresh fixture')`,
       [ids.organization],
+    )
+    await client.query(
+      `INSERT INTO app_users (email, role, status)
+       VALUES ($1, 'admin', 'active')`,
+      [pipelineOwnerEmail],
+    )
+    await client.query(
+      `INSERT INTO pipeline_spaces (
+         id, name, owner_email, workspace_organization_id, is_default
+       ) VALUES (
+         $1::uuid, 'Shopify multi-location refresh fixture',
+         $2, $3::uuid, true
+       )`,
+      [ids.pipeline, pipelineOwnerEmail, ids.organization],
     )
     await client.query(
       `INSERT INTO operations_activation_scopes (
