@@ -12,7 +12,10 @@ function redacted(value) {
   return String(value || '').replaceAll(SECRET_PATTERN, '[secret redacted]').slice(0, 2_000)
 }
 
-function runtimeEnvironment(instance, paths, { allowLocalDevelopment = false } = {}) {
+function runtimeEnvironment(instance, paths, {
+  allowLocalDevelopment = false,
+  windowsLockHelperPath = null,
+} = {}) {
   const inherited = {}
   for (const key of [
     'APPDATA',
@@ -39,6 +42,9 @@ function runtimeEnvironment(instance, paths, { allowLocalDevelopment = false } =
     CLAWPILOT_PRINT_AGENT_LEDGER: path.join(paths.instanceDirectory, 'claim-ledger.json'),
     CLAWPILOT_PRINT_AGENT_DEVICE_KEY: path.join(paths.instanceDirectory, 'device-reference.key'),
     CLAWPILOT_PRINT_AGENT_DEVICE_LOCK_DIRECTORY: paths.lockDirectory,
+    ...(process.platform === 'win32' && windowsLockHelperPath ? {
+      CLAWPILOT_WINDOWS_PRINT_LOCK_HELPER: windowsLockHelperPath,
+    } : {}),
     ...(allowLocalDevelopment ? {
       CLAWPILOT_GATEWAY_TEST_MODE: '1',
       CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK: '1',
@@ -110,6 +116,7 @@ export class WorkerManager extends EventEmitter {
     allowLocalDevelopment = false,
     spawnImplementation = spawn,
     sharedLockDirectory = null,
+    windowsLockHelperPath = null,
     startGuard = () => undefined,
   }) {
     super()
@@ -120,6 +127,7 @@ export class WorkerManager extends EventEmitter {
     this.allowLocalDevelopment = allowLocalDevelopment === true
     this.spawnImplementation = spawnImplementation
     this.sharedLockDirectory = sharedLockDirectory
+    this.windowsLockHelperPath = windowsLockHelperPath
     this.startGuard = startGuard
     this.workers = new Map()
     this.quitting = false
@@ -227,11 +235,13 @@ export class WorkerManager extends EventEmitter {
       command: this.executablePath,
       args: [this.runtimePath],
       macHelperPath: path.join(path.dirname(this.runtimePath), 'lib', 'clawpilot-print-lock'),
-      windowsHelperPath: path.join(path.dirname(this.runtimePath), 'lib', 'clawpilot-print-lock.exe'),
+      windowsHelperPath: this.windowsLockHelperPath
+        || path.join(path.dirname(this.runtimePath), 'lib', 'clawpilot-print-lock.exe'),
     })
     const child = this.spawnImplementation(invocation.command, invocation.args, {
       env: runtimeEnvironment(instance, paths, {
         allowLocalDevelopment: this.allowLocalDevelopment,
+        windowsLockHelperPath: this.windowsLockHelperPath,
       }),
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,

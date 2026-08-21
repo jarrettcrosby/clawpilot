@@ -1013,7 +1013,7 @@ test('two app generations sharing one instance allow exactly one raw delivery', 
 })
 
 test('two organizations share one printer with isolated credentials, ledgers, ACKs, and cleanup', {
-  skip: !['darwin', 'linux'].includes(process.platform),
+  skip: !['darwin', 'linux', 'win32'].includes(process.platform),
 }, async () => {
   const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-multi-org-printer-'))
   const printerPayloads = []
@@ -1143,6 +1143,16 @@ test('two organizations share one printer with isolated credentials, ledgers, AC
     executablePath: process.execPath,
     allowLocalDevelopment: true,
     sharedLockDirectory: path.join(temporary, 'shared-endpoint-locks'),
+    windowsLockHelperPath: process.platform === 'win32'
+      ? path.join(
+        repositoryRoot,
+        'clients',
+        'print-gateway',
+        'build',
+        'windows',
+        'clawpilot-print-lock.exe',
+      )
+      : null,
   }
   const firstGeneration = new WorkerManager(managerInput)
   let restartedGeneration

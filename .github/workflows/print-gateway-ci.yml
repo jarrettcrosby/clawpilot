@@ -93,6 +93,12 @@ jobs:
           cache-dependency-path: clients/print-gateway/package-lock.json
       - run: npm --prefix clients/print-gateway ci
       - run: npm --prefix clients/print-gateway run build:dir
+      - name: Prove two organizations can share one Windows printer
+        if: runner.os == 'Windows'
+        run: >-
+          node --test
+          --test-name-pattern "two organizations share one printer"
+          clients/print-gateway/test/worker-lifetime.test.mjs
       - run: npm --prefix clients/print-gateway run smoke:packaged
       - name: Confirm CI did not create a customer installer
         shell: bash
