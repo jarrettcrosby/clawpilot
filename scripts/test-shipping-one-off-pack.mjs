@@ -217,6 +217,7 @@ for (const fragment of [
   'packIsDurable',
   'packConfirmedEvidenceHash',
   'reconcilePackEvidenceAcknowledgment',
+  'retainedPackReceiptDisposition',
 ]) {
   assert.ok(panel.includes(fragment), `Pack review UI is missing ${fragment}`)
 }
@@ -224,6 +225,11 @@ assert.doesNotMatch(
   panel,
   /canManage|canExecute|canActivate|operations_activation_scopes/,
   'Shipping-only pack UI must not depend on Operations permissions or mode',
+)
+assert.match(
+  panel,
+  /const packDisposition = retainedPackReceiptDisposition\(state, packCommand\)[\s\S]*?if \(packDisposition !== 'pending'\) \{[\s\S]*?clearPackCommand\(\)/,
+  'Mount/status reconciliation must automatically retire K1 only after terminal receipt proof',
 )
 assert.match(projection, /standalone_one_off_pack_eligible/)
 assert.match(projection, /source_order\.status = 'planned'/)
@@ -327,6 +333,130 @@ assert.match(
   panel,
   /const command = packCommand \|\| newCommand/,
   'Pending retries must keep the exact retained command despite new acknowledgment state',
+)
+
+const plannedPackState = {
+  orderGlobalId: 'gor0000001',
+  orderStatus: 'planned',
+  packageCount: 1,
+  packReview: {
+    state: 'review_required',
+    required: true,
+    evidenceHash: evidenceHashA,
+    receipt: null,
+  },
+}
+const terminalCompetingPackState = {
+  orderGlobalId: 'gor0000001',
+  orderStatus: 'packed',
+  packageCount: 1,
+  packReview: {
+    state: 'packed',
+    required: false,
+    evidenceHash: null,
+    receipt: {
+      requestIdempotencyKey:
+        'shipping-one-off-pack:gor0000001:competing-terminal-k2',
+      reviewSnapshotHash: evidenceHashB,
+      packageCount: 1,
+      reservationCount: 1,
+      packedAt: new Date(0).toISOString(),
+    },
+  },
+}
+const exactK1PackState = {
+  ...terminalCompetingPackState,
+  packReview: {
+    ...terminalCompetingPackState.packReview,
+    receipt: {
+      ...terminalCompetingPackState.packReview.receipt,
+      requestIdempotencyKey: retainedPack.key,
+      reviewSnapshotHash: evidenceHashA,
+    },
+  },
+}
+const retainedStorageBytes = storageValues.get('pack-storage')
+const firstMountK1 = recovery.readShippingOneOffRetainedCommand(
+  storage,
+  'pack',
+  'gor0000001',
+  'pack-storage',
+)
+assert.deepEqual(JSON.parse(JSON.stringify(firstMountK1)), retainedPack)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(null, firstMountK1),
+  'pending',
+  'Mount before an authoritative GET must preserve ambiguous K1',
+)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(plannedPackState, firstMountK1),
+  'pending',
+  'A nonterminal same-order state must preserve ambiguous K1',
+)
+assert.equal(storageValues.get('pack-storage'), retainedStorageBytes)
+const remountedK1 = recovery.readShippingOneOffRetainedCommand(
+  storage,
+  'pack',
+  'gor0000001',
+  'pack-storage',
+)
+assert.deepEqual(JSON.parse(JSON.stringify(remountedK1)), retainedPack)
+assert.equal(remountedK1.body, retainedPack.body)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(exactK1PackState, remountedK1),
+  'exact',
+  'The original immutable K1 receipt remains an exact durable success',
+)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(
+    {
+      ...exactK1PackState,
+      packReview: {
+        ...exactK1PackState.packReview,
+        receipt: {
+          ...exactK1PackState.packReview.receipt,
+          reviewSnapshotHash: evidenceHashB,
+        },
+      },
+    },
+    remountedK1,
+  ),
+  'pending',
+  'A same-key receipt with mismatched evidence cannot retire K1',
+)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(
+    { ...terminalCompetingPackState, orderGlobalId: 'gor0000002' },
+    remountedK1,
+  ),
+  'pending',
+  'A different-order terminal receipt cannot retire K1',
+)
+assert.equal(
+  panelModule.retainedPackReceiptDisposition(
+    terminalCompetingPackState,
+    remountedK1,
+  ),
+  'superseded',
+  'An immutable same-order terminal K2 receipt may retire ambiguous K1',
+)
+assert.equal(
+  recovery.writeShippingOneOffRetainedCommand(
+    storage,
+    'pack-storage',
+    null,
+  ),
+  true,
+)
+assert.equal(
+  recovery.readShippingOneOffRetainedCommand(
+    storage,
+    'pack',
+    'gor0000001',
+    'pack-storage',
+  ),
+  null,
+  'Remount after exact terminal K2 proof must not restore retired K1',
 )
 
 let canCreate = true

@@ -155,6 +155,36 @@ function parsedCommandBody<T>(command: RetainedCommand | null): T | null {
   }
 }
 
+export type RetainedPackReceiptDisposition = 'pending' | 'exact' | 'superseded'
+
+export function retainedPackReceiptDisposition(
+  state: OneOffShipmentExecutionState | null,
+  command: RetainedCommand | null,
+): RetainedPackReceiptDisposition {
+  const body = parsedCommandBody<PackBody>(command)
+  const receipt = state?.packReview.receipt
+  if (
+    !state
+    || !command
+    || body?.action !== 'confirm-pack'
+    || body.orderGlobalId !== state.orderGlobalId
+    || !/^[a-f0-9]{64}$/.test(body.expectedReviewSnapshotHash)
+    || state.orderStatus !== 'packed'
+    || state.packReview.state !== 'packed'
+    || state.packReview.required
+    || state.packReview.evidenceHash !== null
+    || !receipt
+    || receipt.packageCount !== state.packageCount
+    || !/^[a-f0-9]{64}$/.test(receipt.reviewSnapshotHash)
+    || typeof receipt.requestIdempotencyKey !== 'string'
+    || receipt.requestIdempotencyKey.length < 8
+  ) return 'pending'
+  if (receipt.requestIdempotencyKey !== command.key) return 'superseded'
+  return receipt.reviewSnapshotHash === body.expectedReviewSnapshotHash
+    ? 'exact'
+    : 'pending'
+}
+
 async function readPayload(response: Response) {
   const raw = await response.text()
   try {
@@ -203,17 +233,7 @@ function packIsDurable(
   state: OneOffShipmentExecutionState | null,
   command: RetainedCommand | null,
 ) {
-  const body = parsedCommandBody<PackBody>(command)
-  return Boolean(
-    state
-    && command
-    && body?.action === 'confirm-pack'
-    && body.orderGlobalId === state.orderGlobalId
-    && state.orderStatus === 'packed'
-    && state.packReview.receipt?.requestIdempotencyKey === command.key
-    && state.packReview.receipt.reviewSnapshotHash
-      === body.expectedReviewSnapshotHash,
-  )
+  return retainedPackReceiptDisposition(state, command) === 'exact'
 }
 
 function purchaseIsDurable(
@@ -371,7 +391,16 @@ export default function ShippingOneOffExecutionPanel({
   }, [loadState, orderGlobalId])
 
   useEffect(() => {
-    if (packIsDurable(state, packCommand)) clearPackCommand()
+    const packDisposition = retainedPackReceiptDisposition(state, packCommand)
+    if (packDisposition !== 'pending') {
+      clearPackCommand()
+      if (packDisposition === 'superseded') {
+        setNotice(
+          'Another immutable physical pack receipt completed this order. '
+          + 'The older retained request was retired without replay; postage controls are ready.',
+        )
+      }
+    }
     if (refreshIsDurable(state, refreshCommand)) clearRefreshCommand()
     if (purchaseIsDurable(state, purchaseCommand)) clearPurchaseCommand()
     if (voidIsDurable(state, voidCommand)) clearVoidCommand()
@@ -503,6 +532,16 @@ export default function ShippingOneOffExecutionPanel({
             await onUpdated()
             return
           }
+          if (retainedPackReceiptDisposition(durable, command) === 'superseded') {
+            clearPackCommand()
+            setError('')
+            setNotice(
+              'Another immutable physical pack receipt completed this order. '
+              + 'The older retained request was retired without replay; postage controls are ready.',
+            )
+            await onUpdated()
+            return
+          }
           clearPackCommand()
           setError(
             `${payloadMessage(payload, 'The physical pack confirmation was rejected')} `
@@ -534,6 +573,14 @@ export default function ShippingOneOffExecutionPanel({
         clearPackCommand()
         setPackConfirmedEvidenceHash(null)
         setNotice('The prior exact physical pack confirmation succeeded. Current postage controls are ready.')
+        await onUpdated()
+      } else if (retainedPackReceiptDisposition(durable, command) === 'superseded') {
+        clearPackCommand()
+        setError('')
+        setNotice(
+          'Another immutable physical pack receipt completed this order. '
+          + 'The older retained request was retired without replay; postage controls are ready.',
+        )
         await onUpdated()
       } else {
         setError(
