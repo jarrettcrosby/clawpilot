@@ -1010,6 +1010,113 @@ async function verifyShipmentCompletion(databaseUrl) {
     let shopifyFulfillmentExecutionCalls = 0
     let shopifyFulfillmentReconciliationCalls = 0
     let shopifyFulfillmentReconciliationResult = null
+    let useExactAuthorityShopifyWriteback = false
+    let exactProviderExpectedLineItems = []
+    let exactProviderExternalOrderId = null
+    let exactProviderMutationCalls = 0
+    let exactProviderReadCalls = 0
+    const exactAuthorityShopifyWriteback = loadTypeScriptModule(
+      'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
+      {
+        mocks: {
+          '@/lib/integrations/commerceCredentialCrypto': {
+            normalizeCommerceOrganizationId: String,
+            normalizeCommerceAccountGlobalId: String,
+            decryptCommerceCredential: () => ({
+              provider: 'shopify',
+              clientId: 'focused-client-id',
+              clientSecret: 'focused-client-secret',
+            }),
+          },
+          '@/lib/integrations/commerceCapabilities': {
+            hasEffectiveShopifyScope: (scopes, scope) => scopes.includes(scope),
+          },
+          '@/lib/integrations/shopifyCommerceClient': {
+            normalizeShopifyShopDomain: String,
+            requestShopifyAccessToken: async () => ({
+              accessToken: 'focused-access-token',
+              grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+            }),
+            probeShopifyConnection: async () => ({
+              shopId: 'gid://shopify/Shop/6567',
+              grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+            }),
+            shopifyAdminGraphql: async (_credential, request) => {
+              if (request.operationName === 'ClawPilotOrderFulfillment') {
+                exactProviderReadCalls += 1
+                return {
+                  order: {
+                    id: exactProviderExternalOrderId,
+                    canNotifyCustomer: true,
+                    fulfillmentsCount: { count: 0 },
+                    fulfillments: [],
+                    fulfillmentOrders: {
+                      nodes: [{
+                        id: 'gid://shopify/FulfillmentOrder/6567',
+                        status: 'OPEN',
+                        requestStatus: 'UNSUBMITTED',
+                        assignedLocation: {
+                          location: { id: 'gid://shopify/Location/6567' },
+                        },
+                        lineItems: {
+                          nodes: exactProviderExpectedLineItems.map(
+                            (line, index) => ({
+                              id: `gid://shopify/FulfillmentOrderLineItem/${6567 + index}`,
+                              lineItem: { id: line.lineItemId },
+                              remainingQuantity: line.quantity,
+                            }),
+                          ),
+                          pageInfo: { hasNextPage: false },
+                        },
+                      }],
+                      pageInfo: { hasNextPage: false },
+                    },
+                  },
+                }
+              }
+              exactProviderMutationCalls += 1
+              return {
+                fulfillmentCreate: {
+                  fulfillment: {
+                    id: 'gid://shopify/Fulfillment/6567',
+                    status: 'SUCCESS',
+                  },
+                  userErrors: [],
+                },
+              }
+            },
+          },
+          '@/lib/persistence/commerceIntegrations': {
+            readCommerceRuntimeCredentialFromPostgres: async (input) => ({
+              organizationId: input.organizationId,
+              globalId: input.accountGlobalId,
+              provider: 'shopify',
+              environment: 'sandbox',
+              externalAccountId: 'gid://shopify/Shop/6567',
+              status: 'active',
+              verificationStatus: 'verified',
+              credentialVersion: 1,
+              configuration: {
+                shopDomain: 'focused-shipment.myshopify.com',
+              },
+              encrypted: {},
+            }),
+          },
+          '@/lib/persistence/commerceActiveTransitionAuthorization': {
+            requireCommerceActiveCapabilityClaimInPostgres:
+              async ({ capability }) => ({
+                activationRevision: 4,
+                credentialGeneration: 1,
+                capability,
+              }),
+          },
+          '@/lib/persistence/shopifyTestStoreCanonicalE2e':
+            shopifyTestStorePersistence,
+          '@/lib/persistence/sandboxCommerceE2eAuthorization':
+            sandboxAuthorization,
+        },
+      },
+    )
     let faireFulfillmentPreparationCalls = 0
     let faireFulfillmentAuthorizationRevision = 4
     let faireFulfillmentExecutionCalls = 0
@@ -1052,6 +1159,12 @@ async function verifyShipmentCompletion(databaseUrl) {
                   quantity: Number(line.quantity),
                 }))
               : []
+            if (useExactAuthorityShopifyWriteback) {
+              exactProviderExpectedLineItems = lineItems
+              exactProviderExternalOrderId = input.externalOrderId
+              return exactAuthorityShopifyWriteback
+                .prepareShopifyFulfillmentWriteback(input)
+            }
             return {
               signature: {
                 version: 1,
@@ -1070,12 +1183,18 @@ async function verifyShipmentCompletion(databaseUrl) {
                 carrier: input.carrier,
                 trackingNumbers: input.trackingNumbers,
                 notifyCustomer: input.notifyCustomer,
+                sandboxE2eAuthorityKind:
+                  input.sandboxE2eAuthorityKind ?? null,
               },
               existing: null,
             }
           },
-          executeShopifyFulfillmentWriteback: async () => {
+          executeShopifyFulfillmentWriteback: async (input) => {
             shopifyFulfillmentExecutionCalls += 1
+            if (useExactAuthorityShopifyWriteback) {
+              return exactAuthorityShopifyWriteback
+                .executeShopifyFulfillmentWriteback(input)
+            }
             return {
               providerReference: 'shopify-focused-fulfillment-reference',
             }
@@ -2846,6 +2965,51 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(exactProviderClaim.credentialGeneration, 1)
     const providerClaimPreparationBaseline = shopifyFulfillmentPreparationCalls
     const providerClaimExecutionBaseline = shopifyFulfillmentExecutionCalls
+    for (const authorityMutation of [
+      `payload_snapshot - 'sandboxE2eAuthorityKind'`,
+      `jsonb_set(
+        payload_snapshot,
+        '{sandboxE2eAuthorityKind}',
+        '"legacy_packed"'::jsonb,
+        true
+      )`,
+    ]) {
+      await mutateCanonicalContext(
+        `UPDATE operations_commerce_fulfillment_exports
+         SET payload_snapshot = ${authorityMutation}
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [
+          canonical.fixture.organizationId,
+          canonicalShipment.commerceExportGlobalId,
+        ],
+      )
+      await assert.rejects(
+        () => shopifyTestStorePersistence
+          .requireShopifyTestStoreFulfillmentWriteClaimInPostgres({
+            organizationId: canonical.fixture.organizationId,
+            accountGlobalId: canonical.source.account_global_id,
+            externalOrderId: canonical.target.externalOrderId,
+            authorizationGlobalId: canonical.authorization.global_id,
+            commerceExportGlobalId: canonicalShipment.commerceExportGlobalId,
+          }),
+        (error) => error?.code === 'SHOPIFY_TEST_E2E_FULFILLMENT_CLAIM_INVALID',
+        'Canonical provider claim must reject missing or cross-kind export evidence',
+      )
+      await mutateCanonicalContext(
+        `UPDATE operations_commerce_fulfillment_exports
+         SET payload_snapshot = jsonb_set(
+           payload_snapshot,
+           '{sandboxE2eAuthorityKind}',
+           '"shopify_test_store_canonical"'::jsonb,
+           true
+         )
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [
+          canonical.fixture.organizationId,
+          canonicalShipment.commerceExportGlobalId,
+        ],
+      )
+    }
     await mutateCanonicalContext(
       `UPDATE operations_labels
        SET status = 'voided', voided_at = now(), voided_by = $3
@@ -3480,7 +3644,8 @@ async function verifyShipmentCompletion(databaseUrl) {
     const requireValidatedFaireSandboxAuthorization = async (client, input) => {
       const result = await client.query(
         `SELECT sandbox_auth.id::text, sandbox_auth.organization_id::text,
-                sandbox_auth.order_id::text, sandbox_auth.authorized_by
+                sandbox_auth.order_id::text, sandbox_auth.authorized_by,
+                sandbox_auth.confirmation_statement_version
          FROM operations_sandbox_commerce_e2e_authorizations sandbox_auth
          JOIN operations_orders source_order
            ON source_order.organization_id = sandbox_auth.organization_id
@@ -3746,10 +3911,34 @@ async function verifyShipmentCompletion(databaseUrl) {
       authorized.planned.orderGlobalId,
     )
     await pool.query(
-      `UPDATE operations_orders
-       SET source_provider = 'shopify'
-       WHERE organization_id = $1::uuid AND global_id = $2`,
-      [authorizedFixture.organizationId, authorized.planned.orderGlobalId],
+      `WITH updated_order AS (
+         UPDATE operations_orders
+         SET source_provider = 'shopify',
+             external_order_id = 'gid://shopify/Order/6567'
+         WHERE organization_id = $1::uuid AND global_id = $2
+         RETURNING id, integration_account_id
+       ), updated_account AS (
+         UPDATE operations_integration_accounts account
+         SET provider = 'shopify', integration_type = 'commerce',
+             environment = 'sandbox', status = 'active',
+             external_account_id = 'gid://shopify/Shop/6567',
+             configuration = '{"shopDomain":"focused-shipment.myshopify.com"}'::jsonb,
+             commerce_credential_generation = 1,
+             updated_by = $3, updated_at = now()
+         FROM updated_order
+         WHERE account.organization_id = $1::uuid
+           AND account.id = updated_order.integration_account_id
+       )
+       UPDATE operations_order_lines source_line
+       SET external_line_id = 'gid://shopify/LineItem/6567'
+       FROM updated_order
+       WHERE source_line.organization_id = $1::uuid
+         AND source_line.order_id = updated_order.id`,
+      [
+        authorizedFixture.organizationId,
+        authorized.planned.orderGlobalId,
+        authorizedFixture.email,
+      ],
     )
     await assert.rejects(
       () => pool.query(
@@ -3851,9 +4040,14 @@ async function verifyShipmentCompletion(databaseUrl) {
     }
     const authorizedPreparationCallsBefore = shopifyFulfillmentPreparationCalls
     const authorizedExecutionCallsBefore = shopifyFulfillmentExecutionCalls
-    const authorizedResult = await persistence.confirmOperationsOrderShipmentFromPostgres(
-      authorizedInput,
-    )
+    useExactAuthorityShopifyWriteback = true
+    let authorizedResult
+    try {
+      authorizedResult = await persistence
+        .confirmOperationsOrderShipmentFromPostgres(authorizedInput)
+    } finally {
+      useExactAuthorityShopifyWriteback = false
+    }
     assert.equal(authorizedResult.orderStatus, 'shipped')
     assert.equal(authorizedResult.replayed, false)
     assert.equal(
@@ -3863,6 +4057,12 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(
       shopifyFulfillmentExecutionCalls,
       authorizedExecutionCallsBefore + 1,
+    )
+    assert.equal(exactProviderReadCalls, 2)
+    assert.equal(
+      exactProviderMutationCalls,
+      1,
+      'Active legacy shipment must reach the real Shopify prepare/execute path exactly once',
     )
     const authorizedProviderAttempt = await pool.query(
       `SELECT state, attempt_number, external_object_id, redacted_request,
@@ -3878,13 +4078,152 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(authorizedProviderAttempt.rows[0].attempt_number, 1)
     assert.equal(
       authorizedProviderAttempt.rows[0].provider_reference,
-      'shopify-focused-fulfillment-reference',
+      'gid://shopify/Fulfillment/6567',
     )
     assert.equal(authorizedProviderAttempt.rows[0].error_code, null)
     assert.equal(authorizedProviderAttempt.rows[0].redacted_request.version, 1)
     assert.equal(
       authorizedProviderAttempt.rows[0].redacted_request.notifyCustomer,
       false,
+    )
+    assert.equal(
+      authorizedProviderAttempt.rows[0].redacted_request
+        .sandboxE2eAuthorityKind,
+      'legacy_packed',
+      'The immutable provider attempt must bind exact legacy authority kind',
+    )
+    const legacyClaimContext = await pool.query(
+      `SELECT account.global_id AS account_global_id,
+              export.payload_snapshot
+       FROM operations_commerce_fulfillment_exports export
+       JOIN operations_orders source_order
+         ON source_order.organization_id = export.organization_id
+        AND source_order.id = export.order_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = source_order.organization_id
+        AND account.id = source_order.integration_account_id
+       WHERE export.organization_id = $1::uuid AND export.global_id = $2`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    assert.equal(
+      legacyClaimContext.rows[0].payload_snapshot.sandboxE2eAuthorityKind,
+      'legacy_packed',
+      'The immutable export snapshot must bind exact legacy authority kind',
+    )
+    const legacyClaimProviderReadsBefore = exactProviderReadCalls
+    const legacyClaimProviderMutationsBefore = exactProviderMutationCalls
+    const retainedLegacyClaimExport = await pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, attempts, payload_snapshot, idempotency_key
+       )
+       SELECT organization_id, order_id, shipment_id, provider,
+              external_order_id, 'processing', 1,
+              payload_snapshot - 'sandboxE2eAuthorityKind'
+                               - 'customerNotification',
+              idempotency_key || ':retained-legacy-claim'
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2
+       RETURNING global_id`,
+      [authorizedFixture.organizationId, authorizedResult.commerceExportGlobalId],
+    )
+    const legacyClaimExportGlobalIds = [
+      retainedLegacyClaimExport.rows[0].global_id,
+    ]
+    const retainedLegacyClaim = await sandboxAuthorization
+      .requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres({
+        organizationId: authorizedFixture.organizationId,
+        accountGlobalId: legacyClaimContext.rows[0].account_global_id,
+        externalOrderId: 'gid://shopify/Order/6567',
+        authorizationGlobalId,
+        commerceExportGlobalId: retainedLegacyClaimExport.rows[0].global_id,
+      })
+    assert.equal(retainedLegacyClaim.authorityKind, 'legacy_packed')
+    assert.equal(retainedLegacyClaim.authorityKindPersisted, false)
+    assert.equal(retainedLegacyClaim.notifyCustomer, false)
+
+    for (const [suffix, payloadExpression] of [
+      [
+        'cross-kind',
+        `jsonb_set(payload_snapshot,
+          '{sandboxE2eAuthorityKind}',
+          '"shopify_test_store_canonical"'::jsonb, true)`,
+      ],
+      [
+        'unsafe-notify',
+        `jsonb_set(
+          payload_snapshot - 'sandboxE2eAuthorityKind',
+          '{customerNotification,notifyCustomer}',
+          'true'::jsonb, true
+        )`,
+      ],
+      [
+        'missing-notification-new-kind',
+        `payload_snapshot - 'customerNotification'`,
+      ],
+      [
+        'missing-authorization',
+        `payload_snapshot - 'sandboxE2eAuthorizationGlobalId'`,
+      ],
+    ]) {
+      const invalidLegacyClaimExport = await pool.query(
+        `INSERT INTO operations_commerce_fulfillment_exports (
+           organization_id, order_id, shipment_id, provider,
+           external_order_id, state, attempts, payload_snapshot,
+           idempotency_key
+         )
+         SELECT organization_id, order_id, shipment_id, provider,
+                external_order_id, 'processing', 1,
+                ${payloadExpression}, idempotency_key || $3
+         FROM operations_commerce_fulfillment_exports
+         WHERE organization_id = $1::uuid AND global_id = $2
+         RETURNING global_id`,
+        [
+          authorizedFixture.organizationId,
+          authorizedResult.commerceExportGlobalId,
+          `:${suffix}`,
+        ],
+      )
+      legacyClaimExportGlobalIds.push(
+        invalidLegacyClaimExport.rows[0].global_id,
+      )
+      await assert.rejects(
+        () => sandboxAuthorization
+          .requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres({
+            organizationId: authorizedFixture.organizationId,
+            accountGlobalId: legacyClaimContext.rows[0].account_global_id,
+            externalOrderId: 'gid://shopify/Order/6567',
+            authorizationGlobalId,
+            commerceExportGlobalId:
+              invalidLegacyClaimExport.rows[0].global_id,
+          }),
+        (error) => error?.code === 'SANDBOX_E2E_FULFILLMENT_CLAIM_INVALID',
+        `${suffix} legacy authority evidence must fail closed`,
+      )
+    }
+    const legacyClaimCleanup = await pool.connect()
+    try {
+      await legacyClaimCleanup.query('BEGIN')
+      await legacyClaimCleanup.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      await legacyClaimCleanup.query(
+        `DELETE FROM operations_commerce_fulfillment_exports
+         WHERE organization_id = $1::uuid AND global_id = ANY($2::text[])`,
+        [authorizedFixture.organizationId, legacyClaimExportGlobalIds],
+      )
+      await legacyClaimCleanup.query('COMMIT')
+    } catch (error) {
+      await legacyClaimCleanup.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      legacyClaimCleanup.release()
+    }
+    assert.equal(exactProviderReadCalls, legacyClaimProviderReadsBefore)
+    assert.equal(
+      exactProviderMutationCalls,
+      legacyClaimProviderMutationsBefore,
+      'Rejected and retained-compatibility claim probes must make zero provider calls',
     )
     assert.deepEqual(
       JSON.parse(JSON.stringify(authorizedResult.customerNotification)),

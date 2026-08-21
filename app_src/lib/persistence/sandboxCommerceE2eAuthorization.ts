@@ -15,6 +15,9 @@ export {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
 const AUTHORIZATION_GLOBAL_ID = /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/
+const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_EXPORT_GLOBAL_ID = /^gfe(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 
 export class SandboxCommerceE2eAuthorizationError extends Error {
   constructor(
@@ -88,6 +91,19 @@ function reason(value: unknown) {
   return normalized
 }
 
+function authorityKind(value: unknown): SandboxCommerceE2eAuthorization['authorityKind'] {
+  if (value === SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION) {
+    return 'legacy_packed'
+  }
+  if (value === 'shopify-test-store-canonical-e2e-v1') {
+    return 'shopify_test_store_canonical'
+  }
+  return fail(
+    'SANDBOX_E2E_AUTHORITY_KIND_INVALID',
+    'Sandbox E2E authorization has an unsupported authority kind',
+  )
+}
+
 function map(row: AuthorizationRow): SandboxCommerceE2eAuthorization {
   return {
     authorizationGlobalId: row.global_id,
@@ -101,10 +117,7 @@ function map(row: AuthorizationRow): SandboxCommerceE2eAuthorization {
     expiresAt: new Date(row.expires_at).toISOString(),
     consumedAt: row.consumed_at ? new Date(row.consumed_at).toISOString() : null,
     consumedBy: row.consumed_by,
-    authorityKind: row.confirmation_statement_version
-      === 'shopify-test-store-canonical-e2e-v1'
-      ? 'shopify_test_store_canonical'
-      : 'legacy_packed',
+    authorityKind: authorityKind(row.confirmation_statement_version),
     fulfillmentConfirmedAt: row.fulfillment_confirmed_at
       ? new Date(row.fulfillment_confirmed_at).toISOString()
       : null,
@@ -793,6 +806,7 @@ export async function authorizeSandboxCommerceE2eInPostgres(input: {
               created.organization_id::text, created.order_id::text,
               $4 AS order_global_id, created.external_order_id, created.state,
               $9 AS source_provider,
+              created.confirmation_statement_version,
               created.reason, created.authorized_by, created.authorized_at,
               created.expires_at, created.consumed_at, created.consumed_by
        FROM created`,
@@ -1104,6 +1118,117 @@ export async function consumeSandboxCommerceE2eAuthorization(
   )
   if (!result.rows[0]) fail('SANDBOX_E2E_AUTHORIZATION_CHANGED', 'Sandbox E2E authorization changed')
   return map(result.rows[0])
+}
+
+/**
+ * Revalidates the exact consumed legacy sandbox authorization that created a
+ * Shopify fulfillment export. This is deliberately separate from the
+ * canonical Shopify test-store claim: legacy execution remains an Active-only
+ * path and must never inherit Read only authority.
+ */
+export async function requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    externalOrderId: unknown
+    authorizationGlobalId: unknown
+    commerceExportGlobalId: unknown
+  },
+) {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const accountGlobalId = String(input.accountGlobalId || '').trim()
+  const externalOrderId = String(input.externalOrderId || '').trim()
+  const authorizationGlobalId = String(
+    input.authorizationGlobalId || '',
+  ).trim()
+  const commerceExportGlobalId = String(
+    input.commerceExportGlobalId || '',
+  ).trim()
+  if (!ACCOUNT_GLOBAL_ID.test(accountGlobalId)) {
+    fail('SANDBOX_E2E_ACCOUNT_INVALID', 'Shopify account is invalid', 400)
+  }
+  if (!SHOPIFY_ORDER_GID.test(externalOrderId)) {
+    fail('SANDBOX_E2E_EXTERNAL_ORDER_INVALID', 'Shopify order is invalid', 400)
+  }
+  if (!AUTHORIZATION_GLOBAL_ID.test(authorizationGlobalId)) {
+    fail('SANDBOX_E2E_AUTHORIZATION_INVALID', 'Sandbox E2E authorization is invalid', 400)
+  }
+  if (!COMMERCE_EXPORT_GLOBAL_ID.test(commerceExportGlobalId)) {
+    fail('SANDBOX_E2E_EXPORT_INVALID', 'Commerce fulfillment export is invalid', 400)
+  }
+  const result = await query<{
+    authorized_by: string
+    authority_kind_persisted: boolean
+  }>(
+    `SELECT auth.authorized_by,
+            export.payload_snapshot ? 'sandboxE2eAuthorityKind'
+              AS authority_kind_persisted
+     FROM operations_sandbox_commerce_e2e_authorizations auth
+     JOIN operations_orders source_order
+       ON source_order.organization_id = auth.organization_id
+      AND source_order.id = auth.order_id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = auth.organization_id
+     JOIN operations_integration_accounts account
+       ON account.organization_id = source_order.organization_id
+      AND account.id = source_order.integration_account_id
+     JOIN operations_commerce_fulfillment_exports export
+       ON export.organization_id = auth.organization_id
+      AND export.order_id = auth.order_id
+      AND export.global_id = $5
+     WHERE auth.organization_id = $1::uuid
+       AND auth.global_id = $2
+       AND auth.state = 'consumed'
+       AND auth.consumed_by = auth.authorized_by
+       AND auth.confirmation_statement_version = '${SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION}'
+       AND activation.state = 'active'
+       AND source_order.status = 'shipped'
+       AND source_order.source_provider = 'shopify'
+       AND source_order.external_order_id = $3
+       AND account.global_id = $4
+       AND account.provider = 'shopify'
+       AND account.integration_type = 'commerce'
+       AND account.status = 'active'
+       AND export.provider = 'shopify'
+       AND export.external_order_id = $3
+       AND export.state = 'processing'
+       AND export.payload_snapshot->>'sandboxE2eAuthorizationGlobalId' = $2
+       AND (
+         NOT (export.payload_snapshot ? 'sandboxE2eAuthorityKind')
+         OR export.payload_snapshot->>'sandboxE2eAuthorityKind'
+              = 'legacy_packed'
+       )
+       AND (
+         export.payload_snapshot->'customerNotification'->>'notifyCustomer'
+           = 'false'
+         OR (
+           NOT (export.payload_snapshot ? 'customerNotification')
+           AND NOT (export.payload_snapshot ? 'sandboxE2eAuthorityKind')
+         )
+       )
+     LIMIT 1`,
+    [
+      scopedOrganizationId,
+      authorizationGlobalId,
+      externalOrderId,
+      accountGlobalId,
+      commerceExportGlobalId,
+    ],
+  )
+  const claim = result.rows[0]
+  if (!claim) {
+    fail(
+      'SANDBOX_E2E_FULFILLMENT_CLAIM_INVALID',
+      'No exact consumed legacy sandbox fulfillment claim matches this export',
+      403,
+    )
+  }
+  return {
+    authorityKind: 'legacy_packed' as const,
+    authorizedBy: claim.authorized_by,
+    notifyCustomer: false as const,
+    authorityKindPersisted: claim.authority_kind_persisted,
+  }
 }
 
 export async function readSandboxCommerceE2eAuthorizationInPostgres(input: {

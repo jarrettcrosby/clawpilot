@@ -19322,13 +19322,13 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         carrier,
         notifyCustomer: claimed.decision.notifyCustomer === true,
         expectedLineItems: snapshot.shippedLines,
-        ...(typeof snapshot.sandboxE2eAuthorizationGlobalId === 'string'
-          ? {
-              sandboxE2eAuthorizationGlobalId:
-                snapshot.sandboxE2eAuthorizationGlobalId,
-              commerceExportGlobalId: claimed.row.global_id,
-            }
-          : {}),
+        sandboxE2eAuthorizationGlobalId:
+          snapshot.sandboxE2eAuthorizationGlobalId,
+        sandboxE2eAuthorityKind: snapshot.sandboxE2eAuthorityKind,
+        commerceExportGlobalId:
+          snapshot.sandboxE2eAuthorizationGlobalId == null
+            ? null
+            : claimed.row.global_id,
       }
       if (claimed.recoveryMode === 'reconcile_only') {
         if (!claimed.row.provider_attempt_request) {
@@ -20280,6 +20280,10 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       let resolvedCustomerNotification: OperationsCustomerNotificationDecision
       let sandboxE2eAuthorizationValidated = false
       let canonicalShopifyTestAuthorizationValidated = false
+      let sandboxE2eAuthorityKind:
+        | 'legacy_packed'
+        | 'shopify_test_store_canonical'
+        | null = null
       if (sandboxE2eAuthorizationGlobalId) {
         const sandboxAuthority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId,
@@ -20301,6 +20305,18 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             requireFulfillmentConfirmation: true,
           })
           canonicalShopifyTestAuthorizationValidated = true
+          sandboxE2eAuthorityKind = 'shopify_test_store_canonical'
+        } else if (
+          sandboxAuthority.confirmation_statement_version
+            === 'sandbox-commerce-e2e-v1'
+        ) {
+          sandboxE2eAuthorityKind = 'legacy_packed'
+        } else {
+          throw new OperationsRequestError(
+            'OPERATIONS_SANDBOX_E2E_AUTHORITY_KIND_INVALID',
+            'Sandbox E2E authorization has an unsupported authority kind',
+            409,
+          )
         }
         sandboxE2eAuthorizationValidated = true
       }
@@ -21081,6 +21097,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         serviceCode: shipment.service_code,
         shippedAt,
         sandboxE2eAuthorizationGlobalId,
+        sandboxE2eAuthorityKind,
         oneOffCarrierGroupGlobalId:
           nativeOneOffAuthority?.groupAttemptGlobalId || null,
         oneOffSelectedAmountMinor:

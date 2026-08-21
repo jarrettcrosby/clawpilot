@@ -1654,6 +1654,7 @@ export async function requireShopifyTestStoreFulfillmentWriteClaimInPostgres(
        AND auth.global_id = $2
        AND auth.state = 'consumed'
        AND auth.consumed_by = auth.authorized_by
+       AND auth.confirmation_statement_version = 'shopify-test-store-canonical-e2e-v1'
        AND confirmation.confirmed_by = auth.authorized_by
        AND activation.state = 'read_only'
        AND activation.revision = evidence.activation_revision
@@ -1681,6 +1682,8 @@ export async function requireShopifyTestStoreFulfillmentWriteClaimInPostgres(
        AND export.external_order_id = $3
        AND export.state = 'processing'
        AND export.payload_snapshot->>'sandboxE2eAuthorizationGlobalId' = $2
+       AND export.payload_snapshot->>'sandboxE2eAuthorityKind'
+             = 'shopify_test_store_canonical'
        AND export.payload_snapshot->'customerNotification'->>'notifyCustomer'
              = 'false'
        AND confirmation.label_evidence_hash = encode(
