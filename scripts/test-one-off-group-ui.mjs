@@ -16,8 +16,8 @@ assert.match(constants, /ONE_OFF_MAX_SYNCHRONOUS_PACKAGES = 40/)
 assert.match(dialog, /ONE_OFF_MAX_SYNCHRONOUS_PACKAGES/)
 assert.match(dialog, /oneOffShipmentConstants/)
 assert.doesNotMatch(dialog, /const MAX_PACKAGES\s*=\s*\d+/)
-assert.match(dialog, /mode\.mode === 'live' && !canActivate/)
-assert.match(dialog, /disabled=\{!mode\.enabled \|\| \(mode\.mode === 'live' && !canActivate\)\}/)
+assert.doesNotMatch(dialog, /canActivate|Operations activation permission/)
+assert.match(dialog, /disabled=\{!mode\.enabled\}/)
 assert.match(dialog, /onChange=\{\(event\) => \{\s*setExecutionMode\(event\.target\.value as 'test' \| 'live'\)\s*resetQuote\(\)/)
 
 for (const action of ['refresh-packed-rates', 'purchase-group', 'void-group']) {

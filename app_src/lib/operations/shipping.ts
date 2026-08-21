@@ -29,7 +29,7 @@ export type ShippingWorkspace = {
   capabilities: {
     canView: boolean
     canCreate: boolean
-    canActivate: boolean
+    canPurchaseLivePostage: boolean
   }
   records: ShippingRecord[]
   pickupAvailability: {

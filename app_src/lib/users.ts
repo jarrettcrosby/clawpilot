@@ -32,6 +32,9 @@ export type AppUserPermissions = {
   viewOperations: boolean
   manageOperations: boolean
   executeWarehouse: boolean
+  viewShipping?: boolean
+  createShipments?: boolean
+  purchaseLivePostage?: boolean
   manageCarrierRateNetworks: boolean
   grantCarrierRateAccess: boolean
   viewCarrierCost: boolean
@@ -56,6 +59,9 @@ export const MEMBER_PERMISSIONS: AppUserPermissions = {
   viewOperations: false,
   manageOperations: false,
   executeWarehouse: false,
+  viewShipping: false,
+  createShipments: false,
+  purchaseLivePostage: false,
   manageCarrierRateNetworks: false,
   grantCarrierRateAccess: false,
   viewCarrierCost: false,
@@ -80,6 +86,9 @@ export const OWNER_PERMISSIONS: AppUserPermissions = {
   viewOperations: true,
   manageOperations: true,
   executeWarehouse: true,
+  viewShipping: true,
+  createShipments: true,
+  purchaseLivePostage: true,
   manageCarrierRateNetworks: true,
   grantCarrierRateAccess: true,
   viewCarrierCost: true,
@@ -329,6 +338,9 @@ function normalizePermissions(value: unknown): AppUserPermissions {
     viewOperations: input.viewOperations === true,
     manageOperations: input.manageOperations === true,
     executeWarehouse: input.executeWarehouse === true,
+    viewShipping: input.viewShipping === true,
+    createShipments: input.createShipments === true,
+    purchaseLivePostage: input.purchaseLivePostage === true,
     manageCarrierRateNetworks: input.manageCarrierRateNetworks === true,
     grantCarrierRateAccess: input.grantCarrierRateAccess === true,
     viewCarrierCost: input.viewCarrierCost === true,
@@ -347,7 +359,15 @@ function normalizePermissions(value: unknown): AppUserPermissions {
 
 export function permissionsForRole(role: AppUserRole, value: unknown): AppUserPermissions {
   if (role === 'owner') return { ...OWNER_PERMISSIONS }
+  const raw = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : {}
   const permissions = normalizePermissions(value)
+  if (role === 'admin') {
+    if (!Object.hasOwn(raw, 'viewShipping')) permissions.viewShipping = true
+    if (!Object.hasOwn(raw, 'createShipments')) permissions.createShipments = true
+    if (!Object.hasOwn(raw, 'purchaseLivePostage')) permissions.purchaseLivePostage = true
+  }
   if (role === 'member') {
     permissions.inviteUsers = false
     permissions.manageUserAccess = false

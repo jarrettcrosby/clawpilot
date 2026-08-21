@@ -68,6 +68,9 @@ import {
   OPERATIONS_COMMERCE_STORE_SYNC_STRUCTURE_HEALTH_SQL,
 } from '@/lib/persistence/commerceStoreSyncHealth'
 import {
+  SHIPPING_INDEPENDENCE_HEALTH_SQL,
+} from '@/lib/persistence/shippingIndependenceHealth'
+import {
   reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 import {
@@ -2286,6 +2289,7 @@ export async function GET() {
           operations_shopify_location_routing_applied: boolean
           operations_shopify_location_administration_applied: boolean
           operations_shadow_training_applied: boolean
+          shipping_independence_applied: boolean
           operations_order_replanning_corrections_applied: boolean
           operations_shopify_inventory_webhook_refresh_applied: boolean
           operations_shopify_catalog_webhook_refresh_applied: boolean
@@ -3020,6 +3024,9 @@ export async function GET() {
               (
                 ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
               ) AS operations_shadow_training_applied,
+              (
+                ${SHIPPING_INDEPENDENCE_HEALTH_SQL}
+              ) AS shipping_independence_applied,
               (
                 ${OPERATIONS_ORDER_REPLANNING_CORRECTIONS_HEALTH_SQL}
               ) AS operations_order_replanning_corrections_applied,
@@ -6028,6 +6035,7 @@ export async function GET() {
             && row?.operations_shopify_location_routing_applied
             && row?.operations_shopify_location_administration_applied
             && row?.operations_shadow_training_applied
+            && row?.shipping_independence_applied
             && row?.operations_order_replanning_corrections_applied
             && row?.operations_shopify_inventory_webhook_refresh_applied
             && row?.operations_shopify_catalog_webhook_refresh_applied
@@ -6129,6 +6137,11 @@ export async function GET() {
           },
           shadowTraining: {
             status: row?.operations_shadow_training_applied
+              ? 'ready'
+              : 'migration-or-structure-pending',
+          },
+          shippingIndependence: {
+            status: row?.shipping_independence_applied
               ? 'ready'
               : 'migration-or-structure-pending',
           },
@@ -6493,6 +6506,7 @@ export async function GET() {
           || !row?.operations_shopify_location_routing_applied
           || !row?.operations_shopify_location_administration_applied
           || !row?.operations_shadow_training_applied
+          || !row?.shipping_independence_applied
           || !row?.operations_order_replanning_corrections_applied
           || !row?.operations_shopify_inventory_webhook_refresh_applied
           || !row?.operations_shopify_catalog_webhook_refresh_applied

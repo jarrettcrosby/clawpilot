@@ -133,7 +133,7 @@ assertIncludes(shippingContract, [
 assertIncludes(shippingRoute, [
   'export async function GET',
   'requireRequestUser(req)',
-  'operationsCapabilities(actor)',
+  'shippingCapabilities(actor)',
   'if (!capabilities.canView)',
   'activeOperationsOrganizationId(actor)',
   'readShippingWorkspaceFromPostgres({',
@@ -141,6 +141,11 @@ assertIncludes(shippingRoute, [
   "code: 'UNAUTHORIZED'",
   "'Cache-Control': 'private, no-store'",
 ], 'Shipping read route')
+assert.doesNotMatch(
+  shippingRoute,
+  /operationsCapabilities|operations_activation_scopes/,
+  'Shipping reads must not depend on Operations permission or activation state',
+)
 assert.doesNotMatch(
   shippingRoute,
   /searchParams\.get\(['"]organizationId['"]\)|req(?:uest)?\.json\(/,

@@ -351,9 +351,9 @@ export default function ShippingSection({
   )
 
   const onCreated = (result: OneOffShipmentCreateResult) => {
-    setNotice(
-      `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. No postage, label, or tracking number was created during planning.`,
-    )
+    setNotice(result.orderStatus === 'packed'
+      ? `Parcel shipment ${result.orderGlobalId} is packed and ready for a current postage quote. No postage, label, or tracking number was created yet.`
+      : `Parcel shipment ${result.orderGlobalId} was planned with ${result.packageCount} ${result.packageCount === 1 ? 'package' : 'packages'}. No postage, label, or tracking number was created during planning.`)
     setMode('parcel')
     void loadWorkspace()
   }
@@ -405,7 +405,7 @@ export default function ShippingSection({
               <Stack spacing={1.25} alignItems="flex-start">
                 {!workspace?.capabilities.canCreate && (
                   <Alert severity="warning">
-                    Operations management and warehouse execution permission are required.
+                    Create shipments permission is required.
                   </Alert>
                 )}
                 <Button
@@ -430,7 +430,7 @@ export default function ShippingSection({
                   <LtlFreightClassAssessmentPanel />
                 ) : (
                   <Alert severity="warning">
-                    Operations management and warehouse execution permission are required to prepare LTL class evidence.
+                    Create shipments permission is required to prepare LTL class evidence.
                   </Alert>
                 )}
               </Stack>
@@ -473,7 +473,6 @@ export default function ShippingSection({
         open={parcelDialogOpen}
         onClose={() => setParcelDialogOpen(false)}
         onCreated={onCreated}
-        canActivate={Boolean(workspace?.capabilities.canActivate)}
       />
       <RecordDialog record={selectedRecord} onClose={() => setSelectedRecord(null)} />
     </Box>

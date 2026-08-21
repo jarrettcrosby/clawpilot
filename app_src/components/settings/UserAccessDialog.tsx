@@ -68,6 +68,9 @@ type UserPermissions = {
   viewOperations: boolean
   manageOperations: boolean
   executeWarehouse: boolean
+  viewShipping: boolean
+  createShipments: boolean
+  purchaseLivePostage: boolean
   manageCarrierRateNetworks: boolean
   grantCarrierRateAccess: boolean
   viewCarrierCost: boolean
@@ -257,6 +260,21 @@ const PERMISSIONS: Array<{
     description: 'Receive assigned picks and use the ClawPilot mobile picking workflow. View operations is enabled automatically.',
   },
   {
+    key: 'viewShipping',
+    label: 'View shipping',
+    description: 'Open the standalone Shipping workspace and shipment history.',
+  },
+  {
+    key: 'createShipments',
+    label: 'Create shipments',
+    description: 'Rate and plan one-off shipments without Operations access. View shipping is enabled automatically.',
+  },
+  {
+    key: 'purchaseLivePostage',
+    label: 'Purchase live postage',
+    description: 'Authorize production carrier charges after the required explicit confirmation.',
+  },
+  {
     key: 'manageCarrierRateNetworks',
     label: 'Manage carrier rate networks',
     description: 'Create, edit, disable, and configure organization carrier rate networks.',
@@ -303,6 +321,9 @@ function permissionsForRolePreset(role: EditableRole, current: UserPermissions):
     viewOperations: enabled,
     manageOperations: enabled,
     executeWarehouse: enabled,
+    viewShipping: enabled,
+    createShipments: enabled,
+    purchaseLivePostage: enabled,
     manageCarrierRateNetworks: enabled,
     grantCarrierRateAccess: enabled,
     viewCarrierCost: enabled,
@@ -327,6 +348,16 @@ function permissionsWithDependencies(
   const next = { ...current, [key]: enabled }
   if (key === 'executeWarehouse' && enabled) next.viewOperations = true
   if (key === 'viewOperations' && !enabled) next.executeWarehouse = false
+  if (key === 'createShipments' && enabled) next.viewShipping = true
+  if (key === 'purchaseLivePostage' && enabled) {
+    next.viewShipping = true
+    next.createShipments = true
+  }
+  if (key === 'createShipments' && !enabled) next.purchaseLivePostage = false
+  if (key === 'viewShipping' && !enabled) {
+    next.createShipments = false
+    next.purchaseLivePostage = false
+  }
   return next
 }
 

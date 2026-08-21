@@ -5430,7 +5430,6 @@ export default function OperationsSection({
         open={oneOffShipmentOpen}
         onClose={() => setOneOffShipmentOpen(false)}
         onCreated={openCreatedOneOffShipment}
-        canActivate={Boolean(capabilities?.canActivate)}
       />
 
       <Dialog

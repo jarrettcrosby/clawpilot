@@ -69,7 +69,7 @@ import type { PackagingMaterial } from '@/lib/operations/packagingMaterials'
 
 type DraftLine = {
   lineKey: string
-  kind: 'existing' | 'new'
+  kind: 'existing' | 'new' | 'ad_hoc'
   productGlobalId: string
   name: string
   sku: string
@@ -275,13 +275,11 @@ export default function OneOffShipmentDialog({
   open,
   onClose,
   onCreated,
-  canActivate,
   developmentFixture,
 }: {
   open: boolean
   onClose: () => void
   onCreated: (result: OneOffShipmentCreateResult) => void | Promise<void>
-  canActivate: boolean
   developmentFixture?: OneOffShipmentDevelopmentFixture
 }) {
   const fixture = process.env.NEXT_PUBLIC_LOCAL_UI_FIXTURES === '1'
@@ -328,7 +326,7 @@ export default function OneOffShipmentDialog({
   )
   const [freshRateRetryAvailable, setFreshRateRetryAvailable] = useState(false)
   const [reason, setReason] = useState(
-    'Create and plan this reviewed one-off shipment from the selected physical inventory',
+    'Create and plan this reviewed one-off shipment from the selected origin',
   )
   const [createAttempt, setCreateAttempt] = useState<OneOffShipmentCreateAttempt | null>(null)
 
@@ -337,6 +335,7 @@ export default function OneOffShipmentDialog({
       left.amountMinor - right.amountMinor
     ))
   ), [quote])
+  const pureAdHoc = lines.length > 0 && lines.every((line) => line.kind === 'ad_hoc')
 
   const lowestPurchasableOfferGlobalId = useMemo(() => (
     sortedQuoteOffers.find((offer) => (
@@ -728,10 +727,7 @@ export default function OneOffShipmentDialog({
   const shipmentError = () => {
     const mode = workspace?.executionModes.find((entry) => entry.mode === executionMode)
     if (!mode?.enabled) return mode?.blockers[0] || 'The selected shipping mode is unavailable.'
-    if (executionMode === 'live' && !canActivate) {
-      return 'LIVE shipment planning requires Operations activation permission.'
-    }
-    if (!customerGlobalId) return 'Choose a customer.'
+    if (!pureAdHoc && !customerGlobalId) return 'Choose a customer for inventory-backed units.'
     if (!referenceNumber.trim()) return 'Enter an order or shipment reference.'
     if (!recipientName.trim() || !line1.trim() || !city.trim()) {
       return 'Complete the recipient name, street, and city.'
@@ -741,8 +737,9 @@ export default function OneOffShipmentDialog({
     if (shipFromPhone.replace(/\D/g, '').length < 7) return 'Enter a sender phone number.'
     if (shipToPhone.replace(/\D/g, '').length < 7) return 'Enter a recipient phone number.'
     if (shipToResidential === null) return 'Choose whether the recipient address is residential or commercial.'
-    if (!warehouseGlobalId || !inventoryPoolGlobalId || !receivingLocationGlobalId) {
-      return 'Choose a warehouse, inventory pool, and physical location.'
+    if (!warehouseGlobalId) return 'Choose the origin warehouse.'
+    if (!pureAdHoc && (!inventoryPoolGlobalId || !receivingLocationGlobalId)) {
+      return 'Choose an inventory pool and physical location for inventory-backed units.'
     }
     if (!lines.length || lines.length > MAX_LINES) return `Add between 1 and ${MAX_LINES} lines.`
     const usedExisting = new Set<string>()
@@ -766,26 +763,27 @@ export default function OneOffShipmentDialog({
           return `Line ${index + 1} exceeds the available quantity in the selected pool.`
         }
       } else {
-        if (!line.name.trim() || !line.sku.trim()) return `Name and SKU are required for new product line ${index + 1}.`
+        if (!line.name.trim()) return `Enter a name for line ${index + 1}.`
+        if (line.kind === 'new' && !line.sku.trim()) return `SKU is required for new product line ${index + 1}.`
         const normalizedSku = line.sku.trim().toLowerCase()
-        const existingProduct = workspace?.products.find((product) => (
+        const existingProduct = line.kind === 'new' ? workspace?.products.find((product) => (
           product.sku?.trim().toLowerCase() === normalizedSku
-        ))
+        )) : undefined
         if (existingProduct) {
           return existingProduct.defaultPackage
             ? `${existingProduct.name} already exists. Choose it under Existing product.`
             : `${existingProduct.name} already exists and needs package setup before shipping.`
         }
-        if (usedSkus.has(normalizedSku)) return 'Each new product SKU must be unique in this shipment.'
-        usedSkus.add(normalizedSku)
+        if (line.kind === 'new' && usedSkus.has(normalizedSku)) return 'Each new product SKU must be unique in this shipment.'
+        if (line.kind === 'new') usedSkus.add(normalizedSku)
         if (nonNegativeInteger(line.unitPriceMinor) === null) return `Line ${index + 1} needs a valid unit value.`
         if (!positiveInteger(line.unitWeightGrams)
           || !positiveInteger(line.lengthMm)
           || !positiveInteger(line.widthMm)
           || !positiveInteger(line.heightMm)) {
-          return `New product line ${index + 1} needs factual unit weight and dimensions.`
+          return `${line.kind === 'new' ? 'New product' : 'Ad-hoc item'} line ${index + 1} needs factual unit weight and dimensions.`
         }
-        if (!line.physicalUnitsOnHandConfirmed) {
+        if (line.kind === 'new' && !line.physicalUnitsOnHandConfirmed) {
           return `Confirm that physical units exist for new product line ${index + 1}.`
         }
       }
@@ -887,10 +885,10 @@ export default function OneOffShipmentDialog({
 
   const buildQuoteInput = (): OneOffShipmentQuoteInput => ({
     executionMode,
-    customerGlobalId,
+    customerGlobalId: customerGlobalId || null,
     warehouseGlobalId,
-    inventoryPoolGlobalId,
-    receivingLocationGlobalId,
+    inventoryPoolGlobalId: pureAdHoc ? null : inventoryPoolGlobalId,
+    receivingLocationGlobalId: pureAdHoc ? null : receivingLocationGlobalId,
     referenceNumber: referenceNumber.trim(),
     currency: 'USD',
     requestedDeliveryAt: requestedDeliveryAt
@@ -913,26 +911,34 @@ export default function OneOffShipmentDialog({
       postalCode: postalCode.trim(),
       country: 'US',
     },
-    lines: lines.map((line) => line.kind === 'existing' ? ({
-      kind: 'existing' as const,
-      lineKey: line.lineKey,
-      productGlobalId: line.productGlobalId,
-      quantity: positiveInteger(line.quantity) || 0,
-    }) : ({
-      kind: 'new' as const,
-      lineKey: line.lineKey,
-      name: line.name.trim(),
-      sku: line.sku.trim(),
-      quantity: positiveInteger(line.quantity) || 0,
-      unitPriceMinor: nonNegativeInteger(line.unitPriceMinor) || 0,
-      unitWeightGrams: positiveInteger(line.unitWeightGrams) || 0,
-      unitDimensionsMm: {
-        length: positiveInteger(line.lengthMm) || 0,
-        width: positiveInteger(line.widthMm) || 0,
-        height: positiveInteger(line.heightMm) || 0,
-      },
-      physicalUnitsOnHandConfirmed: true as const,
-    })),
+    lines: lines.map((line) => {
+      if (line.kind === 'existing') return {
+        kind: 'existing' as const,
+        lineKey: line.lineKey,
+        productGlobalId: line.productGlobalId,
+        quantity: positiveInteger(line.quantity) || 0,
+      }
+      const item = {
+        lineKey: line.lineKey,
+        name: line.name.trim(),
+        sku: line.sku.trim(),
+        quantity: positiveInteger(line.quantity) || 0,
+        unitPriceMinor: nonNegativeInteger(line.unitPriceMinor) || 0,
+        unitWeightGrams: positiveInteger(line.unitWeightGrams) || 0,
+        unitDimensionsMm: {
+          length: positiveInteger(line.lengthMm) || 0,
+          width: positiveInteger(line.widthMm) || 0,
+          height: positiveInteger(line.heightMm) || 0,
+        },
+      }
+      return line.kind === 'ad_hoc'
+        ? { ...item, kind: 'ad_hoc' as const, sku: item.sku || null }
+        : {
+            ...item,
+            kind: 'new' as const,
+            physicalUnitsOnHandConfirmed: true as const,
+          }
+    }),
     packages: packages.map((parcel) => ({
       packageKey: parcel.packageKey,
       packageProfile: {
@@ -1150,6 +1156,7 @@ export default function OneOffShipmentDialog({
 
   const lineLabel = (line: DraftLine, index: number) => {
     if (line.kind === 'new') return line.name.trim() || `New product ${index + 1}`
+    if (line.kind === 'ad_hoc') return line.name.trim() || `Ad-hoc item ${index + 1}`
     return workspace?.products.find((product) => product.globalId === line.productGlobalId)?.name
       || `Existing product ${index + 1}`
   }
@@ -1220,11 +1227,8 @@ export default function OneOffShipmentDialog({
                     }}
                   >
                     {workspace.executionModes.map((mode) => {
-                      const permissionBlocked = mode.mode === 'live' && !canActivate
-                      const ready = mode.enabled && !permissionBlocked
-                      const blocker = permissionBlocked
-                        ? 'Your role does not have Operations activation permission.'
-                        : mode.blockers.join(' · ')
+                      const ready = mode.enabled
+                      const blocker = mode.blockers.join(' · ')
                       return (
                         <Box
                           key={mode.mode}
@@ -1270,7 +1274,7 @@ export default function OneOffShipmentDialog({
                       <MenuItem
                         key={mode.mode}
                         value={mode.mode}
-                        disabled={!mode.enabled || (mode.mode === 'live' && !canActivate)}
+                        disabled={!mode.enabled}
                       >
                         {mode.mode === 'live'
                           ? 'LIVE · production carrier integration'
@@ -1282,11 +1286,15 @@ export default function OneOffShipmentDialog({
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 2 }}>
                     <TextField
                       select
-                      required
-                      label="Customer"
+                      required={!pureAdHoc}
+                      label={pureAdHoc ? 'Customer (optional)' : 'Customer'}
                       value={customerGlobalId}
                       onChange={(event) => { setCustomerGlobalId(event.target.value); resetQuote() }}
+                      helperText={pureAdHoc
+                        ? 'Leave blank to use only the typed recipient snapshot; no CRM customer is created.'
+                        : 'Required for inventory-backed products.'}
                     >
+                      {pureAdHoc && <MenuItem value="">No CRM customer · direct recipient</MenuItem>}
                       {workspace.customers.map((customer) => (
                         <MenuItem key={customer.globalId} value={customer.globalId}>{customer.name}</MenuItem>
                       ))}
@@ -1336,7 +1344,9 @@ export default function OneOffShipmentDialog({
                     </TextField>
                   </Box>
 
-                  <Typography variant="overline" color="text.secondary">Inventory source</Typography>
+                  <Typography variant="overline" color="text.secondary">
+                    {pureAdHoc ? 'Shipping origin' : 'Inventory source'}
+                  </Typography>
                   <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(3, 1fr)' }, gap: 2 }}>
                     <TextField
                       select
@@ -1351,10 +1361,12 @@ export default function OneOffShipmentDialog({
                     </TextField>
                     <TextField
                       select
-                      required
+                      required={!pureAdHoc}
                       label="Inventory pool"
                       value={inventoryPoolGlobalId}
                       onChange={(event) => { setInventoryPoolGlobalId(event.target.value); resetQuote() }}
+                      disabled={pureAdHoc}
+                      helperText={pureAdHoc ? 'Not used for one-time ad-hoc items.' : undefined}
                     >
                       {selectedWarehouse?.inventoryPools.map((pool) => (
                         <MenuItem key={pool.globalId} value={pool.globalId}>{pool.name}</MenuItem>
@@ -1362,11 +1374,14 @@ export default function OneOffShipmentDialog({
                     </TextField>
                     <TextField
                       select
-                      required
+                      required={!pureAdHoc}
                       label="Physical location"
                       value={receivingLocationGlobalId}
                       onChange={(event) => { setReceivingLocationGlobalId(event.target.value); resetQuote() }}
-                      helperText="Used to establish factual stock for manually added units."
+                      disabled={pureAdHoc}
+                      helperText={pureAdHoc
+                        ? 'Not used; the item remains outside Products and inventory.'
+                        : 'Used to establish factual stock for manually added units.'}
                     >
                       {selectedWarehouse?.receivingLocations.map((location) => (
                         <MenuItem key={location.globalId} value={location.globalId}>{location.code}</MenuItem>
@@ -1404,6 +1419,7 @@ export default function OneOffShipmentDialog({
                       >
                         <MenuItem value="existing">Existing product and inventory</MenuItem>
                         <MenuItem value="new">Create a new product from physical units</MenuItem>
+                        <MenuItem value="ad_hoc">One-time ad-hoc item · do not add to Products</MenuItem>
                       </TextField>
                       {line.kind === 'existing' ? (
                         <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 150px' }, gap: 2 }}>
@@ -1436,8 +1452,8 @@ export default function OneOffShipmentDialog({
                       ) : (
                         <Stack spacing={2}>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: 'minmax(0, 1fr) 180px 130px' }, gap: 2 }}>
-                            <TextField required label="Product name" value={line.name} onChange={(event) => updateLine(line.lineKey, { name: event.target.value })} />
-                            <TextField required label="SKU" value={line.sku} onChange={(event) => updateLine(line.lineKey, { sku: event.target.value })} inputProps={{ maxLength: 25 }} />
+                            <TextField required label={line.kind === 'ad_hoc' ? 'Item name' : 'Product name'} value={line.name} onChange={(event) => updateLine(line.lineKey, { name: event.target.value })} />
+                            <TextField required={line.kind === 'new'} label={line.kind === 'ad_hoc' ? 'Item reference (optional)' : 'SKU'} value={line.sku} onChange={(event) => updateLine(line.lineKey, { sku: event.target.value })} inputProps={{ maxLength: line.kind === 'ad_hoc' ? 80 : 25 }} />
                             <TextField required label="Quantity" type="number" value={line.quantity} onChange={(event) => updateLine(line.lineKey, { quantity: event.target.value })} inputProps={{ min: 1, step: 1 }} />
                           </Box>
                           <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2 }}>
@@ -1447,11 +1463,15 @@ export default function OneOffShipmentDialog({
                             <TextField required label="Width (mm)" type="number" value={line.widthMm} onChange={(event) => updateLine(line.lineKey, { widthMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
                             <TextField required label="Height (mm)" type="number" value={line.heightMm} onChange={(event) => updateLine(line.lineKey, { heightMm: event.target.value })} inputProps={{ min: 1, step: 1 }} />
                           </Box>
-                          <FormControlLabel
+                          {line.kind === 'new' ? <FormControlLabel
                             sx={{ alignItems: 'flex-start' }}
                             control={<Checkbox checked={line.physicalUnitsOnHandConfirmed} onChange={(event) => updateLine(line.lineKey, { physicalUnitsOnHandConfirmed: event.target.checked })} />}
                             label="I confirm these are real physical units at the selected warehouse and location. Create this SKU in Products and establish only the stated quantity as inventory when I finalize the shipment."
-                          />
+                          /> : (
+                            <Alert severity="info">
+                              This item is saved only as an immutable shipment snapshot. It will not create a Product, receipt, inventory position, or reservation.
+                            </Alert>
+                          )}
                         </Stack>
                       )}
                     </Box>

@@ -50,7 +50,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
   organizationId: string
   canView: boolean
   canCreate: boolean
-  canActivate: boolean
+  canPurchaseLivePostage: boolean
 }): Promise<ShippingWorkspace> {
   const result = await query<ShippingRecordRow>(
     `WITH shipping_orders AS (
@@ -60,7 +60,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
               source_order.ship_to,
               source_order.source_provider,
               source_order.order_type,
-              customer.name AS customer_name,
+              COALESCE(customer.name, source_order.ship_to->>'name') AS customer_name,
               quote.execution_mode,
               plan.id AS plan_id,
               COALESCE((
@@ -70,7 +70,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
                   AND package.plan_id = plan.id
               ), 0)::text AS package_count
        FROM operations_orders source_order
-       JOIN crm_organizations customer
+       LEFT JOIN crm_organizations customer
          ON customer.pipeline_id = source_order.pipeline_id
         AND customer.id = source_order.customer_id
        JOIN LATERAL (
@@ -186,7 +186,7 @@ export async function readShippingWorkspaceFromPostgres(input: {
     capabilities: {
       canView: input.canView,
       canCreate: input.canCreate,
-      canActivate: input.canActivate,
+      canPurchaseLivePostage: input.canPurchaseLivePostage,
     },
     records: result.rows.map(record),
     pickupAvailability: {

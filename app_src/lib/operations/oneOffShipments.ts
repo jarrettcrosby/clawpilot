@@ -55,9 +55,21 @@ export type OneOffNewProductLine = {
   physicalUnitsOnHandConfirmed: true
 }
 
+export type OneOffAdHocLine = {
+  kind: 'ad_hoc'
+  lineKey: string
+  name: string
+  sku: string | null
+  quantity: number
+  unitPriceMinor: number
+  unitWeightGrams: number
+  unitDimensionsMm: Millimeters
+}
+
 export type OneOffShipmentLineInput =
   | OneOffExistingProductLine
   | OneOffNewProductLine
+  | OneOffAdHocLine
 
 export type OneOffShipmentPackageInput = {
   packageKey: string
@@ -73,10 +85,10 @@ export type OneOffShipmentPackageInput = {
 
 export type OneOffShipmentQuoteInput = {
   executionMode: OneOffExecutionMode
-  customerGlobalId: string
+  customerGlobalId: string | null
   warehouseGlobalId: string
-  inventoryPoolGlobalId: string
-  receivingLocationGlobalId: string
+  inventoryPoolGlobalId: string | null
+  receivingLocationGlobalId: string | null
   referenceNumber: string
   currency: string
   requestedDeliveryAt: string | null
@@ -226,12 +238,13 @@ export type OneOffShipmentQuote = {
 
 export type OneOffShipmentCreateResult = {
   orderGlobalId: string
-  orderStatus: 'planned'
+  orderStatus: 'planned' | 'packed'
   rowVersion: number
   fulfillmentPlanGlobalId: string
   quoteGlobalId: string
   selectedOfferGlobalId: string
   createdProductGlobalIds: string[]
+  adHocItemGlobalIds: string[]
   receiptGlobalId: string | null
   packageCount: number
   replayed: boolean
@@ -279,6 +292,44 @@ export type OneOffShipmentWorkspace = {
     displayName: string
     senderOriginWarehouseGlobalId: string | null
   }>
+}
+
+export function oneOffShippingExecutionModes(input: {
+  runtimeEnvironment: OneOffRateEnvironment
+  canPurchaseLivePostage: boolean
+  sandboxCarrierCount: number
+  productionCarrierCount: number
+}): OneOffShipmentWorkspace['executionModes'] {
+  return [
+    {
+      mode: 'test',
+      environment: 'sandbox',
+      enabled: input.sandboxCarrierCount > 0,
+      blockers: input.sandboxCarrierCount > 0
+        ? []
+        : ['Enable a verified sandbox parcel rate account'],
+    },
+    {
+      mode: 'live',
+      environment: 'production',
+      enabled: input.runtimeEnvironment === 'production'
+        && input.canPurchaseLivePostage
+        && input.productionCarrierCount > 0,
+      blockers: [
+        ...(input.runtimeEnvironment === 'production'
+          ? []
+          : [
+              'Live postage is available only in production or the trusted Railway development service',
+            ]),
+        ...(input.canPurchaseLivePostage
+          ? []
+          : ['Your role needs live-postage permission']),
+        ...(input.productionCarrierCount > 0
+          ? []
+          : ['Enable a verified production parcel rate account']),
+      ],
+    },
+  ]
 }
 
 function canonicalJson(value: unknown): string {

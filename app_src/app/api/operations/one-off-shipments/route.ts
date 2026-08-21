@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
   activeOperationsOrganizationId,
-  operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
@@ -126,11 +126,11 @@ export async function GET(req: NextRequest) {
   try {
     requirePostgres()
     const actor = await requireRequestUser(req)
-    const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canManage || !capabilities.canExecute) {
+    const capabilities = shippingCapabilities(actor)
+    if (!capabilities.canCreate) {
       return forbidden(
-        'You need Operations management and warehouse execution permission to use one-off shipments',
-        'OPERATIONS_ONE_OFF_PERMISSION_REQUIRED',
+        'You need Shipping creation permission to use one-off shipments',
+        'SHIPPING_CREATE_REQUIRED',
       )
     }
     const organizationId = activeOperationsOrganizationId(actor)
@@ -142,7 +142,10 @@ export async function GET(req: NextRequest) {
       })
       return json({ ok: true, state })
     }
-    const workspace = await readOneOffShipmentWorkspaceFromPostgres({ organizationId })
+    const workspace = await readOneOffShipmentWorkspaceFromPostgres({
+      organizationId,
+      canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
+    })
     return json({ ok: true, workspace })
   } catch (error) {
     return errorResponse(error)
@@ -153,11 +156,11 @@ export async function POST(req: NextRequest) {
   try {
     requirePostgres()
     const actor = await requireRequestUser(req)
-    const capabilities = operationsCapabilities(actor)
-    if (!capabilities.canManage || !capabilities.canExecute) {
+    const capabilities = shippingCapabilities(actor)
+    if (!capabilities.canCreate) {
       return forbidden(
-        'You need Operations management and warehouse execution permission to use one-off shipments',
-        'OPERATIONS_ONE_OFF_PERMISSION_REQUIRED',
+        'You need Shipping creation permission to use one-off shipments',
+        'SHIPPING_CREATE_REQUIRED',
       )
     }
     const body = await requestBody(req)
@@ -172,10 +175,10 @@ export async function POST(req: NextRequest) {
         )
       }
       const requestedQuote = body.quote as Record<string, unknown>
-      if (requestedQuote?.executionMode === 'live' && !capabilities.canActivate) {
+      if (requestedQuote?.executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live carrier rating requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+          'Live carrier rating requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const quote = await quoteOneOffShipmentInPostgres({
@@ -201,10 +204,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         quoteGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live one-off planning requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_PLAN_PERMISSION_REQUIRED',
+          'Live one-off planning requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const result = await createAndPlanOneOffShipmentInPostgres({
@@ -232,10 +235,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         orderGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live packed carrier rating requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_RATE_PERMISSION_REQUIRED',
+          'Live packed carrier rating requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       const result = await refreshOperationsOneOffPackedRatesInPostgres({
@@ -264,10 +267,10 @@ export async function POST(req: NextRequest) {
         organizationId,
         orderGlobalId,
       })
-      if (executionMode === 'live' && !capabilities.canActivate) {
+      if (executionMode === 'live' && !capabilities.canPurchaseLivePostage) {
         return forbidden(
-          'Live postage purchase requires Operations activation permission',
-          'OPERATIONS_ONE_OFF_LIVE_PURCHASE_PERMISSION_REQUIRED',
+          'Live postage purchase requires live-postage permission',
+          'SHIPPING_LIVE_POSTAGE_PERMISSION_REQUIRED',
         )
       }
       if (

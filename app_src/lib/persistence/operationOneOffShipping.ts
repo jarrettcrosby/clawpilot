@@ -129,9 +129,11 @@ function addressParty(value: JsonObject, fallbackName: string) {
 }
 
 type PackedLineRow = QueryResultRow & {
+  kind: 'existing' | 'ad_hoc'
   external_line_id: string
-  product_global_id: string
+  product_global_id: string | null
   quantity: string
+  item_snapshot: JsonObject | null
 }
 
 type PackedPackageRow = QueryResultRow & {
@@ -154,15 +156,14 @@ type GroupContext = QueryResultRow & {
   order_status: string
   row_version: string
   currency: string
-  activation_state: string
   plan_id: string
   plan_global_id: string
   warehouse_id: string
   warehouse_global_id: string
   warehouse_address: JsonObject
-  customer_global_id: string
-  inventory_pool_global_id: string
-  receiving_location_global_id: string
+  customer_global_id: string | null
+  inventory_pool_global_id: string | null
+  receiving_location_global_id: string | null
   planning_quote_id: string
   planning_quote_global_id: string
   planning_offer_id: string
@@ -207,7 +208,6 @@ async function readGroupContext(
             source_order.global_id AS order_global_id,
             source_order.order_number, source_order.status AS order_status,
             source_order.row_version::text, source_order.currency,
-            activation.state AS activation_state,
             plan.id::text AS plan_id, plan.global_id AS plan_global_id,
             plan.warehouse_id::text, warehouse.global_id AS warehouse_global_id,
             warehouse.address AS warehouse_address,
@@ -237,8 +237,6 @@ async function readGroupContext(
             selected_rate.id::text AS carrier_rate_id,
             selected_rate.global_id AS carrier_rate_global_id
      FROM operations_orders source_order
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = source_order.organization_id
      JOIN LATERAL (
        SELECT candidate.*
        FROM operations_fulfillment_plans candidate
@@ -271,13 +269,13 @@ async function readGroupContext(
       AND selected_rate.selected = true
       AND selected_rate.one_off_quote_id = plan.one_off_quote_id
       AND selected_rate.one_off_offer_id = plan.one_off_offer_id
-     JOIN crm_organizations customer
+     LEFT JOIN crm_organizations customer
        ON customer.pipeline_id = planning_quote.pipeline_id
       AND customer.id = planning_quote.customer_id
-     JOIN operations_inventory_pools pool
+     LEFT JOIN operations_inventory_pools pool
        ON pool.organization_id = planning_quote.organization_id
       AND pool.id = planning_quote.inventory_pool_id
-     JOIN operations_locations location
+     LEFT JOIN operations_locations location
        ON location.organization_id = planning_quote.organization_id
       AND location.id = planning_quote.receiving_location_id
      WHERE source_order.organization_id = $1::uuid
@@ -309,13 +307,24 @@ async function readPackedLines(
 ) {
   const result = await dbQuery<PackedLineRow>(
     client,
-    `SELECT line.external_line_id, product.reference_code AS product_global_id,
-            line.quantity::text
-     FROM operations_current_order_lines line
-     JOIN crm_products product
-       ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
-     WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
-     ORDER BY line.external_line_id, line.id`,
+    `SELECT packed.kind, packed.external_line_id, packed.product_global_id,
+            packed.quantity, packed.item_snapshot
+     FROM (
+       SELECT 'existing'::text AS kind, line.external_line_id,
+              product.reference_code AS product_global_id,
+              line.quantity::text, NULL::jsonb AS item_snapshot,
+              line.id AS stable_id
+       FROM operations_current_order_lines line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id AND product.id = line.product_id
+       WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
+       UNION ALL
+       SELECT 'ad_hoc'::text, line.line_key, NULL::text,
+              line.quantity::text, line.item_snapshot, line.id
+       FROM operations_one_off_ad_hoc_order_lines line
+       WHERE line.organization_id = $1::uuid AND line.order_id = $2::uuid
+     ) packed
+     ORDER BY packed.external_line_id, packed.stable_id`,
     [organizationId, orderId],
   )
   return result.rows
@@ -337,16 +346,30 @@ async function readPackedPackages(
               AS quote_package_key,
             COALESCE((
               SELECT jsonb_agg(jsonb_build_object(
-                'lineKey', order_line.external_line_id,
-                'quantity', content.quantity
-              ) ORDER BY order_line.external_line_id)
-              FROM operations_package_contents content
-              JOIN operations_current_order_lines order_line
-                ON order_line.organization_id = content.organization_id
-               AND order_line.id = content.order_line_id
-              WHERE content.organization_id = package.organization_id
-                AND content.plan_id = package.plan_id
-                AND content.package_id = package.id
+                'lineKey', allocation.line_key,
+                'quantity', allocation.quantity
+              ) ORDER BY allocation.line_key)
+              FROM (
+                SELECT order_line.external_line_id AS line_key,
+                       content.quantity
+                FROM operations_package_contents content
+                JOIN operations_current_order_lines order_line
+                  ON order_line.organization_id = content.organization_id
+                 AND order_line.id = content.order_line_id
+                WHERE content.organization_id = package.organization_id
+                  AND content.plan_id = package.plan_id
+                  AND content.package_id = package.id
+                UNION ALL
+                SELECT ad_hoc.line_key, content.quantity
+                FROM operations_one_off_ad_hoc_package_contents content
+                JOIN operations_one_off_ad_hoc_order_lines ad_hoc
+                  ON ad_hoc.organization_id = content.organization_id
+                 AND ad_hoc.order_id = content.order_id
+                 AND ad_hoc.id = content.ad_hoc_order_line_id
+                WHERE content.organization_id = package.organization_id
+                  AND content.plan_id = package.plan_id
+                  AND content.package_id = package.id
+              ) allocation
             ), '[]'::jsonb) AS allocations
      FROM operations_packages package
      JOIN operations_one_off_shipment_quotes quote
@@ -365,15 +388,6 @@ function assertPackedContext(
   packages: PackedPackageRow[],
   expectedRowVersion: number,
 ) {
-  const requiredActivation = context.execution_mode === 'live' ? 'active' : 'shadow'
-  if (context.activation_state !== requiredActivation) {
-    fail(
-      context.execution_mode === 'live'
-        ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
-        : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
-      `${context.execution_mode === 'live' ? 'LIVE' : 'TEST'} one-off shipment execution requires Operations ${requiredActivation}`,
-    )
-  }
   if (context.order_status !== 'packed') {
     fail(
       'OPERATIONS_ONE_OFF_GROUP_NOT_PACKED',
@@ -531,12 +545,38 @@ function quoteInput(
       postalCode: String(destination.postalCode || '').trim(),
       country: String(destination.country || 'US').trim(),
     },
-    lines: lines.map((line) => ({
-      kind: 'existing' as const,
-      lineKey: line.external_line_id,
-      productGlobalId: line.product_global_id,
-      quantity: numberValue(line.quantity),
-    })),
+    lines: lines.map((line) => {
+      if (line.kind === 'ad_hoc') {
+        const snapshot = line.item_snapshot || {}
+        return {
+          kind: 'ad_hoc' as const,
+          lineKey: line.external_line_id,
+          name: String(snapshot.name || '').trim(),
+          sku: String(snapshot.sku || '').trim() || null,
+          quantity: numberValue(line.quantity),
+          unitPriceMinor: numberValue(snapshot.unitPriceMinor),
+          unitWeightGrams: numberValue(snapshot.unitWeightGrams),
+          unitDimensionsMm: {
+            length: numberValue((snapshot.unitDimensionsMm as JsonObject)?.length),
+            width: numberValue((snapshot.unitDimensionsMm as JsonObject)?.width),
+            height: numberValue((snapshot.unitDimensionsMm as JsonObject)?.height),
+          },
+        }
+      }
+      if (!line.product_global_id) {
+        fail(
+          'OPERATIONS_ONE_OFF_GROUP_EVIDENCE_INVALID',
+          'The packed product line is missing its immutable product reference',
+          500,
+        )
+      }
+      return {
+        kind: 'existing' as const,
+        lineKey: line.external_line_id,
+        productGlobalId: line.product_global_id,
+        quantity: numberValue(line.quantity),
+      }
+    }),
     packages: packages.map((item, index) => ({
       packageKey: item.quote_package_key,
       packageProfile:
@@ -1706,8 +1746,6 @@ export async function createOperationsOneOffCarrierGroupInPostgres(input: {
          ON purchase_offer.organization_id = purchase_quote.organization_id
         AND purchase_offer.quote_id = purchase_quote.id
         AND purchase_offer.id = attempt.purchase_offer_id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = attempt.organization_id
        JOIN operations_one_off_purchase_quote_consumptions consumption
          ON consumption.organization_id = attempt.organization_id
         AND consumption.quote_id = attempt.purchase_quote_id
@@ -1718,10 +1756,6 @@ export async function createOperationsOneOffCarrierGroupInPostgres(input: {
        WHERE attempt.organization_id = $1::uuid AND attempt.id = $2::uuid
          AND attempt.state = 'prepared'
          AND purchase_quote.expires_at > clock_timestamp()
-         AND (
-           (attempt.environment = 'sandbox' AND activation.state = 'shadow')
-           OR (attempt.environment = 'production' AND activation.state = 'active')
-         )
          AND purchase_offer.provider = attempt.provider
          AND purchase_offer.environment = attempt.environment
          AND purchase_offer.service_code = attempt.service_code
