@@ -1836,67 +1836,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         )
         const labelProviderBaseline = carrierLabelProviderCalls
         const labelEvidenceBaseline = carrierLabelEvidenceCalls
-        await expectRejected(
-          () => shippingPersistence.createOperationsSandboxLabelInPostgres({
-            organizationId: target.fixture.organizationId,
-            actorEmail: target.fixture.email,
-            orderGlobalId: target.order.planned.orderGlobalId,
-            packageGlobalId: target.packageGlobalId,
-            carrierRateGlobalId: target.carrierRateGlobalId,
-            carrierAccountGlobalId: target.carrierAccountGlobalId,
-            sandboxE2eAuthorizationGlobalId:
-              target.authorization.global_id,
-            expectedRowVersion: target.order.packed.rowVersion,
-            reason: `Reject legacy ${provider} label authority in Read only`,
-            idempotencyKey:
-              `legacy-${provider}-read-only-label-${randomUUID()}`,
-          }),
-          (error) => error?.code === 'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
-          `Legacy ${provider} authority must not call a carrier label provider in Read only`,
-        )
-        assert.equal(carrierLabelProviderCalls, labelProviderBaseline)
-        assert.equal(
-          carrierLabelEvidenceCalls,
-          labelEvidenceBaseline,
-          'Legacy Read only authority must fail before preparing carrier evidence',
-        )
-        const labelMutationAfter = await pool.query(
-          `SELECT
-             (SELECT count(*)::int FROM operations_labels
-              WHERE organization_id = $1::uuid) AS labels,
-             (SELECT count(*)::int FROM operations_label_attempts
-              WHERE organization_id = $1::uuid) AS attempts`,
-          [target.fixture.organizationId],
-        )
-        assert.deepEqual(
-          labelMutationAfter.rows[0],
-          labelMutationBaseline.rows[0],
-          `Legacy ${provider} Read only label rejection must write no label or carrier attempt`,
-        )
-        const activeTransition = await pool.connect()
-        try {
-          await activeTransition.query('BEGIN')
-          await activeTransition.query(
-            'SET LOCAL session_replication_role = replica',
-          )
-          await activeTransition.query(
-            `UPDATE operations_activation_scopes
-             SET state = 'active', revision = revision + 1,
-                 reason = 'Retain legacy sandbox E2E behavior in Active',
-                 updated_by = $2, updated_at = now()
-             WHERE organization_id = $1::uuid`,
-            [target.fixture.organizationId, target.fixture.email],
-          )
-          await activeTransition.query('COMMIT')
-        } catch (error) {
-          await activeTransition.query('ROLLBACK').catch(() => undefined)
-          throw error
-        } finally {
-          activeTransition.release()
-        }
-        const activeProviderBaseline = carrierLabelProviderCalls
-        const activeEvidenceBaseline = carrierLabelEvidenceCalls
-        const activePrintBaseline = carrierLabelPrintCalls
+        const labelPrintBaseline = carrierLabelPrintCalls
         const activeLabel = await shippingPersistence
           .createOperationsSandboxLabelInPostgres({
             organizationId: target.fixture.organizationId,
@@ -1909,36 +1849,31 @@ async function verifyShipmentCompletion(databaseUrl) {
               target.authorization.global_id,
             expectedRowVersion: target.order.packed.rowVersion,
             reason:
-              `Retain legacy ${provider} sandbox label execution in Active`,
+              `Create legacy ${provider} sandbox label in Read only`,
             idempotencyKey:
-              `legacy-${provider}-active-label-${randomUUID()}`,
+              `legacy-${provider}-read-only-label-${randomUUID()}`,
           })
         assert.equal(activeLabel.labelStatus, 'created')
         assert.equal(activeLabel.orderStatus, 'packed')
-        assert.equal(carrierLabelProviderCalls, activeProviderBaseline + 1)
-        assert.equal(carrierLabelEvidenceCalls, activeEvidenceBaseline + 1)
-        assert.equal(carrierLabelPrintCalls, activePrintBaseline + 1)
-        const readOnlyTransition = await pool.connect()
-        try {
-          await readOnlyTransition.query('BEGIN')
-          await readOnlyTransition.query(
-            'SET LOCAL session_replication_role = replica',
-          )
-          await readOnlyTransition.query(
-            `UPDATE operations_activation_scopes
-             SET state = 'read_only', revision = revision + 1,
-                 reason = 'Reject legacy authority in Read only shipment',
-                 updated_by = $2, updated_at = now()
-             WHERE organization_id = $1::uuid`,
-            [target.fixture.organizationId, target.fixture.email],
-          )
-          await readOnlyTransition.query('COMMIT')
-        } catch (error) {
-          await readOnlyTransition.query('ROLLBACK').catch(() => undefined)
-          throw error
-        } finally {
-          readOnlyTransition.release()
-        }
+        assert.equal(carrierLabelProviderCalls, labelProviderBaseline + 1)
+        assert.equal(carrierLabelEvidenceCalls, labelEvidenceBaseline + 1)
+        assert.equal(carrierLabelPrintCalls, labelPrintBaseline + 1)
+        const labelMutationAfter = await pool.query(
+          `SELECT
+             (SELECT count(*)::int FROM operations_labels
+              WHERE organization_id = $1::uuid) AS labels,
+             (SELECT count(*)::int FROM operations_label_attempts
+              WHERE organization_id = $1::uuid) AS attempts`,
+          [target.fixture.organizationId],
+        )
+        assert.equal(
+          labelMutationAfter.rows[0].labels,
+          labelMutationBaseline.rows[0].labels + 1,
+        )
+        assert.equal(
+          labelMutationAfter.rows[0].attempts,
+          labelMutationBaseline.rows[0].attempts + 1,
+        )
         const shipmentEvidenceBefore = await orderEvidence(
           pool,
           target.fixture,
@@ -4062,17 +3997,16 @@ async function verifyShipmentCompletion(databaseUrl) {
         authorizedFixture.email,
       ],
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_activation_scopes
+    const activationTelemetry = await pool.query(
+      `UPDATE operations_activation_scopes
          SET state = 'active', revision = revision + 1,
-             reason = 'Reject unauthorized sandbox plan',
+             reason = 'Retain activation telemetry before exact authorization',
              updated_by = $2, updated_at = now()
-         WHERE organization_id = $1::uuid`,
-        [authorizedFixture.organizationId, authorizedFixture.email],
-      ),
-      /Active Operations cannot retain missing or non-production carrier-read plan/,
+         WHERE organization_id = $1::uuid
+         RETURNING state`,
+      [authorizedFixture.organizationId, authorizedFixture.email],
     )
+    assert.equal(activationTelemetry.rows[0]?.state, 'active')
     const authorization = await sandboxAuthorization.authorizeSandboxCommerceE2eInPostgres({
       organizationId: authorizedFixture.organizationId,
       actorEmail: authorizedFixture.email,
