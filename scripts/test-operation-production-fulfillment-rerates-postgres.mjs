@@ -156,6 +156,21 @@ const commerceOrderRevisionGate = {
 const orderShipTo = loadTypeScriptModule(
   'app_src/lib/operations/orderShipTo.ts',
 )
+const carrierSandboxRate = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierSandboxRate.ts',
+  {
+    '@/lib/integrations/carrierCredentialClient': {
+      CarrierCredentialClientError: class extends Error {},
+      requestCarrierAccessToken() {
+        throw new Error('Production rerate fixture does not request carrier credentials')
+      },
+    },
+    '@/lib/integrations/carrierWholeShipmentRateFoundation': {
+      FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+      UPS_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+    },
+  },
+)
 const operationsOrderShipmentAddress = loadTypeScriptModule(
   'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
   {
@@ -168,6 +183,7 @@ const operationsOrderShipmentAddress = loadTypeScriptModule(
         throw new Error('Production rerate fixture does not edit addresses')
       },
     },
+    '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
     '@/lib/operations/orderShipTo': orderShipTo,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
