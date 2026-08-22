@@ -3708,9 +3708,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
       () => pool.query(upgradePreflight),
       /Migration 0176 cannot preserve Active Operations organization .* while plan .* lacks production carrier-read evidence/,
     )
-    await assert.rejects(
-      () => pool.query(
-        `INSERT INTO operations_fulfillment_plans (
+    const localPlan = await pool.query(
+      `INSERT INTO operations_fulfillment_plans (
            organization_id, order_id, warehouse_id, version_number,
            status, method, solver_status, estimated_cost_minor,
            promised_delivery_at, explanation, created_by
@@ -3722,21 +3721,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
         [
           upgradeFixture.organizationId,
           upgradeFixture.order.id,
-          upgradeFixture.warehouse.id,
-          upgradeFixture.email,
-        ],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+           upgradeFixture.warehouse.id,
+           upgradeFixture.email,
+         ],
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_fulfillment_plans
+    assert.equal(localPlan.rowCount, 1)
+    const releasedLocalPlan = await pool.query(
+      `UPDATE operations_fulfillment_plans
          SET status = 'released'
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [upgradeFixture.organizationId, legacyPlan.id],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+      [upgradeFixture.organizationId, legacyPlan.id],
     )
+    assert.equal(releasedLocalPlan.rowCount, 1)
 
     const fixture = await seedCanonicalPlanningFixture(pool)
     const foreignFixture = await seedCanonicalPlanningFixture(pool)
@@ -4499,15 +4495,14 @@ async function verifyCanonicalPlanning(databaseUrl) {
         return true
       },
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_activation_scopes
+    const localProfileTransition = await pool.query(
+      `UPDATE operations_activation_scopes
          SET state = 'active'
-         WHERE organization_id = $1::uuid`,
-        [missingEvidenceFixture.organizationId],
-      ),
-      /Active Operations cannot retain missing or non-production carrier-read plan/,
+         WHERE organization_id = $1::uuid
+         RETURNING state`,
+      [missingEvidenceFixture.organizationId],
     )
+    assert.equal(localProfileTransition.rows[0]?.state, 'active')
 
     const packagingShortageFixture =
       await seedCanonicalPlanningFixture(pool, {
