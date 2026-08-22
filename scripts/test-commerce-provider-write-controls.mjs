@@ -176,6 +176,14 @@ assert.match(
 )
 assert.match(
   persistence,
+  /operations_commerce_granted_scope_snapshot\([\s\S]*AS current_granted_scopes/u,
+)
+assert.match(
+  persistence,
+  /operations_commerce_granted_scope_digest\([\s\S]*AS current_granted_scope_digest/u,
+)
+assert.match(
+  persistence,
   /const fulfillmentWritesEffective = fulfillmentConnected && bindingCurrent/u,
 )
 assert.match(persistence, /fulfillmentWritesBlockedReason/u)
@@ -346,6 +354,28 @@ assert.equal(loaded.canonicalCommerceGrantedScopes(null), null)
 assert.equal(
   loaded.commerceGrantedScopeDigest(canonical),
   createHash('sha256').update('read_orders\nwrite_orders').digest('hex'),
+)
+const databaseOrdered = loaded.validatedCommerceGrantedScopeSnapshot([
+  'read_customers',
+  'read_custom_fulfillment_services',
+])
+assert.deepEqual(
+  Array.from(databaseOrdered),
+  ['read_customers', 'read_custom_fulfillment_services'],
+  'Database-canonical scope order must be retained for the persisted digest',
+)
+assert.equal(
+  loaded.validatedCommerceGrantedScopeSnapshot([
+    'read_customers',
+    'read_customers',
+  ]),
+  null,
+)
+assert.equal(
+  loaded.commerceGrantedScopeDigest(databaseOrdered),
+  createHash('sha256')
+    .update('read_customers\nread_custom_fulfillment_services')
+    .digest('hex'),
 )
 assert.equal(
   loaded.commerceProviderHasWriteScope('shopify', canonical),

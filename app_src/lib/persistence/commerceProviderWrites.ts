@@ -113,6 +113,8 @@ type ControlRow = {
   external_account_id: string | null
   current_credential_generation: number | string
   current_configuration: Record<string, unknown>
+  current_granted_scopes: string[] | null
+  current_granted_scope_digest: string | null
   credential_external_account_id: string | null
   credential_version: number | string | null
   auth_mode: string | null
@@ -342,6 +344,47 @@ export function commerceGrantedScopeDigest(scopes: readonly string[]) {
   return createHash('sha256').update(scopes.join('\n'), 'utf8').digest('hex')
 }
 
+export function validatedCommerceGrantedScopeSnapshot(
+  value: unknown,
+): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
+    return null
+  }
+  const scopes: string[] = []
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (
+      typeof entry !== 'string'
+      || entry !== entry.trim()
+      || entry.length < 1
+      || entry.length > 128
+      || /[\u0000-\u001f\u007f]/u.test(entry)
+      || seen.has(entry)
+    ) {
+      return null
+    }
+    seen.add(entry)
+    scopes.push(entry)
+  }
+  return scopes
+}
+
+function currentCommerceGrantedScopeBinding(row: ControlRow) {
+  const scopes = validatedCommerceGrantedScopeSnapshot(
+    row.current_granted_scopes,
+  )
+  const digest = row.current_granted_scope_digest
+  if (
+    !scopes
+    || typeof digest !== 'string'
+    || !/^[a-f0-9]{64}$/u.test(digest)
+    || commerceGrantedScopeDigest(scopes) !== digest
+  ) {
+    return null
+  }
+  return { scopes, digest }
+}
+
 export function commerceProviderHasWriteScope(
   provider: 'shopify' | 'faire',
   scopes: readonly string[],
@@ -415,9 +458,7 @@ function enableBlocker(row: ControlRow): CommerceProviderWriteBlocker | null {
       message: 'Reconnect Faire with Custom App OAuth before turning provider writes on.',
     }
   }
-  const scopes = canonicalCommerceGrantedScopes(
-    row.current_configuration?.grantedScopes,
-  )
+  const scopes = currentCommerceGrantedScopeBinding(row)?.scopes || null
   if (!scopes) {
     return {
       code: 'COMMERCE_PROVIDER_WRITES_GRANTED_SCOPES_UNAVAILABLE',
@@ -517,10 +558,9 @@ function mapControl(row: ControlRow): CommerceProviderWriteControl {
   const mode: CommerceProviderWriteMode = row.requested_mode === 'on'
     ? 'on'
     : 'off'
-  const scopes = canonicalCommerceGrantedScopes(
-    row.current_configuration?.grantedScopes,
-  )
-  const currentDigest = scopes ? commerceGrantedScopeDigest(scopes) : null
+  const currentScopeBinding = currentCommerceGrantedScopeBinding(row)
+  const scopes = currentScopeBinding?.scopes || null
+  const currentDigest = currentScopeBinding?.digest || null
   const enforcement = commandEnforcement(row, scopes)
   const commandConnected = enforcement !== 'not_connected'
   const fulfillmentConnected = [
@@ -610,6 +650,14 @@ const CONTROL_SELECT = `SELECT
   account.external_account_id,
   current_control.current_credential_generation,
   current_control.current_configuration,
+  public.operations_commerce_granted_scope_snapshot(
+    current_control.current_configuration
+  ) AS current_granted_scopes,
+  public.operations_commerce_granted_scope_digest(
+    public.operations_commerce_granted_scope_snapshot(
+      current_control.current_configuration
+    )
+  ) AS current_granted_scope_digest,
   credential.external_account_id AS credential_external_account_id,
   credential.credential_version,
   credential.auth_mode,
@@ -754,9 +802,8 @@ export async function requireCurrentCommerceProviderWritesInPostgres(input: {
   if (connectionBlocker) {
     fail(connectionBlocker.code, connectionBlocker.message)
   }
-  const scopes = canonicalCommerceGrantedScopes(
-    row.current_configuration?.grantedScopes,
-  )
+  const currentScopeBinding = currentCommerceGrantedScopeBinding(row)
+  const scopes = currentScopeBinding?.scopes || null
   const requiredScopes = canonicalCommerceGrantedScopes(input.requiredScopes)
   if (
     !scopes
@@ -772,7 +819,7 @@ export async function requireCurrentCommerceProviderWritesInPostgres(input: {
   const currentCredentialGeneration = exactInteger(
     row.current_credential_generation,
   )
-  const currentScopeDigest = commerceGrantedScopeDigest(scopes)
+  const currentScopeDigest = currentScopeBinding!.digest
   const bindingCurrent = (
     exactInteger(row.bound_credential_generation)
       === currentCredentialGeneration
@@ -991,16 +1038,13 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
   if (connectionBlocker) {
     fail(connectionBlocker.code, connectionBlocker.message)
   }
-  const scopes = canonicalCommerceGrantedScopes(
-    row.current_configuration?.grantedScopes,
-  )
+  const currentScopeBinding = currentCommerceGrantedScopeBinding(row)
+  const scopes = currentScopeBinding?.scopes || null
   const requiredScopes = canonicalCommerceGrantedScopes(input.requiredScopes)
   const currentCredentialGeneration = exactInteger(
     row.current_credential_generation,
   )
-  const currentScopeDigest = scopes
-    ? commerceGrantedScopeDigest(scopes)
-    : null
+  const currentScopeDigest = currentScopeBinding?.digest || null
   if (
     !scopes
     || !requiredScopes
@@ -1190,16 +1234,17 @@ export async function setCommerceProviderWriteControlInPostgres(rawInput: {
         control.blocker?.message || 'Provider writes are unavailable for this connection',
       )
     }
-    const scopes = input.mode === 'on'
-      ? canonicalCommerceGrantedScopes(row.current_configuration?.grantedScopes)
+    const currentScopeBinding = input.mode === 'on'
+      ? currentCommerceGrantedScopeBinding(row)
       : null
+    const scopes = currentScopeBinding?.scopes || null
     if (input.mode === 'on' && !scopes) {
       fail(
         'COMMERCE_PROVIDER_WRITES_GRANTED_SCOPES_UNAVAILABLE',
         'Refresh the connection so ClawPilot can verify the current granted scopes',
       )
     }
-    const digest = scopes ? commerceGrantedScopeDigest(scopes) : null
+    const digest = currentScopeBinding?.digest || null
     await client.query(
       `INSERT INTO public.operations_commerce_provider_write_controls (
          organization_id, integration_account_id, provider,
