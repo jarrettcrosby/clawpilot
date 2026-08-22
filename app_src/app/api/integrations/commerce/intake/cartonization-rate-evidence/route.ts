@@ -1003,20 +1003,6 @@ export async function POST(req: NextRequest) {
       request.evidenceMode === 'operational'
       && plan.geometryFallbackLines.length > 0
     ) {
-      if (
-        !request.shadowTraining
-        && read.activationState !== 'shadow'
-        && !(
-          read.activationState === 'read_only'
-          && request.sandboxE2eAuthorizationGlobalId
-        )
-      ) {
-        throw new RateEvidenceRequestError(
-          'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow or one exact authorized Shopify test order in Read only mode',
-          422,
-          'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
-        )
-      }
       let optimizer = null
       try {
         optimizer = configuredOrToolsFulfillmentOptimizer()

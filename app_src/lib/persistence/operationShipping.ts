@@ -50,7 +50,6 @@ type OrderRow = QueryResultRow & {
   ship_to: Record<string, unknown>
   shipment_ship_to_ready: boolean
   shipment_rerate_required: boolean
-  activation_state: string
   plan_id: string | null
   warehouse_id: string | null
   warehouse_address: Record<string, unknown> | null
@@ -319,12 +318,9 @@ async function readShippingContext(
     client,
     `SELECT orders.id::text, orders.global_id, orders.status,
             orders.row_version::text, orders.ship_to,
-            activation.state AS activation_state,
             plan.id::text AS plan_id, plan.warehouse_id::text,
             warehouse.address AS warehouse_address
      FROM operations_orders orders
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = orders.organization_id
      LEFT JOIN LATERAL (
        SELECT candidate.*
        FROM operations_fulfillment_plans candidate
@@ -496,21 +492,7 @@ function assertCreateContext(
   context: ShippingContext,
   expectedRowVersion: number,
   authorizedSandboxE2e = false,
-  canonicalReadOnlyAuthorized = false,
 ) {
-  if (
-    context.order.activation_state !== 'active'
-    && !(
-      context.order.activation_state === 'read_only'
-      && canonicalReadOnlyAuthorized
-    )
-  ) {
-    throw new OperationsRequestError(
-      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
-      'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
-      409,
-    )
-  }
   if (context.order.status !== 'packed') {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ORDER_NOT_PACKED',
@@ -595,13 +577,6 @@ function assertCreateContext(
 }
 
 function assertVoidContext(context: ShippingContext, expectedRowVersion: number) {
-  if (context.order.activation_state !== 'active') {
-    throw new OperationsRequestError(
-      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
-      'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
-      409,
-    )
-  }
   if (context.order.status !== 'packed') {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ORDER_NOT_PACKED',
@@ -941,7 +916,6 @@ async function prepareAttempt(input: {
         input.organizationId,
         context.order.id,
       )
-      let canonicalReadOnlyAuthorized = false
       if (input.sandboxE2eAuthorizationGlobalId) {
         const authority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId: input.organizationId,
@@ -962,14 +936,12 @@ async function prepareAttempt(input: {
             expectedOrderRowVersion: input.expectedRowVersion,
             expectedOrderStatus: 'packed',
           })
-          canonicalReadOnlyAuthorized = true
         }
       }
       assertCreateContext(
         context,
         input.expectedRowVersion,
         Boolean(input.sandboxE2eAuthorizationGlobalId),
-        canonicalReadOnlyAuthorized,
       )
     } else {
       assertVoidContext(context, input.expectedRowVersion)

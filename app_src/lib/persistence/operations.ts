@@ -64,7 +64,6 @@ import {
   cartonizeSinglePackage,
   DeterministicFulfillmentOptimizer,
   operationsOrderReplanningActionAvailability,
-  operationsOrderReplanningProfileAllowsCorrection,
   priceContract,
   selectPromiseRate,
 } from '@/lib/operations/domain'
@@ -2562,18 +2561,18 @@ async function readNativeOneOffShipmentAvailability(input: {
   const expectedEnvironment = input.executionMode === 'test'
     ? 'sandbox'
     : 'production'
-  const expectedActivation = input.executionMode === 'test'
-    ? 'shadow'
-    : 'active'
   if (
     row.environment !== expectedEnvironment
-    || input.activationState !== expectedActivation
+    || (
+      input.executionMode === 'live'
+      && input.activationState !== 'active'
+    )
     || !row.authority_exact
   ) {
     return {
       ready: false,
       blockedReason: input.executionMode === 'test'
-        ? 'TEST confirmation requires exact sandbox authority in Operations Shadow.'
+        ? 'TEST confirmation requires exact sandbox authority.'
         : 'LIVE confirmation requires exact production authority in Operations Active.',
     }
   }
@@ -2700,8 +2699,7 @@ async function readOperationsOrderReplanningProjection(
     ...overrides,
   })
   if (
-    !operationsOrderReplanningProfileAllowsCorrection(activation.state)
-    || !input.canManage
+    !input.canManage
     || !input.canExecute
     || !['shopify', 'faire'].includes(order.source_provider)
     || order.order_type === 'one_off'
@@ -3222,6 +3220,7 @@ async function readOrderDetail(
     canExecute: boolean
     canManage: boolean
     canActivate: boolean
+    canPurchaseLivePostage: boolean
     actorEmail: string | null
     canAuthorizeSandboxCommerceE2e: boolean
   },
@@ -3838,7 +3837,7 @@ async function readOrderDetail(
       activationState: context.activationState,
       canExecute: context.canExecute,
       canManage: context.canManage,
-      canActivate: context.canActivate,
+      canPurchaseLivePostage: context.canPurchaseLivePostage,
       planStatus: row.plan_status,
       waveStatus: row.wave_status,
       lineCount: Number(row.line_count),
@@ -4064,6 +4063,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
   actorEmail?: string | null
   capabilities: OperationsCapabilities
+  canPurchaseLivePostage?: boolean
   search?: string
   status?: string | null
   exceptionStatus?: OperationsExceptionStatus | null
@@ -4594,7 +4594,10 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   return {
     organizationId,
     configured: configuredResult.rows[0]?.configured === true,
-    capabilities: input.capabilities,
+    capabilities: {
+      ...input.capabilities,
+      canPurchaseLivePostage: input.canPurchaseLivePostage === true,
+    },
     dataPipeline: {
       id: activation.data_pipeline_id,
       name: activation.pipeline_name,
@@ -4623,6 +4626,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       canExecute: input.capabilities.canExecute,
       canManage: input.capabilities.canManage,
       canActivate: input.capabilities.canActivate,
+      canPurchaseLivePostage: input.canPurchaseLivePostage === true,
       actorEmail: input.actorEmail || null,
       canAuthorizeSandboxCommerceE2e: Boolean(
         input.capabilities.canActivate
@@ -11697,23 +11701,8 @@ export async function planOperationsOrderFromPostgres(input: {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(
         client,
-        `operations:activation:${organizationId}`,
-      )
-      await acquireTransactionAdvisoryLock(
-        client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before planning warehouse work',
-          409,
-        )
-      }
 
       type PlanningOrderRow = OrderIdentityRow & {
         pipeline_id: string
@@ -11996,17 +11985,6 @@ export async function planOperationsOrderFromPostgres(input: {
           409,
         )
       }
-      if (
-        activation.state === 'active'
-        && carrierReadEnvironment !== 'production'
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-          'Active warehouse planning requires production carrier-read evidence. Use Shadow for sandbox carrier estimates.',
-          409,
-        )
-      }
-
       const existingPlan = await client.query<{
         global_id: string
         conflict_kind: 'active_plan' | 'evidence_reuse'
@@ -13525,22 +13503,7 @@ export async function releaseOperationsOrderFromPostgres(input: {
 
   try {
     return await withTransaction(async (client) => {
-      await acquireTransactionAdvisoryLock(
-        client,
-        `operations:activation:${organizationId}`,
-      )
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before releasing warehouse work',
-          409,
-        )
-      }
       if (explicitAssignedTo) {
         await requireEligibleOperationsPicker(client, organizationId, assignedTo)
       }
@@ -13691,21 +13654,6 @@ export async function releaseOperationsOrderFromPostgres(input: {
           409,
         )
       }
-      if (
-        activation.state === 'active'
-        && (
-          !plan.cartonization_evidence_id
-          || plan.carrier_read_environment !== 'production'
-        )
-        && !plan.one_off_live_authority
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-          'Active warehouse release requires production carrier-read evidence. Return to Shadow or replan against production rates.',
-          409,
-        )
-      }
-
       const readinessResult = await client.query<QueryResultRow & {
         line_count: string
         ready_line_count: string
@@ -13971,17 +13919,6 @@ export async function assignOperationsOrderPicksFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before assigning warehouse work',
-          409,
-        )
-      }
       await requireEligibleOperationsPicker(client, organizationId, assignedTo)
       const orderResult = await client.query<OrderIdentityRow>(
         `SELECT id::text, global_id, status, row_version::text
@@ -15598,17 +15535,6 @@ export async function recordWearablePickScanEvidenceFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before recording warehouse scans',
-          409,
-        )
-      }
       const orderResult = await client.query<OrderIdentityRow>(
         `SELECT id::text, global_id, status, row_version::text
          FROM operations_orders
@@ -16412,14 +16338,6 @@ export async function reconcileShopifyExternalFulfillmentFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
-      if (!['shadow', 'active'].includes(activation.state)) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before reconciling warehouse work',
-          409,
-        )
-      }
       const current = await readShopifyExternalFulfillmentDatabaseTarget(
         client,
         { organizationId, orderGlobalId, lock: true },
@@ -17253,17 +17171,6 @@ export async function confirmOperationsOrderPicksFromPostgres(input: {
           `operations:wearable-count-evidence:${organizationId}:${countEvidenceIdempotencyKey}`,
         )
       }
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before confirming warehouse work',
-          409,
-        )
-      }
 
       const orderResult = await client.query<OrderIdentityRow>(
         `SELECT id::text, global_id, status, row_version::text
@@ -17806,17 +17713,6 @@ export async function verifyOperationsOrderPackFromPostgres(input: {
   try {
     return await withTransaction(async (client) => {
       await acquireTransactionAdvisoryLock(client, `operations:order:${organizationId}:${orderGlobalId}`)
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before verifying packages',
-          409,
-        )
-      }
 
       const orderResult = await client.query<OrderIdentityRow & {
         pipeline_id: string
@@ -18195,17 +18091,6 @@ export async function generateOperationsPackagePackingSlipInPostgres(input: {
         client,
         `operations:package-packing-list:${organizationId}:${packageGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before generating warehouse documents',
-          409,
-        )
-      }
 
       const packageResult = await client.query<QueryResultRow & {
         order_id: string
@@ -19810,7 +19695,7 @@ async function lockNativeOneOffShipmentAuthority(
     orderId: string
     planId: string
     activationState: OperationsActivationState
-    canActivate: boolean
+    canPurchaseLivePostage: boolean
     packages: Array<{ id: string; global_id: string; status: string }>
   },
 ): Promise<NativeOneOffShipmentAuthority> {
@@ -19863,20 +19748,17 @@ async function lockNativeOneOffShipmentAuthority(
   }
 
   const executionMode = attempt.environment === 'sandbox' ? 'test' : 'live'
-  const requiredActivation = executionMode === 'test' ? 'shadow' : 'active'
-  if (input.activationState !== requiredActivation) {
+  if (executionMode === 'live' && input.activationState !== 'active') {
     throw new OperationsRequestError(
       'OPERATIONS_ONE_OFF_GROUP_ACTIVATION_MISMATCH',
-      executionMode === 'test'
-        ? 'TEST confirmation requires Operations Shadow'
-        : 'LIVE confirmation requires Operations Active',
+      'LIVE confirmation requires Operations Active',
       409,
     )
   }
-  if (executionMode === 'live' && !input.canActivate) {
+  if (executionMode === 'live' && !input.canPurchaseLivePostage) {
     throw new OperationsRequestError(
-      'OPERATIONS_ACTIVATE_REQUIRED',
-      'Operations activation permission is required to confirm LIVE postage',
+      'OPERATIONS_LIVE_POSTAGE_REQUIRED',
+      'Live-postage permission is required to confirm LIVE postage',
       403,
     )
   }
@@ -20085,7 +19967,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
   expectedNotificationPolicyRevision?: number | null
   customerNotificationOverride?: boolean | null
   customerNotificationOverrideReason?: string | null
-  canActivate?: boolean
+  canPurchaseLivePostage?: boolean
 }): Promise<OperationsShipmentCommandResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
@@ -20219,17 +20101,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
       const activation = await resolveActivation(client, organizationId)
-      if (
-        !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before confirming shipments',
-          409,
-        )
-      }
-
       const orderResult = await client.query<OrderIdentityRow & {
         pipeline_id: string
         customer_id: string
@@ -20308,6 +20179,17 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       }
       const nativeOneOff = order.source_provider === 'clawpilot_native'
         && order.order_type === 'one_off'
+      if (
+        !nativeOneOff
+        && !['shadow', 'active'].includes(activation.state)
+        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_EXECUTION_STATE_INVALID',
+          'Set Operations to Shadow or Active before confirming connected-commerce shipments',
+          409,
+        )
+      }
       if (nativeOneOff && sandboxE2eAuthorizationGlobalId) {
         throw new OperationsRequestError(
           'OPERATIONS_ONE_OFF_SANDBOX_AUTHORITY_CONFLICT',
@@ -20359,7 +20241,8 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         sandboxE2eAuthorizationValidated = true
       }
       if (
-        activation.state === 'read_only'
+        !nativeOneOff
+        && activation.state === 'read_only'
         && !canonicalShopifyTestAuthorizationValidated
       ) {
         throw new OperationsRequestError(
@@ -20571,7 +20454,7 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             orderId: order.id,
             planId: plan.id,
             activationState: activation.state,
-            canActivate: input.canActivate === true,
+            canPurchaseLivePostage: input.canPurchaseLivePostage === true,
             packages: packageResult.rows,
           })
         : null

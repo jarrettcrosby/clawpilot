@@ -967,6 +967,7 @@ export type OperationsWorkspace = {
     canManage: boolean
     canExecute: boolean
     canActivate: boolean
+    canPurchaseLivePostage?: boolean
   }
   dataPipeline: { id: string; name: string }
   activation: {

@@ -280,7 +280,7 @@ function actionInput(overrides = {}) {
     activationState: 'read_only',
     canExecute: true,
     canManage: true,
-    canActivate: true,
+    canPurchaseLivePostage: true,
     planStatus: 'released',
     waveStatus: 'completed',
     lineCount: 1,
@@ -339,8 +339,8 @@ assert.equal(
     sandboxE2eAuthorized: false,
     sandboxE2eAuthorityKind: null,
   }), 'verify_pack').enabled,
-  false,
-  'An unrelated Read-only order must remain blocked',
+  true,
+  'Ordinary local warehouse work must not depend on the legacy profile',
 )
 assert.equal(
   action(actionInput({
@@ -352,8 +352,8 @@ assert.equal(
     sandboxE2eAuthorized: true,
     sandboxE2eAuthorityKind: 'legacy_packed',
   }), 'verify_pack').enabled,
-  false,
-  'A legacy sandbox authorization must not unlock Read-only warehouse work',
+  true,
+  'Legacy sandbox authorization must not be required for local warehouse work',
 )
 assert.equal(
   action(actionInput({
@@ -512,7 +512,7 @@ for (const fragment of [
 }
 
 for (const fragment of [
-  "context.order.activation_state === 'read_only'",
+  'Boolean(input.sandboxE2eAuthorizationGlobalId)',
   "=== 'shopify-test-store-canonical-e2e-v1'",
   "environment !== 'sandbox'",
 ]) {

@@ -16,6 +16,14 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
       AND checksum =
         'b3b801e2469fc4bf596256a12514ac910173154b97c48d04103cfee4b8170df2'
   )
+  AND EXISTS (
+    SELECT 1
+    FROM public.schema_migrations
+    WHERE filename =
+      '0314_operations_local_work_independent_activation.sql'
+      AND checksum =
+        '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+  )
   AND (
     WITH required_function(signature) AS (
       VALUES
@@ -64,7 +72,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
           'sha256'
         ),
         'hex'
-      ) = 'e878ae26eb1435198ac2d7fdf83c16490c61a4b1fba95e20309df589a9974794'
+      ) = '0a001c617305af01c38792cb906847303de4f1b117736b04e072491a1818ff86'
     FROM required_function
     LEFT JOIN pg_catalog.pg_proc installed_function
       ON installed_function.oid = to_regprocedure(required_function.signature)

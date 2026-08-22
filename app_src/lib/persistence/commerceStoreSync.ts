@@ -148,7 +148,6 @@ async function acquireProviderReadLease(input: {
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
          AND account.status = 'active'
-         AND activation.state NOT IN ('disabled', 'frozen')
          AND (
            $3 = 'manual_read_only'
            OR operations_commerce_store_sync_is_running(
@@ -246,16 +245,12 @@ async function renewProviderReadLease(input: {
        AND EXISTS (
          SELECT 1
          FROM operations_commerce_store_sync_controls control
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = control.organization_id
          WHERE control.organization_id =
                  operations_commerce_store_sync_read_leases.organization_id
            AND control.integration_account_id =
                  operations_commerce_store_sync_read_leases.integration_account_id
            AND control.revision =
                  operations_commerce_store_sync_read_leases.control_revision
-           AND activation.revision =
-                 operations_commerce_store_sync_read_leases.activation_revision
            AND operations_commerce_provider_read_authority_is_current(
              control.organization_id,
              control.integration_account_id,
@@ -296,16 +291,12 @@ async function releaseProviderReadLease(input: {
              AND EXISTS (
              SELECT 1
              FROM operations_commerce_store_sync_controls control
-             JOIN operations_activation_scopes activation
-               ON activation.organization_id = control.organization_id
              WHERE control.organization_id =
                      operations_commerce_store_sync_read_leases.organization_id
                AND control.integration_account_id =
                      operations_commerce_store_sync_read_leases.integration_account_id
                AND control.revision =
                      operations_commerce_store_sync_read_leases.control_revision
-               AND activation.revision =
-                     operations_commerce_store_sync_read_leases.activation_revision
                AND operations_commerce_provider_read_authority_is_current(
                  control.organization_id,
                  control.integration_account_id,
@@ -370,8 +361,6 @@ export async function assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
      JOIN operations_commerce_store_sync_controls control
        ON control.organization_id = lease.organization_id
       AND control.integration_account_id = lease.integration_account_id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = lease.organization_id
      WHERE lease.id = $3::uuid
        AND lease.organization_id = $1::uuid
        AND lease.integration_account_id = $2::uuid
@@ -383,14 +372,13 @@ export async function assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(
        AND lease.released_at IS NULL
        AND lease.expires_at > clock_timestamp()
        AND control.revision = lease.control_revision
-       AND activation.revision = lease.activation_revision
        AND operations_commerce_provider_read_authority_is_current(
          lease.organization_id,
          lease.integration_account_id,
          lease.authority_kind
        )
      LIMIT 1
-     FOR SHARE OF lease, control, activation`,
+     FOR SHARE OF lease, control`,
     [
       input.organizationId,
       input.integrationAccountId,
@@ -448,9 +436,9 @@ export async function reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostg
 /**
  * Acquires one durable provider-read intent in a short exact-account
  * transaction, then releases every row lock before network I/O. Pause and
- * emergency state changes therefore commit promptly. Automatic acquisition
- * requires effective Running; permissioned manual read-only acquisition
- * ignores Desired=Paused but still honors Disabled/Frozen. A heartbeat keeps
+ * control changes therefore commit promptly. Automatic acquisition requires
+ * effective Running; permissioned manual read-only acquisition ignores
+ * Desired=Paused. A heartbeat keeps
  * a precommitted read visible as draining and makes crash expiry bounded.
  */
 export async function withCommerceStoreSyncProviderReadFenceInPostgres<T>(

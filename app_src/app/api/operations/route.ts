@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -141,10 +142,8 @@ const ORDER_STATUSES = new Set<OperationsOrderStatus>([
 const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
   'open', 'acknowledged', 'resolved', 'dismissed',
 ])
-// Canonical fulfillment commands are never an execution path for a connected
-// Shopify/Faire order while Operations is in Shadow. Provider reconciliation
-// actions are intentionally absent: the canonical order must keep mirroring
-// provider state while an exact-order training overlay progresses separately.
+// Canonical commands remain isolated only from an exact open training overlay.
+// The legacy workspace activation profile is not local-work authority.
 const SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS = new Set([
   'plan-order',
   'release-order',
@@ -1102,6 +1101,8 @@ export async function GET(req: NextRequest) {
       organizationId: activeOperationsOrganizationId(actor),
       actorEmail: actor.email,
       capabilities,
+      canPurchaseLivePostage:
+        shippingCapabilities(actor).canPurchaseLivePostage,
       search,
       status: statusValue || null,
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
@@ -2374,7 +2375,8 @@ export async function POST(req: NextRequest) {
               'Customer notification exception reason',
               500,
             ),
-        canActivate: capabilities.canActivate,
+        canPurchaseLivePostage:
+          shippingCapabilities(actor).canPurchaseLivePostage,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

@@ -1666,11 +1666,10 @@ const OPERATIONS_SHOPIFY_LOCATION_ADMINISTRATION_HEALTH_SQL = String.raw`
   )
 `
 
-// Exact structural attestation for 0290 plus the rolling 0300 compatibility
-// marker. Release A keeps the three 0290 profile-bound function bodies so the
-// previous runtime remains healthy. The exact 0306 ledger atomically selects
-// the frozen independent-control hashes; a wrong 0306 checksum is never an
-// accepted rollout phase.
+// Exact structural attestation for the 0290 training ledger across its rolling
+// authority phases. 0314 keeps exact-order training isolation while removing
+// only the organization-wide activation gate from unrelated canonical work.
+// Wrong 0306 or 0314 checksums are never accepted rollout phases.
 const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
   EXISTS (
     SELECT 1
@@ -1700,6 +1699,22 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
         '0306_operations_order_training_independent_control_contract.sql'
         AND checksum =
           '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+    )
+  )
+  AND (
+    NOT EXISTS (
+      SELECT 1
+      FROM public.schema_migrations
+      WHERE filename =
+        '0314_operations_local_work_independent_activation.sql'
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.schema_migrations
+      WHERE filename =
+        '0314_operations_local_work_independent_activation.sql'
+        AND checksum =
+          '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
     )
   )
   AND (
@@ -2062,6 +2077,15 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
           SELECT 1
           FROM public.schema_migrations
           WHERE filename =
+            '0314_operations_local_work_independent_activation.sql'
+            AND checksum =
+              '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+        ) THEN
+          '91f77ed50a79257b5540007f89a915fb695f5eb25a4ffb098e692090df0855fa'
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
             '0306_operations_order_training_independent_control_contract.sql'
             AND checksum =
               '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
@@ -2352,6 +2376,17 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
 
 const OPERATIONS_SHADOW_TRAINING_AUTHORITY_CONTRACT_SQL = String.raw`
   CASE
+    WHEN (
+      ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
+    )
+     AND EXISTS (
+      SELECT 1
+      FROM public.schema_migrations
+      WHERE filename =
+        '0314_operations_local_work_independent_activation.sql'
+        AND checksum =
+          '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+    ) THEN 'local-work-independent'
     WHEN (
       ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
     )
@@ -6095,6 +6130,14 @@ export async function GET() {
                   '0298_operations_commerce_store_sync_controls.sql'
                   AND checksum =
                     'e3eb479cc613479a09081bb6f22d2344ce74540f86595a020dfdbd711cfb1abd'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM public.schema_migrations
+                WHERE filename =
+                  '0314_operations_local_work_independent_activation.sql'
+                  AND checksum =
+                    '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
               )
               AND pg_catalog.to_regclass(
                 'public.operations_commerce_store_sync_controls'

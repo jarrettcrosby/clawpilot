@@ -52,7 +52,7 @@ export default function OneOffShippingExecutionPanel({
   activationState,
   canManage,
   canExecute,
-  canActivate,
+  canPurchaseLivePostage,
   busy,
   onRefreshPackedRates,
   onReviewPurchase,
@@ -65,7 +65,7 @@ export default function OneOffShippingExecutionPanel({
   activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
-  canActivate: boolean
+  canPurchaseLivePostage: boolean
   busy: boolean
   onRefreshPackedRates: () => void
   onReviewPurchase: () => void
@@ -74,18 +74,17 @@ export default function OneOffShippingExecutionPanel({
   const dateTime = useUserDateTime()
   const [clock, setClock] = useState(() => Date.now())
   const live = order.oneOffShippingMode === 'live'
-  const requiredActivation: OperationsActivationState = live ? 'active' : 'shadow'
   const basePermissionBlocker = !canManage
     ? 'Operations management permission is required.'
     : !canExecute
       ? 'Warehouse execution permission is required.'
       : null
   const purchasePermissionBlocker = basePermissionBlocker
-    || (live && !canActivate
-      ? 'Operations activation permission is required for LIVE rating and postage purchase.'
+    || (live && !canPurchaseLivePostage
+      ? 'Live-postage permission is required for LIVE rating and postage purchase.'
       : null)
-  const activationBlocker = activationState !== requiredActivation
-    ? `${live ? 'LIVE' : 'TEST'} one-off execution requires Operations ${live ? 'Active' : 'Shadow'} mode.`
+  const activationBlocker = live && activationState !== 'active'
+    ? 'LIVE one-off execution requires Operations Active mode.'
     : null
   const group = state?.carrierGroup || null
   const unresolved = Boolean(group?.unresolved)

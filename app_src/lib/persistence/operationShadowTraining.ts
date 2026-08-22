@@ -1597,17 +1597,9 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
   orderGlobalId: string
 }) {
   const result = await getPostgresPool().query<{
-    activation_state: string
-    order_status: string
-    source_provider: string
-    integration_type: string
     open_training: boolean
   }>(
-    `SELECT activation.state AS activation_state,
-            source_order.status AS order_status,
-            source_order.source_provider,
-            account.integration_type,
-            EXISTS (
+    `SELECT EXISTS (
               SELECT 1
               FROM operations_shadow_training_runs training_run
               WHERE training_run.organization_id = source_order.organization_id
@@ -1615,11 +1607,6 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
                 AND training_run.state <> 'reset'
             ) AS open_training
      FROM operations_orders source_order
-     JOIN operations_integration_accounts account
-       ON account.organization_id = source_order.organization_id
-      AND account.id = source_order.integration_account_id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = source_order.organization_id
      WHERE source_order.organization_id = $1::uuid
        AND source_order.global_id = $2
      LIMIT 1`,
@@ -1629,17 +1616,6 @@ export async function assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres(i
   if (row?.open_training === true) {
     throw new OperationsShadowTrainingError(
       'This order has an open local training run. Reset that run before creating canonical fulfillment work.',
-      409,
-      'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED',
-    )
-  }
-  if (
-    row?.activation_state === 'shadow'
-    && (row.source_provider === 'shopify' || row.source_provider === 'faire')
-    && row.integration_type === 'commerce'
-  ) {
-    throw new OperationsShadowTrainingError(
-      'Shopify and Faire orders remain provider-mirrored in Shadow. Enable training for an untouched imported order to run a local simulation.',
       409,
       'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED',
     )

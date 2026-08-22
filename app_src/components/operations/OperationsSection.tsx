@@ -1077,7 +1077,7 @@ function OrderDetailDrawer({
   activationState,
   canManage,
   canExecute,
-  canActivate,
+  canPurchaseLivePostage,
   canAuthorizeSandboxE2e,
   oneOffExecutionState,
   oneOffExecutionLoading,
@@ -1116,7 +1116,7 @@ function OrderDetailDrawer({
   activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
-  canActivate: boolean
+  canPurchaseLivePostage: boolean
   canAuthorizeSandboxE2e: boolean
   oneOffExecutionState: OneOffShipmentExecutionState | null
   oneOffExecutionLoading: boolean
@@ -1177,30 +1177,18 @@ function OrderDetailDrawer({
       ? sandboxE2eAuthorization
       : null
   const canPlanImportedOrder = Boolean(
-    activationState !== 'shadow'
-    && order?.status === 'imported'
+    order?.status === 'imported'
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce'
-    && (
-      activationState !== 'read_only'
-      || Boolean(canonicalShopifyAuthorization)
-    ),
-  )
-  const shadowProviderOrder = Boolean(
-    activationState === 'shadow'
-    && order?.sourceProvider
-    && ['shopify', 'faire'].includes(order.sourceProvider),
   )
   const trainingProviderOrder = Boolean(
     order?.sourceProvider
     && ['shopify', 'faire'].includes(order.sourceProvider),
   )
+  const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
+    && Boolean(order.oneOffShippingMode)
   const primaryAction = canPlanImportedOrder
     ? undefined
-    : shadowProviderOrder
-      ? order?.shopifyExternalFulfillmentReconciliationRequired
-        ? reconcileExternalFulfillmentAction
-        : undefined
     : order?.status === 'released'
       ? order.shopifyExternalFulfillmentReconciliationRequired
         ? reconcileExternalFulfillmentAction
@@ -1208,7 +1196,7 @@ function OrderDetailDrawer({
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
-          ? activationState === 'shadow'
+          ? activationState === 'shadow' && !nativeOneOff
             ? prepareFulfillmentAction
             : confirmShipmentAction
           : order && !['shipped', 'cancelled'].includes(order.status)
@@ -1236,14 +1224,7 @@ function OrderDetailDrawer({
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
-  const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
-    && Boolean(order.oneOffShippingMode)
-  const activeExecutionRequiredReason = activationState !== 'active'
-    && !(activationState === 'read_only' && canonicalShopifyAuthorization)
-    ? 'Order label create and void actions require Operations Active mode. To test a sandbox carrier account and printer while this workspace is in Shadow, use Shipping Settings → Sandbox / Developer; that diagnostic does not ship or update this order.'
-    : null
-  const createBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+  const createBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
       : order?.shipmentShipTo.readiness !== 'carrier_ready'
         ? 'Add the missing ship-to details before creating a label.'
@@ -1261,9 +1242,8 @@ function OrderDetailDrawer({
                 ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
                 : eligibleCarrierAccounts.length === 0
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
-                  : null)
-  const authorizedPackageCreateBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+                  : null
+  const authorizedPackageCreateBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
       : order?.shipmentShipTo.readiness !== 'carrier_ready'
         ? 'Add the missing ship-to details before creating labels.'
@@ -1281,7 +1261,7 @@ function OrderDetailDrawer({
                 ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
                 : eligibleCarrierAccounts.length === 0
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
-                  : null)
+                  : null
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
     ? 'Only an authorized organization owner or administrator may authorize this test.'
     : !order?.sourceProvider
@@ -1305,12 +1285,11 @@ function OrderDetailDrawer({
       && Boolean(item.latestLabel.trackingNumber)
     )),
   )
-  const voidBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+  const voidBlockedReason = !canExecute
       ? 'You do not have permission to void carrier labels.'
       : unresolvedAttempt
         ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before a carrier command.`
-        : null)
+        : null
 
   return (
     <Drawer
@@ -1898,7 +1877,7 @@ function OrderDetailDrawer({
                     activationState={activationState}
                     canManage={canManage}
                     canExecute={canExecute}
-                    canActivate={canActivate}
+                    canPurchaseLivePostage={canPurchaseLivePostage}
                     busy={busy}
                     onRefreshPackedRates={onRefreshOneOffPackedRates}
                     onReviewPurchase={onReviewOneOffGroupPurchase}
@@ -1906,14 +1885,6 @@ function OrderDetailDrawer({
                   />
                 ) : (
                   <>
-                  {activeExecutionRequiredReason && (
-                  <Alert
-                    severity="info"
-                    data-testid="carrier-label-active-mode-required"
-                  >
-                    {activeExecutionRequiredReason}
-                  </Alert>
-                )}
                 {unresolvedAttempt && (
                   <Alert severity="error">
                     Carrier attempt {unresolvedAttempt.globalId} is {unresolvedAttempt.state}. Do not retry this
@@ -2035,12 +2006,12 @@ function OrderDetailDrawer({
                           </Tooltip>
                         </Stack>
                       </Box>
-                    ) : !activeExecutionRequiredReason ? (
+                    ) : (
                       <Alert severity={createBlockedReason ? 'info' : 'warning'}>
                         {createBlockedReason
                           || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
                       </Alert>
-                    ) : null}
+                    )}
                     {!activeLabel && (
                       <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
                         <span>
@@ -4685,9 +4656,13 @@ export default function OperationsSection({
   const oneOffGroupPurchasePermissionsReady = () => Boolean(
     capabilities?.canManage
     && capabilities.canExecute
-    && (detail?.oneOffShippingMode !== 'live' || capabilities.canActivate)
-    && workspace?.activation.state === (
-      detail?.oneOffShippingMode === 'live' ? 'active' : 'shadow'
+    && (
+      detail?.oneOffShippingMode !== 'live'
+      || capabilities.canPurchaseLivePostage === true
+    )
+    && (
+      detail?.oneOffShippingMode !== 'live'
+      || workspace?.activation.state === 'active'
     )
   )
 
@@ -6156,7 +6131,9 @@ export default function OperationsSection({
         activationState={workspace?.activation.state || 'disabled'}
         canManage={Boolean(capabilities?.canManage)}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
-        canActivate={Boolean(capabilities?.canActivate)}
+        canPurchaseLivePostage={Boolean(
+          workspace?.capabilities.canPurchaseLivePostage,
+        )}
         canAuthorizeSandboxE2e={Boolean(
           capabilities?.canActivate
           && capabilities.canManage

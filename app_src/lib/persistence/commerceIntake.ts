@@ -896,7 +896,6 @@ async function lockCommerceStoreSyncState(
   const state = await client.query<{
     running: boolean
     effective_reason: string
-    activation_state: IntakeAccountRow['activation_state']
   }>(
     `SELECT
        operations_commerce_store_sync_is_running(
@@ -907,20 +906,16 @@ async function lockCommerceStoreSyncState(
          control.organization_id,
          control.integration_account_id
        ) AS effective_reason
-       , activation.state AS activation_state
      FROM operations_commerce_store_sync_controls control
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = control.organization_id
      WHERE control.organization_id = $1::uuid
        AND control.integration_account_id = $2::uuid
      LIMIT 1
-     FOR UPDATE OF control, activation`,
+     FOR UPDATE OF control`,
     [input.organizationId, input.integrationAccountId],
   )
   return state.rows[0] || {
     running: false,
     effective_reason: 'STORE_SYNC_CONTROL_MISSING',
-    activation_state: 'disabled',
   }
 }
 
@@ -941,7 +936,6 @@ function requireCommerceProviderReadAuthority(
   state: {
     running: boolean
     effective_reason: string
-    activation_state: IntakeAccountRow['activation_state']
   },
   authority: CommerceIntakeProviderReadAuthority,
 ) {
@@ -949,14 +943,8 @@ function requireCommerceProviderReadAuthority(
     requireCommerceStoreSyncRunning(state)
     return
   }
-  if (state.activation_state === 'disabled'
-      || state.activation_state === 'frozen') {
-    intakeError(
-      'COMMERCE_PROVIDER_READ_EMERGENCY_OVERRIDE',
-      `Manual provider reads are unavailable while Operations is ${state.activation_state}`,
-      409,
-    )
-  }
+  // Operator-requested reads are account-scoped and never authorize provider
+  // writes, so the legacy workspace activation profile is not an authority.
 }
 
 function normalizedCustomerPrefetchEmail(value: unknown) {
@@ -1245,12 +1233,6 @@ export async function confirmCommerceCustomerPrefetchBindingInPostgres(input: {
         'COMMERCE_CUSTOMER_PREFETCH_FAIRE_REQUIRED',
         'Pre-fetch retailer binding is available only for a Faire connection',
         409,
-      )
-    }
-    if (account.activation_state === 'frozen') {
-      intakeError(
-        'COMMERCE_INTAKE_FROZEN',
-        'Faire retailer binding changes are unavailable while Operations is Frozen',
       )
     }
     const requestHash = commandHash({
@@ -1889,31 +1871,16 @@ async function commandStart(
   })
   const automaticMirror = context.automaticStoreSync === true
     || context.actorEmail === 'system:commerce-order-reconciliation'
-  const localReviewCommand = context.localReviewCommand === true
   const lockedStoreSync = automaticMirror
     ? await lockCommerceStoreSyncState(client, {
         organizationId: account.organization_id,
         integrationAccountId: account.id,
       })
     : null
-  if (
-    automaticMirror
-      ? !lockedStoreSync?.running
-      : localReviewCommand
-        ? account.activation_state === 'frozen'
-        : !['shadow', 'active'].includes(account.activation_state)
-  ) {
+  if (automaticMirror && !lockedStoreSync?.running) {
     intakeError(
-      automaticMirror
-        ? 'COMMERCE_STORE_SYNC_PAUSED'
-        : localReviewCommand
-          ? 'COMMERCE_INTAKE_FROZEN'
-          : 'COMMERCE_INTAKE_ACTIVATION_REQUIRED',
-      automaticMirror
-        ? `Store sync is Paused (${lockedStoreSync?.effective_reason || 'STORE_SYNC_CONTROL_MISSING'})`
-        : localReviewCommand
-          ? 'Local commerce review changes are unavailable while Operations is Frozen'
-          : 'Open Operations and set Activation to Shadow or Active before resolving or promoting orders',
+      'COMMERCE_STORE_SYNC_PAUSED',
+      `Store sync is Paused (${lockedStoreSync?.effective_reason || 'STORE_SYNC_CONTROL_MISSING'})`,
     )
   }
   return { account, requestHash, ...prepared }
@@ -3923,7 +3890,6 @@ export async function prepareCommerceIntakeReadIntentInPostgres(input: {
     requireCommerceProviderReadAuthority({
       running: account.store_sync_running,
       effective_reason: account.store_sync_effective_reason,
-      activation_state: account.activation_state,
     }, input.providerReadAuthority)
     const continuationAction = (
       input.action === 'fetch-next'
@@ -8417,13 +8383,9 @@ export async function readCommerceIntakeStateFromPostgres(input: {
         retentionDays: 30,
         activationState: account.activation_state,
         activationRevision: account.activation_revision,
-        operatorCommandsAllowed: ['shadow', 'active'].includes(
-          account.activation_state,
-        ),
-        manualProviderReadsAllowed: !['disabled', 'frozen'].includes(
-          account.activation_state,
-        ),
-        localReviewCommandsAllowed: account.activation_state !== 'frozen',
+        operatorCommandsAllowed: true,
+        manualProviderReadsAllowed: true,
+        localReviewCommandsAllowed: true,
         storeSync: {
           desiredState: account.store_sync_desired_state || 'paused',
           effectiveState: account.store_sync_running ? 'running' : 'paused',
@@ -9741,12 +9703,6 @@ export async function excludeCommerceIntakeRejectionInPostgres(input: {
       accountGlobalId: input.runtime.globalId,
       forUpdate: true,
     })
-    if (account.activation_state === 'frozen') {
-      intakeError(
-        'COMMERCE_INTAKE_FROZEN',
-        'Local rejection review changes are unavailable while Operations is Frozen',
-      )
-    }
     const requestHash = commandHash({
       policyVersion: POLICY_VERSION,
       accountGlobalId: input.runtime.globalId,

@@ -34,6 +34,7 @@
     "pilot:apple-wearable-readiness": "node scripts/apple-wearable-pilot-readiness.mjs",
     "test:operations-receipt-health": "node scripts/test-operations-command-receipt-health.mjs",
     "test:operations-order-shipment-address": "node --experimental-strip-types --test app_src/tests/operations/order-ship-to.test.mts && node scripts/test-operations-order-shipment-address.mjs && node scripts/test-operations-order-shipment-address-ui.mjs && node scripts/test-operations-order-shipment-address-postgres.mjs",
+    "test:operations-local-work-independence": "node --experimental-strip-types --test app_src/tests/operations/local-work-activation-matrix.test.mts app_src/tests/operations/one-off-group-confirmation.test.mts app_src/tests/operations/order-replanning-correction.test.mts && node scripts/test-operations-local-work-independence.mjs && node scripts/test-operation-shadow-training-ui.mjs && node scripts/test-operation-shipping-persistence.mjs && node scripts/test-cartonization-rate-evidence.mjs && node scripts/test-operations-local-work-independence-postgres.mjs",
     "test:operation-active-preparation": "node scripts/test-operation-active-fulfillment-preparation.mjs",
     "test:operation-active-preparation-postgres": "node scripts/test-operation-active-execution-preparation-postgres.mjs",
     "test:operation-fulfillment-validator-postgres": "node scripts/test-operation-fulfillment-execution-validator-repair-postgres.mjs",

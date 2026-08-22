@@ -1021,14 +1021,16 @@ const operationalGeometryFence = section(
   'Operational geometry fence',
 )
 assertIncludes(operationalGeometryFence, [
-  '!request.shadowTraining',
-  "read.activationState !== 'shadow'",
-  'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
   'configuredOrToolsFulfillmentOptimizer()',
   'planOperationalGeometryRatePackages({',
   'optimizer,',
   "operationalGeometryRatePlan.status === 'blocked'",
-], 'Operational geometry must use one fail-closed OR-Tools plan in Shadow')
+], 'Operational geometry must use one fail-closed OR-Tools plan')
+assert.doesNotMatch(
+  operationalGeometryFence,
+  /activationState|CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED/u,
+  'Operational read-only rating must not depend on workspace activation',
+)
 const sandboxGeometrySection = section(
   route,
   'const sandboxGeometryRatePlan =',

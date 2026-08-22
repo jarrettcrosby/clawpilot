@@ -658,15 +658,10 @@ function verifySourceContracts() {
     /providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.released[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
     'Warehouse release domain and audit evidence must record the latest current Shopify inventory sync runs',
   )
-  assert.match(
-    persistence,
-    /LEFT JOIN operations_cartonization_rate_evidence evidence[\s\S]*?plan\.cartonization_evidence_id IS NULL[\s\S]*?carrierReadEnvironment'[\s\S]*?IS DISTINCT FROM 'production'/,
-    'Active activation must fail closed for both missing and non-production plan evidence',
-  )
-  assert.match(
-    persistence,
-    /activation\.state === 'active'[\s\S]*?!plan\.cartonization_evidence_id[\s\S]*?plan\.carrier_read_environment !== 'production'[\s\S]*?OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
-    'Warehouse release must fail closed when active planning evidence is missing or non-production',
+  assert.doesNotMatch(
+    warehouseReleaseRegion,
+    /OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
+    'Local warehouse release must not reinterpret activation as carrier-read authority',
   )
   assert.match(
     persistence,

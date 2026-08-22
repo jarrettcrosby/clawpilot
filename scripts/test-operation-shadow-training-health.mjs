@@ -79,6 +79,8 @@ const requiredStructure = [
   releaseACompatibilityMarkerChecksum,
   '0306_operations_order_training_independent_control_contract.sql',
   futureIndependentControlChecksum,
+  '0314_operations_local_work_independent_activation.sql',
+  '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1',
   'operations_shadow_training_runs',
   'operations_shadow_training_packages',
   'operations_shadow_training_pick_tasks',
@@ -101,6 +103,7 @@ const requiredStructure = [
   '786a373981688256f1f83b94208b405a2b6446d04a21678a2a76a4110005d14e',
   'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310',
   'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3',
+  '91f77ed50a79257b5540007f89a915fb695f5eb25a4ffb098e692090df0855fa',
   'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053',
   'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f',
   'operations_shadow_training_runs_one_open_order',
@@ -174,6 +177,7 @@ for (const unsafeResolution of [
 for (const phase of [
   'profile-bound-compatible',
   'independent-strict',
+  'local-work-independent',
 ]) {
   assert.ok(
     healthSource.includes(`'${phase}'`),
@@ -583,6 +587,68 @@ async function exerciseForeignFirstNamespaceSafety(pool) {
 }
 
 async function exercise(pool) {
+  if (await authorityContract(pool) === 'local-work-independent') {
+    assert.equal(
+      await attest(pool),
+      true,
+      'Fresh 0314 schema must preserve exact-order training isolation',
+    )
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      for (const [label, tamperSql] of [
+        [
+          '0314 ledger checksum',
+          `UPDATE public.schema_migrations
+           SET checksum = repeat('0', 64)
+           WHERE filename =
+             '0314_operations_local_work_independent_activation.sql'`,
+        ],
+        [
+          'exact-order canonical-write guard',
+          `CREATE OR REPLACE FUNCTION
+             public.guard_shadow_commerce_canonical_write()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN RETURN NEW; END;
+           $$`,
+        ],
+        [
+          'canonical-plan trigger binding',
+          `ALTER TABLE public.operations_fulfillment_plans
+           DISABLE TRIGGER guard_shadow_commerce_canonical_plan_insert`,
+        ],
+      ]) {
+        await client.query('SAVEPOINT local_work_health_tamper')
+        try {
+          await client.query(tamperSql)
+          assert.equal(
+            await attest(client),
+            false,
+            `${label} drift must make exact health red`,
+          )
+          assert.equal(
+            await authorityContract(client),
+            'invalid',
+            `${label} drift must invalidate the rollout phase`,
+          )
+        } finally {
+          await client.query('ROLLBACK TO SAVEPOINT local_work_health_tamper')
+          await client.query('RELEASE SAVEPOINT local_work_health_tamper')
+        }
+        assert.equal(await attest(client), true)
+        assert.equal(
+          await authorityContract(client),
+          'local-work-independent',
+        )
+      }
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined)
+      client.release()
+    }
+    assert.equal(await attest(pool), true)
+    assert.equal(await authorityContract(pool), 'local-work-independent')
+    return
+  }
   assert.equal(
     await attest(pool),
     true,

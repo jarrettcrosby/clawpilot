@@ -4399,26 +4399,17 @@ async function verifyCanonicalPlanning(databaseUrl) {
         activationState: 'active',
         carrierReadEnvironment: 'sandbox',
       })
-    await assert.rejects(
-      () => operations.planOperationsOrderFromPostgres({
-        organizationId: activeSandboxFixture.organizationId,
-        actorEmail: activeSandboxFixture.email,
-        orderGlobalId: activeSandboxFixture.order.global_id,
-        cartonizationEvidenceGlobalId:
-          activeSandboxFixture.evidence.global_id,
-        expectedRowVersion:
-          Number(activeSandboxFixture.order.row_version),
-        reason: 'Active planning must reject sandbox carrier estimates',
-        idempotencyKey: `canonical-plan-${randomUUID()}`,
-      }),
-      (error) => {
-        assert.equal(
-          error.code,
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-        )
-        return true
-      },
-    )
+    await operations.planOperationsOrderFromPostgres({
+      organizationId: activeSandboxFixture.organizationId,
+      actorEmail: activeSandboxFixture.email,
+      orderGlobalId: activeSandboxFixture.order.global_id,
+      cartonizationEvidenceGlobalId:
+        activeSandboxFixture.evidence.global_id,
+      expectedRowVersion:
+        Number(activeSandboxFixture.order.row_version),
+      reason: 'Local planning accepts exact sandbox carrier estimates',
+      idempotencyKey: `canonical-plan-${randomUUID()}`,
+    })
     const activeSandboxEffects = await pool.query(
       `SELECT
          (SELECT count(*)::int
@@ -4434,8 +4425,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
       ],
     )
     assert.deepEqual(activeSandboxEffects.rows[0], {
-      plans: 0,
-      packaging_claims: 0,
+      plans: 1,
+      packaging_claims: 1,
     })
 
     const missingEvidenceFixture =

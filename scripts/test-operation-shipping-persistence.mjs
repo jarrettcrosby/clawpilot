@@ -115,25 +115,36 @@ const createContextGuard = section(
   persistence,
   'function assertCreateContext(',
   'function assertVoidContext(',
-  'Create-label activation guard',
+  'Create-label local safeguards',
 )
 assertIncludes(createContextGuard, [
-  "context.order.activation_state !== 'active'",
-  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
-  'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
-], 'Create-label activation guard')
+  "'OPERATIONS_LABEL_ORDER_NOT_PACKED'",
+  "'OPERATIONS_ORDER_VERSION_CONFLICT'",
+  "'OPERATIONS_LABEL_RERATE_REQUIRED'",
+  "'OPERATIONS_LABEL_ALREADY_CREATED'",
+], 'Create-label local safeguards')
+assert.doesNotMatch(
+  createContextGuard,
+  /activation_state|OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED/u,
+  'Sandbox label creation must not depend on workspace activation',
+)
 
 const voidContextGuard = section(
   persistence,
   'function assertVoidContext(',
   'function commandHash(',
-  'Void-label activation guard',
+  'Void-label local safeguards',
 )
 assertIncludes(voidContextGuard, [
-  "context.order.activation_state !== 'active'",
-  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
-  'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
-], 'Void-label activation guard')
+  "'OPERATIONS_LABEL_ORDER_NOT_PACKED'",
+  "'OPERATIONS_ORDER_VERSION_CONFLICT'",
+  "'OPERATIONS_LABEL_VOID_UNAVAILABLE'",
+], 'Void-label local safeguards')
+assert.doesNotMatch(
+  voidContextGuard,
+  /activation_state|OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED/u,
+  'Sandbox label void must not depend on workspace activation',
+)
 
 const replay = section(
   persistence,

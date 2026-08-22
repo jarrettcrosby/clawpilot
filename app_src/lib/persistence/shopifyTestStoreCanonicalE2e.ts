@@ -1169,13 +1169,11 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
   ).trim()
   return withTransaction(async (client) => {
     const context = await client.query<{
-      activation_state: string
       order_global_id: string
       order_row_version: string
       order_status: string
     }>(
-      `SELECT activation.state AS activation_state,
-              source_order.global_id AS order_global_id,
+      `SELECT source_order.global_id AS order_global_id,
               source_order.row_version::text AS order_row_version,
               source_order.status AS order_status
        FROM operations_integration_accounts account
@@ -1185,8 +1183,6 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
        JOIN operations_orders source_order
          ON source_order.organization_id = candidate.organization_id
         AND source_order.id = candidate.canonical_order_id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = account.organization_id
        WHERE account.organization_id = $1::uuid
          AND account.global_id = $2
          AND account.provider = 'shopify'
@@ -1210,21 +1206,8 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
       )
     }
     const row = context.rows[0]
-    if (row.activation_state !== 'read_only') {
-      if (authorizationGlobalId) {
-        fail(
-          'SHOPIFY_TEST_E2E_READ_ONLY_REQUIRED',
-          'The exact Shopify test-store lane is current only in Read only mode',
-        )
-      }
-      return { authorityKind: 'ordinary' as const }
-    }
     if (!authorizationGlobalId) {
-      fail(
-        'SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
-        'Authorize this exact verified Shopify test order before saving operational planning evidence in Read only mode',
-        403,
-      )
+      return { authorityKind: 'ordinary' as const }
     }
     await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
       organizationId: scopedOrganizationId,
