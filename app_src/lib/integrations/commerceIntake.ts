@@ -2762,6 +2762,7 @@ type ExecuteCommerceIntakeInput = {
 type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
+  runAutomaticOrderHooks?: boolean
   runtimeAuthority?: 'development_interactive' | 'read_reconciliation'
   providerAttemptActorEmail?: string | null
   expectedCredentialVersion?: number
@@ -3134,7 +3135,7 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
-      const automaticOrderHooksEnabled = !(
+      const automaticOrderHooksEnabled = options.runAutomaticOrderHooks !== false && !(
         reconciliationRead
         && commerceReadRuntimeMode() === 'production'
       )
@@ -3443,7 +3444,7 @@ async function executeCommerceIntakeCommandInternal(
         action: commandAction,
       },
     )
-    const automaticOrderHooksEnabled = !(
+    const automaticOrderHooksEnabled = options.runAutomaticOrderHooks !== false && !(
       reconciliationRead
       && commerceReadRuntimeMode() === 'production'
     )
@@ -3856,6 +3857,36 @@ export async function executeCommerceIntakeCommand(
   return executeCommerceIntakeCommandInternal(input, {
     includeIntakeState: true,
     hydrateProductInventory: true,
+  })
+}
+
+/**
+ * Exact manual provider refresh for the ordinary Operations order editor.
+ * The existing intake read-intent/capture/stage pipeline retains the provider
+ * evidence, while automatic customer resolution and candidate promotion stay
+ * paused until the workbench performs its explicit three-way local rebase.
+ */
+export async function refreshCommerceOrderWorkbenchCandidate(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: 'refresh',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      candidateGlobalId: input.candidateGlobalId,
+      confirmReadOnly: true,
+    },
+  }, {
+    includeIntakeState: false,
+    hydrateProductInventory: false,
+    runAutomaticOrderHooks: false,
   })
 }
 

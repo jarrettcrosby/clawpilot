@@ -1,4 +1,10 @@
+import { createHash } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
+import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
+import {
+  CommerceIntegrationRequestError,
+  sanitizedCommerceIntegrationError,
+} from '@/lib/integrations/commerceIntegrations'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -11,14 +17,18 @@ import {
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   CommerceOrderWorkbenchError,
+  readCommerceOrderWorkbenchRefreshTargetFromPostgres,
   readCommerceOrderWorkbenchFromPostgres,
+  rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres,
   updateCommerceOrderWorkbenchShipToInPostgres,
+  type CommerceOrderWorkbenchRefreshResolution,
 } from '@/lib/persistence/commerceOrderWorkbench'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
+export const maxDuration = 60
 
 const MAX_REQUEST_BYTES = 64 * 1024
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/u
@@ -154,6 +164,41 @@ function shipToPatchValue(value: unknown): OrderShipToPatch {
   return changes
 }
 
+function refreshResolutionsValue(
+  value: unknown,
+): CommerceOrderWorkbenchRefreshResolution {
+  if (value === undefined || value === null) return {}
+  const input = record(value, 'Refresh choices')
+  assertFields(input, SHIP_TO_FIELDS, 'Refresh choices')
+  const resolutions: CommerceOrderWorkbenchRefreshResolution = {}
+  for (const field of ORDER_SHIP_TO_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(input, field)) continue
+    if (!['local', 'provider'].includes(String(input[field] || ''))) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+        'Choose whether to keep the local or provider value',
+      )
+    }
+    resolutions[field] = input[field] as 'local' | 'provider'
+  }
+  return resolutions
+}
+
+function derivedIdempotencyKey(input: {
+  organizationId: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  purpose: 'provider' | 'rebase'
+}) {
+  const digest = createHash('sha256').update([
+    input.organizationId,
+    input.idempotencyKey,
+    input.candidateGlobalId,
+    input.purpose,
+  ].join(':')).digest('hex')
+  return `order-workbench-${input.purpose}:${digest}`
+}
+
 async function requestBody(req: NextRequest) {
   const contentType = String(req.headers.get('content-type') || '').toLowerCase()
   if (!/^application\/json(?:\s*;|$)/u.test(contentType)) {
@@ -203,7 +248,18 @@ function errorResponse(error: unknown) {
       ok: false,
       code: error.code,
       error: error.message,
+      ...(error instanceof CommerceOrderWorkbenchError && error.details
+        ? error.details
+        : {}),
     }, error.status)
+  }
+  if (error instanceof CommerceIntegrationRequestError) {
+    const commerceError = sanitizedCommerceIntegrationError(error)
+    return response({
+      ok: false,
+      code: commerceError.code,
+      error: commerceError.message,
+    }, commerceError.status)
   }
   console.error('[operations-order-workbench] request failed', {
     message: error instanceof Error ? error.message : 'Unknown error',
@@ -279,6 +335,101 @@ export async function PATCH(req: NextRequest) {
       candidateGlobalId,
     })
     return response({ ok: true, result, order: order || null })
+  } catch (error) {
+    return errorResponse(error)
+  }
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    requirePostgres()
+    const actor = await requireRequestUser(req)
+    const capabilities = operationsCapabilities(actor)
+    if (!capabilities.canManage) {
+      return response({
+        ok: false,
+        code: 'OPERATIONS_MANAGE_REQUIRED',
+        error: 'You do not have permission to refresh Operations orders',
+      }, 403)
+    }
+    const organizationId = activeOperationsOrganizationId(actor)
+    const body = await requestBody(req)
+    assertFields(
+      body,
+      new Set([
+        'action',
+        'candidateGlobalId',
+        'expectedRowVersion',
+        'latestCandidateGlobalId',
+        'resolutions',
+      ]),
+      'Order refresh',
+    )
+    if (body.action !== 'refresh') {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_INVALID',
+        'Order refresh action is invalid',
+      )
+    }
+    const candidateGlobalId = candidateGlobalIdValue(body.candidateGlobalId)
+    const expectedRowVersion = rowVersionValue(body.expectedRowVersion)
+    const resolutions = refreshResolutionsValue(body.resolutions)
+    const resolvingConflict = Object.keys(resolutions).length > 0
+    const latestCandidateGlobalId = body.latestCandidateGlobalId === undefined
+      || body.latestCandidateGlobalId === null
+      ? null
+      : candidateGlobalIdValue(body.latestCandidateGlobalId)
+    if (resolvingConflict && !latestCandidateGlobalId) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+        'Reload the provider conflict before choosing values',
+      )
+    }
+    const requestKey = idempotencyKeyValue(req)
+    if (!resolvingConflict) {
+      const target = await readCommerceOrderWorkbenchRefreshTargetFromPostgres({
+        organizationId,
+        candidateGlobalId,
+      })
+      await refreshCommerceOrderWorkbenchCandidate({
+        organizationId,
+        accountGlobalId: target.accountGlobalId,
+        actorEmail: actor.email,
+        idempotencyKey: derivedIdempotencyKey({
+          organizationId,
+          idempotencyKey: requestKey,
+          candidateGlobalId,
+          purpose: 'provider',
+        }),
+        candidateGlobalId: target.candidateGlobalId,
+      })
+    }
+    const result = await rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+      organizationId,
+      actorEmail: actor.email,
+      idempotencyKey: derivedIdempotencyKey({
+        organizationId,
+        idempotencyKey: requestKey,
+        candidateGlobalId,
+        purpose: 'rebase',
+      }),
+      candidateGlobalId,
+      expectedRowVersion,
+      expectedLatestCandidateGlobalId: latestCandidateGlobalId,
+      resolutions,
+    })
+    const [order] = await readCommerceOrderWorkbenchFromPostgres({
+      organizationId,
+      candidateGlobalId: result.candidateGlobalId,
+    })
+    if (!order) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESULT_INVALID',
+        'The refreshed order could not be reloaded',
+        500,
+      )
+    }
+    return response({ ok: true, refreshResult: result, order })
   } catch (error) {
     return errorResponse(error)
   }

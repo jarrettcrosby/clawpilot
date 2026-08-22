@@ -21,6 +21,7 @@ import CloseRounded from '@mui/icons-material/CloseRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import type {
+  OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderWorkingCopy,
 } from '@/lib/operations/types'
 import {
@@ -38,7 +39,16 @@ type ImportedOrderWorkingCopyDrawerProps = {
   refreshing?: boolean
   onClose: () => void
   onSave: (shipTo: OrderShipToDraft) => Promise<void> | void
-  onRefresh?: () => Promise<void> | void
+  onRefresh?: (input?: {
+    latestCandidateGlobalId: string
+    resolutions: Partial<Record<keyof OrderShipToDraft, 'local' | 'provider'>>
+  }) => Promise<{
+    latestCandidateGlobalId: string
+    conflicts: OperationsImportedOrderRefreshConflict[]
+  } | null> | {
+    latestCandidateGlobalId: string
+    conflicts: OperationsImportedOrderRefreshConflict[]
+  } | null
 }
 
 const EMPTY_SHIP_TO = normalizeOrderShipToDraft(null)
@@ -69,6 +79,13 @@ export default function ImportedOrderWorkingCopyDrawer({
   const [shipTo, setShipTo] = useState<OrderShipToDraft>(() => (
     order ? normalizeOrderShipToDraft(order.shipTo.value) : EMPTY_SHIP_TO
   ))
+  const [refreshConflict, setRefreshConflict] = useState<{
+    latestCandidateGlobalId: string
+    conflicts: OperationsImportedOrderRefreshConflict[]
+  } | null>(null)
+  const [refreshChoices, setRefreshChoices] = useState<Partial<
+    Record<keyof OrderShipToDraft, 'local' | 'provider'>
+  >>({})
 
   const changed = useMemo(() => {
     if (!order) return false
@@ -82,6 +99,18 @@ export default function ImportedOrderWorkingCopyDrawer({
 
   const update = (field: keyof OrderShipToDraft, value: string) => {
     setShipTo((current) => ({ ...current, [field]: value || null }))
+  }
+
+  const refresh = async (resolveConflict = false) => {
+    if (!onRefresh) return
+    const conflict = await onRefresh(resolveConflict && refreshConflict
+      ? {
+          latestCandidateGlobalId: refreshConflict.latestCandidateGlobalId,
+          resolutions: refreshChoices,
+        }
+      : undefined)
+    setRefreshConflict(conflict)
+    if (!conflict) setRefreshChoices({})
   }
 
   return (
@@ -151,7 +180,69 @@ export default function ImportedOrderWorkingCopyDrawer({
           {order?.providerVersionChanged && (
             <Alert severity="warning">
               {providerLabel(order.provider)} changed this order after the local draft was saved.
-              Refresh before replacing source information.
+              Refresh to merge the provider changes with your local edits.
+            </Alert>
+          )}
+          {refreshConflict && (
+            <Alert severity="warning">
+              <Stack spacing={1.25}>
+                <Typography variant="body2" fontWeight={700}>
+                  Choose a value for each field changed in both places.
+                </Typography>
+                {refreshConflict.conflicts.map((conflict) => (
+                  <Stack key={conflict.field} spacing={0.5}>
+                    <Typography variant="caption" fontWeight={700}>
+                      {conflict.field === 'postalCode'
+                        ? 'Postal code'
+                        : conflict.field === 'line1'
+                          ? 'Address'
+                          : conflict.field === 'line2'
+                            ? 'Address line 2'
+                            : conflict.field[0].toUpperCase()
+                              + conflict.field.slice(1)}
+                    </Typography>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} gap={0.75}>
+                      <Button
+                        size="small"
+                        variant={refreshChoices[conflict.field] === 'local'
+                          ? 'contained'
+                          : 'outlined'}
+                        onClick={() => setRefreshChoices((current) => ({
+                          ...current,
+                          [conflict.field]: 'local',
+                        }))}
+                      >
+                        Keep mine: {conflict.localValue || 'blank'}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant={refreshChoices[conflict.field] === 'provider'
+                          ? 'contained'
+                          : 'outlined'}
+                        onClick={() => setRefreshChoices((current) => ({
+                          ...current,
+                          [conflict.field]: 'provider',
+                        }))}
+                      >
+                        Use {providerLabel(order!.provider)}: {conflict.providerValue || 'blank'}
+                      </Button>
+                    </Stack>
+                  </Stack>
+                ))}
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={
+                    refreshing
+                    || refreshConflict.conflicts.some((conflict) => (
+                      !refreshChoices[conflict.field]
+                    ))
+                  }
+                  onClick={() => void refresh(true)}
+                >
+                  Apply choices
+                </Button>
+              </Stack>
             </Alert>
           )}
 
@@ -173,7 +264,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 variant="outlined"
                 startIcon={refreshing ? <CircularProgress size={16} /> : <RefreshRounded />}
                 disabled={!order || saving || refreshing}
-                onClick={() => void onRefresh()}
+                onClick={() => void refresh(false)}
               >
                 Refresh from {order ? providerLabel(order.provider) : 'provider'}
               </Button>

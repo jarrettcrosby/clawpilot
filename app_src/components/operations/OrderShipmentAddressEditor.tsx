@@ -158,6 +158,11 @@ export default function OrderShipmentAddressEditor({
           The store address changed after this local shipment address was saved.
         </Alert>
       )}
+      {shipmentAddress.rerateRequired && (
+        <Alert severity="warning">
+          This shipment address changed after planning. Compare rates again before creating a label.
+        </Alert>
+      )}
       {!shipmentAddress.editable && shipmentAddress.editBlockedReason && (
         <Alert severity="info">{shipmentAddress.editBlockedReason}</Alert>
       )}

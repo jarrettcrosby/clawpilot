@@ -69,6 +69,25 @@ function loadTypeScriptModule(path, mocks = {}, globals = {}) {
           'app_src/lib/operations/shopifyCheckoutRateControl.ts',
         )
       }
+      if (specifier === '@/lib/operations/orderShipTo') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/orderShipTo.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/operationsOrderShipmentAddress') {
+        return {
+          async readOperationsOrderShipmentAddressInPostgres() {
+            throw new Error('Unexpected canonical order shipment-address read')
+          },
+        }
+      }
+      if (specifier === '@/lib/persistence/commerceOrderWorkbench') {
+        return {
+          async readCommerceOrderWorkbenchFromPostgres() {
+            return []
+          },
+        }
+      }
       if (specifier === '@/lib/persistence/commerceStoreSync') {
         return {
           async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
@@ -951,6 +970,25 @@ function loadOperationalWarehouseServices(pool) {
   const fulfillmentOptimizerContract = loadTypeScriptModule(
     'app_src/lib/operations/fulfillmentOptimizerContract.ts',
   )
+  const orderShipTo = loadTypeScriptModule(
+    'app_src/lib/operations/orderShipTo.ts',
+  )
+  const shipmentAddress = {
+    async readOperationsOrderShipmentAddressInPostgres(input) {
+      const queryable = input.client || pool
+      const result = await queryable.query(
+        `SELECT ship_to
+         FROM operations_orders
+         WHERE organization_id = $1::uuid
+           AND global_id = $2
+           AND archived_at IS NULL
+         LIMIT 1`,
+        [input.organizationId, input.orderGlobalId],
+      )
+      assert.ok(result.rows[0], 'Operational order shipment address must exist')
+      return { value: result.rows[0].ship_to }
+    },
+  }
   const cartonizationRateEvidence = loadTypeScriptModule(
     'app_src/lib/persistence/cartonizationRateEvidence.ts',
     {
@@ -959,6 +997,8 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
       '@/lib/operations/fulfillmentOptimizerContract':
         fulfillmentOptimizerContract,
+      '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/persistence/operationsOrderShipmentAddress': shipmentAddress,
       '@/lib/persistence/postgres': postgres,
     },
   )
@@ -1059,6 +1099,13 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/domain': domain,
       '@/lib/operations/pickManagement': pickManagement,
       '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/persistence/commerceOrderWorkbench': {
+        async readCommerceOrderWorkbenchFromPostgres() {
+          return []
+        },
+      },
+      '@/lib/persistence/operationsOrderShipmentAddress': shipmentAddress,
       '@/lib/persistence/commerceOrderRevisions': {
         async assertCommerceOrderRevisionExecutionCurrent() {},
         CommerceOrderRevisionGateError: class extends Error {},

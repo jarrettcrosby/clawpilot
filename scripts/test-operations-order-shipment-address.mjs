@@ -52,7 +52,9 @@ assert.equal(
 for (const fragment of [
   'readOperationsOrderShipmentAddressInPostgres',
   'updateOperationsOrderShipmentAddressInPostgres',
-  "row.order_status !== 'imported'",
+  'shipmentAddressRequiresRerate',
+  'plan_destination_fingerprints',
+  'active_plan_count',
   'expectedOrderRowVersion',
   'expectedAddressRowVersion',
   'operations_order_shipment_address_working_copies',
@@ -64,6 +66,7 @@ for (const fragment of [
   'providerWrites: 0',
   'providerWriteIntentCreated: false',
   'LEFT JOIN operations_integration_accounts source_account',
+  "attempt.environment = 'production'",
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
@@ -135,6 +138,10 @@ assert.ok(
 assert.ok(
   shipping.includes('OPERATIONS_LABEL_SHIP_TO_INCOMPLETE'),
   'Label creation must reject an incomplete address at the label boundary',
+)
+assert.ok(
+  shipping.includes('OPERATIONS_LABEL_RERATE_REQUIRED'),
+  'Label creation must reject stale destination-rate evidence',
 )
 assert.ok(
   migration.match(/operations_order_dispatch_destination_matches\(/gu)?.length

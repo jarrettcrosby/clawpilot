@@ -3185,7 +3185,18 @@ export async function readCommerceIntakeRefreshTargetFromPostgres(input: {
          AND candidate.integration_account_id = $2::uuid
          AND candidate.global_id = $3
          AND candidate.workflow_state <> 'promoted'
-         AND candidate.expires_at > now()
+         AND (
+           candidate.expires_at > now()
+           OR EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_workbench workbench
+             WHERE workbench.organization_id = candidate.organization_id
+               AND workbench.integration_account_id =
+                 candidate.integration_account_id
+               AND workbench.candidate_id = candidate.id
+               AND workbench.canonical_order_id IS NULL
+           )
+         )
        LIMIT 1`,
       [account.organization_id, account.id, input.candidateGlobalId],
     )

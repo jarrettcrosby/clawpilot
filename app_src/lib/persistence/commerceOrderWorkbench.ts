@@ -6,6 +6,7 @@ import {
   encryptCommerceCandidateSnapshot,
 } from '@/lib/integrations/commerceCredentialCrypto'
 import {
+  ORDER_SHIP_TO_FIELDS,
   changedOrderShipToFields,
   mergeOrderShipToDraft,
   normalizeOrderShipToDraft,
@@ -13,9 +14,12 @@ import {
   orderShipToReadiness,
   orderShipToStorageValue,
   type OrderShipToDraft,
+  type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
 import type {
+  OperationsImportedOrderRefreshConflict,
+  OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
   OperationsImportedOrderWorkingCopy,
 } from '@/lib/operations/types'
@@ -34,6 +38,7 @@ import {
 } from '@/lib/persistence/postgres'
 
 const COMMAND_TYPE = 'operations.commerce_order_workbench.update_ship_to'
+const REFRESH_COMMAND_TYPE = 'operations.commerce_order_workbench.refresh'
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
@@ -157,17 +162,29 @@ type CommandReceiptRow = {
 export class CommerceOrderWorkbenchError extends Error {
   readonly code: string
   readonly status: number
+  readonly details: Record<string, unknown> | null
 
-  constructor(code: string, message: string, status = 409) {
+  constructor(
+    code: string,
+    message: string,
+    status = 409,
+    details: Record<string, unknown> | null = null,
+  ) {
     super(message)
     this.name = 'CommerceOrderWorkbenchError'
     this.code = code
     this.status = status
+    this.details = details
   }
 }
 
-function requestError(code: string, message: string, status = 409): never {
-  throw new CommerceOrderWorkbenchError(code, message, status)
+function requestError(
+  code: string,
+  message: string,
+  status = 409,
+  details: Record<string, unknown> | null = null,
+): never {
+  throw new CommerceOrderWorkbenchError(code, message, status, details)
 }
 
 function canonicalJson(value: unknown): string {
@@ -274,6 +291,63 @@ function decryptAddress(input: {
     postalCode: value.postalCode,
     country: value.countryCode || value.country,
   })
+}
+
+export type CommerceOrderWorkbenchRefreshResolution = Partial<
+  Record<OrderShipToField, 'local' | 'provider'>
+>
+
+export function mergeCommerceOrderWorkbenchProviderAddress(input: {
+  acceptedProvider: OrderShipToDraft
+  local: OrderShipToDraft
+  latestProvider: OrderShipToDraft
+  resolutions?: CommerceOrderWorkbenchRefreshResolution | null
+}) {
+  const acceptedProvider = normalizeOrderShipToDraft(input.acceptedProvider)
+  const local = normalizeOrderShipToDraft(input.local)
+  const latestProvider = normalizeOrderShipToDraft(input.latestProvider)
+  const providerChangedFields = changedOrderShipToFields(
+    acceptedProvider,
+    latestProvider,
+  )
+  const localChangedFields = changedOrderShipToFields(acceptedProvider, local)
+  const conflicts: OperationsImportedOrderRefreshConflict[] = []
+  const merged: Record<OrderShipToField, string | null> = {
+    ...latestProvider,
+  }
+
+  for (const field of ORDER_SHIP_TO_FIELDS) {
+    const localChanged = local[field] !== acceptedProvider[field]
+    const providerChanged = latestProvider[field] !== acceptedProvider[field]
+    if (!localChanged) continue
+    if (!providerChanged || local[field] === latestProvider[field]) {
+      merged[field] = local[field]
+      continue
+    }
+    const resolution = input.resolutions?.[field]
+    if (resolution === 'local') {
+      merged[field] = local[field]
+      continue
+    }
+    if (resolution === 'provider') {
+      merged[field] = latestProvider[field]
+      continue
+    }
+    conflicts.push({
+      field,
+      localValue: local[field],
+      providerValue: latestProvider[field],
+    })
+  }
+
+  return {
+    merged: normalizeOrderShipToDraft(merged),
+    providerChangedFields,
+    preservedLocalFields: localChangedFields.filter((field) => (
+      merged[field] === local[field]
+    )),
+    conflicts,
+  }
 }
 
 function customerSnapshotName(row: WorkbenchReadRow) {
@@ -886,12 +960,46 @@ async function handoffCarrierReadyDraft(input: {
       409,
     )
   }
+  const preflightValidation = await validateCommerceCandidateInPostgres({
+    runtime,
+    actorEmail: input.actorEmail,
+    idempotencyKey: `workbench:${saved.receipt.id}:preflight-validate`,
+    candidateGlobalId: saved.result.candidateGlobalId,
+    candidateRowVersion: Number(saved.candidate.row_version),
+  }) as CandidateCommandResult
+  const preflightRowVersion = Number(preflightValidation.rowVersion)
+  if (!Number.isSafeInteger(preflightRowVersion)) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_HANDOFF_INVALID',
+      'The imported-order preflight result was invalid',
+      500,
+    )
+  }
+  const remainingBlockerCodes = blockerCodes(
+    preflightValidation.blockers,
+  ).filter((code) => !ADDRESS_BLOCKERS.has(code))
+  if (remainingBlockerCodes.length) {
+    // Keep a completed local address in the workbench until every unrelated
+    // intake fact is ready. Confirming it on the provider candidate early
+    // would destroy the three-way refresh base and make a later provider
+    // rebase unable to distinguish source data from the user's local edits.
+    return completeWorkbenchReceipt({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      receiptId: saved.receipt.id,
+      result: {
+        ...saved.result,
+        promotionStatus: 'needs_info',
+        remainingBlockerCodes,
+      },
+    })
+  }
   const addressResult = await confirmCommerceCandidateAddressInPostgres({
     runtime,
     actorEmail: input.actorEmail,
     idempotencyKey: `workbench:${saved.receipt.id}:confirm-address`,
     candidateGlobalId: saved.result.candidateGlobalId,
-    candidateRowVersion: Number(saved.candidate.row_version),
+    candidateRowVersion: preflightRowVersion,
     address: carrierAddress(saved.address),
   }) as CandidateCommandResult
   const confirmedRowVersion = Number(addressResult.rowVersion)
@@ -1392,5 +1500,585 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
     actorEmail,
     exactRequestHash,
     saved,
+  })
+}
+
+function replayedRefreshResult(
+  receipt: CommandReceiptRow,
+): OperationsImportedOrderRefreshResult {
+  const payload = receipt.result_payload
+  if (
+    !payload
+    || typeof payload.previousCandidateGlobalId !== 'string'
+    || typeof payload.candidateGlobalId !== 'string'
+    || !Number.isSafeInteger(payload.rowVersion)
+    || !['unchanged', 'rebased'].includes(String(payload.status || ''))
+    || !Array.isArray(payload.providerChangedFields)
+    || !Array.isArray(payload.preservedLocalFields)
+  ) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_REFRESH_RESULT_INVALID',
+      'The refreshed order could not be reloaded',
+      500,
+    )
+  }
+  return {
+    ...(payload as Omit<OperationsImportedOrderRefreshResult, 'replayed'>),
+    replayed: true,
+  }
+}
+
+async function prepareRefreshReceipt(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    actorEmail: string
+    candidateGlobalId: string
+    idempotencyKey: string
+    requestHash: string
+  },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `commerce-order-workbench-refresh-receipt:${input.organizationId}:${input.idempotencyKey}`,
+  )
+  const existing = await client.query<CommandReceiptRow>(
+    `SELECT id::text, request_hash, target_global_id, status,
+            correlation_id::text, result_payload, updated_at
+     FROM operations_command_receipts
+     WHERE organization_id = $1::uuid
+       AND command_type = $2
+       AND idempotency_key = $3
+     FOR UPDATE`,
+    [input.organizationId, REFRESH_COMMAND_TYPE, input.idempotencyKey],
+  )
+  const receipt = existing.rows[0]
+  if (receipt) {
+    if (
+      receipt.request_hash !== input.requestHash
+      || receipt.target_global_id !== input.candidateGlobalId
+    ) {
+      requestError(
+        'OPERATIONS_IDEMPOTENCY_CONFLICT',
+        'This idempotency key was already used for a different order refresh',
+      )
+    }
+    if (receipt.status === 'succeeded') {
+      return { receipt, replayed: true }
+    }
+    const retried = await client.query<CommandReceiptRow>(
+      `UPDATE operations_command_receipts
+       SET status = 'processing', actor_email = $2,
+           attempts = attempts + 1, error_code = NULL,
+           error_message = NULL, completed_at = NULL,
+           started_at = now(), updated_at = now()
+       WHERE id = $1::uuid
+       RETURNING id::text, request_hash, target_global_id, status,
+                 correlation_id::text, result_payload, updated_at`,
+      [receipt.id, input.actorEmail],
+    )
+    return { receipt: retried.rows[0], replayed: false }
+  }
+  const created = await client.query<CommandReceiptRow>(
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, status, correlation_id, target_global_id
+     ) VALUES (
+       $1::uuid, $2, $3, $4, $5, 'processing', $6::uuid, $7
+     )
+     RETURNING id::text, request_hash, target_global_id, status,
+               correlation_id::text, result_payload, updated_at`,
+    [
+      input.organizationId,
+      REFRESH_COMMAND_TYPE,
+      input.idempotencyKey,
+      input.requestHash,
+      input.actorEmail,
+      randomUUID(),
+      input.candidateGlobalId,
+    ],
+  )
+  return { receipt: created.rows[0], replayed: false }
+}
+
+export async function readCommerceOrderWorkbenchRefreshTargetFromPostgres(
+  input: {
+    organizationId: string
+    candidateGlobalId: string
+  },
+) {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const candidateGlobalId = requireCandidateGlobalId(input.candidateGlobalId)
+  const result = await query<{
+    account_global_id: string
+    candidate_global_id: string
+    candidate_row_version: string
+  }>(
+    `SELECT account.global_id AS account_global_id,
+            COALESCE(latest.global_id, accepted.global_id)
+              AS candidate_global_id,
+            COALESCE(latest.row_version, accepted.row_version)::text
+              AS candidate_row_version
+     FROM operations_commerce_order_candidates accepted
+     JOIN operations_integration_accounts account
+       ON account.organization_id = accepted.organization_id
+      AND account.id = accepted.integration_account_id
+      AND account.integration_type = 'commerce'
+      AND account.provider IN ('shopify', 'faire')
+     LEFT JOIN LATERAL (
+       SELECT candidate.global_id, candidate.row_version
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_commerce_intake_runs run
+         ON run.organization_id = candidate.organization_id
+        AND run.integration_account_id = candidate.integration_account_id
+        AND run.pipeline_id = candidate.pipeline_id
+        AND run.id = candidate.run_id
+       WHERE candidate.organization_id = accepted.organization_id
+         AND candidate.integration_account_id = accepted.integration_account_id
+         AND candidate.external_order_id = accepted.external_order_id
+         AND candidate.canonical_order_id IS NULL
+         AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         AND candidate.expires_at > now()
+         AND run.expires_at > now()
+         AND run.workflow_state <> 'expired'
+       ORDER BY candidate.observed_at DESC, candidate.created_at DESC,
+                candidate.id DESC
+       LIMIT 1
+     ) latest ON true
+     WHERE accepted.organization_id = $1::uuid
+       AND accepted.global_id = $2
+       AND accepted.canonical_order_id IS NULL
+     LIMIT 1`,
+    [organizationId, candidateGlobalId],
+  )
+  if (!result.rows[0]) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_NOT_FOUND',
+      'Imported order is no longer available',
+      404,
+    )
+  }
+  return {
+    accountGlobalId: result.rows[0].account_global_id,
+    candidateGlobalId: result.rows[0].candidate_global_id,
+    candidateRowVersion: Number(result.rows[0].candidate_row_version),
+  }
+}
+
+export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
+  input: {
+    organizationId: string
+    actorEmail: string
+    idempotencyKey: string
+    candidateGlobalId: string
+    expectedRowVersion: number
+    expectedLatestCandidateGlobalId?: string | null
+    resolutions?: CommerceOrderWorkbenchRefreshResolution | null
+  },
+): Promise<OperationsImportedOrderRefreshResult> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const candidateGlobalId = requireCandidateGlobalId(input.candidateGlobalId)
+  const actorEmail = String(input.actorEmail || '').trim().toLowerCase()
+  if (!actorEmail) {
+    requestError('OPERATIONS_ACTOR_REQUIRED', 'A signed-in user is required', 401)
+  }
+  if (!IDEMPOTENCY_KEY.test(input.idempotencyKey)) {
+    requestError(
+      'OPERATIONS_IDEMPOTENCY_KEY_INVALID',
+      'A valid Idempotency-Key header is required',
+      400,
+    )
+  }
+  if (
+    !Number.isSafeInteger(input.expectedRowVersion)
+    || input.expectedRowVersion < 0
+  ) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_VERSION_INVALID',
+      'Imported order version is invalid',
+      400,
+    )
+  }
+  const expectedLatestCandidateGlobalId = input.expectedLatestCandidateGlobalId
+    ? requireCandidateGlobalId(input.expectedLatestCandidateGlobalId)
+    : null
+  const resolutions = input.resolutions || {}
+  for (const [field, resolution] of Object.entries(resolutions)) {
+    if (
+      !ORDER_SHIP_TO_FIELDS.includes(field as OrderShipToField)
+      || !['local', 'provider'].includes(String(resolution || ''))
+    ) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+        'Choose whether to keep the local or provider value for each conflicting field',
+        400,
+      )
+    }
+  }
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-order-workbench-candidate:${organizationId}:${candidateGlobalId}`,
+    )
+    const acceptedResult = await client.query<LockedCandidateRow>(
+      `SELECT candidate.id::text, candidate.global_id,
+              candidate.organization_id::text,
+              candidate.integration_account_id::text,
+              account.global_id AS account_global_id,
+              candidate.external_order_id, candidate.source_hash,
+              candidate.provider_updated_at, candidate.observed_at,
+              candidate.canonical_order_id::text,
+              canonical_order.global_id AS canonical_order_global_id,
+              candidate.workflow_state, candidate.blocking_codes,
+              candidate.row_version::text,
+              candidate.ship_to_snapshot_state,
+              candidate.ship_to_snapshot_ciphertext,
+              candidate.ship_to_snapshot_iv,
+              candidate.ship_to_snapshot_tag,
+              false AS live_for_new_draft
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_integration_accounts account
+         ON account.organization_id = candidate.organization_id
+        AND account.id = candidate.integration_account_id
+        AND account.integration_type = 'commerce'
+        AND account.provider IN ('shopify', 'faire')
+       LEFT JOIN operations_orders canonical_order
+         ON canonical_order.organization_id = candidate.organization_id
+        AND canonical_order.id = candidate.canonical_order_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.global_id = $2
+       FOR UPDATE OF candidate`,
+      [organizationId, candidateGlobalId],
+    )
+    const accepted = acceptedResult.rows[0]
+    if (!accepted || accepted.canonical_order_id) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_NOT_FOUND',
+        'Imported order is no longer available',
+        404,
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-order-workbench:${organizationId}:${accepted.integration_account_id}:${accepted.external_order_id}`,
+    )
+    const currentResult = await client.query<LockedWorkbenchRow>(
+      `SELECT id::text, candidate_id::text,
+              accepted_provider_source_hash,
+              accepted_provider_updated_at, ship_to_edit_state,
+              ship_to_ciphertext, ship_to_iv, ship_to_tag,
+              ship_to_source_hash, canonical_order_id::text,
+              last_command_receipt_id::text, last_request_hash,
+              row_version::text
+       FROM operations_commerce_order_workbench
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3
+       FOR UPDATE`,
+      [organizationId, accepted.integration_account_id, accepted.external_order_id],
+    )
+    const current = currentResult.rows[0] || null
+    const latestResult = await client.query<LockedCandidateRow>(
+      `SELECT candidate.id::text, candidate.global_id,
+              candidate.organization_id::text,
+              candidate.integration_account_id::text,
+              account.global_id AS account_global_id,
+              candidate.external_order_id, candidate.source_hash,
+              candidate.provider_updated_at, candidate.observed_at,
+              candidate.canonical_order_id::text,
+              canonical_order.global_id AS canonical_order_global_id,
+              candidate.workflow_state, candidate.blocking_codes,
+              candidate.row_version::text,
+              candidate.ship_to_snapshot_state,
+              candidate.ship_to_snapshot_ciphertext,
+              candidate.ship_to_snapshot_iv,
+              candidate.ship_to_snapshot_tag,
+              true AS live_for_new_draft
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_commerce_intake_runs run
+         ON run.organization_id = candidate.organization_id
+        AND run.integration_account_id = candidate.integration_account_id
+        AND run.pipeline_id = candidate.pipeline_id
+        AND run.id = candidate.run_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = candidate.organization_id
+        AND account.id = candidate.integration_account_id
+       LEFT JOIN operations_orders canonical_order
+         ON canonical_order.organization_id = candidate.organization_id
+        AND canonical_order.id = candidate.canonical_order_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.integration_account_id = $2::uuid
+         AND candidate.external_order_id = $3
+         AND candidate.canonical_order_id IS NULL
+         AND candidate.workflow_state IN ('held', 'resolving', 'ready')
+         AND candidate.expires_at > now()
+         AND run.expires_at > now()
+         AND run.workflow_state <> 'expired'
+       ORDER BY candidate.observed_at DESC, candidate.created_at DESC,
+                candidate.id DESC
+       LIMIT 1
+       FOR UPDATE OF candidate`,
+      [organizationId, accepted.integration_account_id, accepted.external_order_id],
+    )
+    const latest = latestResult.rows[0]
+    if (!latest) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_REQUIRED',
+        'Refresh the store connection, then try this order again',
+      )
+    }
+    if (
+      expectedLatestCandidateGlobalId
+      && latest.global_id !== expectedLatestCandidateGlobalId
+    ) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_CHANGED',
+        'The provider changed this order again. Refresh before choosing values',
+      )
+    }
+    if (!current) {
+      if (input.expectedRowVersion !== 0) {
+        requestError(
+          'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
+          'This order changed. Reload it before refreshing',
+        )
+      }
+      return {
+        previousCandidateGlobalId: candidateGlobalId,
+        candidateGlobalId: latest.global_id,
+        rowVersion: 0,
+        status: latest.id === accepted.id ? 'unchanged' : 'rebased',
+        providerChangedFields: [],
+        preservedLocalFields: [],
+        providerWrites: 0,
+        providerWriteIntentCreated: false,
+        replayed: false,
+      }
+    }
+    if (
+      latest.id === accepted.id
+      && latest.source_hash === current.accepted_provider_source_hash
+    ) {
+      if (
+        current.candidate_id !== accepted.id
+        || Number(current.row_version) !== input.expectedRowVersion
+      ) {
+        requestError(
+          'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
+          'This order changed. Reload it before refreshing',
+        )
+      }
+      return {
+        previousCandidateGlobalId: candidateGlobalId,
+        candidateGlobalId,
+        rowVersion: Number(current.row_version),
+        status: 'unchanged',
+        providerChangedFields: [],
+        preservedLocalFields: [],
+        providerWrites: 0,
+        providerWriteIntentCreated: false,
+        replayed: false,
+      }
+    }
+
+    const exactRequestHash = requestHash({
+      candidateGlobalId,
+      latestCandidateGlobalId: latest.global_id,
+      expectedRowVersion: input.expectedRowVersion,
+      resolutions,
+      providerWrites: 0,
+    })
+    const prepared = await prepareRefreshReceipt(client, {
+      organizationId,
+      actorEmail,
+      candidateGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: exactRequestHash,
+    })
+    if (prepared.replayed) return replayedRefreshResult(prepared.receipt)
+    if (current.candidate_id !== accepted.id) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_CHANGED',
+        'This order was already refreshed. Reload it before refreshing again',
+      )
+    }
+    if (Number(current.row_version) !== input.expectedRowVersion) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
+        'This order changed. Reload it before refreshing',
+      )
+    }
+
+    const acceptedProvider = decryptAddress({
+      ciphertext: accepted.ship_to_snapshot_ciphertext,
+      iv: accepted.ship_to_snapshot_iv,
+      tag: accepted.ship_to_snapshot_tag,
+      organizationId,
+      accountGlobalId: accepted.account_global_id,
+      externalOrderId: accepted.external_order_id,
+      sourceHash: accepted.source_hash,
+      required: accepted.ship_to_snapshot_state === 'protected'
+        || accepted.ship_to_snapshot_state === 'confirmed',
+    })
+    const local = current.ship_to_edit_state === 'provider_snapshot'
+      ? acceptedProvider
+      : decryptAddress({
+          ciphertext: current.ship_to_ciphertext,
+          iv: current.ship_to_iv,
+          tag: current.ship_to_tag,
+          organizationId,
+          accountGlobalId: accepted.account_global_id,
+          externalOrderId: accepted.external_order_id,
+          sourceHash: current.ship_to_source_hash,
+          required: true,
+        })
+    const latestProvider = decryptAddress({
+      ciphertext: latest.ship_to_snapshot_ciphertext,
+      iv: latest.ship_to_snapshot_iv,
+      tag: latest.ship_to_snapshot_tag,
+      organizationId,
+      accountGlobalId: latest.account_global_id,
+      externalOrderId: latest.external_order_id,
+      sourceHash: latest.source_hash,
+      required: latest.ship_to_snapshot_state === 'protected'
+        || latest.ship_to_snapshot_state === 'confirmed',
+    })
+    const merge = mergeCommerceOrderWorkbenchProviderAddress({
+      acceptedProvider,
+      local,
+      latestProvider,
+      resolutions,
+    })
+    if (merge.conflicts.length) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
+        `Choose which value to keep for ${merge.conflicts.map((item) => item.field).join(', ')}`,
+        409,
+        {
+          latestCandidateGlobalId: latest.global_id,
+          conflicts: merge.conflicts,
+          providerWrites: 0,
+        },
+      )
+    }
+    const unexpectedResolutions = Object.keys(resolutions).filter((field) => (
+      !merge.providerChangedFields.includes(field as OrderShipToField)
+    ))
+    if (unexpectedResolutions.length) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_STALE',
+        'The selected refresh fields are stale. Refresh the order again',
+      )
+    }
+    const readiness = orderShipToReadiness(merge.merged)
+    const retainsLocalAddress = changedOrderShipToFields(
+      latestProvider,
+      merge.merged,
+    ).length > 0
+    const encrypted = retainsLocalAddress
+      ? encryptCommerceCandidateSnapshot(
+          orderShipToStorageValue(merge.merged),
+          organizationId,
+          latest.account_global_id,
+          latest.external_order_id,
+          latest.source_hash,
+          'ship_to',
+        )
+      : null
+    const updated = await client.query<{ row_version: string }>(
+      `UPDATE operations_commerce_order_workbench
+       SET candidate_id = $4::uuid,
+           accepted_provider_source_hash = $5,
+           accepted_provider_updated_at = $6,
+           ship_to_edit_state = $7,
+           ship_to_ciphertext = $8,
+           ship_to_iv = $9,
+           ship_to_tag = $10,
+           ship_to_hash = $11,
+           ship_to_source_hash = $12,
+           ship_to_encryption_version = $13,
+           sync_state = $14,
+           last_command_receipt_id = $15::uuid,
+           last_idempotency_key = $16,
+           last_request_hash = $17,
+           row_version = row_version + 1,
+           updated_by = $18,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3
+         AND candidate_id = $19::uuid
+         AND row_version = $20::bigint
+       RETURNING row_version::text`,
+      [
+        organizationId,
+        accepted.integration_account_id,
+        accepted.external_order_id,
+        latest.id,
+        latest.source_hash,
+        latest.provider_updated_at || latest.observed_at,
+        retainsLocalAddress ? `local_${readiness}` : 'provider_snapshot',
+        encrypted?.ciphertext || null,
+        encrypted?.iv || null,
+        encrypted?.tag || null,
+        encrypted?.hash || null,
+        retainsLocalAddress ? latest.source_hash : null,
+        encrypted?.encryptionVersion || null,
+        retainsLocalAddress ? 'local_only' : 'provider_snapshot',
+        prepared.receipt.id,
+        input.idempotencyKey,
+        exactRequestHash,
+        actorEmail,
+        accepted.id,
+        input.expectedRowVersion,
+      ],
+    )
+    if (!updated.rows[0]) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
+        'This order changed. Reload it before refreshing',
+      )
+    }
+    const result: OperationsImportedOrderRefreshResult = {
+      previousCandidateGlobalId: candidateGlobalId,
+      candidateGlobalId: latest.global_id,
+      rowVersion: Number(updated.rows[0].row_version),
+      status: 'rebased',
+      providerChangedFields: merge.providerChangedFields,
+      preservedLocalFields: merge.preservedLocalFields,
+      providerWrites: 0,
+      providerWriteIntentCreated: false,
+      replayed: false,
+    }
+    await client.query(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_global_id = $2,
+           result_payload = $3::jsonb, error_code = NULL,
+           error_message = NULL, completed_at = now(), updated_at = now()
+       WHERE id = $1::uuid`,
+      [prepared.receipt.id, latest.global_id, JSON.stringify(result)],
+    )
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.commerce_order_workbench.provider_rebased',
+      aggregateType: 'operations.commerce_order_workbench',
+      aggregateId: latest.global_id,
+      subject: latest.global_id,
+      organizationId,
+      eventKey: `operations:commerce-order-workbench-refresh:${prepared.receipt.id}`,
+      payload: {
+        previousCandidateGlobalId: candidateGlobalId,
+        candidateGlobalId: latest.global_id,
+        rowVersion: result.rowVersion,
+        providerChangedFields: result.providerChangedFields,
+        preservedLocalFields: result.preservedLocalFields,
+        providerWrites: 0,
+        providerWriteIntentCreated: false,
+        commandReceiptId: prepared.receipt.id,
+        correlationId: prepared.receipt.correlation_id,
+      },
+    }, client)
+    return result
   })
 }

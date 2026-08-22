@@ -71,6 +71,8 @@ import type {
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
   OperationsExternalFulfillmentReconciliationResult,
+  OperationsImportedOrderRefreshConflict,
+  OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
   OperationsImportedOrderWorkingCopy,
   OperationsOrderCommandResult,
@@ -238,8 +240,11 @@ type ImportedOrderWorkbenchPayload = {
   error?: string
   code?: string
   result?: OperationsImportedOrderShipToUpdateResult
+  refreshResult?: OperationsImportedOrderRefreshResult
   order?: OperationsImportedOrderWorkingCopy | null
   orders?: OperationsImportedOrderWorkingCopy[]
+  latestCandidateGlobalId?: string
+  conflicts?: OperationsImportedOrderRefreshConflict[]
 }
 
 type PendingImportedOrderSave = {
@@ -1247,6 +1252,8 @@ function OrderDetailDrawer({
       ? 'You do not have permission to purchase carrier labels.'
       : order?.shipmentShipTo.readiness !== 'carrier_ready'
         ? 'Add the missing ship-to details before creating a label.'
+      : order?.shipmentShipTo.rerateRequired
+        ? 'The ship-to changed after planning. Compare rates again before creating a label.'
       : order?.status !== 'packed'
         ? 'Verify package packing before creating a label.'
         : activeLabel
@@ -1265,6 +1272,8 @@ function OrderDetailDrawer({
       ? 'You do not have permission to purchase carrier labels.'
       : order?.shipmentShipTo.readiness !== 'carrier_ready'
         ? 'Add the missing ship-to details before creating labels.'
+      : order?.shipmentShipTo.rerateRequired
+        ? 'The ship-to changed after planning. Compare rates again before creating labels.'
       : !sandboxE2eAuthorization
         ? 'Authorize this exact commerce test order before creating package-specific sandbox labels.'
         : order?.status !== 'packed'
@@ -2607,6 +2616,7 @@ export default function OperationsSection({
     useState<string | null>(null)
   const [importedDrawerOpen, setImportedDrawerOpen] = useState(false)
   const [savingImportedOrder, setSavingImportedOrder] = useState(false)
+  const [refreshingImportedOrder, setRefreshingImportedOrder] = useState(false)
   const [importedOrderError, setImportedOrderError] = useState('')
   const pendingImportedOrderSave = useRef<PendingImportedOrderSave | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
@@ -3003,6 +3013,98 @@ export default function OperationsSection({
         : 'Order changes could not be saved')
     } finally {
       setSavingImportedOrder(false)
+    }
+  }
+
+  const refreshImportedOrder = async (conflictResolution?: {
+    latestCandidateGlobalId: string
+    resolutions: Partial<
+      Record<keyof OrderShipToDraft, 'local' | 'provider'>
+    >
+  }) => {
+    const order = workspace?.importedOrders.find(
+      (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
+    )
+    if (!order || refreshingImportedOrder || savingImportedOrder) return null
+    setRefreshingImportedOrder(true)
+    setImportedOrderError('')
+    try {
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': crypto.randomUUID(),
+        },
+        body: JSON.stringify({
+          action: 'refresh',
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          ...(conflictResolution
+            ? {
+                latestCandidateGlobalId:
+                  conflictResolution.latestCandidateGlobalId,
+                resolutions: conflictResolution.resolutions,
+              }
+            : {}),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        ImportedOrderWorkbenchPayload
+      if (
+        response.status === 409
+        && payload.code === 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT'
+        && payload.latestCandidateGlobalId
+        && Array.isArray(payload.conflicts)
+      ) {
+        return {
+          latestCandidateGlobalId: payload.latestCandidateGlobalId,
+          conflicts: payload.conflicts,
+        }
+      }
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.order
+        || !payload.refreshResult
+      ) {
+        throw new Error(payload.error || 'Order could not be refreshed')
+      }
+      const refreshed = payload.order
+      setWorkspace((current) => {
+        if (!current) return current
+        let inserted = false
+        const importedOrders = current.importedOrders.flatMap((candidate) => {
+          if (
+            candidate.candidateGlobalId !== order.candidateGlobalId
+            && candidate.candidateGlobalId !== refreshed.candidateGlobalId
+          ) return [candidate]
+          if (inserted) return []
+          inserted = true
+          return [refreshed]
+        })
+        if (!inserted) importedOrders.unshift(refreshed)
+        return { ...current, importedOrders }
+      })
+      setSelectedImportedGlobalId(refreshed.candidateGlobalId)
+      const nextUrl = new URL(window.location.href)
+      nextUrl.searchParams.set(
+        OPERATIONS_ORDER_QUERY,
+        refreshed.candidateGlobalId,
+      )
+      window.history.replaceState(window.history.state, '', nextUrl)
+      setNotice(
+        payload.refreshResult.status === 'rebased'
+          ? `Order ${refreshed.orderNumber} refreshed; local edits preserved`
+          : `Order ${refreshed.orderNumber} is current`,
+      )
+      return null
+    } catch (caught) {
+      setImportedOrderError(caught instanceof Error
+        ? caught.message
+        : 'Order could not be refreshed')
+      return null
+    } finally {
+      setRefreshingImportedOrder(false)
     }
   }
 
@@ -5996,9 +6098,11 @@ export default function OperationsSection({
         order={importedDetail}
         canManage={Boolean(capabilities?.canManage)}
         saving={savingImportedOrder}
+        refreshing={refreshingImportedOrder}
         error={importedOrderError}
         onClose={closeImportedDrawer}
         onSave={saveImportedOrderShipTo}
+        onRefresh={refreshImportedOrder}
       />
       <OrderDetailDrawer
         order={detail}

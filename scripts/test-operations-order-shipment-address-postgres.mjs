@@ -284,6 +284,11 @@ function loadPersistence(pool) {
     'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
     {
       '@/lib/operations/orderShipTo': orderShipTo,
+      '@/lib/integrations/carrierSandboxRate': {
+        carrierSandboxPartyFingerprint() {
+          return 'f'.repeat(64)
+        },
+      },
       '@/lib/persistence/postgres': postgresAdapter(pool),
       '@/lib/auditWriter': {
         async recordAuditEvent(input, client) {
@@ -325,7 +330,7 @@ async function seedLabelFence(pool, item) {
          promised_delivery_at, created_by
        ) VALUES (
          $1::uuid, 'gfp0009811', $2::uuid, $3::uuid, $4::uuid,
-         1, 'planned', 'manual_override', 'not_run', now() + interval '2 days', $5
+         2, 'planned', 'manual_override', 'not_run', now() + interval '2 days', $5
        )`,
       [planId, item.organizationId, item.orderId, randomUUID(), actorEmail],
     )
@@ -362,10 +367,39 @@ async function seedLabelFence(pool, item) {
        )`,
       [item.organizationId, packageId, rateId],
     )
+    await client.query(
+      `UPDATE operations_labels SET environment = 'production'
+       WHERE organization_id = $1::uuid AND global_id = 'glb0009811'`,
+      [item.organizationId],
+    )
   } finally {
     await client.query('SET session_replication_role = origin')
     client.release()
   }
+}
+
+async function seedUnratedPlan(pool, item) {
+  const client = await pool.connect()
+  const planId = randomUUID()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO operations_fulfillment_plans (
+         id, global_id, organization_id, order_id, warehouse_id,
+         version_number, status, method, solver_status,
+         promised_delivery_at, created_by
+       ) VALUES (
+         $1::uuid, 'gfp0009810', $2::uuid, $3::uuid, $4::uuid,
+         1, 'planned', 'manual_override', 'not_run',
+         now() + interval '2 days', $5
+       )`,
+      [planId, item.organizationId, item.orderId, randomUUID(), actorEmail],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+    client.release()
+  }
+  return planId
 }
 
 async function verifyAcceptance(databaseUrl, primary, other, native) {
@@ -606,25 +640,37 @@ async function verifyAcceptance(databaseUrl, primary, other, native) {
       [primary.organizationId, primary.orderId, originalCiphertext],
     )
 
+    const stalePlanId = await seedUnratedPlan(pool, primary)
     await pool.query(
       `UPDATE operations_orders SET status = 'planned'
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [primary.organizationId, primary.orderId],
     )
-    await expectAddressError(
-      () => persistence.updateOperationsOrderShipmentAddressInPostgres({
+    const plannedEdit = plain(await persistence
+      .updateOperationsOrderShipmentAddressInPostgres({
         ...readyInput,
         idempotencyKey: 'shipment-address-planned-0007',
         expectedAddressRowVersion: 3,
-        changes: { line2: 'Too late' },
-      }),
-      'OPERATIONS_SHIPMENT_ADDRESS_STAGE_INVALID',
-      409,
-    )
+        changes: { line2: 'Dock 4' },
+      }))
+    assert.equal(plannedEdit.rowVersion, 4)
+    assert.equal(plannedEdit.rerateRequired, true)
+    const plannedAddress = plain(await persistence
+      .readOperationsOrderShipmentAddressInPostgres({
+        organizationId: primary.organizationId,
+        orderGlobalId: primary.orderGlobalId,
+      }))
+    assert.equal(plannedAddress.editable, true)
+    assert.equal(plannedAddress.rerateRequired, true)
     await pool.query(
       `UPDATE operations_orders SET status = 'imported'
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [primary.organizationId, primary.orderId],
+    )
+    await pool.query(
+      `UPDATE operations_fulfillment_plans SET status = 'cancelled'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [primary.organizationId, stalePlanId],
     )
 
     await seedLabelFence(pool, primary)
@@ -632,7 +678,7 @@ async function verifyAcceptance(databaseUrl, primary, other, native) {
       () => persistence.updateOperationsOrderShipmentAddressInPostgres({
         ...readyInput,
         idempotencyKey: 'shipment-address-label-fence-0008',
-        expectedAddressRowVersion: 3,
+        expectedAddressRowVersion: 4,
         changes: { line2: 'Too late' },
       }),
       'OPERATIONS_SHIPMENT_ADDRESS_DOWNSTREAM_EVIDENCE_EXISTS',
@@ -641,8 +687,8 @@ async function verifyAcceptance(databaseUrl, primary, other, native) {
 
     const finalCounts = await stateCounts(pool, primary)
     assert.equal(finalCounts.working_copies, 1)
-    assert.equal(finalCounts.receipts, 3)
-    assert.equal(finalCounts.audits, 3)
+    assert.equal(finalCounts.receipts, 4)
+    assert.equal(finalCounts.audits, 4)
     assert.equal(finalCounts.external_effect_intents, 0)
     assert.equal(initialCounts.external_effect_intents, 0)
     const protectedText = JSON.stringify((await pool.query(

@@ -400,6 +400,14 @@ async function seedNewerProviderRevision(pool, fixture) {
   try {
     await client.query('SET session_replication_role = replica')
     await client.query(
+      `INSERT INTO crm_reference_registry (
+         reference_code, prefix, canonical_code, status, entity_type
+       ) VALUES (
+         'gcoc0009703', 'gcoc', 'gcoc0009703', 'active',
+         'operations.commerce_order_candidate'
+       ) ON CONFLICT (reference_code) DO NOTHING`,
+    )
+    await client.query(
       `INSERT INTO operations_commerce_intake_runs (
          id, global_id, organization_id, integration_account_id, pipeline_id,
          provider, resource, credential_version, provider_api_version,
@@ -678,6 +686,42 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
   try {
     await seedFixtures(pool, primary, other, readyFixture)
     const persistence = workbenchPersistence(pool)
+    const emptyAddress = {
+      name: null,
+      line1: null,
+      line2: null,
+      city: null,
+      region: null,
+      postalCode: null,
+      country: null,
+    }
+    const mergeConflict = plain(
+      persistence.mergeCommerceOrderWorkbenchProviderAddress({
+        acceptedProvider: emptyAddress,
+        local: { ...emptyAddress, city: 'Charlotte', region: 'NC' },
+        latestProvider: { ...emptyAddress, city: 'Raleigh', line1: '20 New Way' },
+      }),
+    )
+    assert.deepEqual(mergeConflict.conflicts, [{
+      field: 'city',
+      localValue: 'Charlotte',
+      providerValue: 'Raleigh',
+    }])
+    assert.equal(mergeConflict.merged.line1, '20 New Way')
+    assert.equal(mergeConflict.merged.region, 'NC')
+    const resolvedMerge = plain(
+      persistence.mergeCommerceOrderWorkbenchProviderAddress({
+        acceptedProvider: emptyAddress,
+        local: { ...emptyAddress, city: 'Charlotte', region: 'NC' },
+        latestProvider: { ...emptyAddress, city: 'Raleigh', line1: '20 New Way' },
+        resolutions: { city: 'local' },
+      }),
+    )
+    assert.deepEqual(resolvedMerge.conflicts, [])
+    assert.equal(resolvedMerge.merged.city, 'Charlotte')
+    assert.equal(resolvedMerge.merged.line1, '20 New Way')
+    assert.ok(resolvedMerge.preservedLocalFields.includes('city'))
+    assert.ok(resolvedMerge.preservedLocalFields.includes('region'))
     const providerBefore = await candidateSnapshot(pool, primary)
     const initialCounts = await stateCounts(pool, primary)
 
@@ -902,19 +946,11 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
     assert.ok(ready.remainingBlockerCodes.includes('customer_resolution_required'))
     assert.ok(ready.remainingBlockerCodes.includes('line_items_empty'))
     const addressConfirmed = await candidateSnapshot(pool, primary)
-    assert.equal(addressConfirmed.ship_to_snapshot_state, 'confirmed')
-    for (const blocker of [
-      'ship_to_confirmation_required',
-      'ship_to_incomplete',
-      'ship_to_redacted',
-      'ship_to_unavailable',
-    ]) {
-      assert.ok(
-        !addressConfirmed.blocking_codes.includes(blocker),
-        `carrier-ready Save must clear ${blocker}`,
-      )
-    }
-
+    assert.equal(
+      addressConfirmed.ship_to_snapshot_state,
+      'missing',
+      'unrelated blockers must leave the provider refresh base untouched',
+    )
     const readyCandidateBefore = await candidateSnapshot(pool, readyFixture)
     const promotableInput = {
       organizationId: readyFixture.organization,
@@ -1160,6 +1196,40 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
     assert.equal(driftedSave.readiness, 'carrier_ready')
     assert.equal(driftedSave.providerVersionChanged, true)
 
+    const rebased = plain(await persistence
+      .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: primary.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-provider-rebase-0009',
+        candidateGlobalId: primary.candidateGlobalId,
+        expectedRowVersion: 6,
+      }))
+    assert.equal(rebased.previousCandidateGlobalId, primary.candidateGlobalId)
+    assert.equal(rebased.candidateGlobalId, 'gcoc0009703')
+    assert.equal(rebased.rowVersion, 7)
+    assert.equal(rebased.status, 'rebased')
+    assert.equal(rebased.providerWrites, 0)
+    assert.equal(rebased.providerWriteIntentCreated, false)
+    assert.ok(rebased.preservedLocalFields.includes('line2'))
+    const rebasedOrder = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: primary.organization,
+        candidateGlobalId: rebased.candidateGlobalId,
+      }))
+    assert.equal(rebasedOrder.length, 1)
+    assert.equal(rebasedOrder[0].providerVersionChanged, false)
+    assert.equal(rebasedOrder[0].shipTo.value.line2, 'Dock 3')
+    const rebaseReplay = plain(await persistence
+      .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: primary.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-provider-rebase-0009',
+        candidateGlobalId: primary.candidateGlobalId,
+        expectedRowVersion: 6,
+      }))
+    assert.equal(rebaseReplay.replayed, true)
+    assert.equal(rebaseReplay.rowVersion, 7)
+
     await expectDatabaseError(
       () => pool.query(
         `UPDATE operations_commerce_order_candidates
@@ -1181,7 +1251,7 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
     const providerAfter = await candidateSnapshot(pool, primary)
     assert.equal(providerAfter.source_hash, providerBefore.source_hash)
     assert.equal(providerAfter.source_revision, providerBefore.source_revision)
-    assert.equal(providerAfter.ship_to_snapshot_state, 'confirmed')
+    assert.equal(providerAfter.ship_to_snapshot_state, 'missing')
     assert.ok(Number(providerAfter.row_version) > Number(providerBefore.row_version))
     const finalCounts = await stateCounts(pool, primary)
     assert.equal(finalCounts.working_copies, 1)
@@ -1200,12 +1270,17 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
       [primary.organization],
     )
     assert.equal(retained.rowCount, 1)
-    assert.equal(retained.rows[0].candidate_id, primary.candidate)
+    const latestCandidate = await pool.query(
+      `SELECT id::text FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid AND global_id = 'gcoc0009703'`,
+      [primary.organization],
+    )
+    assert.equal(retained.rows[0].candidate_id, latestCandidate.rows[0].id)
     assert.equal(retained.rows[0].ship_to_edit_state, 'local_carrier_ready')
     assert.equal(retained.rows[0].sync_state, 'local_only')
-    assert.equal(retained.rows[0].accepted_provider_source_hash, 'b'.repeat(64))
-    assert.equal(retained.rows[0].ship_to_source_hash, 'b'.repeat(64))
-    assert.equal(retained.rows[0].row_version, 6)
+    assert.equal(retained.rows[0].accepted_provider_source_hash, 'e'.repeat(64))
+    assert.equal(retained.rows[0].ship_to_source_hash, 'e'.repeat(64))
+    assert.equal(retained.rows[0].row_version, 7)
     const protectedText = JSON.stringify(retained.rows[0])
     for (const secret of [
       'Vendor Receiving',

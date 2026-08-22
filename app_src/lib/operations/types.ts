@@ -931,6 +931,7 @@ export type OperationsOrderShipmentAddress = {
   issues: OrderShipToIssue[]
   provenance: 'source' | 'local'
   sourceVersionChanged: boolean
+  rerateRequired: boolean
   editable: boolean
   editBlockedReason: string | null
   providerWrites: 0
@@ -952,6 +953,7 @@ export type OperationsOrderShipmentAddressUpdateResult = {
     | 'country'
   >
   sourceVersionChanged: false
+  rerateRequired: boolean
   providerWrites: 0
   providerWriteIntentCreated: false
   replayed: boolean
@@ -1160,6 +1162,31 @@ export type OperationsImportedOrderShipToUpdateResult = {
   promotionStatus: 'not_ready' | 'needs_info' | 'promoted'
   remainingBlockerCodes: string[]
   providerVersionChanged: boolean
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
+}
+
+export type OperationsImportedOrderRefreshConflict = {
+  field:
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  localValue: string | null
+  providerValue: string | null
+}
+
+export type OperationsImportedOrderRefreshResult = {
+  previousCandidateGlobalId: string
+  candidateGlobalId: string
+  rowVersion: number
+  status: 'unchanged' | 'rebased'
+  providerChangedFields: OperationsImportedOrderRefreshConflict['field'][]
+  preservedLocalFields: OperationsImportedOrderRefreshConflict['field'][]
   providerWrites: 0
   providerWriteIntentCreated: false
   replayed: boolean

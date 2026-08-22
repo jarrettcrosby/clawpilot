@@ -112,28 +112,60 @@ RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = public, pg_catalog, pg_temp
 AS $$
+DECLARE
+  prior_candidate_global_id text;
+  refresh_receipt_valid boolean := false;
 BEGIN
   IF TG_OP = 'UPDATE' AND ROW(
     NEW.organization_id,
     NEW.integration_account_id,
-    NEW.candidate_id,
     NEW.external_order_id,
-    NEW.accepted_provider_source_hash,
-    NEW.accepted_provider_updated_at,
     NEW.created_by,
     NEW.created_at
   ) IS DISTINCT FROM ROW(
     OLD.organization_id,
     OLD.integration_account_id,
-    OLD.candidate_id,
     OLD.external_order_id,
-    OLD.accepted_provider_source_hash,
-    OLD.accepted_provider_updated_at,
     OLD.created_by,
     OLD.created_at
   ) THEN
     RAISE EXCEPTION
       'Commerce order working copy accepted provider binding is immutable';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND ROW(
+    NEW.candidate_id,
+    NEW.accepted_provider_source_hash,
+    NEW.accepted_provider_updated_at
+  ) IS DISTINCT FROM ROW(
+    OLD.candidate_id,
+    OLD.accepted_provider_source_hash,
+    OLD.accepted_provider_updated_at
+  ) THEN
+    SELECT candidate.global_id
+      INTO prior_candidate_global_id
+    FROM public.operations_commerce_order_candidates candidate
+    WHERE candidate.organization_id = OLD.organization_id
+      AND candidate.integration_account_id = OLD.integration_account_id
+      AND candidate.id = OLD.candidate_id
+      AND candidate.external_order_id = OLD.external_order_id;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.operations_command_receipts receipt
+      WHERE receipt.organization_id = NEW.organization_id
+        AND receipt.id = NEW.last_command_receipt_id
+        AND receipt.command_type =
+          'operations.commerce_order_workbench.refresh'
+        AND receipt.status = 'processing'
+        AND receipt.target_global_id = prior_candidate_global_id
+        AND receipt.request_hash = NEW.last_request_hash
+    ) INTO refresh_receipt_valid;
+
+    IF NOT refresh_receipt_valid THEN
+      RAISE EXCEPTION
+        'Commerce order working copy accepted provider binding is immutable';
+    END IF;
   END IF;
 
   IF NOT EXISTS (
@@ -206,10 +238,10 @@ COMMENT ON TABLE operations_commerce_order_workbench IS
 
 COMMENT ON COLUMN
   operations_commerce_order_workbench.accepted_provider_source_hash IS
-  'Last provider revision visible when the local working copy was first created; later provider drift remains explicit.';
+  'Provider revision accepted by the current explicit read-only refresh/rebase. It changes only with a matching durable refresh receipt.';
 
 COMMENT ON COLUMN operations_commerce_order_workbench.candidate_id IS
-  'Immutable provider candidate bound when the durable local working copy is first created; retention expiry never changes this accepted evidence.';
+  'Provider candidate bound to the working copy. A read-only refresh may rebind it only through the validated refresh receipt while retaining old candidate and audit evidence.';
 
 COMMENT ON COLUMN operations_commerce_order_workbench.canonical_order_id IS
   'Set only after the bound candidate passes the existing validation and promotion gates. The Orders workbench suppresses the candidate row once this exact canonical link exists.';

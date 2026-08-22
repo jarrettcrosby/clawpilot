@@ -10,6 +10,8 @@ const [
   operationsRoute,
   operations,
   types,
+  intake,
+  drawer,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
   read('app_src/lib/persistence/commerceOrderWorkbench.ts'),
@@ -17,6 +19,8 @@ const [
   read('app_src/app/api/operations/route.ts'),
   read('app_src/lib/persistence/operations.ts'),
   read('app_src/lib/operations/types.ts'),
+  read('app_src/lib/integrations/commerceIntake.ts'),
+  read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
 ])
 
 for (const fragment of [
@@ -33,6 +37,8 @@ for (const fragment of [
   'operations_commerce_order_workbench_candidate_fkey',
   'operations_commerce_order_workbench_receipt_fkey',
   'accepted provider binding is immutable',
+  'operations.commerce_order_workbench.refresh',
+  'matching durable refresh receipt',
 ]) {
   assert.ok(migration.includes(fragment), `0307 is missing ${fragment}`)
 }
@@ -68,6 +74,11 @@ for (const fragment of [
   'retained.canonical_order_id IS NULL',
   'retained_candidate.canonical_order_id IS NULL',
   'canonical_order_id = canonical.canonical_order_id',
+  'mergeCommerceOrderWorkbenchProviderAddress',
+  'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
+  'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
+  'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
+  'provider_rebased',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
@@ -95,11 +106,31 @@ assert.equal(
 for (const fragment of [
   'export async function GET',
   'export async function PATCH',
+  'export async function POST',
   "new Set(['candidateGlobalId', 'expectedRowVersion', 'shipTo'])",
+  'refreshCommerceOrderWorkbenchCandidate',
+  'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
   'capabilities.canManage',
   'idempotencyKeyValue(req)',
 ]) {
   assert.ok(route.includes(fragment), `Route is missing ${fragment}`)
+}
+
+for (const fragment of [
+  'refreshCommerceOrderWorkbenchCandidate',
+  'runAutomaticOrderHooks: false',
+  "action: 'refresh'",
+  'confirmReadOnly: true',
+]) {
+  assert.ok(intake.includes(fragment), `Intake refresh is missing ${fragment}`)
+}
+for (const fragment of [
+  'Choose a value for each field changed in both places.',
+  'Keep mine:',
+  'Use {providerLabel(order!.provider)}:',
+  'Apply choices',
+]) {
+  assert.ok(drawer.includes(fragment), `Drawer refresh is missing ${fragment}`)
 }
 assert.equal(
   /reasonValue|confirmationStatement|canActivate/u.test(route),

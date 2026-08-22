@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { carrierSandboxPartyFingerprint } from '@/lib/integrations/carrierSandboxRate'
 import {
   decryptCommerceCandidateSnapshot,
   encryptCommerceCandidateSnapshot,
@@ -43,6 +44,8 @@ type ShipmentAddressRow = QueryResultRow & {
   label_count: string
   shipment_count: string
   export_count: string
+  active_plan_count: string
+  plan_destination_fingerprints: string[]
   working_copy_id: string | null
   accepted_source_order_row_version: string | null
   accepted_source_order_hash: string | null
@@ -192,10 +195,42 @@ function editBlockedReason(row: ShipmentAddressRow) {
   ) {
     return 'This order already has label, shipment, or store-export evidence.'
   }
-  if (row.order_status !== 'imported') {
-    return 'Edit the ship-to before creating the warehouse plan.'
-  }
   return null
+}
+
+function currentRateDestinationFingerprint(value: OrderShipToDraft) {
+  if (orderShipToReadiness(value) !== 'carrier_ready' || value.country !== 'US') {
+    return null
+  }
+  try {
+    return carrierSandboxPartyFingerprint({
+      name: value.name!,
+      line1: value.line1!,
+      line2: value.line2,
+      city: value.city!,
+      region: value.region!,
+      postalCode: value.postalCode!,
+      countryCode: 'US',
+    })
+  } catch {
+    return null
+  }
+}
+
+function shipmentAddressRequiresRerate(
+  row: ShipmentAddressRow,
+  value: OrderShipToDraft,
+) {
+  const activePlanCount = Number(row.active_plan_count)
+  if (activePlanCount === 0) return false
+  const currentFingerprint = currentRateDestinationFingerprint(value)
+  if (!currentFingerprint) return true
+  return (
+    row.plan_destination_fingerprints.length !== activePlanCount
+    || row.plan_destination_fingerprints.some((fingerprint) => (
+      fingerprint !== currentFingerprint
+    ))
+  )
 }
 
 function projectShipmentAddress(
@@ -224,6 +259,7 @@ function projectShipmentAddress(
       local
       && row.accepted_source_order_hash !== currentSourceHash
     ),
+    rerateRequired: shipmentAddressRequiresRerate(row, value),
     editable: blockedReason === null,
     editBlockedReason: blockedReason,
     providerWrites: 0,
@@ -256,7 +292,21 @@ async function readShipmentAddressRow(input: {
        source_order.external_order_id,
        source_account.global_id AS account_global_id,
        source_order.ship_to AS source_ship_to,
-       (SELECT count(*)::text
+       (SELECT (
+          count(*) FILTER (
+            WHERE label.environment = 'production'
+              AND label.status = 'created'
+          )
+          + (
+            SELECT count(*)
+            FROM operations_label_attempts attempt
+            WHERE attempt.organization_id = source_order.organization_id
+              AND attempt.order_id = source_order.id
+              AND attempt.action = 'create'
+              AND attempt.environment = 'production'
+              AND attempt.state IN ('prepared', 'succeeded', 'unknown')
+          )
+        )::text
         FROM operations_labels label
         JOIN operations_packages package
           ON package.organization_id = label.organization_id
@@ -275,6 +325,22 @@ async function readShipmentAddressRow(input: {
         WHERE fulfillment_export.organization_id =
               source_order.organization_id
           AND fulfillment_export.order_id = source_order.id) AS export_count,
+       (SELECT count(*)::text
+        FROM operations_fulfillment_plans plan
+        WHERE plan.organization_id = source_order.organization_id
+          AND plan.order_id = source_order.id
+          AND plan.status IN ('planned', 'released')) AS active_plan_count,
+       ARRAY(
+         SELECT evidence.destination_fingerprint
+         FROM operations_fulfillment_plans plan
+         JOIN operations_cartonization_rate_evidence evidence
+           ON evidence.organization_id = plan.organization_id
+          AND evidence.id = plan.cartonization_evidence_id
+         WHERE plan.organization_id = source_order.organization_id
+           AND plan.order_id = source_order.id
+           AND plan.status IN ('planned', 'released')
+         ORDER BY plan.version_number, plan.id
+       ) AS plan_destination_fingerprints,
        working_copy.id::text AS working_copy_id,
        working_copy.source_order_row_version::text
          AS accepted_source_order_row_version,
@@ -695,6 +761,7 @@ export async function updateOperationsOrderShipmentAddressInPostgres(input: {
       issues,
       changedFields,
       sourceVersionChanged: false,
+      rerateRequired: shipmentAddressRequiresRerate(row, after),
       providerWrites: 0,
       providerWriteIntentCreated: false,
       replayed: false,
@@ -722,6 +789,7 @@ export async function updateOperationsOrderShipmentAddressInPostgres(input: {
         readiness,
         issueFields: issues.map((issue) => issue.field),
         changedFields,
+        rerateRequired: result.rerateRequired,
         providerWrites: 0,
         providerWriteIntentCreated: false,
         commandReceiptId: prepared.receipt.id,
