@@ -21,7 +21,9 @@ import {
 import CloseRounded from '@mui/icons-material/CloseRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
+import MoveToInboxRounded from '@mui/icons-material/MoveToInboxRounded'
 import type {
+  OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderWorkingCopyDraft,
   OperationsImportedOrderWorkingCopy,
@@ -45,15 +47,19 @@ type ImportedOrderWorkingCopyDrawerProps = {
   refreshing?: boolean
   onClose: () => void
   onSave: (draft: OperationsImportedOrderWorkingCopyDraft) => Promise<void> | void
+  onAccept: () => Promise<void> | void
   onRefresh?: (input?: {
     latestCandidateGlobalId: string
     resolutions: Partial<Record<keyof OrderShipToDraft, 'local' | 'provider'>>
+    lineResolutions: Record<string, 'provider'>
   }) => Promise<{
     latestCandidateGlobalId: string
     conflicts: OperationsImportedOrderRefreshConflict[]
+    lineConflicts: OperationsImportedOrderLineRefreshConflict[]
   } | null> | {
     latestCandidateGlobalId: string
     conflicts: OperationsImportedOrderRefreshConflict[]
+    lineConflicts: OperationsImportedOrderLineRefreshConflict[]
   } | null
 }
 
@@ -135,6 +141,7 @@ export default function ImportedOrderWorkingCopyDrawer({
   refreshing = false,
   onClose,
   onSave,
+  onAccept,
   onRefresh,
 }: ImportedOrderWorkingCopyDrawerProps) {
   const theme = useTheme()
@@ -154,10 +161,14 @@ export default function ImportedOrderWorkingCopyDrawer({
   const [refreshConflict, setRefreshConflict] = useState<{
     latestCandidateGlobalId: string
     conflicts: OperationsImportedOrderRefreshConflict[]
+    lineConflicts: OperationsImportedOrderLineRefreshConflict[]
   } | null>(null)
   const [refreshChoices, setRefreshChoices] = useState<Partial<
     Record<keyof OrderShipToDraft, 'local' | 'provider'>
   >>({})
+  const [lineRefreshChoices, setLineRefreshChoices] = useState<
+    Record<string, 'provider'>
+  >({})
 
   const changed = useMemo(() => order ? editorFingerprint({
     shipTo,
@@ -234,14 +245,22 @@ export default function ImportedOrderWorkingCopyDrawer({
 
   const refresh = async (resolveConflict = false) => {
     if (!onRefresh) return
+    if (!resolveConflict) {
+      setRefreshChoices({})
+      setLineRefreshChoices({})
+    }
     const conflict = await onRefresh(resolveConflict && refreshConflict
       ? {
           latestCandidateGlobalId: refreshConflict.latestCandidateGlobalId,
           resolutions: refreshChoices,
+          lineResolutions: lineRefreshChoices,
         }
       : undefined)
     setRefreshConflict(conflict)
-    if (!conflict) setRefreshChoices({})
+    if (!conflict) {
+      setRefreshChoices({})
+      setLineRefreshChoices({})
+    }
   }
 
   return (
@@ -323,7 +342,7 @@ export default function ImportedOrderWorkingCopyDrawer({
             <Alert severity="warning">
               <Stack spacing={1.25}>
                 <Typography variant="body2" fontWeight={700}>
-                  Choose a value for each field changed in both places.
+                  Review each local value changed by the provider refresh.
                 </Typography>
                 {refreshConflict.conflicts.map((conflict) => (
                   <Stack key={conflict.field} spacing={0.5}>
@@ -365,6 +384,37 @@ export default function ImportedOrderWorkingCopyDrawer({
                     </Stack>
                   </Stack>
                 ))}
+                {refreshConflict.lineConflicts.map((conflict) => {
+                  const productName = order?.productOptions.find((option) => (
+                    option.globalId === conflict.localDraft.productGlobalId
+                  ))?.name || conflict.localDraft.productGlobalId
+                  return (
+                    <Box
+                      key={conflict.lineGlobalId}
+                      sx={{ border: 1, borderColor: 'warning.main', borderRadius: 1.5, p: 1 }}
+                    >
+                      <Typography variant="body2" fontWeight={700}>
+                        {conflict.title}{conflict.sku ? ` · ${conflict.sku}` : ''}
+                      </Typography>
+                      <Typography variant="caption" display="block" sx={{ mb: 0.75 }}>
+                        Your saved match to {productName} could not be tied to one exact
+                        refreshed provider item. It has not been discarded.
+                      </Typography>
+                      <Button
+                        size="small"
+                        variant={lineRefreshChoices[conflict.lineGlobalId]
+                          ? 'contained'
+                          : 'outlined'}
+                        onClick={() => setLineRefreshChoices((current) => ({
+                          ...current,
+                          [conflict.lineGlobalId]: 'provider',
+                        }))}
+                      >
+                        Use refreshed provider item
+                      </Button>
+                    </Box>
+                  )
+                })}
                 <Button
                   size="small"
                   variant="contained"
@@ -372,6 +422,9 @@ export default function ImportedOrderWorkingCopyDrawer({
                     refreshing
                     || refreshConflict.conflicts.some((conflict) => (
                       !refreshChoices[conflict.field]
+                    ))
+                    || refreshConflict.lineConflicts.some((conflict) => (
+                      !lineRefreshChoices[conflict.lineGlobalId]
                     ))
                   }
                   onClick={() => void refresh(true)}
@@ -712,6 +765,26 @@ export default function ImportedOrderWorkingCopyDrawer({
           </Typography>
           <Stack direction="row" gap={1}>
             <Button onClick={onClose} disabled={saving}>Close</Button>
+            <Button
+              variant="contained"
+              startIcon={saving
+                ? <CircularProgress size={16} />
+                : <MoveToInboxRounded />}
+              disabled={
+                !order
+                || !order.resolutionDetailsLoaded
+                || !canManage
+                || saving
+                || changed
+                || order.needsInfo
+                || order.providerVersionChanged
+                || draftReadiness !== 'carrier_ready'
+                || invalidLinePrices.size > 0
+              }
+              onClick={() => void onAccept()}
+            >
+              Accept &amp; import
+            </Button>
             <Button
               variant="contained"
               startIcon={saving ? <CircularProgress size={16} /> : <SaveRounded />}

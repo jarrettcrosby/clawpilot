@@ -1251,6 +1251,20 @@ export type OperationsImportedOrderRefreshConflict = {
   providerValue: string | null
 }
 
+export type OperationsImportedOrderLineRefreshConflict = {
+  lineGlobalId: string
+  externalLineId: string
+  title: string
+  sku: string | null
+  reason: 'provider_line_missing' | 'provider_line_ambiguous'
+  localDraft: {
+    productGlobalId: string
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+  }
+}
+
 export type OperationsImportedOrderRefreshResult = {
   previousCandidateGlobalId: string
   candidateGlobalId: string
@@ -1258,6 +1272,11 @@ export type OperationsImportedOrderRefreshResult = {
   status: 'unchanged' | 'rebased'
   providerChangedFields: OperationsImportedOrderRefreshConflict['field'][]
   preservedLocalFields: OperationsImportedOrderRefreshConflict['field'][]
+  preservedLineDrafts: Array<{
+    previousLineGlobalId: string
+    lineGlobalId: string
+    externalLineId: string
+  }>
   providerWrites: 0
   providerWriteIntentCreated: false
   replayed: boolean

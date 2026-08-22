@@ -72,6 +72,7 @@ import type {
   OperationsExceptionUpdateResult,
   OperationsExternalFulfillmentReconciliationResult,
   OperationsImportedOrderRefreshConflict,
+  OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
   OperationsImportedOrderWorkingCopyDraft,
@@ -246,6 +247,7 @@ type ImportedOrderWorkbenchPayload = {
   orders?: OperationsImportedOrderWorkingCopy[]
   latestCandidateGlobalId?: string
   conflicts?: OperationsImportedOrderRefreshConflict[]
+  lineConflicts?: OperationsImportedOrderLineRefreshConflict[]
 }
 
 type PendingImportedOrderSave = {
@@ -2585,6 +2587,7 @@ export default function OperationsSection({
   const [refreshingImportedOrder, setRefreshingImportedOrder] = useState(false)
   const [importedOrderError, setImportedOrderError] = useState('')
   const pendingImportedOrderSave = useRef<PendingImportedOrderSave | null>(null)
+  const pendingImportedOrderAccept = useRef<PendingImportedOrderSave | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -2948,6 +2951,27 @@ export default function OperationsSection({
     }
   }
 
+  const openAcceptedImportedOrder = async (
+    orderNumber: string,
+    canonicalOrderGlobalId: string,
+  ) => {
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
+    setSearch('')
+    setStatus('')
+    const nextUrl = new URL(window.location.href)
+    nextUrl.searchParams.set(
+      OPERATIONS_ORDER_QUERY,
+      canonicalOrderGlobalId,
+    )
+    window.history.replaceState(window.history.state, '', nextUrl)
+    await loadWorkspace(canonicalOrderGlobalId)
+    setSelectedGlobalId(canonicalOrderGlobalId)
+    setDrawerOpen(true)
+    setNotice(`Order ${orderNumber} imported`)
+  }
+
   const saveImportedOrderDraft = async (
     draft: OperationsImportedOrderWorkingCopyDraft,
   ) => {
@@ -2994,18 +3018,10 @@ export default function OperationsSection({
       pendingImportedOrderSave.current = null
       const canonicalOrderGlobalId = payload.result.canonicalOrderGlobalId
       if (canonicalOrderGlobalId) {
-        setImportedDrawerOpen(false)
-        setSelectedImportedGlobalId(null)
-        setImportedOrderError('')
-        setSearch('')
-        setStatus('')
-        const nextUrl = new URL(window.location.href)
-        nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, canonicalOrderGlobalId)
-        window.history.replaceState(window.history.state, '', nextUrl)
-        await loadWorkspace(canonicalOrderGlobalId)
-        setSelectedGlobalId(canonicalOrderGlobalId)
-        setDrawerOpen(true)
-        setNotice(`Order ${order.orderNumber} imported`)
+        await openAcceptedImportedOrder(
+          order.orderNumber,
+          canonicalOrderGlobalId,
+        )
         return
       }
       if (!payload.order) {
@@ -3030,11 +3046,82 @@ export default function OperationsSection({
     }
   }
 
+  const acceptImportedOrder = async () => {
+    const order = workspace?.importedOrders.find(
+      (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
+    )
+    if (!order || savingImportedOrder) return
+    const retained = pendingImportedOrderAccept.current
+    const pending = retained
+      && retained.candidateGlobalId === order.candidateGlobalId
+      && retained.expectedRowVersion === order.rowVersion
+      ? retained
+      : {
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          fingerprint: 'accept',
+          idempotencyKey: crypto.randomUUID(),
+        }
+    pendingImportedOrderAccept.current = pending
+    setSavingImportedOrder(true)
+    setImportedOrderError('')
+    try {
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': pending.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'accept',
+          candidateGlobalId: pending.candidateGlobalId,
+          expectedRowVersion: pending.expectedRowVersion,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        ImportedOrderWorkbenchPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        if (response.status >= 400 && response.status < 500) {
+          pendingImportedOrderAccept.current = null
+        }
+        throw new Error(payload.error || 'Order could not be imported')
+      }
+      pendingImportedOrderAccept.current = null
+      if (payload.result.canonicalOrderGlobalId) {
+        await openAcceptedImportedOrder(
+          order.orderNumber,
+          payload.result.canonicalOrderGlobalId,
+        )
+        return
+      }
+      if (!payload.order) {
+        throw new Error('Imported order result could not be reloaded')
+      }
+      const retainedOrder = payload.order
+      setWorkspace((current) => current ? {
+        ...current,
+        importedOrders: current.importedOrders.map((candidate) => (
+          candidate.candidateGlobalId === retainedOrder.candidateGlobalId
+            ? retainedOrder
+            : candidate
+        )),
+      } : current)
+      setNotice(`Order ${retainedOrder.orderNumber} still needs information`)
+    } catch (caught) {
+      setImportedOrderError(caught instanceof Error
+        ? caught.message
+        : 'Order could not be imported')
+    } finally {
+      setSavingImportedOrder(false)
+    }
+  }
+
   const refreshImportedOrder = async (conflictResolution?: {
     latestCandidateGlobalId: string
     resolutions: Partial<
       Record<keyof OrderShipToDraft, 'local' | 'provider'>
     >
+    lineResolutions: Record<string, 'provider'>
   }) => {
     const order = workspace?.importedOrders.find(
       (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
@@ -3058,6 +3145,7 @@ export default function OperationsSection({
                 latestCandidateGlobalId:
                   conflictResolution.latestCandidateGlobalId,
                 resolutions: conflictResolution.resolutions,
+                lineResolutions: conflictResolution.lineResolutions,
               }
             : {}),
         }),
@@ -3069,10 +3157,12 @@ export default function OperationsSection({
         && payload.code === 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT'
         && payload.latestCandidateGlobalId
         && Array.isArray(payload.conflicts)
+        && Array.isArray(payload.lineConflicts)
       ) {
         return {
           latestCandidateGlobalId: payload.latestCandidateGlobalId,
           conflicts: payload.conflicts,
+          lineConflicts: payload.lineConflicts,
         }
       }
       if (
@@ -3108,7 +3198,9 @@ export default function OperationsSection({
       window.history.replaceState(window.history.state, '', nextUrl)
       setNotice(
         payload.refreshResult.status === 'rebased'
-          ? `Order ${refreshed.orderNumber} refreshed; review item matches before saving`
+          ? payload.refreshResult.preservedLineDrafts.length
+            ? `Order ${refreshed.orderNumber} refreshed; saved item matches were preserved`
+            : `Order ${refreshed.orderNumber} refreshed; review provider item changes`
           : `Order ${refreshed.orderNumber} is current`,
       )
       return null
@@ -6122,6 +6214,7 @@ export default function OperationsSection({
         error={importedOrderError}
         onClose={closeImportedDrawer}
         onSave={saveImportedOrderDraft}
+        onAccept={acceptImportedOrder}
         onRefresh={refreshImportedOrder}
       />
       <OrderDetailDrawer

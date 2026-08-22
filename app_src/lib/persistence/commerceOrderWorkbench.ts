@@ -18,6 +18,7 @@ import {
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
 import type {
+  OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
@@ -164,6 +165,27 @@ type WorkbenchLineResolutionDraft = {
   unitPriceMinor: number | null
   currency: string
   packageProfileGlobalId: string | null
+}
+
+type RefreshCandidateLineRow = {
+  candidate_id: string
+  global_id: string
+  external_line_id: string
+  product_title_snapshot: string
+  sku_snapshot: string | null
+}
+
+export type CommerceOrderWorkbenchLineRefreshResolution = Record<
+  string,
+  'provider'
+>
+
+type CommerceOrderWorkbenchLineDraftMerge = {
+  drafts: Record<string, WorkbenchLineResolutionDraft>
+  preservedLineDrafts: OperationsImportedOrderRefreshResult[
+    'preservedLineDrafts'
+  ]
+  conflicts: OperationsImportedOrderLineRefreshConflict[]
 }
 
 type WorkbenchLineReadRow = {
@@ -517,6 +539,73 @@ export function mergeCommerceOrderWorkbenchProviderAddress(input: {
     )),
     conflicts,
   }
+}
+
+export function mergeCommerceOrderWorkbenchLineDrafts(input: {
+  acceptedLines: RefreshCandidateLineRow[]
+  latestLines: RefreshCandidateLineRow[]
+  localDrafts: Record<string, WorkbenchLineResolutionDraft>
+  resolutions?: CommerceOrderWorkbenchLineRefreshResolution | null
+}): CommerceOrderWorkbenchLineDraftMerge {
+  const acceptedByGlobalId = new Map(input.acceptedLines.map((line) => (
+    [line.global_id, line]
+  )))
+  const acceptedByExternalId = new Map<string, RefreshCandidateLineRow[]>()
+  const latestByExternalId = new Map<string, RefreshCandidateLineRow[]>()
+  for (const line of input.acceptedLines) {
+    const matches = acceptedByExternalId.get(line.external_line_id) || []
+    matches.push(line)
+    acceptedByExternalId.set(line.external_line_id, matches)
+  }
+  for (const line of input.latestLines) {
+    const matches = latestByExternalId.get(line.external_line_id) || []
+    matches.push(line)
+    latestByExternalId.set(line.external_line_id, matches)
+  }
+
+  const drafts: Record<string, WorkbenchLineResolutionDraft> = {}
+  const preservedLineDrafts: CommerceOrderWorkbenchLineDraftMerge[
+    'preservedLineDrafts'
+  ] = []
+  const conflicts: OperationsImportedOrderLineRefreshConflict[] = []
+  for (const [lineGlobalId, draft] of Object.entries(input.localDrafts)) {
+    const accepted = acceptedByGlobalId.get(lineGlobalId)
+    if (!accepted) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_LINE_DRAFT_INVALID',
+        'A saved item match no longer belongs to the accepted provider order',
+        500,
+      )
+    }
+    const acceptedMatches = acceptedByExternalId.get(
+      accepted.external_line_id,
+    ) || []
+    const latestMatches = latestByExternalId.get(
+      accepted.external_line_id,
+    ) || []
+    if (acceptedMatches.length === 1 && latestMatches.length === 1) {
+      const latest = latestMatches[0]
+      drafts[latest.global_id] = draft
+      preservedLineDrafts.push({
+        previousLineGlobalId: lineGlobalId,
+        lineGlobalId: latest.global_id,
+        externalLineId: accepted.external_line_id,
+      })
+      continue
+    }
+    if (input.resolutions?.[lineGlobalId] === 'provider') continue
+    conflicts.push({
+      lineGlobalId,
+      externalLineId: accepted.external_line_id,
+      title: accepted.product_title_snapshot,
+      sku: accepted.sku_snapshot,
+      reason: latestMatches.length === 0
+        ? 'provider_line_missing'
+        : 'provider_line_ambiguous',
+      localDraft: { ...draft },
+    })
+  }
+  return { drafts, preservedLineDrafts, conflicts }
 }
 
 function customerSnapshotName(row: WorkbenchReadRow) {
@@ -1660,7 +1749,7 @@ async function handoffCarrierReadyDraft(input: {
   })
 }
 
-export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
+async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
   organizationId: string
   actorEmail: string
   idempotencyKey: string
@@ -1668,6 +1757,7 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
   expectedRowVersion: number
   changes: OrderShipToPatch
   resolutionDraft?: OperationsImportedOrderResolutionDraft
+  action: 'save' | 'accept'
   /** Test-only crash seam after the durable local checkpoint commits. */
   afterLocalSaveBeforeHandoff?: () => void | Promise<void>
 }): Promise<OperationsImportedOrderShipToUpdateResult> {
@@ -1694,12 +1784,13 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
       400,
     )
   }
-  const resolution = normalizedResolutionDraft(input.resolutionDraft)
+  const requestedResolution = normalizedResolutionDraft(input.resolutionDraft)
   if (
-    !Object.keys(input.changes).length
-    && !resolution.customerGlobalId
-    && !resolution.requestedDeliveryAt
-    && !resolution.lines.length
+    input.action === 'save'
+    && !Object.keys(input.changes).length
+    && !requestedResolution.customerGlobalId
+    && !requestedResolution.requestedDeliveryAt
+    && !requestedResolution.lines.length
   ) {
     requestError(
       'OPERATIONS_IMPORTED_ORDER_EDIT_EMPTY',
@@ -1708,10 +1799,11 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
     )
   }
   const exactRequestHash = requestHash({
+    action: input.action,
     candidateGlobalId,
     expectedRowVersion: input.expectedRowVersion,
     changes: input.changes,
-    resolution,
+    resolution: requestedResolution,
   })
   const saved = await withTransaction<
     SavedDraft | OperationsImportedOrderShipToUpdateResult
@@ -1805,6 +1897,17 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
       [organizationId, candidate.integration_account_id, candidate.external_order_id],
     )
     const current = workbenchResult.rows[0] || null
+    const resolution = input.action === 'accept' && current
+      ? {
+          customerGlobalId: current.customer_global_id_draft,
+          requestedDeliveryAt:
+            current.requested_delivery_at_draft?.toISOString() || null,
+          lines: Object.entries(current.line_resolution_drafts).map(([
+            lineGlobalId,
+            draft,
+          ]) => ({ lineGlobalId, ...draft })),
+        }
+      : requestedResolution
     if (current && current.candidate_id !== candidate.id) {
       requestError(
         'OPERATIONS_IMPORTED_ORDER_CHANGED',
@@ -2118,6 +2221,7 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
         providerWriteIntentCreated: false,
         commandReceiptId: prepared.receipt.id,
         correlationId: prepared.receipt.correlation_id,
+        commandAction: input.action,
       },
     }, client)
     return {
@@ -2146,6 +2250,37 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
   })
 }
 
+export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  expectedRowVersion: number
+  changes: OrderShipToPatch
+  resolutionDraft?: OperationsImportedOrderResolutionDraft
+  /** Test-only crash seam after the durable local checkpoint commits. */
+  afterLocalSaveBeforeHandoff?: () => void | Promise<void>
+}): Promise<OperationsImportedOrderShipToUpdateResult> {
+  return saveOrAcceptCommerceOrderWorkbenchInPostgres({
+    ...input,
+    action: 'save',
+  })
+}
+
+export async function acceptCommerceOrderWorkbenchInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+  expectedRowVersion: number
+}): Promise<OperationsImportedOrderShipToUpdateResult> {
+  return saveOrAcceptCommerceOrderWorkbenchInPostgres({
+    ...input,
+    changes: {},
+    action: 'accept',
+  })
+}
+
 function replayedRefreshResult(
   receipt: CommandReceiptRow,
 ): OperationsImportedOrderRefreshResult {
@@ -2158,6 +2293,10 @@ function replayedRefreshResult(
     || !['unchanged', 'rebased'].includes(String(payload.status || ''))
     || !Array.isArray(payload.providerChangedFields)
     || !Array.isArray(payload.preservedLocalFields)
+    || (
+      payload.preservedLineDrafts !== undefined
+      && !Array.isArray(payload.preservedLineDrafts)
+    )
   ) {
     requestError(
       'OPERATIONS_IMPORTED_ORDER_REFRESH_RESULT_INVALID',
@@ -2167,6 +2306,11 @@ function replayedRefreshResult(
   }
   return {
     ...(payload as Omit<OperationsImportedOrderRefreshResult, 'replayed'>),
+    preservedLineDrafts: Array.isArray(payload.preservedLineDrafts)
+      ? payload.preservedLineDrafts as OperationsImportedOrderRefreshResult[
+          'preservedLineDrafts'
+        ]
+      : [],
     replayed: true,
   }
 }
@@ -2317,6 +2461,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
     expectedRowVersion: number
     expectedLatestCandidateGlobalId?: string | null
     resolutions?: CommerceOrderWorkbenchRefreshResolution | null
+    lineResolutions?: CommerceOrderWorkbenchLineRefreshResolution | null
   },
 ): Promise<OperationsImportedOrderRefreshResult> {
   const organizationId = requireOrganizationId(input.organizationId)
@@ -2354,6 +2499,16 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       requestError(
         'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
         'Choose whether to keep the local or provider value for each conflicting field',
+        400,
+      )
+    }
+  }
+  const lineResolutions = input.lineResolutions || {}
+  for (const [lineGlobalId, resolution] of Object.entries(lineResolutions)) {
+    if (!LINE_GLOBAL_ID.test(lineGlobalId) || resolution !== 'provider') {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+        'Choose the refreshed provider item for each changed saved item match',
         400,
       )
     }
@@ -2412,6 +2567,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               accepted_provider_updated_at, ship_to_edit_state,
               ship_to_ciphertext, ship_to_iv, ship_to_tag,
               ship_to_source_hash, canonical_order_id::text,
+              line_resolution_drafts,
               last_command_receipt_id::text, last_request_hash,
               row_version::text
        FROM operations_commerce_order_workbench
@@ -2494,6 +2650,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         status: latest.id === accepted.id ? 'unchanged' : 'rebased',
         providerChangedFields: [],
         preservedLocalFields: [],
+        preservedLineDrafts: [],
         providerWrites: 0,
         providerWriteIntentCreated: false,
         replayed: false,
@@ -2519,6 +2676,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         status: 'unchanged',
         providerChangedFields: [],
         preservedLocalFields: [],
+        preservedLineDrafts: [],
         providerWrites: 0,
         providerWriteIntentCreated: false,
         replayed: false,
@@ -2530,6 +2688,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       latestCandidateGlobalId: latest.global_id,
       expectedRowVersion: input.expectedRowVersion,
       resolutions,
+      lineResolutions,
       providerWrites: 0,
     })
     const prepared = await prepareRefreshReceipt(client, {
@@ -2593,14 +2752,41 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       latestProvider,
       resolutions,
     })
-    if (merge.conflicts.length) {
+    const lineResult = await client.query<RefreshCandidateLineRow>(
+      `SELECT line.order_candidate_id::text AS candidate_id,
+              line.global_id, line.external_line_id,
+              line.product_title_snapshot, line.sku_snapshot
+       FROM operations_commerce_order_candidate_lines line
+       WHERE line.organization_id = $1::uuid
+         AND line.integration_account_id = $2::uuid
+         AND line.order_candidate_id = ANY($3::uuid[])
+         AND line.unfulfilled_quantity > 0
+       ORDER BY line.order_candidate_id, line.created_at, line.id`,
+      [
+        organizationId,
+        accepted.integration_account_id,
+        [accepted.id, latest.id],
+      ],
+    )
+    const lineMerge = mergeCommerceOrderWorkbenchLineDrafts({
+      acceptedLines: lineResult.rows.filter((line) => (
+        line.candidate_id === accepted.id
+      )),
+      latestLines: lineResult.rows.filter((line) => (
+        line.candidate_id === latest.id
+      )),
+      localDrafts: current.line_resolution_drafts,
+      resolutions: lineResolutions,
+    })
+    if (merge.conflicts.length || lineMerge.conflicts.length) {
       requestError(
         'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
-        `Choose which value to keep for ${merge.conflicts.map((item) => item.field).join(', ')}`,
+        'Review each local value that changed in the refreshed provider order',
         409,
         {
           latestCandidateGlobalId: latest.global_id,
           conflicts: merge.conflicts,
+          lineConflicts: lineMerge.conflicts,
           providerWrites: 0,
         },
       )
@@ -2612,6 +2798,25 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       requestError(
         'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_STALE',
         'The selected refresh fields are stale. Refresh the order again',
+      )
+    }
+    const expectedLineResolutionIds = new Set(
+      mergeCommerceOrderWorkbenchLineDrafts({
+        acceptedLines: lineResult.rows.filter((line) => (
+          line.candidate_id === accepted.id
+        )),
+        latestLines: lineResult.rows.filter((line) => (
+          line.candidate_id === latest.id
+        )),
+        localDrafts: current.line_resolution_drafts,
+      }).conflicts.map((conflict) => conflict.lineGlobalId),
+    )
+    if (Object.keys(lineResolutions).some((lineGlobalId) => (
+      !expectedLineResolutionIds.has(lineGlobalId)
+    ))) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_STALE',
+        'The selected refreshed items are stale. Refresh the order again',
       )
     }
     const readiness = orderShipToReadiness(merge.merged)
@@ -2641,19 +2846,19 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
            ship_to_hash = $11,
            ship_to_source_hash = $12,
            ship_to_encryption_version = $13,
-           line_resolution_drafts = '{}'::jsonb,
-           sync_state = $14,
-           last_command_receipt_id = $15::uuid,
-           last_idempotency_key = $16,
-           last_request_hash = $17,
+           line_resolution_drafts = $14::jsonb,
+           sync_state = $15,
+           last_command_receipt_id = $16::uuid,
+           last_idempotency_key = $17,
+           last_request_hash = $18,
            row_version = row_version + 1,
-           updated_by = $18,
+           updated_by = $19,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND external_order_id = $3
-         AND candidate_id = $19::uuid
-         AND row_version = $20::bigint
+         AND candidate_id = $20::uuid
+         AND row_version = $21::bigint
        RETURNING row_version::text`,
       [
         organizationId,
@@ -2669,6 +2874,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         encrypted?.hash || null,
         retainsLocalAddress ? latest.source_hash : null,
         encrypted?.encryptionVersion || null,
+        JSON.stringify(lineMerge.drafts),
         retainsLocalAddress ? 'local_only' : 'provider_snapshot',
         prepared.receipt.id,
         input.idempotencyKey,
@@ -2691,6 +2897,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       status: 'rebased',
       providerChangedFields: merge.providerChangedFields,
       preservedLocalFields: merge.preservedLocalFields,
+      preservedLineDrafts: lineMerge.preservedLineDrafts,
       providerWrites: 0,
       providerWriteIntentCreated: false,
       replayed: false,
@@ -2717,6 +2924,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         rowVersion: result.rowVersion,
         providerChangedFields: result.providerChangedFields,
         preservedLocalFields: result.preservedLocalFields,
+        preservedLineDrafts: result.preservedLineDrafts,
         providerWrites: 0,
         providerWriteIntentCreated: false,
         commandReceiptId: prepared.receipt.id,

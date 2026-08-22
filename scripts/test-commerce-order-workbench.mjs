@@ -64,6 +64,7 @@ assert.equal(
 for (const fragment of [
   'readCommerceOrderWorkbenchFromPostgres',
   'updateCommerceOrderWorkbenchShipToInPostgres',
+  'acceptCommerceOrderWorkbenchInPostgres',
   "sync_state = 'local_only'",
   'providerWrites: 0',
   'providerWriteIntentCreated: false',
@@ -83,6 +84,7 @@ for (const fragment of [
   'retained_candidate.canonical_order_id IS NULL',
   'canonical_order_id = canonical.canonical_order_id',
   'mergeCommerceOrderWorkbenchProviderAddress',
+  'mergeCommerceOrderWorkbenchLineDrafts',
   'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
   'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
   'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
@@ -93,6 +95,7 @@ for (const fragment of [
   'resolveCommerceCandidatePackageInPostgres',
   'applyWorkbenchResolutionDraft',
   'includeResolutionDetails',
+  'preservedLineDrafts',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
@@ -126,6 +129,7 @@ for (const fragment of [
   'includeResolutionDetails: true',
   'refreshCommerceOrderWorkbenchCandidate',
   'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
+  'acceptCommerceOrderWorkbenchInPostgres',
   'capabilities.canManage',
   'idempotencyKeyValue(req)',
 ]) {
@@ -147,10 +151,13 @@ assert.ok(
   'Provider delivery resolution must preserve exact stored timestamp precision',
 )
 for (const fragment of [
-  'Choose a value for each field changed in both places.',
+  'Review each local value changed by the provider refresh.',
   'Keep mine:',
   'Use {providerLabel(order!.provider)}:',
+  'Use refreshed provider item',
+  'It has not been discarded.',
   'Apply choices',
+  'Accept &amp; import',
 ]) {
   assert.ok(drawer.includes(fragment), `Drawer refresh is missing ${fragment}`)
 }

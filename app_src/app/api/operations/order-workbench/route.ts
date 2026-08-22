@@ -19,11 +19,13 @@ import type {
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  acceptCommerceOrderWorkbenchInPostgres,
   CommerceOrderWorkbenchError,
   readCommerceOrderWorkbenchRefreshTargetFromPostgres,
   readCommerceOrderWorkbenchFromPostgres,
   rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres,
   updateCommerceOrderWorkbenchShipToInPostgres,
+  type CommerceOrderWorkbenchLineRefreshResolution,
   type CommerceOrderWorkbenchRefreshResolution,
 } from '@/lib/persistence/commerceOrderWorkbench'
 import { requireRequestUser } from '@/lib/requestUser'
@@ -296,6 +298,30 @@ function refreshResolutionsValue(
   return resolutions
 }
 
+function lineRefreshResolutionsValue(
+  value: unknown,
+): CommerceOrderWorkbenchLineRefreshResolution {
+  if (value === undefined || value === null) return {}
+  const input = record(value, 'Refreshed item choices')
+  if (Object.keys(input).length > 250) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+      'Too many refreshed item choices were supplied',
+    )
+  }
+  const resolutions: CommerceOrderWorkbenchLineRefreshResolution = {}
+  for (const [lineGlobalId, resolution] of Object.entries(input)) {
+    if (!LINE_GLOBAL_ID.test(lineGlobalId) || resolution !== 'provider') {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_INVALID',
+        'Choose the refreshed provider item for each changed saved item match',
+      )
+    }
+    resolutions[lineGlobalId] = 'provider'
+  }
+  return resolutions
+}
+
 function derivedIdempotencyKey(input: {
   organizationId: string
   idempotencyKey: string
@@ -474,6 +500,27 @@ export async function POST(req: NextRequest) {
     }
     const organizationId = activeOperationsOrganizationId(actor)
     const body = await requestBody(req)
+    if (body.action === 'accept') {
+      assertFields(
+        body,
+        new Set(['action', 'candidateGlobalId', 'expectedRowVersion']),
+        'Order import',
+      )
+      const candidateGlobalId = candidateGlobalIdValue(body.candidateGlobalId)
+      const result = await acceptCommerceOrderWorkbenchInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKeyValue(req),
+        candidateGlobalId,
+        expectedRowVersion: rowVersionValue(body.expectedRowVersion),
+      })
+      const [order] = await readCommerceOrderWorkbenchFromPostgres({
+        organizationId,
+        candidateGlobalId,
+        includeResolutionDetails: true,
+      })
+      return response({ ok: true, result, order: order || null })
+    }
     assertFields(
       body,
       new Set([
@@ -482,6 +529,7 @@ export async function POST(req: NextRequest) {
         'expectedRowVersion',
         'latestCandidateGlobalId',
         'resolutions',
+        'lineResolutions',
       ]),
       'Order refresh',
     )
@@ -494,7 +542,9 @@ export async function POST(req: NextRequest) {
     const candidateGlobalId = candidateGlobalIdValue(body.candidateGlobalId)
     const expectedRowVersion = rowVersionValue(body.expectedRowVersion)
     const resolutions = refreshResolutionsValue(body.resolutions)
+    const lineResolutions = lineRefreshResolutionsValue(body.lineResolutions)
     const resolvingConflict = Object.keys(resolutions).length > 0
+      || Object.keys(lineResolutions).length > 0
     const latestCandidateGlobalId = body.latestCandidateGlobalId === undefined
       || body.latestCandidateGlobalId === null
       ? null
@@ -537,6 +587,7 @@ export async function POST(req: NextRequest) {
       expectedRowVersion,
       expectedLatestCandidateGlobalId: latestCandidateGlobalId,
       resolutions,
+      lineResolutions,
     })
     const [order] = await readCommerceOrderWorkbenchFromPostgres({
       organizationId,

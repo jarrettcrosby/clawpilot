@@ -26,6 +26,12 @@ for (const fragment of [
   "candidate: selected.candidateGlobalId",
   'resolution: draft.resolution',
   'resolutionDetailsLoaded',
+  "action: 'accept'",
+  'pendingImportedOrderAccept.current',
+  'await openAcceptedImportedOrder(',
+  'lineResolutions: conflictResolution.lineResolutions',
+  'Array.isArray(payload.lineConflicts)',
+  'saved item matches were preserved',
 ]) {
   assert.ok(operations.includes(fragment), `Operations UI is missing ${fragment}`)
 }
@@ -54,6 +60,10 @@ for (const fragment of [
   'Provider SKU and quantity stay visible',
   'SKU ${line.sku || \'not supplied\'}',
   'Quantity ${line.quantity}',
+  'Accept &amp; import',
+  'order.providerVersionChanged',
+  'Use refreshed provider item',
+  'lineRefreshChoices[conflict.lineGlobalId]',
 ]) {
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }
@@ -69,8 +79,11 @@ assert.equal(
   false,
   'The ordinary workbench must only bind real existing catalog identities',
 )
+const saveActionStart = drawer.indexOf(': <SaveRounded />}')
+const saveActionEnd = drawer.indexOf('</Button>', saveActionStart)
+assert.ok(saveActionStart >= 0 && saveActionEnd > saveActionStart)
 assert.equal(
-  /disabled=\{[^}]*draftReadiness/u.test(drawer),
+  drawer.slice(saveActionStart, saveActionEnd).includes('draftReadiness'),
   false,
   'Incomplete addresses must remain saveable',
 )

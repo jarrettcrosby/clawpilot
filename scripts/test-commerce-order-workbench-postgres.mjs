@@ -438,7 +438,15 @@ async function seedNeedsInfoFacts(client, fixture) {
   )
 }
 
-async function seedFixtures(pool, primary, other, ready, needsInfo) {
+async function seedFixtures(
+  pool,
+  primary,
+  other,
+  ready,
+  needsInfo,
+  accept,
+  refresh,
+) {
   const client = await pool.connect()
   try {
     await client.query('SET session_replication_role = replica')
@@ -451,8 +459,12 @@ async function seedFixtures(pool, primary, other, ready, needsInfo) {
     await seedTenant(client, other, 'Other tenant')
     await seedTenant(client, ready, 'Ready workbench')
     await seedTenant(client, needsInfo, 'Needs info workbench')
+    await seedTenant(client, accept, 'Accept workbench')
+    await seedTenant(client, refresh, 'Refresh workbench')
     await seedReadyFacts(client, ready)
     await seedNeedsInfoFacts(client, needsInfo)
+    await seedReadyFacts(client, accept)
+    await seedNeedsInfoFacts(client, refresh)
   } finally {
     await client.query('SET session_replication_role = origin')
     client.release()
@@ -615,6 +627,151 @@ async function seedNewerProviderRevision(pool, fixture) {
         actorEmail,
       ],
     )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+    client.release()
+  }
+}
+
+async function seedProviderLineRevision(pool, fixture, input) {
+  const client = await pool.connect()
+  const runId = randomUUID()
+  const candidateId = randomUUID()
+  const lineId = randomUUID()
+  const candidateGlobalId = `gcoc${input.suffix}`
+  const runGlobalId = `gcir${input.suffix}`
+  const lineGlobalId = `gcol${input.suffix}`
+  const sourceHash = input.sourceCharacter.repeat(64)
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO crm_reference_registry (
+         reference_code, prefix, canonical_code, status, entity_type
+       ) VALUES
+         ($1, 'gcoc', $1, 'active',
+          'operations.commerce_order_candidate'),
+         ($2, 'gcir', $2, 'active',
+          'operations.commerce_intake_run'),
+         ($3, 'gcol', $3, 'active',
+          'operations.commerce_order_candidate_line')
+       ON CONFLICT (reference_code) DO NOTHING`,
+      [candidateGlobalId, runGlobalId, lineGlobalId],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_intake_runs (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         provider, resource, credential_version, provider_api_version,
+         normalizer_version, idempotency_key, request_hash, window_end,
+         workflow_state, records_seen, records_staged, created_by, updated_by,
+         expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+         'shopify', 'orders', 1, '2026-07',
+         'commerce-order-workbench-postgres-line-refresh-v1',
+         $6, $7, now(), 'held', 1, 1, $8, $8,
+         now() + interval '7 days'
+       )`,
+      [
+        runId,
+        runGlobalId,
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        `workbench-line-refresh-${input.suffix}`,
+        sourceHash,
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_candidates (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         run_id, provider, external_order_id, order_number_snapshot,
+         provider_order_status_raw, provider_financial_status_raw,
+         provider_fulfillment_status_raw, provider_return_status_raw,
+         normalized_order_status, normalized_payment_status,
+         normalized_fulfillment_status, normalized_return_status,
+         requires_shipping, currency_code, subtotal_minor, discount_minor,
+         brand_discount_minor, shipping_minor, tax_minor,
+         other_adjustment_minor, total_minor, party_snapshot_state,
+         customer_resolution_state, ship_to_snapshot_state,
+         ship_to_snapshot_source, delivery_resolution_state, observed_at,
+         provider_updated_at, source_revision, source_hash,
+         provider_api_version, normalizer_version, workflow_state,
+         blocking_codes, row_version, created_by, updated_by, expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, 'shopify', $7, $8,
+         'OPEN', 'PAID', 'UNFULFILLED', 'NONE',
+         'open', 'paid', 'unfulfilled', 'none',
+         true, 'USD', 2500, 0, 0, 0, 0, 0, 2500, 'missing',
+         'unresolved', 'missing', 'none', 'unresolved',
+         now() + $9::integer * interval '1 minute',
+         now() + $9::integer * interval '1 minute',
+         $10, $11, '2026-07',
+         'commerce-order-workbench-postgres-line-refresh-v1', 'held',
+         ARRAY[
+           'customer_resolution_required', 'ship_to_unavailable',
+           'delivery_decision_required', 'product_mapping_required',
+           'line_price_required', 'packaging_required'
+         ]::text[], 0, $12, $12, now() + interval '7 days'
+       )`,
+      [
+        candidateId,
+        candidateGlobalId,
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        runId,
+        `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
+        `#REFRESH-${input.suffix}`,
+        input.order,
+        `workbench-line-refresh-${input.suffix}`,
+        sourceHash,
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_candidate_lines (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         run_id, order_candidate_id, provider, external_line_id,
+         sku_snapshot, product_title_snapshot, provider_status_raw,
+         normalized_status, ordered_quantity, current_quantity,
+         cancelled_quantity, fulfilled_quantity, unfulfilled_quantity,
+         returned_quantity, unit_multiplier, physical_quantity,
+         currency_code, unit_price_minor, subtotal_minor, discount_minor,
+         brand_discount_minor, tax_minor, other_adjustment_minor, total_minor,
+         price_resolution_state, requires_shipping, mapping_state,
+         packaging_state, packaging_source, observed_at, source_revision,
+         source_hash, provider_api_version, normalizer_version, workflow_state,
+         blocking_codes, created_by, updated_by, expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, $7::uuid, 'shopify', $8,
+         'PB-BOX-12', 'Bakery Bites Provider Box', 'OPEN', 'open',
+         2, 2, 0, 0, 2, 0, 1, 2, 'USD', 1250,
+         2500, 0, 0, 0, 0, 2500, 'unresolved', true, 'unresolved',
+         'unresolved', 'none', now(), $9, $10, '2026-07',
+         'commerce-order-workbench-postgres-line-refresh-v1', 'held',
+         ARRAY[
+           'product_mapping_required', 'line_price_required',
+           'packaging_required'
+         ]::text[], $11, $11, now() + interval '7 days'
+       )`,
+      [
+        lineId,
+        lineGlobalId,
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        runId,
+        candidateId,
+        input.externalLineId,
+        `workbench-line-refresh-${input.suffix}`,
+        sourceHash,
+        actorEmail,
+      ],
+    )
+    return { candidateGlobalId, lineGlobalId }
   } finally {
     await client.query('SET session_replication_role = origin')
     client.release()
@@ -831,12 +988,22 @@ async function verifyAcceptance(
   other,
   readyFixture,
   needsInfoFixture,
+  acceptFixture,
+  refreshFixture,
 ) {
   process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY =
     'commerce-order-workbench-postgres-encryption-key-material-0001'
   const pool = new Pool({ connectionString: databaseUrl, max: 4 })
   try {
-    await seedFixtures(pool, primary, other, readyFixture, needsInfoFixture)
+    await seedFixtures(
+      pool,
+      primary,
+      other,
+      readyFixture,
+      needsInfoFixture,
+      acceptFixture,
+      refreshFixture,
+    )
     const persistence = workbenchPersistence(pool)
     const emptyAddress = {
       name: null,
@@ -874,6 +1041,62 @@ async function verifyAcceptance(
     assert.equal(resolvedMerge.merged.line1, '20 New Way')
     assert.ok(resolvedMerge.preservedLocalFields.includes('city'))
     assert.ok(resolvedMerge.preservedLocalFields.includes('region'))
+    const savedLineDraft = {
+      productGlobalId: 'gp0009701',
+      unitPriceMinor: 1250,
+      currency: 'USD',
+      packageProfileGlobalId: 'gpp0009701',
+    }
+    const preservedLineMerge = plain(
+      persistence.mergeCommerceOrderWorkbenchLineDrafts({
+        acceptedLines: [{
+          candidate_id: 'accepted',
+          global_id: 'gcol0009701',
+          external_line_id: 'provider-line-1',
+          product_title_snapshot: 'Bakery bites',
+          sku_snapshot: 'BITES-1',
+        }],
+        latestLines: [{
+          candidate_id: 'latest',
+          global_id: 'gcol0009702',
+          external_line_id: 'provider-line-1',
+          product_title_snapshot: 'Bakery bites updated',
+          sku_snapshot: 'BITES-1',
+        }],
+        localDrafts: { gcol0009701: savedLineDraft },
+      }),
+    )
+    assert.deepEqual(preservedLineMerge.drafts, {
+      gcol0009702: savedLineDraft,
+    })
+    assert.deepEqual(preservedLineMerge.preservedLineDrafts, [{
+      previousLineGlobalId: 'gcol0009701',
+      lineGlobalId: 'gcol0009702',
+      externalLineId: 'provider-line-1',
+    }])
+    assert.deepEqual(preservedLineMerge.conflicts, [])
+    const changedLineIdentity = plain(
+      persistence.mergeCommerceOrderWorkbenchLineDrafts({
+        acceptedLines: [{
+          candidate_id: 'accepted',
+          global_id: 'gcol0009701',
+          external_line_id: 'provider-line-1',
+          product_title_snapshot: 'Bakery bites',
+          sku_snapshot: 'BITES-1',
+        }],
+        latestLines: [{
+          candidate_id: 'latest',
+          global_id: 'gcol0009702',
+          external_line_id: 'provider-line-2',
+          product_title_snapshot: 'Replacement bites',
+          sku_snapshot: 'BITES-2',
+        }],
+        localDrafts: { gcol0009701: savedLineDraft },
+      }),
+    )
+    assert.equal(changedLineIdentity.conflicts.length, 1)
+    assert.equal(changedLineIdentity.conflicts[0].reason, 'provider_line_missing')
+    assert.deepEqual(changedLineIdentity.conflicts[0].localDraft, savedLineDraft)
     const providerBefore = await candidateSnapshot(pool, primary)
     const initialCounts = await stateCounts(pool, primary)
 
@@ -1313,6 +1536,236 @@ async function verifyAcceptance(
       'missing',
       'unrelated blockers must leave the provider refresh base untouched',
     )
+
+    const acceptPreparation = {
+      organizationId: acceptFixture.organization,
+      actorEmail,
+      idempotencyKey: 'workbench-accept-preparation-0001',
+      candidateGlobalId: acceptFixture.candidateGlobalId,
+      expectedRowVersion: 0,
+      changes: {
+        name: 'Vendor Paperwork Desk',
+        line1: '22 Market Street',
+        city: 'Charlotte',
+        region: 'NC',
+        postalCode: '28202',
+        country: 'US',
+      },
+    }
+    await assert.rejects(
+      () => persistence.updateCommerceOrderWorkbenchShipToInPostgres({
+        ...acceptPreparation,
+        afterLocalSaveBeforeHandoff() {
+          throw new Error('leave carrier-ready draft for explicit accept')
+        },
+      }),
+      /leave carrier-ready draft for explicit accept/u,
+    )
+    const [unchangedReadyDraft] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: acceptFixture.organization,
+        candidateGlobalId: acceptFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(unchangedReadyDraft.rowVersion, 1)
+    assert.equal(unchangedReadyDraft.needsInfo, false)
+    assert.equal(unchangedReadyDraft.shipTo.readiness, 'carrier_ready')
+    const acceptInput = {
+      organizationId: acceptFixture.organization,
+      actorEmail,
+      idempotencyKey: 'workbench-explicit-accept-0002',
+      candidateGlobalId: acceptFixture.candidateGlobalId,
+      expectedRowVersion: 1,
+    }
+    const explicitlyAccepted = plain(await persistence
+      .acceptCommerceOrderWorkbenchInPostgres(acceptInput))
+    assert.equal(explicitlyAccepted.promotionStatus, 'promoted')
+    assert.match(
+      explicitlyAccepted.canonicalOrderGlobalId,
+      /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u,
+    )
+    assert.deepEqual(explicitlyAccepted.changedFields, [])
+    assert.equal(explicitlyAccepted.providerWrites, 0)
+    assert.equal(explicitlyAccepted.providerWriteIntentCreated, false)
+    const explicitlyAcceptedReplay = plain(await persistence
+      .acceptCommerceOrderWorkbenchInPostgres(acceptInput))
+    assert.equal(explicitlyAcceptedReplay.replayed, true)
+    assert.equal(
+      explicitlyAcceptedReplay.canonicalOrderGlobalId,
+      explicitlyAccepted.canonicalOrderGlobalId,
+    )
+    const acceptedCanonicalCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3`,
+      [
+        acceptFixture.organization,
+        acceptFixture.integration,
+        `gid://shopify/Order/${acceptFixture.candidateGlobalId.slice(-7)}`,
+      ],
+    )
+    assert.equal(acceptedCanonicalCount.rows[0].count, 1)
+
+    const [refreshDetailed] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: refreshFixture.organization,
+        candidateGlobalId: refreshFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    const refreshDraft = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: refreshFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-line-draft-0001',
+        candidateGlobalId: refreshFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: { name: 'Bakery Receiving' },
+        resolutionDraft: {
+          customerGlobalId: refreshFixture.customerGlobalId,
+          requestedDeliveryAt:
+            refreshDetailed.delivery.providerRequestedDeliveryAt,
+          lines: [{
+            lineGlobalId: refreshFixture.lineGlobalId,
+            productGlobalId: refreshFixture.productGlobalId,
+            unitPriceMinor: 1250,
+            currency: 'USD',
+            packageProfileGlobalId:
+              refreshFixture.packageProfileGlobalId,
+          }],
+        },
+      }))
+    assert.equal(refreshDraft.rowVersion, 1)
+    const providerExternalLineId = (
+      `gid://shopify/LineItem/${refreshFixture.lineGlobalId.slice(-7)}`
+    )
+    const stableLineRevision = await seedProviderLineRevision(
+      pool,
+      refreshFixture,
+      {
+        suffix: '0009710',
+        sourceCharacter: '7',
+        order: 1,
+        externalLineId: providerExternalLineId,
+      },
+    )
+    const lineRebased = plain(await persistence
+      .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: refreshFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-line-rebase-0002',
+        candidateGlobalId: refreshFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+      }))
+    assert.equal(lineRebased.candidateGlobalId, stableLineRevision.candidateGlobalId)
+    assert.deepEqual(lineRebased.preservedLineDrafts, [{
+      previousLineGlobalId: refreshFixture.lineGlobalId,
+      lineGlobalId: stableLineRevision.lineGlobalId,
+      externalLineId: providerExternalLineId,
+    }])
+    const [stableLineOrder] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: refreshFixture.organization,
+        candidateGlobalId: stableLineRevision.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(stableLineOrder.lines[0].globalId, stableLineRevision.lineGlobalId)
+    assert.equal(
+      stableLineOrder.lines[0].productGlobalId,
+      refreshFixture.productGlobalId,
+    )
+    assert.equal(stableLineOrder.lines[0].unitPriceMinor, 1250)
+    assert.equal(
+      stableLineOrder.lines[0].packageProfileGlobalId,
+      refreshFixture.packageProfileGlobalId,
+    )
+
+    const changedLineRevision = await seedProviderLineRevision(
+      pool,
+      refreshFixture,
+      {
+        suffix: '0009711',
+        sourceCharacter: '8',
+        order: 2,
+        externalLineId: `${providerExternalLineId}-replacement`,
+      },
+    )
+    let lineConflict = null
+    try {
+      await persistence.rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: refreshFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-line-conflict-0003',
+        candidateGlobalId: stableLineRevision.candidateGlobalId,
+        expectedRowVersion: 2,
+      })
+    } catch (error) {
+      lineConflict = error
+    }
+    assert.equal(lineConflict?.code, 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT')
+    assert.equal(lineConflict?.status, 409)
+    assert.equal(lineConflict?.details?.latestCandidateGlobalId,
+      changedLineRevision.candidateGlobalId)
+    assert.deepEqual(plain(lineConflict?.details?.lineConflicts), [{
+      lineGlobalId: stableLineRevision.lineGlobalId,
+      externalLineId: providerExternalLineId,
+      title: 'Bakery Bites Provider Box',
+      sku: 'PB-BOX-12',
+      reason: 'provider_line_missing',
+      localDraft: {
+        productGlobalId: refreshFixture.productGlobalId,
+        unitPriceMinor: 1250,
+        currency: 'USD',
+        packageProfileGlobalId: refreshFixture.packageProfileGlobalId,
+      },
+    }])
+    const retainedLineDraft = await pool.query(
+      `SELECT candidate.global_id AS candidate_global_id,
+              workbench.line_resolution_drafts
+       FROM operations_commerce_order_workbench workbench
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = workbench.organization_id
+        AND candidate.id = workbench.candidate_id
+       WHERE workbench.organization_id = $1::uuid`,
+      [refreshFixture.organization],
+    )
+    assert.equal(
+      retainedLineDraft.rows[0].candidate_global_id,
+      stableLineRevision.candidateGlobalId,
+    )
+    assert.ok(
+      retainedLineDraft.rows[0].line_resolution_drafts[
+        stableLineRevision.lineGlobalId
+      ],
+      'a changed provider line identity must not silently discard its draft',
+    )
+    const reviewedLineRebase = plain(await persistence
+      .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: refreshFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-line-review-0004',
+        candidateGlobalId: stableLineRevision.candidateGlobalId,
+        expectedRowVersion: 2,
+        expectedLatestCandidateGlobalId:
+          changedLineRevision.candidateGlobalId,
+        lineResolutions: {
+          [stableLineRevision.lineGlobalId]: 'provider',
+        },
+      }))
+    assert.equal(
+      reviewedLineRebase.candidateGlobalId,
+      changedLineRevision.candidateGlobalId,
+    )
+    assert.deepEqual(reviewedLineRebase.preservedLineDrafts, [])
+    const reviewedLineDraft = await pool.query(
+      `SELECT line_resolution_drafts
+       FROM operations_commerce_order_workbench
+       WHERE organization_id = $1::uuid`,
+      [refreshFixture.organization],
+    )
+    assert.deepEqual(reviewedLineDraft.rows[0].line_resolution_drafts, {})
+
     const readyCandidateBefore = await candidateSnapshot(pool, readyFixture)
     const promotableInput = {
       organizationId: readyFixture.organization,
@@ -1768,6 +2221,8 @@ async function main() {
       ids('0009702'),
       ids('0009704'),
       ids('0009705'),
+      ids('0009706'),
+      ids('0009707'),
     )
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {
