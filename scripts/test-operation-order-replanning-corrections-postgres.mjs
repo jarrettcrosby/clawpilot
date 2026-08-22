@@ -23,9 +23,44 @@ function persistenceFor(pool) {
   const domain = loadTypeScriptModule('app_src/lib/operations/domain.ts', {
     '@/lib/operations/types': {},
   })
+  const orderShipTo = loadTypeScriptModule(
+    'app_src/lib/operations/orderShipTo.ts',
+  )
   class RevisionGateError extends Error {}
   class NamedBoundaryError extends Error {}
   const noOp = async () => undefined
+  const readShipmentAddress = async (input) => {
+    const executor = input.client || pool
+    const result = await executor.query(
+      `SELECT global_id, row_version, status, ship_to
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND archived_at IS NULL
+       LIMIT 1`,
+      [input.organizationId, input.orderGlobalId],
+    )
+    const row = result.rows[0]
+    if (!row) throw new NamedBoundaryError('Operations order was not found')
+    const value = orderShipTo.normalizeOrderShipToDraft(row.ship_to)
+    return {
+      orderGlobalId: row.global_id,
+      orderRowVersion: Number(row.row_version),
+      rowVersion: 0,
+      value,
+      sourceValue: value,
+      readiness: orderShipTo.orderShipToReadiness(value),
+      issues: orderShipTo.orderShipToIssues(value),
+      provenance: 'source',
+      sourceVersionChanged: false,
+      rerateRequired: false,
+      editable: row.status !== 'shipped',
+      editBlockedReason: row.status === 'shipped'
+        ? 'Shipped orders are no longer editable.'
+        : null,
+      providerWrites: 0,
+    }
+  }
   return loadTypeScriptModule('app_src/lib/persistence/operations.ts', {
     '@/lib/auditWriter': { recordAuditEvent: noOp },
     '@/lib/crm/stableId': {
@@ -48,6 +83,7 @@ function persistenceFor(pool) {
     },
     '@/lib/operations/adapters': {},
     '@/lib/operations/domain': domain,
+    '@/lib/operations/orderShipTo': orderShipTo,
     '@/lib/operations/packingSlip': {
       PACKAGE_PACK_WORK_INSTRUCTION_TEMPLATE_VERSION: 'test-pack-work-v1',
       PACKING_SLIP_TEMPLATE_VERSION: 'test-packing-slip-v1',
@@ -64,6 +100,9 @@ function persistenceFor(pool) {
     '@/lib/operations/pickManagement': {},
     '@/lib/persistence/crm': {},
     '@/lib/persistence/cartonizationRateEvidence': {},
+    '@/lib/persistence/commerceOrderWorkbench': {
+      readCommerceOrderWorkbenchFromPostgres: async () => [],
+    },
     '@/lib/persistence/commerceStoreSync': {
       readCommerceStoreSyncControlsFromPostgres: async () => [],
     },
@@ -73,6 +112,9 @@ function persistenceFor(pool) {
     },
     '@/lib/persistence/operationShadowTraining': {
       assertNoOpenOperationsShadowTrainingRunsForActivation: noOp,
+    },
+    '@/lib/persistence/operationsOrderShipmentAddress': {
+      readOperationsOrderShipmentAddressInPostgres: readShipmentAddress,
     },
     '@/lib/persistence/productPackaging': {},
     '@/lib/persistence/postgres': postgresAdapter(pool),
