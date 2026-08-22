@@ -1332,6 +1332,9 @@ async function verifyRouteBehavior() {
       },
       '@/lib/operations/authorization': {
         operationsCapabilities: (actor) => actor.capabilities,
+        shippingCapabilities: (actor) => ({
+          canPurchaseLivePostage: Boolean(actor.capabilities.canActivate),
+        }),
         activeOperationsOrganizationId: (actor) => {
           if (!actor.organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
           return actor.organizationId
@@ -1646,6 +1649,7 @@ async function verifyRouteBehavior() {
     organizationId: actor.organizationId,
     actorEmail: actor.email,
     capabilities: actor.capabilities,
+    canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
     exceptionStatus: 'open',
