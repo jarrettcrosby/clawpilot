@@ -51,7 +51,7 @@
     "test:case-pack-planning": "node --experimental-strip-types --test app_src/tests/operations/case-pack-planning.test.mts",
     "test:hybrid-cartonization": "node --experimental-strip-types --test app_src/tests/operations/hybrid-cartonization.test.mts",
     "test:hybrid-cartonization-persistence": "node scripts/test-hybrid-cartonization-persistence.mjs",
-    "test:cartonization-rate-evidence": "node scripts/test-cartonization-rate-evidence.mjs",
+    "test:cartonization-rate-evidence": "node --experimental-strip-types --test app_src/tests/integrations/carrier-origin-binding.test.ts && node scripts/test-cartonization-rate-evidence.mjs",
     "test:one-off-shipments": "node scripts/test-shipping-package-catalog.mjs && node scripts/test-wwex-shipping-sandbox-regression.mjs && node scripts/test-shipping-independence.mjs && node scripts/test-shipping-one-off-pack.mjs && node scripts/test-one-off-shipments.mjs && node scripts/test-one-off-packed-rerate-selection.mjs && node scripts/test-carrier-one-off-group-shipment.mjs && node scripts/test-one-off-group-ui.mjs && npm run test:shipping-ui-fixture && npm run test:operation-one-off-group-persistence",
     "test:shipping-independence": "node scripts/test-shipping-module.mjs && node scripts/test-shipping-independence.mjs && node scripts/test-shipping-one-off-pack.mjs && node scripts/test-one-off-shipments.mjs",
     "test:shipping-independence-postgres": "node scripts/test-shipping-independence-postgres.mjs && node scripts/test-shipping-one-off-pack-postgres.mjs",
