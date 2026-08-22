@@ -651,6 +651,18 @@ async function verify(databaseUrl) {
           phone: null,
           poNumber: null,
           note: null,
+          shippingAddress: {
+            firstName: 'Private',
+            lastName: 'Draft',
+            company: null,
+            address1: '10 Provider Writes Off Way',
+            address2: null,
+            city: 'Raleigh',
+            provinceCode: 'NC',
+            countryCode: 'US',
+            zip: '27601',
+            phone: null,
+          },
           tagAdds: [],
           tagRemoves: [],
           lineQuantities: [],
@@ -2201,7 +2213,8 @@ async function verify(databaseUrl) {
     )
 
     // 0312 retains one exact combined ordinary Save without retaining any
-    // email, phone, PO, note, or tag plaintext. The same pre-network claim
+    // email, phone, PO, note, source-address, or tag plaintext. The same
+    // pre-network claim
     // fence binds write_orders plus write_order_edits for multi-line edits.
     const ordinarySaveProjectionHash = '7'.repeat(64)
     const ordinarySaveAction = {
@@ -2210,6 +2223,18 @@ async function verify(databaseUrl) {
       phone: '+15555550199',
       poNumber: 'PRIVATE-PO-6601',
       note: 'Private handling note',
+      shippingAddress: {
+        firstName: 'Private',
+        lastName: 'Buyer',
+        company: 'Private Receiving LLC',
+        address1: '987 Private Shipping Lane',
+        address2: 'Suite 123',
+        city: 'Durham',
+        provinceCode: 'NC',
+        countryCode: 'US',
+        zip: '27701',
+        phone: '+15555550177',
+      },
       tagAdds: ['private-priority'],
       tagRemoves: [],
       lineQuantities: [
@@ -2269,11 +2294,15 @@ async function verify(databaseUrl) {
       providerWriteCount: 5,
     })
     const ordinaryStored = await pool.query(
-      `SELECT authz.*, attempt.*
+      `SELECT authz.*, attempt.*, outcome.*
        FROM operations_shopify_order_management_authorizations authz
        JOIN operations_shopify_order_management_attempts attempt
          ON attempt.organization_id = authz.organization_id
         AND attempt.authorization_id = authz.id
+       JOIN operations_shopify_order_management_outcomes outcome
+         ON outcome.organization_id = authz.organization_id
+        AND outcome.authorization_id = authz.id
+        AND outcome.provider_attempt_id = attempt.id
        WHERE authz.organization_id = $1::uuid
          AND authz.global_id = $2`,
       [
@@ -2288,6 +2317,7 @@ async function verify(databaseUrl) {
       ordinarySaveAction.poNumber,
       ordinarySaveAction.note,
       ordinarySaveAction.tagAdds[0],
+      ...Object.values(ordinarySaveAction.shippingAddress).filter(Boolean),
     ]) {
       assert.equal(ordinarySerialized.includes(privateValue), false)
       assert.equal(

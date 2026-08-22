@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
@@ -9,6 +10,15 @@ import vm from 'node:vm'
 const root = process.cwd()
 const routePath = 'app_src/app/api/health/route.ts'
 const routeSource = readFileSync(resolve(root, routePath), 'utf8')
+const singleSaveMigrationPath =
+  'db/migrations/0312_operations_shopify_order_single_save.sql'
+const singleSaveMigration = readFileSync(
+  resolve(root, singleSaveMigrationPath),
+  'utf8',
+)
+const singleSaveMigrationChecksum = createHash('sha256')
+  .update(singleSaveMigration)
+  .digest('hex')
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
@@ -70,6 +80,22 @@ const managementTriggers = [
   ],
 ]
 
+assert.equal(
+  singleSaveMigrationChecksum,
+  'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb',
+  'health attestation must pin the exact address-aware 0312 migration',
+)
+assert.match(singleSaveMigration, /including the Shopify source[\s\S]{0,40}shipping address/u)
+assert.match(
+  singleSaveMigration,
+  /No plaintext order field or address is retained\./u,
+)
+assert.doesNotMatch(
+  singleSaveMigration,
+  /ADD COLUMN (?:shipping_address|address1|address2|city|zip|postal_code)/u,
+  'address PII must remain represented only by the requested projection hash',
+)
+
 for (const fragment of [
   "from '@/lib/persistence/shopifyOrderManagement'",
   'readShopifyOrderManagementHealthFromPostgres',
@@ -93,7 +119,7 @@ for (const fragment of [
   '9d0946bfb810bd7be8b859e8643b1fa51a946dd98c32b5e781b573c163cdbaf5',
   '442a1b8a8cac37652c6f193d5ab07ae3325891dcfa98f80593603e8166ac97d6',
   "'0312_operations_shopify_order_single_save.sql'",
-  'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978',
+  'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb',
   'c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7',
   '656bf1da59cb5f5f282fd1f37173df02cf79a77bdcfa7449032970cb283241e7',
   'acf4d37a8b2d32bbd2b5731994bccf86f1b5549ce69fe9e4060d24e79c28c650',

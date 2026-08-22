@@ -42,6 +42,18 @@ function managementFixture(globalId = 'gor1234567') {
       phone: '+15555550100',
       poNumber: 'PO-6600',
       note: null,
+      shippingAddress: {
+        firstName: 'Pat',
+        lastName: 'Buyer',
+        company: 'Buyer Bakery',
+        address1: '100 Test Avenue',
+        address2: null,
+        city: 'Raleigh',
+        provinceCode: 'NC',
+        countryCode: 'US',
+        zip: '27601',
+        phone: '+15555550100',
+      },
       tags: [],
       lines: [{
         lineItemId: 'gid://shopify/LineItem/123',
@@ -408,6 +420,18 @@ const ordinarySaveMutation = Object.freeze({
   phone: '+15555550199',
   poNumber: 'PO-UPDATED',
   note: 'Handle together',
+  shippingAddress: {
+    firstName: 'Pat',
+    lastName: 'Buyer',
+    company: 'Receiving Bakery',
+    address1: '500 Receiving Lane',
+    address2: 'Dock 4',
+    city: 'Durham',
+    provinceCode: 'NC',
+    countryCode: 'US',
+    zip: '27701',
+    phone: '+15555550199',
+  },
   tagAdds: ['priority'],
   tagRemoves: ['old-tag'],
   lineQuantities: [
@@ -514,6 +538,26 @@ for (const [body, expectedCode] of [
       ...ordinarySaveMutation,
       tagAdds: ['priority'],
       tagRemoves: ['priority'],
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...ordinarySaveMutation,
+      shippingAddress: {
+        ...ordinarySaveMutation.shippingAddress,
+        countryCode: 'us',
+      },
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...ordinarySaveMutation,
+      shippingAddress: {
+        ...ordinarySaveMutation.shippingAddress,
+        localShipmentOverride: 'must-not-cross-provider-boundary',
+      },
     },
   }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
   [{

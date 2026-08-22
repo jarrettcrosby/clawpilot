@@ -9,6 +9,7 @@ import {
   shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
   type ShopifyOrderManagementPreview,
+  type ShopifyOrderShippingAddress,
 } from '@/lib/integrations/shopifyOrderManagement'
 import {
   shopifyOrderManagementAccountAllowed,
@@ -46,6 +47,7 @@ export type ShopifyOrderManagementMutation =
       phone: string | null
       poNumber: string | null
       note: string | null
+      shippingAddress: ShopifyOrderShippingAddress | null
       tagAdds: string[]
       tagRemoves: string[]
       lineQuantities: Array<{
@@ -94,6 +96,7 @@ function providerAction(
       phone: mutation.phone,
       poNumber: mutation.poNumber,
       note: mutation.note,
+      shippingAddress: mutation.shippingAddress,
       tagAdds: mutation.tagAdds,
       tagRemoves: mutation.tagRemoves,
       lineQuantities: mutation.lineQuantities.map((line) => ({
@@ -294,6 +297,7 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     phone: null,
     poNumber: null,
     note: null,
+    shippingAddress: null,
     tags: [],
     lines: [],
   }
@@ -435,6 +439,9 @@ function publicState(input: {
       phone: input.preview.phone,
       poNumber: input.preview.poNumber,
       note: input.preview.note,
+      shippingAddress: input.preview.shippingAddress
+        ? Object.freeze({ ...input.preview.shippingAddress })
+        : null,
       tags: Object.freeze([...input.preview.tags]),
       lines: Object.freeze(input.preview.lines.map((line) => Object.freeze({
         lineItemId: line.id,

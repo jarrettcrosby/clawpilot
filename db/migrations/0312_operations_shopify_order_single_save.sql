@@ -1,7 +1,8 @@
 -- ShipStation-like ordinary Shopify order Save.
 --
 -- This additive phase extends the frozen 0283/0308 authorization ledger with
--- one combined, hash-bound save_order intent. PII and note/tag values remain
+-- one combined, hash-bound save_order intent, including the Shopify source
+-- shipping address. PII and note/tag values remain
 -- outside durable authorization, attempt, outcome, and audit rows. Only the
 -- SHA-256 hash of the exact desired provider projection is retained.
 --
@@ -745,7 +746,7 @@ IS
 COMMENT ON COLUMN
   public.operations_shopify_order_management_authorizations.requested_projection_hash
 IS
-  'SHA-256 of the exact desired email, phone, PO, note, complete tag set, and complete line-quantity projection. No plaintext order field is retained.';
+  'SHA-256 of the exact desired email, phone, PO, note, Shopify source shipping address, complete tag set, and complete line-quantity projection. No plaintext order field or address is retained.';
 
 COMMENT ON COLUMN
   public.operations_shopify_order_management_attempts.requested_projection_hash

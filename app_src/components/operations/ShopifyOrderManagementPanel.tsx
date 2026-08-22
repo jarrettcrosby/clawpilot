@@ -39,6 +39,30 @@ type LineEligibility = Readonly<{
   minQuantity: number
   maxQuantity: number
 }>
+type ShopifyShippingAddress = Readonly<{
+  firstName: string | null
+  lastName: string | null
+  company: string | null
+  address1: string | null
+  address2: string | null
+  city: string | null
+  provinceCode: string | null
+  countryCode: string | null
+  zip: string | null
+  phone: string | null
+}>
+type ShippingAddressDraft = {
+  firstName: string
+  lastName: string
+  company: string
+  address1: string
+  address2: string
+  city: string
+  provinceCode: string
+  countryCode: string
+  zip: string
+  phone: string
+}
 type OpenAttempt = Readonly<{
   attemptGlobalId: string
   authorizationGlobalId: string
@@ -71,6 +95,7 @@ type ShopifyManagement = Readonly<{
     phone: string | null
     poNumber: string | null
     note: string | null
+    shippingAddress: ShopifyShippingAddress | null
     tags: string[]
     lines: ShopifyLine[]
   }>
@@ -95,6 +120,7 @@ type ShopifyMutation = Readonly<{ kind: 'add_tag'; tag: string }>
       phone: string | null
       poNumber: string | null
       note: string | null
+      shippingAddress: ShopifyShippingAddress | null
       tagAdds: string[]
       tagRemoves: string[]
       lineQuantities: Array<{
@@ -128,6 +154,19 @@ const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/
 const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
 const SHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/
 const SHA256 = /^[a-f0-9]{64}$/
+const COUNTRY_CODE = /^[A-Z]{2}$/
+const EMPTY_SHIPPING_ADDRESS: ShippingAddressDraft = {
+  firstName: '',
+  lastName: '',
+  company: '',
+  address1: '',
+  address2: '',
+  city: '',
+  provinceCode: '',
+  countryCode: '',
+  zip: '',
+  phone: '',
+}
 
 function idempotencyKey(action: 'save' | 'reconcile', exactId: string) {
   const nonce = typeof crypto !== 'undefined'
@@ -160,6 +199,45 @@ function optionalText(value: unknown): value is string | null {
 }
 function integer(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value)
+}
+function shippingAddress(value: unknown): value is ShopifyShippingAddress | null {
+  if (value === null) return true
+  if (!value || typeof value !== 'object') return false
+  const address = value as Partial<ShopifyShippingAddress>
+  return [
+    address.firstName,
+    address.lastName,
+    address.company,
+    address.address1,
+    address.address2,
+    address.city,
+    address.provinceCode,
+    address.zip,
+    address.phone,
+  ].every((field) => field === null || typeof field === 'string')
+    && (address.countryCode === null || (
+      typeof address.countryCode === 'string'
+      && COUNTRY_CODE.test(address.countryCode)
+    ))
+}
+function addressDraft(
+  value: ShopifyShippingAddress | null,
+): ShippingAddressDraft {
+  if (!value) return { ...EMPTY_SHIPPING_ADDRESS }
+  return Object.fromEntries(Object.entries(value).map(([key, field]) => [
+    key,
+    field || '',
+  ])) as ShippingAddressDraft
+}
+function addressMutation(
+  value: ShippingAddressDraft,
+  hadAddress: boolean,
+): ShopifyShippingAddress | null {
+  const hasValue = Object.values(value).some((field) => field.length > 0)
+  if (!hadAddress && !hasValue) return null
+  return Object.freeze(Object.fromEntries(
+    Object.entries(value).map(([key, field]) => [key, field || null]),
+  )) as ShopifyShippingAddress
 }
 function line(value: unknown): value is ShopifyLine {
   if (!value || typeof value !== 'object') return false
@@ -230,6 +308,7 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && (order.phone === null || typeof order.phone === 'string')
     && (order.poNumber === null || typeof order.poNumber === 'string')
     && (order.note === null || typeof order.note === 'string')
+    && shippingAddress(order.shippingAddress)
     && Array.isArray(order.tags) && order.tags.every(text)
     && lines.every(line)
     && typeof eligibility?.addTag?.allowed === 'boolean'
@@ -306,6 +385,8 @@ export default function ShopifyOrderManagementPanel({
   const [phone, setPhone] = useState('')
   const [poNumber, setPoNumber] = useState('')
   const [note, setNote] = useState('')
+  const [shippingAddressDraft, setShippingAddressDraft] =
+    useState<ShippingAddressDraft>({ ...EMPTY_SHIPPING_ADDRESS })
   const [tags, setTags] = useState('')
   const [quantities, setQuantities] = useState<Record<string, string>>({})
   const [lastResult, setLastResult] = useState<ManagementResult | null>(null)
@@ -336,6 +417,9 @@ export default function ShopifyOrderManagementPanel({
       setPhone(payload.management.order.phone || '')
       setPoNumber(payload.management.order.poNumber || '')
       setNote(payload.management.order.note || '')
+      setShippingAddressDraft(addressDraft(
+        payload.management.order.shippingAddress,
+      ))
       setTags(payload.management.order.tags.join(', '))
       setQuantities(Object.fromEntries(
         payload.management!.order.lines.map((item) => [
@@ -404,11 +488,19 @@ export default function ShopifyOrderManagementPanel({
       ? [{ lineItemId: item.lineItemId, quantity: entered }]
       : []
   }) || []
+  const desiredShippingAddress = addressMutation(
+    shippingAddressDraft,
+    state?.order.shippingAddress !== null,
+  )
+  const shippingAddressDirty = Boolean(state) && JSON.stringify(
+    desiredShippingAddress,
+  ) !== JSON.stringify(state?.order.shippingAddress)
   const ordinaryDirty = Boolean(state) && (
     email !== (state?.order.email || '')
     || phone !== (state?.order.phone || '')
     || poNumber !== (state?.order.poNumber || '')
     || note !== (state?.order.note || '')
+    || shippingAddressDirty
     || tagAdds.length > 0
     || tagRemoves.length > 0
     || changedLineQuantities.length > 0
@@ -441,6 +533,19 @@ export default function ShopifyOrderManagementPanel({
     && phone.length <= 64
     && poNumber.length <= 255
     && note.length <= 5_000
+    && shippingAddressDraft.firstName.length <= 255
+    && shippingAddressDraft.lastName.length <= 255
+    && shippingAddressDraft.company.length <= 255
+    && shippingAddressDraft.address1.length <= 255
+    && shippingAddressDraft.address2.length <= 255
+    && shippingAddressDraft.city.length <= 255
+    && shippingAddressDraft.provinceCode.length <= 64
+    && (
+      shippingAddressDraft.countryCode.length === 0
+      || COUNTRY_CODE.test(shippingAddressDraft.countryCode)
+    )
+    && shippingAddressDraft.zip.length <= 64
+    && shippingAddressDraft.phone.length <= 64
     && tagsValid
     && changedLinesValid
     && allLineDraftsValid
@@ -496,6 +601,9 @@ export default function ShopifyOrderManagementPanel({
         setPhone(saved.management.order.phone || '')
         setPoNumber(saved.management.order.poNumber || '')
         setNote(saved.management.order.note || '')
+        setShippingAddressDraft(addressDraft(
+          saved.management.order.shippingAddress,
+        ))
         setTags(saved.management.order.tags.join(', '))
         setQuantities(Object.fromEntries(
           saved.management.order.lines.map((item) => [
@@ -749,6 +857,76 @@ export default function ShopifyOrderManagementPanel({
             </Stack>
           </Box>
 
+          <Box
+            sx={{ p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1.5 }}
+            data-testid="shopify-source-shipping-address"
+          >
+            <Stack spacing={1.25}>
+              <Box>
+                <Typography fontWeight={700}>
+                  Shopify source shipping address
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  This changes the address stored on the Shopify order. It does
+                  not change ClawPilot&apos;s local shipment-address override.
+                </Typography>
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: {
+                    xs: 'minmax(0, 1fr)',
+                    sm: 'repeat(2, minmax(0, 1fr))',
+                  },
+                  gap: 1.25,
+                }}
+              >
+                {([
+                  ['firstName', 'First name', 255],
+                  ['lastName', 'Last name', 255],
+                  ['company', 'Company', 255],
+                  ['address1', 'Address line 1', 255],
+                  ['address2', 'Address line 2', 255],
+                  ['city', 'City', 255],
+                  ['provinceCode', 'State / province code', 64],
+                  ['zip', 'ZIP / postal code', 64],
+                  ['phone', 'Address phone', 64],
+                ] as const).map(([field, label, maxLength]) => (
+                  <TextField
+                    key={field}
+                    label={label}
+                    value={shippingAddressDraft[field]}
+                    onChange={(event) => {
+                      setShippingAddressDraft((current) => ({
+                        ...current,
+                        [field]: event.target.value,
+                      }))
+                      saveAttempt.current = null
+                    }}
+                    inputProps={{ maxLength }}
+                    disabled={busy || Boolean(retainedAttempt)}
+                  />
+                ))}
+                <TextField
+                  label="Country code"
+                  value={shippingAddressDraft.countryCode}
+                  onChange={(event) => {
+                    setShippingAddressDraft((current) => ({
+                      ...current,
+                      countryCode: event.target.value.toUpperCase(),
+                    }))
+                    saveAttempt.current = null
+                  }}
+                  inputProps={{ maxLength: 2 }}
+                  error={shippingAddressDraft.countryCode.length > 0
+                    && !COUNTRY_CODE.test(shippingAddressDraft.countryCode)}
+                  helperText="Two-letter code, such as US or CA."
+                  disabled={busy || Boolean(retainedAttempt)}
+                />
+              </Box>
+            </Stack>
+          </Box>
+
           <Box sx={{ p: 1.5, border: 1, borderColor: 'divider', borderRadius: 1.5 }}>
             <Stack spacing={1.25}>
               <Stack direction="row" spacing={1} alignItems="center">
@@ -859,6 +1037,7 @@ export default function ShopifyOrderManagementPanel({
                     phone: phone || null,
                     poNumber: poNumber || null,
                     note: note || null,
+                    shippingAddress: desiredShippingAddress,
                     tagAdds,
                     tagRemoves,
                     lineQuantities: changedLineQuantities,

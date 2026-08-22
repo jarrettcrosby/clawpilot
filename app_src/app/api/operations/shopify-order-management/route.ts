@@ -29,6 +29,7 @@ const LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/u
 const SHA256 = /^[a-f0-9]{64}$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
+const COUNTRY_CODE = /^[A-Z]{2}$/u
 
 class ShopifyOrderManagementApiError extends Error {
   constructor(
@@ -167,6 +168,74 @@ function tagList(value: unknown, label: string) {
   return tags
 }
 
+function shippingAddress(value: unknown) {
+  if (value === null) return null
+  const input = record(value)
+  exactFields(input, [
+    'firstName', 'lastName', 'company', 'address1', 'address2', 'city',
+    'provinceCode', 'countryCode', 'zip', 'phone',
+  ])
+  const countryCode = nullableField(
+    input.countryCode,
+    'Shopify shipping-address country code',
+    2,
+  )
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+      'Shopify shipping-address country code is invalid',
+    )
+  }
+  return Object.freeze({
+    firstName: nullableField(
+      input.firstName,
+      'Shopify shipping-address first name',
+      255,
+    ),
+    lastName: nullableField(
+      input.lastName,
+      'Shopify shipping-address last name',
+      255,
+    ),
+    company: nullableField(
+      input.company,
+      'Shopify shipping-address company',
+      255,
+    ),
+    address1: nullableField(
+      input.address1,
+      'Shopify shipping-address line 1',
+      255,
+    ),
+    address2: nullableField(
+      input.address2,
+      'Shopify shipping-address line 2',
+      255,
+    ),
+    city: nullableField(
+      input.city,
+      'Shopify shipping-address city',
+      255,
+    ),
+    provinceCode: nullableField(
+      input.provinceCode,
+      'Shopify shipping-address province or state code',
+      64,
+    ),
+    countryCode,
+    zip: nullableField(
+      input.zip,
+      'Shopify shipping-address postal code',
+      64,
+    ),
+    phone: nullableField(
+      input.phone,
+      'Shopify shipping-address phone',
+      64,
+    ),
+  })
+}
+
 function mutation(value: unknown) {
   const input = record(value)
   const kind = boundedText(input.kind, 'Shopify mutation', 40)
@@ -207,7 +276,7 @@ function mutation(value: unknown) {
   if (kind === 'save_order') {
     exactFields(input, [
       'kind', 'email', 'phone', 'poNumber', 'note',
-      'tagAdds', 'tagRemoves', 'lineQuantities',
+      'shippingAddress', 'tagAdds', 'tagRemoves', 'lineQuantities',
     ])
     const tagAdds = tagList(input.tagAdds, 'Shopify tags to add')
     const tagRemoves = tagList(input.tagRemoves, 'Shopify tags to remove')
@@ -257,6 +326,7 @@ function mutation(value: unknown) {
         allowNewlines: true,
         allowEmpty: true,
       }),
+      shippingAddress: shippingAddress(input.shippingAddress),
       tagAdds,
       tagRemoves,
       lineQuantities,
@@ -329,6 +399,25 @@ function resultInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
     resultInvalid()
   }
   return Number(value)
+}
+
+function resultShippingAddress(value: unknown) {
+  if (value === null) return null
+  const address = resultRecord(value)
+  const countryCode = resultNullableField(address.countryCode, 2)
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) resultInvalid()
+  return Object.freeze({
+    firstName: resultNullableField(address.firstName, 255),
+    lastName: resultNullableField(address.lastName, 255),
+    company: resultNullableField(address.company, 255),
+    address1: resultNullableField(address.address1, 255),
+    address2: resultNullableField(address.address2, 255),
+    city: resultNullableField(address.city, 255),
+    provinceCode: resultNullableField(address.provinceCode, 64),
+    countryCode,
+    zip: resultNullableField(address.zip, 64),
+    phone: resultNullableField(address.phone, 64),
+  })
 }
 
 function resultId(value: unknown, pattern: RegExp) {
@@ -442,6 +531,7 @@ function publicManagement(value: unknown) {
         allowEmpty: true,
         allowNewlines: true,
       }),
+      shippingAddress: resultShippingAddress(order.shippingAddress),
       tags: Object.freeze(tags),
       lines: Object.freeze(lines),
     }),

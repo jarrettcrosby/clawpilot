@@ -12,6 +12,19 @@ export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_SECONDS = 300 as const
 export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE =
   'SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED' as const
 
+export type ShopifyOrderManagementShippingAddress = {
+  firstName: string | null
+  lastName: string | null
+  company: string | null
+  address1: string | null
+  address2: string | null
+  city: string | null
+  provinceCode: string | null
+  countryCode: string | null
+  zip: string | null
+  phone: string | null
+}
+
 export type ShopifyOrderManagementAction =
   | { type: 'add_tag'; tag: string }
   | {
@@ -31,6 +44,7 @@ export type ShopifyOrderManagementAction =
       phone: string | null
       poNumber: string | null
       note: string | null
+      shippingAddress: ShopifyOrderManagementShippingAddress | null
       tagAdds: string[]
       tagRemoves: string[]
       lineQuantities: Array<{
@@ -346,6 +360,19 @@ const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/
+const COUNTRY_CODE = /^[A-Z]{2}$/
+const SHIPPING_ADDRESS_FIELDS = [
+  'firstName',
+  'lastName',
+  'company',
+  'address1',
+  'address2',
+  'city',
+  'provinceCode',
+  'countryCode',
+  'zip',
+  'phone',
+] as const
 
 function fail(code: string, message: string, status = 409): never {
   throw new ShopifyOrderManagementPersistenceError(code, message, status)
@@ -597,6 +624,89 @@ function normalizedTags(value: unknown, label: string): string[] {
   return tags
 }
 
+function normalizedShippingAddress(
+  value: unknown,
+): ShopifyOrderManagementShippingAddress | null {
+  if (value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping address is invalid',
+      400,
+    )
+  }
+  const address = value as Record<string, unknown>
+  if (Object.keys(address).some((key) => (
+    !(SHIPPING_ADDRESS_FIELDS as readonly string[]).includes(key)
+  ))) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping address is invalid',
+      400,
+    )
+  }
+  const countryCode = nullableActionText(
+    address.countryCode,
+    'Shopify shipping-address country code',
+    2,
+  )
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping-address country code is invalid',
+      400,
+    )
+  }
+  return {
+    firstName: nullableActionText(
+      address.firstName,
+      'Shopify shipping-address first name',
+      255,
+    ),
+    lastName: nullableActionText(
+      address.lastName,
+      'Shopify shipping-address last name',
+      255,
+    ),
+    company: nullableActionText(
+      address.company,
+      'Shopify shipping-address company',
+      255,
+    ),
+    address1: nullableActionText(
+      address.address1,
+      'Shopify shipping-address line 1',
+      255,
+    ),
+    address2: nullableActionText(
+      address.address2,
+      'Shopify shipping-address line 2',
+      255,
+    ),
+    city: nullableActionText(
+      address.city,
+      'Shopify shipping-address city',
+      255,
+    ),
+    provinceCode: nullableActionText(
+      address.provinceCode,
+      'Shopify shipping-address province or state code',
+      64,
+    ),
+    countryCode,
+    zip: nullableActionText(
+      address.zip,
+      'Shopify shipping-address postal code',
+      64,
+    ),
+    phone: nullableActionText(
+      address.phone,
+      'Shopify shipping-address phone',
+      64,
+    ),
+  }
+}
+
 export function normalizeShopifyOrderManagementAction(
   value: unknown,
 ): ShopifyOrderManagementAction {
@@ -729,6 +839,7 @@ export function normalizeShopifyOrderManagementAction(
         5_000,
         true,
       ),
+      shippingAddress: normalizedShippingAddress(input.shippingAddress),
       tagAdds,
       tagRemoves,
       lineQuantities,

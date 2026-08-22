@@ -66,6 +66,24 @@ for (const field of [
   'label="Tags"',
   'label="Order note"',
 ]) assert.ok(source.panel.includes(field), `ordinary Save is missing ${field}`)
+assert.match(source.panel, />\s*Shopify source shipping address\s*</)
+assert.match(
+  source.panel,
+  /This changes the address stored on the Shopify order\. It does[\s\S]{0,100}not change ClawPilot&apos;s local shipment-address override\./,
+  'the provider address must be clearly distinct from the local shipment override',
+)
+for (const field of [
+  'First name',
+  'Last name',
+  'Company',
+  'Address line 1',
+  'Address line 2',
+  'City',
+  'State / province code',
+  'Country code',
+  'ZIP / postal code',
+  'Address phone',
+]) assert.ok(source.panel.includes(field), `Shopify source address is missing ${field}`)
 assert.match(source.panel, />Line quantities</)
 assert.match(source.panel, />Cancel order</)
 assert.match(source.panel, /if \(!canManage\) return/)
@@ -119,11 +137,18 @@ assert.match(source.panel, /kind: 'save_order'/)
 assert.match(source.panel, /tagAdds,/)
 assert.match(source.panel, /tagRemoves,/)
 assert.match(source.panel, /lineQuantities: changedLineQuantities/)
+assert.match(source.panel, /shippingAddress: desiredShippingAddress/)
+assert.match(source.panel, /shippingAddressDirty/)
 assert.match(source.panel, /position: 'sticky'/)
 assert.equal(
   (source.panel.match(/>\s*Save order\s*</g) || []).length,
   1,
   'ordinary Shopify fields must use one Save button',
+)
+assert.equal(
+  (source.panel.match(/<SaveRounded/g) || []).length,
+  1,
+  'address and ordinary Shopify fields must share the one Save control',
 )
 assert.doesNotMatch(source.panel, />\s*Save tag\s*</)
 assert.doesNotMatch(source.panel, />\s*Save quantity\s*</)
@@ -170,6 +195,11 @@ assert.match(
   source.panel,
   /disabled=\{busy \|\| Boolean\(retainedAttempt\)\}/,
   'Provider writes Off must not prevent drafting ordinary fields locally',
+)
+assert.doesNotMatch(
+  source.panel,
+  /disabled=\{[^}]*eligibility\.ordinarySave[^}]*\}[\s\S]{0,120}label="Address/,
+  'Provider writes Off must disable dispatch, not source-address drafting',
 )
 assert.match(source.panel, /providerWrites === null/)
 assert.ok(source.panel.includes('const AUTHORIZATION_GLOBAL_ID = /^gsom'))

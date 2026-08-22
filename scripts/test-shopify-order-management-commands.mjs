@@ -47,6 +47,27 @@ const reason = 'Verify exact mutation against the Shopify test order'
 const idempotencyKey = 'shopify-order-test-0001'
 const intentHash = 'a'.repeat(64)
 const providerUpdatedAt = '2026-08-14T03:20:00.000Z'
+const sourceShippingAddress = {
+  firstName: 'Pat',
+  lastName: 'Buyer',
+  company: 'Buyer Bakery',
+  address1: '100 Test Avenue',
+  address2: null,
+  city: 'Raleigh',
+  provinceCode: 'NC',
+  countryCode: 'US',
+  zip: '27601',
+  phone: '+15555550100',
+}
+const updatedShippingAddress = {
+  ...sourceShippingAddress,
+  company: 'Receiving Bakery',
+  address1: '500 Receiving Lane',
+  address2: 'Dock 4',
+  city: 'Durham',
+  zip: '27701',
+  phone: '+15555550199',
+}
 
 function targetFixture(overrides = {}) {
   return {
@@ -106,6 +127,7 @@ function previewFixture(overrides = {}) {
     phone: '+15555550100',
     poNumber: 'PO-6600',
     note: null,
+    shippingAddress: sourceShippingAddress,
     tags: [],
     lines: [{
       id: lineItemGid,
@@ -629,6 +651,7 @@ const combinedMutation = {
   phone: '+15555550199',
   poNumber: 'PO-UPDATED',
   note: 'Handle together',
+  shippingAddress: updatedShippingAddress,
   tagAdds: ['priority'],
   tagRemoves: [],
   lineQuantities: [{ lineItemId: lineItemGid, quantity: 1 }],
@@ -649,6 +672,7 @@ assert.deepEqual(plain(lastPrepareInput.action), {
   phone: combinedMutation.phone,
   poNumber: combinedMutation.poNumber,
   note: combinedMutation.note,
+  shippingAddress: updatedShippingAddress,
   tagAdds: ['priority'],
   tagRemoves: [],
   lineQuantities: [{ lineItemGid, quantity: 1 }],
@@ -679,6 +703,29 @@ await expectCode(commands.prepareShopifyOrderManagementCommand({
   idempotencyKey,
 }), 'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF')
 assert.deepEqual(events.map(([event]) => event), ['target-read'])
+assert.equal(lastPrepareInput, null)
+assert.equal(providerExecutionCount, 0)
+
+reset()
+target = targetFixture({
+  providerWriteRequestedMode: 'off',
+  providerWriteControlRowVersion: 9,
+  providerWriteBindingCurrent: false,
+  providerWriteScopeDigest: null,
+})
+await expectCode(commands.saveShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: combinedMutation,
+  idempotencyKey: 'shopify-address-draft-provider-writes-off',
+}), 'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF')
+assert.deepEqual(
+  events.map(([event]) => event),
+  ['target-read'],
+  'Provider writes Off must reject the address-aware Save before credentials, provider calls, or durable intent',
+)
 assert.equal(lastPrepareInput, null)
 assert.equal(providerExecutionCount, 0)
 
@@ -1072,6 +1119,7 @@ const combinedAction = {
   phone: '+15555550199',
   poNumber: 'PO-UPDATED',
   note: 'Handle together',
+  shippingAddress: updatedShippingAddress,
   tagAdds: ['priority'],
   tagRemoves: [],
   lineQuantities: [{ lineItemGid, quantity: 1 }],

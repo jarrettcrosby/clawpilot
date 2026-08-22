@@ -5549,7 +5549,7 @@ export async function GET() {
                         WHERE filename =
                           '0312_operations_shopify_order_single_save.sql'
                           AND checksum =
-                            'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978'
+                            'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb'
                       )
                       AND (
                         SELECT pg_catalog.count(*) = 4
@@ -5818,7 +5818,7 @@ export async function GET() {
                           WHERE filename =
                             '0312_operations_shopify_order_single_save.sql'
                             AND checksum =
-                              'a2df79ce8f38f275860f082edcc5f1c3ac9f473ba27c19f65d285449aa745978'
+                              'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb'
                         ) THEN
                           'c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7'
                         ELSE

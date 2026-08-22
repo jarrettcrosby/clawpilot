@@ -97,6 +97,38 @@ const orderEditSessionGid = 'gid://shopify/OrderEditSession/6600000000'
 const calculatedLineGid = 'gid://shopify/CalculatedLineItem/6600000001'
 const cancellationJobGid = 'gid://shopify/Job/123e4567-e89b-12d3-a456-426614174000'
 
+function providerShippingAddress(overrides = {}) {
+  return {
+    firstName: 'Pat',
+    lastName: 'Buyer',
+    company: 'Buyer Bakery',
+    address1: '100 Test Avenue',
+    address2: null,
+    city: 'Raleigh',
+    provinceCode: 'NC',
+    countryCodeV2: 'US',
+    zip: '27601',
+    phone: '+15555550100',
+    ...overrides,
+  }
+}
+
+function shippingAddressInput(overrides = {}) {
+  return {
+    firstName: 'Pat',
+    lastName: 'Buyer',
+    company: 'Buyer Bakery',
+    address1: '100 Test Avenue',
+    address2: null,
+    city: 'Raleigh',
+    provinceCode: 'NC',
+    countryCode: 'US',
+    zip: '27601',
+    phone: '+15555550100',
+    ...overrides,
+  }
+}
+
 function plain(value) {
   return JSON.parse(JSON.stringify(value))
 }
@@ -132,6 +164,7 @@ function providerOrder(overrides = {}) {
     phone: '+15555550100',
     poNumber: 'PO-6600',
     note: null,
+    shippingAddress: providerShippingAddress(),
     tags: ['warehouse-test'],
     lineItems: {
       nodes: [{
@@ -246,7 +279,7 @@ function stagedQuantityResponse(overrides = {}) {
 assert.equal(adapter.SHOPIFY_ORDER_MANAGEMENT_API_VERSION, '2026-07')
 assert.equal(
   adapter.SHOPIFY_ORDER_MANAGEMENT_ADAPTER_VERSION,
-  'shopify-graphql-2026-07-order-management-v1',
+  'shopify-graphql-2026-07-order-management-v2',
 )
 
 // The read contract is pinned, bounded, accepts Shopify's valid blank SKU, and
@@ -267,6 +300,7 @@ assert.equal(
   assert.equal(preview.updatedAt, beforeUpdatedAt)
   assert.equal(preview.shopCurrencyCode, 'USD')
   assert.equal(preview.orderCurrencyCode, 'USD')
+  assert.deepEqual(plain(preview.shippingAddress), shippingAddressInput())
   assert.deepEqual(plain(preview.currentTotalPrice), {
     amount: '150.00',
     currencyCode: 'USD',
@@ -279,7 +313,62 @@ assert.equal(
   assert.match(request.query, /\btest\b/)
   assert.match(request.query, /\bunpaid\b/)
   assert.match(request.query, /\breturnStatus\b/)
+  assert.match(request.query, /shippingAddress \{/)
+  assert.match(request.query, /countryCodeV2/)
   assert.deepEqual(plain(request.variables), { id: orderGid })
+}
+
+// Unknown-outcome reconciliation binds the complete source address inside the
+// hash-only desired projection. Changing only address line 1 must change the
+// projection without retaining the plaintext address in durable evidence.
+{
+  const h = harness([{
+    operation: 'ClawPilotShopifyOrderManagementPreview',
+    response: previewResponse(),
+  }])
+  const preview = await adapter.readShopifyOrderManagementPreview(
+    { shopDomain, accessToken: 'short-lived-access-token' },
+    orderGid,
+    {},
+    h.dependencies,
+  )
+  const unchangedHash = adapter.requestedShopifyOrderSaveProjectionHash(
+    preview,
+    {
+      type: 'save_order',
+      email: preview.email,
+      phone: preview.phone,
+      poNumber: preview.poNumber,
+      note: preview.note,
+      shippingAddress: shippingAddressInput(),
+      tagAdds: [],
+      tagRemoves: [],
+      lineQuantities: [],
+    },
+  )
+  const changedAddressHash = adapter.requestedShopifyOrderSaveProjectionHash(
+    preview,
+    {
+      type: 'save_order',
+      email: preview.email,
+      phone: preview.phone,
+      poNumber: preview.poNumber,
+      note: preview.note,
+      shippingAddress: shippingAddressInput({
+        address1: '500 Reconciliation Lane',
+      }),
+      tagAdds: [],
+      tagRemoves: [],
+      lineQuantities: [],
+    },
+  )
+  assert.equal(
+    unchangedHash,
+    adapter.shopifyOrderManagementProjectionHash(preview),
+  )
+  assert.notEqual(changedAddressHash, unchangedHash)
+  assert.match(changedAddressHash, /^[a-f0-9]{64}$/)
+  assert.equal(changedAddressHash.includes('Reconciliation Lane'), false)
 }
 
 {
@@ -666,6 +755,9 @@ for (const testCase of [
           phone: '+15555550100',
           poNumber: 'PO-6600',
           note: 'Warehouse test note',
+          shippingAddress: providerShippingAddress({
+            address1: '200 Updated Avenue',
+          }),
           tags: ['warehouse-test'],
         },
         userErrors: [],
@@ -677,6 +769,9 @@ for (const testCase of [
     {
       orderGid,
       note: 'Warehouse test note',
+      shippingAddress: shippingAddressInput({
+        address1: '200 Updated Avenue',
+      }),
       tags: ['warehouse-test'],
     },
     {},
@@ -687,6 +782,9 @@ for (const testCase of [
     input: {
       id: orderGid,
       note: 'Warehouse test note',
+      shippingAddress: shippingAddressInput({
+        address1: '200 Updated Avenue',
+      }),
       tags: ['warehouse-test'],
     },
   })
@@ -1200,9 +1298,93 @@ for (const testCase of [
   assert.equal(h.calls.graphql.length, 2)
 }
 
-// One ordinary Save can update contact/order metadata, exact tag deltas, and
-// multiple eligible line decreases. Quantities share one Shopify order-edit
-// session and the commit hardcodes notifyCustomer=false.
+// An address-only Save uses the same orderUpdate and exact final readback. It
+// uses the non-deprecated MailingAddressInput code fields and no edit session.
+{
+  const desiredAddress = shippingAddressInput({
+    address1: '700 Address Only Road',
+    city: 'Cary',
+    zip: '27513',
+  })
+  const after = providerOrder({
+    updatedAt: afterUpdatedAt,
+    shippingAddress: providerShippingAddress({
+      address1: desiredAddress.address1,
+      city: desiredAddress.city,
+      zip: desiredAddress.zip,
+    }),
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderMetadataUpdate',
+      response: {
+        orderUpdate: {
+          order: {
+            id: orderGid,
+            name: '#6600',
+            updatedAt: afterUpdatedAt,
+            email: 'buyer@example.com',
+            phone: '+15555550100',
+            poNumber: 'PO-6600',
+            note: null,
+            shippingAddress: after.shippingAddress,
+            tags: ['warehouse-test'],
+          },
+          userErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({
+      type: 'save_order',
+      email: 'buyer@example.com',
+      phone: '+15555550100',
+      poNumber: 'PO-6600',
+      note: null,
+      shippingAddress: desiredAddress,
+      tagAdds: [],
+      tagRemoves: [],
+      lineQuantities: [],
+    }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'succeeded')
+  assert.equal(result.providerWrites, 1)
+  assert.deepEqual(h.calls.graphql.map(
+    (call) => call.request.operationName,
+  ), [
+    'ClawPilotShopifyOrderManagementPreview',
+    'ClawPilotShopifyOrderMetadataUpdate',
+    'ClawPilotShopifyOrderManagementPreview',
+  ])
+  assert.deepEqual(
+    plain(h.calls.graphql[1].request.variables.input.shippingAddress),
+    desiredAddress,
+  )
+  assert.equal(
+    'country' in h.calls.graphql[1].request.variables.input.shippingAddress,
+    false,
+    'the address write must use countryCode, not Shopify deprecated country',
+  )
+  assert.equal(
+    'province' in h.calls.graphql[1].request.variables.input.shippingAddress,
+    false,
+    'the address write must use provinceCode, not Shopify deprecated province',
+  )
+}
+
+// One ordinary Save can update contact/order metadata, source address, exact
+// tag deltas, and multiple eligible line decreases. Quantities share one
+// Shopify order-edit session and the commit hardcodes notifyCustomer=false.
 {
   const secondLineGid = 'gid://shopify/LineItem/6600000002'
   const before = providerOrder({
@@ -1228,6 +1410,14 @@ for (const testCase of [
     phone: '+15555550199',
     poNumber: 'PO-UPDATED',
     note: 'Handle together',
+    shippingAddress: providerShippingAddress({
+      company: 'Receiving Bakery',
+      address1: '500 Receiving Lane',
+      address2: 'Dock 4',
+      city: 'Durham',
+      zip: '27701',
+      phone: '+15555550199',
+    }),
     tags: ['priority'],
     currentTotalPriceSet: {
       shopMoney: { amount: '75.00', currencyCode: 'USD' },
@@ -1272,6 +1462,14 @@ for (const testCase of [
             phone: '+15555550199',
             poNumber: 'PO-UPDATED',
             note: 'Handle together',
+            shippingAddress: providerShippingAddress({
+              company: 'Receiving Bakery',
+              address1: '500 Receiving Lane',
+              address2: 'Dock 4',
+              city: 'Durham',
+              zip: '27701',
+              phone: '+15555550199',
+            }),
             tags: ['priority'],
           },
           userErrors: [],
@@ -1320,6 +1518,14 @@ for (const testCase of [
       phone: '+15555550199',
       poNumber: 'PO-UPDATED',
       note: 'Handle together',
+      shippingAddress: shippingAddressInput({
+        company: 'Receiving Bakery',
+        address1: '500 Receiving Lane',
+        address2: 'Dock 4',
+        city: 'Durham',
+        zip: '27701',
+        phone: '+15555550199',
+      }),
       tagAdds: ['priority'],
       tagRemoves: ['warehouse-test'],
       lineQuantities: [
@@ -1341,6 +1547,14 @@ for (const testCase of [
       phone: '+15555550199',
       poNumber: 'PO-UPDATED',
       note: 'Handle together',
+      shippingAddress: shippingAddressInput({
+        company: 'Receiving Bakery',
+        address1: '500 Receiving Lane',
+        address2: 'Dock 4',
+        city: 'Durham',
+        zip: '27701',
+        phone: '+15555550199',
+      }),
       tags: ['priority'],
     },
   )
