@@ -37,6 +37,9 @@ const migration = read('db/migrations/0098_operations_label_execution.sql')
 const sandboxTrackingMigration = read(
   'db/migrations/0319_operations_sandbox_label_tracking_uniqueness.sql',
 )
+const maskedTrackingMigration = read(
+  'db/migrations/0320_operations_standard_sandbox_masked_tracking.sql',
+)
 const persistence = read('app_src/lib/persistence/operationShipping.ts')
 
 assertIncludes(sandboxTrackingMigration, [
@@ -56,6 +59,38 @@ assert.doesNotMatch(
   sandboxTrackingMigration,
   /WHERE environment = 'sandbox'/,
   'Sandbox tracking must not receive a uniqueness fence',
+)
+
+assertIncludes(maskedTrackingMigration, [
+  'CREATE OR REPLACE FUNCTION validate_operations_one_off_group_label()',
+  "NEW.environment = 'sandbox'",
+  "NEW.tracking_number ~* '^1Z[X]{16}$'",
+  'NEW.one_off_carrier_group_attempt_id IS NULL',
+  'NEW.create_attempt_id IS NOT NULL',
+  'masked_standard_attempt.id = NEW.create_attempt_id',
+  'masked_standard_attempt.package_id = NEW.package_id',
+  'masked_standard_attempt.carrier_rate_id = NEW.carrier_rate_id',
+  'masked_standard_attempt.integration_account_id =',
+  'NEW.integration_account_id',
+  'masked_standard_attempt.carrier_account_id =',
+  'NEW.carrier_account_id',
+  "masked_standard_attempt.state = 'prepared'",
+  "masked_standard_attempt.environment = 'sandbox'",
+  "masked_standard_attempt.provider = 'ups_rest'",
+  'masked_plan.one_off_quote_id IS NULL',
+  'UPS CIE masked tracking requires an exact sandbox one-off group or standard label attempt',
+  "attempt.error_code = 'OPERATIONS_LABEL_PERSISTENCE_UNKNOWN'",
+  "attempt.redacted_response ->> 'trackingNumber' ~* '^1Z[X]{16}$'",
+  "error_code = 'OPERATIONS_SANDBOX_MASKED_TRACKING_RETRYABLE'",
+  "'persistenceDisposition', 'sandbox_masked_tracking_rejected'",
+  "'0320_operations_standard_sandbox_masked_tracking'",
+  'DROP TRIGGER IF EXISTS protect_operations_label_attempt_write',
+  'CREATE TRIGGER protect_operations_label_attempt_write',
+], 'Standard sandbox masked-tracking migration')
+assert.doesNotMatch(
+  maskedTrackingMigration,
+  /NEW\.environment = 'production'[\s\S]{0,300}\^1Z\[X\]\{16\}\$/u,
+  'Production masked tracking must not be admitted',
 )
 
 const attemptTable = section(

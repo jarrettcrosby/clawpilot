@@ -109,6 +109,11 @@ function fixtureIds() {
     purchaseOffer: randomUUID(),
     carrierRate: randomUUID(),
     groupAttempt: randomUUID(),
+    standardOrder: randomUUID(),
+    standardPlan: randomUUID(),
+    standardPackage: randomUUID(),
+    standardCarrierRate: randomUUID(),
+    standardLabelAttempt: randomUUID(),
   }
 }
 
@@ -622,6 +627,146 @@ async function seedOneOffAuthority(client, ids) {
   })
 }
 
+async function seedStandardMaskedLabelAuthority(client, ids) {
+  await client.query('SET LOCAL session_replication_role = replica')
+  await client.query(
+    `INSERT INTO operations_orders (
+       id, global_id, organization_id, pipeline_id, customer_id,
+       integration_account_id, source_provider, external_order_id,
+       order_number, order_type, status, currency,
+       merchandise_total_minor, ship_to, source_payload
+     ) VALUES (
+       $1, 'gor0009302', $2, $3, $4, $5, 'clawpilot_native',
+       'standard-masked-label-order-1', 'STANDARD-MASKED-LABEL-1',
+       'standard', 'packed', 'USD', 2500, $6::jsonb, '{}'::jsonb
+     )`,
+    [
+      ids.standardOrder,
+      ids.organization,
+      ids.pipeline,
+      ids.customer,
+      ids.nativeIntegration,
+      JSON.stringify(destination),
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_fulfillment_plans (
+       id, organization_id, order_id, warehouse_id, status, method,
+       solver_status, estimated_cost_minor, promised_delivery_at,
+       explanation
+     ) VALUES (
+       $1, $2, $3, $4, 'released', 'manual_override', 'optimal', 1200,
+       now() + interval '3 days', '{}'::jsonb
+     )`,
+    [ids.standardPlan, ids.organization, ids.standardOrder, ids.warehouse],
+  )
+  await client.query(
+    `INSERT INTO operations_packages (
+       id, organization_id, plan_id, package_number, length_mm,
+       width_mm, height_mm, weight_grams, status, packed_by, packed_at
+     ) VALUES (
+       $1, $2, $3, 1, 300, 200, 100, 1000, 'packed', $4, now()
+     )`,
+    [ids.standardPackage, ids.organization, ids.standardPlan, actorEmail],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_rates (
+       id, organization_id, plan_id, carrier, service_code, service_name,
+       internal_cost_minor, customer_charge_minor, transit_days,
+       estimated_delivery_at, meets_promise, selected, quote_snapshot
+     ) VALUES (
+       $1, $2, $3, 'UPS', '03', 'UPS Ground', 1200, 1200, 3,
+       now() + interval '3 days', true, true, '{}'::jsonb
+     )`,
+    [ids.standardCarrierRate, ids.organization, ids.standardPlan],
+  )
+  await client.query(
+    `INSERT INTO operations_label_attempts (
+       id, organization_id, order_id, package_id, carrier_rate_id,
+       integration_account_id, carrier_account_id, action, state,
+       environment, provider, adapter_version, idempotency_key,
+       request_hash, redacted_request, actor_email
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, 'create', 'prepared',
+       'sandbox', 'ups_rest', 'fixture-v1', 'standard-masked-attempt-1',
+       $8, '{}'::jsonb, $9
+     )`,
+    [
+      ids.standardLabelAttempt,
+      ids.organization,
+      ids.standardOrder,
+      ids.standardPackage,
+      ids.standardCarrierRate,
+      ids.carrierIntegration,
+      ids.carrierAccount,
+      HASH.label1Request,
+      actorEmail,
+    ],
+  )
+  await client.query('SET LOCAL session_replication_role = origin')
+}
+
+async function verifyStandardMaskedLabelAuthority(client, ids) {
+  await client.query('BEGIN')
+  try {
+    const inserted = await client.query(
+      `INSERT INTO operations_labels (
+         organization_id, package_id, carrier_rate_id, carrier,
+         service_code, tracking_number, format, label_payload,
+         provider_label_id, idempotency_key, status,
+         integration_account_id, carrier_account_id, environment,
+         request_hash, redacted_provider_evidence, create_attempt_id
+       ) VALUES (
+         $1, $2, $3, 'UPS', '03', '1ZXXXXXXXXXXXXXXXX', 'ZPL',
+         '^XA^FDstandard masked sandbox label^FS^XZ',
+         'standard-masked-provider-label', 'standard-masked-label-1',
+         'created', $4, $5, 'sandbox', $6, '{}'::jsonb, $7
+       )
+       RETURNING id::text`,
+      [
+        ids.organization,
+        ids.standardPackage,
+        ids.standardCarrierRate,
+        ids.carrierIntegration,
+        ids.carrierAccount,
+        HASH.label1Request,
+        ids.standardLabelAttempt,
+      ],
+    )
+    assert.equal(inserted.rowCount, 1)
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+  }
+
+  await expectDatabaseReject(
+    client,
+    'unbound standard UPS masked sandbox label',
+    /exact sandbox one-off group or standard label attempt/iu,
+    () => client.query(
+      `INSERT INTO operations_labels (
+         organization_id, package_id, carrier_rate_id, carrier,
+         service_code, tracking_number, format, label_payload,
+         provider_label_id, idempotency_key, status,
+         integration_account_id, carrier_account_id, environment,
+         request_hash, redacted_provider_evidence
+       ) VALUES (
+         $1, $2, $3, 'UPS', '03', '1ZXXXXXXXXXXXXXXXX', 'ZPL',
+         '^XA^FDunbound masked sandbox label^FS^XZ',
+         'unbound-masked-provider-label', 'unbound-masked-label-1',
+         'created', $4, $5, 'sandbox', $6, '{}'::jsonb
+       )`,
+      [
+        ids.organization,
+        ids.standardPackage,
+        ids.standardCarrierRate,
+        ids.carrierIntegration,
+        ids.carrierAccount,
+        HASH.label1Request,
+      ],
+    ),
+  )
+}
+
 async function insertCarrierGroupAttempt(client, ids) {
   await client.query(
     `INSERT INTO operations_one_off_carrier_group_attempts (
@@ -937,7 +1082,10 @@ async function verifyAcceptance(databaseUrl) {
     await client.query('BEGIN')
     await seedPrerequisites(client, ids)
     await seedOneOffAuthority(client, ids)
+    await seedStandardMaskedLabelAuthority(client, ids)
     await client.query('COMMIT')
+
+    await verifyStandardMaskedLabelAuthority(client, ids)
 
     const freshBeforeConsumption = await client.query(
       `SELECT operations_one_off_purchase_quote_is_valid(
