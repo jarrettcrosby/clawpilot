@@ -1124,6 +1124,23 @@ async function verifyShipmentCompletion(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const carrierSandboxRate = loadTypeScriptModule(
+      'app_src/lib/integrations/carrierSandboxRate.ts',
+      {
+        mocks: {
+          '@/lib/integrations/carrierCredentialClient': {
+            CarrierCredentialClientError: class extends Error {},
+            requestCarrierAccessToken() {
+              throw new Error('Shipment completion does not request carrier credentials')
+            },
+          },
+          '@/lib/integrations/carrierWholeShipmentRateFoundation': {
+            FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+            UPS_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+          },
+        },
+      },
+    )
     const operationsOrderShipmentAddress = loadTypeScriptModule(
       'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
       {
@@ -1137,6 +1154,7 @@ async function verifyShipmentCompletion(databaseUrl) {
               throw new Error('Shipment completion does not edit addresses')
             },
           },
+          '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/postgres': postgres,
         },
@@ -1550,7 +1568,9 @@ async function verifyShipmentCompletion(databaseUrl) {
         const context = await setup.query(
           `SELECT source_order.id::text AS order_id,
                   source_order.integration_account_id::text AS account_id,
-                  plan.id::text AS plan_id
+                  source_order.ship_to,
+                  plan.id::text AS plan_id,
+                  plan.warehouse_id::text AS warehouse_id
            FROM operations_orders source_order
            JOIN operations_fulfillment_plans plan
              ON plan.organization_id = source_order.organization_id
@@ -1560,6 +1580,59 @@ async function verifyShipmentCompletion(databaseUrl) {
           [fixture.organizationId, order.planned.orderGlobalId],
         )
         assert.equal(context.rowCount, 1)
+        const sourceShipTo = orderShipTo.normalizeOrderShipToDraft(
+          context.rows[0].ship_to,
+        )
+        assert.equal(
+          orderShipTo.orderShipToReadiness(sourceShipTo),
+          'carrier_ready',
+        )
+        const destinationFingerprint = carrierSandboxRate
+          .carrierSandboxPartyFingerprint({
+            name: sourceShipTo.name,
+            line1: sourceShipTo.line1,
+            line2: sourceShipTo.line2,
+            city: sourceShipTo.city,
+            region: sourceShipTo.region,
+            postalCode: sourceShipTo.postalCode,
+            countryCode: sourceShipTo.country,
+          })
+        const cartonizationEvidence = await setup.query(
+          `INSERT INTO operations_cartonization_rate_evidence (
+             organization_id, integration_account_id, order_candidate_id,
+             candidate_row_version, candidate_source_hash, warehouse_id,
+             destination_fingerprint, evidence_mode, policy_version,
+             algorithm_version, request_hash, plan_input_hash,
+             plan_result_hash, plan_snapshot, assumption_snapshot, status,
+             idempotency_key, actor_email, write_token_hash, sealed_at
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, 0, repeat('a', 64), $4::uuid,
+             $5, 'operational', 'legacy-authority-fixture-v1',
+             'legacy-authority-fixture-v1', repeat('b', 64),
+             repeat('c', 64), repeat('d', 64),
+             jsonb_build_object('carrierReadEnvironment', 'sandbox'),
+             '{}'::jsonb, 'succeeded', $6, $7, repeat('e', 64), now()
+           ) RETURNING id::text`,
+          [
+            fixture.organizationId,
+            context.rows[0].account_id,
+            randomUUID(),
+            context.rows[0].warehouse_id,
+            destinationFingerprint,
+            `legacy-authority-evidence-${randomUUID()}`,
+            fixture.email,
+          ],
+        )
+        await setup.query(
+          `UPDATE operations_fulfillment_plans
+           SET cartonization_evidence_id = $3::uuid
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            fixture.organizationId,
+            context.rows[0].plan_id,
+            cartonizationEvidence.rows[0].id,
+          ],
+        )
         const carrierIntegration = await setup.query(
           `INSERT INTO operations_integration_accounts (
              organization_id, provider, integration_type, environment,
@@ -2069,6 +2142,7 @@ async function verifyShipmentCompletion(databaseUrl) {
                 source_order.row_version::text AS order_row_version,
                 source_order.pipeline_id::text AS pipeline_id,
                 source_order.integration_account_id::text AS account_id,
+                source_order.ship_to,
                 integration.global_id AS account_global_id,
                 plan.id::text AS plan_id,
                 plan.warehouse_id::text AS warehouse_id
@@ -2085,6 +2159,23 @@ async function verifyShipmentCompletion(databaseUrl) {
       )
       assert.equal(context.rowCount, 1)
       const source = context.rows[0]
+      const sourceShipTo = orderShipTo.normalizeOrderShipToDraft(
+        source.ship_to,
+      )
+      assert.equal(
+        orderShipTo.orderShipToReadiness(sourceShipTo),
+        'carrier_ready',
+      )
+      const destinationFingerprint = carrierSandboxRate
+        .carrierSandboxPartyFingerprint({
+          name: sourceShipTo.name,
+          line1: sourceShipTo.line1,
+          line2: sourceShipTo.line2,
+          city: sourceShipTo.city,
+          region: sourceShipTo.region,
+          postalCode: sourceShipTo.postalCode,
+          countryCode: sourceShipTo.country,
+        })
       const externalShopId = `gid://shopify/Shop/${Date.now()}1`
       const externalOrderId = `gid://shopify/Order/${Date.now()}2`
       const candidateSourceHash = 'c'.repeat(64)
@@ -2265,12 +2356,12 @@ async function verifyShipmentCompletion(databaseUrl) {
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid,
              $4::bigint, $5, $6::uuid,
-             repeat('5', 64),
+             $7,
              'operational', 'canonical-test-policy-v1',
              'canonical-test-algorithm-v1',
              repeat('1', 64), repeat('2', 64), repeat('3', 64),
              jsonb_build_object('carrierReadEnvironment', 'sandbox'),
-             '{}'::jsonb, 'succeeded', $7, $8, repeat('4', 64), now()
+             '{}'::jsonb, 'succeeded', $8, $9, repeat('4', 64), now()
            ) RETURNING id::text`,
           [
             fixture.organizationId,
@@ -2279,6 +2370,7 @@ async function verifyShipmentCompletion(databaseUrl) {
             candidate.row_version,
             candidateSourceHash,
             source.warehouse_id,
+            destinationFingerprint,
             `canonical-test-evidence-${randomUUID()}`,
             fixture.email,
           ],
