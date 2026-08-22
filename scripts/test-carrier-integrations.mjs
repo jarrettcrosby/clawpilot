@@ -236,7 +236,7 @@ for (const fragment of [
   'CarrierIntegrationSourceManagedError',
   'CarrierProductionLabelNotReadyError',
   "readonly code = 'CARRIER_PRODUCTION_LABEL_NOT_READY'",
-  'Move Operations to Active before authorizing live postage',
+  'Enable production rating for this carrier connection before authorizing live postage',
   'Verify the production carrier credential before authorizing live postage',
   'Add and enable a production sender-billing account before authorizing live postage',
   'lockedUserManagedCarrierConnection',
@@ -245,6 +245,19 @@ for (const fragment of [
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
+const productionLabelCapabilityMutation = persistence.slice(
+  persistence.indexOf('export async function setCarrierProductionLabelCapabilityInPostgres'),
+  persistence.indexOf('export async function disconnectCarrierCredentialInPostgres'),
+)
+assert.ok(
+  !productionLabelCapabilityMutation.includes('operations_activation_scopes')
+    && !productionLabelCapabilityMutation.includes('operations:activation'),
+  'Production-label capability must not depend on the global Operations activation profile',
+)
+assert.ok(
+  productionLabelCapabilityMutation.includes("current.includes('production_rate')"),
+  'Production-label authorization must require the existing exact production-rate capability',
+)
 assert.ok(
   !persistence.includes("$1::uuid, $2, 'carrier', $3, $4, 'active'"),
   'A newly connected carrier credential must require explicit enablement',
@@ -476,7 +489,6 @@ for (const fragment of [
   'Used as the shipper name for carrier rating and labels.',
   'Registered address line 1',
   'set-account-status',
-  'delete-account',
   'Sandbox billing account',
   'carrierAccountGlobalId: selectedCarrierAccountGlobalId',
   'destination: rateDestination',
@@ -530,6 +542,15 @@ for (const fragment of [
 ]) {
   assert.ok(panel.includes(fragment), `Carrier settings UI missing ${fragment}`)
 }
+assert.ok(
+  !panel.includes("action: 'delete-account'"),
+  'Carrier settings must not expose the account delete operation forbidden by database integrity rules',
+)
+assert.ok(
+  !panel.includes('New account number (optional)')
+    && panel.includes('Account numbers cannot be changed after creation.'),
+  'Carrier settings must keep an existing account number masked and immutable',
+)
 assert.ok(
   panel.includes("account.status !== 'active'"),
   'Sandbox rate UI must remain disabled until the verified credential is explicitly enabled',
@@ -1193,7 +1214,7 @@ assert.equal(
 )
 const sanitizedProductionLabelReadiness =
   delegatedCarrierServiceModule.sanitizedCarrierIntegrationError(Object.assign(
-    new Error('Move Operations to Active before authorizing live postage'),
+    new Error('Enable production rating for this carrier connection before authorizing live postage'),
     { status: 409, code: 'CARRIER_PRODUCTION_LABEL_NOT_READY' },
   ))
 assert.equal(sanitizedProductionLabelReadiness.status, 409)
@@ -1203,7 +1224,7 @@ assert.equal(
 )
 assert.equal(
   sanitizedProductionLabelReadiness.message,
-  'Move Operations to Active before authorizing live postage',
+  'Enable production rating for this carrier connection before authorizing live postage',
 )
 
 const previousClawPilotEnvironment = process.env.CLAWPILOT_ENV

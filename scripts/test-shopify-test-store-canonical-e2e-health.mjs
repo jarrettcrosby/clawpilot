@@ -12,6 +12,17 @@ const healthSource = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
 )
+const canonicalMigrationSource = readFileSync(
+  resolve(root, 'db/migrations/0302_operations_shopify_test_store_canonical_e2e.sql'),
+  'utf8',
+)
+const pre0315CurrentnessFunction = canonicalMigrationSource.match(
+  /CREATE OR REPLACE FUNCTION operations_shopify_test_store_e2e_is_current\([\s\S]*?\n\$\$;/u,
+)?.[0]
+assert.ok(
+  pre0315CurrentnessFunction,
+  '0302 must retain the exact pre-0315 currentness function fixture',
+)
 const sqlMatch = healthSource.match(
   /const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String\.raw`([\s\S]*?)`\n/u,
 )
@@ -263,6 +274,253 @@ async function tamper(pool, sql, message) {
   assert.equal(await attest(pool), true, `${message}: rollback must restore green`)
 }
 
+async function verifyCurrentnessProfileIndependence(pool) {
+  const ids = {
+    organization: randomUUID(),
+    pipeline: randomUUID(),
+    account: randomUUID(),
+    order: randomUUID(),
+    candidate: randomUUID(),
+    authorization: randomUUID(),
+    customer: randomUUID(),
+  }
+  const actor = 'shopify-currentness-fixture@example.com'
+  const externalOrderId = 'gid://shopify/Order/6600000315'
+  const externalAccountId = 'gid://shopify/Shop/315000000'
+  const confirmationHash = 'a'.repeat(64)
+  const candidateSourceHash = 'b'.repeat(64)
+  await pool.query('BEGIN')
+  try {
+    await pool.query('SET LOCAL session_replication_role = replica')
+    await pool.query(
+      `INSERT INTO operations_activation_scopes (
+         organization_id, data_pipeline_id, state, revision
+       ) VALUES ($1, $2, 'read_only', 7)`,
+      [ids.organization, ids.pipeline],
+    )
+    await pool.query(
+      `INSERT INTO operations_integration_accounts (
+         id, global_id, organization_id, provider, integration_type,
+         environment, display_name, status, configuration,
+         external_account_id, commerce_credential_generation
+       ) VALUES (
+         $1, 'gia0000315', $2, 'shopify', 'commerce', 'sandbox',
+         '0315 exact Shopify fixture', 'active', '{}'::jsonb, $3, 1
+       )`,
+      [ids.account, ids.organization, externalAccountId],
+    )
+    await pool.query(
+      `INSERT INTO operations_commerce_credentials (
+         organization_id, integration_account_id, external_account_id,
+         auth_mode, credential_ciphertext, credential_iv, credential_tag,
+         credential_version, credential_identifier_last_four,
+         verification_status, verified_at, webhook_verification_status
+       ) VALUES (
+         $1, $2, $3, 'shopify_client_credentials',
+         decode('010203', 'hex'), decode(repeat('01', 12), 'hex'),
+         decode(repeat('02', 16), 'hex'), 1, '0315', 'verified', now(),
+         'unverified'
+       )`,
+      [ids.organization, ids.account, externalAccountId],
+    )
+    await pool.query(
+      `INSERT INTO operations_orders (
+         id, global_id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, status, currency, merchandise_total_minor,
+         ship_to, source_payload, row_version
+       ) VALUES (
+         $1, 'gor0000315', $2, $3, $4, $5, 'shopify', $6,
+         '#0315', 'packed', 'USD', 100,
+         '{}'::jsonb, '{}'::jsonb, 9
+       )`,
+      [
+        ids.order,
+        ids.organization,
+        ids.pipeline,
+        ids.customer,
+        ids.account,
+        externalOrderId,
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_commerce_order_candidates (
+         id, global_id, organization_id, integration_account_id,
+         pipeline_id, run_id, provider, external_order_id,
+         order_number_snapshot, provider_order_status_raw,
+         provider_financial_status_raw, provider_fulfillment_status_raw,
+         provider_return_status_raw, normalized_order_status,
+         normalized_payment_status, normalized_fulfillment_status,
+         normalized_return_status, test_order, requires_shipping,
+         currency_code, subtotal_minor, shipping_minor, tax_minor,
+         other_adjustment_minor, total_minor, party_kind,
+         party_snapshot_state, customer_resolution_state,
+         customer_match_method, customer_id, ship_to_snapshot_state,
+         ship_to_snapshot_source, delivery_resolution_state,
+         observed_at, source_revision, source_hash,
+         provider_api_version, normalizer_version, workflow_state,
+         canonical_order_id, promotion_command_receipt_id,
+         promotion_idempotency_key, promotion_request_hash, promoted_at,
+         row_version, created_by, updated_by, expires_at
+       ) VALUES (
+         $1, 'gcoc0000315', $2, $3, $4, gen_random_uuid(), 'shopify', $5,
+         '#0315', 'open', 'paid', 'fulfilled', 'none',
+         'open', 'paid', 'fulfilled', 'none', true, false,
+         'USD', 100, 0, 0, 0, 100, 'consumer', 'missing',
+         'resolved', 'exact_email', $6, 'missing', 'none',
+         'not_required', now(), 'shopify-updated-at:0315', $7,
+         '2026-07', '0315-fixture-v1', 'promoted', $8,
+         gen_random_uuid(), 'promote-0315', repeat('c', 64), now(),
+         3, $9, $9, now() + interval '1 day'
+       )`,
+      [
+        ids.candidate,
+        ids.organization,
+        ids.account,
+        ids.pipeline,
+        externalOrderId,
+        ids.customer,
+        candidateSourceHash,
+        ids.order,
+        actor,
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_sandbox_commerce_e2e_authorizations (
+         id, organization_id, order_id, external_order_id, state,
+         confirmation_statement_version, confirmation_hash, reason,
+         authorized_by, authorized_at, expires_at
+       ) VALUES (
+         $1, $2, $3, $4, 'active',
+         'shopify-test-store-canonical-e2e-v1', $5,
+         'Exact 0315 profile-independent currentness fixture', $6,
+         now(), now() + interval '1 hour'
+       )`,
+      [
+        ids.authorization,
+        ids.organization,
+        ids.order,
+        externalOrderId,
+        confirmationHash,
+        actor,
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_shopify_test_store_e2e_evidence (
+         authorization_id, organization_id, confirmation_hash,
+         integration_account_id, account_global_id, external_account_id,
+         credential_generation, activation_revision, order_id,
+         order_global_id, external_order_id, initial_order_row_version,
+         order_candidate_id, order_candidate_global_id,
+         order_candidate_row_version, order_candidate_source_revision,
+         order_candidate_source_hash, provider_proof_version,
+         provider_proof_hash, provider_order_updated_at,
+         provider_verified_at, provider_test,
+         authorization_idempotency_key, authorization_request_hash,
+         created_by
+       ) VALUES (
+         $1, $2, $3, $4, 'gia0000315', $5, 1, 7, $6,
+         'gor0000315', $7, 9, $8, 'gcoc0000315', 3,
+         'shopify-updated-at:0315', $9,
+         'shopify-test-store-canonical-e2e-proof-v1', repeat('d', 64),
+         now() - interval '1 minute', now(), true,
+         'authorize-0315', repeat('e', 64), $10
+       )`,
+      [
+        ids.authorization,
+        ids.organization,
+        confirmationHash,
+        ids.account,
+        externalAccountId,
+        ids.order,
+        externalOrderId,
+        ids.candidate,
+        candidateSourceHash,
+        actor,
+      ],
+    )
+    await pool.query('SET LOCAL session_replication_role = origin')
+
+    const isCurrent = async () => {
+      const result = await pool.query(
+        `SELECT operations_shopify_test_store_e2e_is_current(
+           $1::uuid, $2::uuid, $3::uuid
+         ) AS current`,
+        [ids.organization, ids.authorization, ids.order],
+      )
+      return result.rows[0]?.current === true
+    }
+    for (const profile of [
+      'disabled',
+      'shadow',
+      'read_only',
+      'active',
+      'frozen',
+    ]) {
+      await pool.query('SET LOCAL session_replication_role = replica')
+      await pool.query(
+        `UPDATE operations_activation_scopes SET state = $2
+         WHERE organization_id = $1::uuid`,
+        [ids.organization, profile],
+      )
+      await pool.query('SET LOCAL session_replication_role = origin')
+      assert.equal(
+        await isCurrent(),
+        true,
+        `Exact Shopify test-order authority must survive ${profile}`,
+      )
+    }
+
+    for (const [label, staleSql, restoreSql] of [
+      [
+        'credential verification',
+        `UPDATE operations_commerce_credentials
+         SET verification_status = 'failed', verified_at = NULL
+         WHERE organization_id = $1::uuid`,
+        `UPDATE operations_commerce_credentials
+         SET verification_status = 'verified', verified_at = now()
+         WHERE organization_id = $1::uuid`,
+      ],
+      [
+        'candidate source hash',
+        `UPDATE operations_commerce_order_candidates
+         SET source_hash = repeat('f', 64)
+         WHERE organization_id = $1::uuid`,
+        `UPDATE operations_commerce_order_candidates
+         SET source_hash = repeat('b', 64)
+         WHERE organization_id = $1::uuid`,
+      ],
+      [
+        'commerce account status',
+        `UPDATE operations_integration_accounts SET status = 'disabled'
+         WHERE organization_id = $1::uuid`,
+        `UPDATE operations_integration_accounts SET status = 'active'
+         WHERE organization_id = $1::uuid`,
+      ],
+      [
+        'credential generation',
+        `UPDATE operations_integration_accounts
+         SET commerce_credential_generation = 2
+         WHERE organization_id = $1::uuid`,
+        `UPDATE operations_integration_accounts
+         SET commerce_credential_generation = 1
+         WHERE organization_id = $1::uuid`,
+      ],
+    ]) {
+      await pool.query('SET LOCAL session_replication_role = replica')
+      await pool.query(staleSql, [ids.organization])
+      await pool.query('SET LOCAL session_replication_role = origin')
+      assert.equal(await isCurrent(), false, `Stale ${label} must fail closed`)
+      await pool.query('SET LOCAL session_replication_role = replica')
+      await pool.query(restoreSql, [ids.organization])
+      await pool.query('SET LOCAL session_replication_role = origin')
+      assert.equal(await isCurrent(), true, `${label} restore must be exact`)
+    }
+  } finally {
+    await pool.query('ROLLBACK')
+  }
+}
+
 async function exercise(pool) {
   const exactFingerprints = await fingerprints(pool)
   if (process.argv.includes('--print-fingerprints')) {
@@ -274,6 +532,42 @@ async function exercise(pool) {
     true,
     `Fresh 0302 schema must pass exact health attestation: ${JSON.stringify(exactFingerprints)}`,
   )
+  await tamper(
+    pool,
+    `UPDATE public.schema_migrations SET checksum = repeat('0', 64)
+     WHERE filename =
+       '0315_operations_carrier_writes_independent_activation.sql'`,
+    'Changed 0315 checksum must fail health',
+  )
+  await tamper(
+    pool,
+    `DELETE FROM public.schema_migrations
+     WHERE filename =
+       '0315_operations_carrier_writes_independent_activation.sql'`,
+    'Post-0315 function bytes without the 0315 ledger must fail health',
+  )
+  await pool.query('BEGIN')
+  try {
+    await pool.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0315_operations_carrier_writes_independent_activation.sql'`,
+    )
+    await pool.query(pre0315CurrentnessFunction)
+    assert.equal(
+      await attest(pool),
+      true,
+      'Exact 0302 through 0314 function bytes must remain a valid phase',
+    )
+  } finally {
+    await pool.query('ROLLBACK')
+  }
+  assert.equal(
+    await attest(pool),
+    true,
+    'Pre-0315 phase rollback must restore current health',
+  )
+  await verifyCurrentnessProfileIndependence(pool)
   await tamper(
     pool,
     `UPDATE public.schema_migrations SET checksum = repeat('0', 64)

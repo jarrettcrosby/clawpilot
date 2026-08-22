@@ -1635,7 +1635,10 @@ function assertActiveRecipeMaterial(material: MaterialRow) {
     material.status !== 'active'
     || material.dimension_basis !== 'inner'
     || material.dimension_evidence_type === 'unknown'
-    || !material.dimension_evidence_reference
+    || (
+      material.dimension_evidence_type !== 'measured'
+      && !material.dimension_evidence_reference?.trim()
+    )
     || material.dimension_confirmed_at === null
     || !Number.isSafeInteger(material.inner_length_mm)
     || Number(material.inner_length_mm) < 1
@@ -1649,8 +1652,13 @@ function assertActiveRecipeMaterial(material: MaterialRow) {
     || Number(material.rated_outer_width_mm) < 1
     || !Number.isSafeInteger(material.rated_outer_height_mm)
     || Number(material.rated_outer_height_mm) < 1
-    || !material.rated_outer_dimension_evidence_type
-    || !material.rated_outer_dimension_evidence_reference
+    || !['customer_confirmed', 'measured', 'provider'].includes(
+      material.rated_outer_dimension_evidence_type || '',
+    )
+    || (
+      material.rated_outer_dimension_evidence_type !== 'measured'
+      && !material.rated_outer_dimension_evidence_reference?.trim()
+    )
     || material.rated_outer_dimension_confirmed_at === null
     || !Number.isSafeInteger(material.tare_weight_grams)
     || Number(material.tare_weight_grams) < 1

@@ -117,6 +117,7 @@ type CarrierPayload = {
   error?: string
   canManage?: boolean
   canExecute?: boolean
+  canPurchaseLivePostage?: boolean
   canReconcile?: boolean
   canRevealCredentials?: boolean
   productionLabelAuthorizationAllowed?: boolean
@@ -513,6 +514,7 @@ export default function CarrierIntegrationPanel({
   const [voidLabelConfirmed, setVoidLabelConfirmed] = useState(false)
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [canExecute, setCanExecute] = useState(false)
+  const [canPurchaseLivePostage, setCanPurchaseLivePostage] = useState(false)
   const [canReconcile, setCanReconcile] = useState(false)
   const [reconciliationAttemptGlobalId, setReconciliationAttemptGlobalId] = useState('')
   const [reconciliationOutcome, setReconciliationOutcome] = useState('')
@@ -733,6 +735,8 @@ export default function CarrierIntegrationPanel({
     ? 'Save and verify the production credential first.'
     : account.verificationStatus !== 'verified'
       ? 'Verify the production credential first.'
+      : !canPurchaseLivePostage
+        ? 'Live-postage permission is required to run a LIVE production shipping diagnostic.'
       : account.status !== 'active'
         ? 'Enable the production connection first.'
         : !account.allowedCapabilities.includes('production_rate')
@@ -758,6 +762,8 @@ export default function CarrierIntegrationPanel({
     ? ''
     : !productionLabelAuthorizationAllowed
       ? 'LIVE label buying is available only in the trusted ClawPilot Railway development or production runtime.'
+      : !canPurchaseLivePostage
+        ? 'Live-postage permission is required to buy REAL POSTAGE.'
       : !livePostageAuthorized
         ? 'Authorize the production_label capability above before buying REAL POSTAGE.'
         : !canRevealCredentials
@@ -780,6 +786,7 @@ export default function CarrierIntegrationPanel({
         )
         setProductionLabelRuntimeLane(result.productionLabelRuntimeLane || null)
         setCanExecute(result.canExecute === true)
+        setCanPurchaseLivePostage(result.canPurchaseLivePostage === true)
         setCanReconcile(result.canReconcile === true)
         if (result.rateTestLabels) setRateTestLabels(result.rateTestLabels)
         if (result.rateTestLabelOutputs) {
@@ -1012,7 +1019,7 @@ export default function CarrierIntegrationPanel({
           : {}),
         displayName: carrierAccountForm.displayName,
         senderName: carrierAccountForm.senderName,
-        ...(carrierAccountForm.accountNumber.trim()
+        ...(!editingCarrierAccountGlobalId && carrierAccountForm.accountNumber.trim()
           ? { accountNumber: carrierAccountForm.accountNumber }
           : {}),
         registeredAddress: {
@@ -1650,7 +1657,8 @@ export default function CarrierIntegrationPanel({
                   busy
                   || livePostageReason.trim().length < 3
                   || (!livePostageAuthorized
-                    && (!productionLabelAuthorizationAllowed
+                    && (!canPurchaseLivePostage
+                      || !productionLabelAuthorizationAllowed
                       || livePostageConfirmation !== 'AUTHORIZE LIVE POSTAGE'))
                 }
                 onClick={() => {
@@ -1683,7 +1691,7 @@ export default function CarrierIntegrationPanel({
             </Stack>
           ) : productionLabelAuthorizationAllowed ? (
             <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
-              An organization owner or administrator with Operations activation permission must change live-postage authorization.
+              An organization owner or administrator with live-postage permission must change live-postage authorization.
             </Typography>
           ) : null}
         </Box>
@@ -1957,32 +1965,6 @@ export default function CarrierIntegrationPanel({
                       </Button>
                     </span>
                   </Tooltip>
-                  <Tooltip title="Delete unused carrier account">
-                    <span>
-                      <Button
-                        size="small"
-                        color="error"
-                        startIcon={<DeleteOutlineRounded />}
-                        disabled={busy || ratingOnlyDelegation}
-                        sx={{ minHeight: 44, minWidth: 44 }}
-                        onClick={() => {
-                          if (!window.confirm(`Delete ${entry.displayName}?`)) return
-                          void patch(
-                            `delete-${entry.globalId}`,
-                            {
-                              action: 'delete-account',
-                              provider,
-                              environment,
-                              carrierAccountGlobalId: entry.globalId,
-                            },
-                            'Carrier account deleted.',
-                          )
-                        }}
-                      >
-                        Delete
-                      </Button>
-                    </span>
-                  </Tooltip>
                 </Stack>
               </Box>
             ))}
@@ -2002,15 +1984,28 @@ export default function CarrierIntegrationPanel({
                 inputProps={{ maxLength: 120 }}
                 sx={fieldSx}
               />
-              <TextField
-                required={!editingCarrierAccountGlobalId}
-                label={editingCarrierAccountGlobalId ? 'New account number (optional)' : 'Account number'}
-                value={carrierAccountForm.accountNumber}
-                onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
-                disabled={busy || ratingOnlyDelegation}
-                autoComplete="off"
-                sx={fieldSx}
-              />
+              {editingCarrierAccountGlobalId ? (
+                <TextField
+                  label="Account number"
+                  value={`••••${account?.carrierAccounts.find((entry) => (
+                    entry.globalId === editingCarrierAccountGlobalId
+                  ))?.accountNumberLastFour || ''}`}
+                  helperText="Account numbers cannot be changed after creation. Add a new account if the billing identity changes."
+                  InputProps={{ readOnly: true }}
+                  disabled={busy || ratingOnlyDelegation}
+                  sx={fieldSx}
+                />
+              ) : (
+                <TextField
+                  required
+                  label="Account number"
+                  value={carrierAccountForm.accountNumber}
+                  onChange={(event) => updateCarrierAccountForm('accountNumber', event.target.value)}
+                  disabled={busy || ratingOnlyDelegation}
+                  autoComplete="off"
+                  sx={fieldSx}
+                />
+              )}
               <TextField
                 required
                 label="Sender name"

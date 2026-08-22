@@ -29,6 +29,10 @@ import {
   acquireTransactionAdvisoryLock,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   assertCommerceOrderRevisionExecutionCurrent,
   CommerceOrderRevisionGateError,
@@ -597,11 +601,8 @@ type ActiveExecutionContextRow = QueryResultRow & {
   warehouse_global_id: string
   source_fulfillment_pack_rate_run_id: string
   activation_revision: number
-  current_activation_state: string
-  current_activation_revision: number
   order_currency: string
   group_currency: string
-  ship_to: JsonObject
 }
 
 function packageSnapshotFromRow(
@@ -961,11 +962,8 @@ export async function prepareProductionFulfillmentRerateInPostgres(
                 shadow.fulfillment_pack_rate_run_id::text
                   AS source_fulfillment_pack_rate_run_id,
                 execution.activation_revision,
-                activation.state AS current_activation_state,
-                activation.revision AS current_activation_revision,
                 orders.currency AS order_currency,
-                shipment_group.currency AS group_currency,
-                orders.ship_to
+                shipment_group.currency AS group_currency
          FROM operations_active_fulfillment_executions execution
          JOIN workspace_organizations organization
            ON organization.id = execution.organization_id
@@ -984,14 +982,12 @@ export async function prepareProductionFulfillmentRerateInPostgres(
          JOIN operations_warehouses warehouse
            ON warehouse.organization_id = execution.organization_id
           AND warehouse.id = execution.warehouse_id
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = execution.organization_id
          WHERE execution.organization_id = $1::uuid
            AND execution.global_id = $2
            AND shipment_group.global_id = $3
          LIMIT 1
          FOR SHARE OF execution, shipment_group, shadow, orders, plan,
-           warehouse, activation`,
+           warehouse`,
         [organizationId, activeExecutionGlobalId, activeShipmentGroupGlobalId],
       )
       const context = contextResult.rows[0]
@@ -1008,13 +1004,11 @@ export async function prepareProductionFulfillmentRerateInPostgres(
         operation: 'rate',
       })
       if (
-        context.current_activation_state !== 'active'
-        || Number(context.current_activation_revision) !== expectedRevision
-        || Number(context.activation_revision) !== expectedRevision
+        Number(context.activation_revision) !== expectedRevision
       ) {
         fail(
-          'OPERATIONS_PRODUCTION_RERATE_ACTIVE_REVISION_CHANGED',
-          'Production rerating requires the current Operations Active revision',
+          'OPERATIONS_PRODUCTION_RERATE_EXECUTION_REVISION_CHANGED',
+          'Production rerating no longer matches the exact fulfillment execution lineage',
         )
       }
       if (
@@ -1026,7 +1020,16 @@ export async function prepareProductionFulfillmentRerateInPostgres(
           'Production rerate currency must match the canonical order and shipment group',
         )
       }
-      if (!sameOrderDestination(context.ship_to, destination)) {
+      const operationalDestination =
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId,
+          orderGlobalId: context.order_global_id,
+          client,
+        })
+      if (!sameOrderDestination(
+        orderShipToStorageValue(operationalDestination.value),
+        destination,
+      )) {
         fail(
           'OPERATIONS_PRODUCTION_RERATE_DESTINATION_MISMATCH',
           'Production rerate destination must match the canonical order',
@@ -1484,34 +1487,19 @@ export async function prepareProductionFulfillmentRerateAttemptInPostgres(
         currency: string
         destination_snapshot: JsonObject
         activation_revision: number
-        current_activation_state: string
-        current_activation_revision: number
       }>(
         `SELECT run.id::text, run.package_count, run.currency,
-                run.destination_snapshot, run.activation_revision,
-                activation.state AS current_activation_state,
-                activation.revision AS current_activation_revision
+                run.destination_snapshot, run.activation_revision
          FROM operations_production_fulfillment_rerate_runs run
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = run.organization_id
          WHERE run.organization_id = $1::uuid
            AND run.global_id = $2
          LIMIT 1
-         FOR SHARE OF run, activation`,
+         FOR SHARE OF run`,
         [organizationId, rerateRunGlobalId],
       )
       const run = runResult.rows[0]
       if (!run) {
         fail('OPERATIONS_PRODUCTION_RERATE_NOT_FOUND', 'Production rerate was not found', 404)
-      }
-      if (
-        run.current_activation_state !== 'active'
-        || Number(run.current_activation_revision) !== Number(run.activation_revision)
-      ) {
-        fail(
-          'OPERATIONS_PRODUCTION_RERATE_ACTIVE_REVISION_CHANGED',
-          'Production rerate no longer matches the current Active revision',
-        )
       }
       const runPackages = await readReratePackages(
         client,
@@ -2629,8 +2617,8 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
           )
         }
         // This is a historical command replay, not fresh dispatch authority.
-        // Dispatch resolution independently revalidates expiration, Active
-        // revision, destination, and provider configuration before any write.
+        // Dispatch resolution independently revalidates expiration,
+        // destination, and provider configuration before any write.
         const selection = await loadRerateSelection(
           client,
           organizationId,
@@ -2713,62 +2701,46 @@ export async function selectProductionFulfillmentRerateOfferInPostgres(
       ) {
         fail(
           'OPERATIONS_PRODUCTION_RERATE_OFFER_INELIGIBLE',
-          'Only one currently unexpired offer from the current Active revision may be selected',
+          'Only one currently unexpired exact production carrier offer may be selected',
         )
       }
 
       // Lock every mutable row used as current selection authority in one
       // stable order. These SHARE locks remain held through the insert and its
-      // database trigger, so a concurrent order, activation, account, or
-      // credential update cannot invalidate evidence between validation and
-      // commit.
-      const activationResult = await client.query<{
-        state: string
-        revision: number
-      }>(
-        `SELECT state, revision
-         FROM operations_activation_scopes
-         WHERE organization_id = $1::uuid
-         LIMIT 1
-         FOR SHARE`,
-        [organizationId],
-      )
-      const activation = activationResult.rows[0]
-      if (
-        !activation
-        || activation.state !== 'active'
-        || Number(activation.revision) !== Number(candidate.activation_revision)
-      ) {
-        fail(
-          'OPERATIONS_PRODUCTION_RERATE_OFFER_INELIGIBLE',
-          'Only one currently unexpired offer from the current Active revision may be selected',
-        )
-      }
+      // database trigger, so a concurrent order, account, or credential update
+      // cannot invalidate evidence between validation and commit.
       const orderResult = await client.query<{
         currency: string
-        destination_matches: boolean
+        order_global_id: string
       }>(
-        `SELECT orders.currency,
-                operations_dispatch_address_matches_core(
-                  $3::jsonb,
-                  orders.ship_to
-                ) AS destination_matches
+        `SELECT orders.currency, orders.global_id AS order_global_id
          FROM operations_orders orders
          WHERE orders.organization_id = $1::uuid
            AND orders.id = $2::uuid
          LIMIT 1
          FOR SHARE`,
-        [
-          organizationId,
-          candidate.order_id,
-          JSON.stringify(candidate.destination_snapshot),
-        ],
+        [organizationId, candidate.order_id],
       )
       const currentOrder = orderResult.rows[0]
+      const candidateDestination = normalizeAddress(
+        candidate.destination_snapshot as unknown as ActiveCarrierDispatchAddressSnapshot,
+        'Destination',
+      )
+      const currentOperationalDestination = currentOrder
+        ? await readOperationsOrderShipmentAddressInPostgres({
+            organizationId,
+            orderGlobalId: currentOrder.order_global_id,
+            client,
+          })
+        : null
       if (
         !currentOrder
         || currency(currentOrder.currency) !== currency(candidate.currency)
-        || currentOrder.destination_matches !== true
+        || !currentOperationalDestination
+        || !sameOrderDestination(
+          orderShipToStorageValue(currentOperationalDestination.value),
+          candidateDestination,
+        )
       ) {
         fail(
           'OPERATIONS_PRODUCTION_RERATE_SELECTION_DESTINATION_OR_CURRENCY_STALE',
@@ -2963,7 +2935,6 @@ type DispatchSelectionRow = QueryResultRow & {
   order_id: string
   order_global_id: string
   current_order_currency: string
-  current_order_ship_to: JsonObject
   plan_id: string
   plan_global_id: string
   warehouse_id: string
@@ -3007,8 +2978,6 @@ type DispatchSelectionRow = QueryResultRow & {
   service_name: string
   amount_minor: string | number
   currency: string
-  current_activation_state: string
-  current_activation_revision: number
 }
 
 export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
@@ -3040,7 +3009,6 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
               run.order_id::text AS order_id,
               orders.global_id AS order_global_id,
               orders.currency AS current_order_currency,
-              orders.ship_to AS current_order_ship_to,
               run.plan_id::text AS plan_id, plan.global_id AS plan_global_id,
               run.warehouse_id::text AS warehouse_id,
               warehouse.global_id AS warehouse_global_id,
@@ -3078,9 +3046,7 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
               selection.provider_reference, result.completed_at,
               result.expires_at AS result_expires_at,
               selection.service_code, selection.service_name,
-              selection.amount_minor::text, selection.currency,
-              activation.state AS current_activation_state,
-              activation.revision AS current_activation_revision
+              selection.amount_minor::text, selection.currency
        FROM operations_production_fulfillment_rerate_selections selection
        JOIN operations_production_fulfillment_rerate_runs run
          ON run.organization_id = selection.organization_id
@@ -3112,13 +3078,11 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
        JOIN operations_carrier_credentials credential
          ON credential.organization_id = selection.organization_id
         AND credential.integration_account_id = selection.integration_account_id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = selection.organization_id
        WHERE selection.organization_id = $1::uuid
          AND selection.global_id = $2
        LIMIT 1
        FOR SHARE OF selection, run, attempt, result, orders, plan, warehouse,
-         integration, carrier_account, credential, activation`,
+         integration, carrier_account, credential`,
       [organizationId, selectionGlobalId],
     )
     const row = result.rows[0]
@@ -3139,8 +3103,6 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
       || row.integration_status !== 'active'
       || row.carrier_account_status !== 'active'
       || row.credential_verification_status !== 'verified'
-      || Number(row.current_activation_revision) !== Number(row.activation_revision)
-      || row.current_activation_state !== 'active'
       || Number(row.current_carrier_account_configuration_revision)
         !== Number(row.carrier_account_configuration_revision)
       || row.current_account_number_fingerprint !== row.account_number_fingerprint
@@ -3154,7 +3116,7 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
     ) {
       fail(
         'OPERATIONS_PRODUCTION_RERATE_DISPATCH_CONTEXT_STALE',
-        'Selected rate evidence is expired or no longer matches the current Active account and credential binding',
+        'Selected rate evidence is expired or no longer matches the current production carrier account and credential binding',
       )
     }
 
@@ -3197,9 +3159,18 @@ export async function loadProductionFulfillmentRerateDispatchContextInPostgres(
       row.destination_snapshot as unknown as ActiveCarrierDispatchAddressSnapshot,
       'Destination',
     )
+    const currentOperationalDestination =
+      await readOperationsOrderShipmentAddressInPostgres({
+        organizationId,
+        orderGlobalId: row.order_global_id,
+        client,
+      })
     if (
       currency(row.current_order_currency) !== currency(row.currency)
-      || !sameOrderDestination(row.current_order_ship_to, destination)
+      || !sameOrderDestination(
+        orderShipToStorageValue(currentOperationalDestination.value),
+        destination,
+      )
     ) {
       fail(
         'OPERATIONS_PRODUCTION_RERATE_ORDER_BINDING_STALE',

@@ -162,7 +162,7 @@ export type HybridRecipePackage = {
       | 'measured'
       | 'provider'
       | 'legacy'
-    dimensionEvidenceReference: string
+    dimensionEvidenceReference: string | null
     dimensionConfirmedAt: string
   }
   contentCompatibilityKey: string | null
@@ -460,7 +460,10 @@ function materialEvidenceProblem(
       && !sandboxUnconfirmedBasisWithRatedExterior
     )
     || material.dimensionEvidenceType === 'unknown'
-    || !present(material.dimensionEvidenceReference)
+    || (
+      material.dimensionEvidenceType !== 'measured'
+      && !present(material.dimensionEvidenceReference)
+    )
     || !validTimestamp(material.dimensionConfirmedAt)
     || !Number.isSafeInteger(dimensions.length)
     || dimensions.length <= 0
@@ -930,7 +933,7 @@ function allocatePackage(
       dimensionBasis: option.material.dimensionBasis,
       dimensionEvidenceType: option.material.dimensionEvidenceType,
       dimensionEvidenceReference:
-        option.material.dimensionEvidenceReference ?? '',
+        option.material.dimensionEvidenceReference,
       dimensionConfirmedAt: option.material.dimensionConfirmedAt ?? '',
     },
     contentCompatibilityKey: option.contentCompatibilityKey,

@@ -65,6 +65,19 @@ function loadPersistence() {
     if (specifier === '@/lib/operations/fulfillmentOptimizerContract') {
       return fulfillmentOptimizerContract
     }
+    if (specifier === '@/lib/operations/orderShipTo') {
+      return { orderShipToStorageValue: (value) => value }
+    }
+    if (
+      specifier
+        === '@/lib/persistence/operationsOrderShipmentAddress'
+    ) {
+      return {
+        readOperationsOrderShipmentAddressInPostgres: async () => {
+          throw new Error('not used by the hash contract')
+        },
+      }
+    }
     if (specifier === '@/lib/persistence/postgres') {
       return {
         acquireTransactionAdvisoryLock: async () => {},
@@ -1008,14 +1021,16 @@ const operationalGeometryFence = section(
   'Operational geometry fence',
 )
 assertIncludes(operationalGeometryFence, [
-  '!request.shadowTraining',
-  "read.activationState !== 'shadow'",
-  'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
   'configuredOrToolsFulfillmentOptimizer()',
   'planOperationalGeometryRatePackages({',
   'optimizer,',
   "operationalGeometryRatePlan.status === 'blocked'",
-], 'Operational geometry must use one fail-closed OR-Tools plan in Shadow')
+], 'Operational geometry must use one fail-closed OR-Tools plan')
+assert.doesNotMatch(
+  operationalGeometryFence,
+  /activationState|CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED/u,
+  'Operational read-only rating must not depend on workspace activation',
+)
 const sandboxGeometrySection = section(
   route,
   'const sandboxGeometryRatePlan =',
@@ -1248,8 +1263,8 @@ const sandboxMaterials = [
     status: 'draft',
     innerDimensionsMm: { length: 200, width: 150, height: 100 },
     dimensionBasis: 'unconfirmed',
-    dimensionEvidenceType: 'customer_confirmed',
-    dimensionEvidenceReference: 'customer-box-proof-small',
+    dimensionEvidenceType: 'measured',
+    dimensionEvidenceReference: null,
     dimensionConfirmedAt: '2026-08-10T12:00:00.000Z',
     tareWeightGrams: null,
     maximumGrossWeightGrams: 2_000,
@@ -1307,6 +1322,12 @@ assert.equal(
   sandboxGeometryPlan.packages[0].geometryEvidence.materialDimensionBasis,
   'unconfirmed',
   'Sandbox geometry must retain the actual material dimension basis without upgrading it to inner evidence',
+)
+assert.equal(
+  sandboxGeometryPlan.packages[0].geometryEvidence
+    .materialDimensionEvidenceReference,
+  null,
+  'Sandbox rate evidence must preserve a measured null reference truthfully',
 )
 assert.equal(
   sandboxGeometryPlan.evidence.materialStockAuthority,

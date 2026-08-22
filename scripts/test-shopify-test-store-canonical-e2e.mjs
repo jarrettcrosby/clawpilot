@@ -280,7 +280,8 @@ function actionInput(overrides = {}) {
     activationState: 'read_only',
     canExecute: true,
     canManage: true,
-    canActivate: true,
+    canPurchaseLivePostage: true,
+    fulfillmentWritesEnabled: true,
     planStatus: 'released',
     waveStatus: 'completed',
     lineCount: 1,
@@ -339,8 +340,8 @@ assert.equal(
     sandboxE2eAuthorized: false,
     sandboxE2eAuthorityKind: null,
   }), 'verify_pack').enabled,
-  false,
-  'An unrelated Read-only order must remain blocked',
+  true,
+  'Ordinary local warehouse work must not depend on the legacy profile',
 )
 assert.equal(
   action(actionInput({
@@ -352,13 +353,14 @@ assert.equal(
     sandboxE2eAuthorized: true,
     sandboxE2eAuthorityKind: 'legacy_packed',
   }), 'verify_pack').enabled,
-  false,
-  'A legacy sandbox authorization must not unlock Read-only warehouse work',
+  true,
+  'Legacy sandbox authorization must not be required for local warehouse work',
 )
 assert.equal(
   action(actionInput({
     activationState: 'active',
     sandboxE2eAuthorized: false,
+    sandboxE2eAuthorityKind: null,
     sandboxE2eFulfillmentConfirmed: false,
     activeLabelCount: 1,
     shippableLabelCount: 1,
@@ -370,6 +372,9 @@ assert.equal(
 
 const sources = {
   persistence: read('app_src/lib/persistence/shopifyTestStoreCanonicalE2e.ts'),
+  sandboxAuthorization: read(
+    'app_src/lib/persistence/sandboxCommerceE2eAuthorization.ts',
+  ),
   operations: read('app_src/lib/persistence/operations.ts'),
   shipping: read('app_src/lib/persistence/operationShipping.ts'),
   writeback: read('app_src/lib/integrations/shopifyFulfillmentWriteback.ts'),
@@ -385,7 +390,24 @@ const sources = {
   migration: read(
     'db/migrations/0302_operations_shopify_test_store_canonical_e2e.sql',
   ),
+  activationIndependentMigration: read(
+    'db/migrations/0315_operations_carrier_writes_independent_activation.sql',
+  ),
 }
+
+assert.ok(
+  sources.sandboxAuthorization.includes(
+    'Shopify test-store E2E authority no longer matches its exact current account, credential, order, or source evidence',
+  ),
+  'Canonical authorization stale copy must describe its current exact evidence',
+)
+assert.equal(
+  sources.sandboxAuthorization.includes(
+    'no longer matches Read only activation or its exact source evidence',
+  ),
+  false,
+  'Canonical authorization stale copy must not claim the legacy profile is current authority',
+)
 
 for (const fragment of [
   'verifiedAt < proofClaimedAt - 5 * 60_000',
@@ -424,9 +446,47 @@ for (const fragment of [
   assert.ok(sources.migration.includes(fragment), `Migration missing ${fragment}`)
 }
 
+const currentAuthorityReplacement =
+  sources.activationIndependentMigration.match(
+    /CREATE OR REPLACE FUNCTION\s+public\.operations_shopify_test_store_e2e_is_current\([\s\S]*?\n\$\$;/u,
+  )?.[0]
+assert.ok(
+  currentAuthorityReplacement,
+  '0315 must replace the exact canonical Shopify currentness helper',
+)
+for (const removedProfileDependency of [
+  'operations_activation_scopes',
+  "activation.state = 'read_only'",
+  'activation.revision = evidence.activation_revision',
+]) {
+  assert.equal(
+    currentAuthorityReplacement.includes(removedProfileDependency),
+    false,
+    `0315 currentness helper still depends on ${removedProfileDependency}`,
+  )
+}
+for (const retainedExactFence of [
+  "auth.state = 'active'",
+  'auth.expires_at > statement_timestamp()',
+  "auth.confirmation_statement_version =\n            'shopify-test-store-canonical-e2e-v1'",
+  "account.environment = 'sandbox'",
+  "account.status = 'active'",
+  "credential.verification_status = 'verified'",
+  "candidate.workflow_state = 'promoted'",
+  'candidate.test_order = true',
+  'evidence.provider_test = true',
+]) {
+  assert.ok(
+    currentAuthorityReplacement.includes(retainedExactFence),
+    `0315 currentness helper dropped ${retainedExactFence}`,
+  )
+}
+
 for (const fragment of [
   "'0302_operations_shopify_test_store_canonical_e2e.sql'",
   "'2e4a2d7b74322bcc4b2a8f5565c9e14da0c2d41961e25bbfd56edfd8c8e2d6cb'",
+  "'0315_operations_carrier_writes_independent_activation.sql'",
+  "'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'",
   'operations_shopify_test_store_e2e_is_current(uuid,uuid,uuid)',
   'operations_shopify_test_store_e2e_active_org_unique',
   'operations_shopify_test_store_canonical_e2e_applied',
@@ -436,6 +496,7 @@ for (const fragment of [
   '59d38d75ae50f7f0de62639c1e82f8e04429e48ca72e3a6253297821f0c4c638',
   'e46f58b04972cbcaf0741c2a62b3ac1fc5d248f087eda1b85dce621b5a70c66d',
   '7916b6b3bea6c7ded0f480fa653f7b21b2ae31f3e217f4520dc1493483bc429a',
+  'e660cd4db9019a22e55ad2e3778650f95cd3b036571bc675338e024ca6ae3e0c',
   'fb376ea9ea5eedac159dc234b5f399e9b95d3e5e605b70491e4643d930afcf9d',
   'operations_sandbox_e2e_confirm_version_check',
   "'public.' || required.signature",
@@ -512,7 +573,7 @@ for (const fragment of [
 }
 
 for (const fragment of [
-  "context.order.activation_state === 'read_only'",
+  'Boolean(input.sandboxE2eAuthorizationGlobalId)',
   "=== 'shopify-test-store-canonical-e2e-v1'",
   "environment !== 'sandbox'",
 ]) {

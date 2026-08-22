@@ -13,9 +13,12 @@ import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
-  requireCommerceActiveCapabilityClaimInPostgres,
   requireCurrentFaireFulfillmentScopeEvidenceInPostgres,
 } from '@/lib/persistence/commerceActiveTransitionAuthorization'
+import {
+  requireCurrentCommerceProviderWritesInPostgres,
+  requireSealedCommerceProviderWritesInPostgres,
+} from '@/lib/persistence/commerceProviderWrites'
 
 const REQUIRED_READ_OAUTH_SCOPES = [
   'READ_BRAND',
@@ -26,6 +29,11 @@ const REQUIRED_WRITE_OAUTH_SCOPES = [
   ...REQUIRED_READ_OAUTH_SCOPES,
   'WRITE_ORDERS',
 ] as const
+const PROVIDER_ATTEMPT_GLOBAL_ID = /^gxa(?:[0-9]{7}|[0-9a-v]{12})$/
+const COMMERCE_EXPORT_GLOBAL_ID = /^gfe(?:[0-9]{7}|[0-9a-v]{12})$/
+const SHA256 = /^[a-f0-9]{64}$/
+const PROVIDER_ATTEMPT_LEASE_TOKEN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export type FaireFulfillmentRuntimeAuthority = {
   authorizationRevision: number
@@ -39,6 +47,29 @@ export type CurrentFaireFulfillmentWritebackInput = Omit<
 > & {
   organizationId: unknown
   accountGlobalId: unknown
+  providerWriteControlRowVersion?: unknown
+  providerWriteCredentialGeneration?: unknown
+  providerWriteScopeDigest?: unknown
+  providerWriteAccountGlobalId?: unknown
+  providerWriteProvider?: unknown
+  providerWriteEnvironment?: unknown
+  providerAttemptGlobalId?: unknown
+  providerAttemptRequestHash?: unknown
+  providerAttemptLeaseToken?: unknown
+  commerceExportGlobalId?: unknown
+}
+
+type FaireProviderWriteExpectation = {
+  providerWriteControlRowVersion?: unknown
+  providerWriteCredentialGeneration?: unknown
+  providerWriteScopeDigest?: unknown
+  providerWriteAccountGlobalId?: unknown
+  providerWriteProvider?: unknown
+  providerWriteEnvironment?: unknown
+  providerAttemptGlobalId?: unknown
+  providerAttemptRequestHash?: unknown
+  providerAttemptLeaseToken?: unknown
+  commerceExportGlobalId?: unknown
 }
 
 export class FaireFulfillmentRuntimeError extends Error {
@@ -50,7 +81,10 @@ export class FaireFulfillmentRuntimeError extends Error {
 
 type FaireFulfillmentRuntimeDependencies = {
   readRuntimeCredential: typeof readCommerceRuntimeCredentialFromPostgres
-  requireCapability: typeof requireCommerceActiveCapabilityClaimInPostgres
+  requireProviderWrites:
+    typeof requireCurrentCommerceProviderWritesInPostgres
+  requireSealedProviderWrites:
+    typeof requireSealedCommerceProviderWritesInPostgres
   requireTrustedScopeEvidence:
     typeof requireCurrentFaireFulfillmentScopeEvidenceInPostgres
   decryptCredential: typeof decryptCommerceCredential
@@ -60,7 +94,8 @@ type FaireFulfillmentRuntimeDependencies = {
 
 const DEFAULT_DEPENDENCIES: FaireFulfillmentRuntimeDependencies = {
   readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
-  requireCapability: requireCommerceActiveCapabilityClaimInPostgres,
+  requireProviderWrites: requireCurrentCommerceProviderWritesInPostgres,
+  requireSealedProviderWrites: requireSealedCommerceProviderWritesInPostgres,
   requireTrustedScopeEvidence:
     requireCurrentFaireFulfillmentScopeEvidenceInPostgres,
   decryptCredential: decryptCommerceCredential,
@@ -69,30 +104,80 @@ const DEFAULT_DEPENDENCIES: FaireFulfillmentRuntimeDependencies = {
 }
 
 async function currentAuthority(
-  input: { organizationId: unknown; accountGlobalId: unknown },
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+  } & FaireProviderWriteExpectation,
   dependencies: FaireFulfillmentRuntimeDependencies,
+  authorityMode: 'provider_writes' | 'sealed_attempt' = 'provider_writes',
 ) {
   const organizationId = normalizeCommerceOrganizationId(input.organizationId)
   const accountGlobalId = normalizeCommerceAccountGlobalId(input.accountGlobalId)
-  const [orderUpdateClaim, fulfillmentClaim, trackingClaim, runtime] =
-    await Promise.all([
-      dependencies.requireCapability({
+  let providerWriteAuthority
+  if (authorityMode === 'sealed_attempt') {
+    const providerAttemptGlobalId = String(
+      input.providerAttemptGlobalId || '',
+    ).trim().toLowerCase()
+    const providerAttemptRequestHash = String(
+      input.providerAttemptRequestHash || '',
+    ).trim().toLowerCase()
+    const providerAttemptLeaseToken = String(
+      input.providerAttemptLeaseToken || '',
+    ).trim().toLowerCase()
+    const commerceExportGlobalId = String(
+      input.commerceExportGlobalId || '',
+    ).trim().toLowerCase()
+    if (
+      !PROVIDER_ATTEMPT_GLOBAL_ID.test(providerAttemptGlobalId)
+      || !SHA256.test(providerAttemptRequestHash)
+      || !PROVIDER_ATTEMPT_LEASE_TOKEN.test(providerAttemptLeaseToken)
+      || !COMMERCE_EXPORT_GLOBAL_ID.test(commerceExportGlobalId)
+    ) {
+      throw new FaireFulfillmentRuntimeError(
+        'FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_INVALID',
+        'Execution requires an exact durable prepared provider attempt, request hash, and commerce export',
+      )
+    }
+    if (
+      input.providerWriteAccountGlobalId !== accountGlobalId
+      || input.providerWriteProvider !== 'faire'
+      || input.providerWriteEnvironment !== 'production'
+    ) {
+      throw new FaireFulfillmentRuntimeError(
+        'FAIRE_FULFILLMENT_PROVIDER_AUTHORITY_MISMATCH',
+        'Registered provider attempt authority does not match the exact Faire account',
+      )
+    }
+    providerWriteAuthority =
+      await dependencies.requireSealedProviderWrites({
         organizationId,
         accountGlobalId,
-        capability: 'order_update',
-      }),
-      dependencies.requireCapability({
-        organizationId,
-        accountGlobalId,
-        capability: 'fulfillment_export',
-      }),
-      dependencies.requireCapability({
-        organizationId,
-        accountGlobalId,
-        capability: 'tracking_export',
-      }),
-      dependencies.readRuntimeCredential({ organizationId, accountGlobalId }),
-    ])
+        provider: 'faire',
+        environment: 'production',
+        providerAttemptGlobalId,
+        providerAttemptRequestHash,
+        providerAttemptLeaseToken,
+        commerceExportGlobalId,
+        requiredScopes: REQUIRED_WRITE_OAUTH_SCOPES,
+        expectedControlRowVersion: input.providerWriteControlRowVersion,
+        expectedCredentialGeneration: input.providerWriteCredentialGeneration,
+        expectedGrantedScopeDigest: input.providerWriteScopeDigest,
+      })
+  } else {
+    providerWriteAuthority = await dependencies.requireProviderWrites({
+      organizationId,
+      accountGlobalId,
+      provider: 'faire',
+      requiredScopes: REQUIRED_WRITE_OAUTH_SCOPES,
+      expectedControlRowVersion: input.providerWriteControlRowVersion,
+      expectedCredentialGeneration: input.providerWriteCredentialGeneration,
+      expectedGrantedScopeDigest: input.providerWriteScopeDigest,
+    })
+  }
+  const runtime = await dependencies.readRuntimeCredential({
+    organizationId,
+    accountGlobalId,
+  })
   if (
     !runtime
     || runtime.provider !== 'faire'
@@ -107,27 +192,17 @@ async function currentAuthority(
     )
   }
   if (
-    orderUpdateClaim.provider !== 'faire'
-    || fulfillmentClaim.provider !== 'faire'
-    || trackingClaim.provider !== 'faire'
-    || orderUpdateClaim.environment !== 'production'
-    || fulfillmentClaim.environment !== 'production'
-    || trackingClaim.environment !== 'production'
-    || orderUpdateClaim.accountGlobalId !== accountGlobalId
-    || fulfillmentClaim.accountGlobalId !== accountGlobalId
-    || trackingClaim.accountGlobalId !== accountGlobalId
-    || orderUpdateClaim.externalAccountId !== runtime.externalAccountId
-    || fulfillmentClaim.externalAccountId !== runtime.externalAccountId
-    || trackingClaim.externalAccountId !== runtime.externalAccountId
-    || orderUpdateClaim.activationRevision !== fulfillmentClaim.activationRevision
-    || fulfillmentClaim.activationRevision !== trackingClaim.activationRevision
-    || orderUpdateClaim.credentialGeneration !== runtime.credentialVersion
-    || fulfillmentClaim.credentialGeneration !== runtime.credentialVersion
-    || trackingClaim.credentialGeneration !== runtime.credentialVersion
+    providerWriteAuthority.provider !== 'faire'
+    || providerWriteAuthority.environment !== 'production'
+    || providerWriteAuthority.accountGlobalId !== accountGlobalId
+    || providerWriteAuthority.credentialGeneration !== runtime.credentialVersion
+    || REQUIRED_WRITE_OAUTH_SCOPES.some(
+      (scope) => !providerWriteAuthority.grantedScopes.includes(scope),
+    )
   ) {
     throw new FaireFulfillmentRuntimeError(
       'FAIRE_FULFILLMENT_AUTHORIZATION_STALE',
-      'Faire fulfillment authority is stale; review the Active capability cohort again',
+      'Faire fulfillment authority is stale; turn Provider writes Off, then On for the current connection',
     )
   }
   await dependencies.requireTrustedScopeEvidence({
@@ -153,7 +228,7 @@ async function currentAuthority(
       'Faire OAuth must currently grant READ_BRAND, READ_ORDERS, READ_SHIPMENTS, and WRITE_ORDERS',
     )
   }
-  const authorizationRevision = orderUpdateClaim.activationRevision
+  const authorizationRevision = providerWriteAuthority.controlRowVersion
   return {
     organizationId,
     accountGlobalId,
@@ -257,7 +332,10 @@ async function currentReadAuthority(
 }
 
 export async function prepareCurrentFaireFulfillmentAuthority(
-  input: { organizationId: unknown; accountGlobalId: unknown },
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+  } & FaireProviderWriteExpectation,
   dependencies: FaireFulfillmentRuntimeDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<FaireFulfillmentRuntimeAuthority> {
   return (await currentAuthority(input, dependencies)).authority
@@ -280,16 +358,50 @@ export async function executeCurrentFaireFulfillmentWriteback(
       packages: input.packages,
     })
   }
-  const current = await currentAuthority(input, dependencies)
-  return dependencies.executeWriteback({
-    mode: input.mode,
-    writeAttempt: input.writeAttempt,
-    credential: current.credential,
-    authorization: current.authorization,
-    externalOrderId: input.externalOrderId,
-    ...(input.expectedShipDate === undefined
-      ? {}
-      : { expectedShipDate: input.expectedShipDate }),
-    packages: input.packages,
-  })
+  if (
+    String(input.providerAttemptGlobalId || '').trim().toLowerCase()
+      !== String(input.writeAttempt.attemptId || '').trim().toLowerCase()
+  ) {
+    throw new FaireFulfillmentRuntimeError(
+      'FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_INVALID',
+      'The durable provider attempt does not match the exact Faire write attempt',
+    )
+  }
+  const current = await currentAuthority(
+    input,
+    dependencies,
+    'sealed_attempt',
+  )
+  return dependencies.executeWriteback(
+    {
+      mode: input.mode,
+      writeAttempt: input.writeAttempt,
+      credential: current.credential,
+      authorization: current.authorization,
+      externalOrderId: input.externalOrderId,
+      ...(input.expectedShipDate === undefined
+        ? {}
+        : { expectedShipDate: input.expectedShipDate }),
+      packages: input.packages,
+    },
+    undefined,
+    async () => {
+      await dependencies.requireSealedProviderWrites({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+        provider: 'faire',
+        environment: 'production',
+        providerAttemptGlobalId: input.providerAttemptGlobalId,
+        providerAttemptRequestHash: input.providerAttemptRequestHash,
+        providerAttemptLeaseToken: input.providerAttemptLeaseToken,
+        commerceExportGlobalId: input.commerceExportGlobalId,
+        requiredScopes: REQUIRED_WRITE_OAUTH_SCOPES,
+        expectedControlRowVersion: input.providerWriteControlRowVersion,
+        expectedCredentialGeneration:
+          input.providerWriteCredentialGeneration,
+        expectedGrantedScopeDigest: input.providerWriteScopeDigest,
+        leaseCheckPhase: 'provider_mutation',
+      })
+    },
+  )
 }

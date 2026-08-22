@@ -114,8 +114,6 @@ type ShadowContextRow = QueryResultRow & {
   group_state: string
   source_package_count: number
   source_run_id: string
-  current_activation_state: string
-  current_activation_revision: number
   blocking_exception_count: string | number
   linked_label_attempt_count: string | number
   linked_label_count: string | number
@@ -544,8 +542,6 @@ export async function prepareActiveFulfillmentExecutionFromShadowInPostgres(
                 shipment_group.state AS group_state,
                 source_run.package_count AS source_package_count,
                 source_run.id::text AS source_run_id,
-                activation.state AS current_activation_state,
-                activation.revision AS current_activation_revision,
                 (
                   SELECT count(*)
                   FROM operations_exceptions exception
@@ -588,14 +584,12 @@ export async function prepareActiveFulfillmentExecutionFromShadowInPostgres(
          JOIN operations_pack_rate_runs source_run
            ON source_run.organization_id = shipment_group.organization_id
           AND source_run.id = shipment_group.fulfillment_pack_rate_run_id
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = shadow.organization_id
          WHERE shadow.organization_id = $1::uuid
            AND shadow.global_id = $2
          LIMIT 2
          FOR UPDATE OF orders
          FOR SHARE OF shadow, plan, warehouse, shipment_group,
-           source_run, activation`,
+           source_run`,
         [organizationId, sourceGlobalId],
       )
       if (contextResult.rows.length !== 1) {
@@ -636,15 +630,6 @@ export async function prepareActiveFulfillmentExecutionFromShadowInPostgres(
         fail(
           'OPERATIONS_ACTIVE_PREPARATION_ORDER_BLOCKED',
           'Active preparation is blocked by an open high or critical order exception',
-        )
-      }
-      if (
-        context.current_activation_state !== 'active'
-        || Number(context.current_activation_revision) !== expectedRevision
-      ) {
-        fail(
-          'OPERATIONS_ACTIVE_PREPARATION_REVISION_CHANGED',
-          'Active preparation requires the current Operations Active revision',
         )
       }
       if (
@@ -755,7 +740,7 @@ export async function prepareActiveFulfillmentExecutionFromShadowInPostgres(
       }
 
       const prepared = prepareActiveFulfillmentExecution({
-        activationState: context.current_activation_state,
+        activationState: 'profile_independent',
         activationRevision: expectedRevision,
         shadowExecutionId: context.shadow_execution_id,
         orderId: context.order_id,

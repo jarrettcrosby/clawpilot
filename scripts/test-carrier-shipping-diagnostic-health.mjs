@@ -111,6 +111,14 @@ const required0286Structure = [
   "'sandbox' | 'production'",
   'stalePrepared',
   'unknown provider outcomes requiring manual review; do not retry',
+  '0315_operations_carrier_writes_independent_activation.sql',
+  'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d',
+  'FOR UPDATE OF integration, credential, carrier_account%',
+  'NOT LIKE \'%operations_activation_scopes%\'',
+  'UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts',
+  'NOT EXISTS (\n                    SELECT 1 FROM pg_trigger diagnostic_activation_trigger',
+  'FROM public.operations_activation_scopes\n                      diagnostic_activation_scope',
+  '.production_shipping_diagnostic_lease_count <> 0',
 ]
 
 for (const fragment of [...required0285Structure, ...required0286Structure]) {

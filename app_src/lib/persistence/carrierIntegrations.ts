@@ -1148,57 +1148,54 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
   actorEmail: string
 }) {
   await withTransaction(async (client) => {
-    await acquireTransactionAdvisoryLock(
-      client,
-      `operations:activation:${input.organizationId}`,
-    )
     const connection = await lockedUserManagedCarrierConnection(client, {
       organizationId: input.organizationId,
       provider: input.provider,
       environment: 'production',
     })
+    const current = Array.isArray(connection.configuration.allowedCapabilities)
+      ? connection.configuration.allowedCapabilities.filter(
+          (value): value is string => typeof value === 'string',
+        )
+      : []
     if (input.enabled) {
       if (connection.status !== 'active') {
         throw new CarrierProductionLabelNotReadyError(
           'Enable the production carrier connection before authorizing live postage',
         )
       }
+      if (!current.includes('production_rate')) {
+        throw new CarrierProductionLabelNotReadyError(
+          'Enable production rating for this carrier connection before authorizing live postage',
+        )
+      }
       const readiness = await client.query<{
-        activation_state: string | null
         verified: boolean
         sender_account_count: string
       }>(
-        `SELECT activation.state AS activation_state,
-                EXISTS (
+        `SELECT EXISTS (
                   SELECT 1 FROM operations_carrier_credentials credential
                   WHERE credential.organization_id = connection.organization_id
                     AND credential.integration_account_id = connection.id
                     AND credential.verification_status = 'verified'
                 ) AS verified,
-                count(carrier_account.id) FILTER (
-                  WHERE carrier_account.status = 'active'
+                (
+                  SELECT count(*)::text
+                  FROM operations_carrier_accounts carrier_account
+                  WHERE carrier_account.organization_id = connection.organization_id
+                    AND carrier_account.integration_account_id = connection.id
+                    AND carrier_account.status = 'active'
                     AND carrier_account.allow_sender_billing = true
-                )::text AS sender_account_count
+                ) AS sender_account_count
          FROM operations_integration_accounts connection
-         LEFT JOIN operations_activation_scopes activation
-           ON activation.organization_id = connection.organization_id
-         LEFT JOIN operations_carrier_accounts carrier_account
-           ON carrier_account.organization_id = connection.organization_id
-          AND carrier_account.integration_account_id = connection.id
          WHERE connection.organization_id = $1::uuid
            AND connection.id = $2::uuid
            AND connection.environment = 'production'
-           AND connection.status = 'active'
-         GROUP BY connection.organization_id, connection.id, activation.state`,
+           AND connection.status = 'active'`,
         [input.organizationId, connection.id],
       )
       const row = readiness.rows[0]
-      if (!row || row.activation_state !== 'active') {
-        throw new CarrierProductionLabelNotReadyError(
-          'Move Operations to Active before authorizing live postage',
-        )
-      }
-      if (!row.verified) {
+      if (!row?.verified) {
         throw new CarrierProductionLabelNotReadyError(
           'Verify the production carrier credential before authorizing live postage',
         )
@@ -1209,14 +1206,8 @@ export async function setCarrierProductionLabelCapabilityInPostgres(input: {
         )
       }
     }
-    const current = Array.isArray(connection.configuration.allowedCapabilities)
-      ? connection.configuration.allowedCapabilities.filter(
-          (value): value is string => typeof value === 'string',
-        )
-      : []
     const allowedCapabilities = [...new Set([
       ...current.filter((value) => value !== 'production_label'),
-      'production_rate',
       ...(input.enabled ? ['production_label'] : []),
     ])]
     await client.query(

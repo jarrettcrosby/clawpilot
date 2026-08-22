@@ -84,13 +84,22 @@ assert.equal(
 assert.ok(Object.isFrozen(prepared))
 assert.ok(Object.isFrozen(prepared.packages))
 
-expectCode(
-  () => prepareActiveFulfillmentExecution({
-    ...executionInput,
-    activationState: 'shadow',
-  }),
-  'OPERATIONS_ACTIVE_AUTHORITY_REQUIRED',
-)
+for (const activationState of [
+  'disabled',
+  'shadow',
+  'read_only',
+  'active',
+  'frozen',
+]) {
+  assert.equal(
+    prepareActiveFulfillmentExecution({
+      ...executionInput,
+      activationState,
+    }).requestHash,
+    prepared.requestHash,
+    `${activationState} must preserve identical real carrier-lineage authority`,
+  )
+}
 expectCode(
   () => prepareActiveFulfillmentExecution({
     ...executionInput,

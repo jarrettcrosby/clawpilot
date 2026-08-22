@@ -2,6 +2,8 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { readdirSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
@@ -10,7 +12,10 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const { Pool } = requireFromApp('pg')
-const migration = '0286_carrier_shipping_account_diagnostics.sql'
+const migration = '0315_operations_carrier_writes_independent_activation.sql'
+const migrationsDirectory = fileURLToPath(
+  new URL('../db/migrations/', import.meta.url),
+)
 
 function command(file, args, options = {}) {
   return execFileSync(file, args, {
@@ -34,6 +39,39 @@ async function waitForPostgres(pool) {
     }
   }
   throw lastError || new Error('Disposable PostgreSQL did not become ready')
+}
+
+async function applyMigration(client, filename) {
+  const sql = readFileSync(`${migrationsDirectory}/${filename}`, 'utf8')
+  const checksum = createHash('sha256').update(sql).digest('hex')
+  await client.query('BEGIN')
+  try {
+    await client.query(sql)
+    await client.query(
+      `INSERT INTO schema_migrations (filename, checksum)
+       VALUES ($1, $2)`,
+      [filename, checksum],
+    )
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined)
+    throw error
+  }
+}
+
+async function applyMigrationsThrough(client, finalFilename) {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       filename text PRIMARY KEY,
+       checksum text,
+       applied_at timestamptz NOT NULL DEFAULT now()
+     )`,
+  )
+  const files = readdirSync(migrationsDirectory)
+    .filter((filename) => /^\d+_.+\.sql$/.test(filename))
+    .sort((left, right) => left.localeCompare(right))
+    .filter((filename) => filename.localeCompare(finalFilename) <= 0)
+  for (const filename of files) await applyMigration(client, filename)
 }
 
 async function assertRejected(client, sql, message) {
@@ -369,10 +407,6 @@ async function seedFixture(client) {
   )
   for (const [table, trigger] of [
     [
-      'operations_activation_scopes',
-      'protect_operations_carrier_shipping_diagnostic_activation',
-    ],
-    [
       'operations_integration_accounts',
       'protect_operations_carrier_shipping_diagnostic_integration',
     ],
@@ -400,6 +434,7 @@ function attemptInsert({
   carrierAccountId = '28600000-0000-4000-8000-000000000020',
   rateRequestId = '28600000-0000-4000-8000-000000000040',
   credentialVersion = 1,
+  provider = 'ups_rest',
 }) {
   return `INSERT INTO operations_carrier_rate_test_label_attempts (
     id, global_id, organization_id, rate_request_id,
@@ -412,12 +447,235 @@ function attemptInsert({
     '28600000-0000-4000-8000-000000000001'::uuid,
     '${rateRequestId}'::uuid,
     '${integrationAccountId}'::uuid, '${carrierAccountId}'::uuid,
-    '${action}', 'prepared', 'ups_rest', 'production',
+    '${action}', 'prepared', '${provider}', 'production',
     ${credentialVersion}, '03',
     '{"serviceCode":"03","serviceName":"UPS Ground","amount":"12.34","currency":"USD"}'::jsonb,
     repeat('d', 64), 'ups-rest-v1', 'Disposable diagnostic test',
     '${idempotencyKey}', repeat('e', 64), '{}'::jsonb, '{}'::jsonb
   )`
+}
+
+async function exercise0315UpgradeCutover(client) {
+  const organizationId = '31500000-0000-4000-8000-000000000001'
+  const integrationAccountId = '31500000-0000-4000-8000-000000000010'
+  const carrierAccountId = '31500000-0000-4000-8000-000000000020'
+  const rateRequestId = '31500000-0000-4000-8000-000000000040'
+  const attemptId = '31500000-0000-4000-8000-000000000050'
+
+  // Seed exact 0314 authority while bypassing unrelated global-reference
+  // fixture requirements. The prepared attempt itself is inserted in origin
+  // mode so the 0286 validation and four-row lease trigger execute normally.
+  await client.query('SET session_replication_role = replica')
+  await client.query(
+    `INSERT INTO workspace_organizations (
+       id, name, organization_type, reference_code
+     ) VALUES ($1::uuid, '0315 upgrade fixture', 'root', 'ga3150000')`,
+    [organizationId],
+  )
+  await client.query(
+    `INSERT INTO operations_integration_accounts (
+       id, global_id, organization_id, provider, integration_type,
+       environment, display_name, status, configuration
+     ) VALUES (
+       $1::uuid, 'gia3150001', $2::uuid, 'ups_rest', 'carrier',
+       'production', '0315 upgrade UPS', 'active',
+       '{"allowedCapabilities":["production_rate","production_label"]}'::jsonb
+     )`,
+    [integrationAccountId, organizationId],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_credentials (
+       organization_id, integration_account_id,
+       credential_ciphertext, credential_iv, credential_tag,
+       credential_version, client_id_last_four,
+       account_number_last_four, verification_status, verified_at,
+       credential_fingerprint, credential_kind,
+       credential_identifier_last_four
+     ) VALUES (
+       $1::uuid, $2::uuid,
+       decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
+       decode(repeat('00', 16), 'hex'), 1, '0010', '0010',
+       'verified', now(),
+       operations_carrier_credential_fingerprint(
+         1, decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
+         decode(repeat('00', 16), 'hex')
+       ), 'oauth_client_credentials', '0010'
+     )`,
+    [organizationId, integrationAccountId],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_accounts (
+       id, global_id, organization_id, integration_account_id,
+       display_name, sender_name,
+       account_number_ciphertext, account_number_iv, account_number_tag,
+       account_number_last_four, account_number_fingerprint,
+       registered_address, registered_address_fingerprint,
+       allow_sender_billing, status
+     ) VALUES (
+       $1::uuid, 'gac3150001', $2::uuid, $3::uuid,
+       '0315 upgrade UPS account', '0315 upgrade UPS account',
+       'ciphertext', 'iv', 'tag', '0020', repeat('a', 64),
+       '{
+         "line1":"1 Test Street",
+         "city":"Hartford",
+         "region":"CT",
+         "postalCode":"06103",
+         "countryCode":"US"
+       }'::jsonb,
+       repeat('b', 64), true, 'active'
+     )`,
+    [carrierAccountId, organizationId, integrationAccountId],
+  )
+  await client.query(
+    `INSERT INTO operations_activation_scopes (
+       organization_id, data_pipeline_id, state, revision
+     ) VALUES (
+       $1::uuid, '31500000-0000-4000-8000-000000000030'::uuid,
+       'active', 1
+     )`,
+    [organizationId],
+  )
+  await client.query(
+    `INSERT INTO operations_carrier_rate_requests (
+       id, global_id, organization_id, integration_account_id,
+       carrier_account_id, provider, environment, purpose,
+       adapter_version, credential_version, request_hash,
+       redacted_request, redacted_response, status,
+       requested_at, completed_at, billing_relationship,
+       billing_selection_snapshot
+     ) VALUES (
+       $1::uuid, 'grq3150001', $2::uuid, $3::uuid, $4::uuid,
+       'ups_rest', 'production', 'shipping_account_diagnostic',
+       'ups-rest-v1', 1, repeat('c', 64),
+       '{"shipment":{"destinationFingerprint":"fixed"}}'::jsonb,
+       '{"rates":[{"serviceCode":"03","amount":"12.34","currency":"USD"}]}'::jsonb,
+       'succeeded', now() - interval '1 second', now(), 'sender',
+       jsonb_build_object(
+         'relationship', 'sender',
+         'credentialFingerprint', (
+           SELECT credential_fingerprint
+           FROM operations_carrier_credentials
+           WHERE organization_id = $2::uuid
+             AND integration_account_id = $3::uuid
+         ),
+         'accountNumberFingerprint', repeat('a', 64),
+         'registeredAddressFingerprint', repeat('b', 64),
+         'senderName', '0315 upgrade UPS account'
+       )
+     )`,
+    [rateRequestId, organizationId, integrationAccountId, carrierAccountId],
+  )
+  await client.query('SET session_replication_role = origin')
+  await client.query(
+    `INSERT INTO operations_carrier_rate_test_label_attempts (
+       id, organization_id, rate_request_id, integration_account_id,
+       carrier_account_id, action, state, provider, environment,
+       credential_version, service_code, selected_rate,
+       destination_fingerprint, adapter_version, reason,
+       idempotency_key, request_hash, redacted_request, redacted_response
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+       'create', 'prepared', 'ups_rest', 'production', 1, '03',
+       '{"serviceCode":"03","serviceName":"UPS Ground","amount":"12.34","currency":"USD"}'::jsonb,
+       repeat('d', 64), 'ups-rest-v1', '0315 upgrade transition fixture',
+       '0315-upgrade-transition-fixture-0001', repeat('e', 64),
+       '{}'::jsonb, '{}'::jsonb
+     )`,
+    [
+      attemptId,
+      organizationId,
+      rateRequestId,
+      integrationAccountId,
+      carrierAccountId,
+    ],
+  )
+  const before = await client.query(
+    `SELECT
+       activation.production_shipping_diagnostic_lease_count AS activation,
+       integration.production_shipping_diagnostic_lease_count AS integration,
+       credential.production_shipping_diagnostic_lease_count AS credential,
+       carrier_account.production_shipping_diagnostic_lease_count
+         AS carrier_account
+     FROM operations_activation_scopes activation
+     JOIN operations_integration_accounts integration
+       ON integration.organization_id = activation.organization_id
+      AND integration.id = $2::uuid
+     JOIN operations_carrier_credentials credential
+       ON credential.organization_id = integration.organization_id
+      AND credential.integration_account_id = integration.id
+     JOIN operations_carrier_accounts carrier_account
+       ON carrier_account.organization_id = integration.organization_id
+      AND carrier_account.integration_account_id = integration.id
+      AND carrier_account.id = $3::uuid
+     WHERE activation.organization_id = $1::uuid`,
+    [organizationId, integrationAccountId, carrierAccountId],
+  )
+  assert.deepEqual(before.rows[0], {
+    activation: 1,
+    integration: 1,
+    credential: 1,
+    carrier_account: 1,
+  })
+
+  await applyMigration(client, migration)
+  await client.query(
+    `UPDATE operations_carrier_rate_test_label_attempts
+     SET state = 'failed', completed_at = now(),
+         error_code = 'AUDIT_FIXTURE_COMPLETED'
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [organizationId, attemptId],
+  )
+  const after = await client.query(
+    `SELECT
+       activation.production_shipping_diagnostic_lease_count AS activation,
+       integration.production_shipping_diagnostic_lease_count AS integration,
+       credential.production_shipping_diagnostic_lease_count AS credential,
+       carrier_account.production_shipping_diagnostic_lease_count
+         AS carrier_account
+     FROM operations_activation_scopes activation
+     JOIN operations_integration_accounts integration
+       ON integration.organization_id = activation.organization_id
+      AND integration.id = $2::uuid
+     JOIN operations_carrier_credentials credential
+       ON credential.organization_id = integration.organization_id
+      AND credential.integration_account_id = integration.id
+     JOIN operations_carrier_accounts carrier_account
+       ON carrier_account.organization_id = integration.organization_id
+      AND carrier_account.integration_account_id = integration.id
+      AND carrier_account.id = $3::uuid
+     WHERE activation.organization_id = $1::uuid`,
+    [organizationId, integrationAccountId, carrierAccountId],
+  )
+  assert.deepEqual(after.rows[0], {
+    activation: 0,
+    integration: 0,
+    credential: 0,
+    carrier_account: 0,
+  })
+
+  const activationCountersClear = async () => client.query(
+    `SELECT NOT EXISTS (
+       SELECT 1
+       FROM public.operations_activation_scopes diagnostic_activation_scope
+       WHERE diagnostic_activation_scope
+         .production_shipping_diagnostic_lease_count <> 0
+     ) AS current`,
+  )
+  assert.equal((await activationCountersClear()).rows[0]?.current, true)
+  await client.query(
+    `UPDATE operations_activation_scopes
+     SET production_shipping_diagnostic_lease_count = 1
+     WHERE organization_id = $1::uuid`,
+    [organizationId],
+  )
+  assert.equal((await activationCountersClear()).rows[0]?.current, false)
+  await client.query(
+    `UPDATE operations_activation_scopes
+     SET production_shipping_diagnostic_lease_count = 0
+     WHERE organization_id = $1::uuid`,
+    [organizationId],
+  )
+  assert.equal((await activationCountersClear()).rows[0]?.current, true)
 }
 
 function sandboxVoidAttemptInsert({
@@ -576,6 +834,72 @@ async function exerciseProductionAccountFence(client) {
   )
 }
 
+async function exerciseProductionProfileIndependence(client) {
+  await enableProductionCreateAuthority(client)
+  const profiles = ['disabled', 'shadow', 'read_only', 'active', 'frozen']
+  for (const [index, profile] of profiles.entries()) {
+    const suffix = 90 + index
+    const attemptId =
+      `28600000-0000-4000-8000-${String(suffix).padStart(12, '0')}`
+    const idempotencyKey = `diagnostic-profile-${profile}-0001`
+    await client.query(
+      `UPDATE operations_activation_scopes
+       SET state = $1, revision = revision + 1
+       WHERE organization_id =
+         '28600000-0000-4000-8000-000000000001'::uuid`,
+      [profile],
+    )
+    await client.query(
+      attemptInsert({
+        id: attemptId,
+        globalId: `gsa28600${suffix}`,
+        idempotencyKey,
+      }),
+    )
+    const leases = await client.query(
+      `SELECT
+         (SELECT production_shipping_diagnostic_lease_count
+          FROM operations_activation_scopes
+          WHERE organization_id =
+            '28600000-0000-4000-8000-000000000001'::uuid) AS activation,
+         (SELECT production_shipping_diagnostic_lease_count
+          FROM operations_integration_accounts
+          WHERE id =
+            '28600000-0000-4000-8000-000000000010'::uuid) AS integration,
+         (SELECT production_shipping_diagnostic_lease_count
+          FROM operations_carrier_credentials
+          WHERE integration_account_id =
+            '28600000-0000-4000-8000-000000000010'::uuid) AS credential,
+         (SELECT production_shipping_diagnostic_lease_count
+          FROM operations_carrier_accounts
+          WHERE id =
+            '28600000-0000-4000-8000-000000000020'::uuid) AS carrier_account`,
+    )
+    assert.deepEqual(leases.rows[0], {
+      activation: 0,
+      integration: 1,
+      credential: 1,
+      carrier_account: 1,
+    })
+    await reconcilePreparedCreateAsNoActiveLabel(client, attemptId)
+    const released = await client.query(
+      `SELECT production_shipping_diagnostic_lease_count AS lease_count
+       FROM operations_integration_accounts
+       WHERE id = '28600000-0000-4000-8000-000000000010'::uuid`,
+    )
+    assert.equal(released.rows[0]?.lease_count, 0)
+  }
+  await assertRejected(
+    client,
+    attemptInsert({
+      id: '28600000-0000-4000-8000-000000000095',
+      globalId: 'gsa2860095',
+      idempotencyKey: 'diagnostic-profile-disabled-0001',
+    }),
+    'operations_carrier_rate_test_label_attempts_idempotency_unique',
+  )
+}
+
 async function exerciseProductionAuthorityInterlocks(pool, client) {
   await enableProductionCreateAuthority(client)
   const peer = await pool.connect()
@@ -591,29 +915,28 @@ async function exerciseProductionAuthorityInterlocks(pool, client) {
         rateRequestId: '28600000-0000-4000-8000-000000000043',
       }),
     )
-    const downgrade = peer.query(
+    const profileChange = peer.query(
       `UPDATE operations_activation_scopes
-       SET state = 'shadow', revision = revision + 1
+       SET state = 'frozen', revision = revision + 1
        WHERE organization_id =
          '28600000-0000-4000-8000-000000000001'::uuid`,
     ).then(
       (value) => ({ value, error: null }),
       (error) => ({ value: null, error }),
     )
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    const profileChangeResult = await profileChange
+    assert.equal(profileChangeResult.error, null)
     await client.query('COMMIT')
-    const downgradeResult = await downgrade
-    assert.match(
-      String(downgradeResult.error?.message || ''),
-      /Operations Active cannot be revoked during a prepared LIVE carrier diagnostic/u,
-    )
-    const activationAfterRejectedDowngrade = await client.query(
-      `SELECT state
+    const activationAfterProfileChange = await client.query(
+      `SELECT state, production_shipping_diagnostic_lease_count AS lease_count
        FROM operations_activation_scopes
        WHERE organization_id =
          '28600000-0000-4000-8000-000000000001'::uuid`,
     )
-    assert.equal(activationAfterRejectedDowngrade.rows[0]?.state, 'active')
+    assert.deepEqual(activationAfterProfileChange.rows[0], {
+      state: 'frozen',
+      lease_count: 0,
+    })
     await reconcilePreparedCreateAsNoActiveLabel(
       client,
       '28600000-0000-4000-8000-000000000070',
@@ -686,7 +1009,7 @@ async function exerciseProductionAuthorityInterlocks(pool, client) {
     const editedAccountCreateResult = await createAgainstEditedAccount
     assert.match(
       String(editedAccountCreateResult.error?.message || ''),
-      /LIVE carrier shipping diagnostic create requires current Active production-label authority/u,
+      /LIVE carrier shipping diagnostic create requires current exact production-label authority/u,
     )
     await client.query('ROLLBACK')
     const accountAfterCreateLostRace = await client.query(
@@ -740,7 +1063,7 @@ async function exerciseProductionAuthorityInterlocks(pool, client) {
     const createResult = await create
     assert.match(
       String(createResult.error?.message || ''),
-      /(?:LIVE carrier shipping diagnostic create requires current Active production-label authority|LIVE carrier authority cannot be revoked during a prepared diagnostic)/u,
+      /(?:LIVE carrier shipping diagnostic create requires current exact production-label authority|LIVE carrier authority cannot be revoked during a prepared diagnostic)/u,
     )
     await client.query('ROLLBACK')
     const authorityAfterCreateLostRace = await client.query(
@@ -792,7 +1115,7 @@ async function exerciseLineage(client) {
       globalId: 'gsa2860001',
       idempotencyKey: 'diagnostic-live-shadow-0001',
     }),
-    'LIVE carrier shipping diagnostic create requires current Active production-label authority',
+    'LIVE carrier shipping diagnostic create requires current exact production-label authority',
   )
 
   await client.query(
@@ -816,6 +1139,83 @@ async function exerciseLineage(client) {
       credentialVersion: 2,
     }),
     'Carrier shipping diagnostic must bind exact successful rate evidence',
+  )
+
+  await assertRejected(
+    client,
+    attemptInsert({
+      id: '28600000-0000-4000-8000-000000000056',
+      globalId: 'gsa2860006',
+      idempotencyKey: 'diagnostic-live-provider-mismatch-0001',
+      provider: 'fedex_rest',
+    }),
+    'Carrier shipping diagnostic must bind exact successful rate evidence',
+  )
+
+  await client.query(
+    `UPDATE operations_carrier_credentials
+     SET verification_status = 'failed'
+     WHERE organization_id =
+       '28600000-0000-4000-8000-000000000001'::uuid
+       AND integration_account_id =
+         '28600000-0000-4000-8000-000000000010'::uuid`,
+  )
+  await assertRejected(
+    client,
+    attemptInsert({
+      id: '28600000-0000-4000-8000-000000000057',
+      globalId: 'gsa2860007',
+      idempotencyKey: 'diagnostic-live-unverified-0001',
+    }),
+    'LIVE carrier shipping diagnostic create requires current exact production-label authority',
+  )
+  await client.query(
+    `UPDATE operations_carrier_credentials
+     SET verification_status = 'verified'
+     WHERE organization_id =
+       '28600000-0000-4000-8000-000000000001'::uuid
+       AND integration_account_id =
+         '28600000-0000-4000-8000-000000000010'::uuid`,
+  )
+
+  await client.query(
+    `UPDATE operations_carrier_accounts
+     SET allow_sender_billing = false
+     WHERE id = '28600000-0000-4000-8000-000000000020'::uuid`,
+  )
+  await assertRejected(
+    client,
+    attemptInsert({
+      id: '28600000-0000-4000-8000-000000000058',
+      globalId: 'gsa2860008',
+      idempotencyKey: 'diagnostic-live-sender-billing-0001',
+    }),
+    'LIVE carrier shipping diagnostic create requires current exact production-label authority',
+  )
+  await client.query(
+    `UPDATE operations_carrier_accounts
+     SET allow_sender_billing = true
+     WHERE id = '28600000-0000-4000-8000-000000000020'::uuid`,
+  )
+
+  await client.query(
+    `UPDATE operations_carrier_rate_requests
+     SET status = 'failed', error_code = 'DISPOSABLE_RATE_FAILURE'
+     WHERE id = '28600000-0000-4000-8000-000000000040'::uuid`,
+  )
+  await assertRejected(
+    client,
+    attemptInsert({
+      id: '28600000-0000-4000-8000-000000000059',
+      globalId: 'gsa2860009',
+      idempotencyKey: 'diagnostic-live-failed-rate-0001',
+    }),
+    'Carrier shipping diagnostic must bind exact successful rate evidence',
+  )
+  await client.query(
+    `UPDATE operations_carrier_rate_requests
+     SET status = 'succeeded', error_code = NULL
+     WHERE id = '28600000-0000-4000-8000-000000000040'::uuid`,
   )
 
   await client.query(
@@ -867,7 +1267,8 @@ async function assertStructure(client) {
      FROM schema_migrations
      WHERE filename IN (
        '0285_shopify_carrier_service_configured_carriers.sql',
-       '0286_carrier_shipping_account_diagnostics.sql'
+       '0286_carrier_shipping_account_diagnostics.sql',
+       '0315_operations_carrier_writes_independent_activation.sql'
      )
      ORDER BY filename`,
   )
@@ -876,6 +1277,7 @@ async function assertStructure(client) {
     [
       '0285_shopify_carrier_service_configured_carriers.sql',
       '0286_carrier_shipping_account_diagnostics.sql',
+      '0315_operations_carrier_writes_independent_activation.sql',
     ],
   )
 
@@ -1118,9 +1520,6 @@ async function assertStructure(client) {
        ('operations_carrier_rate_test_label_attempts',
         'maintain_operations_carrier_shipping_diagnostic_authority_lease',
         'maintain_operations_carrier_shipping_diagnostic_authority_lease'),
-       ('operations_activation_scopes',
-        'protect_operations_carrier_shipping_diagnostic_activation',
-        'protect_operations_carrier_shipping_diagnostic_authority'),
        ('operations_integration_accounts',
         'protect_operations_carrier_shipping_diagnostic_integration',
         'protect_operations_carrier_shipping_diagnostic_authority'),
@@ -1144,7 +1543,18 @@ async function assertStructure(client) {
        AND installed.enabled IN ('O', 'A')
      ORDER BY table_name, trigger_name`,
   )
-  assert.equal(triggerResult.rowCount, 16)
+  assert.equal(triggerResult.rowCount, 15)
+  const removedActivationTrigger = await client.query(
+    `SELECT to_regclass('operations_activation_scopes') IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM pg_trigger installed
+         WHERE installed.tgrelid = to_regclass('operations_activation_scopes')
+           AND installed.tgname =
+             'protect_operations_carrier_shipping_diagnostic_activation'
+           AND NOT installed.tgisinternal
+       ) AS removed`,
+  )
+  assert.equal(removedActivationTrigger.rows[0]?.removed, true)
 
   const exactDiagnosticTriggers = await client.query(
     `SELECT required.trigger_name
@@ -1158,9 +1568,6 @@ async function assertStructure(client) {
          ('operations_carrier_rate_test_label_attempts',
           'maintain_operations_carrier_shipping_diagnostic_authority_lease',
           'maintain_operations_carrier_shipping_diagnostic_authority_lease()', 29),
-         ('operations_activation_scopes',
-          'protect_operations_carrier_shipping_diagnostic_activation',
-          'protect_operations_carrier_shipping_diagnostic_authority()', 19),
          ('operations_integration_accounts',
           'protect_operations_carrier_shipping_diagnostic_integration',
           'protect_operations_carrier_shipping_diagnostic_authority()', 19),
@@ -1181,7 +1588,7 @@ async function assertStructure(client) {
         AND installed.tgconstraint = 0
       ORDER BY required.trigger_name`,
   )
-  assert.equal(exactDiagnosticTriggers.rowCount, 7)
+  assert.equal(exactDiagnosticTriggers.rowCount, 6)
 
   const functions = await client.query(
     `SELECT
@@ -1329,11 +1736,15 @@ async function assertStructure(client) {
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_operations_carrier_shipping_diagnostic_lineage()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%production_label%activation.state = ''active''%'
+           LIKE '%production_rate%production_label%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_operations_carrier_shipping_diagnostic_lineage()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%FOR UPDATE OF integration, credential, carrier_account, activation%'
+           LIKE '%FOR UPDATE OF integration, credential, carrier_account%'
+         AND regexp_replace(pg_get_functiondef(to_regprocedure(
+           'validate_operations_carrier_shipping_diagnostic_lineage()'
+         )), '[[:space:]]+', ' ', 'g')
+           NOT LIKE '%operations_activation_scopes%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'validate_operations_carrier_shipping_diagnostic_lineage()'
          )), '[[:space:]]+', ' ', 'g')
@@ -1350,12 +1761,20 @@ async function assertStructure(client) {
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
          )), '[[:space:]]+', ' ', 'g')
-           LIKE '%UPDATE operations_activation_scopes%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
+           LIKE '%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
+         AND regexp_replace(pg_get_functiondef(to_regprocedure(
+           'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+         )), '[[:space:]]+', ' ', 'g')
+           NOT LIKE '%operations_activation_scopes%'
          AS diagnostic_lease_body,
        regexp_replace(pg_get_functiondef(to_regprocedure(
          'protect_operations_carrier_shipping_diagnostic_authority()'
        )), '[[:space:]]+', ' ', 'g')
-         LIKE '%production_shipping_diagnostic_lease_count%operations_activation_scopes%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+         LIKE '%production_shipping_diagnostic_lease_count%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+         AND regexp_replace(pg_get_functiondef(to_regprocedure(
+           'protect_operations_carrier_shipping_diagnostic_authority()'
+         )), '[[:space:]]+', ' ', 'g')
+           NOT LIKE '%operations_activation_scopes%'
          AND regexp_replace(pg_get_functiondef(to_regprocedure(
            'protect_operations_carrier_shipping_diagnostic_authority()'
          )), '[[:space:]]+', ' ', 'g')
@@ -1679,7 +2098,7 @@ async function assertMutatedDiagnosticAuthorityBodyFailsAttestation(client) {
        regexp_replace(pg_get_functiondef(to_regprocedure(
          'protect_operations_carrier_shipping_diagnostic_authority()'
        )), '[[:space:]]+', ' ', 'g')
-         LIKE '%production_shipping_diagnostic_lease_count%operations_activation_scopes%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+         LIKE '%production_shipping_diagnostic_lease_count%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
        AND regexp_replace(pg_get_functiondef(to_regprocedure(
          'protect_operations_carrier_shipping_diagnostic_authority()'
        )), '[[:space:]]+', ' ', 'g')
@@ -1785,6 +2204,16 @@ async function main() {
     ])
     pool = new Pool({ connectionString: databaseUrl, max: 2 })
     await waitForPostgres(pool)
+    const upgradeClient = await pool.connect()
+    try {
+      await applyMigrationsThrough(
+        upgradeClient,
+        '0314_operations_local_work_independent_activation.sql',
+      )
+      await exercise0315UpgradeCutover(upgradeClient)
+    } finally {
+      upgradeClient.release()
+    }
     command('node', ['scripts/db-migrate.mjs'], {
       env: { ...process.env, DATABASE_URL: databaseUrl },
     })
@@ -1794,6 +2223,7 @@ async function main() {
       await assertStructure(client)
       await seedFixture(client)
       await exerciseProductionAccountFence(client)
+      await exerciseProductionProfileIndependence(client)
       await exerciseProductionAuthorityInterlocks(pool, client)
       await exerciseLineage(client)
       await exerciseSandboxVoidAfterCredentialRotation(client)
@@ -1809,10 +2239,6 @@ async function main() {
         [
           'operations_carrier_rate_test_label_attempts',
           'maintain_operations_carrier_shipping_diagnostic_authority_lease',
-        ],
-        [
-          'operations_activation_scopes',
-          'protect_operations_carrier_shipping_diagnostic_activation',
         ],
         [
           'operations_integration_accounts',

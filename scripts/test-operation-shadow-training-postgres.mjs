@@ -35,7 +35,7 @@ const futureIndependentControlContract = readFileSync(
   'utf8',
 )
 const futureIndependentControlChecksum =
-  '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+  '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
 assert.equal(
   sha(futureIndependentControlContract),
   futureIndependentControlChecksum,
@@ -1023,6 +1023,33 @@ async function verifyCanonicalWriteGuards(pool, fixture) {
       pool.query(statement, [fixture.organizationId, fixture.order.id]),
       /OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED/u,
       `${fixture.provider} canonical write must require the Shadow overlay`,
+    )
+  }
+}
+
+async function verifyCanonicalWritesAreNotGloballyShadowBlocked(pool, fixture) {
+  const statements = [
+    `INSERT INTO operations_fulfillment_plans (organization_id, order_id)
+     VALUES ($1::uuid, $2::uuid)`,
+    `INSERT INTO operations_reservations (organization_id, order_id)
+     VALUES ($1::uuid, $2::uuid)`,
+    `INSERT INTO operations_shipments (organization_id, order_id)
+     VALUES ($1::uuid, $2::uuid)`,
+    `INSERT INTO operations_commerce_fulfillment_exports (
+       organization_id, order_id
+     ) VALUES ($1::uuid, $2::uuid)`,
+  ]
+  for (const statement of statements) {
+    await assert.rejects(
+      pool.query(statement, [fixture.organizationId, fixture.order.id]),
+      (error) => {
+        assert.doesNotMatch(
+          String(error?.message || error),
+          /OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED/u,
+          `${fixture.provider} ordinary canonical work must not be globally Shadow-blocked`,
+        )
+        return true
+      },
     )
   }
 }
@@ -2110,8 +2137,8 @@ async function verify(databaseUrl) {
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [ids.organization, faire.order.id],
     ))
-    await verifyCanonicalWriteGuards(pool, shopify)
-    await verifyCanonicalWriteGuards(pool, faire)
+    await verifyCanonicalWritesAreNotGloballyShadowBlocked(pool, shopify)
+    await verifyCanonicalWritesAreNotGloballyShadowBlocked(pool, faire)
 
     const retained = await pool.query(
       `SELECT count(*)::integer AS run_count,

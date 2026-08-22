@@ -1543,9 +1543,11 @@ assert.doesNotMatch(
 )
 includes(persistenceSource, [
   'activation.state AS activation_state',
-  'FOR UPDATE OF account, activation',
-  "'COMMERCE_INTAKE_ACTIVATION_REQUIRED'",
-  "['shadow', 'active'].includes(account.activation_state)",
+  'operatorCommandsAllowed: true',
+  'manualProviderReadsAllowed: true',
+  'localReviewCommandsAllowed: true',
+  "authority === 'automatic'",
+  'if (automaticMirror && !lockedStoreSync?.running)',
   'canonicalExternalOrderIds',
   'latestCandidateByExternalOrder',
   '&& !input.refreshCandidateGlobalId',

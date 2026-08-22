@@ -1,4 +1,4 @@
-// Exact runtime attestation for migration 0301. Keep this expression shared by
+// Exact runtime attestation for migrations 0301 and 0313. Keep this expression shared by
 // /api/health and the disposable-PostgreSQL tamper suite so presence-only
 // checks cannot bless weakened Shipping authority.
 export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
@@ -8,6 +8,21 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
     WHERE filename = '0301_shipping_independent_one_off_items.sql'
       AND checksum =
         '21d58421f998e503f16c1f4ebc4c95dee9c986c0e5049a2dedb18df686058f53'
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM public.schema_migrations
+    WHERE filename = '0313_shipping_one_off_documents_minimal_fields.sql'
+      AND checksum =
+        'b3b801e2469fc4bf596256a12514ac910173154b97c48d04103cfee4b8170df2'
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM public.schema_migrations
+    WHERE filename =
+      '0314_operations_local_work_independent_activation.sql'
+      AND checksum =
+        '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
   )
   AND (
     WITH required_function(signature) AS (
@@ -57,7 +72,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
           'sha256'
         ),
         'hex'
-      ) = '568d98f7fd1a57225f990177e11dad3e425102bffae18c57635075c37d63d79a'
+      ) = '0a001c617305af01c38792cb906847303de4f1b117736b04e072491a1818ff86'
     FROM required_function
     LEFT JOIN pg_catalog.pg_proc installed_function
       ON installed_function.oid = to_regprocedure(required_function.signature)
@@ -100,7 +115,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
           'sha256'
         ),
         'hex'
-      ) = 'c1a48ece59d693bfea95c49db58955d9524728840b2adbc104281e746f145e85'
+      ) = '11d9d6ff6728efc8b33092b4d7bfca186d991a05125d5c74e19cbffe3d664a31'
     FROM pg_catalog.pg_class installed_table
     JOIN pg_catalog.pg_namespace installed_namespace
       ON installed_namespace.oid = installed_table.relnamespace
@@ -184,7 +199,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
       )
   )
   AND (
-    SELECT count(*) = 37
+    SELECT count(*) = 38
       AND encode(
         digest(
           convert_to(
@@ -211,7 +226,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
           'sha256'
         ),
         'hex'
-      ) = 'cb2d3b69c181388919d8d2fc0bb465da2f4402a29c244ccefde0aba55e4a2b4f'
+      ) = 'cdab4cdb5dca40269d61e47ad23c7d6f4d2fa91d65d057413a18968349267bb9'
     FROM pg_catalog.pg_constraint installed_constraint
     JOIN pg_catalog.pg_class installed_table
       ON installed_table.oid = installed_constraint.conrelid

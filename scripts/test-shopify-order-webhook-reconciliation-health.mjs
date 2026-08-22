@@ -10,9 +10,17 @@ const migrationPath = resolve(
   root,
   'db/migrations/0303_operations_shopify_order_webhook_reconciliation.sql',
 )
+const leaseMigrationPath = resolve(
+  root,
+  'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
+)
 const healthPath = resolve(
   root,
   'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
+)
+const orderEditingHealthPath = resolve(
+  root,
+  'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
 )
 const routePath = resolve(root, 'app_src/app/api/health/route.ts')
 const packagePath = resolve(root, 'package.json')
@@ -20,18 +28,37 @@ const ciPath = resolve(root, '.github/workflows/ci.yml')
 const predeployPath = resolve(root, 'scripts/verify-predeploy.mjs')
 
 const migration = readFileSync(migrationPath, 'utf8')
+const leaseMigration = readFileSync(leaseMigrationPath, 'utf8')
 const health = readFileSync(healthPath, 'utf8')
+const orderEditingHealth = readFileSync(orderEditingHealthPath, 'utf8')
 const route = readFileSync(routePath, 'utf8')
 const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'))
 const ci = readFileSync(ciPath, 'utf8')
 const predeploy = readFileSync(predeployPath, 'utf8')
 const checksum = createHash('sha256').update(migration).digest('hex')
+const leaseChecksum = createHash('sha256').update(leaseMigration).digest('hex')
 
 assert.match(
   health,
   new RegExp(checksum, 'u'),
   'health must pin the exact 0303 migration checksum',
 )
+assert.match(
+  orderEditingHealth,
+  new RegExp(leaseChecksum, 'u'),
+  'shared release health must pin the exact 0316 migration checksum',
+)
+for (const leasePhaseEvidence of [
+  '0316_operations_commerce_fulfillment_authority_leases.sql',
+  'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM',
+  'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL',
+  'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT',
+  'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_HASH',
+  'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_FUNCTION_HASH',
+  'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_FUNCTION_HASH',
+  'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_TRIGGER_HASH',
+  'SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_TRIGGER_HASH',
+]) assert.match(health, new RegExp(leasePhaseEvidence, 'u'))
 for (const required of [
   'operations_shopify_order_webhook_commands',
   'operations_shopify_order_webhook_attempts',
@@ -87,6 +114,7 @@ assert.ok(
 assert.match(ci, /run: npm run test:shopify-order-webhook-reconciliation/u)
 for (const path of [
   '0303_operations_shopify_order_webhook_reconciliation.sql',
+  '0316_operations_commerce_fulfillment_authority_leases.sql',
   'test-shopify-order-webhook-reconciliation-postgres.mjs',
   'test-shopify-order-webhook-reconciliation-health.mjs',
 ]) assert.match(predeploy, new RegExp(path, 'u'))

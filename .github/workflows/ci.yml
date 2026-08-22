@@ -26,6 +26,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Fetch rolling-release compatibility source
+        run: git fetch --no-tags --depth=1 origin 9d67c8d097bcd475e0109c3169a61a0885fcf059
+
       - name: Setup Node
         uses: actions/setup-node@v5
         with:

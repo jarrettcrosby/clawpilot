@@ -139,7 +139,6 @@ export type ShopifyTestStoreCanonicalE2eTarget = {
 }
 
 type TargetRow = {
-  activation_state: string
   activation_revision: number
   order_id: string
   order_global_id: string
@@ -170,8 +169,11 @@ type TargetRow = {
 }
 
 const TARGET_SELECT = `SELECT
-  activation.state AS activation_state,
-  activation.revision AS activation_revision,
+  COALESCE((
+    SELECT activation.revision
+    FROM operations_activation_scopes activation
+    WHERE activation.organization_id = source_order.organization_id
+  ), 1) AS activation_revision,
   source_order.id::text AS order_id,
   source_order.global_id AS order_global_id,
   source_order.row_version::text AS order_row_version,
@@ -233,8 +235,6 @@ const TARGET_SELECT = `SELECT
      AND plan.order_id = source_order.id
      AND label.environment <> 'sandbox')::text AS production_label_count
 FROM operations_orders source_order
-JOIN operations_activation_scopes activation
-  ON activation.organization_id = source_order.organization_id
 JOIN operations_integration_accounts account
   ON account.organization_id = source_order.organization_id
  AND account.id = source_order.integration_account_id
@@ -263,12 +263,6 @@ function mapAndRequireEligibleTarget(
       'The Shopify order changed; refresh before authorizing this test',
     )
   }
-  if (row.activation_state !== 'read_only') {
-    fail(
-      'SHOPIFY_TEST_E2E_READ_ONLY_REQUIRED',
-      'The canonical Shopify test lane is available only while Operations is Read only',
-    )
-  }
   const resumableStatuses = [
     'imported',
     'planned',
@@ -290,7 +284,7 @@ function mapAndRequireEligibleTarget(
   ) {
     fail(
       'SHOPIFY_TEST_E2E_ORDER_INELIGIBLE',
-      'Authorization requires one exact unfulfilled Shopify sandbox test-order candidate with no production effects in Read only mode',
+      'Authorization requires one exact unfulfilled Shopify sandbox test-order candidate with no production effects',
     )
   }
   const resumed = row.order_status !== 'imported'
@@ -488,8 +482,13 @@ function normalizeProof(
 export function shopifyTestStoreCanonicalE2eProofHash(
   value: ShopifyTestStoreCanonicalE2eProviderProof,
 ) {
+  const {
+    activationRevision: legacyActivationRevision,
+    ...authority
+  } = normalizeProof(value)
+  void legacyActivationRevision
   return createHash('sha256')
-    .update(JSON.stringify(normalizeProof(value)))
+    .update(JSON.stringify(authority))
     .digest('hex')
 }
 
@@ -600,7 +599,6 @@ export async function persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres
       SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION_VERSION,
     reason: authorizationReason,
     lifetimeMinutes,
-    activationRevision: proof.activationRevision,
     accountGlobalId: proof.accountGlobalId,
     externalAccountId: proof.externalAccountId,
     credentialGeneration: proof.credentialGeneration,
@@ -647,7 +645,6 @@ export async function persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres
     )
     if (
       target.account.globalId !== proof.accountGlobalId
-      || target.activationRevision !== proof.activationRevision
       || target.account.externalAccountId !== proof.externalAccountId
       || target.account.credentialGeneration !== proof.credentialGeneration
       || target.order.externalOrderId !== proof.externalOrderId
@@ -847,7 +844,6 @@ export async function persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres
         || previous.account_global_id !== proof.accountGlobalId
         || previous.external_account_id !== proof.externalAccountId
         || previous.credential_generation !== proof.credentialGeneration
-        || previous.activation_revision !== proof.activationRevision
         || previous.order_global_id !== proof.orderGlobalId
         || previous.external_order_id !== proof.externalOrderId
         || Number(previous.initial_order_row_version) > proof.orderRowVersion
@@ -979,7 +975,7 @@ export async function persistShopifyTestStoreCanonicalE2eAuthorizationInPostgres
         authorizationIdempotencyKey: key,
         authorizationRequestHash: requestHash,
         expiresAt: new Date(authorization.expires_at).toISOString(),
-        activationState: 'read_only',
+        legacyActivationRevisionAtAuthorization: target.activationRevision,
         productionPostageAuthorized: false,
         notifyCustomerAuthorized: false,
       },
@@ -1169,13 +1165,11 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
   ).trim()
   return withTransaction(async (client) => {
     const context = await client.query<{
-      activation_state: string
       order_global_id: string
       order_row_version: string
       order_status: string
     }>(
-      `SELECT activation.state AS activation_state,
-              source_order.global_id AS order_global_id,
+      `SELECT source_order.global_id AS order_global_id,
               source_order.row_version::text AS order_row_version,
               source_order.status AS order_status
        FROM operations_integration_accounts account
@@ -1185,8 +1179,6 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
        JOIN operations_orders source_order
          ON source_order.organization_id = candidate.organization_id
         AND source_order.id = candidate.canonical_order_id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = account.organization_id
        WHERE account.organization_id = $1::uuid
          AND account.global_id = $2
          AND account.provider = 'shopify'
@@ -1210,21 +1202,8 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
       )
     }
     const row = context.rows[0]
-    if (row.activation_state !== 'read_only') {
-      if (authorizationGlobalId) {
-        fail(
-          'SHOPIFY_TEST_E2E_READ_ONLY_REQUIRED',
-          'The exact Shopify test-store lane is current only in Read only mode',
-        )
-      }
-      return { authorityKind: 'ordinary' as const }
-    }
     if (!authorizationGlobalId) {
-      fail(
-        'SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
-        'Authorize this exact verified Shopify test order before saving operational planning evidence in Read only mode',
-        403,
-      )
+      return { authorityKind: 'ordinary' as const }
     }
     await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
       organizationId: scopedOrganizationId,
@@ -1635,8 +1614,6 @@ export async function requireShopifyTestStoreFulfillmentWriteClaimInPostgres(
      JOIN operations_orders source_order
        ON source_order.organization_id = auth.organization_id
       AND source_order.id = auth.order_id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = auth.organization_id
      JOIN operations_integration_accounts account
        ON account.organization_id = evidence.organization_id
       AND account.id = evidence.integration_account_id
@@ -1656,8 +1633,6 @@ export async function requireShopifyTestStoreFulfillmentWriteClaimInPostgres(
        AND auth.consumed_by = auth.authorized_by
        AND auth.confirmation_statement_version = 'shopify-test-store-canonical-e2e-v1'
        AND confirmation.confirmed_by = auth.authorized_by
-       AND activation.state = 'read_only'
-       AND activation.revision = evidence.activation_revision
        AND source_order.status = 'shipped'
        AND source_order.source_provider = 'shopify'
        AND source_order.external_order_id = $3

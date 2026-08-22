@@ -28,8 +28,10 @@ function correction(overrides: Partial<Parameters<
   })
 }
 
-test('projects one exact local correction in every non-emergency profile', () => {
-  for (const activationState of ['shadow', 'read_only', 'active'] as const) {
+test('projects one exact local correction in every activation profile', () => {
+  for (const activationState of [
+    'disabled', 'shadow', 'read_only', 'active', 'frozen',
+  ] as const) {
     const action = correction({ activationState })
     assert.equal(action.action, 'reopen_for_replanning')
     assert.equal(action.enabled, true)
@@ -56,10 +58,8 @@ test('keeps released correction visible but blocks it pending device recall', ()
   assert.equal(released.expectedCorrectionFingerprint, null)
 })
 
-test('emergency profiles and invalid commerce work remain blocked', () => {
+test('invalid commerce work remains blocked independent of activation', () => {
   const cases = [
-    correction({ activationState: 'disabled' }),
-    correction({ activationState: 'frozen' }),
     correction({ sourceProvider: 'mock-commerce' }),
     correction({ sourceProvider: 'clawpilot_native', orderType: 'one_off' }),
     correction({ status: 'picking', planStatus: 'released' }),
@@ -70,10 +70,6 @@ test('emergency profiles and invalid commerce work remain blocked', () => {
     assert.equal(action.enabled, false)
     assert.equal(action.expectedCorrectionFingerprint, null)
   }
-  assert.equal(
-    correction({ activationState: 'frozen' }).blockedCode,
-    'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED',
-  )
 })
 
 test('carries the server exact-state blocker and fails closed without a fingerprint', () => {
@@ -108,7 +104,7 @@ test('adds correction as a secondary action without replacing forward workflow',
     activationState: 'active',
     canManage: true,
     canExecute: true,
-    canActivate: false,
+    canPurchaseLivePostage: false,
     planStatus: 'planned',
     waveStatus: null,
     lineCount: 1,

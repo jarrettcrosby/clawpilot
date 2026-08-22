@@ -77,6 +77,19 @@ async function healthApplied(client, healthSql) {
   return result.rows[0]?.applied === true
 }
 
+function loadHealthModule() {
+  const orderEditingReleaseHealth = loadTypeScriptModule(
+    'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
+  )
+  return loadTypeScriptModule(
+    'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
+    {
+      '@/lib/persistence/operationsOrderEditingReleaseHealth':
+        orderEditingReleaseHealth,
+    },
+  )
+}
+
 async function expectHealthTamper(pool, healthSql, sql, label) {
   const client = await pool.connect()
   try {
@@ -226,14 +239,28 @@ function prepareInput(fixture, overrides = {}) {
 
 async function exercise(pool) {
   const fixture = await seed(pool)
-  const health = loadTypeScriptModule(
-    'app_src/lib/persistence/shopifyOrderWebhookReconciliationHealth.ts',
-  )
+  const health = loadHealthModule()
   const healthyMigration = await pool.query(
     `SELECT (${health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL})
        AS applied`,
   )
   assert.equal(healthyMigration.rows[0].applied, true)
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `UPDATE public.schema_migrations
+     SET checksum = repeat('0', 64)
+     WHERE filename =
+       '0316_operations_commerce_fulfillment_authority_leases.sql'`,
+    'wrong 0316 migration checksum',
+  )
+  await expectHealthTamper(
+    pool,
+    health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+    `ALTER TABLE public.operations_integration_accounts
+       DISABLE TRIGGER protect_commerce_fulfillment_account_authority`,
+    'disabled 0316 account-authority trigger',
+  )
   await expectHealthTamper(
     pool,
     health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
@@ -980,7 +1007,35 @@ async function main() {
     try {
       const client = await pool.connect()
       try {
-        for (const file of migrations()) await applyMigration(client, file)
+        const files = migrations()
+        const leaseMigration =
+          '0316_operations_commerce_fulfillment_authority_leases.sql'
+        const leaseIndex = files.indexOf(leaseMigration)
+        assert.ok(leaseIndex > 0, `${leaseMigration} is missing`)
+        for (const file of files.slice(0, leaseIndex)) {
+          await applyMigration(client, file)
+        }
+        const health = loadHealthModule()
+        assert.equal(
+          await healthApplied(
+            client,
+            health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+          ),
+          true,
+          'The exact pre-0316 reconciliation phase must remain healthy',
+        )
+        await expectHealthTamper(
+          pool,
+          health.SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL,
+          `CREATE OR REPLACE FUNCTION
+             public.protect_shopify_order_webhook_credential_drift()
+           RETURNS trigger LANGUAGE plpgsql
+           AS 'BEGIN RETURN NEW; END'`,
+          'weakened pre-0316 credential-drift function',
+        )
+        for (const file of files.slice(leaseIndex)) {
+          await applyMigration(client, file)
+        }
       } finally {
         client.release()
       }

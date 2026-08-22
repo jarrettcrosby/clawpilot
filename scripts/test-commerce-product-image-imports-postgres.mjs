@@ -2640,8 +2640,10 @@ async function verifyImports(pool) {
     observations: 0,
   })
 
-  // Frozen is an emergency override for both automatic and permissioned manual
-  // provider-read authority. Freezing after claim must reject local capture.
+  // The workspace activation profile is telemetry, not Store sync authority.
+  // Changing its revision after claim still invalidates the exact correlated
+  // mapping fence, while the independently Running Store sync can immediately
+  // resolve an auditable successor generation without a provider write.
   const frozenProduct = await addProduct(pool, gamma, {
     key: 'activation-freeze',
     name: 'Activation freeze product',
@@ -2669,9 +2671,22 @@ async function verifyImports(pool) {
      WHERE organization_id = $1::uuid`,
     [gamma.organizationId, gamma.actorEmail],
   )
+  const readAuthorityWhileFrozen = await pool.query(
+    `SELECT operations_commerce_provider_read_authority_is_current(
+       $1::uuid,
+       $2::uuid,
+       'automatic'
+     ) AS current`,
+    [gamma.organizationId, gamma.accountId],
+  )
+  assert.equal(
+    readAuthorityWhileFrozen.rows[0]?.current,
+    true,
+    'workspace Frozen telemetry must not pause an independently Running Store sync',
+  )
   await assertImportCode(
     completeClaim(frozenClaim, ONE_PIXEL_PNG, 'image/png'),
-    'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+    'COMMERCE_PRODUCT_IMAGE_FENCE_STALE',
   )
   const frozenWrites = await pool.query(
     `SELECT
@@ -2708,62 +2723,19 @@ async function verifyImports(pool) {
     state: 'waiting_mapping',
     attemptCount: 1,
   })
-  const frozenResolverBefore = await pool.query(
-    `SELECT state, wait_reason, attempt_count, updated_at::text
-     FROM operations_commerce_product_image_import_jobs
-     WHERE organization_id = $1::uuid
-       AND id = $2::uuid`,
-    [gamma.organizationId, frozenReceipt.jobId],
-  )
   const whileFrozen = await imageImports
     .resolveWaitingCommerceProductImageImportJobsInPostgres({
       organizationId: gamma.organizationId,
-      updatedBy: 'activation-freeze-resolver',
+      updatedBy: 'activation-fence-resolver',
       limit: 10,
     })
-  assert.deepEqual(Array.from(whileFrozen), [])
-  const whileStillFrozen = await imageImports
-    .resolveWaitingCommerceProductImageImportJobsInPostgres({
-      organizationId: gamma.organizationId,
-      updatedBy: 'activation-freeze-resolver-second-cycle',
-      limit: 10,
-    })
-  assert.deepEqual(Array.from(whileStillFrozen), [])
-  const frozenResolverAfter = await pool.query(
-    `SELECT state, wait_reason, attempt_count, updated_at::text
-     FROM operations_commerce_product_image_import_jobs
-     WHERE organization_id = $1::uuid
-       AND id = $2::uuid`,
-    [gamma.organizationId, frozenReceipt.jobId],
-  )
-  assert.deepEqual(
-    frozenResolverAfter.rows[0],
-    frozenResolverBefore.rows[0],
-    'repeated paused resolver cycles must not churn durable image job state',
-  )
-  await pool.query(
-    `UPDATE operations_activation_scopes
-     SET state = 'shadow',
-         revision = revision + 1,
-         reason = 'Acceptance freeze released',
-         updated_by = $2,
-         updated_at = clock_timestamp()
-     WHERE organization_id = $1::uuid`,
-    [gamma.organizationId, gamma.actorEmail],
-  )
-  const afterUnfreeze = await imageImports
-    .resolveWaitingCommerceProductImageImportJobsInPostgres({
-      organizationId: gamma.organizationId,
-      updatedBy: 'activation-unfreeze-resolver',
-      limit: 10,
-    })
-  assert.ok(afterUnfreeze.some((job) => (
+  assert.ok(whileFrozen.some((job) => (
     job.jobId !== frozenReceipt.jobId
     && job.state === 'queued'
     && job.productId === frozenProduct.id
   )))
   await completeClaim(
-    await claimOne(gamma.organizationId, 'activation-unfreeze-worker'),
+    await claimOne(gamma.organizationId, 'activation-fence-worker'),
     ONE_PIXEL_PNG,
     'image/png',
   )
@@ -2776,7 +2748,7 @@ async function verifyImports(pool) {
   )
   assert.deepEqual(frozenBinding.rows[0], {
     lifecycle_state: 'active',
-    activation_revision: 3,
+    activation_revision: 2,
   })
   const frozenJobGenerations = await pool.query(
     `SELECT job_generation, state, attempt_count, last_error_code

@@ -274,6 +274,18 @@ function sanitize(error: unknown): CommerceIntegrationRequestError {
       'COMMERCE_ACCOUNT_IDENTITY_CONFLICT',
     )
   }
+  if (
+    message === 'Commerce fulfillment provider authority is leased by a prepared attempt'
+    || message === 'Commerce fulfillment provider account authority cannot drift while leased'
+    || message === 'Commerce fulfillment provider credential is leased by a prepared attempt'
+    || message === 'Commerce fulfillment provider credential authority cannot drift while leased'
+  ) {
+    return new CommerceIntegrationRequestError(
+      'A fulfillment update is still in progress or awaiting reconciliation; refresh its status before changing this sales-channel connection',
+      409,
+      'COMMERCE_FULFILLMENT_LEASE_BUSY',
+    )
+  }
   if (message === 'Shopify reused a webhook event ID with a different payload') {
     return new CommerceIntegrationRequestError(
       'Shopify webhook delivery identity conflicted with prior evidence',

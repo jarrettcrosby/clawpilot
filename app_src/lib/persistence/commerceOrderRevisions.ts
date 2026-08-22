@@ -1168,8 +1168,6 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
        JOIN operations_commerce_credentials credential
          ON credential.organization_id = account.organization_id
         AND credential.integration_account_id = account.id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = account.organization_id
        WHERE target.id = $1::uuid
          AND target.organization_id = $2::uuid
          AND target.claim_state = 'processing'
@@ -1179,9 +1177,9 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
          AND credential.verification_status = 'verified'
          AND credential.credential_version = account.commerce_credential_generation
          AND ${observation.trigger.kind === 'manager'
-           ? "activation.state NOT IN ('disabled', 'frozen')"
+           ? 'TRUE'
            : STORE_SYNC_RUNNING_SQL}
-       FOR UPDATE OF target, account, credential, activation`,
+       FOR UPDATE OF target, account, credential`,
       [
         input.claim.targetId,
         input.claim.organizationId,

@@ -62,9 +62,10 @@ import {
   type CommerceProductReviewImportResult,
 } from '@/lib/integrations/commerceIntakeCsv'
 import { commerceProductDisplayName } from '@/lib/integrations/commerceProductNaming'
-import type {
-  PackagingMaterial,
-  PackagingMaterialsWorkspace,
+import {
+  packagingRatedOuterEvidenceReady,
+  type PackagingMaterial,
+  type PackagingMaterialsWorkspace,
 } from '@/lib/operations/packagingMaterials'
 import type { CartonizationPreviewResult } from '@/lib/operations/cartonizationPreview'
 import {
@@ -1213,11 +1214,11 @@ function operationalPackagingMaterialBlockers(
     blockers.push('rated exterior dimensions are incomplete')
   }
   if (
-    !['customer_confirmed', 'measured', 'provider'].includes(
-      material.ratedOuterDimensionEvidenceType || '',
-    )
-    || !material.ratedOuterDimensionEvidenceReference
-    || !material.ratedOuterDimensionConfirmedAt
+    !packagingRatedOuterEvidenceReady({
+      evidenceType: material.ratedOuterDimensionEvidenceType,
+      evidenceReference: material.ratedOuterDimensionEvidenceReference,
+      confirmedAt: material.ratedOuterDimensionConfirmedAt,
+    })
   ) {
     blockers.push('factual rated exterior evidence is incomplete')
   }

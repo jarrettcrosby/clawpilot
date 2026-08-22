@@ -658,15 +658,10 @@ function verifySourceContracts() {
     /providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.released[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
     'Warehouse release domain and audit evidence must record the latest current Shopify inventory sync runs',
   )
-  assert.match(
-    persistence,
-    /LEFT JOIN operations_cartonization_rate_evidence evidence[\s\S]*?plan\.cartonization_evidence_id IS NULL[\s\S]*?carrierReadEnvironment'[\s\S]*?IS DISTINCT FROM 'production'/,
-    'Active activation must fail closed for both missing and non-production plan evidence',
-  )
-  assert.match(
-    persistence,
-    /activation\.state === 'active'[\s\S]*?!plan\.cartonization_evidence_id[\s\S]*?plan\.carrier_read_environment !== 'production'[\s\S]*?OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
-    'Warehouse release must fail closed when active planning evidence is missing or non-production',
+  assert.doesNotMatch(
+    warehouseReleaseRegion,
+    /OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
+    'Local warehouse release must not reinterpret activation as carrier-read authority',
   )
   assert.match(
     persistence,
@@ -1337,6 +1332,9 @@ async function verifyRouteBehavior() {
       },
       '@/lib/operations/authorization': {
         operationsCapabilities: (actor) => actor.capabilities,
+        shippingCapabilities: (actor) => ({
+          canPurchaseLivePostage: Boolean(actor.capabilities.canActivate),
+        }),
         activeOperationsOrganizationId: (actor) => {
           if (!actor.organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
           return actor.organizationId
@@ -1352,6 +1350,24 @@ async function verifyRouteBehavior() {
         CommerceStoreSyncPersistenceError,
         updateCommerceStoreSyncControlInPostgres: async () => {
           throw new Error('Store sync updates are covered by their focused route contract')
+        },
+      },
+      '@/lib/persistence/commerceOrderWorkbench': {
+        CommerceOrderWorkbenchError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
+      '@/lib/persistence/operationsOrderShipmentAddress': {
+        OperationsOrderShipmentAddressError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
         },
       },
       '@/lib/integrations/carrierIntegrations': {
@@ -1633,6 +1649,7 @@ async function verifyRouteBehavior() {
     organizationId: actor.organizationId,
     actorEmail: actor.email,
     capabilities: actor.capabilities,
+    canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
     exceptionStatus: 'open',
@@ -2014,7 +2031,7 @@ async function verifyRouteBehavior() {
   assert.equal(deniedProductionRerate.status, 403)
   assert.equal(
     (await payload(deniedProductionRerate)).code,
-    'OPERATIONS_EXECUTE_REQUIRED',
+    'OPERATIONS_LIVE_POSTAGE_REQUIRED',
   )
   assert.equal(calls.productionRerates.length, 0)
 
@@ -3938,6 +3955,38 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not fingerprint shipment parties',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not encrypt shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3960,6 +4009,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -4018,6 +4070,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
               'Distributed Operations acceptance does not write Shopify fulfillment',
             )
           },
+          shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+            throw new Error(
+              'Distributed Operations acceptance does not hash Shopify fulfillment attempts',
+            )
+          },
         },
         '@/lib/integrations/shopifyOrderPlanningAuthority': {
           ShopifyOrderPlanningAuthorityError: class extends Error {},
@@ -4063,8 +4120,23 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
+        '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
+        '@/lib/persistence/commerceOrderWorkbench': {
+          readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
+        '@/lib/persistence/commerceProviderWrites': {
+          CommerceProviderWriteControlError: class extends Error {},
+          readCommerceProviderWriteControlsFromPostgres: async () => ({
+            accounts: [],
+          }),
+          requireCurrentCommerceProviderWritesInPostgres: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not authorize commerce provider writes',
+            )
+          },
+        },
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
@@ -4082,6 +4154,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
           assertNoOpenOperationsShadowTrainingRunsForActivation:
             async () => {},
         },
+        '@/lib/persistence/operationsOrderShipmentAddress':
+          operationsOrderShipmentAddress,
         '@/lib/persistence/sandboxCommerceE2eAuthorization': {
           requireActiveSandboxCommerceE2eAuthorization: async () => {
             throw new Error(

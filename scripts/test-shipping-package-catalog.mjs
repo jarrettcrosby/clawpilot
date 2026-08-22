@@ -379,6 +379,7 @@ const parcelDialog = read('app_src/components/operations/OneOffShipmentDialog.ts
 const ltlPanel = read('app_src/components/operations/LtlFreightClassAssessmentPanel.tsx')
 const shippingSection = read('app_src/components/shipping/ShippingSection.tsx')
 const integrationSettings = read('app_src/components/settings/IntegrationSettingsPanel.tsx')
+const carrierConnections = read('app_src/components/settings/CarrierConnectionsPanel.tsx')
 const brokeredPanel = read('app_src/components/settings/BrokeredTransportIntegrationPanel.tsx')
 const directCarrierPanel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
 const persistence = read('app_src/lib/persistence/oneOffShipments.ts')
@@ -500,15 +501,22 @@ for (const [source, label] of [
     `${label} must not expose reference catalogs, raw package codes, or provider attribution`,
   )
 }
+assert.ok(
+  integrationSettings.includes('<CarrierConnectionsPanel onNavigate={onNavigate} />'),
+  'Shipping settings must open the persistent carrier-connections workspace',
+)
 for (const fragment of [
-  "'small_parcel' | 'ltl'",
-  'Small Parcel · UPS / FedEx / Worldwide Express',
-  'LTL · R+L / Worldwide Express',
-  'brokeredFocus="small_parcel"',
-  'focus="ltl"',
-  "'& .MuiTab-root': { minHeight: 44 }",
+  "Array<'small_parcel' | 'ltl'>",
+  "['Carrier', 'Connection', 'Services', 'Done']",
+  'Parcel rates',
+  'LTL rates',
+  'brokeredFocus="all"',
+  'Troubleshoot',
 ]) {
-  assert.ok(integrationSettings.includes(fragment), `Shipping integration split is missing ${fragment}`)
+  assert.ok(
+    carrierConnections.includes(fragment),
+    `Carrier connections are missing ${fragment}`,
+  )
 }
 assert.ok(
   brokeredPanel.includes('any previously active mode was preserved'),

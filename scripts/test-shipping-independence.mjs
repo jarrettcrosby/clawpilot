@@ -205,14 +205,66 @@ const route = read('app_src/app/api/operations/one-off-shipments/route.ts')
 const persistence = read('app_src/lib/persistence/oneOffShipments.ts')
 const execution = read('app_src/lib/persistence/operationOneOffShipping.ts')
 const migration = read('db/migrations/0301_shipping_independent_one_off_items.sql')
+const documentsMigration = read('db/migrations/0313_shipping_one_off_documents_minimal_fields.sql')
 const health = read('app_src/app/api/health/route.ts')
 const healthContract = read('app_src/lib/persistence/shippingIndependenceHealth.ts')
 const ui = read('app_src/components/operations/OneOffShipmentDialog.tsx')
+const measurements = runTypeScript('app_src/lib/measurements.ts', {})
+const oneOffMeasurements = runTypeScript(
+  'app_src/lib/operations/oneOffShipmentMeasurements.ts',
+  { '@/lib/measurements': measurements },
+)
 const shippingUi = read('app_src/components/shipping/ShippingSection.tsx')
 const shippingExecutionUi = read('app_src/components/shipping/ShippingOneOffExecutionPanel.tsx')
 const shippingProjection = read('app_src/lib/persistence/shipping.ts')
 const accessUi = read('app_src/components/settings/UserAccessDialog.tsx')
 const recovery = runTypeScript('app_src/lib/operations/shippingOneOffRecovery.ts', {})
+
+assert.equal(oneOffMeasurements.canonicalLengthFromDisplay('10', 'imperial'), 254)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('1', 'imperial'), 454)
+assert.equal(oneOffMeasurements.canonicalLengthFromDisplay('10', 'metric'), 100)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('0.45', 'metric'), 450)
+assert.equal(oneOffMeasurements.positiveDisplayMeasurement('0.5'), 0.5)
+assert.equal(oneOffMeasurements.canonicalLengthFromDisplay('0.001', 'imperial'), null)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('0.001', 'metric'), 1)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('0.0001', 'metric'), null)
+assert.equal(oneOffMeasurements.canonicalLengthFromDisplay('', 'imperial'), null)
+assert.equal(oneOffMeasurements.canonicalLengthFromDisplay('0', 'imperial'), null)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('-1', 'imperial'), null)
+assert.equal(oneOffMeasurements.canonicalWeightFromDisplay('Infinity', 'imperial'), null)
+assert.equal(
+  oneOffMeasurements.canonicalLengthFromDisplay(
+    String(Number.MAX_SAFE_INTEGER),
+    'imperial',
+  ),
+  null,
+)
+assert.equal(
+  oneOffMeasurements.canonicalWeightFromDisplay(
+    String(Number.MAX_SAFE_INTEGER),
+    'metric',
+  ),
+  null,
+)
+assert.equal(oneOffMeasurements.displayLengthFromMillimeters(254, 'imperial'), '10')
+assert.equal(oneOffMeasurements.displayLengthFromMillimeters(315, 'imperial'), '12.402')
+assert.equal(oneOffMeasurements.displayLengthFromMillimeters(315, 'metric'), '31.5')
+assert.equal(oneOffMeasurements.rebaseDisplayLength('10', 'imperial', 'metric'), '25.4')
+assert.equal(oneOffMeasurements.rebaseDisplayWeight('1', 'imperial', 'metric'), '0.454')
+assert.equal(
+  oneOffMeasurements.canonicalLengthFromDisplay(
+    oneOffMeasurements.rebaseDisplayLength('10', 'imperial', 'metric'),
+    'metric',
+  ),
+  254,
+)
+assert.equal(
+  oneOffMeasurements.canonicalWeightFromDisplay(
+    oneOffMeasurements.rebaseDisplayWeight('1', 'imperial', 'metric'),
+    'metric',
+  ),
+  454,
+)
 
 assert.doesNotMatch(route, /operationsCapabilities|operations_activation_scopes/)
 assert.doesNotMatch(persistence, /operations_activation_scopes/)
@@ -308,13 +360,111 @@ assert.match(
   /key === 'viewShipping' && !enabled[\s\S]*next\.purchaseLivePostage = false/,
 )
 for (const fragment of [
-  'One-time ad-hoc item · do not add to Products',
+  'What are you shipping?',
+  'Existing inventory',
+  'New product',
+  'Documents or other contents',
+  'one-off-contents-mode',
   'No CRM customer · direct recipient',
   'no CRM customer is created',
-  'will not create a Product, receipt, inventory position, or reservation',
+  'stay outside Products and inventory',
+  'without creating or reserving inventory',
+  'useMeasurementSystem()',
+  'canonicalWeightFromDisplay(',
+  'canonicalLengthFromDisplay(',
+  'displayLengthFromMillimeters(',
+  'rebaseDisplayWeight(',
+  'rebaseDisplayLength(',
+  'measurementUnits(draftMeasurementSystem)',
+  'step: \'any\'',
+  "lines.every((line) => line.kind === 'ad_hoc')",
+  'inventoryPoolGlobalId: pureAdHoc ? null : inventoryPoolGlobalId',
+  'receivingLocationGlobalId: pureAdHoc ? null : receivingLocationGlobalId',
+  "if (!pureAdHoc && !customerGlobalId)",
 ]) {
   assert.ok(ui.includes(fragment), `One-off UI is missing ${fragment}`)
 }
+assert.doesNotMatch(ui, /label="(?:Unit |Gross )?weight \(g\)"/)
+assert.doesNotMatch(ui, /label="(?:Length|Width|Height) \(mm\)"/)
+const packageOptionMeasurementBlock = ui.slice(
+  ui.indexOf('const selectPackageOption ='),
+  ui.indexOf('const addPackage ='),
+)
+assert.match(
+  packageOptionMeasurementBlock,
+  /length: displayLengthFromMillimeters\([\s\S]*width: displayLengthFromMillimeters\([\s\S]*height: displayLengthFromMillimeters\(/,
+)
+const quoteMeasurementBlock = ui.slice(
+  ui.indexOf('const buildQuoteInput ='),
+  ui.indexOf('const continueToParcels ='),
+)
+const adHocQuoteInput = quoteMeasurementBlock.slice(
+  quoteMeasurementBlock.indexOf("if (line.kind === 'ad_hoc')"),
+  quoteMeasurementBlock.indexOf("kind: 'new' as const"),
+)
+assert.match(adHocQuoteInput, /unitWeightGrams: null/)
+assert.match(adHocQuoteInput, /unitDimensionsMm: null/)
+assert.doesNotMatch(adHocQuoteInput, /canonicalWeightFromDisplay|canonicalLengthFromDisplay/)
+assert.match(
+  ui,
+  /!pureAdHoc && \([\s\S]*label="Planning reason"/,
+  'Documents-only creation must not show a planning-reason essay',
+)
+assert.match(
+  ui,
+  /\.\.\.\(pureAdHoc \? \{\} : \{ reason: reason\.trim\(\) \}\)/,
+  'Documents-only creation must not send a fabricated operator reason',
+)
+assert.match(
+  persistence,
+  /operations_one_off_lines_are_pure_ad_hoc\(quote\.lines_snapshot\)[\s\S]*Created from the selected one-off parcel rate/,
+  'Persistence must derive a stable audit description for documents-only creation',
+)
+assert.match(
+  quoteMeasurementBlock,
+  /unitWeightGrams: canonicalWeightFromDisplay\([\s\S]*unitDimensionsMm:[\s\S]*dimensionsMm:[\s\S]*grossWeightGrams: canonicalWeightFromDisplay\(/,
+)
+const measurementRebaseBlock = ui.slice(
+  ui.indexOf('if (measurementSystem === draftMeasurementSystem) return'),
+  ui.indexOf('const updateCarrierSelection ='),
+)
+for (const fragment of ['setLines(', 'setPackages(', 'setDraftMeasurementSystem(']) {
+  assert.ok(measurementRebaseBlock.includes(fragment), `Measurement rebase is missing ${fragment}`)
+}
+for (const fragment of [
+  'setStep(',
+  'setQuote(',
+  'setSelectedOfferGlobalId(',
+  'setQuoteIdempotencyKey(',
+  'setCreateAttempt(',
+]) {
+  assert.ok(
+    !measurementRebaseBlock.includes(fragment),
+    `Presentation-only measurement rebasing must preserve workflow and idempotency state: ${fragment}`,
+  )
+}
+assert.match(
+  ui,
+  /directRecipientSelected\.current && !current[\s\S]*\? ''[\s\S]*selectContentsMode[\s\S]*directRecipientSelected\.current = mode === 'ad_hoc'[\s\S]*\? ''/,
+  'Documents-only drafts must preserve the explicit direct-recipient selection across reopen',
+)
+for (const fragment of [
+  'ALTER COLUMN unit_weight_grams DROP NOT NULL',
+  'ALTER COLUMN unit_dimensions_mm DROP NOT NULL',
+  'operations_one_off_ad_hoc_lines_physical_facts_valid',
+  "NULLIF(snapshot->'unitDimensionsMm', 'null'::jsonb)",
+  'IS NOT DISTINCT FROM NEW.unit_weight_grams',
+]) {
+  assert.ok(
+    documentsMigration.includes(fragment),
+    `0313 minimal paperwork evidence is missing ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  documentsMigration,
+  /ALTER TABLE operations_order_lines|ALTER TABLE crm_products|DROP COLUMN/,
+  'Minimal paperwork fields must not weaken product or canonical order lines',
+)
 for (const fragment of [
   '<ShippingOneOffExecutionPanel',
   'standaloneOneOffPackEligible',
@@ -522,6 +672,8 @@ assert.match(health, /shipping_independence_applied/)
 for (const fragment of [
   '0301_shipping_independent_one_off_items.sql',
   '21d58421f998e503f16c1f4ebc4c95dee9c986c0e5049a2dedb18df686058f53',
+  '0313_shipping_one_off_documents_minimal_fields.sql',
+  'b3b801e2469fc4bf596256a12514ac910173154b97c48d04103cfee4b8170df2',
   "installed_namespace.nspname = 'public'",
   'installed_function.prosrc',
   'installed_trigger.tgfoid',

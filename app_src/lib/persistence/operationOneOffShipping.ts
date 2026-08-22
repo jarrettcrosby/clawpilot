@@ -565,6 +565,12 @@ function quoteInput(
     lines: lines.map((line) => {
       if (line.kind === 'ad_hoc') {
         const snapshot = line.item_snapshot || {}
+        const unitDimensions = snapshot.unitDimensionsMm
+        const hasUnitDimensions = Boolean(
+          unitDimensions
+          && typeof unitDimensions === 'object'
+          && !Array.isArray(unitDimensions),
+        )
         return {
           kind: 'ad_hoc' as const,
           lineKey: line.external_line_id,
@@ -572,12 +578,15 @@ function quoteInput(
           sku: String(snapshot.sku || '').trim() || null,
           quantity: numberValue(line.quantity),
           unitPriceMinor: numberValue(snapshot.unitPriceMinor),
-          unitWeightGrams: numberValue(snapshot.unitWeightGrams),
-          unitDimensionsMm: {
-            length: numberValue((snapshot.unitDimensionsMm as JsonObject)?.length),
-            width: numberValue((snapshot.unitDimensionsMm as JsonObject)?.width),
-            height: numberValue((snapshot.unitDimensionsMm as JsonObject)?.height),
-          },
+          unitWeightGrams: snapshot.unitWeightGrams === null
+            || snapshot.unitWeightGrams === undefined
+            ? null
+            : numberValue(snapshot.unitWeightGrams),
+          unitDimensionsMm: hasUnitDimensions ? {
+            length: numberValue((unitDimensions as JsonObject).length),
+            width: numberValue((unitDimensions as JsonObject).width),
+            height: numberValue((unitDimensions as JsonObject).height),
+          } : null,
         }
       }
       if (!line.product_global_id) {

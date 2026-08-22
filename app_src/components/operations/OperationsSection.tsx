@@ -71,6 +71,12 @@ import type {
   OperationsExceptionStatus,
   OperationsExceptionUpdateResult,
   OperationsExternalFulfillmentReconciliationResult,
+  OperationsImportedOrderRefreshConflict,
+  OperationsImportedOrderLineRefreshConflict,
+  OperationsImportedOrderRefreshResult,
+  OperationsImportedOrderShipToUpdateResult,
+  OperationsImportedOrderWorkingCopyDraft,
+  OperationsImportedOrderWorkingCopy,
   OperationsOrderCommandResult,
   OperationsOrderDetail,
   OperationsOrderListItem,
@@ -112,6 +118,8 @@ import ShopifyOrderManagementPanel from '@/components/operations/ShopifyOrderMan
 import ReceivingPanel from '@/components/operations/ReceivingPanel'
 import WarehouseSetupPanel from '@/components/operations/WarehouseSetupPanel'
 import OneOffShipmentDialog from '@/components/operations/OneOffShipmentDialog'
+import ImportedOrderWorkingCopyDrawer from '@/components/operations/ImportedOrderWorkingCopyDrawer'
+import OrderShipmentAddressEditor from '@/components/operations/OrderShipmentAddressEditor'
 import OneOffShippingExecutionPanel from '@/components/operations/OneOffShippingExecutionPanel'
 import ShadowOrderTrainingPanel, {
   type ShadowTrainingPlanTarget,
@@ -130,10 +138,13 @@ import {
   SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
 } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
-import type {
-  PackagingMaterial,
-  PackagingMaterialsWorkspace,
+import {
+  packagingDimensionEvidenceReady,
+  packagingRatedOuterEvidenceReady,
+  type PackagingMaterial,
+  type PackagingMaterialsWorkspace,
 } from '@/lib/operations/packagingMaterials'
+import type { OrderShipToDraft } from '@/lib/operations/orderShipTo'
 
 type SandboxCommerceE2eAuthorizationResult = {
   authorizationGlobalId: string
@@ -225,6 +236,26 @@ type OperationsPayload = {
     | OperationsCommerceFulfillmentRetryResult
     | ProviderOrderCancellationResult
     | CommerceStoreSyncUpdateResult
+}
+
+type ImportedOrderWorkbenchPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  result?: OperationsImportedOrderShipToUpdateResult
+  refreshResult?: OperationsImportedOrderRefreshResult
+  order?: OperationsImportedOrderWorkingCopy | null
+  orders?: OperationsImportedOrderWorkingCopy[]
+  latestCandidateGlobalId?: string
+  conflicts?: OperationsImportedOrderRefreshConflict[]
+  lineConflicts?: OperationsImportedOrderLineRefreshConflict[]
+}
+
+type PendingImportedOrderSave = {
+  candidateGlobalId: string
+  expectedRowVersion: number
+  fingerprint: string
+  idempotencyKey: string
 }
 
 type PackagingMaterialsPayload = {
@@ -366,10 +397,21 @@ const ACTIVATION_OPTIONS: Array<{
 
 const CARTONIZATION_EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const OPERATIONS_ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
+const OPERATIONS_IMPORTED_ORDER_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
 const OPERATIONS_ORDER_QUERY = 'operationsOrder'
+// The legacy organization-wide activation workflow remains available to the
+// server while per-connection Provider writes replaces it in the product UI.
+// Do not expose this migration-era profile in the daily Orders workbench.
+const LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE = false
 const COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED =
   'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
 const COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT = 8
+
+function importedOrderDraftFingerprint(
+  draft: OperationsImportedOrderWorkingCopyDraft,
+) {
+  return JSON.stringify(draft)
+}
 
 function isCommerceFulfillmentReconciliationPending(input: {
   provider: string
@@ -634,17 +676,38 @@ function operationalPlanningMaterialBlockers(
   requireStock = true,
 ) {
   const blockers: string[] = []
+  const inner = material.innerDimensionsMm
   const ratedOuter = material.ratedOuterDimensionsMm
   if (material.status !== 'active') blockers.push('not active')
+  if (
+    !Number.isSafeInteger(inner.length)
+    || Number(inner.length) < 1
+    || !Number.isSafeInteger(inner.width)
+    || Number(inner.width) < 1
+    || !Number.isSafeInteger(inner.height)
+    || Number(inner.height) < 1
+  ) {
+    blockers.push('usable inner dimensions missing')
+  }
+  if (
+    material.dimensionBasis !== 'inner'
+    || !packagingDimensionEvidenceReady({
+      evidenceType: material.dimensionEvidenceType,
+      evidenceReference: material.dimensionEvidenceReference,
+      confirmedAt: material.dimensionConfirmedAt,
+    })
+  ) {
+    blockers.push('factual inner evidence missing')
+  }
   if (!ratedOuter.length || !ratedOuter.width || !ratedOuter.height) {
     blockers.push('rated exterior dimensions missing')
   }
   if (
-    !['customer_confirmed', 'measured', 'provider'].includes(
-      material.ratedOuterDimensionEvidenceType || '',
-    )
-    || !material.ratedOuterDimensionEvidenceReference
-    || !material.ratedOuterDimensionConfirmedAt
+    !packagingRatedOuterEvidenceReady({
+      evidenceType: material.ratedOuterDimensionEvidenceType,
+      evidenceReference: material.ratedOuterDimensionEvidenceReference,
+      confirmedAt: material.ratedOuterDimensionConfirmedAt,
+    })
   ) {
     blockers.push('factual exterior evidence missing')
   }
@@ -1016,7 +1079,7 @@ function OrderDetailDrawer({
   activationState,
   canManage,
   canExecute,
-  canActivate,
+  canPurchaseLivePostage,
   canAuthorizeSandboxE2e,
   oneOffExecutionState,
   oneOffExecutionLoading,
@@ -1055,7 +1118,7 @@ function OrderDetailDrawer({
   activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
-  canActivate: boolean
+  canPurchaseLivePostage: boolean
   canAuthorizeSandboxE2e: boolean
   oneOffExecutionState: OneOffShipmentExecutionState | null
   oneOffExecutionLoading: boolean
@@ -1104,42 +1167,28 @@ function OrderDetailDrawer({
     (item) => item.action === 'reconcile_external_fulfillment',
   )
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
-  const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const canonicalShopifyTestLane = Boolean(
-    activationState === 'read_only'
-    && order?.sourceProvider === 'shopify',
+    order?.sourceProvider === 'shopify',
   )
   const canonicalShopifyAuthorization =
     sandboxE2eAuthorization?.authorityKind === 'shopify_test_store_canonical'
       ? sandboxE2eAuthorization
       : null
   const canPlanImportedOrder = Boolean(
-    activationState !== 'shadow'
-    && order?.status === 'imported'
+    order?.status === 'imported'
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce'
-    && (
-      activationState !== 'read_only'
-      || Boolean(canonicalShopifyAuthorization)
-    ),
-  )
-  const shadowProviderOrder = Boolean(
-    activationState === 'shadow'
-    && order?.sourceProvider
-    && ['shopify', 'faire'].includes(order.sourceProvider),
   )
   const trainingProviderOrder = Boolean(
     order?.sourceProvider
     && ['shopify', 'faire'].includes(order.sourceProvider),
   )
+  const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
+    && Boolean(order.oneOffShippingMode)
   const primaryAction = canPlanImportedOrder
     ? undefined
-    : shadowProviderOrder
-      ? order?.shopifyExternalFulfillmentReconciliationRequired
-        ? reconcileExternalFulfillmentAction
-        : undefined
     : order?.status === 'released'
       ? order.shopifyExternalFulfillmentReconciliationRequired
         ? reconcileExternalFulfillmentAction
@@ -1147,9 +1196,7 @@ function OrderDetailDrawer({
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
-          ? activationState === 'shadow'
-            ? prepareFulfillmentAction
-            : confirmShipmentAction
+          ? confirmShipmentAction
           : order && !['shipped', 'cancelled'].includes(order.status)
             ? releaseAction
             : undefined
@@ -1175,15 +1222,12 @@ function OrderDetailDrawer({
   const unresolvedAttempt = labelAttempts.find(
     (attempt) => attempt.state === 'prepared' || attempt.state === 'unknown',
   ) || null
-  const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
-    && Boolean(order.oneOffShippingMode)
-  const activeExecutionRequiredReason = activationState !== 'active'
-    && !(activationState === 'read_only' && canonicalShopifyAuthorization)
-    ? 'Order label create and void actions require Operations Active mode. To test a sandbox carrier account and printer while this workspace is in Shadow, use Shipping Settings → Sandbox / Developer; that diagnostic does not ship or update this order.'
-    : null
-  const createBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+  const createBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
+      : order?.shipmentShipTo.readiness !== 'carrier_ready'
+        ? 'Add the missing ship-to details before creating a label.'
+      : order?.shipmentShipTo.rerateRequired
+        ? 'The ship-to changed after planning. Compare rates again before creating a label.'
       : order?.status !== 'packed'
         ? 'Verify package packing before creating a label.'
         : activeLabel
@@ -1196,10 +1240,13 @@ function OrderDetailDrawer({
                 ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
                 : eligibleCarrierAccounts.length === 0
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
-                  : null)
-  const authorizedPackageCreateBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+                  : null
+  const authorizedPackageCreateBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
+      : order?.shipmentShipTo.readiness !== 'carrier_ready'
+        ? 'Add the missing ship-to details before creating labels.'
+      : order?.shipmentShipTo.rerateRequired
+        ? 'The ship-to changed after planning. Compare rates again before creating labels.'
       : !sandboxE2eAuthorization
         ? 'Authorize this exact commerce test order before creating package-specific sandbox labels.'
         : order?.status !== 'packed'
@@ -1212,7 +1259,7 @@ function OrderDetailDrawer({
                 ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
                 : eligibleCarrierAccounts.length === 0
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
-                  : null)
+                  : null
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
     ? 'Only an authorized organization owner or administrator may authorize this test.'
     : !order?.sourceProvider
@@ -1236,12 +1283,11 @@ function OrderDetailDrawer({
       && Boolean(item.latestLabel.trackingNumber)
     )),
   )
-  const voidBlockedReason = activeExecutionRequiredReason
-    || (!canExecute
+  const voidBlockedReason = !canExecute
       ? 'You do not have permission to void carrier labels.'
       : unresolvedAttempt
         ? `Attempt ${unresolvedAttempt.globalId} requires reconciliation before a carrier command.`
-        : null)
+        : null
 
   return (
     <Drawer
@@ -1303,19 +1349,24 @@ function OrderDetailDrawer({
                 <Box><Typography variant="caption" color="text.secondary">Promise</Typography><Typography>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: 'Not promised' })}</Typography></Box>
                 <Box><Typography variant="caption" color="text.secondary">Tracking</Typography><Typography sx={{ overflowWrap: 'anywhere' }}>{order.trackingNumber || 'Not shipped'}</Typography></Box>
               </Box>
-              <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-                {order.shipTo.name} · {order.shipTo.line1}{order.shipTo.line2 ? `, ${order.shipTo.line2}` : ''}, {order.shipTo.city}, {order.shipTo.region} {order.shipTo.postalCode}
-              </Typography>
             </DetailSection>
 
-            {order.sourceProvider === 'shopify' && activationState !== 'shadow' && (
+            <DetailSection title="Shipment details">
+              <OrderShipmentAddressEditor
+                key={`${order.globalId}:${order.rowVersion}:${order.shipmentShipTo.rowVersion}`}
+                order={order}
+                canManage={canManage}
+                disabled={busy}
+                onSaved={onOrderRevisionChanged}
+              />
+            </DetailSection>
+
+            {order.sourceProvider === 'shopify' && (
               <DetailSection title="Provider writes">
                 <ShopifyOrderManagementPanel
                   orderGlobalId={order.globalId}
                   orderRowVersion={order.rowVersion}
                   canManage={canManage}
-                  canExecute={canExecute}
-                  canActivate={canActivate}
                   disabled={busy}
                   onBusyChange={onOrderRevisionBusyChange}
                   onOrderChanged={onOrderRevisionChanged}
@@ -1732,8 +1783,8 @@ function OrderDetailDrawer({
                           fallback: sandboxE2eAuthorization.expiresAt,
                         },
                       )}. {canonicalShopifyAuthorization
-                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order while Operations remains Read only.'
-                        : `It permits only this order's package-specific sandbox labels, reserved-inventory consumption, and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback.`}
+                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order. Provider writes must also be On before fulfillment is sent to Shopify.'
+                        : `It permits only this order's package-specific sandbox labels and reserved-inventory consumption. Provider writes must be On before ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment or tracking is sent.`}
                     </Alert>
                     {canonicalShopifyAuthorization && order.status === 'packed' && (
                       canonicalShopifyAuthorization.fulfillmentConfirmedAt ? (
@@ -1821,10 +1872,9 @@ function OrderDetailDrawer({
                     state={oneOffExecutionState}
                     loading={oneOffExecutionLoading}
                     error={oneOffExecutionError}
-                    activationState={activationState}
                     canManage={canManage}
                     canExecute={canExecute}
-                    canActivate={canActivate}
+                    canPurchaseLivePostage={canPurchaseLivePostage}
                     busy={busy}
                     onRefreshPackedRates={onRefreshOneOffPackedRates}
                     onReviewPurchase={onReviewOneOffGroupPurchase}
@@ -1832,14 +1882,6 @@ function OrderDetailDrawer({
                   />
                 ) : (
                   <>
-                  {activeExecutionRequiredReason && (
-                  <Alert
-                    severity="info"
-                    data-testid="carrier-label-active-mode-required"
-                  >
-                    {activeExecutionRequiredReason}
-                  </Alert>
-                )}
                 {unresolvedAttempt && (
                   <Alert severity="error">
                     Carrier attempt {unresolvedAttempt.globalId} is {unresolvedAttempt.state}. Do not retry this
@@ -1961,12 +2003,12 @@ function OrderDetailDrawer({
                           </Tooltip>
                         </Stack>
                       </Box>
-                    ) : !activeExecutionRequiredReason ? (
+                    ) : (
                       <Alert severity={createBlockedReason ? 'info' : 'warning'}>
                         {createBlockedReason
                           || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
                       </Alert>
-                    ) : null}
+                    )}
                     {!activeLabel && (
                       <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
                         <span>
@@ -2533,6 +2575,14 @@ export default function OperationsSection({
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [selectedImportedGlobalId, setSelectedImportedGlobalId] =
+    useState<string | null>(null)
+  const [importedDrawerOpen, setImportedDrawerOpen] = useState(false)
+  const [savingImportedOrder, setSavingImportedOrder] = useState(false)
+  const [refreshingImportedOrder, setRefreshingImportedOrder] = useState(false)
+  const [importedOrderError, setImportedOrderError] = useState('')
+  const pendingImportedOrderSave = useRef<PendingImportedOrderSave | null>(null)
+  const pendingImportedOrderAccept = useRef<PendingImportedOrderSave | null>(null)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -2717,9 +2767,21 @@ export default function OperationsSection({
     ) {
       setSelectedGlobalId(pendingOrderGlobalId)
       setDrawerOpen(true)
+      setSelectedImportedGlobalId(null)
+      setImportedDrawerOpen(false)
+    } else if (
+      initialView === 'orders'
+      && OPERATIONS_IMPORTED_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)
+    ) {
+      setSelectedGlobalId(null)
+      setDrawerOpen(false)
+      setSelectedImportedGlobalId(pendingOrderGlobalId)
+      setImportedDrawerOpen(true)
     } else {
       setSelectedGlobalId(null)
       setDrawerOpen(false)
+      setSelectedImportedGlobalId(null)
+      setImportedDrawerOpen(false)
     }
     setSelectedExceptionGlobalId(null)
     setExceptionDrawerOpen(false)
@@ -2792,9 +2854,70 @@ export default function OperationsSection({
     }
   }, [loadWorkspace, search, selectedGlobalId])
 
+  useEffect(() => {
+    if (!importedDrawerOpen || !selectedImportedGlobalId) return
+    const selected = workspace?.importedOrders.find((order) => (
+      order.candidateGlobalId === selectedImportedGlobalId
+    ))
+    if (!selected || selected.resolutionDetailsLoaded) return
+    const controller = new AbortController()
+    const loadDetails = async () => {
+      try {
+        const params = new URLSearchParams({
+          candidate: selected.candidateGlobalId,
+        })
+        const response = await fetch(
+          `/api/operations/order-workbench?${params.toString()}`,
+          { cache: 'no-store', signal: controller.signal },
+        )
+        const payload = await response.json().catch(() => ({})) as
+          ImportedOrderWorkbenchPayload
+        const detailed = payload.orders?.[0]
+        if (!response.ok || !payload.ok || !detailed) {
+          throw new Error(payload.error || 'Editable order details are unavailable')
+        }
+        setWorkspace((current) => current ? {
+          ...current,
+          importedOrders: current.importedOrders.map((order) => (
+            order.candidateGlobalId === detailed.candidateGlobalId
+              ? detailed
+              : order
+          )),
+        } : current)
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === 'AbortError') return
+        setImportedOrderError(caught instanceof Error
+          ? caught.message
+          : 'Editable order details are unavailable')
+      }
+    }
+    void loadDetails()
+    return () => controller.abort()
+  }, [
+    importedDrawerOpen,
+    selectedImportedGlobalId,
+    workspace?.importedOrders,
+  ])
+
   const chooseOrder = (order: OperationsOrderListItem) => {
+    setSelectedImportedGlobalId(null)
+    setImportedDrawerOpen(false)
+    setImportedOrderError('')
     setSelectedGlobalId(order.globalId)
     setDrawerOpen(true)
+  }
+
+  const chooseImportedOrder = (order: OperationsImportedOrderWorkingCopy) => {
+    setSearch('')
+    setStatus('')
+    setSelectedGlobalId(null)
+    setDrawerOpen(false)
+    setSelectedImportedGlobalId(order.candidateGlobalId)
+    setImportedDrawerOpen(true)
+    setImportedOrderError('')
+    const nextUrl = new URL(window.location.href)
+    nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, order.candidateGlobalId)
+    window.history.replaceState(window.history.state, '', nextUrl)
   }
 
   const closeDrawer = () => {
@@ -2809,6 +2932,281 @@ export default function OperationsSection({
     setOneOffExecutionError('')
     setOneOffGroupPurchaseOpen(false)
     setOneOffGroupVoidOpen(false)
+  }
+
+  const closeImportedDrawer = () => {
+    if (savingImportedOrder) return
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
+    const nextUrl = new URL(window.location.href)
+    if (nextUrl.searchParams.has(OPERATIONS_ORDER_QUERY)) {
+      nextUrl.searchParams.delete(OPERATIONS_ORDER_QUERY)
+      window.history.replaceState(window.history.state, '', nextUrl)
+    }
+  }
+
+  const openAcceptedImportedOrder = async (
+    orderNumber: string,
+    canonicalOrderGlobalId: string,
+  ) => {
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
+    setSearch('')
+    setStatus('')
+    const nextUrl = new URL(window.location.href)
+    nextUrl.searchParams.set(
+      OPERATIONS_ORDER_QUERY,
+      canonicalOrderGlobalId,
+    )
+    window.history.replaceState(window.history.state, '', nextUrl)
+    await loadWorkspace(canonicalOrderGlobalId)
+    setSelectedGlobalId(canonicalOrderGlobalId)
+    setDrawerOpen(true)
+    setNotice(`Order ${orderNumber} imported`)
+  }
+
+  const saveImportedOrderDraft = async (
+    draft: OperationsImportedOrderWorkingCopyDraft,
+  ) => {
+    const order = workspace?.importedOrders.find(
+      (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
+    )
+    if (!order || savingImportedOrder) return
+    const fingerprint = importedOrderDraftFingerprint(draft)
+    const retained = pendingImportedOrderSave.current
+    const pending = retained
+      && retained.candidateGlobalId === order.candidateGlobalId
+      && retained.expectedRowVersion === order.rowVersion
+      && retained.fingerprint === fingerprint
+      ? retained
+      : {
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          fingerprint,
+          idempotencyKey: crypto.randomUUID(),
+        }
+    pendingImportedOrderSave.current = pending
+    setSavingImportedOrder(true)
+    setImportedOrderError('')
+    try {
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': pending.idempotencyKey,
+        },
+        body: JSON.stringify({
+          candidateGlobalId: pending.candidateGlobalId,
+          expectedRowVersion: pending.expectedRowVersion,
+          shipTo: draft.shipTo,
+          resolution: draft.resolution,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as ImportedOrderWorkbenchPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        const rejected = response.status >= 400 && response.status < 500
+        if (rejected) pendingImportedOrderSave.current = null
+        throw new Error(payload.error || 'Order changes could not be saved')
+      }
+      pendingImportedOrderSave.current = null
+      const canonicalOrderGlobalId = payload.result.canonicalOrderGlobalId
+      if (canonicalOrderGlobalId) {
+        await openAcceptedImportedOrder(
+          order.orderNumber,
+          canonicalOrderGlobalId,
+        )
+        return
+      }
+      if (!payload.order) {
+        throw new Error('Saved order could not be reloaded')
+      }
+      const savedOrder = payload.order
+      setWorkspace((current) => current ? {
+        ...current,
+        importedOrders: current.importedOrders.map((candidate) => (
+          candidate.candidateGlobalId === savedOrder.candidateGlobalId
+            ? savedOrder
+            : candidate
+        )),
+      } : current)
+      setNotice(`Order ${savedOrder.orderNumber} saved locally`)
+    } catch (caught) {
+      setImportedOrderError(caught instanceof Error
+        ? caught.message
+        : 'Order changes could not be saved')
+    } finally {
+      setSavingImportedOrder(false)
+    }
+  }
+
+  const acceptImportedOrder = async () => {
+    const order = workspace?.importedOrders.find(
+      (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
+    )
+    if (!order || savingImportedOrder) return
+    const retained = pendingImportedOrderAccept.current
+    const pending = retained
+      && retained.candidateGlobalId === order.candidateGlobalId
+      && retained.expectedRowVersion === order.rowVersion
+      ? retained
+      : {
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          fingerprint: 'accept',
+          idempotencyKey: crypto.randomUUID(),
+        }
+    pendingImportedOrderAccept.current = pending
+    setSavingImportedOrder(true)
+    setImportedOrderError('')
+    try {
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': pending.idempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'accept',
+          candidateGlobalId: pending.candidateGlobalId,
+          expectedRowVersion: pending.expectedRowVersion,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        ImportedOrderWorkbenchPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        if (response.status >= 400 && response.status < 500) {
+          pendingImportedOrderAccept.current = null
+        }
+        throw new Error(payload.error || 'Order could not be imported')
+      }
+      pendingImportedOrderAccept.current = null
+      if (payload.result.canonicalOrderGlobalId) {
+        await openAcceptedImportedOrder(
+          order.orderNumber,
+          payload.result.canonicalOrderGlobalId,
+        )
+        return
+      }
+      if (!payload.order) {
+        throw new Error('Imported order result could not be reloaded')
+      }
+      const retainedOrder = payload.order
+      setWorkspace((current) => current ? {
+        ...current,
+        importedOrders: current.importedOrders.map((candidate) => (
+          candidate.candidateGlobalId === retainedOrder.candidateGlobalId
+            ? retainedOrder
+            : candidate
+        )),
+      } : current)
+      setNotice(`Order ${retainedOrder.orderNumber} still needs information`)
+    } catch (caught) {
+      setImportedOrderError(caught instanceof Error
+        ? caught.message
+        : 'Order could not be imported')
+    } finally {
+      setSavingImportedOrder(false)
+    }
+  }
+
+  const refreshImportedOrder = async (conflictResolution?: {
+    latestCandidateGlobalId: string
+    resolutions: Partial<
+      Record<keyof OrderShipToDraft, 'local' | 'provider'>
+    >
+    lineResolutions: Record<string, 'provider'>
+  }) => {
+    const order = workspace?.importedOrders.find(
+      (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
+    )
+    if (!order || refreshingImportedOrder || savingImportedOrder) return null
+    setRefreshingImportedOrder(true)
+    setImportedOrderError('')
+    try {
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': crypto.randomUUID(),
+        },
+        body: JSON.stringify({
+          action: 'refresh',
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          ...(conflictResolution
+            ? {
+                latestCandidateGlobalId:
+                  conflictResolution.latestCandidateGlobalId,
+                resolutions: conflictResolution.resolutions,
+                lineResolutions: conflictResolution.lineResolutions,
+              }
+            : {}),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        ImportedOrderWorkbenchPayload
+      if (
+        response.status === 409
+        && payload.code === 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT'
+        && payload.latestCandidateGlobalId
+        && Array.isArray(payload.conflicts)
+        && Array.isArray(payload.lineConflicts)
+      ) {
+        return {
+          latestCandidateGlobalId: payload.latestCandidateGlobalId,
+          conflicts: payload.conflicts,
+          lineConflicts: payload.lineConflicts,
+        }
+      }
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.order
+        || !payload.refreshResult
+      ) {
+        throw new Error(payload.error || 'Order could not be refreshed')
+      }
+      const refreshed = payload.order
+      setWorkspace((current) => {
+        if (!current) return current
+        let inserted = false
+        const importedOrders = current.importedOrders.flatMap((candidate) => {
+          if (
+            candidate.candidateGlobalId !== order.candidateGlobalId
+            && candidate.candidateGlobalId !== refreshed.candidateGlobalId
+          ) return [candidate]
+          if (inserted) return []
+          inserted = true
+          return [refreshed]
+        })
+        if (!inserted) importedOrders.unshift(refreshed)
+        return { ...current, importedOrders }
+      })
+      setSelectedImportedGlobalId(refreshed.candidateGlobalId)
+      const nextUrl = new URL(window.location.href)
+      nextUrl.searchParams.set(
+        OPERATIONS_ORDER_QUERY,
+        refreshed.candidateGlobalId,
+      )
+      window.history.replaceState(window.history.state, '', nextUrl)
+      setNotice(
+        payload.refreshResult.status === 'rebased'
+          ? payload.refreshResult.preservedLineDrafts.length
+            ? `Order ${refreshed.orderNumber} refreshed; saved item matches were preserved`
+            : `Order ${refreshed.orderNumber} refreshed; review provider item changes`
+          : `Order ${refreshed.orderNumber} is current`,
+      )
+      return null
+    } catch (caught) {
+      setImportedOrderError(caught instanceof Error
+        ? caught.message
+        : 'Order could not be refreshed')
+      return null
+    } finally {
+      setRefreshingImportedOrder(false)
+    }
   }
 
   const chooseException = (exception: OperationsExceptionListItem) => {
@@ -2874,6 +3272,9 @@ export default function OperationsSection({
 
   const openExceptionOrder = (orderGlobalId: string) => {
     closeExceptionDrawer()
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
     setView('orders')
     setSelectedGlobalId(orderGlobalId)
     setDrawerOpen(true)
@@ -2881,6 +3282,9 @@ export default function OperationsSection({
 
   const openPickingOrder = (orderGlobalId: string) => {
     if (!OPERATIONS_ORDER_GLOBAL_ID.test(orderGlobalId)) return
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
     const nextUrl = new URL(window.location.href)
     nextUrl.searchParams.set(OPERATIONS_ORDER_QUERY, orderGlobalId)
     window.history.replaceState(window.history.state, '', nextUrl)
@@ -3977,8 +4381,7 @@ export default function OperationsSection({
   const authorizeSandboxE2e = async (event: FormEvent) => {
     event.preventDefault()
     const canonicalShopifyTestLane = Boolean(
-      workspace?.activation.state === 'read_only'
-      && detail?.sourceProvider === 'shopify',
+      detail?.sourceProvider === 'shopify',
     )
     if (
       !detail
@@ -4339,9 +4742,9 @@ export default function OperationsSection({
   const oneOffGroupPurchasePermissionsReady = () => Boolean(
     capabilities?.canManage
     && capabilities.canExecute
-    && (detail?.oneOffShippingMode !== 'live' || capabilities.canActivate)
-    && workspace?.activation.state === (
-      detail?.oneOffShippingMode === 'live' ? 'active' : 'shadow'
+    && (
+      detail?.oneOffShippingMode !== 'live'
+      || capabilities.canPurchaseLivePostage === true
     )
   )
 
@@ -5010,6 +5413,9 @@ export default function OperationsSection({
     setView('orders')
     setSearch('')
     setStatus('')
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
     setSelectedGlobalId(result.orderGlobalId)
     setDrawerOpen(true)
     setNotice(
@@ -5028,6 +5434,13 @@ export default function OperationsSection({
   ).reduce((total, entries) => total + entries.length, 0)
   const capabilities = workspace?.capabilities
   const detail = workspace?.selectedOrder?.globalId === selectedGlobalId ? workspace.selectedOrder : null
+  const importedDetail = workspace?.importedOrders.find(
+    (order) => order.candidateGlobalId === selectedImportedGlobalId,
+  ) || null
+  const visibleImportedOrders = !status || status === 'imported'
+    ? workspace?.importedOrders || []
+    : []
+  const visibleOrderCount = (workspace?.orders.length || 0) + visibleImportedOrders.length
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
@@ -5076,7 +5489,7 @@ export default function OperationsSection({
   const summary = workspace?.summary
   const empty = !loading && (
     view === 'orders'
-      ? workspace?.orders.length === 0
+      ? visibleOrderCount === 0
       : view === 'exceptions'
         ? workspace?.exceptions.length === 0
         : false
@@ -5140,7 +5553,9 @@ export default function OperationsSection({
           <Box>
             <Stack direction="row" spacing={1} alignItems="center">
               <Typography variant="h5" fontWeight={700}>{heading}</Typography>
-              {mainWorkspaceView && workspace && (
+              {LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE
+                && mainWorkspaceView
+                && workspace && (
                 <Chip
                   size="small"
                   label={displayStatus(workspace.activation.state)}
@@ -5268,7 +5683,9 @@ export default function OperationsSection({
           </Stack>
         )}
 
-        {mainWorkspaceView && workspace?.capabilities.canActivate && (
+        {LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE
+          && mainWorkspaceView
+          && workspace?.capabilities.canActivate && (
           <Stack
             data-testid="operations-advanced-safety"
             direction={{ xs: 'column', sm: 'row' }}
@@ -5384,6 +5801,11 @@ export default function OperationsSection({
               setView(next)
               setSearch('')
               closeDrawer()
+              if (!savingImportedOrder) {
+                setImportedDrawerOpen(false)
+                setSelectedImportedGlobalId(null)
+                setImportedOrderError('')
+              }
               closeExceptionDrawer()
               window.location.hash = next === 'orders'
                 ? 'operations'
@@ -5438,7 +5860,7 @@ export default function OperationsSection({
               },
             }}
           >
-            <Tab value="orders" label={`Orders${workspace ? ` (${workspace.orders.length})` : ''}`} />
+            <Tab value="orders" label={`Orders${workspace ? ` (${visibleOrderCount})` : ''}`} />
             <Tab
               value="picking"
               icon={<AssignmentIndRounded fontSize="small" />}
@@ -5630,6 +6052,46 @@ export default function OperationsSection({
           </TableContainer>
         ) : mobile ? (
           <Stack divider={<Divider flexItem />}>
+            {visibleImportedOrders.map((order) => (
+              <Box
+                key={order.candidateGlobalId}
+                component="button"
+                type="button"
+                data-testid={`imported-order-${order.candidateGlobalId}`}
+                onClick={() => chooseImportedOrder(order)}
+                sx={{
+                  appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
+                  px: 2, py: 1.75, width: '100%', cursor: 'pointer',
+                  '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                }}
+              >
+                <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {order.customerName || 'Customer not provided'}
+                    </Typography>
+                  </Box>
+                  <Chip
+                    size="small"
+                    label={order.needsInfo ? 'Needs info' : 'Imported'}
+                    color={order.needsInfo ? 'warning' : 'info'}
+                  />
+                </Stack>
+                <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
+                  <Box sx={{ minWidth: 0 }}>
+                    <Typography variant="caption" color="#A8C7FA">
+                      Imported from {displayStatus(order.provider)}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                      {displayStatus(order.provider)} · {order.integrationAccountName} · {order.lineCount}{' '}
+                      {order.lineCount === 1 ? 'line' : 'lines'}
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption" fontWeight={700}>Local draft</Typography>
+                </Stack>
+              </Box>
+            ))}
             {workspace?.orders.map((order) => (
               <Box
                 key={order.globalId}
@@ -5668,6 +6130,47 @@ export default function OperationsSection({
                 </TableRow>
               </TableHead>
               <TableBody>
+                {visibleImportedOrders.map((order) => (
+                  <TableRow
+                    key={order.candidateGlobalId}
+                    data-testid={`imported-order-${order.candidateGlobalId}`}
+                    hover
+                    onClick={() => chooseImportedOrder(order)}
+                    sx={{ cursor: 'pointer' }}
+                  >
+                    <TableCell>
+                      <Typography fontWeight={600}>{order.orderNumber}</Typography>
+                      <Typography variant="caption" color="#A8C7FA">
+                        Imported from {displayStatus(order.provider)}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Typography>{order.customerName || '—'}</Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        {displayStatus(order.provider)} · {order.integrationAccountName}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        size="small"
+                        label={order.needsInfo ? 'Needs info' : 'Imported'}
+                        color={order.needsInfo ? 'warning' : 'info'}
+                      />
+                    </TableCell>
+                    <TableCell>—</TableCell>
+                    <TableCell>—</TableCell>
+                    <TableCell align="right">{order.lineCount}</TableCell>
+                    <TableCell align="right">—</TableCell>
+                    <TableCell>—</TableCell>
+                    <TableCell padding="checkbox">
+                      <Tooltip title="Open imported order">
+                        <IconButton size="small" aria-label={`Open imported order ${order.orderNumber}`}>
+                          <OpenInNewRounded fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))}
                 {workspace?.orders.map((order) => (
                   <TableRow key={order.globalId} hover onClick={() => chooseOrder(order)} sx={{ cursor: 'pointer' }}>
                     <TableCell><Typography fontWeight={600}>{order.orderNumber}</Typography><Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography></TableCell>
@@ -5687,6 +6190,23 @@ export default function OperationsSection({
         )}
       </Box>
 
+      <ImportedOrderWorkingCopyDrawer
+        key={importedDetail
+          ? `${importedDetail.candidateGlobalId}:${importedDetail.rowVersion}:${
+              importedDetail.resolutionDetailsLoaded ? 'details' : 'summary'
+            }`
+          : 'no-imported-order'}
+        open={importedDrawerOpen}
+        order={importedDetail}
+        canManage={Boolean(capabilities?.canManage)}
+        saving={savingImportedOrder}
+        refreshing={refreshingImportedOrder}
+        error={importedOrderError}
+        onClose={closeImportedDrawer}
+        onSave={saveImportedOrderDraft}
+        onAccept={acceptImportedOrder}
+        onRefresh={refreshImportedOrder}
+      />
       <OrderDetailDrawer
         order={detail}
         sandboxCarrierAccounts={workspace?.shipping?.sandboxCarrierAccounts || []}
@@ -5694,7 +6214,9 @@ export default function OperationsSection({
         activationState={workspace?.activation.state || 'disabled'}
         canManage={Boolean(capabilities?.canManage)}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
-        canActivate={Boolean(capabilities?.canActivate)}
+        canPurchaseLivePostage={Boolean(
+          workspace?.capabilities.canPurchaseLivePostage,
+        )}
         canAuthorizeSandboxE2e={Boolean(
           capabilities?.canActivate
           && capabilities.canManage
@@ -5783,7 +6305,7 @@ export default function OperationsSection({
       />
 
       <Dialog
-        open={commerceActiveOpen}
+        open={LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE && commerceActiveOpen}
         onClose={closeCommerceActive}
         fullWidth
         maxWidth="md"
@@ -6777,8 +7299,7 @@ export default function OperationsSection({
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
           <DialogTitle>
-            {workspace?.activation.state === 'read_only'
-              && detail?.sourceProvider === 'shopify'
+            {detail?.sourceProvider === 'shopify'
               ? detail.status === 'imported'
                 ? 'Authorize verified Shopify test order'
                 : 'Renew or resume verified Shopify test order'
@@ -6787,9 +7308,8 @@ export default function OperationsSection({
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="error">
-                {workspace?.activation.state === 'read_only'
-                  && detail?.sourceProvider === 'shopify'
-                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, local order revision, and Read only activation revision. It expires after two hours and never permits production postage or customer notification.`
+                {detail?.sourceProvider === 'shopify'
+                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, and local order revision. It expires after two hours and never permits production postage or customer notification.`
                   : `This authority is limited to ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). It permits non-tracking sandbox labels followed by real reserved inventory consumption and ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback. The authorization expires after two hours and is consumed by a successful shipment confirmation.`}
               </Alert>
               <Box
@@ -6800,14 +7320,12 @@ export default function OperationsSection({
                 }}
               >
                 <Typography variant="body2">
-                  {workspace?.activation.state === 'read_only'
-                    && detail?.sourceProvider === 'shopify'
+                  {detail?.sourceProvider === 'shopify'
                     ? SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
                     : SANDBOX_COMMERCE_E2E_CONFIRMATION}
                 </Typography>
               </Box>
-              {workspace?.activation.state === 'read_only'
-                && detail?.sourceProvider === 'shopify' ? (
+              {detail?.sourceProvider === 'shopify' ? (
                 <TextField
                   required
                   multiline
@@ -6863,8 +7381,7 @@ export default function OperationsSection({
               disabled={
                 authorizingSandboxE2e
                 || (
-                  workspace?.activation.state === 'read_only'
-                    && detail?.sourceProvider === 'shopify'
+                  detail?.sourceProvider === 'shopify'
                     ? sandboxE2eConfirmationText
                       !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
                     : !sandboxE2eAuthorizationConfirmed
@@ -6980,7 +7497,9 @@ export default function OperationsSection({
                 plan as shipped, creates immutable shipment and packing-slip evidence, seeds
                 tracking, and attempts the commerce fulfillment export for
                 {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
-                readiness checks are repeated when you confirm.
+                readiness checks are repeated when you confirm. For Shopify and Faire,
+                the exact connection&apos;s Provider writes control must still be On and
+                bound to its current credential and scopes.
               </Alert>
               {detail?.sandboxCommerceE2eAuthorization && (
                 <Alert severity="error" data-testid="sandbox-commerce-e2e-confirm-shipment-warning">

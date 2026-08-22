@@ -5,8 +5,11 @@ import { hasEffectiveShopifyScope } from '@/lib/integrations/commerceCapabilitie
 import {
   executeShopifyOrderManagementAction,
   inspectShopifyOrderManagementTarget,
+  requestedShopifyOrderSaveProjectionHash,
+  shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
   type ShopifyOrderManagementPreview,
+  type ShopifyOrderShippingAddress,
 } from '@/lib/integrations/shopifyOrderManagement'
 import {
   shopifyOrderManagementAccountAllowed,
@@ -37,6 +40,20 @@ export type ShopifyOrderManagementMutation =
       kind: 'set_line_quantity'
       lineItemId: string
       quantity: number
+    }>
+  | Readonly<{
+      kind: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      shippingAddress: ShopifyOrderShippingAddress | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemId: string
+        quantity: number
+      }>
     }>
 
 export class ShopifyOrderManagementCommandError extends Error {
@@ -72,6 +89,22 @@ function providerAction(
       staffNote: staffNote(reason),
     }
   }
+  if (mutation.kind === 'save_order') {
+    return {
+      type: 'save_order',
+      email: mutation.email,
+      phone: mutation.phone,
+      poNumber: mutation.poNumber,
+      note: mutation.note,
+      shippingAddress: mutation.shippingAddress,
+      tagAdds: mutation.tagAdds,
+      tagRemoves: mutation.tagRemoves,
+      lineQuantities: mutation.lineQuantities.map((line) => ({
+        lineItemGid: line.lineItemId,
+        quantity: line.quantity,
+      })),
+    }
+  }
   return {
     type: 'set_line_quantity',
     lineItemGid: mutation.lineItemId,
@@ -101,15 +134,12 @@ function exactCurrentSource(target: ShopifyOrderManagementTarget) {
   )
 }
 
-function targetBlocker(target: ShopifyOrderManagementTarget) {
+function targetReadBlocker(target: ShopifyOrderManagementTarget) {
   if (target.accountEnvironment !== 'sandbox') {
     return 'SHOPIFY_ORDER_MANAGEMENT_SANDBOX_ACCOUNT_REQUIRED'
   }
   if (!target.credentialCurrent) {
     return 'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT'
-  }
-  if (target.activationState !== 'shadow' && target.activationState !== 'active') {
-    return 'SHOPIFY_ORDER_MANAGEMENT_ACTIVATION_REQUIRED'
   }
   if (
     target.orderStatus !== 'imported'
@@ -119,6 +149,22 @@ function targetBlocker(target: ShopifyOrderManagementTarget) {
     return 'SHOPIFY_ORDER_MANAGEMENT_UNSTARTED_ORDER_REQUIRED'
   }
   return null
+}
+
+function providerWriteBlocker(target: ShopifyOrderManagementTarget) {
+  if (
+    target.providerWriteRequestedMode !== 'on'
+    || !target.providerWriteBindingCurrent
+    || target.providerWriteControlRowVersion < 1
+    || !target.providerWriteScopeDigest
+  ) {
+    return 'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF'
+  }
+  return null
+}
+
+function targetBlocker(target: ShopifyOrderManagementTarget) {
+  return targetReadBlocker(target) || providerWriteBlocker(target)
 }
 
 function assertReconciliationTarget(
@@ -139,15 +185,22 @@ function assertReconciliationTarget(
   }
 }
 
-function assertRuntimeWriteAuthorized(accountGlobalId: string) {
+function assertProviderWritesEnabled(target: ShopifyOrderManagementTarget) {
+  if (providerWriteBlocker(target)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Turn Provider writes On for this Shopify connection before saving changes',
+      409,
+    )
+  }
+}
+
+function assertLegacyRollingWriteAuthorized(accountGlobalId: string) {
   const runtime = shopifyOrderManagementRuntime()
-  if (
-    !runtime.available
-    || !shopifyOrderManagementAccountAllowed(accountGlobalId)
-  ) {
+  if (!runtime.available || !shopifyOrderManagementAccountAllowed(accountGlobalId)) {
     fail(
       runtime.blockerCode || 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED',
-      'Shopify test-order writes are not enabled for this development account',
+      'The rolling-deploy Shopify write lane is unavailable',
       503,
     )
   }
@@ -240,7 +293,11 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     orderCurrencyCode: 'XXX',
     currentTotalPrice: { amount: '0.00', currencyCode: 'XXX' },
     totalOutstanding: { amount: '0.00', currencyCode: 'XXX' },
+    email: null,
+    phone: null,
+    poNumber: null,
     note: null,
+    shippingAddress: null,
     tags: [],
     lines: [],
   }
@@ -306,6 +363,9 @@ function publicState(input: {
     'write_order_edits',
   )
   const addTagReason = baseReason || (!writeOrders
+    ? 'The Shopify connection is missing write_orders'
+    : null)
+  const ordinarySaveReason = baseReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
   const destructiveCurrent = exactCurrentSource(input.target)
@@ -375,6 +435,13 @@ function publicState(input: {
       financialStatus: input.preview.displayFinancialStatus,
       fulfillmentStatus: input.preview.displayFulfillmentStatus,
       merchantEditable: input.preview.merchantEditable,
+      email: input.preview.email,
+      phone: input.preview.phone,
+      poNumber: input.preview.poNumber,
+      note: input.preview.note,
+      shippingAddress: input.preview.shippingAddress
+        ? Object.freeze({ ...input.preview.shippingAddress })
+        : null,
       tags: Object.freeze([...input.preview.tags]),
       lines: Object.freeze(input.preview.lines.map((line) => Object.freeze({
         lineItemId: line.id,
@@ -389,6 +456,10 @@ function publicState(input: {
     }),
     eligibility: Object.freeze({
       addTag: Object.freeze({ allowed: addTagReason === null, reason: addTagReason }),
+      ordinarySave: Object.freeze({
+        allowed: ordinarySaveReason === null,
+        reason: ordinarySaveReason,
+      }),
       cancel: Object.freeze({
         allowed: cancellationReason === null,
         reason: cancellationReason,
@@ -439,15 +510,7 @@ export async function readShopifyOrderManagementState(input: {
   orderGlobalId: string
 }) {
   const target = await exactTarget(input)
-  const runtime = shopifyOrderManagementRuntime()
-  const accountAllowed = shopifyOrderManagementAccountAllowed(
-    target.accountGlobalId,
-  )
-  const blockerCode = !runtime.available
-    ? runtime.blockerCode
-    : !accountAllowed
-      ? 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED'
-      : targetBlocker(target)
+  const blockerCode = targetReadBlocker(target)
   if (blockerCode) {
     return publicState({
       target,
@@ -496,6 +559,40 @@ function assertPreparedMutation(input: {
     }
     return
   }
+  if (input.mutation.kind === 'save_order') {
+    if (!input.management.eligibility.ordinarySave.allowed) {
+      fail(
+        'SHOPIFY_ORDER_SAVE_NOT_ELIGIBLE',
+        input.management.eligibility.ordinarySave.reason
+          || 'Shopify order save is unavailable',
+      )
+    }
+    if (
+      input.mutation.tagAdds.some((tag) => input.preview.tags.includes(tag))
+      || input.mutation.tagRemoves.some((tag) => !input.preview.tags.includes(tag))
+    ) {
+      fail(
+        'SHOPIFY_ORDER_TAG_STALE',
+        'Shopify tags changed before this order save',
+      )
+    }
+    for (const lineMutation of input.mutation.lineQuantities) {
+      const eligibility = input.management.eligibility.lineEdits.find(
+        (line) => line.lineItemId === lineMutation.lineItemId,
+      )
+      if (
+        !eligibility?.allowed
+        || lineMutation.quantity < eligibility.minQuantity
+        || lineMutation.quantity > eligibility.maxQuantity
+      ) {
+        fail(
+          'SHOPIFY_ORDER_EDIT_NOT_ELIGIBLE',
+          eligibility?.reason || 'A Shopify line quantity is unavailable',
+        )
+      }
+    }
+    return
+  }
   const lineMutation = input.mutation
   const eligibility = input.management.eligibility.lineEdits.find(
     (line) => line.lineItemId === lineMutation.lineItemId,
@@ -528,12 +625,19 @@ export async function prepareShopifyOrderManagementCommand(input: {
       'The ClawPilot order changed before this action was prepared',
     )
   }
-  assertRuntimeWriteAuthorized(target.accountGlobalId)
+  assertProviderWritesEnabled(target)
   const action = providerAction(input.mutation, input.reason)
   const live = await inspect({
     organizationId: input.organizationId,
     target,
-    requiredActions: [action.type],
+    requiredActions: action.type === 'save_order'
+      ? [
+          'save_order',
+          ...(action.lineQuantities.length > 0
+            ? ['set_line_quantity' as const]
+            : []),
+        ]
+      : [action.type],
   })
   const management = publicState({
     target,
@@ -554,6 +658,12 @@ export async function prepareShopifyOrderManagementCommand(input: {
       (line) => line.id === lineItemId,
     )?.currentQuantity
   }
+  const requestedProjectionHash = action.type === 'save_order'
+    ? requestedShopifyOrderSaveProjectionHash(
+        live.inspected.preview,
+        action,
+      )
+    : undefined
   const authorization = await prepareShopifyOrderManagementInPostgres({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,
@@ -565,6 +675,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
     providerOrderObservedAt: live.observedAt,
     providerOrderTest: live.inspected.preview.test,
     expectedLineQuantity,
+    requestedProjectionHash,
     action,
     reason: input.reason,
     idempotencyKey: input.idempotencyKey,
@@ -591,6 +702,38 @@ export async function prepareShopifyOrderManagementCommand(input: {
   })
 }
 
+function automaticSaveReason(mutation: ShopifyOrderManagementMutation) {
+  if (mutation.kind === 'add_tag') return 'Saved Shopify order tag in ClawPilot'
+  if (mutation.kind === 'cancel') return 'Saved Shopify order cancellation in ClawPilot'
+  if (mutation.kind === 'save_order') return 'Saved Shopify order changes in ClawPilot'
+  return 'Saved Shopify order line quantity in ClawPilot'
+}
+
+export async function saveShopifyOrderManagementCommand(input: {
+  organizationId: string
+  actorEmail: string
+  orderGlobalId: string
+  expectedRowVersion: number
+  mutation: ShopifyOrderManagementMutation
+  idempotencyKey: string
+}) {
+  const reason = automaticSaveReason(input.mutation)
+  const prepared = await prepareShopifyOrderManagementCommand({
+    ...input,
+    reason,
+  })
+  return executeShopifyOrderManagementCommand({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    authorizationGlobalId: prepared.authorizationGlobalId,
+    intentHash: prepared.intentHash,
+    confirmationStatement: prepared.confirmationStatement,
+    mutation: input.mutation,
+    reason,
+    idempotencyKey: input.idempotencyKey,
+  })
+}
+
 function actionMatchesMutation(
   authorization: ShopifyOrderManagementAuthorization,
   action: ShopifyOrderManagementAction,
@@ -608,6 +751,10 @@ function actionMatchesMutation(
         schema: 'shopify-order-management-staff-note-v1',
         staffNote: action.staffNote,
       })
+  }
+  if (action.type === 'save_order') {
+    return authorization.requestedProjectionHash !== null
+      && authorization.requestedProjectionHash.length === 64
   }
   return authorization.lineItemGid === action.lineItemGid
     && authorization.requestedQuantity === action.quantity
@@ -628,7 +775,6 @@ async function localResult(input: {
     organizationId: input.organizationId,
     orderGlobalId: input.authorization.orderGlobalId,
   })
-  const runtime = shopifyOrderManagementRuntime()
   return Object.freeze({
     authorizationGlobalId: input.authorization.authorizationGlobalId,
     attemptGlobalId: input.authorization.providerAttemptGlobalId || '',
@@ -641,8 +787,8 @@ async function localResult(input: {
       target,
       preview: placeholderPreview(target),
       grantedScopes: [],
-      runtimeAvailable: runtime.available,
-      blockerCode: runtime.available ? null : runtime.blockerCode,
+      runtimeAvailable: targetReadBlocker(target) === null,
+      blockerCode: targetBlocker(target),
       authorization: input.authorization,
     }),
   })
@@ -727,11 +873,6 @@ export async function executeShopifyOrderManagementCommand(input: {
       providerReads: 0,
     })
   }
-  // Preparation is intentionally short-lived, but runtime authority remains
-  // revocable. Re-check the development-only flag and exact account allowlist
-  // immediately before creating a durable provider attempt. A prepared row
-  // must never outlive an operator disabling this proving lane.
-  assertRuntimeWriteAuthorized(authorization.accountGlobalId)
   // Resolve and decrypt the exact current credential before committing the
   // provider-attempt row. Once claim succeeds, every adapter return is either
   // a retained terminal result or an explicitly unknown outcome.
@@ -739,14 +880,20 @@ export async function executeShopifyOrderManagementCommand(input: {
     organizationId: input.organizationId,
     orderGlobalId: authorization.orderGlobalId,
   })
+  const legacyRollingAuthorization =
+    authorization.providerWriteControlRowVersion === null
+    && authorization.providerWriteScopeDigest === null
+    && authorization.legacyActivationState !== null
+    && authorization.legacyActivationRevision !== null
+  if (legacyRollingAuthorization) {
+    assertLegacyRollingWriteAuthorized(authorization.accountGlobalId)
+  } else {
+    assertProviderWritesEnabled(target)
+  }
   const credential = await credentialFor({
     organizationId: input.organizationId,
     target,
   })
-  // Keep revocation effective across the credential-resolution window. A
-  // disabled flag or removed exact-account allowlist entry must win before the
-  // transaction creates its immutable provider-attempt row.
-  assertRuntimeWriteAuthorized(authorization.accountGlobalId)
   const claimed = await claimShopifyOrderManagementInPostgres({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,
@@ -925,6 +1072,13 @@ export async function reconcileShopifyOrderManagementCommand(input: {
       }) === authorization.tagHash
     ))
     if (present) resolution = 'applied'
+  } else if (
+    authorization.action === 'save_order'
+    && authorization.requestedProjectionHash
+    && shopifyOrderManagementProjectionHash(live.inspected.preview)
+      === authorization.requestedProjectionHash
+  ) {
+    resolution = 'applied'
   } else if (authorization.action === 'cancel') {
     if (live.inspected.preview.cancelledAt) resolution = 'applied'
   } else if (
@@ -970,6 +1124,10 @@ export async function reconcileShopifyOrderManagementCommand(input: {
       providerOrderUpdatedAt: live.inspected.preview.updatedAt,
       cancelledAt: live.inspected.preview.cancelledAt,
       requestedQuantity: authorization.requestedQuantity,
+      requestedProjectionHash: authorization.requestedProjectionHash,
+      observedProjectionHash: authorization.action === 'save_order'
+        ? shopifyOrderManagementProjectionHash(live.inspected.preview)
+        : null,
       observedQuantity: authorization.lineItemGid
         ? live.inspected.preview.lines.find(
             (line) => line.id === authorization.lineItemGid,

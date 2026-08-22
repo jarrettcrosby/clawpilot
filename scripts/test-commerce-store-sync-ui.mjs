@@ -24,15 +24,16 @@ const section = (source, start, end) => {
 assert.ok(
   operations.indexOf('data-testid="commerce-store-sync-summary"')
     < operations.indexOf('data-testid="operations-advanced-safety"'),
-  'Desired/Effective Store sync must precede the advanced legacy safety mode',
+  'Store sync must remain separate from the retained legacy activation code',
 )
 assert.match(
   operations,
-  /Advanced safety · legacy execution profile/u,
+  /const LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE = false/u,
 )
 assert.match(
   operations,
-  /Shadow, Read only,[\s\S]*Active no longer determine Store sync/u,
+  /LEGACY_COMMERCE_ACTIVATION_UI_VISIBLE[\s\S]{0,180}data-testid="operations-advanced-safety"/u,
+  'The migration-era global activation profile must not appear in daily Orders UX',
 )
 assert.match(
   operations,

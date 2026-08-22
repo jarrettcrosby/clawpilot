@@ -883,6 +883,11 @@ const getResponse = await route.GET(new Request(
 ))
 assert.equal(getResponse.status, 200)
 const getSerialized = await getResponse.text()
+assert.equal(
+  JSON.parse(getSerialized).canActivate,
+  true,
+  'Transport GET must tell the UI whether activation is permitted before rendering the action',
+)
 assertSerializedStateIsSanitized(
   getSerialized,
   'Route read response',

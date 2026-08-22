@@ -60,8 +60,6 @@ class MockRateClientError extends Error {
 }
 
 let trustedRuntime = true
-let activationState = 'shadow'
-let activationReads = 0
 let productionRateExecutions = 0
 const persistedRateEvidence = []
 
@@ -162,12 +160,6 @@ const diagnosticModule = loadTypeScriptModule(
     '@/lib/persistence/operations': {
       OperationsRequestError: MockOperationsRequestError,
     },
-    '@/lib/persistence/postgres': {
-      async query() {
-        activationReads += 1
-        return { rows: [{ state: activationState }] }
-      },
-    },
   },
 )
 
@@ -205,11 +197,6 @@ assert.equal(result.carrierAccountGlobalId, runtime.carrierAccountGlobalId)
 assert.equal(result.evidenceGlobalId, 'grq0000286')
 assert.equal(result.rates[0].amount, '12.34')
 assert.equal(productionRateExecutions, 1)
-assert.equal(
-  activationReads,
-  0,
-  'LIVE read-only rating must not require Operations Active',
-)
 assert.equal(persistedRateEvidence[0].purpose, 'shipping_account_diagnostic')
 assert.equal(
   persistedRateEvidence[0].carrierAccountGlobalId,
@@ -226,18 +213,6 @@ assert.equal(
   productionRateExecutions,
   1,
   'Untrusted runtimes must fail before the mocked provider rate adapter',
-)
-
-activationState = 'shadow'
-await assert.rejects(
-  diagnosticModule.requireProductionShippingDiagnosticActive(
-    runtime.organizationId,
-  ),
-  (error) => error.code === 'CARRIER_PRODUCTION_LABEL_NOT_READY',
-)
-activationState = 'active'
-await diagnosticModule.requireProductionShippingDiagnosticActive(
-  runtime.organizationId,
 )
 
 const migration = read(
@@ -263,8 +238,9 @@ const actions = read(
 for (const fragment of [
   'BUY REAL POSTAGE',
   'assertFreshProductionRate',
-  'requireProductionShippingDiagnosticActive',
   'resolveCarrierProductionShippingRuntime',
+  'productionLivePostageAuthorized',
+  'Live-postage permission is required to buy REAL POSTAGE',
   'prepareCarrierRateTestLabelCreateInPostgres',
   'executeCarrierOneOffGroupShipment',
   "state: 'unknown'",
@@ -292,11 +268,22 @@ for (const fragment of [
   'destinationResidential',
   'diagnosticParcelInput',
   'productionAuthorizedByOwnerAdmin: canRevealCredential(actor)',
+  'productionLivePostageAuthorized:',
+  'shippingCapabilities(actor).canPurchaseLivePostage',
   "plainText(body.operatorConfirmation, 'REAL POSTAGE confirmation'",
   'requireExecutor(actor)',
 ]) {
   assert.ok(route.includes(fragment), `Carrier route missing ${fragment}`)
 }
+assert.ok(
+  !read('app_src/lib/integrations/carrierShippingDiagnosticRate.ts')
+    .includes('operations_activation_scopes'),
+  'LIVE read-only rating must not require the global Operations activation profile',
+)
+assert.ok(
+  !actions.includes('requireProductionShippingDiagnosticActive'),
+  'LIVE label purchase must use exact carrier authority instead of global Operations Active',
+)
 
 const panel = read('app_src/components/settings/CarrierIntegrationPanel.tsx')
 for (const fragment of [
@@ -309,6 +296,7 @@ for (const fragment of [
   'Print stored {environment === \'production\' ? \'LIVE label\' : \'test label\'}',
   'Void exact LIVE production label now',
   'label.carrierAccountGlobalId',
+  'canPurchaseLivePostage',
 ]) {
   assert.ok(panel.includes(fragment), `Carrier diagnostic UI missing ${fragment}`)
 }

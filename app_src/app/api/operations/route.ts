@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -21,6 +22,12 @@ import {
   CommerceStoreSyncPersistenceError,
   updateCommerceStoreSyncControlInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
+import {
+  CommerceOrderWorkbenchError,
+} from '@/lib/persistence/commerceOrderWorkbench'
+import {
+  OperationsOrderShipmentAddressError,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
@@ -135,10 +142,8 @@ const ORDER_STATUSES = new Set<OperationsOrderStatus>([
 const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
   'open', 'acknowledged', 'resolved', 'dismissed',
 ])
-// Canonical fulfillment commands are never an execution path for a connected
-// Shopify/Faire order while Operations is in Shadow. Provider reconciliation
-// actions are intentionally absent: the canonical order must keep mirroring
-// provider state while an exact-order training overlay progresses separately.
+// Canonical commands remain isolated only from an exact open training overlay.
+// The legacy workspace activation profile is not local-work authority.
 const SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS = new Set([
   'plan-order',
   'release-order',
@@ -1008,6 +1013,12 @@ function errorResponse(error: unknown) {
   if (error instanceof CommerceStoreSyncPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof CommerceOrderWorkbenchError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof OperationsOrderShipmentAddressError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (error instanceof OperationsShadowTrainingError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
@@ -1090,6 +1101,8 @@ export async function GET(req: NextRequest) {
       organizationId: activeOperationsOrganizationId(actor),
       actorEmail: actor.email,
       capabilities,
+      canPurchaseLivePostage:
+        shippingCapabilities(actor).canPurchaseLivePostage,
       search,
       status: statusValue || null,
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
@@ -2057,11 +2070,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'prepare-active-fulfillment-execution') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
-          error: 'You do not have permission to prepare Active fulfillment execution',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          error: 'You do not have permission to prepare production carrier execution',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -2110,11 +2126,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'execute-production-rerate') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to execute production carrier rating',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -2209,11 +2228,14 @@ export async function POST(req: NextRequest) {
       return json({ ok: true, capabilities, result }, 201)
     }
     if (action === 'select-production-rerate-offer') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to select a production carrier service',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -2362,7 +2384,8 @@ export async function POST(req: NextRequest) {
               'Customer notification exception reason',
               500,
             ),
-        canActivate: capabilities.canActivate,
+        canPurchaseLivePostage:
+          shippingCapabilities(actor).canPurchaseLivePostage,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })

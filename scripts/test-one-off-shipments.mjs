@@ -348,12 +348,12 @@ directRecipientAdHoc.receivingLocationGlobalId = null
 directRecipientAdHoc.lines = [{
   kind: 'ad_hoc',
   lineKey: 'line-adhoc-1',
-  name: 'One-time display sample',
+  name: 'Documents / paperwork',
   sku: null,
   quantity: 1,
-  unitPriceMinor: 2500,
-  unitWeightGrams: 450,
-  unitDimensionsMm: { length: 220, width: 140, height: 80 },
+  unitPriceMinor: 0,
+  unitWeightGrams: null,
+  unitDimensionsMm: null,
 }]
 directRecipientAdHoc.packages[0].allocations = [{
   lineKey: 'line-adhoc-1',
@@ -364,6 +364,42 @@ assert.equal(normalizedAdHoc.customerGlobalId, null)
 assert.equal(normalizedAdHoc.inventoryPoolGlobalId, null)
 assert.equal(normalizedAdHoc.receivingLocationGlobalId, null)
 assert.equal(normalizedAdHoc.lines[0].kind, 'ad_hoc')
+assert.equal(normalizedAdHoc.lines[0].unitWeightGrams, null)
+assert.equal(normalizedAdHoc.lines[0].unitDimensionsMm, null)
+
+const measuredAdHoc = structuredClone(directRecipientAdHoc)
+measuredAdHoc.lines[0].unitWeightGrams = 450
+measuredAdHoc.lines[0].unitDimensionsMm = { length: 220, width: 140, height: 80 }
+assert.equal(
+  validateOneOffShipmentQuoteInput(measuredAdHoc).lines[0].unitWeightGrams,
+  450,
+  'Existing factual ad-hoc unit measurements remain supported',
+)
+
+const partialAdHocMeasurements = structuredClone(directRecipientAdHoc)
+partialAdHocMeasurements.lines[0].unitWeightGrams = 450
+assert.throws(
+  () => validateOneOffShipmentQuoteInput(partialAdHocMeasurements),
+  (error) => error instanceof OneOffShipmentPersistenceError
+    && error.code === 'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+  'Ad-hoc unit facts must be wholly present or wholly omitted',
+)
+
+const mixedMissingMeasurements = validQuote()
+mixedMissingMeasurements.lines.push({
+  ...structuredClone(directRecipientAdHoc.lines[0]),
+  lineKey: 'line-adhoc-mixed',
+})
+mixedMissingMeasurements.packages[0].allocations.push({
+  lineKey: 'line-adhoc-mixed',
+  quantity: 1,
+})
+assert.throws(
+  () => validateOneOffShipmentQuoteInput(mixedMissingMeasurements),
+  (error) => error instanceof OneOffShipmentPersistenceError
+    && error.code === 'OPERATIONS_ONE_OFF_AD_HOC_PHYSICAL_FACTS_REQUIRED',
+  'Only pure productless shipments may rely solely on parcel physical facts',
+)
 
 assert.equal(
   nextOneOffWwexShipmentDateTime(new Date('2026-08-14T23:59:59.000Z')),

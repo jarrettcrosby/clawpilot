@@ -67,30 +67,40 @@ for (const fragment of [
   'No new carrier request, commerce-provider',
   'This evidence is reused exactly as sealed',
   'store writes',
-  "order.sourceProvider === 'shopify' && activationState !== 'shadow'",
+  'const primaryAction = canPlanImportedOrder',
 ]) {
   assert.ok(operations.includes(fragment), `Operations training integration is missing ${fragment}`)
 }
+assert.doesNotMatch(
+  operations,
+  /order\.sourceProvider === 'shopify' && activationState !== 'shadow'/,
+  'global Operations Shadow must not hide the per-account Shopify editor',
+)
 assert.match(
   operations,
   /const assignmentRequest = order\.sourceProvider === 'shopify'\s*&& !localTraining\s*\? fetch/,
   'local training must not depend on a live Shopify planning-assignment read',
 )
 
-const mirrorOnlyStart = operations.indexOf('const shadowProviderOrder')
+const mirrorOnlyStart = operations.indexOf('const primaryAction')
 const primaryActionEnd = operations.indexOf(
   "const confirmingPicks = primaryAction?.action",
   mirrorOnlyStart,
 )
 const mirrorOnlyPrimaryAction = operations.slice(mirrorOnlyStart, primaryActionEnd)
+assert.equal(
+  operations.includes('const shadowProviderOrder'),
+  false,
+  'the legacy Shadow profile must not hide ordinary local order actions',
+)
 assert.ok(
   mirrorOnlyPrimaryAction.includes('reconcileExternalFulfillmentAction'),
-  'provider reconciliation must remain visible in Shadow',
+  'provider reconciliation must remain visible independent of profile',
 )
 assert.match(
   mirrorOnlyPrimaryAction,
-  /: shadowProviderOrder[\s\S]*\? reconcileExternalFulfillmentAction[\s\S]*: undefined[\s\S]*: order\?\.status === 'released'/,
-  'provider-mirrored Shadow orders must stop at reconciliation before canonical actions',
+  /: order\?\.status === 'released'[\s\S]*\? reconcileExternalFulfillmentAction[\s\S]*: confirmPicksAction/,
+  'ordinary released work must remain actionable in every profile',
 )
 
 console.log('Shadow exact-order training UI contract passed.')

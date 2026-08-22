@@ -678,21 +678,6 @@ export async function createCartonizationPreview(input: {
     ))
   }
   if (
-    !snapshot.account.activationState
-    || !['shadow', 'read_only', 'active'].includes(
-      snapshot.account.activationState,
-    )
-  ) {
-    blockers.push(blocker(
-      'CARTONIZATION_OPERATIONS_ACTIVATION_REQUIRED',
-      'Operations is not available for this preview',
-      'The active organization is not in a readable Operations state.',
-      'Initialize Operations in Shadow or Read-only mode and reload the order.',
-      'account',
-      snapshot.account.globalId,
-    ))
-  }
-  if (
     !['held', 'resolving', 'ready'].includes(
       snapshot.candidate.workflowState,
     )

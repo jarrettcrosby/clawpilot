@@ -743,6 +743,28 @@ async function auditCommerce(
   }, client)
 }
 
+function commerceProviderWritesAccountLockKey(input: {
+  organizationId: string
+  accountGlobalId: string
+}) {
+  return `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`
+}
+
+async function fenceExpiredCommerceFulfillmentLeasesWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    accountGlobalId: string
+  },
+) {
+  await client.query(
+    `SELECT public.fence_operations_commerce_fulfillment_expired_leases(
+       $1::uuid, $2
+     )`,
+    [input.organizationId, input.accountGlobalId],
+  )
+}
+
 export async function createFaireOAuthInstallationInPostgres(input: {
   organizationId: string
   browserSessionId: string
@@ -990,6 +1012,31 @@ export async function writeCommerceCredentialInPostgres(input: {
       client,
       `commerce-credential:${input.organizationId}:${input.provider}:${input.environment}:${input.externalAccountId}`,
     )
+    const existingIdentity = await client.query<{
+      global_id: string
+    }>(
+      `SELECT global_id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND integration_type = 'commerce'
+         AND provider = $2
+         AND environment = $3
+       LIMIT 1`,
+      [input.organizationId, input.provider, input.environment],
+    )
+    if (existingIdentity.rows[0]) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        commerceProviderWritesAccountLockKey({
+          organizationId: input.organizationId,
+          accountGlobalId: existingIdentity.rows[0].global_id,
+        }),
+      )
+      await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+        organizationId: input.organizationId,
+        accountGlobalId: existingIdentity.rows[0].global_id,
+      })
+    }
     const existingAccount = await client.query<{
       id: string
       global_id: string
@@ -1308,6 +1355,17 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
   await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
+      commerceProviderWritesAccountLockKey({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+      }),
+    )
+    await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
+    await acquireTransactionAdvisoryLock(
+      client,
       commerceOrderSyncAccountLockKey({
         organizationId: input.organizationId,
         accountGlobalId: input.accountGlobalId,
@@ -1560,6 +1618,17 @@ export async function disconnectCommerceCredentialInPostgres(input: {
   actorEmail: string
 }) {
   await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      commerceProviderWritesAccountLockKey({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+      }),
+    )
+    await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
     const account = await client.query<{
       id: string
       global_id: string
@@ -2499,8 +2568,6 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = account.organization_id
      WHERE receipt.provider = 'shopify'
        AND receipt.topic = 'products/delete'
        AND receipt.state = 'held'

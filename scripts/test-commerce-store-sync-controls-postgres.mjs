@@ -2162,6 +2162,56 @@ async function verify(databaseUrl, fixtures) {
       control_guard: true,
       receipt_guard: true,
     })
+
+    const post0314Client = await pool.connect()
+    try {
+      await applyMigration(
+        post0314Client,
+        '0314_operations_local_work_independent_activation.sql',
+      )
+    } finally {
+      post0314Client.release()
+    }
+    let post0314ManualProviderCalls = 0
+    let post0314AutomaticProviderCalls = 0
+    for (const activationState of ['disabled', 'frozen']) {
+      const account = fixtures.find((value) => value.state === activationState)
+      assert.ok(account)
+      await assert.rejects(
+        persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+          organizationId: account.organizationId,
+          integrationAccountId: account.accountId,
+          authorityKind: 'automatic',
+          readKind: 'order_history',
+          intentKey: `acceptance:${activationState}:post-0314-automatic:1`,
+          acquiredBy: actorEmail,
+          async read() {
+            post0314AutomaticProviderCalls += 1
+            return 'must-not-run'
+          },
+        }),
+        (error) => (
+          error?.code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+        ),
+      )
+      assert.equal(
+        await persistence.withCommerceStoreSyncProviderReadFenceInPostgres({
+          organizationId: account.organizationId,
+          integrationAccountId: account.accountId,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_revision',
+          intentKey: `acceptance:${activationState}:post-0314-manual-refresh:1`,
+          acquiredBy: actorEmail,
+          async read() {
+            post0314ManualProviderCalls += 1
+            return `manual-read-completed-after-0314:${activationState}`
+          },
+        }),
+        `manual-read-completed-after-0314:${activationState}`,
+      )
+    }
+    assert.equal(post0314AutomaticProviderCalls, 0)
+    assert.equal(post0314ManualProviderCalls, 2)
   } finally {
     await pool.end()
   }
@@ -2175,6 +2225,20 @@ async function main() {
   const migrationSha256 = createHash('sha256')
     .update(migrationSource)
     .digest('hex')
+  const storeSyncPersistenceSource = readFileSync(
+    resolve(root, 'app_src/lib/persistence/commerceStoreSync.ts'),
+    'utf8',
+  )
+  assert.match(
+    storeSyncPersistenceSource,
+    /AND operations_commerce_provider_read_authority_is_current\(\s*account\.organization_id,\s*account\.id,\s*\$3\s*\)\s*LIMIT 1\s*FOR SHARE OF account, control, activation/u,
+    'Provider-read preflight must use the same exact authority as its insert trigger',
+  )
+  assert.doesNotMatch(
+    storeSyncPersistenceSource,
+    /\$3 = 'manual_read_only'\s*OR operations_commerce_store_sync_is_running/u,
+    'Provider-read preflight must not bypass exact manual-read authority',
+  )
   const storeSyncHealthSource = readFileSync(
     resolve(root, 'app_src/lib/persistence/commerceStoreSyncHealth.ts'),
     'utf8',

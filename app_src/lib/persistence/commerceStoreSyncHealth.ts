@@ -14,7 +14,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
       VALUES
         (
           'public.operations_commerce_store_sync_effective_reason(uuid,uuid)',
-          '74bebc0fb36d86c9970249a91cef314962596faf7e17ad6d426680bc6cc7c593',
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0314_operations_local_work_independent_activation.sql'
+              AND checksum =
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+          ) THEN
+            'e3464f9506ab744c174b026ad6d525c711b2f3f5153c42246f112a003174b1c3'
+          ELSE
+            '74bebc0fb36d86c9970249a91cef314962596faf7e17ad6d426680bc6cc7c593'
+          END,
           'sql', 's', 'text'
         ),
         (
@@ -24,7 +34,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
         ),
         (
           'public.seed_operations_commerce_store_sync_control()',
-          '82527578c401058683ed859165997af9a89ed5cee2162d09b808b485267912e1',
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0314_operations_local_work_independent_activation.sql'
+              AND checksum =
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+          ) THEN
+            '0c8f917c0f8f477eb06e8fc4978e5e74cb85a9a6741c1bbc660a03b96e012d5f'
+          ELSE
+            '82527578c401058683ed859165997af9a89ed5cee2162d09b808b485267912e1'
+          END,
           'plpgsql', 'v', 'trigger'
         ),
         (
@@ -44,7 +64,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
         ),
         (
           'public.operations_commerce_provider_read_authority_is_current(uuid,uuid,text)',
-          '4f0f62a1eef912a6a648c6df67e9e1998b5f01247df9b46d006d120ac0e2abd4',
+          CASE WHEN EXISTS (
+            SELECT 1 FROM public.schema_migrations
+            WHERE filename =
+              '0314_operations_local_work_independent_activation.sql'
+              AND checksum =
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+          ) THEN
+            '0b035f56b1645b1c29ebc3fe0f5db2accf017aa742f91d5582c5ef4df9697c33'
+          ELSE
+            '4f0f62a1eef912a6a648c6df67e9e1998b5f01247df9b46d006d120ac0e2abd4'
+          END,
           'sql', 's', 'boolean'
         ),
         (
@@ -175,7 +205,17 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
         ),
         'hex'
       ) OPERATOR(pg_catalog.=)
-        'bb66159fdec700a84c7dccd76088b9052f107f78cf604bb43dbd95163513e2b6'
+        CASE WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0314_operations_local_work_independent_activation.sql'
+            AND checksum =
+              '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+        ) THEN
+          '1d86f5c2c2693c949e6de870e0e1f93af2dc5c5b8aa306349c11291e82d6e78f'
+        ELSE
+          'bb66159fdec700a84c7dccd76088b9052f107f78cf604bb43dbd95163513e2b6'
+        END
     FROM required_function
     LEFT JOIN pg_catalog.pg_proc installed_function
       ON installed_function.oid OPERATOR(pg_catalog.=)

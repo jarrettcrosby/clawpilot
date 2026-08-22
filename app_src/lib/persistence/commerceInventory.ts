@@ -84,24 +84,19 @@ async function lockShopifyInventoryProviderReadAuthority(
 ) {
   const result = await client.query<{
     effective_reason: string
-    activation_state: string
   }>(
     `SELECT operations_commerce_store_sync_effective_reason(
        account.organization_id,
        account.id
-     ) AS effective_reason,
-       activation.state AS activation_state
+     ) AS effective_reason
      FROM operations_integration_accounts account
      JOIN operations_commerce_store_sync_controls control
        ON control.organization_id = account.organization_id
       AND control.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = account.organization_id
      WHERE account.organization_id = $1::uuid
        AND account.id = $2::uuid
        AND account.integration_type = 'commerce'
        AND account.provider = 'shopify'
-       AND activation.state NOT IN ('disabled', 'frozen')
        AND (
          $3 = 'manual_read_only'
          OR operations_commerce_store_sync_is_running(
@@ -110,7 +105,7 @@ async function lockShopifyInventoryProviderReadAuthority(
          )
        )
      LIMIT 1
-     FOR UPDATE OF account, control, activation`,
+     FOR UPDATE OF account, control`,
     [runtime.organizationId, runtime.integrationAccountId, authority],
   )
   if (!result.rows[0]) {
@@ -1479,13 +1474,10 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
          JOIN operations_commerce_store_sync_controls control
            ON control.organization_id = account.organization_id
           AND control.integration_account_id = account.id
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = account.organization_id
          WHERE account.organization_id =
                  operations_commerce_provider_attempts.organization_id
            AND account.id =
                  operations_commerce_provider_attempts.integration_account_id
-           AND activation.state NOT IN ('disabled', 'frozen')
            AND (
              $6 = 'manual_read_only'
              OR operations_commerce_store_sync_is_running(

@@ -76,8 +76,8 @@ async function applyMigration(client, filename) {
   }
 }
 
-function loadTypeScriptModule(path, mocks = {}) {
-  const source = readFileSync(resolve(root, path), 'utf8')
+function loadTypeScriptModule(path, mocks = {}, sourceOverride = null) {
+  const source = sourceOverride ?? readFileSync(resolve(root, path), 'utf8')
   const output = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
@@ -185,18 +185,22 @@ async function seed(pool) {
     `shopify-order-execute-${randomUUID()}@example.test`
   const qualifiedAdminEmail =
     `shopify-order-qualified-${randomUUID()}@example.test`
+  const legacyMemberEmail =
+    `shopify-order-legacy-member-${randomUUID()}@example.test`
   await pool.query(
     `INSERT INTO app_users (email, role, status)
      VALUES
        ($1, 'owner', 'active'),
        ($2, 'admin', 'active'),
        ($3, 'admin', 'active'),
-       ($4, 'admin', 'active')`,
+       ($4, 'admin', 'active'),
+       ($5, 'member', 'active')`,
     [
       ownerEmail,
       manageOnlyAdminEmail,
       executeOnlyAdminEmail,
       qualifiedAdminEmail,
+      legacyMemberEmail,
     ],
   )
   const organization = await pool.query(
@@ -216,6 +220,17 @@ async function seed(pool) {
        'active', true, $1, $1
      )`,
     [ownerEmail, organizationId],
+  )
+  await pool.query(
+    `INSERT INTO app_user_organization_memberships (
+       user_email, organization_id, role, permissions, status, is_default,
+       created_by, updated_by
+     ) VALUES (
+       $1, $2::uuid, 'member',
+       '{"manageOperations":true,"executeWarehouse":true}'::jsonb,
+       'active', false, $3, $3
+     )`,
+    [legacyMemberEmail, organizationId, ownerEmail],
   )
   await pool.query(
     `INSERT INTO app_user_organization_memberships (
@@ -270,7 +285,11 @@ async function seed(pool) {
      ) VALUES (
        $1::uuid, 'shopify', 'commerce', 'sandbox',
        'AG Alchemy Shopify acceptance', 'active',
-       '{"shopDomain":"ag-alchemy-order-management.myshopify.com"}'::jsonb,
+       '{
+         "shopDomain":"ag-alchemy-order-management.myshopify.com",
+         "authMode":"shopify_client_credentials",
+         "grantedScopes":["read_orders","write_order_edits","write_orders"]
+       }'::jsonb,
        'gid://shopify/Shop/6600001', 1, $2, $2
      ) RETURNING id::text, global_id`,
     [organizationId, ownerEmail],
@@ -291,6 +310,27 @@ async function seed(pool) {
        1, '0001', 'verified', now(), 'unverified', $3, $3
      )`,
     [organizationId, accountId, ownerEmail],
+  )
+  await pool.query(
+    `INSERT INTO operations_commerce_provider_write_controls (
+       organization_id, integration_account_id, provider, row_version,
+       expected_row_version, requested_mode, bound_credential_generation,
+       bound_granted_scopes, bound_granted_scope_digest, changed_by,
+       changed_role, idempotency_key, request_hash
+     ) VALUES (
+       $1::uuid, $2::uuid, 'shopify', 1, 0, 'on', 1,
+       ARRAY['read_orders','write_order_edits','write_orders']::text[],
+       operations_commerce_granted_scope_digest(
+         ARRAY['read_orders','write_order_edits','write_orders']::text[]
+       ),
+       $3, 'owner', $4, repeat('9', 64)
+     )`,
+    [
+      organizationId,
+      accountId,
+      ownerEmail,
+      `shopify-order-provider-writes-${randomUUID()}`,
+    ],
   )
   const customer = await pool.query(
     `INSERT INTO crm_organizations (
@@ -453,6 +493,7 @@ async function seed(pool) {
     manageOnlyAdminEmail,
     executeOnlyAdminEmail,
     qualifiedAdminEmail,
+    legacyMemberEmail,
     organizationId,
     pipelineId,
     customerId,
@@ -478,6 +519,41 @@ function snapshot(test, providerOrderUpdatedAt = null) {
   }
 }
 
+async function appendProviderWriteControl(pool, fixture, rowVersion, mode) {
+  await pool.query(
+    `INSERT INTO operations_commerce_provider_write_controls (
+       organization_id, integration_account_id, provider, row_version,
+       expected_row_version, requested_mode, bound_credential_generation,
+       bound_granted_scopes, bound_granted_scope_digest, changed_by,
+       changed_role, idempotency_key, request_hash
+     )
+     SELECT
+       account.organization_id, account.id, 'shopify', $3::bigint,
+       $3::bigint - 1, $4,
+       CASE WHEN $4 = 'on' THEN account.commerce_credential_generation END,
+       CASE WHEN $4 = 'on' THEN
+         operations_commerce_granted_scope_snapshot(account.configuration)
+       END,
+       CASE WHEN $4 = 'on' THEN
+         operations_commerce_granted_scope_digest(
+           operations_commerce_granted_scope_snapshot(account.configuration)
+         )
+       END,
+       $5, 'owner', $6, encode(digest(convert_to($6, 'UTF8'), 'sha256'), 'hex')
+     FROM operations_integration_accounts account
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid`,
+    [
+      fixture.organizationId,
+      fixture.accountId,
+      rowVersion,
+      mode,
+      fixture.ownerEmail,
+      `shopify-order-provider-writes-${mode}-${rowVersion}-${randomUUID()}`,
+    ],
+  )
+}
+
 async function verify(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -489,6 +565,7 @@ async function verify(databaseUrl) {
   const transactionControl = { beforeCommit: null }
   try {
     const fixture = await seed(pool)
+    const independentFixture = await seed(pool)
     // This acceptance isolates the 0283 unresolved-attempt race. The 0290
     // Shadow canonical-plan fence has its own PostgreSQL acceptance suite.
     await pool.query(
@@ -507,37 +584,175 @@ async function verify(databaseUrl) {
       },
     )
 
+    // The new command lane is controlled only by the exact account revision.
+    // A disabled global Operations activation must not affect it, and one
+    // account being Off must not affect a different organization's account.
+    await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'disabled', revision = revision + 1,
+           reason = 'Provider writes owns Shopify order authority',
+           updated_by = $3, updated_at = clock_timestamp()
+       WHERE organization_id IN ($1::uuid, $2::uuid)`,
+      [
+        fixture.organizationId,
+        independentFixture.organizationId,
+        fixture.ownerEmail,
+      ],
+    )
+    await appendProviderWriteControl(pool, fixture, 2, 'off')
+    const offTarget = await persistence
+      .readShopifyOrderManagementTargetInPostgres({
+        organizationId: fixture.organizationId,
+        orderGlobalId: fixture.fulfilled.global_id,
+      })
+    const independentTarget = await persistence
+      .readShopifyOrderManagementTargetInPostgres({
+        organizationId: independentFixture.organizationId,
+        orderGlobalId: independentFixture.fulfilled.global_id,
+      })
+    assert.equal(offTarget.providerWriteRequestedMode, 'off')
+    assert.equal(offTarget.providerWriteBindingCurrent, false)
+    assert.equal(independentTarget.providerWriteRequestedMode, 'on')
+    assert.equal(independentTarget.providerWriteBindingCurrent, true)
+    const offAuthorizationCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_authorizations
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId],
+    )
+    await expectRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: { type: 'add_tag', tag: 'blocked-while-account-off' },
+        reason: 'Provider writes Off must reject before durable intent',
+        idempotencyKey: 'shopify-order-provider-writes-off',
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Provider writes Off must reject before authorization',
+    )
+    await expectRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(true),
+        action: {
+          type: 'save_order',
+          email: 'draft@example.com',
+          phone: null,
+          poNumber: null,
+          note: null,
+          shippingAddress: {
+            firstName: 'Private',
+            lastName: 'Draft',
+            company: null,
+            address1: '10 Provider Writes Off Way',
+            address2: null,
+            city: 'Raleigh',
+            provinceCode: 'NC',
+            countryCode: 'US',
+            zip: '27601',
+            phone: null,
+          },
+          tagAdds: [],
+          tagRemoves: [],
+          lineQuantities: [],
+        },
+        requestedProjectionHash: '6'.repeat(64),
+        reason: 'Provider writes Off must block combined order Save',
+        idempotencyKey: 'shopify-order-combined-save-off',
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Provider writes Off must reject combined Save before authorization',
+    )
+    const afterOffAuthorizationCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_authorizations
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId],
+    )
+    assert.equal(
+      afterOffAuthorizationCount.rows[0].count,
+      offAuthorizationCount.rows[0].count,
+    )
+
+    const independentAction = {
+      type: 'add_tag',
+      tag: 'independent-account-stays-on',
+    }
+    const independentReason =
+      'Prove another account remains writable while the first is Off'
+    const independentPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        accountGlobalId: independentFixture.accountGlobalId,
+        orderGlobalId: independentFixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(
+          independentFixture.fulfilled.row_version,
+        ),
+        expectedSourceHash: independentFixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: independentAction,
+        reason: independentReason,
+        idempotencyKey: 'shopify-order-independent-account-on',
+      })
+    assert.equal(independentPrepared.providerWriteControlRowVersion, 1)
+    assert.equal(independentPrepared.legacyActivationState, null)
+    const independentClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        authorizationGlobalId: independentPrepared.authorizationGlobalId,
+        action: independentAction,
+        reason: independentReason,
+      })
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: independentFixture.organizationId,
+      actorEmail: independentFixture.ownerEmail,
+      authorizationGlobalId: independentPrepared.authorizationGlobalId,
+      providerAttemptGlobalId: independentClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: { providerAlreadySatisfied: true },
+      providerWriteCount: 0,
+    })
+    await appendProviderWriteControl(pool, fixture, 3, 'on')
+
     const adminPermissionAction = {
       type: 'add_tag',
       tag: 'clawpilot-admin-permission-check',
     }
     const adminPermissionReason =
-      'Verify both admin operations and warehouse permissions are required'
-    for (const [actor, suffix] of [
-      [fixture.manageOnlyAdminEmail, 'manage-only'],
-      [fixture.executeOnlyAdminEmail, 'execute-only'],
-    ]) {
-      await expectRejected(
-        () => persistence.prepareShopifyOrderManagementInPostgres({
-          organizationId: fixture.organizationId,
-          actorEmail: actor,
-          accountGlobalId: fixture.accountGlobalId,
-          orderGlobalId: fixture.fulfilled.global_id,
-          expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
-          expectedSourceHash: fixture.fulfilledSourceHash,
-          ...snapshot(false),
-          action: adminPermissionAction,
-          reason: adminPermissionReason,
-          idempotencyKey: `shopify-order-admin-${suffix}`,
-        }),
-        'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
-        `${suffix} admin must not authorize Shopify order management`,
-      )
-    }
+      'Verify normal Shopify order work requires Operations management'
+    await expectRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.executeOnlyAdminEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: adminPermissionAction,
+        reason: adminPermissionReason,
+        idempotencyKey: 'shopify-order-admin-execute-only',
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
+      'execute-only admin must not authorize Shopify order management',
+    )
     const qualifiedAdminPrepared = await persistence
       .prepareShopifyOrderManagementInPostgres({
         organizationId: fixture.organizationId,
-        actorEmail: fixture.qualifiedAdminEmail,
+        actorEmail: fixture.manageOnlyAdminEmail,
         accountGlobalId: fixture.accountGlobalId,
         orderGlobalId: fixture.fulfilled.global_id,
         expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
@@ -551,7 +766,7 @@ async function verify(databaseUrl) {
     const qualifiedAdminClaimed = await persistence
       .claimShopifyOrderManagementInPostgres({
         organizationId: fixture.organizationId,
-        actorEmail: fixture.qualifiedAdminEmail,
+        actorEmail: fixture.manageOnlyAdminEmail,
         authorizationGlobalId: qualifiedAdminPrepared.authorizationGlobalId,
         action: adminPermissionAction,
         reason: adminPermissionReason,
@@ -561,13 +776,13 @@ async function verify(databaseUrl) {
       `UPDATE app_user_organization_memberships
        SET status = 'disabled', updated_at = clock_timestamp()
        WHERE organization_id = $1::uuid AND user_email = $2`,
-      [fixture.organizationId, fixture.qualifiedAdminEmail],
+      [fixture.organizationId, fixture.manageOnlyAdminEmail],
     )
     try {
       qualifiedAdminOutcome = await persistence
         .recordShopifyOrderManagementOutcomeInPostgres({
           organizationId: fixture.organizationId,
-          actorEmail: fixture.qualifiedAdminEmail,
+          actorEmail: fixture.manageOnlyAdminEmail,
           authorizationGlobalId: qualifiedAdminPrepared.authorizationGlobalId,
           providerAttemptGlobalId: qualifiedAdminClaimed.providerAttemptGlobalId,
           outcome: 'succeeded',
@@ -579,10 +794,200 @@ async function verify(databaseUrl) {
         `UPDATE app_user_organization_memberships
          SET status = 'active', updated_at = clock_timestamp()
          WHERE organization_id = $1::uuid AND user_email = $2`,
-        [fixture.organizationId, fixture.qualifiedAdminEmail],
+        [fixture.organizationId, fixture.manageOnlyAdminEmail],
       )
     }
     assert.equal(qualifiedAdminOutcome.status, 'succeeded')
+
+    const offAfterPrepareAction = {
+      type: 'add_tag',
+      tag: 'provider-writes-off-after-prepare',
+    }
+    const offAfterPrepareReason =
+      'Prove Off after prepare prevents a durable provider attempt'
+    const offAfterPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: offAfterPrepareAction,
+        reason: offAfterPrepareReason,
+        idempotencyKey: 'shopify-order-off-after-prepare',
+      })
+    await appendProviderWriteControl(pool, fixture, 4, 'off')
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        authorizationGlobalId: offAfterPrepared.authorizationGlobalId,
+        action: offAfterPrepareAction,
+        reason: offAfterPrepareReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+      'Off after prepare must block before the provider-attempt row',
+    )
+    const offAfterAttemptCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_attempts attempt
+       JOIN operations_shopify_order_management_authorizations authz
+         ON authz.organization_id = attempt.organization_id
+        AND authz.id = attempt.authorization_id
+       WHERE authz.organization_id = $1::uuid
+         AND authz.global_id = $2`,
+      [fixture.organizationId, offAfterPrepared.authorizationGlobalId],
+    )
+    assert.equal(offAfterAttemptCount.rows[0].count, 0)
+    await appendProviderWriteControl(pool, fixture, 5, 'on')
+
+    const scopeDriftAction = {
+      type: 'add_tag',
+      tag: 'provider-write-scope-drift',
+    }
+    const scopeDriftReason =
+      'Prove exact granted-scope drift blocks before provider attempt'
+    const scopeDriftPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: scopeDriftAction,
+        reason: scopeDriftReason,
+        idempotencyKey: 'shopify-order-scope-drift',
+      })
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+             configuration,
+             '{grantedScopes}',
+             '["read_products","write_products"]'::jsonb
+           ),
+           updated_at = clock_timestamp(), updated_by = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId, fixture.ownerEmail],
+    )
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        authorizationGlobalId: scopeDriftPrepared.authorizationGlobalId,
+        action: scopeDriftAction,
+        reason: scopeDriftReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+      'scope drift must block before provider attempt',
+    )
+    await appendProviderWriteControl(pool, fixture, 6, 'on')
+    const productOnlyAuthorizationCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_authorizations
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId],
+    )
+    await expectRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: { type: 'add_tag', tag: 'product-scope-is-not-order-scope' },
+        reason: 'write_products alone must not authorize an order command',
+        idempotencyKey: 'shopify-order-product-only-scope',
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'On without write_orders must reject before authorization',
+    )
+    const afterProductOnlyAuthorizationCount = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_authorizations
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId],
+    )
+    assert.equal(
+      afterProductOnlyAuthorizationCount.rows[0].count,
+      productOnlyAuthorizationCount.rows[0].count,
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+             configuration,
+             '{grantedScopes}',
+             '["read_orders","write_order_edits","write_orders"]'::jsonb
+           ),
+           updated_at = clock_timestamp(), updated_by = $3
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, fixture.accountId, fixture.ownerEmail],
+    )
+    await appendProviderWriteControl(pool, fixture, 7, 'on')
+
+    const credentialDriftAction = {
+      type: 'add_tag',
+      tag: 'provider-write-credential-drift',
+    }
+    const credentialDriftReason =
+      'Prove credential generation drift blocks before provider attempt'
+    const credentialDriftPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: credentialDriftAction,
+        reason: credentialDriftReason,
+        idempotencyKey: 'shopify-order-credential-drift',
+      })
+    const credentialDriftClient = await pool.connect()
+    await credentialDriftClient.query('BEGIN')
+    try {
+      await credentialDriftClient.query(
+        `UPDATE operations_commerce_credentials
+         SET credential_version = 2,
+             credential_ciphertext = decode('04', 'hex'),
+             credential_identifier_last_four = '0002',
+             updated_at = clock_timestamp(), updated_by = $3
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid`,
+        [fixture.organizationId, fixture.accountId, fixture.ownerEmail],
+      )
+      await credentialDriftClient.query(
+        `UPDATE operations_integration_accounts
+         SET commerce_credential_generation = 2,
+             updated_at = clock_timestamp(), updated_by = $3
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, fixture.accountId, fixture.ownerEmail],
+      )
+      await credentialDriftClient.query('COMMIT')
+    } catch (error) {
+      await credentialDriftClient.query('ROLLBACK')
+      throw error
+    } finally {
+      credentialDriftClient.release()
+    }
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        authorizationGlobalId: credentialDriftPrepared.authorizationGlobalId,
+        action: credentialDriftAction,
+        reason: credentialDriftReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+      'credential drift must block before provider attempt',
+    )
+    await appendProviderWriteControl(pool, fixture, 8, 'on')
 
     const tagAction = { type: 'add_tag', tag: 'clawpilot-test-6600' }
     const tagReason = 'Validate an additive marker on fulfilled order 6600'
@@ -603,6 +1008,10 @@ async function verify(databaseUrl) {
     assert.equal(preparedTag.providerOrderTest, false)
     assert.equal(preparedTag.action, 'add_tag')
     assert.equal(preparedTag.authorizationReason, tagReason)
+    assert.equal(preparedTag.legacyActivationState, null)
+    assert.equal(preparedTag.legacyActivationRevision, null)
+    assert.equal(preparedTag.providerWriteControlRowVersion, 8)
+    assert.match(preparedTag.providerWriteScopeDigest, /^[a-f0-9]{64}$/u)
     assert.ok(preparedTag.tagHash)
     assert.equal(JSON.stringify(preparedTag).includes(tagAction.tag), false)
     assert.equal(
@@ -768,6 +1177,7 @@ async function verify(databaseUrl) {
       'unknown must block another order write',
     )
 
+    await appendProviderWriteControl(pool, fixture, 9, 'off')
     const reconciled = await persistence
       .reconcileShopifyOrderManagementOutcomeInPostgres({
         organizationId: fixture.organizationId,
@@ -786,6 +1196,13 @@ async function verify(databaseUrl) {
       1,
       'reconciliation must preserve a known original provider write count',
     )
+    const offDuringReconciliation = await persistence
+      .readShopifyOrderManagementTargetInPostgres({
+        organizationId: fixture.organizationId,
+        orderGlobalId: fixture.fulfilled.global_id,
+      })
+    assert.equal(offDuringReconciliation.providerWriteRequestedMode, 'off')
+    await appendProviderWriteControl(pool, fixture, 10, 'on')
 
     const unknownCountAction = {
       type: 'add_tag',
@@ -1351,7 +1768,11 @@ async function verify(databaseUrl) {
     assert.equal(target.materialState, 'provider_fulfilled')
     assert.equal(target.latestSourceHash, 'c'.repeat(64))
     assert.equal(target.zeroDownstream, true)
-    assert.equal(target.latestOpenAuthorization, null)
+    assert.ok(
+      target.latestOpenAuthorization === null
+      || target.latestOpenAuthorization.status === 'prepared',
+      'stale prepared authorizations may remain visible but never become attempts',
+    )
 
     const quantityAction = {
       type: 'set_line_quantity',
@@ -1636,6 +2057,279 @@ async function verify(databaseUrl) {
       ),
       /outcomes are immutable/i,
       'provider outcome evidence must be immutable',
+    )
+
+    // 0308 is a predeploy migration, so the exact old 9d67 runtime must keep
+    // serving during a rolling release. Its owner/admin activation-bound
+    // prepare and claim shape remains accepted, while normal new commands use
+    // only Provider writes. The bridge is intentionally not available to a
+    // member even when that member has both legacy permission flags.
+    await appendProviderWriteControl(pool, fixture, 11, 'off')
+    await pool.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'shadow', revision = revision + 1,
+           reason = 'Exact 9d67 rolling-runtime compatibility proof',
+           updated_by = $2, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid`,
+      [fixture.organizationId, fixture.ownerEmail],
+    )
+    const legacyPersistence = loadTypeScriptModule(
+      'app_src/lib/persistence/shopifyOrderManagement.ts',
+      {
+        '@/lib/auditWriter': {
+          async recordAuditEvent(event) {
+            audits.push(event)
+          },
+        },
+        '@/lib/persistence/postgres': postgresAdapter(pool),
+      },
+      command('git', [
+        'show',
+        '9d67c8d097bcd475e0109c3169a61a0885fcf059:app_src/lib/persistence/shopifyOrderManagement.ts',
+      ]),
+    )
+    const legacyAction = {
+      type: 'add_tag',
+      tag: 'rolling-runtime-legacy-shape',
+    }
+    const legacyReason =
+      'Prove the exact old runtime can finish during migration overlap'
+    const legacyPrepared = await legacyPersistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        accountGlobalId: fixture.accountGlobalId,
+        orderGlobalId: fixture.fulfilled.global_id,
+        expectedOrderRowVersion: Number(fixture.fulfilled.row_version),
+        expectedSourceHash: fixture.fulfilledSourceHash,
+        ...snapshot(false),
+        action: legacyAction,
+        reason: legacyReason,
+        idempotencyKey: 'shopify-order-legacy-rolling-prepare',
+      })
+    const legacyClaimed = await legacyPersistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: fixture.organizationId,
+        actorEmail: fixture.ownerEmail,
+        authorizationGlobalId: legacyPrepared.authorizationGlobalId,
+        action: legacyAction,
+        reason: legacyReason,
+      })
+    await legacyPersistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.ownerEmail,
+      authorizationGlobalId: legacyPrepared.authorizationGlobalId,
+      providerAttemptGlobalId: legacyClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: { providerAlreadySatisfied: true },
+      providerWriteCount: 0,
+    })
+    const legacyShape = await pool.query(
+      `SELECT
+         authz.activation_state,
+         authz.activation_revision::integer,
+         authz.provider_write_control_row_version,
+         authz.provider_write_scope_digest,
+         attempt.activation_revision::integer AS attempt_activation_revision,
+         attempt.provider_write_control_row_version
+           AS attempt_provider_write_control_row_version,
+         attempt.provider_write_scope_digest AS attempt_provider_write_scope_digest
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       WHERE authz.organization_id = $1::uuid
+         AND authz.global_id = $2`,
+      [fixture.organizationId, legacyPrepared.authorizationGlobalId],
+    )
+    assert.equal(legacyShape.rows[0].activation_state, 'shadow')
+    assert.equal(
+      legacyShape.rows[0].attempt_activation_revision,
+      legacyShape.rows[0].activation_revision,
+    )
+    assert.equal(legacyShape.rows[0].provider_write_control_row_version, null)
+    assert.equal(legacyShape.rows[0].provider_write_scope_digest, null)
+    assert.equal(
+      legacyShape.rows[0].attempt_provider_write_control_row_version,
+      null,
+    )
+    assert.equal(legacyShape.rows[0].attempt_provider_write_scope_digest, null)
+
+    await expectDatabaseRejected(
+      () => pool.query(
+        `WITH source AS (
+           SELECT *
+           FROM operations_shopify_order_management_authorizations
+           WHERE organization_id = $1::uuid AND global_id = $2
+         ), prepared_clock AS (
+           SELECT clock_timestamp() AS prepared_at
+         )
+         INSERT INTO operations_shopify_order_management_authorizations (
+           organization_id, integration_account_id,
+           integration_account_global_id, provider, account_environment,
+           external_account_id, shop_domain, credential_generation,
+           activation_state, activation_revision,
+           provider_write_control_row_version, provider_write_scope_digest,
+           order_id, order_global_id, external_order_id, order_number,
+           expected_order_row_version, expected_source_hash,
+           accepted_observation_id, accepted_provider_order_updated_at,
+           provider_order_updated_at, provider_order_observed_at,
+           provider_order_test, provider_snapshot_hash, action, line_item_id,
+           expected_line_quantity, requested_quantity, tag_hash,
+           cancel_reason, staff_note_hash, authorization_reason, intent_hash,
+           idempotency_key, request_hash, status, authorized_by,
+           authorized_role, prepared_at, expires_at
+         )
+         SELECT
+           source.organization_id, source.integration_account_id,
+           source.integration_account_global_id, source.provider,
+           source.account_environment, source.external_account_id,
+           source.shop_domain, source.credential_generation,
+           source.activation_state, source.activation_revision,
+           NULL, NULL, source.order_id, source.order_global_id,
+           source.external_order_id, source.order_number,
+           source.expected_order_row_version, source.expected_source_hash,
+           source.accepted_observation_id,
+           source.accepted_provider_order_updated_at,
+           prepared_clock.prepared_at - interval '1 second',
+           prepared_clock.prepared_at, source.provider_order_test,
+           source.provider_snapshot_hash, source.action, source.line_item_id,
+           source.expected_line_quantity, source.requested_quantity,
+           source.tag_hash, source.cancel_reason, source.staff_note_hash,
+           'Member must not fabricate a rolling legacy authorization',
+           source.intent_hash, $4, repeat('8', 64), 'prepared', $3,
+           'member', prepared_clock.prepared_at,
+           prepared_clock.prepared_at + interval '5 minutes'
+         FROM source CROSS JOIN prepared_clock`,
+        [
+          fixture.organizationId,
+          legacyPrepared.authorizationGlobalId,
+          fixture.legacyMemberEmail,
+          `shopify-order-legacy-member-${randomUUID()}`,
+        ],
+      ),
+      /authorization is not current or permitted/i,
+      'member cannot fabricate the legacy rolling-runtime shape',
+    )
+
+    // 0312 retains one exact combined ordinary Save without retaining any
+    // email, phone, PO, note, source-address, or tag plaintext. The same
+    // pre-network claim
+    // fence binds write_orders plus write_order_edits for multi-line edits.
+    const ordinarySaveProjectionHash = '7'.repeat(64)
+    const ordinarySaveAction = {
+      type: 'save_order',
+      email: 'private-buyer@example.com',
+      phone: '+15555550199',
+      poNumber: 'PRIVATE-PO-6601',
+      note: 'Private handling note',
+      shippingAddress: {
+        firstName: 'Private',
+        lastName: 'Buyer',
+        company: 'Private Receiving LLC',
+        address1: '987 Private Shipping Lane',
+        address2: 'Suite 123',
+        city: 'Durham',
+        provinceCode: 'NC',
+        countryCode: 'US',
+        zip: '27701',
+        phone: '+15555550177',
+      },
+      tagAdds: ['private-priority'],
+      tagRemoves: [],
+      lineQuantities: [
+        { lineItemGid: 'gid://shopify/LineItem/6600000201', quantity: 1 },
+        { lineItemGid: 'gid://shopify/LineItem/6600000202', quantity: 2 },
+      ],
+    }
+    const ordinarySaveReason = 'Save ordinary Shopify order fields together'
+    const ordinaryPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        accountGlobalId: independentFixture.accountGlobalId,
+        orderGlobalId: independentFixture.current.global_id,
+        expectedOrderRowVersion: Number(
+          independentFixture.current.row_version,
+        ),
+        expectedSourceHash: independentFixture.currentSourceHash,
+        ...snapshot(
+          true,
+          independentFixture.currentAcceptedProviderUpdatedAt,
+        ),
+        action: ordinarySaveAction,
+        requestedProjectionHash: ordinarySaveProjectionHash,
+        reason: ordinarySaveReason,
+        idempotencyKey: 'shopify-order-combined-save-0312',
+      })
+    assert.equal(
+      ordinaryPrepared.requestedProjectionHash,
+      ordinarySaveProjectionHash,
+    )
+    assert.equal(ordinaryPrepared.requiresOrderEdits, true)
+    const ordinaryClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        authorizationGlobalId: ordinaryPrepared.authorizationGlobalId,
+        action: ordinarySaveAction,
+        reason: ordinarySaveReason,
+      })
+    assert.equal(
+      ordinaryClaimed.requestedProjectionHash,
+      ordinarySaveProjectionHash,
+    )
+    assert.equal(ordinaryClaimed.requiresOrderEdits, true)
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: independentFixture.organizationId,
+      actorEmail: independentFixture.ownerEmail,
+      authorizationGlobalId: ordinaryPrepared.authorizationGlobalId,
+      providerAttemptGlobalId: ordinaryClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: {
+        schema: 'shopify-order-management-combined-save-test-v1',
+        requestedProjectionHash: ordinarySaveProjectionHash,
+      },
+      providerReference: independentFixture.current.external_order_id,
+      providerWriteCount: 5,
+    })
+    const ordinaryStored = await pool.query(
+      `SELECT authz.*, attempt.*, outcome.*
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       JOIN operations_shopify_order_management_outcomes outcome
+         ON outcome.organization_id = authz.organization_id
+        AND outcome.authorization_id = authz.id
+        AND outcome.provider_attempt_id = attempt.id
+       WHERE authz.organization_id = $1::uuid
+         AND authz.global_id = $2`,
+      [
+        independentFixture.organizationId,
+        ordinaryPrepared.authorizationGlobalId,
+      ],
+    )
+    const ordinarySerialized = JSON.stringify(ordinaryStored.rows)
+    for (const privateValue of [
+      ordinarySaveAction.email,
+      ordinarySaveAction.phone,
+      ordinarySaveAction.poNumber,
+      ordinarySaveAction.note,
+      ordinarySaveAction.tagAdds[0],
+      ...Object.values(ordinarySaveAction.shippingAddress).filter(Boolean),
+    ]) {
+      assert.equal(ordinarySerialized.includes(privateValue), false)
+      assert.equal(
+        JSON.stringify(audits.filter((event) => (
+          event.aggregateId === ordinaryPrepared.authorizationGlobalId
+        ))).includes(privateValue),
+        false,
+      )
+    }
+    assert.equal(
+      ordinaryStored.rows[0].requested_projection_hash,
+      ordinarySaveProjectionHash,
     )
 
     const health = await persistence

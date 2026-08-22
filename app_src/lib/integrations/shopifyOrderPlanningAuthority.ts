@@ -33,7 +33,7 @@ const SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID =
   /^gid:\/\/shopify\/FulfillmentOrderLineItem\/[1-9][0-9]*$/
 const SHOPIFY_LOCATION_GID = /^gid:\/\/shopify\/Location\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_SERVICE_GID =
-  /^gid:\/\/shopify\/FulfillmentService\/[1-9][0-9]*$/
+  /^gid:\/\/shopify\/FulfillmentService\/[1-9][0-9]*(?:\?id=true)?$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -1117,7 +1117,7 @@ export async function readShopifyOrderPlanningAssignment(
       let fulfillmentService: ProviderPlanningAssignment[
         'fulfillmentService'
       ] = null
-      if (isFulfillmentService) {
+      if (isFulfillmentService && location.fulfillmentService !== null) {
         const service = record(
           location.fulfillmentService,
           'fulfillmentOrder.assignedLocation.location.fulfillmentService',

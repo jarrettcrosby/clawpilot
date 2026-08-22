@@ -1049,7 +1049,7 @@ export async function requireActiveSandboxCommerceE2eAuthorization(
     if (!current.rows[0]?.current) {
       fail(
         'SHOPIFY_TEST_E2E_AUTHORIZATION_STALE',
-        'Shopify test-store E2E authority no longer matches Read only activation or its exact source evidence',
+        'Shopify test-store E2E authority no longer matches its exact current account, credential, order, or source evidence',
         403,
       )
     }
@@ -1123,8 +1123,9 @@ export async function consumeSandboxCommerceE2eAuthorization(
 /**
  * Revalidates the exact consumed legacy sandbox authorization that created a
  * Shopify fulfillment export. This is deliberately separate from the
- * canonical Shopify test-store claim: legacy execution remains an Active-only
- * path and must never inherit Read only authority.
+ * canonical Shopify test-store claim. The exact consumed actor/order/account,
+ * sandbox-label, export, no-notify, and credential evidence is the authority;
+ * the legacy organization-wide Operations profile is not a write gate.
  */
 export async function requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres(
   input: {
@@ -1167,8 +1168,6 @@ export async function requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPost
      JOIN operations_orders source_order
        ON source_order.organization_id = auth.organization_id
       AND source_order.id = auth.order_id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = auth.organization_id
      JOIN operations_integration_accounts account
        ON account.organization_id = source_order.organization_id
       AND account.id = source_order.integration_account_id
@@ -1181,7 +1180,6 @@ export async function requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPost
        AND auth.state = 'consumed'
        AND auth.consumed_by = auth.authorized_by
        AND auth.confirmation_statement_version = '${SANDBOX_COMMERCE_E2E_CONFIRMATION_VERSION}'
-       AND activation.state = 'active'
        AND source_order.status = 'shipped'
        AND source_order.source_provider = 'shopify'
        AND source_order.external_order_id = $3

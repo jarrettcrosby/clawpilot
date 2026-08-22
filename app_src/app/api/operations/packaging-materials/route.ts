@@ -9,6 +9,7 @@ import {
   PACKAGING_MATERIAL_SOURCES,
   PACKAGING_MATERIAL_STATUSES,
   PACKAGING_MATERIAL_TYPES,
+  packagingDimensionEvidenceReferenceRequired,
   type PackagingMaterialInput,
   type PackagingMaterialStockInput,
 } from '@/lib/operations/packagingMaterials'
@@ -256,9 +257,9 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     )
   }
   const ratedOuterDimensionEvidenceType =
-    ratedOuterEvidenceValue as PackagingMaterialInput[
+    ratedOuterEvidenceValue as NonNullable<PackagingMaterialInput[
       'ratedOuterDimensionEvidenceType'
-    ]
+    ]> | null
   const ratedOuterDimensionEvidenceReference = optionalTextValue(
     value.ratedOuterDimensionEvidenceReference,
     'Rated outer dimension evidence reference',
@@ -279,10 +280,15 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     hasAnyOuterDimension !== hasAllOuterDimensions
     || (
       hasAllOuterDimensions
-      && (
-        ratedOuterDimensionEvidenceType === null
-        || ratedOuterDimensionEvidenceReference === null
+      && ratedOuterDimensionEvidenceType === null
+    )
+    || (
+      hasAllOuterDimensions
+      && ratedOuterDimensionEvidenceType !== null
+      && packagingDimensionEvidenceReferenceRequired(
+        ratedOuterDimensionEvidenceType,
       )
+      && ratedOuterDimensionEvidenceReference === null
     )
     || (
       !hasAnyOuterDimension
@@ -294,7 +300,7 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   ) {
     fail(
       'PACKAGING_MATERIAL_RATED_OUTER_FACTS_REQUIRED',
-      'Rated outer dimensions require length, width, height, evidence type, and evidence reference together',
+      'Rated outer dimensions require length, width, height, and evidence type together; measured evidence does not require a note',
       409,
     )
   }
@@ -320,12 +326,32 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     500,
   )
   if (
-    ['customer_confirmed', 'measured'].includes(dimensionEvidenceType)
+    (
+      ['customer_confirmed', 'provider'].includes(dimensionEvidenceType)
+      || (
+        status === 'active'
+        && packagingDimensionEvidenceReferenceRequired(dimensionEvidenceType)
+      )
+    )
     && dimensionEvidenceReference === null
   ) {
     fail(
       'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
-      'Describe the customer confirmation or measurement evidence',
+      'Provide the retained evidence reference for these dimensions',
+      409,
+    )
+  }
+  if (
+    dimensionEvidenceType === 'measured'
+    && (
+      innerLengthMm === null
+      || innerWidthMm === null
+      || innerHeightMm === null
+    )
+  ) {
+    fail(
+      'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
+      'Measured evidence requires exact positive length, width, and height',
       409,
     )
   }

@@ -2963,6 +2963,38 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Canonical planning acceptance reads sealed address evidence only',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not edit shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -2985,6 +3017,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3240,6 +3275,11 @@ async function verifyCanonicalPlanning(databaseUrl) {
                 'Canonical planning acceptance does not write Shopify fulfillment',
               )
             },
+            shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+              throw new Error(
+                'Canonical planning acceptance does not hash Shopify fulfillment attempts',
+              )
+            },
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,
@@ -3266,8 +3306,23 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
+          '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
+          '@/lib/persistence/commerceOrderWorkbench': {
+            readCommerceOrderWorkbenchFromPostgres: async () => [],
+          },
+          '@/lib/persistence/commerceProviderWrites': {
+            CommerceProviderWriteControlError: class extends Error {},
+            readCommerceProviderWriteControlsFromPostgres: async () => ({
+              accounts: [],
+            }),
+            requireCurrentCommerceProviderWritesInPostgres: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize Provider writes',
+              )
+            },
+          },
           '@/lib/persistence/commerceOrderRevisions': {
             async assertCommerceOrderRevisionExecutionCurrent() {},
             CommerceOrderRevisionGateError: class extends Error {},
@@ -3312,6 +3367,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
             assertNoOpenOperationsShadowTrainingRunsForActivation:
               async () => {},
           },
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/sandboxCommerceE2eAuthorization': {
             requireActiveSandboxCommerceE2eAuthorization: async () => {
               throw new Error(
@@ -3667,9 +3724,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
       () => pool.query(upgradePreflight),
       /Migration 0176 cannot preserve Active Operations organization .* while plan .* lacks production carrier-read evidence/,
     )
-    await assert.rejects(
-      () => pool.query(
-        `INSERT INTO operations_fulfillment_plans (
+    const localPlan = await pool.query(
+      `INSERT INTO operations_fulfillment_plans (
            organization_id, order_id, warehouse_id, version_number,
            status, method, solver_status, estimated_cost_minor,
            promised_delivery_at, explanation, created_by
@@ -3681,21 +3737,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
         [
           upgradeFixture.organizationId,
           upgradeFixture.order.id,
-          upgradeFixture.warehouse.id,
-          upgradeFixture.email,
-        ],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+           upgradeFixture.warehouse.id,
+           upgradeFixture.email,
+         ],
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_fulfillment_plans
+    assert.equal(localPlan.rowCount, 1)
+    const releasedLocalPlan = await pool.query(
+      `UPDATE operations_fulfillment_plans
          SET status = 'released'
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [upgradeFixture.organizationId, legacyPlan.id],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+      [upgradeFixture.organizationId, legacyPlan.id],
     )
+    assert.equal(releasedLocalPlan.rowCount, 1)
 
     const fixture = await seedCanonicalPlanningFixture(pool)
     const foreignFixture = await seedCanonicalPlanningFixture(pool)
@@ -4358,26 +4411,17 @@ async function verifyCanonicalPlanning(databaseUrl) {
         activationState: 'active',
         carrierReadEnvironment: 'sandbox',
       })
-    await assert.rejects(
-      () => operations.planOperationsOrderFromPostgres({
-        organizationId: activeSandboxFixture.organizationId,
-        actorEmail: activeSandboxFixture.email,
-        orderGlobalId: activeSandboxFixture.order.global_id,
-        cartonizationEvidenceGlobalId:
-          activeSandboxFixture.evidence.global_id,
-        expectedRowVersion:
-          Number(activeSandboxFixture.order.row_version),
-        reason: 'Active planning must reject sandbox carrier estimates',
-        idempotencyKey: `canonical-plan-${randomUUID()}`,
-      }),
-      (error) => {
-        assert.equal(
-          error.code,
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-        )
-        return true
-      },
-    )
+    await operations.planOperationsOrderFromPostgres({
+      organizationId: activeSandboxFixture.organizationId,
+      actorEmail: activeSandboxFixture.email,
+      orderGlobalId: activeSandboxFixture.order.global_id,
+      cartonizationEvidenceGlobalId:
+        activeSandboxFixture.evidence.global_id,
+      expectedRowVersion:
+        Number(activeSandboxFixture.order.row_version),
+      reason: 'Local planning accepts exact sandbox carrier estimates',
+      idempotencyKey: `canonical-plan-${randomUUID()}`,
+    })
     const activeSandboxEffects = await pool.query(
       `SELECT
          (SELECT count(*)::int
@@ -4393,8 +4437,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
       ],
     )
     assert.deepEqual(activeSandboxEffects.rows[0], {
-      plans: 0,
-      packaging_claims: 0,
+      plans: 1,
+      packaging_claims: 1,
     })
 
     const missingEvidenceFixture =
@@ -4467,15 +4511,14 @@ async function verifyCanonicalPlanning(databaseUrl) {
         return true
       },
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_activation_scopes
+    const localProfileTransition = await pool.query(
+      `UPDATE operations_activation_scopes
          SET state = 'active'
-         WHERE organization_id = $1::uuid`,
-        [missingEvidenceFixture.organizationId],
-      ),
-      /Active Operations cannot retain missing or non-production carrier-read plan/,
+         WHERE organization_id = $1::uuid
+         RETURNING state`,
+      [missingEvidenceFixture.organizationId],
     )
+    assert.equal(localProfileTransition.rows[0]?.state, 'active')
 
     const packagingShortageFixture =
       await seedCanonicalPlanningFixture(pool, {

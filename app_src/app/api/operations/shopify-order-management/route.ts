@@ -8,6 +8,7 @@ import {
   prepareShopifyOrderManagementCommand,
   readShopifyOrderManagementState,
   reconcileShopifyOrderManagementCommand,
+  saveShopifyOrderManagementCommand,
   ShopifyOrderManagementCommandError,
 } from '@/lib/operations/shopifyOrderManagementCommands'
 import { ShopifyOrderManagementError } from '@/lib/integrations/shopifyOrderManagement'
@@ -19,7 +20,7 @@ export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
 
-const MAX_REQUEST_BYTES = 32 * 1024
+const MAX_REQUEST_BYTES = 128 * 1024
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u
 const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/u
 const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/u
@@ -28,6 +29,7 @@ const LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/u
 const SHA256 = /^[a-f0-9]{64}$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
+const COUNTRY_CODE = /^[A-Z]{2}$/u
 
 class ShopifyOrderManagementApiError extends Error {
   constructor(
@@ -127,6 +129,113 @@ function reason(value: unknown) {
   return boundedText(value, 'Authorization reason', 500, 10)
 }
 
+function nullableField(
+  value: unknown,
+  label: string,
+  maximum: number,
+  options: { allowNewlines?: boolean; allowEmpty?: boolean } = {},
+) {
+  if (value === null) return null
+  if (typeof value !== 'string' || value !== value.trim()) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} is invalid`)
+  }
+  if (
+    value.length > maximum
+    || (!options.allowEmpty && value.length < 1)
+    || (options.allowNewlines
+      ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+      : /[\u0000-\u001f\u007f]/u.test(value))
+  ) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return value
+}
+
+function tagList(value: unknown, label: string) {
+  if (!Array.isArray(value) || value.length > 250) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} are invalid`)
+  }
+  const tags = value.map((tag) => {
+    const normalized = nullableField(tag, label, 255)
+    if (!normalized || normalized.includes(',')) {
+      fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} are invalid`)
+    }
+    return normalized
+  })
+  if (new Set(tags).size !== tags.length) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} contain duplicates`)
+  }
+  return tags
+}
+
+function shippingAddress(value: unknown) {
+  if (value === null) return null
+  const input = record(value)
+  exactFields(input, [
+    'firstName', 'lastName', 'company', 'address1', 'address2', 'city',
+    'provinceCode', 'countryCode', 'zip', 'phone',
+  ])
+  const countryCode = nullableField(
+    input.countryCode,
+    'Shopify shipping-address country code',
+    2,
+  )
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+      'Shopify shipping-address country code is invalid',
+    )
+  }
+  return Object.freeze({
+    firstName: nullableField(
+      input.firstName,
+      'Shopify shipping-address first name',
+      255,
+    ),
+    lastName: nullableField(
+      input.lastName,
+      'Shopify shipping-address last name',
+      255,
+    ),
+    company: nullableField(
+      input.company,
+      'Shopify shipping-address company',
+      255,
+    ),
+    address1: nullableField(
+      input.address1,
+      'Shopify shipping-address line 1',
+      255,
+    ),
+    address2: nullableField(
+      input.address2,
+      'Shopify shipping-address line 2',
+      255,
+    ),
+    city: nullableField(
+      input.city,
+      'Shopify shipping-address city',
+      255,
+    ),
+    provinceCode: nullableField(
+      input.provinceCode,
+      'Shopify shipping-address province or state code',
+      64,
+    ),
+    countryCode,
+    zip: nullableField(
+      input.zip,
+      'Shopify shipping-address postal code',
+      64,
+    ),
+    phone: nullableField(
+      input.phone,
+      'Shopify shipping-address phone',
+      64,
+    ),
+  })
+}
+
 function mutation(value: unknown) {
   const input = record(value)
   const kind = boundedText(input.kind, 'Shopify mutation', 40)
@@ -164,9 +273,68 @@ function mutation(value: unknown) {
       quantity: Number(input.quantity),
     })
   }
+  if (kind === 'save_order') {
+    exactFields(input, [
+      'kind', 'email', 'phone', 'poNumber', 'note',
+      'shippingAddress', 'tagAdds', 'tagRemoves', 'lineQuantities',
+    ])
+    const tagAdds = tagList(input.tagAdds, 'Shopify tags to add')
+    const tagRemoves = tagList(input.tagRemoves, 'Shopify tags to remove')
+    if (tagAdds.some((tag) => tagRemoves.includes(tag))) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify tag changes are contradictory',
+      )
+    }
+    if (!Array.isArray(input.lineQuantities) || input.lineQuantities.length > 250) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify order line changes are invalid',
+      )
+    }
+    const lineQuantities = input.lineQuantities.map((value) => {
+      const line = record(value)
+      exactFields(line, ['lineItemId', 'quantity'])
+      if (!Number.isSafeInteger(line.quantity) || Number(line.quantity) < 0) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+          'Shopify order line quantity is invalid',
+        )
+      }
+      return Object.freeze({
+        lineItemId: exactId(
+          line.lineItemId,
+          'Shopify order line',
+          LINE_ITEM_GID,
+        ),
+        quantity: Number(line.quantity),
+      })
+    })
+    if (new Set(lineQuantities.map((line) => line.lineItemId)).size
+      !== lineQuantities.length) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify order line changes contain duplicates',
+      )
+    }
+    return Object.freeze({
+      kind,
+      email: nullableField(input.email, 'Shopify order email', 254),
+      phone: nullableField(input.phone, 'Shopify order phone', 64),
+      poNumber: nullableField(input.poNumber, 'Shopify order PO number', 255),
+      note: nullableField(input.note, 'Shopify order note', 5_000, {
+        allowNewlines: true,
+        allowEmpty: true,
+      }),
+      shippingAddress: shippingAddress(input.shippingAddress),
+      tagAdds,
+      tagRemoves,
+      lineQuantities,
+    })
+  }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
-    'Supported Shopify actions are add tag, cancel, and decrease quantity',
+    'Supported Shopify actions are save order, add tag, cancel, and decrease quantity',
   )
 }
 
@@ -209,11 +377,47 @@ function resultNullableText(value: unknown, maximum = 512) {
   return resultText(value, maximum)
 }
 
+function resultNullableField(
+  value: unknown,
+  maximum: number,
+  options: { allowEmpty?: boolean; allowNewlines?: boolean } = {},
+) {
+  if (value === null) return null
+  if (
+    typeof value !== 'string'
+    || value.length > maximum
+    || (!options.allowEmpty && value.length < 1)
+    || (options.allowNewlines
+      ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+      : /[\u0000-\u001f\u007f]/u.test(value))
+  ) resultInvalid()
+  return value
+}
+
 function resultInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > maximum) {
     resultInvalid()
   }
   return Number(value)
+}
+
+function resultShippingAddress(value: unknown) {
+  if (value === null) return null
+  const address = resultRecord(value)
+  const countryCode = resultNullableField(address.countryCode, 2)
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) resultInvalid()
+  return Object.freeze({
+    firstName: resultNullableField(address.firstName, 255),
+    lastName: resultNullableField(address.lastName, 255),
+    company: resultNullableField(address.company, 255),
+    address1: resultNullableField(address.address1, 255),
+    address2: resultNullableField(address.address2, 255),
+    city: resultNullableField(address.city, 255),
+    provinceCode: resultNullableField(address.provinceCode, 64),
+    countryCode,
+    zip: resultNullableField(address.zip, 64),
+    phone: resultNullableField(address.phone, 64),
+  })
 }
 
 function resultId(value: unknown, pattern: RegExp) {
@@ -228,13 +432,13 @@ function publicOpenAttempt(value: unknown) {
   const state = resultText(source.state, 32)
   const actionKind = resultText(source.actionKind, 40)
   if (!['processing', 'unknown'].includes(state)) resultInvalid()
-  if (!['add_tag', 'cancel', 'set_line_quantity'].includes(actionKind)) {
+  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(actionKind)) {
     resultInvalid()
   }
   const intentHash = resultText(source.intentHash, 64)
   if (!SHA256.test(intentHash)) resultInvalid()
   const providerWrites = source.providerWrites === null
-    ? null : resultInteger(source.providerWrites, 3)
+    ? null : resultInteger(source.providerWrites, 253)
   return Object.freeze({
     attemptGlobalId: resultId(source.attemptGlobalId, ATTEMPT_GLOBAL_ID),
     authorizationGlobalId: resultId(
@@ -257,6 +461,7 @@ function publicManagement(value: unknown) {
   const order = resultRecord(source.order)
   const eligibility = resultRecord(source.eligibility)
   const addTag = resultRecord(eligibility.addTag)
+  const ordinarySave = resultRecord(eligibility.ordinarySave)
   const cancel = resultRecord(eligibility.cancel)
   if (
     typeof source.runtimeAvailable !== 'boolean'
@@ -264,6 +469,7 @@ function publicManagement(value: unknown) {
     || typeof order.closed !== 'boolean'
     || typeof order.merchantEditable !== 'boolean'
     || typeof addTag.allowed !== 'boolean'
+    || typeof ordinarySave.allowed !== 'boolean'
     || typeof cancel.allowed !== 'boolean'
     || !Array.isArray(order.tags)
     || order.tags.length > 250
@@ -318,6 +524,14 @@ function publicManagement(value: unknown) {
       financialStatus: resultNullableText(order.financialStatus, 64),
       fulfillmentStatus: resultNullableText(order.fulfillmentStatus, 64),
       merchantEditable: order.merchantEditable,
+      email: resultNullableText(order.email, 254),
+      phone: resultNullableText(order.phone, 64),
+      poNumber: resultNullableText(order.poNumber, 255),
+      note: resultNullableField(order.note, 5_000, {
+        allowEmpty: true,
+        allowNewlines: true,
+      }),
+      shippingAddress: resultShippingAddress(order.shippingAddress),
       tags: Object.freeze(tags),
       lines: Object.freeze(lines),
     }),
@@ -325,6 +539,10 @@ function publicManagement(value: unknown) {
       addTag: Object.freeze({
         allowed: addTag.allowed,
         reason: resultNullableText(addTag.reason, 512),
+      }),
+      ordinarySave: Object.freeze({
+        allowed: ordinarySave.allowed,
+        reason: resultNullableText(ordinarySave.reason, 512),
       }),
       cancel: Object.freeze({
         allowed: cancel.allowed,
@@ -346,7 +564,7 @@ function publicAuthorization(value: unknown) {
   ) resultInvalid()
   const preview = resultRecord(source.preview)
   const action = resultText(preview.action, 40)
-  if (!['add_tag', 'cancel', 'set_line_quantity'].includes(action)) {
+  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(action)) {
     resultInvalid()
   }
   return Object.freeze({
@@ -396,7 +614,7 @@ function publicResult(value: unknown) {
     replayed: source.replayed,
     providerReads: resultInteger(source.providerReads, 20),
     providerWrites: source.providerWrites === null
-      ? null : resultInteger(source.providerWrites, 3),
+      ? null : resultInteger(source.providerWrites, 253),
     management: publicManagement(source.management),
   })
 }
@@ -467,14 +685,10 @@ async function requestBody(req: NextRequest) {
 
 function requireWriteAuthority(actor: Awaited<ReturnType<typeof requireRequestUser>>) {
   const capabilities = operationsCapabilities(actor)
-  if (
-    !capabilities.canActivate
-    || !capabilities.canManage
-    || !capabilities.canExecute
-  ) {
+  if (!capabilities.canManage) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED',
-      'Owner or authorized operations administrator approval is required',
+      'Operations-management permission is required',
       403,
     )
   }
@@ -553,6 +767,25 @@ export async function POST(req: NextRequest) {
     const action = boundedText(body.action, 'Shopify order action', 24)
     const exactKey = idempotencyKey(req)
 
+    if (action === 'save') {
+      exactFields(body, [
+        'action', 'orderGlobalId', 'expectedRowVersion', 'mutation',
+      ])
+      const result = await saveShopifyOrderManagementCommand({
+        organizationId,
+        actorEmail: actor.email,
+        orderGlobalId: exactId(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: rowVersion(body.expectedRowVersion),
+        mutation: mutation(body.mutation),
+        idempotencyKey: exactKey,
+      })
+      return json({ ok: true, result: publicResult(result) })
+    }
+
     if (action === 'prepare') {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation', 'reason',
@@ -623,7 +856,7 @@ export async function POST(req: NextRequest) {
 
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
-      'Supported actions are prepare, execute, and reconcile',
+      'Supported actions are save, prepare, execute, and reconcile',
     )
   } catch (error) {
     return errorResponse(error)
