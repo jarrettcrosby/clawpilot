@@ -1045,6 +1045,9 @@ function loadOperationalWarehouseServices(pool) {
         reconcileShopifyFulfillmentWriteback: mustNotRun(
           'reconcileShopifyFulfillmentWriteback',
         ),
+        shopifyFulfillmentAttemptSignatureHashCandidates: mustNotRun(
+          'shopifyFulfillmentAttemptSignatureHashCandidates',
+        ),
       },
       '@/lib/integrations/shopifyOrderPlanningAuthority': {
         ShopifyOrderPlanningAuthorityError: class extends Error {

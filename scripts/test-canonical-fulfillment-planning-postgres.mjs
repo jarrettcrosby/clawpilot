@@ -3275,6 +3275,11 @@ async function verifyCanonicalPlanning(databaseUrl) {
                 'Canonical planning acceptance does not write Shopify fulfillment',
               )
             },
+            shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+              throw new Error(
+                'Canonical planning acceptance does not hash Shopify fulfillment attempts',
+              )
+            },
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,

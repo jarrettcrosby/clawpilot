@@ -66,7 +66,13 @@ function persistenceFor(pool) {
     '@/lib/crm/stableId': {
       normalizedCrmIdentityText: (value) => String(value || '').trim().toLowerCase(),
     },
-    '@/lib/integrations/shopifyFulfillmentWriteback': {},
+    '@/lib/integrations/shopifyFulfillmentWriteback': {
+      shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+        throw new Error(
+          'Order replanning corrections do not hash Shopify fulfillment attempts',
+        )
+      },
+    },
     '@/lib/integrations/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityError: NamedBoundaryError,
     },

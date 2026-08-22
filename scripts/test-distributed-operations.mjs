@@ -4070,6 +4070,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
               'Distributed Operations acceptance does not write Shopify fulfillment',
             )
           },
+          shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+            throw new Error(
+              'Distributed Operations acceptance does not hash Shopify fulfillment attempts',
+            )
+          },
         },
         '@/lib/integrations/shopifyOrderPlanningAuthority': {
           ShopifyOrderPlanningAuthorityError: class extends Error {},
