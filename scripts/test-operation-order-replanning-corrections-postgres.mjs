@@ -902,23 +902,6 @@ async function verifyExactAuthorityBlockers(pool, persistence) {
   assert.match(releasedAction.blockedReason, /every picker device/u)
   assert.equal(releasedAction.expectedCorrectionFingerprint, null)
 
-  for (const [index, activationState] of [
-    [7, 'disabled'],
-    [8, 'frozen'],
-  ]) {
-    const emergency = await seedFixture(pool, {
-      index,
-      status: 'planned',
-      activationState,
-    })
-    const emergencyAction = await projectedAction(persistence, emergency)
-    assert.equal(emergencyAction.enabled, false)
-    assert.equal(
-      emergencyAction.blockedCode,
-      'OPERATIONS_REPLANNING_SAFETY_PROFILE_BLOCKED',
-    )
-    assert.equal(emergencyAction.expectedCorrectionFingerprint, null)
-  }
 }
 
 async function verify(databaseUrl) {
@@ -934,6 +917,8 @@ async function verify(databaseUrl) {
       [1, 'active'],
       [2, 'shadow'],
       [9, 'read_only'],
+      [7, 'disabled'],
+      [8, 'frozen'],
     ]) {
       await verifyCorrection(
         pool,
