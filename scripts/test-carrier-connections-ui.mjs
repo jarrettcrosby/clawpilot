@@ -12,6 +12,10 @@ const directDiagnostics = read('app_src/components/settings/CarrierIntegrationPa
 const brokeredDiagnostics = read('app_src/components/settings/BrokeredTransportIntegrationPanel.tsx')
 const brokeredRoute = read('app_src/app/api/integrations/brokered-transport/route.ts')
 const developmentFixture = read('app_src/app/dev/carrier-connections/page.tsx')
+const developmentFixtureClient = read(
+  'app_src/components/settings/CarrierConnectionsDevelopmentFixture.tsx',
+)
+const renderedAcceptance = read('app_src/tests/carrier-connections/ui-acceptance.spec.ts')
 
 for (const fragment of [
   'data-testid="carrier-connections-landing"',
@@ -102,9 +106,32 @@ for (const fragment of [
   '!process.env.VERCEL',
   "process.env.LOCAL_UI_FIXTURES === '1'",
   'Loading this page never contacts a carrier provider.',
-  '<CarrierConnectionsPanel />',
+  '<CarrierConnectionsDevelopmentFixture />',
 ]) {
   assert.ok(developmentFixture.includes(fragment), `Carrier UI fixture missing safety gate ${fragment}`)
+}
+
+for (const fragment of [
+  '<CarrierConnectionsPanel onNavigate={navigate} />',
+  'window.location.hash = hash',
+  'data-testid="carrier-connections-printing-handoff"',
+]) {
+  assert.ok(
+    developmentFixtureClient.includes(fragment),
+    `Carrier UI fixture client missing ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  "page.route('**/api/integrations/carriers'",
+  "page.route('**/api/integrations/brokered-transport'",
+  "name: 'Search carriers'",
+  "carrier-provider-usps_rest",
+  'carrier-connection-ups_rest-sandbox',
+  "name: 'Set up label printing'",
+  'Local fixture handoff: #operations/printing',
+]) {
+  assert.ok(renderedAcceptance.includes(fragment), `Rendered carrier acceptance missing ${fragment}`)
 }
 
 console.log('Carrier connections landing and wizard source checks passed.')

@@ -1,5 +1,5 @@
 import { notFound } from 'next/navigation'
-import CarrierConnectionsPanel from '@/components/settings/CarrierConnectionsPanel'
+import CarrierConnectionsDevelopmentFixture from '@/components/settings/CarrierConnectionsDevelopmentFixture'
 
 export const dynamic = 'force-dynamic'
 
@@ -18,7 +18,7 @@ export default function CarrierConnectionsDevelopmentPage() {
         <p style={{ margin: '8px 0 24px', color: '#b9b9c7' }}>
           Local-only layout fixture. Loading this page never contacts a carrier provider.
         </p>
-        <CarrierConnectionsPanel />
+        <CarrierConnectionsDevelopmentFixture />
       </div>
     </main>
   )
