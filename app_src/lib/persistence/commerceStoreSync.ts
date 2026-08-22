@@ -148,12 +148,10 @@ async function acquireProviderReadLease(input: {
          AND account.integration_type = 'commerce'
          AND account.provider IN ('shopify', 'faire')
          AND account.status = 'active'
-         AND (
-           $3 = 'manual_read_only'
-           OR operations_commerce_store_sync_is_running(
-             account.organization_id,
-             account.id
-           )
+         AND operations_commerce_provider_read_authority_is_current(
+           account.organization_id,
+           account.id,
+           $3
          )
        LIMIT 1
        FOR SHARE OF account, control, activation`,
