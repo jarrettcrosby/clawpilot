@@ -157,7 +157,7 @@ test('release verifier proves signatures, hardened runtime, and payload architec
     "'stapler', 'validate'",
     "'--assess'",
     'flags=0x',
-    "'/usr/bin/lipo', ['-verify_arch', 'x86_64', 'arm64'",
+    "'/usr/bin/lipo', [filePath, '-verify_arch', 'x86_64', 'arm64']",
     'assertUniversalMachOPayload',
     'assertWindowsX64PayloadTree',
     'for (const filePath of pePayloads) assertValidWindowsSignature(filePath)',

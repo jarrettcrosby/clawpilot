@@ -99,7 +99,7 @@ function verifyMac() {
     assertNoConcreteSecretsInPaths([appPath])
     assertUniversalMachOPayload(appPath, {
       architecturesFor(filePath) {
-        execute('/usr/bin/lipo', ['-verify_arch', 'x86_64', 'arm64', filePath])
+        execute('/usr/bin/lipo', [filePath, '-verify_arch', 'x86_64', 'arm64'])
         return execute('/usr/bin/lipo', ['-archs', filePath], true).trim().split(/\s+/)
       },
     })
