@@ -193,6 +193,11 @@ assert.match(
 )
 assert.match(
   routeSource,
+  /installed\.conrelid\s*=\s*pg_catalog\.to_regclass\([\s\S]{0,140}operations_commerce_provider_write_controls[\s\S]{0,140}installed\.contype\s*<>\s*'n'/u,
+  'Provider-write constraint health must ignore PostgreSQL 18 NOT NULL catalog rows',
+)
+assert.match(
+  routeSource,
   /row\.operations_commerce_provider_write_controls_applied[\s\S]{0,100}\? 'ready'/u,
   'Post-0308 health status must use per-account Provider writes authority',
 )

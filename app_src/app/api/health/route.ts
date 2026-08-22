@@ -5757,6 +5757,7 @@ export async function GET() {
                     WHERE installed.conrelid = pg_catalog.to_regclass(
                       'public.operations_commerce_provider_write_controls'
                     )
+                      AND installed.contype <> 'n'
                   )
                   AND (
                     SELECT pg_catalog.count(installed.oid) = 7
