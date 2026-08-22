@@ -1240,6 +1240,8 @@ requireAll(healthRoute, [
   'shopify_carrier_configured_carriers_applied',
   '0285_shopify_carrier_service_configured_carriers.sql',
   "'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'",
+  '0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+  '8b6de19ad2fa428edd087100e1cb73c851ba59a7fdff248ce71eedd9d3b3e3bb',
 ], 'configured-carrier migration health gate')
 requireAll(predeployVerification, [
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
