@@ -284,6 +284,13 @@ function loadOperationalFaireRoute(
     warehouse: {
       globalId: 'gwh0000001',
       name: 'Faire local inventory warehouse',
+      address: {
+        line1: '1 Warehouse Way',
+        city: 'Omaha',
+        region: 'NE',
+        postalCode: '68102',
+        country: 'US',
+      },
     },
     inventory: {
       syncRunGlobalId: null,
@@ -510,6 +517,12 @@ function loadOperationalFaireRoute(
         weight: input.grossPounds,
         weightUnit: 'LB',
       }),
+    },
+    '@/lib/integrations/carrierOriginBinding': {
+      carrierSenderOriginMatches: (input) => (
+        input.senderOriginWarehouseGlobalId
+          === input.warehouseGlobalId
+      ),
     },
     '@/lib/integrations/commerceIntake': {
       assertCommerceIntakeRuntime() {},

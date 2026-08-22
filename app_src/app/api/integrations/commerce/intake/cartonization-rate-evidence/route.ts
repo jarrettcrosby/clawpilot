@@ -9,6 +9,9 @@ import {
   normalizeCarrierSandboxParcel,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
+  carrierSenderOriginMatches,
+} from '@/lib/integrations/carrierOriginBinding'
+import {
   assertCommerceIntakeRuntime,
 } from '@/lib/integrations/commerceIntake'
 import {
@@ -1230,10 +1233,22 @@ export async function POST(req: NextRequest) {
           'CARTONIZATION_RATE_EVIDENCE_CARRIER_REQUIRED',
         )
       }
-      if (
-        connection.senderOriginWarehouseGlobalId
-        !== read.warehouse.globalId
-      ) {
+      const senderAccounts = connection.carrierAccounts.filter(
+        (account) => (
+          account.status === 'active'
+          && account.allowSenderBilling
+        ),
+      )
+      const senderAccount = senderAccounts.length === 1
+        ? senderAccounts[0]
+        : null
+      if (!carrierSenderOriginMatches({
+        senderOriginWarehouseGlobalId:
+          connection.senderOriginWarehouseGlobalId,
+        warehouseGlobalId: read.warehouse.globalId,
+        warehouseAddress: read.warehouse.address,
+        registeredCarrierAddress: senderAccount?.registeredAddress,
+      })) {
         throw new RateEvidenceRequestError(
           `${
             provider === 'ups_rest' ? 'UPS' : 'FedEx'
@@ -1242,12 +1257,6 @@ export async function POST(req: NextRequest) {
           'CARTONIZATION_RATE_EVIDENCE_ORIGIN_MISMATCH',
         )
       }
-      const senderAccounts = connection.carrierAccounts.filter(
-        (account) => (
-          account.status === 'active'
-          && account.allowSenderBilling
-        ),
-      )
       if (senderAccounts.length !== 1) {
         throw new RateEvidenceRequestError(
           `Exactly one active sender-billing ${

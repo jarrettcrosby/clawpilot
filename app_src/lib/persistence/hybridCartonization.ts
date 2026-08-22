@@ -90,6 +90,7 @@ export type HybridCartonizationReadResult = {
   warehouse: {
     globalId: string
     name: string
+    address: Record<string, unknown>
   }
   inventory: {
     syncRunGlobalId: string | null
@@ -285,6 +286,7 @@ type WarehouseRow = {
   id: string
   global_id: string
   name: string
+  address: Record<string, unknown>
 }
 
 type InventoryRunRow = {
@@ -1612,7 +1614,8 @@ async function readWarehouse(
   input: HybridCartonizationReadRequest,
 ) {
   const result = await client.query<WarehouseRow>(
-    `SELECT warehouse.id::text, warehouse.global_id, warehouse.name
+    `SELECT warehouse.id::text, warehouse.global_id, warehouse.name,
+            warehouse.address
      FROM operations_warehouses warehouse
      WHERE warehouse.organization_id = $1::uuid
        AND warehouse.global_id = $2
@@ -3300,6 +3303,7 @@ export async function readHybridCartonizationInputFromPostgres(
       warehouse: {
         globalId: warehouse.global_id,
         name: warehouse.name,
+        address: warehouse.address,
       },
       inventory: {
         syncRunGlobalId: inventoryRun?.global_id || null,
