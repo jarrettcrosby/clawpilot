@@ -172,6 +172,53 @@ test('selects across all services when no delivery promise or checkout charge ex
   assert.equal(selection.policy.rejectedForPromiseCount, 0)
 })
 
+test('selects a sealed undated service only when the order has no delivery promise', () => {
+  const selection = selectCanonicalFulfillmentRate(planningInput([
+    offer('ups_rest', 'GROUND', {
+      carrierCostMinor: 700,
+      transitDays: null,
+      estimatedDeliveryAt: null,
+    }),
+    offer('fedex_rest', 'FEDEX_GROUND', {
+      carrierCostMinor: 900,
+      transitDays: 3,
+    }),
+  ], {
+    requestedDeliveryAt: null,
+  }))
+
+  assert.equal(selection.carrierProvider, 'ups_rest')
+  assert.equal(selection.serviceCode, 'ground')
+  assert.equal(selection.transitDays, null)
+  assert.equal(selection.estimatedDeliveryAt, null)
+  assert.equal(selection.meetsRequestedDelivery, true)
+})
+
+test('rejects undated services for a promised order', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        transitDays: null,
+        estimatedDeliveryAt: null,
+      }),
+    ])),
+    'CANONICAL_FULFILLMENT_RATE_PROMISE_UNAVAILABLE',
+  )
+})
+
+test('rejects partially dated carrier evidence', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        transitDays: null,
+      }),
+    ], {
+      requestedDeliveryAt: null,
+    })),
+    'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
+  )
+})
+
 test('filters services that miss the promise before comparing cost', () => {
   const selection = selectCanonicalFulfillmentRate(planningInput([
     offer('fedex_rest', 'LATE_BUT_CHEAP', {

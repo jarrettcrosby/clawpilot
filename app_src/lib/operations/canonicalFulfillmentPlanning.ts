@@ -3,7 +3,7 @@
 import { isIso4217CurrencyCode } from '../currency.ts'
 
 export const CANONICAL_FULFILLMENT_RATE_POLICY_VERSION =
-  'canonical-fulfillment-whole-shipment-rate-v2' as const
+  'canonical-fulfillment-whole-shipment-rate-v3' as const
 
 export const CANONICAL_FULFILLMENT_RATE_OBJECTIVE_SEQUENCE = [
   'whole_shipment_delivery_feasible',
@@ -45,8 +45,8 @@ export type CanonicalWholeShipmentRateOffer = Readonly<{
   serviceName: string
   carrierCostMinor: number
   currency: string
-  transitDays: number
-  estimatedDeliveryAt: string
+  transitDays: number | null
+  estimatedDeliveryAt: string | null
 }>
 
 export type CanonicalFulfillmentPlanningInput = Readonly<{
@@ -89,8 +89,8 @@ export type CanonicalFulfillmentRateSelection = Readonly<{
   serviceName: string
   carrierCostMinor: number
   currency: string
-  transitDays: number
-  estimatedDeliveryAt: string
+  transitDays: number | null
+  estimatedDeliveryAt: string | null
   requestedDeliveryAt: string | null
   meetsRequestedDelivery: true
   actualCheckoutShippingChargeMinor: number | null
@@ -330,10 +330,21 @@ function normalizeOffer(
       'Carrier offer currency does not match the canonical order currency',
     )
   }
+  const transitUnknown = offer.transitDays === null
+  const deliveryUnknown = offer.estimatedDeliveryAt === null
+  if (transitUnknown !== deliveryUnknown) {
+    fail(
+      'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
+      'Carrier transit days and estimated delivery must both be known or both be unavailable',
+    )
+  }
   if (
-    !Number.isSafeInteger(offer.transitDays)
-    || offer.transitDays < 0
-    || offer.transitDays > 365
+    !transitUnknown
+    && (
+      !Number.isSafeInteger(offer.transitDays)
+      || Number(offer.transitDays) < 0
+      || Number(offer.transitDays) > 365
+    )
   ) {
     fail(
       'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
@@ -350,10 +361,10 @@ function normalizeOffer(
     ),
     currency: offerCurrency,
     packageKeys: offerPackageKeys,
-    estimatedDeliveryAt: timestamp(
-      offer.estimatedDeliveryAt,
-      'Estimated delivery',
-    ),
+    transitDays: transitUnknown ? null : Number(offer.transitDays),
+    estimatedDeliveryAt: deliveryUnknown
+      ? null
+      : timestamp(offer.estimatedDeliveryAt, 'Estimated delivery'),
   }
 }
 
@@ -442,11 +453,15 @@ export function selectCanonicalFulfillmentRate(
   const feasibleOffers = normalizedOffers
     .filter((offer) => (
       requestedDeliveryMs === null
-      || new Date(offer.estimatedDeliveryAt).getTime() <= requestedDeliveryMs
+      || (
+        offer.estimatedDeliveryAt !== null
+        && new Date(offer.estimatedDeliveryAt).getTime()
+          <= requestedDeliveryMs
+      )
     ))
     .sort((left, right) => (
       left.carrierCostMinor - right.carrierCostMinor
-      || left.transitDays - right.transitDays
+      || (left.transitDays ?? 366) - (right.transitDays ?? 366)
       || left.provider.localeCompare(right.provider)
       || left.carrierAccountGlobalId.localeCompare(
         right.carrierAccountGlobalId,

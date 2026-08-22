@@ -839,7 +839,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     serviceName: string
     internalCostMinor: string
     customerChargeMinor: string | null
-    estimatedDeliveryAt: string
+    estimatedDeliveryAt: string | null
     meetsPromise: boolean
     selected: boolean
   }>

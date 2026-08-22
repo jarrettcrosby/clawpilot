@@ -374,6 +374,7 @@ for (const requiredPath of [
   'db/migrations/0315_operations_carrier_writes_independent_activation.sql',
   'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
   'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+  'db/migrations/0318_operations_unpromised_canonical_rates.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
   'db/migrations/0309_operations_measured_packaging_evidence.sql',
   'app_src/components/shipping/ShippingSection.tsx',
