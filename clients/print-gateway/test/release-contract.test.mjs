@@ -139,6 +139,16 @@ test('packaging contains exact runtime, native Windows helper, and no PowerShell
     packageSource,
     /cppair\.v1\.[0-9a-f-]{36}\.|cpprint\.v1\.[0-9a-f-]{36}\./i,
   )
+
+  const afterPack = read('clients/print-gateway/scripts/after-pack.cjs')
+  const localNetworkDelete = afterPack.indexOf(
+    "plist(infoPlist, 'Delete :NSLocalNetworkUsageDescription', false)",
+  )
+  const localNetworkAdd = afterPack.indexOf(
+    "'Add :NSLocalNetworkUsageDescription string ClawPilot uses the local network only to reach the Zebra printer you configure.'",
+  )
+  assert.ok(localNetworkDelete >= 0, 'macOS packaging must clear the existing local-network usage key')
+  assert.ok(localNetworkAdd > localNetworkDelete, 'macOS packaging must replace the local-network usage key idempotently')
 })
 
 test('release verifier proves signatures, hardened runtime, and payload architectures', () => {

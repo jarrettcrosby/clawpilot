@@ -24,6 +24,7 @@ module.exports = async function afterPack(context) {
   plist(infoPlist, 'Add :NSAppTransportSecurity dict')
   plist(infoPlist, 'Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool false')
   plist(infoPlist, 'Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true')
+  plist(infoPlist, 'Delete :NSLocalNetworkUsageDescription', false)
   plist(
     infoPlist,
     'Add :NSLocalNetworkUsageDescription string ClawPilot uses the local network only to reach the Zebra printer you configure.',
