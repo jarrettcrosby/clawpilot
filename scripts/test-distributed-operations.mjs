@@ -1354,6 +1354,24 @@ async function verifyRouteBehavior() {
           throw new Error('Store sync updates are covered by their focused route contract')
         },
       },
+      '@/lib/persistence/commerceOrderWorkbench': {
+        CommerceOrderWorkbenchError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
+      '@/lib/persistence/operationsOrderShipmentAddress': {
+        OperationsOrderShipmentAddressError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
       },
@@ -3938,6 +3956,38 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not fingerprint shipment parties',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not encrypt shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3960,6 +4010,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -4063,8 +4116,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
+        '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
+        '@/lib/persistence/commerceOrderWorkbench': {
+          readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
@@ -4082,6 +4139,8 @@ async function verifyPostgresAcceptance(databaseUrl) {
           assertNoOpenOperationsShadowTrainingRunsForActivation:
             async () => {},
         },
+        '@/lib/persistence/operationsOrderShipmentAddress':
+          operationsOrderShipmentAddress,
         '@/lib/persistence/sandboxCommerceE2eAuthorization': {
           requireActiveSandboxCommerceE2eAuthorization: async () => {
             throw new Error(
