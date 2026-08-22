@@ -750,6 +750,15 @@ export function carrierSandboxLabelRequestEvidence(
       ? fixture.origin.name
       : String(senderName || '').trim() || fixture.origin.name,
   }
+  const destinationParty: CarrierSandboxRateFixture['destination'] = {
+    name: fixture.destination.name,
+    line1: fixture.destination.line1,
+    line2: fixture.destination.line2,
+    city: fixture.destination.city,
+    region: fixture.destination.region,
+    postalCode: fixture.destination.postalCode,
+    countryCode: fixture.destination.countryCode,
+  }
   const value = {
     provider,
     environment: 'sandbox',
@@ -778,7 +787,7 @@ export function carrierSandboxLabelRequestEvidence(
       label: value.label,
       shipment: {
         originFingerprint: carrierSandboxPartyFingerprint(origin),
-        destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
+        destinationFingerprint: carrierSandboxPartyFingerprint(destinationParty),
         origin: {
           region: origin.region,
           countryCode: origin.countryCode,
