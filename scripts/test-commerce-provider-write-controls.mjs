@@ -85,6 +85,9 @@ function loadPersistenceModule() {
 const migration = read(
   'db/migrations/0308_operations_commerce_provider_write_controls.sql',
 )
+const fulfillmentLeaseMigration = read(
+  'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/commerceProviderWrites.ts',
 )
@@ -115,6 +118,9 @@ const faireFulfillment = read(
 const operationsPersistence = read(
   'app_src/lib/persistence/operations.ts',
 )
+const commerceIntegrations = read(
+  'app_src/lib/integrations/commerceIntegrations.ts',
+)
 
 assert.match(migration, /COALESCE\(control\.requested_mode, 'off'::text\)/u)
 assert.match(migration, /requested_mode = 'off'[\s\S]*bound_credential_generation IS NULL/u)
@@ -139,6 +145,26 @@ assert.equal(
   'Authorization, current, and attempt DB gates must each require write_orders',
 )
 assert.doesNotMatch(migration, /operations_commerce_active_transition/u)
+assert.match(
+  fulfillmentLeaseMigration,
+  /LOCK TABLE public\.operations_commerce_provider_attempts,[\s\S]*public\.operations_integration_accounts,[\s\S]*public\.operations_commerce_credentials[\s\S]*IN ACCESS EXCLUSIVE MODE/u,
+)
+assert.match(
+  fulfillmentLeaseMigration,
+  /source_order\.integration_account_id = account\.id[\s\S]*source_order\.external_order_id =[\s\S]*fulfillment_export\.external_order_id/u,
+)
+assert.match(
+  fulfillmentLeaseMigration,
+  /lease_expires_at >[\s\S]*requested_at \+ interval '5 minutes'/u,
+)
+assert.match(
+  fulfillmentLeaseMigration,
+  /commerce_fulfillment_lease_count/u,
+)
+assert.match(
+  fulfillmentLeaseMigration,
+  /fence_operations_commerce_fulfillment_expired_leases/u,
+)
 
 assert.match(
   persistence,
@@ -183,6 +209,15 @@ assert.match(
 )
 assert.match(persistence, /provider_attempt\.state = 'prepared'/u)
 assert.match(persistence, /provider_attempt\.request_hash = \$9/u)
+assert.match(persistence, /provider_attempt\.lease_token = \$11::uuid/u)
+assert.match(
+  persistence,
+  /minimumLeaseRemainingSeconds =[\s\S]*'provider_mutation' \? 60 : 240/u,
+)
+assert.match(
+  persistence,
+  /source_order\.integration_account_id = account\.id/u,
+)
 assert.match(
   persistence,
   /provider_attempt\.redacted_request->'providerWriteAuthority'[\s\S]*= \$10::jsonb/u,
@@ -253,6 +288,8 @@ assert.doesNotMatch(shopifyFulfillment, /providerAttemptRegistered/u)
 assert.match(shopifyFulfillment, /providerAttemptGlobalId/u)
 assert.match(shopifyFulfillment, /providerAttemptRequestHash/u)
 assert.match(shopifyFulfillment, /commerceExportGlobalId/u)
+assert.match(shopifyFulfillment, /leaseCheckPhase: 'provider_mutation'/u)
+assert.match(shopifyFulfillment, /await beforeProviderMutation\?\.\(\)/u)
 assert.match(
   faireFulfillment,
   /requireCurrentCommerceProviderWritesInPostgres/u,
@@ -265,6 +302,19 @@ assert.doesNotMatch(faireFulfillment, /providerAttemptRegistered/u)
 assert.match(faireFulfillment, /providerAttemptGlobalId/u)
 assert.match(faireFulfillment, /providerAttemptRequestHash/u)
 assert.match(faireFulfillment, /commerceExportGlobalId/u)
+assert.match(faireFulfillment, /leaseCheckPhase: 'provider_mutation'/u)
+assert.match(
+  read('app_src/lib/integrations/faireFulfillmentWriteback.ts'),
+  /await beforeProviderMutation\?\.\(\)[\s\S]*moveOrderToProcessing[\s\S]*await beforeProviderMutation\?\.\(\)[\s\S]*addOrderShipments/u,
+)
+assert.match(
+  commerceIntegrations,
+  /COMMERCE_FULFILLMENT_LEASE_BUSY/u,
+)
+assert.match(
+  commerceIntegrations,
+  /409,[\s\S]*'COMMERCE_FULFILLMENT_LEASE_BUSY'/u,
+)
 assert.match(
   operationsPersistence,
   /requireShipmentProviderWriteAuthority[\s\S]*providerWriteAuthority/u,

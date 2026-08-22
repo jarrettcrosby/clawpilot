@@ -592,10 +592,32 @@ try {
 
   const sealedExportClient = await pool.connect()
   let sealedCommerceExportGlobalId = null
+  let wrongAccountCommerceExportGlobalId = null
   try {
     await sealedExportClient.query('BEGIN')
     await sealedExportClient.query(
       'SET LOCAL session_replication_role = replica',
+    )
+    const sealedOrderId = randomUUID()
+    const sealedExternalOrderId = 'gid://shopify/Order/6567'
+    await sealedExportClient.query(
+      `INSERT INTO public.operations_orders (
+         id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, ship_to, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', $6, '#6567', '{}'::jsonb, $7, $7
+       )`,
+      [
+        sealedOrderId,
+        tenant.organizationId,
+        randomUUID(),
+        randomUUID(),
+        tenant.shopify.id,
+        sealedExternalOrderId,
+        tenant.ownerEmail,
+      ],
     )
     const sealedExport = await sealedExportClient.query(
       `INSERT INTO public.operations_commerce_fulfillment_exports (
@@ -607,13 +629,59 @@ try {
        ) RETURNING global_id`,
       [
         tenant.organizationId,
+        sealedOrderId,
         randomUUID(),
-        randomUUID(),
-        'gid://shopify/Order/6567',
+        sealedExternalOrderId,
         `provider-writes-sealed-export-${randomUUID()}`,
       ],
     )
     sealedCommerceExportGlobalId = sealedExport.rows[0].global_id
+    await sealedExportClient.query(
+      `UPDATE public.operations_commerce_fulfillment_exports
+       SET attempts = 1
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [tenant.organizationId, sealedCommerceExportGlobalId],
+    )
+    const wrongAccountOrderId = randomUUID()
+    const wrongAccountExternalOrderId = 'gid://shopify/Order/6568'
+    await sealedExportClient.query(
+      `INSERT INTO public.operations_orders (
+         id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, ship_to, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', $6, '#6568', '{}'::jsonb, $7, $7
+       )`,
+      [
+        wrongAccountOrderId,
+        tenant.organizationId,
+        randomUUID(),
+        randomUUID(),
+        tenant.shopifyProduction.id,
+        wrongAccountExternalOrderId,
+        tenant.ownerEmail,
+      ],
+    )
+    const wrongAccountExport = await sealedExportClient.query(
+      `INSERT INTO public.operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, payload_snapshot, idempotency_key, attempts
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', $4,
+         'processing', '{}'::jsonb, $5, 1
+       ) RETURNING global_id`,
+      [
+        tenant.organizationId,
+        wrongAccountOrderId,
+        randomUUID(),
+        wrongAccountExternalOrderId,
+        `provider-writes-wrong-account-export-${randomUUID()}`,
+      ],
+    )
+    wrongAccountCommerceExportGlobalId =
+      wrongAccountExport.rows[0].global_id
     await sealedExportClient.query('COMMIT')
   } catch (error) {
     await sealedExportClient.query('ROLLBACK')
@@ -622,6 +690,7 @@ try {
     sealedExportClient.release()
   }
   assert.match(sealedCommerceExportGlobalId, /^gfe[0-9a-v]+$/u)
+  assert.match(wrongAccountCommerceExportGlobalId, /^gfe[0-9a-v]+$/u)
 
   const sealedProviderWriteAuthority = {
     accountGlobalId: tenant.shopify.global_id,
@@ -632,40 +701,132 @@ try {
     grantedScopeDigest: enabled.control.boundGrantedScopeDigest,
   }
   const sealedProviderAttemptRequestHash = 'e'.repeat(64)
+  const sealedProviderAttemptLeaseToken = randomUUID()
   const insertSealedProviderAttempt = async ({
     action = 'shopify.fulfillment.create',
     adapterVersion = 'shopify-fulfillment-writeback-v2',
     state = 'prepared',
     authority = sealedProviderWriteAuthority,
+    leaseToken = randomUUID(),
+    commerceExportGlobalId = sealedCommerceExportGlobalId,
+    executor = pool,
   } = {}) => {
-    const attempt = await pool.query(
+    const attempt = await executor.query(
       `INSERT INTO public.operations_commerce_provider_attempts (
          organization_id, integration_account_id, action, adapter_version,
          external_object_id, idempotency_key, request_hash,
          redacted_request, redacted_response, state, attempt_number,
-         requested_at, completed_at, created_by
+         lease_token, lease_expires_at, requested_at, completed_at, created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
          jsonb_build_object('providerWriteAuthority', $8::jsonb),
-         '{}'::jsonb, $9, 1, now(),
-         CASE WHEN $9 = 'prepared' THEN NULL ELSE now() END, $10
+         '{}'::jsonb, $9, 1, $10::uuid,
+         CASE WHEN $9 = 'prepared' THEN now() + interval '5 minutes' ELSE NULL END,
+         now(),
+         CASE WHEN $9 = 'prepared' THEN NULL ELSE now() END, $11
        ) RETURNING global_id`,
       [
         tenant.organizationId,
         tenant.shopify.id,
         action,
         adapterVersion,
-        sealedCommerceExportGlobalId,
+        commerceExportGlobalId,
         `provider-writes-sealed-attempt-${randomUUID()}`,
         sealedProviderAttemptRequestHash,
         JSON.stringify(authority),
         state,
+        leaseToken,
         tenant.ownerEmail,
       ],
     )
     return attempt.rows[0].global_id
   }
-  const sealedProviderAttemptGlobalId = await insertSealedProviderAttempt()
+  const sealedProviderAttemptGlobalId = await insertSealedProviderAttempt({
+    leaseToken: sealedProviderAttemptLeaseToken,
+  })
+  const leasedAuthorityCounts = await pool.query(
+    `SELECT account.commerce_fulfillment_lease_count AS account_count,
+            credential.commerce_fulfillment_lease_count AS credential_count
+     FROM public.operations_integration_accounts account
+     JOIN public.operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid`,
+    [tenant.organizationId, tenant.shopify.id],
+  )
+  assert.equal(leasedAuthorityCounts.rows[0].account_count, 1)
+  assert.equal(leasedAuthorityCounts.rows[0].credential_count, 1)
+  const spoofClient = await pool.connect()
+  try {
+    await spoofClient.query('BEGIN')
+    await spoofClient.query(
+      `SELECT pg_catalog.set_config(
+         'clawpilot.commerce_fulfillment_lease_update', '1', true
+       )`,
+    )
+    await rejectedMessage(
+      () => spoofClient.query(
+        `UPDATE public.operations_integration_accounts
+         SET commerce_fulfillment_lease_count =
+               commerce_fulfillment_lease_count + 1
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [tenant.organizationId, tenant.shopify.id],
+      ),
+      /lease count is system managed/u,
+    )
+  } finally {
+    await spoofClient.query('ROLLBACK')
+    spoofClient.release()
+  }
+  const registrationClient = await pool.connect()
+  const blockedReconnectClient = await pool.connect()
+  let racingProviderAttemptGlobalId = null
+  try {
+    await registrationClient.query('BEGIN')
+    racingProviderAttemptGlobalId = await insertSealedProviderAttempt({
+      executor: registrationClient,
+    })
+    let reconnectSettled = false
+    const blockedReconnect = blockedReconnectClient.query(
+      `UPDATE public.operations_integration_accounts
+       SET status = 'disabled'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    ).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    ).finally(() => {
+      reconnectSettled = true
+    })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
+    assert.equal(
+      reconnectSettled,
+      false,
+      'Reconnect must wait for the concurrent registration transaction',
+    )
+    await registrationClient.query('COMMIT')
+    const blockedReconnectResult = await blockedReconnect
+    assert.match(
+      String(blockedReconnectResult.error?.message || ''),
+      /account authority cannot drift while leased/u,
+    )
+  } catch (error) {
+    await registrationClient.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    registrationClient.release()
+    blockedReconnectClient.release()
+  }
+  const racingFinalized = await pool.query(
+    `UPDATE public.operations_commerce_provider_attempts
+     SET state = 'failed', error_code = 'TEST_RACE_COMPLETE',
+         lease_token = NULL, lease_expires_at = NULL, completed_at = now()
+     WHERE organization_id = $1::uuid AND global_id = $2`,
+    [tenant.organizationId, racingProviderAttemptGlobalId],
+  )
+  assert.equal(racingFinalized.rowCount, 1)
   const sealedAttemptInput = (overrides = {}) => ({
     organizationId: tenant.organizationId,
     accountGlobalId: tenant.shopify.global_id,
@@ -673,6 +834,7 @@ try {
     environment: 'sandbox',
     providerAttemptGlobalId: sealedProviderAttemptGlobalId,
     providerAttemptRequestHash: sealedProviderAttemptRequestHash,
+    providerAttemptLeaseToken: sealedProviderAttemptLeaseToken,
     commerceExportGlobalId: sealedCommerceExportGlobalId,
     requiredScopes: [
       'read_orders',
@@ -691,13 +853,23 @@ try {
   })
   const terminalAttemptGlobalId = await insertSealedProviderAttempt({
     state: 'failed',
+    leaseToken: null,
   })
-  const wrongAuthorityAttemptGlobalId = await insertSealedProviderAttempt({
-    authority: {
-      ...sealedProviderWriteAuthority,
-      controlRowVersion: enabled.control.rowVersion + 100,
-    },
-  })
+  await rejectedMessage(
+    () => insertSealedProviderAttempt({
+      authority: {
+        ...sealedProviderWriteAuthority,
+        controlRowVersion: enabled.control.rowVersion + 100,
+      },
+    }),
+    /authority is stale or invalid/u,
+  )
+  await rejectedMessage(
+    () => insertSealedProviderAttempt({
+      commerceExportGlobalId: wrongAccountCommerceExportGlobalId,
+    }),
+    /authority is stale or invalid/u,
+  )
   for (const invalidAttemptInput of [
     sealedAttemptInput({ providerAttemptGlobalId: 'gxa9999999' }),
     sealedAttemptInput({ organizationId: tenant.auxiliaryOrganizationId }),
@@ -714,9 +886,6 @@ try {
     sealedAttemptInput({ commerceExportGlobalId: 'gfe9999999' }),
     sealedAttemptInput({ providerAttemptGlobalId: terminalAttemptGlobalId }),
     sealedAttemptInput({ providerAttemptRequestHash: 'f'.repeat(64) }),
-    sealedAttemptInput({
-      providerAttemptGlobalId: wrongAuthorityAttemptGlobalId,
-    }),
   ]) {
     await rejected(
       () => persistence.requireSealedCommerceProviderWritesInPostgres(
@@ -728,6 +897,12 @@ try {
   await rejected(
     () => persistence.requireSealedCommerceProviderWritesInPostgres(
       sealedAttemptInput({ providerAttemptGlobalId: undefined }),
+    ),
+    'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_INVALID',
+  )
+  await rejected(
+    () => persistence.requireSealedCommerceProviderWritesInPostgres(
+      sealedAttemptInput({ providerAttemptLeaseToken: undefined }),
     ),
     'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_INVALID',
   )
@@ -909,6 +1084,170 @@ try {
   assert.equal(sealedWhileOff.accountGlobalId, tenant.shopify.global_id)
   assert.equal(sealedWhileOff.provider, 'shopify')
   assert.equal(sealedWhileOff.environment, 'sandbox')
+  await rejectedMessage(
+    () => pool.query(
+      `UPDATE public.operations_integration_accounts
+       SET status = 'disabled'
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    ),
+    /account authority cannot drift while leased/u,
+  )
+  await rejectedMessage(
+    () => pool.query(
+      `UPDATE public.operations_commerce_credentials
+       SET credential_ciphertext = decode('04', 'hex')
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    ),
+    /credential authority cannot drift while leased/u,
+  )
+  await rejectedMessage(
+    () => pool.query(
+      `UPDATE public.operations_commerce_credentials
+       SET verification_status = 'failed',
+           last_error_code = 'TEST_LEASE_BUSY'
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    ),
+    /credential authority cannot drift while leased/u,
+  )
+  await rejectedMessage(
+    () => pool.query(
+      `DELETE FROM public.operations_commerce_credentials
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    ),
+    /credential is leased by a prepared attempt/u,
+  )
+  await pool.query(
+    `UPDATE public.operations_integration_accounts
+     SET display_name = display_name || ' same-org-independent'
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [tenant.organizationId, tenant.shopifyProduction.id],
+  )
+  await pool.query(
+    `UPDATE public.operations_integration_accounts
+     SET display_name = display_name || ' independent'
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [tenant.auxiliaryOrganizationId, tenant.shopifyProductOnly.id],
+  )
+  const expiryClient = await pool.connect()
+  try {
+    await expiryClient.query('BEGIN')
+    await expiryClient.query('SET LOCAL session_replication_role = replica')
+    await expiryClient.query(
+      `UPDATE public.operations_commerce_provider_attempts
+       SET lease_expires_at = clock_timestamp() - interval '1 second'
+       WHERE organization_id = $1::uuid
+         AND global_id = $2
+         AND lease_token = $3::uuid`,
+      [
+        tenant.organizationId,
+        sealedProviderAttemptGlobalId,
+        sealedProviderAttemptLeaseToken,
+      ],
+    )
+    await expiryClient.query('COMMIT')
+  } catch (error) {
+    await expiryClient.query('ROLLBACK')
+    throw error
+  } finally {
+    expiryClient.release()
+  }
+  const fenced = await pool.query(
+    `SELECT public.fence_operations_commerce_fulfillment_expired_leases(
+       $1::uuid, $2
+     )::integer AS count`,
+    [tenant.organizationId, tenant.shopify.global_id],
+  )
+  assert.equal(fenced.rows[0].count, 1)
+  const fencedAttempt = await pool.query(
+    `SELECT state, lease_token, lease_expires_at, error_code
+     FROM public.operations_commerce_provider_attempts
+     WHERE organization_id = $1::uuid AND global_id = $2`,
+    [tenant.organizationId, sealedProviderAttemptGlobalId],
+  )
+  assert.equal(fencedAttempt.rows[0].state, 'unknown')
+  assert.equal(fencedAttempt.rows[0].lease_token, null)
+  assert.equal(fencedAttempt.rows[0].lease_expires_at, null)
+  assert.equal(
+    fencedAttempt.rows[0].error_code,
+    'COMMERCE_FULFILLMENT_PROVIDER_LEASE_EXPIRED',
+  )
+  const lateFinalizer = await pool.query(
+    `UPDATE public.operations_commerce_provider_attempts
+     SET state = 'succeeded', lease_token = NULL, lease_expires_at = NULL,
+         completed_at = now()
+     WHERE organization_id = $1::uuid
+       AND global_id = $2
+       AND state = 'prepared'
+       AND lease_token = $3::uuid
+       AND lease_expires_at > clock_timestamp()`,
+    [
+      tenant.organizationId,
+      sealedProviderAttemptGlobalId,
+      sealedProviderAttemptLeaseToken,
+    ],
+  )
+  assert.equal(lateFinalizer.rowCount, 0)
+  const releasedAuthorityCounts = await pool.query(
+    `SELECT account.commerce_fulfillment_lease_count AS account_count,
+            credential.commerce_fulfillment_lease_count AS credential_count
+     FROM public.operations_integration_accounts account
+     JOIN public.operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid`,
+    [tenant.organizationId, tenant.shopify.id],
+  )
+  assert.equal(releasedAuthorityCounts.rows[0].account_count, 0)
+  assert.equal(releasedAuthorityCounts.rows[0].credential_count, 0)
+  const reconnectAfterFence = await pool.connect()
+  try {
+    await reconnectAfterFence.query('BEGIN')
+    await reconnectAfterFence.query(
+      `SELECT 1
+       FROM public.operations_integration_accounts
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       FOR UPDATE`,
+      [tenant.organizationId, tenant.shopify.id],
+    )
+    await reconnectAfterFence.query(
+      `UPDATE public.operations_commerce_credentials
+       SET credential_ciphertext = decode('04', 'hex'),
+           credential_version = 2,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    )
+    await reconnectAfterFence.query(
+      `UPDATE public.operations_integration_accounts
+       SET commerce_credential_generation = 2,
+           credential_reference = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        tenant.organizationId,
+        tenant.shopify.id,
+        `commerce-credential:${tenant.shopify.id}:v2`,
+      ],
+    )
+    await reconnectAfterFence.query('COMMIT')
+  } catch (error) {
+    await reconnectAfterFence.query('ROLLBACK')
+    throw error
+  } finally {
+    reconnectAfterFence.release()
+  }
   await pool.query(
     `UPDATE public.operations_activation_scopes
      SET state = 'active', revision = revision + 1, updated_by = $2
@@ -963,6 +1302,74 @@ try {
       idempotencyKey: `provider-writes-enable-again-${randomUUID()}`,
     })
   assert.equal(enabledAgain.control.bindingCurrent, true)
+  const reconnectFirstClient = await pool.connect()
+  const registrationAfterReconnectClient = await pool.connect()
+  try {
+    await reconnectFirstClient.query('BEGIN')
+    await reconnectFirstClient.query(
+      `SELECT 1
+       FROM public.operations_integration_accounts
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       FOR UPDATE`,
+      [tenant.organizationId, tenant.shopify.id],
+    )
+    await reconnectFirstClient.query(
+      `UPDATE public.operations_commerce_credentials
+       SET credential_ciphertext = decode('05', 'hex'),
+           credential_version = 3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid`,
+      [tenant.organizationId, tenant.shopify.id],
+    )
+    await reconnectFirstClient.query(
+      `UPDATE public.operations_integration_accounts
+       SET commerce_credential_generation = 3,
+           credential_reference = $3,
+           updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        tenant.organizationId,
+        tenant.shopify.id,
+        `commerce-credential:${tenant.shopify.id}:v3`,
+      ],
+    )
+    let registrationSettled = false
+    const staleRegistration = insertSealedProviderAttempt({
+      executor: registrationAfterReconnectClient,
+      authority: {
+        accountGlobalId: tenant.shopify.global_id,
+        provider: 'shopify',
+        environment: 'sandbox',
+        controlRowVersion: enabledAgain.control.rowVersion,
+        credentialGeneration: enabledAgain.control.boundCredentialGeneration,
+        grantedScopeDigest: enabledAgain.control.boundGrantedScopeDigest,
+      },
+    }).then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    ).finally(() => {
+      registrationSettled = true
+    })
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 75))
+    assert.equal(
+      registrationSettled,
+      false,
+      'Registration must wait for the concurrent reconnect transaction',
+    )
+    await reconnectFirstClient.query('COMMIT')
+    const staleRegistrationResult = await staleRegistration
+    assert.match(
+      String(staleRegistrationResult.error?.message || ''),
+      /authority is stale or invalid/u,
+    )
+  } catch (error) {
+    await reconnectFirstClient.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally {
+    reconnectFirstClient.release()
+    registrationAfterReconnectClient.release()
+  }
   await pool.query(
     `UPDATE public.operations_integration_accounts
      SET status = 'disabled', updated_at = now(), updated_by = $3
@@ -1108,6 +1515,145 @@ try {
     })
   assert.equal(faireAuthority.controlRowVersion, 1)
   assert.equal(faireAuthority.environment, 'production')
+  const faireLeaseClient = await pool.connect()
+  let faireCommerceExportGlobalId = null
+  try {
+    await faireLeaseClient.query('BEGIN')
+    await faireLeaseClient.query('SET LOCAL session_replication_role = replica')
+    const faireOrderId = randomUUID()
+    const faireExternalOrderId = `bo_lease_${randomUUID().replaceAll('-', '')}`
+    await faireLeaseClient.query(
+      `INSERT INTO public.operations_orders (
+         id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, ship_to, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'faire', $6, $7, '{}'::jsonb, $8, $8
+       )`,
+      [
+        faireOrderId,
+        tenant.organizationId,
+        randomUUID(),
+        randomUUID(),
+        tenant.faireOauth.id,
+        faireExternalOrderId,
+        `Faire ${faireExternalOrderId}`,
+        tenant.ownerEmail,
+      ],
+    )
+    const faireExport = await faireLeaseClient.query(
+      `INSERT INTO public.operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, payload_snapshot, idempotency_key, attempts
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'faire', $4,
+         'processing', '{}'::jsonb, $5, 1
+       ) RETURNING global_id`,
+      [
+        tenant.organizationId,
+        faireOrderId,
+        randomUUID(),
+        faireExternalOrderId,
+        `provider-writes-faire-export-${randomUUID()}`,
+      ],
+    )
+    faireCommerceExportGlobalId = faireExport.rows[0].global_id
+    await faireLeaseClient.query('COMMIT')
+  } catch (error) {
+    await faireLeaseClient.query('ROLLBACK')
+    throw error
+  } finally {
+    faireLeaseClient.release()
+  }
+  const faireProviderAttemptRequestHash = '9'.repeat(64)
+  const faireProviderAttemptLeaseToken = randomUUID()
+  const faireProviderWriteAuthority = {
+    accountGlobalId: tenant.faireOauth.global_id,
+    provider: 'faire',
+    environment: 'production',
+    controlRowVersion: faireEnabled.control.rowVersion,
+    credentialGeneration: faireEnabled.control.boundCredentialGeneration,
+    grantedScopeDigest: faireEnabled.control.boundGrantedScopeDigest,
+  }
+  const faireAttempt = await pool.query(
+    `INSERT INTO public.operations_commerce_provider_attempts (
+       organization_id, integration_account_id, action, adapter_version,
+       external_object_id, idempotency_key, request_hash,
+       redacted_request, redacted_response, state, attempt_number,
+       lease_token, lease_expires_at, requested_at, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'faire.fulfillment.shipments.create',
+       'faire-fulfillment-writeback-v2', $3, $4, $5,
+       jsonb_build_object('providerWriteAuthority', $6::jsonb),
+       '{}'::jsonb, 'prepared', 1, $7::uuid,
+       now() + interval '5 minutes', now(), $8
+     ) RETURNING global_id`,
+    [
+      tenant.organizationId,
+      tenant.faireOauth.id,
+      faireCommerceExportGlobalId,
+      `provider-writes-faire-attempt-${randomUUID()}`,
+      faireProviderAttemptRequestHash,
+      JSON.stringify(faireProviderWriteAuthority),
+      faireProviderAttemptLeaseToken,
+      tenant.ownerEmail,
+    ],
+  )
+  const faireProviderAttemptGlobalId = faireAttempt.rows[0].global_id
+  const faireLeased = await persistence
+    .requireSealedCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      provider: 'faire',
+      environment: 'production',
+      providerAttemptGlobalId: faireProviderAttemptGlobalId,
+      providerAttemptRequestHash: faireProviderAttemptRequestHash,
+      providerAttemptLeaseToken: faireProviderAttemptLeaseToken,
+      commerceExportGlobalId: faireCommerceExportGlobalId,
+      requiredScopes: [
+        'READ_BRAND',
+        'READ_ORDERS',
+        'READ_SHIPMENTS',
+        'WRITE_ORDERS',
+      ],
+      expectedControlRowVersion: faireEnabled.control.rowVersion,
+      expectedCredentialGeneration:
+        faireEnabled.control.boundCredentialGeneration,
+      expectedGrantedScopeDigest:
+        faireEnabled.control.boundGrantedScopeDigest,
+    })
+  assert.equal(faireLeased.provider, 'faire')
+  for (const [field, value] of [
+    ['requestedScopes', 'tampered'],
+    ['scopeVerification', 'tampered'],
+    ['tokenAcquisition', 'tampered'],
+    ['oauthGrantTokenType', 'tampered'],
+    ['oauthGrantCredentialFingerprintSha256', 'tampered'],
+    ['scopeProofProviderReference', 'tampered'],
+    ['scopeProofAttemptGlobalId', 'tampered'],
+  ]) {
+    await rejectedMessage(
+      () => pool.query(
+        `UPDATE public.operations_integration_accounts
+         SET configuration = jsonb_set(
+               configuration, ARRAY[$3]::text[], to_jsonb($4::text), true
+             )
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [tenant.organizationId, tenant.faireOauth.id, field, value],
+      ),
+      /account authority cannot drift while leased/u,
+    )
+  }
+  await rejectedMessage(
+    () => pool.query(
+      `UPDATE public.operations_integration_accounts
+       SET credential_reference = credential_reference || ':tampered'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [tenant.organizationId, tenant.faireOauth.id],
+    ),
+    /account authority cannot drift while leased/u,
+  )
   await pool.query(
     `UPDATE public.operations_activation_scopes
      SET state = 'active', revision = revision + 1, updated_by = $2
@@ -1125,6 +1671,61 @@ try {
       idempotencyKey: `provider-writes-faire-off-${randomUUID()}`,
     })
   assert.equal(faireDisabled.control.providerWritesEffective, false)
+  const faireSealedWhileOff = await persistence
+    .requireSealedCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      provider: 'faire',
+      environment: 'production',
+      providerAttemptGlobalId: faireProviderAttemptGlobalId,
+      providerAttemptRequestHash: faireProviderAttemptRequestHash,
+      providerAttemptLeaseToken: faireProviderAttemptLeaseToken,
+      commerceExportGlobalId: faireCommerceExportGlobalId,
+      requiredScopes: [
+        'READ_BRAND',
+        'READ_ORDERS',
+        'READ_SHIPMENTS',
+        'WRITE_ORDERS',
+      ],
+      expectedControlRowVersion: faireEnabled.control.rowVersion,
+      expectedCredentialGeneration:
+        faireEnabled.control.boundCredentialGeneration,
+      expectedGrantedScopeDigest:
+        faireEnabled.control.boundGrantedScopeDigest,
+      leaseCheckPhase: 'provider_mutation',
+    })
+  assert.equal(faireSealedWhileOff.controlRowVersion, 1)
+  const finalizedFaire = await pool.query(
+    `UPDATE public.operations_commerce_provider_attempts
+     SET state = 'succeeded',
+         redacted_response = '{"outcome":"succeeded"}'::jsonb,
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = now()
+     WHERE organization_id = $1::uuid
+       AND global_id = $2
+       AND state = 'prepared'
+       AND lease_token = $3::uuid
+       AND lease_expires_at > clock_timestamp()`,
+    [
+      tenant.organizationId,
+      faireProviderAttemptGlobalId,
+      faireProviderAttemptLeaseToken,
+    ],
+  )
+  assert.equal(finalizedFaire.rowCount, 1)
+  const faireReleasedCounts = await pool.query(
+    `SELECT account.commerce_fulfillment_lease_count AS account_count,
+            credential.commerce_fulfillment_lease_count AS credential_count
+     FROM public.operations_integration_accounts account
+     JOIN public.operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+    [tenant.organizationId, tenant.faireOauth.id],
+  )
+  assert.equal(faireReleasedCounts.rows[0].account_count, 0)
+  assert.equal(faireReleasedCounts.rows[0].credential_count, 0)
   await rejected(
     () => persistence.requireCurrentCommerceProviderWritesInPostgres({
       organizationId: tenant.organizationId,
@@ -1138,6 +1739,188 @@ try {
       ],
     }),
     'COMMERCE_PROVIDER_WRITES_OFF',
+  )
+
+  await pool.query(
+    `UPDATE public.operations_integration_accounts
+     SET status = 'active', updated_at = now(), updated_by = $3
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [tenant.organizationId, tenant.shopify.id, tenant.ownerEmail],
+  )
+  const upgradeProviderWritesOn = await persistence
+    .setCommerceProviderWriteControlInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.shopify.global_id,
+      mode: 'on',
+      expectedRowVersion: 4,
+      actorEmail: tenant.ownerEmail,
+      actorRole: 'owner',
+      idempotencyKey: `provider-writes-upgrade-on-${randomUUID()}`,
+    })
+  const upgradeLeaseToken = randomUUID()
+  const upgradeAttemptGlobalId = await insertSealedProviderAttempt({
+    leaseToken: upgradeLeaseToken,
+    authority: {
+      accountGlobalId: tenant.shopify.global_id,
+      provider: 'shopify',
+      environment: 'sandbox',
+      controlRowVersion: upgradeProviderWritesOn.control.rowVersion,
+      credentialGeneration:
+        upgradeProviderWritesOn.control.boundCredentialGeneration,
+      grantedScopeDigest:
+        upgradeProviderWritesOn.control.boundGrantedScopeDigest,
+    },
+  })
+  await persistence.setCommerceProviderWriteControlInPostgres({
+    organizationId: tenant.organizationId,
+    accountGlobalId: tenant.shopify.global_id,
+    mode: 'off',
+    expectedRowVersion: upgradeProviderWritesOn.control.rowVersion,
+    actorEmail: tenant.ownerEmail,
+    actorRole: 'owner',
+    idempotencyKey: `provider-writes-upgrade-off-${randomUUID()}`,
+  })
+  const openWebhookCommandId = randomUUID()
+  const openWebhookClient = await pool.connect()
+  try {
+    await openWebhookClient.query('BEGIN')
+    await openWebhookClient.query(
+      'SET LOCAL session_replication_role = replica',
+    )
+    await openWebhookClient.query(
+      `INSERT INTO public.operations_shopify_order_webhook_commands (
+         id, organization_id, integration_account_id,
+         integration_account_global_id, credential_generation,
+         external_account_id, shop_domain, callback_uri, desired_topics,
+         include_fields, idempotency_key, request_hash, confirmation_hash,
+         status, authorized_by, authorized_role
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4, 3,
+         'gid://shopify/Shop/123', 'upgrade-test.myshopify.com',
+         $5, ARRAY[
+           'orders/create', 'orders/updated', 'orders/edited',
+           'orders/cancelled', 'orders/paid', 'orders/fulfilled',
+           'orders/partially_fulfilled'
+         ]::text[], ARRAY[
+           'admin_graphql_api_id', 'updated_at'
+         ]::text[], $6, repeat('7', 64), repeat('8', 64),
+         'prepared', $7, 'owner'
+       )`,
+      [
+        openWebhookCommandId,
+        tenant.organizationId,
+        tenant.shopify.id,
+        tenant.shopify.global_id,
+        `https://upgrade.example.test/api/integrations/commerce/shopify/webhooks/${tenant.shopify.global_id}`,
+        `upgrade-open-webhook-${randomUUID()}`,
+        tenant.ownerEmail,
+      ],
+    )
+    await openWebhookClient.query('COMMIT')
+  } catch (error) {
+    await openWebhookClient.query('ROLLBACK')
+    throw error
+  } finally {
+    openWebhookClient.release()
+  }
+
+  await pool.query(
+    read(
+      'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
+    ),
+  )
+  const reapplyArtifacts = await pool.query(
+    `SELECT
+       (
+         SELECT count(*)::integer
+         FROM pg_catalog.pg_trigger trigger
+         JOIN pg_catalog.pg_class relation ON relation.oid = trigger.tgrelid
+         JOIN pg_catalog.pg_namespace namespace
+           ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND NOT trigger.tgisinternal
+           AND trigger.tgname IN (
+             'maintain_commerce_fulfillment_authority_lease',
+             'protect_commerce_fulfillment_account_authority',
+             'protect_commerce_fulfillment_credential_authority',
+             'protect_shopify_order_webhook_credential_drift'
+           )
+       ) AS trigger_count,
+       (
+         SELECT count(*)::integer
+         FROM public.operations_integration_accounts
+         WHERE commerce_fulfillment_lease_count <> 0
+       ) AS leased_accounts,
+       (
+         SELECT count(*)::integer
+         FROM public.operations_commerce_credentials
+         WHERE commerce_fulfillment_lease_count <> 0
+       ) AS leased_credentials`,
+  )
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(reapplyArtifacts.rows[0])),
+    { trigger_count: 4, leased_accounts: 1, leased_credentials: 1 },
+    '0316 must preserve a live exact lease across a later Off revision and rerun',
+  )
+  const sealedAfterReapply = await persistence
+    .requireSealedCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.shopify.global_id,
+      provider: 'shopify',
+      environment: 'sandbox',
+      providerAttemptGlobalId: upgradeAttemptGlobalId,
+      providerAttemptRequestHash: sealedProviderAttemptRequestHash,
+      providerAttemptLeaseToken: upgradeLeaseToken,
+      commerceExportGlobalId: sealedCommerceExportGlobalId,
+      requiredScopes: [
+        'read_orders',
+        'write_merchant_managed_fulfillment_orders',
+      ],
+      expectedControlRowVersion: upgradeProviderWritesOn.control.rowVersion,
+      expectedCredentialGeneration:
+        upgradeProviderWritesOn.control.boundCredentialGeneration,
+      expectedGrantedScopeDigest:
+        upgradeProviderWritesOn.control.boundGrantedScopeDigest,
+      leaseCheckPhase: 'provider_mutation',
+    })
+  assert.equal(
+    sealedAfterReapply.controlRowVersion,
+    upgradeProviderWritesOn.control.rowVersion,
+  )
+  const finalizedUpgradeAttempt = await pool.query(
+    `UPDATE public.operations_commerce_provider_attempts
+     SET state = 'unknown',
+         redacted_response = '{"outcome":"unknown"}'::jsonb,
+         error_code = 'TEST_UPGRADE_RECONCILIATION',
+         next_attempt_at = now(),
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = now()
+     WHERE organization_id = $1::uuid
+       AND global_id = $2
+       AND state = 'prepared'
+       AND lease_token = $3::uuid`,
+    [tenant.organizationId, upgradeAttemptGlobalId, upgradeLeaseToken],
+  )
+  assert.equal(finalizedUpgradeAttempt.rowCount, 1)
+  const postUpgradeCounters = await pool.query(
+    `SELECT account.commerce_fulfillment_lease_count AS account_count,
+            credential.commerce_fulfillment_lease_count AS credential_count
+     FROM public.operations_integration_accounts account
+     JOIN public.operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid AND account.id = $2::uuid`,
+    [tenant.organizationId, tenant.shopify.id],
+  )
+  assert.equal(postUpgradeCounters.rows[0].account_count, 0)
+  assert.equal(postUpgradeCounters.rows[0].credential_count, 0)
+  await pool.query(
+    `UPDATE public.operations_shopify_order_webhook_commands
+     SET status = 'failed', completed_at = now(),
+         error_code = 'TEST_UPGRADE_COMPLETE', updated_at = now()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [tenant.organizationId, openWebhookCommandId],
   )
 
   command('node', ['scripts/test-shopify-order-management-health.mjs'], {

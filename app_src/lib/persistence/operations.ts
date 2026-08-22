@@ -18,6 +18,7 @@ import {
   executeShopifyFulfillmentWriteback,
   prepareShopifyFulfillmentWriteback,
   reconcileShopifyFulfillmentWriteback,
+  shopifyFulfillmentAttemptSignatureHashCandidates,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
 import {
   assertShopifyOrderPlanningAuthorityHash,
@@ -18512,6 +18513,8 @@ type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
   provider_attempt_number: number | null
   provider_attempt_request_hash: string | null
   provider_attempt_request: Record<string, unknown> | null
+  provider_attempt_lease_token: string | null
+  provider_attempt_lease_expires_at: Date | null
 }
 
 const SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_ACTION =
@@ -18894,6 +18897,7 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
     const attempt = await client.query<{
       id: string
       global_id: string
+      lease_token: string
     }>(
       `INSERT INTO operations_commerce_provider_attempts (
          organization_id, integration_account_id, action, adapter_version,
@@ -18905,7 +18909,7 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
          $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
          $10::uuid, now() + interval '5 minutes', now(), $11
        )
-       RETURNING id::text, global_id`,
+       RETURNING id::text, global_id, lease_token::text`,
       [
         input.organizationId,
         input.integrationAccountId,
@@ -18942,6 +18946,7 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
       id: attempt.rows[0].id,
       globalId: attempt.rows[0].global_id,
       requestHash,
+      leaseToken: attempt.rows[0].lease_token,
       providerWriteExpectation,
     }
   })
@@ -19053,6 +19058,7 @@ async function registerFaireFulfillmentProviderAttempt(input: {
     const attempt = await client.query<{
       id: string
       global_id: string
+      lease_token: string
     }>(
       `INSERT INTO operations_commerce_provider_attempts (
          organization_id, integration_account_id, action, adapter_version,
@@ -19064,7 +19070,7 @@ async function registerFaireFulfillmentProviderAttempt(input: {
          $5, $6, $7, $8::jsonb, '{}'::jsonb, 'prepared', $9,
          $10::uuid, now() + interval '5 minutes', now(), $11
        )
-       RETURNING id::text, global_id`,
+       RETURNING id::text, global_id, lease_token::text`,
       [
         input.organizationId,
         input.integrationAccountId,
@@ -19101,9 +19107,42 @@ async function registerFaireFulfillmentProviderAttempt(input: {
       id: attempt.rows[0].id,
       globalId: attempt.rows[0].global_id,
       requestHash,
+      leaseToken: attempt.rows[0].lease_token,
       preparedRequest,
       providerWriteExpectation,
     }
+  })
+}
+
+async function fenceExpiredCommerceFulfillmentProviderAttempt(input: {
+  organizationId: string
+  accountGlobalId: string
+  providerAttemptId: string
+}) {
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    await client.query(
+      `SELECT public.fence_operations_commerce_fulfillment_expired_leases(
+         $1::uuid, $2
+       )`,
+      [input.organizationId, input.accountGlobalId],
+    )
+    const result = await client.query<{
+      state: string
+      lease_token: string | null
+      lease_expires_at: Date | null
+    }>(
+      `SELECT state, lease_token::text, lease_expires_at
+       FROM operations_commerce_provider_attempts
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+       LIMIT 1`,
+      [input.organizationId, input.providerAttemptId],
+    )
+    return result.rows[0] || null
   })
 }
 
@@ -19145,7 +19184,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
               provider_attempt.state AS provider_attempt_state,
               provider_attempt.attempt_number AS provider_attempt_number,
               provider_attempt.request_hash AS provider_attempt_request_hash,
-              provider_attempt.redacted_request AS provider_attempt_request
+              provider_attempt.redacted_request AS provider_attempt_request,
+              provider_attempt.lease_token::text AS provider_attempt_lease_token,
+              provider_attempt.lease_expires_at AS provider_attempt_lease_expires_at
        FROM operations_commerce_fulfillment_exports fulfillment_export
        JOIN operations_orders source_order
          ON source_order.organization_id = fulfillment_export.organization_id
@@ -19156,7 +19197,8 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
        LEFT JOIN LATERAL (
          SELECT attempt.id, attempt.global_id, attempt.state,
                 attempt.attempt_number, attempt.request_hash,
-                attempt.redacted_request,
+                attempt.redacted_request, attempt.lease_token,
+                attempt.lease_expires_at,
                 attempt.requested_at
          FROM operations_commerce_provider_attempts attempt
          WHERE attempt.organization_id = fulfillment_export.organization_id
@@ -19185,11 +19227,6 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         404,
       )
     }
-    await requireCurrentCommerceOrderRevision(client, {
-      organizationId: input.organizationId,
-      orderId: row.order_id,
-      operation: 'export',
-    })
     const decision = commerceExportCustomerNotificationDecision(
       row.payload_snapshot,
       row.provider,
@@ -19236,6 +19273,13 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       usesSafeShopifyAttemptProtocol,
       usesSafeFaireAttemptProtocol,
     })
+    if (recoveryMode !== 'reconcile_only') {
+      await requireCurrentCommerceOrderRevision(client, {
+        organizationId: input.organizationId,
+        orderId: row.order_id,
+        operation: 'export',
+      })
+    }
     let claimedRow: CommerceFulfillmentExportExecutionRow
     if (input.preclaimed) {
       if (
@@ -19270,7 +19314,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
                    NULL::text AS provider_attempt_state,
                    NULL::integer AS provider_attempt_number,
                    NULL::text AS provider_attempt_request_hash,
-                   NULL::jsonb AS provider_attempt_request`,
+                   NULL::jsonb AS provider_attempt_request,
+                   NULL::text AS provider_attempt_lease_token,
+                   NULL::timestamptz AS provider_attempt_lease_expires_at`,
         [
           input.organizationId,
           input.commerceExportGlobalId,
@@ -19298,6 +19344,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         provider_attempt_number: row.provider_attempt_number,
         provider_attempt_request_hash: row.provider_attempt_request_hash,
         provider_attempt_request: row.provider_attempt_request,
+        provider_attempt_lease_token: row.provider_attempt_lease_token,
+        provider_attempt_lease_expires_at:
+          row.provider_attempt_lease_expires_at,
       }
     }
     await recordAuditEvent({
@@ -19340,6 +19389,31 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
     }
   }
 
+  if (
+    claimed.recoveryMode === 'reconcile_only'
+    && claimed.row.provider_attempt_state === 'prepared'
+    && claimed.row.provider_attempt_id
+    && claimed.row.account_global_id
+  ) {
+    const durableAttempt =
+      await fenceExpiredCommerceFulfillmentProviderAttempt({
+        organizationId: input.organizationId,
+        accountGlobalId: claimed.row.account_global_id,
+        providerAttemptId: claimed.row.provider_attempt_id,
+      })
+    if (!durableAttempt) {
+      throw new OperationsRequestError(
+        'OPERATIONS_COMMERCE_EXPORT_CHANGED',
+        'The durable commerce provider attempt is unavailable for reconciliation',
+        409,
+      )
+    }
+    claimed.row.provider_attempt_state = durableAttempt.state
+    claimed.row.provider_attempt_lease_token = durableAttempt.lease_token
+    claimed.row.provider_attempt_lease_expires_at =
+      durableAttempt.lease_expires_at
+  }
+
   const snapshot = json(claimed.row.payload_snapshot)
   const trackingNumbers = Array.isArray(snapshot.trackingNumbers)
     ? [...new Set(snapshot.trackingNumbers
@@ -19363,6 +19437,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
     id: string
     globalId: string
     requestHash: string
+    leaseToken: string
     providerWriteExpectation?: FulfillmentProviderWriteExpectation
   } | null = null
   let providerAttemptResponse: Record<string, unknown> | null = null
@@ -19533,12 +19608,40 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
             : claimed.row.global_id,
       }
       if (claimed.recoveryMode === 'reconcile_only') {
-        if (!claimed.row.provider_attempt_request) {
+        if (
+          !claimed.row.provider_attempt_request
+          || !claimed.row.provider_attempt_request_hash
+        ) {
           throw new OperationsRequestError(
             'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
             'The prior Shopify attempt predates durable exact signatures and cannot be replayed safely',
             409,
           )
+        }
+        if (
+          !shopifyFulfillmentAttemptSignatureHashCandidates(
+            claimed.row.provider_attempt_request,
+          ).includes(claimed.row.provider_attempt_request_hash)
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_SHOPIFY_FULFILLMENT_SIGNATURE_INVALID',
+            'The durable Shopify fulfillment attempt signature failed its integrity check',
+            409,
+          )
+        }
+        if (
+          claimed.row.provider_attempt_state === 'prepared'
+          && claimed.row.provider_attempt_id
+          && claimed.row.provider_attempt_global_id
+          && claimed.row.provider_attempt_request_hash
+          && claimed.row.provider_attempt_lease_token
+        ) {
+          registeredProviderAttempt = {
+            id: claimed.row.provider_attempt_id,
+            globalId: claimed.row.provider_attempt_global_id,
+            requestHash: claimed.row.provider_attempt_request_hash,
+            leaseToken: claimed.row.provider_attempt_lease_token,
+          }
         }
         const observed = await reconcileShopifyFulfillmentWriteback(
           {
@@ -19589,6 +19692,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
             attemptSignature: prepared.signature,
             providerAttemptGlobalId: registeredAttempt.globalId,
             providerAttemptRequestHash: registeredAttempt.requestHash,
+            providerAttemptLeaseToken: registeredAttempt.leaseToken,
             commerceExportGlobalId: input.commerceExportGlobalId,
           })
           state = 'succeeded'
@@ -19642,11 +19746,13 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           claimed.row.provider_attempt_state === 'prepared'
           && claimed.row.provider_attempt_id
           && claimed.row.provider_attempt_request_hash
+          && claimed.row.provider_attempt_lease_token
         ) {
           registeredProviderAttempt = {
             id: claimed.row.provider_attempt_id,
             globalId: claimed.row.provider_attempt_global_id,
             requestHash: claimed.row.provider_attempt_request_hash,
+            leaseToken: claimed.row.provider_attempt_lease_token,
           }
         }
       } else {
@@ -19706,6 +19812,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           ? {
               providerAttemptGlobalId: registeredProviderAttempt.globalId,
               providerAttemptRequestHash: registeredProviderAttempt.requestHash,
+              providerAttemptLeaseToken: registeredProviderAttempt.leaseToken,
               commerceExportGlobalId: input.commerceExportGlobalId,
             }
           : {}),
@@ -19792,6 +19899,19 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
 
   const providerAttemptToFinalize = registeredProviderAttempt
   await withTransaction(async (client) => {
+    if (providerAttemptToFinalize) {
+      if (!claimed.row.account_global_id) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_ACCOUNT_REQUIRED',
+          'The durable provider attempt lost its exact commerce account',
+          409,
+        )
+      }
+      await acquireTransactionAdvisoryLock(
+        client,
+        `commerce-provider-writes:${input.organizationId}:${claimed.row.account_global_id}`,
+      )
+    }
     await acquireTransactionAdvisoryLock(
       client,
       `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
@@ -19812,7 +19932,9 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
              completed_at = now()
          WHERE organization_id = $1::uuid
            AND id = $2::uuid
-           AND state = 'prepared'`,
+           AND state = 'prepared'
+           AND lease_token = $7::uuid
+           AND lease_expires_at > pg_catalog.clock_timestamp()`,
         [
           input.organizationId,
           providerAttemptToFinalize.id,
@@ -19828,6 +19950,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           }),
           providerReference,
           errorCode,
+          providerAttemptToFinalize.leaseToken,
         ],
       )
       if (finalizedProviderAttempt.rowCount !== 1) {

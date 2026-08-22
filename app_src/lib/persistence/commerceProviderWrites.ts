@@ -225,6 +225,18 @@ function providerAttemptRequestHash(value: unknown) {
   return normalized
 }
 
+function providerAttemptLeaseToken(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!UUID.test(normalized)) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_INVALID',
+      'Registered provider attempt lease token is invalid',
+      400,
+    )
+  }
+  return normalized
+}
+
 function requestedMode(value: unknown): CommerceProviderWriteMode {
   if (value !== 'off' && value !== 'on') {
     fail(
@@ -832,11 +844,13 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
   environment: 'sandbox' | 'production'
   providerAttemptGlobalId: unknown
   providerAttemptRequestHash: unknown
+  providerAttemptLeaseToken: unknown
   commerceExportGlobalId: unknown
   requiredScopes: readonly string[]
   expectedControlRowVersion: unknown
   expectedCredentialGeneration: unknown
   expectedGrantedScopeDigest: unknown
+  leaseCheckPhase?: 'initial' | 'provider_mutation'
   client?: PoolClient
 }): Promise<CommerceProviderWriteAuthority> {
   const normalizedOrganizationId = organizationId(input.organizationId)
@@ -846,6 +860,9 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
   )
   const normalizedProviderAttemptRequestHash = providerAttemptRequestHash(
     input.providerAttemptRequestHash,
+  )
+  const normalizedProviderAttemptLeaseToken = providerAttemptLeaseToken(
+    input.providerAttemptLeaseToken,
   )
   const normalizedCommerceExportGlobalId = fulfillmentExportGlobalId(
     input.commerceExportGlobalId,
@@ -872,7 +889,20 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
       400,
     )
   }
+  if (
+    input.leaseCheckPhase !== undefined
+    && input.leaseCheckPhase !== 'initial'
+    && input.leaseCheckPhase !== 'provider_mutation'
+  ) {
+    fail(
+      'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_INVALID',
+      'Registered provider attempt lease check phase is invalid',
+      400,
+    )
+  }
   const executor: QueryExecutor = input.client || { query }
+  const minimumLeaseRemainingSeconds =
+    input.leaseCheckPhase === 'provider_mutation' ? 60 : 240
   const attemptContract = FULFILLMENT_PROVIDER_ATTEMPT_CONTRACT[input.provider]
   const sealedAuthority = {
     accountGlobalId: normalizedAccountGlobalId,
@@ -892,6 +922,13 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
        ON fulfillment_export.organization_id = provider_attempt.organization_id
       AND fulfillment_export.global_id = provider_attempt.external_object_id
       AND fulfillment_export.provider = account.provider
+     JOIN public.operations_orders source_order
+       ON source_order.organization_id = fulfillment_export.organization_id
+      AND source_order.id = fulfillment_export.order_id
+      AND source_order.integration_account_id = account.id
+      AND source_order.source_provider = account.provider
+      AND source_order.external_order_id =
+            fulfillment_export.external_order_id
      WHERE provider_attempt.organization_id = $1::uuid
        AND provider_attempt.global_id = $2
        AND account.global_id = $3
@@ -905,6 +942,10 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
        AND provider_attempt.request_hash = $9
        AND provider_attempt.redacted_request->'providerWriteAuthority'
          = $10::jsonb
+       AND provider_attempt.lease_token = $11::uuid
+       AND provider_attempt.lease_expires_at >
+             pg_catalog.clock_timestamp()
+               + ($12::integer * interval '1 second')
      LIMIT 1`,
     [
       normalizedOrganizationId,
@@ -917,6 +958,8 @@ export async function requireSealedCommerceProviderWritesInPostgres(input: {
       normalizedCommerceExportGlobalId,
       normalizedProviderAttemptRequestHash,
       JSON.stringify(sealedAuthority),
+      normalizedProviderAttemptLeaseToken,
+      minimumLeaseRemainingSeconds,
     ],
   )
   if (attempt.rowCount !== 1) {

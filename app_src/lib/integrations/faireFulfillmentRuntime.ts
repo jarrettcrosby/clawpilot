@@ -32,6 +32,8 @@ const REQUIRED_WRITE_OAUTH_SCOPES = [
 const PROVIDER_ATTEMPT_GLOBAL_ID = /^gxa(?:[0-9]{7}|[0-9a-v]{12})$/
 const COMMERCE_EXPORT_GLOBAL_ID = /^gfe(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
+const PROVIDER_ATTEMPT_LEASE_TOKEN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 export type FaireFulfillmentRuntimeAuthority = {
   authorizationRevision: number
@@ -53,6 +55,7 @@ export type CurrentFaireFulfillmentWritebackInput = Omit<
   providerWriteEnvironment?: unknown
   providerAttemptGlobalId?: unknown
   providerAttemptRequestHash?: unknown
+  providerAttemptLeaseToken?: unknown
   commerceExportGlobalId?: unknown
 }
 
@@ -65,6 +68,7 @@ type FaireProviderWriteExpectation = {
   providerWriteEnvironment?: unknown
   providerAttemptGlobalId?: unknown
   providerAttemptRequestHash?: unknown
+  providerAttemptLeaseToken?: unknown
   commerceExportGlobalId?: unknown
 }
 
@@ -117,12 +121,16 @@ async function currentAuthority(
     const providerAttemptRequestHash = String(
       input.providerAttemptRequestHash || '',
     ).trim().toLowerCase()
+    const providerAttemptLeaseToken = String(
+      input.providerAttemptLeaseToken || '',
+    ).trim().toLowerCase()
     const commerceExportGlobalId = String(
       input.commerceExportGlobalId || '',
     ).trim().toLowerCase()
     if (
       !PROVIDER_ATTEMPT_GLOBAL_ID.test(providerAttemptGlobalId)
       || !SHA256.test(providerAttemptRequestHash)
+      || !PROVIDER_ATTEMPT_LEASE_TOKEN.test(providerAttemptLeaseToken)
       || !COMMERCE_EXPORT_GLOBAL_ID.test(commerceExportGlobalId)
     ) {
       throw new FaireFulfillmentRuntimeError(
@@ -148,6 +156,7 @@ async function currentAuthority(
         environment: 'production',
         providerAttemptGlobalId,
         providerAttemptRequestHash,
+        providerAttemptLeaseToken,
         commerceExportGlobalId,
         requiredScopes: REQUIRED_WRITE_OAUTH_SCOPES,
         expectedControlRowVersion: input.providerWriteControlRowVersion,
@@ -363,15 +372,36 @@ export async function executeCurrentFaireFulfillmentWriteback(
     dependencies,
     'sealed_attempt',
   )
-  return dependencies.executeWriteback({
-    mode: input.mode,
-    writeAttempt: input.writeAttempt,
-    credential: current.credential,
-    authorization: current.authorization,
-    externalOrderId: input.externalOrderId,
-    ...(input.expectedShipDate === undefined
-      ? {}
-      : { expectedShipDate: input.expectedShipDate }),
-    packages: input.packages,
-  })
+  return dependencies.executeWriteback(
+    {
+      mode: input.mode,
+      writeAttempt: input.writeAttempt,
+      credential: current.credential,
+      authorization: current.authorization,
+      externalOrderId: input.externalOrderId,
+      ...(input.expectedShipDate === undefined
+        ? {}
+        : { expectedShipDate: input.expectedShipDate }),
+      packages: input.packages,
+    },
+    undefined,
+    async () => {
+      await dependencies.requireSealedProviderWrites({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+        provider: 'faire',
+        environment: 'production',
+        providerAttemptGlobalId: input.providerAttemptGlobalId,
+        providerAttemptRequestHash: input.providerAttemptRequestHash,
+        providerAttemptLeaseToken: input.providerAttemptLeaseToken,
+        commerceExportGlobalId: input.commerceExportGlobalId,
+        requiredScopes: REQUIRED_WRITE_OAUTH_SCOPES,
+        expectedControlRowVersion: input.providerWriteControlRowVersion,
+        expectedCredentialGeneration:
+          input.providerWriteCredentialGeneration,
+        expectedGrantedScopeDigest: input.providerWriteScopeDigest,
+        leaseCheckPhase: 'provider_mutation',
+      })
+    },
+  )
 }

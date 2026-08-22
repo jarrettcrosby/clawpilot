@@ -741,9 +741,13 @@ const normal = fixtureClient({
     shipmentReadback,
   ],
 })
+let normalMutationLeaseChecks = 0
 const normalResult = await writeback.executeFaireFulfillmentWriteback(
   writebackInput,
   { createClient: () => normal.client },
+  async () => {
+    normalMutationLeaseChecks += 1
+  },
 )
 assert.equal(normalResult.outcome, 'succeeded')
 assert.equal(normalResult.writeAttempt.state, 'succeeded')
@@ -755,10 +759,46 @@ assert.equal(
   'omitted expectedShipDate must remain omitted',
 )
 assert.equal(normal.calls.adds, 1)
+assert.equal(
+  normalMutationLeaseChecks,
+  2,
+  'Faire must recheck the sealed lease immediately before both mutations',
+)
 assert.equal(normal.calls.shipments.length, 2)
 assert.ok(normal.calls.shipments.every(
   (shipment) => shipment.shippingType === 'SHIP_ON_YOUR_OWN',
 ))
+
+const blockedProcessing = fixtureClient({
+  orders: [{ id: 'bo_order123', state: 'NEW', shipments: [] }],
+})
+await assert.rejects(
+  () => writeback.executeFaireFulfillmentWriteback(
+    writebackInput,
+    { createClient: () => blockedProcessing.client },
+    async () => {
+      throw new Error('sealed lease expired before processing mutation')
+    },
+  ),
+  /sealed lease expired/u,
+)
+assert.equal(blockedProcessing.calls.processing, 0)
+assert.equal(blockedProcessing.calls.adds, 0)
+
+const blockedShipment = fixtureClient({
+  orders: [{ id: 'bo_order123', state: 'PROCESSING', shipments: [] }],
+})
+await assert.rejects(
+  () => writeback.executeFaireFulfillmentWriteback(
+    writebackInput,
+    { createClient: () => blockedShipment.client },
+    async () => {
+      throw new Error('sealed lease expired before shipment mutation')
+    },
+  ),
+  /sealed lease expired/u,
+)
+assert.equal(blockedShipment.calls.adds, 0)
 
 const explicitNullDate = fixtureClient({
   orders: [
@@ -1064,11 +1104,14 @@ const runtimeProviderWriteAuthority = {
   grantedScopeDigest: 'b'.repeat(64),
 }
 const runtimeProviderAttemptRequestHash = 'c'.repeat(64)
+const runtimeProviderAttemptLeaseToken =
+  '44444444-4444-4444-8444-444444444444'
 const runtimeCommerceExportGlobalId = 'gfe1234567'
 function runtimeProviderAttemptEvidence(providerAttemptGlobalId) {
   return {
     providerAttemptGlobalId,
     providerAttemptRequestHash: runtimeProviderAttemptRequestHash,
+    providerAttemptLeaseToken: runtimeProviderAttemptLeaseToken,
     commerceExportGlobalId: runtimeCommerceExportGlobalId,
     providerWriteAccountGlobalId: runtimeAccountGlobalId,
     providerWriteProvider: 'faire',
@@ -1114,6 +1157,10 @@ const runtimeDependencies = {
       input.providerAttemptRequestHash,
       runtimeProviderAttemptRequestHash,
     )
+    assert.equal(
+      input.providerAttemptLeaseToken,
+      runtimeProviderAttemptLeaseToken,
+    )
     assert.equal(input.commerceExportGlobalId, runtimeCommerceExportGlobalId)
     assert.equal(input.expectedControlRowVersion, 6)
     assert.equal(input.expectedCredentialGeneration, 9)
@@ -1140,7 +1187,8 @@ const runtimeDependencies = {
       scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
     }
   },
-  executeWriteback: async (input) => {
+  executeWriteback: async (input, _dependencies, beforeProviderMutation) => {
+    await beforeProviderMutation?.()
     runtimeExecutions += 1
     runtimeExecutionInput = input
     return {
@@ -1218,7 +1266,7 @@ await runtime.executeCurrentFaireFulfillmentWriteback({
 assert.equal(runtimeExecutions, 1)
 assert.equal(runtimeTrustedEvidenceChecks, 2)
 assert.equal(runtimeProviderWriteChecks, 1)
-assert.equal(runtimeSealedProviderWriteChecks, 1)
+assert.equal(runtimeSealedProviderWriteChecks, 2)
 assert.deepEqual(
   JSON.parse(JSON.stringify(runtimeExecutionInput.authorization)),
   {
@@ -1416,7 +1464,7 @@ await assert.rejects(
   }, runtimeDependencies),
   (error) => error?.code === 'FAIRE_FULFILLMENT_PROVIDER_AUTHORITY_MISMATCH',
 )
-assert.equal(runtimeSealedProviderWriteChecks, 2)
+assert.equal(runtimeSealedProviderWriteChecks, 3)
 assert.equal(runtimeCredentialReads, readsBeforeRegisteredFaire)
 assert.equal(runtimeDecryptions, decryptionsBeforeRegisteredFaire)
 
@@ -1444,7 +1492,7 @@ await runtime.executeCurrentFaireFulfillmentWriteback({
     throw new Error('Registered execution must not re-require current On')
   },
 })
-assert.equal(runtimeSealedProviderWriteChecks, 3)
+assert.equal(runtimeSealedProviderWriteChecks, 5)
 assert.equal(runtimeExecutions, 2)
 
 console.log('Faire provider-write foundation tests passed')

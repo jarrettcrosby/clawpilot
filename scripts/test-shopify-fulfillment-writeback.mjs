@@ -88,10 +88,12 @@ const hasEffectiveShopifyScope = (scopes, scope) => (
 const providerWriteScopeDigest = 'a'.repeat(64)
 const providerAttemptGlobalId = 'gxa1234567'
 const providerAttemptRequestHash = 'c'.repeat(64)
+const providerAttemptLeaseToken = '33333333-3333-4333-8333-333333333333'
 const providerCommerceExportGlobalId = 'gfe7654321'
 const registeredProviderAttemptEvidence = {
   providerAttemptGlobalId,
   providerAttemptRequestHash,
+  providerAttemptLeaseToken,
   commerceExportGlobalId: providerCommerceExportGlobalId,
   providerWriteAccountGlobalId: accountGlobalId,
   providerWriteProvider: 'shopify',
@@ -221,6 +223,7 @@ const module = load({
         request.providerAttemptRequestHash,
         providerAttemptRequestHash,
       )
+      assert.equal(request.providerAttemptLeaseToken, providerAttemptLeaseToken)
       assert.equal(
         request.commerceExportGlobalId,
         providerCommerceExportGlobalId,
@@ -472,7 +475,8 @@ assert.equal(registeredResult.replayed, false)
 assert.equal(providerWriteChecks, providerChecksBeforeRegisteredExecution)
 assert.equal(
   sealedProviderWriteChecks,
-  sealedChecksBeforeRegisteredExecution + 1,
+  sealedChecksBeforeRegisteredExecution + 3,
+  'A sealed attempt must be checked before credential use and immediately before the mutation',
 )
 assert.equal(calls.length, 2)
 providerWritesOn = true
@@ -827,6 +831,7 @@ const authorityModule = load({
         request.providerAttemptRequestHash,
         providerAttemptRequestHash,
       )
+      assert.equal(request.providerAttemptLeaseToken, providerAttemptLeaseToken)
       assert.equal(request.commerceExportGlobalId, commerceExportGlobalId)
       return exactProviderWriteAuthority(authorityEnvironment)
     },

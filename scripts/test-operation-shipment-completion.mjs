@@ -165,6 +165,16 @@ async function seedWorkspace(pool, scenario) {
      WHERE email = $1`,
     [email, organizationId, `Shipment completion ${scenario} ${suffix}`],
   )
+  await pool.query(
+    `INSERT INTO app_user_organization_memberships (
+       user_email, organization_id, role, permissions, status, is_default,
+       created_by, updated_by
+     ) VALUES (
+       $1, $2::uuid, 'owner', '{"manageOperations":true}'::jsonb,
+       'active', true, $1, $1
+     )`,
+    [email, organizationId],
+  )
   const pipeline = await pool.query(
     `INSERT INTO pipeline_spaces (name, owner_email, is_default, workspace_organization_id)
      VALUES ('Shipment completion pipeline', $1, true, $2::uuid)
@@ -918,8 +928,27 @@ async function verifyShipmentCompletion(databaseUrl) {
     let focusedProviderWriteChecks = 0
     let focusedProviderWriteOffRejections = 0
     let focusedProviderCredentialGenerationOverride = null
-    const focusedProviderWriteControlRowVersion = 51
-    const focusedProviderWriteScopeDigest = 'f'.repeat(64)
+    let focusedProviderWriteControlRowVersion = 1
+    const focusedProviderWriteGrantedScopes = {
+      shopify: [
+        'read_orders',
+        'write_merchant_managed_fulfillment_orders',
+      ],
+      faire: [
+        'READ_BRAND',
+        'READ_ORDERS',
+        'READ_SHIPMENTS',
+        'WRITE_ORDERS',
+      ],
+    }
+    const focusedProviderWriteScopeDigest = Object.fromEntries(
+      Object.entries(focusedProviderWriteGrantedScopes).map(
+        ([provider, scopes]) => [
+          provider,
+          createHash('sha256').update([...scopes].sort().join('\n')).digest('hex'),
+        ],
+      ),
+    )
     const commerceProviderWrites = {
       CommerceProviderWriteControlError: FocusedProviderWriteControlError,
       readCommerceProviderWriteControlsFromPostgres: async ({
@@ -997,7 +1026,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         if (
           input.expectedGrantedScopeDigest !== undefined
           && input.expectedGrantedScopeDigest
-            !== focusedProviderWriteScopeDigest
+            !== focusedProviderWriteScopeDigest[input.provider]
         ) {
           throw new FocusedProviderWriteControlError(
             'COMMERCE_PROVIDER_WRITES_AUTHORITY_CHANGED',
@@ -1010,8 +1039,8 @@ async function verifyShipmentCompletion(databaseUrl) {
           environment: account.rows[0].environment,
           controlRowVersion: focusedProviderWriteControlRowVersion,
           credentialGeneration,
-          grantedScopes: [...input.requiredScopes],
-          grantedScopeDigest: focusedProviderWriteScopeDigest,
+          grantedScopes: [...focusedProviderWriteGrantedScopes[input.provider]],
+          grantedScopeDigest: focusedProviderWriteScopeDigest[input.provider],
         }
       },
       requireSealedCommerceProviderWritesInPostgres: async (input) => {
@@ -1371,6 +1400,9 @@ async function verifyShipmentCompletion(databaseUrl) {
           },
         },
         '@/lib/integrations/shopifyFulfillmentWriteback': {
+          shopifyFulfillmentAttemptSignatureHashCandidates:
+            exactAuthorityShopifyWriteback
+              .shopifyFulfillmentAttemptSignatureHashCandidates,
           prepareShopifyFulfillmentWriteback: async (input) => {
             shopifyFulfillmentPreparationCalls += 1
             shopifyFulfillmentInputs.push(JSON.parse(JSON.stringify(input)))
@@ -1730,6 +1762,289 @@ async function verifyShipmentCompletion(databaseUrl) {
       return fixture
     }
 
+    const seedFocusedShopifyProviderWriteAuthority = async ({
+      organizationId,
+      integrationAccountId,
+      externalAccountId,
+      shopDomain,
+      actorEmail,
+    }) => {
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_integration_accounts
+           SET provider = 'shopify', integration_type = 'commerce',
+               status = 'active', external_account_id = $3,
+               commerce_credential_generation = 1,
+               configuration = configuration || jsonb_build_object(
+                 'shopDomain', $4::text,
+                 'grantedScopes', $5::jsonb
+               ),
+               updated_by = $6, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            organizationId,
+            integrationAccountId,
+            externalAccountId,
+            shopDomain,
+            JSON.stringify(focusedProviderWriteGrantedScopes.shopify),
+            actorEmail,
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_commerce_credentials (
+             organization_id, integration_account_id, external_account_id,
+             auth_mode, credential_ciphertext, credential_iv, credential_tag,
+             credential_version, credential_identifier_last_four,
+             verification_status, verified_at, webhook_verification_status,
+             created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, 'shopify_client_credentials',
+             decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
+             decode(repeat('00', 16), 'hex'), 1, '0001', 'verified', now(),
+             'unverified', $4, $4
+           )
+           ON CONFLICT (organization_id, integration_account_id) DO UPDATE
+           SET external_account_id = EXCLUDED.external_account_id,
+               auth_mode = EXCLUDED.auth_mode,
+               credential_ciphertext = EXCLUDED.credential_ciphertext,
+               credential_iv = EXCLUDED.credential_iv,
+               credential_tag = EXCLUDED.credential_tag,
+               credential_version = EXCLUDED.credential_version,
+               credential_identifier_last_four =
+                 EXCLUDED.credential_identifier_last_four,
+               verification_status = EXCLUDED.verification_status,
+               verified_at = EXCLUDED.verified_at,
+               last_error_code = NULL,
+               webhook_verification_status =
+                 EXCLUDED.webhook_verification_status,
+               webhook_verified_at = NULL,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()`,
+          [organizationId, integrationAccountId, externalAccountId, actorEmail],
+        )
+        await client.query('SET LOCAL session_replication_role = origin')
+        await client.query(
+          `INSERT INTO operations_commerce_provider_write_controls (
+             organization_id, integration_account_id, provider, row_version,
+             expected_row_version, requested_mode,
+             bound_credential_generation, bound_granted_scopes,
+             bound_granted_scope_digest, changed_by, changed_role,
+             idempotency_key, request_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'shopify', $3::bigint,
+             ($3::bigint - 1), 'on', 1, $4::text[], $5, $6, 'owner',
+             $7, repeat('c', 64)
+           )`,
+          [
+            organizationId,
+            integrationAccountId,
+            focusedProviderWriteControlRowVersion,
+            focusedProviderWriteGrantedScopes.shopify,
+            focusedProviderWriteScopeDigest.shopify,
+            actorEmail,
+            `focused-shopify-provider-writes-${randomUUID()}`,
+          ],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    }
+
+    const seedFocusedFaireProviderWriteAuthority = async ({
+      organizationId,
+      integrationAccountId,
+      externalAccountId,
+      actorEmail,
+    }) => {
+      const client = await pool.connect()
+      const credentialFingerprint = 'd'.repeat(64)
+      const requestedScopes = focusedProviderWriteGrantedScopes.faire
+      try {
+        await client.query('BEGIN')
+        await client.query('SET LOCAL session_replication_role = replica')
+        await client.query(
+          `UPDATE operations_integration_accounts
+           SET provider = 'faire', integration_type = 'commerce',
+               environment = 'production', status = 'active',
+               external_account_id = $3,
+               commerce_credential_generation = 1,
+               credential_reference =
+                 'commerce-credential:' || id::text || ':v1',
+               configuration = jsonb_build_object(
+                 'authMode', 'faire_oauth',
+                 'tokenAcquisition', 'authorization_code',
+                 'requestedScopes', $4::jsonb,
+                 'grantedScopes', $4::jsonb,
+                 'scopeVerification', 'oauth_grant',
+                 'oauthGrantTokenType', 'BEARER',
+                 'oauthGrantCredentialFingerprintSha256', $5::text,
+                 'scopeProofProviderReference', $5::text,
+                 'scopeProofAttemptGlobalId', 'pending'
+               ),
+               updated_by = $6, updated_at = now()
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [
+            organizationId,
+            integrationAccountId,
+            externalAccountId,
+            JSON.stringify(requestedScopes),
+            credentialFingerprint,
+            actorEmail,
+          ],
+        )
+        await client.query(
+          `INSERT INTO operations_commerce_credentials (
+             organization_id, integration_account_id, external_account_id,
+             auth_mode, credential_ciphertext, credential_iv, credential_tag,
+             credential_version, credential_identifier_last_four,
+             verification_status, verified_at, webhook_verification_status,
+             created_by, updated_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3, 'faire_oauth',
+             decode('02', 'hex'), decode(repeat('00', 12), 'hex'),
+             decode(repeat('00', 16), 'hex'), 1, '0002', 'verified', now(),
+             'not_applicable', $4, $4
+           )
+           ON CONFLICT (organization_id, integration_account_id) DO UPDATE
+           SET external_account_id = EXCLUDED.external_account_id,
+               auth_mode = EXCLUDED.auth_mode,
+               credential_ciphertext = EXCLUDED.credential_ciphertext,
+               credential_iv = EXCLUDED.credential_iv,
+               credential_tag = EXCLUDED.credential_tag,
+               credential_version = EXCLUDED.credential_version,
+               credential_identifier_last_four =
+                 EXCLUDED.credential_identifier_last_four,
+               verification_status = EXCLUDED.verification_status,
+               verified_at = EXCLUDED.verified_at,
+               last_error_code = NULL,
+               webhook_verification_status =
+                 EXCLUDED.webhook_verification_status,
+               webhook_verified_at = NULL,
+               updated_by = EXCLUDED.updated_by,
+               updated_at = now()`,
+          [organizationId, integrationAccountId, externalAccountId, actorEmail],
+        )
+        const grantRequest = {
+          provider: 'faire',
+          operation: 'authorizationCodeExchange',
+          grantType: 'AUTHORIZATION_CODE',
+          requestedScopes,
+          credentialFingerprintSha256: credentialFingerprint,
+          providerWrites: 0,
+        }
+        const grantEvidence = {
+          provider: 'faire',
+          operation: 'authorizationCodeExchange',
+          grantType: 'AUTHORIZATION_CODE',
+          tokenType: 'BEARER',
+          externalAccountId,
+          credentialGeneration: 1,
+          requestedScopes,
+          grantedScopes: requestedScopes,
+          credentialFingerprintSha256: credentialFingerprint,
+          providerReference: credentialFingerprint,
+          providerWrites: 0,
+        }
+        const grantObservedAt = new Date()
+        const grantAttempt = await client.query(
+          `INSERT INTO operations_commerce_provider_attempts (
+             organization_id, integration_account_id, action, adapter_version,
+             external_object_id, idempotency_key, request_hash,
+             redacted_request, redacted_response, state, attempt_number,
+             provider_reference, requested_at, completed_at, created_by
+           ) VALUES (
+             $1::uuid, $2::uuid, 'faire.oauth.authorization_code.exchange',
+             'faire-external-api-v2-oauth-authorization-code-v1',
+             'commerce-credential:' || $2::uuid::text || ':v1', $3,
+             operations_faire_provider_write_request_hash($4::jsonb),
+             $4::jsonb, $5::jsonb, 'succeeded', 1, $6,
+             $8::timestamptz, $8::timestamptz, $7
+           ) RETURNING id::text, global_id, completed_at`,
+          [
+            organizationId,
+            integrationAccountId,
+            `faire-oauth-grant:1:${credentialFingerprint}`,
+            JSON.stringify(grantRequest),
+            JSON.stringify(grantEvidence),
+            credentialFingerprint,
+            actorEmail,
+            grantObservedAt,
+          ],
+        )
+        await client.query(
+          `UPDATE operations_integration_accounts
+           SET configuration = jsonb_set(
+             configuration,
+             '{scopeProofAttemptGlobalId}',
+             to_jsonb($3::text),
+             true
+           )
+           WHERE organization_id = $1::uuid AND id = $2::uuid`,
+          [organizationId, integrationAccountId, grantAttempt.rows[0].global_id],
+        )
+        await client.query(
+          `INSERT INTO operations_faire_provider_write_scope_evidence (
+             organization_id, integration_account_id, provider_attempt_id,
+             external_account_id, credential_generation,
+             verified_write_scopes, verification_source,
+             provider_reference, redacted_evidence, evidence_hash,
+             observed_at, recorded_by
+           ) VALUES (
+             $1::uuid, $2::uuid, $3::uuid, $4, 1,
+             ARRAY['WRITE_ORDERS']::text[], 'oauth_grant', $5, $6::jsonb,
+             operations_faire_provider_write_request_hash($6::jsonb),
+             $7::timestamptz, $8
+           )`,
+          [
+            organizationId,
+            integrationAccountId,
+            grantAttempt.rows[0].id,
+            externalAccountId,
+            credentialFingerprint,
+            JSON.stringify(grantEvidence),
+            grantAttempt.rows[0].completed_at,
+            actorEmail,
+          ],
+        )
+        await client.query('SET LOCAL session_replication_role = origin')
+        await client.query(
+          `INSERT INTO operations_commerce_provider_write_controls (
+             organization_id, integration_account_id, provider, row_version,
+             expected_row_version, requested_mode,
+             bound_credential_generation, bound_granted_scopes,
+             bound_granted_scope_digest, changed_by, changed_role,
+             idempotency_key, request_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'faire', $3::bigint,
+             ($3::bigint - 1), 'on', 1, $4::text[], $5, $6, 'owner',
+             $7, repeat('d', 64)
+           )`,
+          [
+            organizationId,
+            integrationAccountId,
+            focusedProviderWriteControlRowVersion,
+            requestedScopes,
+            focusedProviderWriteScopeDigest.faire,
+            actorEmail,
+            `focused-faire-provider-writes-${randomUUID()}`,
+          ],
+        )
+        await client.query('COMMIT')
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    }
+
     const createLegacyReadOnlyAuthorizationFixture = async (provider) => {
       const scenario = `legacy-${provider}-read-only-authority`
       const fixture = await createFixture(scenario, { unitsPerPackage: 1 })
@@ -1929,6 +2244,17 @@ async function verifyShipmentCompletion(databaseUrl) {
            SET provider = $3, integration_type = 'commerce',
                environment = 'sandbox', status = 'active',
                external_account_id = $4,
+               commerce_credential_generation = CASE
+                 WHEN $3 = 'shopify' THEN 1
+                 ELSE commerce_credential_generation
+               END,
+               configuration = CASE
+                 WHEN $3 = 'shopify' THEN jsonb_build_object(
+                   'shopDomain', 'legacy-read-only.myshopify.com',
+                   'grantedScopes', $6::jsonb
+                 )
+                 ELSE configuration
+               END,
                updated_by = $5, updated_at = now()
            WHERE organization_id = $1::uuid AND id = $2::uuid`,
           [
@@ -1937,8 +2263,55 @@ async function verifyShipmentCompletion(databaseUrl) {
             provider,
             externalAccountId,
             fixture.email,
+            JSON.stringify(focusedProviderWriteGrantedScopes.shopify),
           ],
         )
+        if (provider === 'shopify') {
+          await setup.query(
+            `INSERT INTO operations_commerce_credentials (
+               organization_id, integration_account_id, external_account_id,
+               auth_mode, credential_ciphertext, credential_iv, credential_tag,
+               credential_version, credential_identifier_last_four,
+               verification_status, verified_at, webhook_verification_status,
+               created_by, updated_by
+             ) VALUES (
+               $1::uuid, $2::uuid, $3, 'shopify_client_credentials',
+               decode('01', 'hex'), decode(repeat('00', 12), 'hex'),
+               decode(repeat('00', 16), 'hex'), 1, '0001', 'verified', now(),
+               'unverified', $4, $4
+             )`,
+            [
+              fixture.organizationId,
+              context.rows[0].account_id,
+              externalAccountId,
+              fixture.email,
+            ],
+          )
+          await setup.query('SET LOCAL session_replication_role = origin')
+          await setup.query(
+            `INSERT INTO operations_commerce_provider_write_controls (
+               organization_id, integration_account_id, provider, row_version,
+               expected_row_version, requested_mode,
+               bound_credential_generation, bound_granted_scopes,
+               bound_granted_scope_digest, changed_by, changed_role,
+               idempotency_key, request_hash
+             ) VALUES (
+               $1::uuid, $2::uuid, 'shopify', $3::bigint,
+               ($3::bigint - 1), 'on', 1, $4::text[], $5, $6, 'owner',
+               $7, repeat('a', 64)
+             )`,
+            [
+              fixture.organizationId,
+              context.rows[0].account_id,
+              focusedProviderWriteControlRowVersion,
+              focusedProviderWriteGrantedScopes.shopify,
+              focusedProviderWriteScopeDigest.shopify,
+              fixture.email,
+              `legacy-shopify-provider-writes-${randomUUID()}`,
+            ],
+          )
+          await setup.query('SET LOCAL session_replication_role = replica')
+        }
         await setup.query(
           `UPDATE operations_orders
            SET source_provider = $3, external_order_id = $4,
@@ -2262,7 +2635,9 @@ async function verifyShipmentCompletion(databaseUrl) {
            AND source_order.global_id = $2
            AND integration.organization_id = source_order.organization_id
            AND integration.id = source_order.integration_account_id
-         RETURNING integration.id::text, integration.global_id`,
+         RETURNING integration.id::text, integration.global_id,
+                   integration.external_account_id,
+                   integration.configuration->>'shopDomain' AS shop_domain`,
         [
           fixture.organizationId,
           order.planned.orderGlobalId,
@@ -2285,6 +2660,13 @@ async function verifyShipmentCompletion(databaseUrl) {
           fixture.email,
         ],
       )
+      await seedFocusedShopifyProviderWriteAuthority({
+        organizationId: fixture.organizationId,
+        integrationAccountId: account.rows[0].id,
+        externalAccountId: account.rows[0].external_account_id,
+        shopDomain: account.rows[0].shop_domain,
+        actorEmail: fixture.email,
+      })
       // Shopify notification behavior is exercised after the separately
       // tested production-planning boundary. Retain an exact active fixture
       // authorization so the disposable database accepts the prebuilt plan.
@@ -2420,7 +2802,8 @@ async function verifyShipmentCompletion(databaseUrl) {
                external_account_id = $3,
                commerce_credential_generation = 1,
                configuration = jsonb_build_object(
-                 'shopDomain', 'canonical-test.myshopify.com'
+                 'shopDomain', 'canonical-test.myshopify.com',
+                 'grantedScopes', $5::jsonb
                ),
                updated_by = $4, updated_at = now()
            WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -2429,6 +2812,7 @@ async function verifyShipmentCompletion(databaseUrl) {
             source.account_id,
             externalShopId,
             fixture.email,
+            JSON.stringify(focusedProviderWriteGrantedScopes.shopify),
           ],
         )
         await setup.query(
@@ -2451,6 +2835,30 @@ async function verifyShipmentCompletion(databaseUrl) {
             fixture.email,
           ],
         )
+        await setup.query('SET LOCAL session_replication_role = origin')
+        await setup.query(
+          `INSERT INTO operations_commerce_provider_write_controls (
+             organization_id, integration_account_id, provider, row_version,
+             expected_row_version, requested_mode,
+             bound_credential_generation, bound_granted_scopes,
+             bound_granted_scope_digest, changed_by, changed_role,
+             idempotency_key, request_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'shopify', $3::bigint,
+             ($3::bigint - 1), 'on', 1, $4::text[], $5, $6, 'owner',
+             $7, repeat('b', 64)
+           )`,
+          [
+            fixture.organizationId,
+            source.account_id,
+            focusedProviderWriteControlRowVersion,
+            focusedProviderWriteGrantedScopes.shopify,
+            focusedProviderWriteScopeDigest.shopify,
+            fixture.email,
+            `canonical-shopify-provider-writes-${randomUUID()}`,
+          ],
+        )
+        await setup.query('SET LOCAL session_replication_role = replica')
         await setup.query(
           `UPDATE operations_orders
            SET source_provider = 'shopify', external_order_id = $3,
@@ -3896,7 +4304,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       faireOrder.planned.orderGlobalId,
       'mock',
     )
-    await pool.query(
+    const faireCommerceAccount = await pool.query(
       `UPDATE operations_integration_accounts integration
        SET provider = 'faire', environment = 'production',
            external_account_id = 'b_faire-shipment-acceptance',
@@ -3905,9 +4313,11 @@ async function verifyShipmentCompletion(databaseUrl) {
        WHERE source_order.organization_id = $1::uuid
          AND source_order.global_id = $2
          AND integration.organization_id = source_order.organization_id
-         AND integration.id = source_order.integration_account_id`,
+         AND integration.id = source_order.integration_account_id
+       RETURNING integration.id::text`,
       [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
     )
+    assert.equal(faireCommerceAccount.rowCount, 1)
     await pool.query(
       `UPDATE operations_orders
        SET source_provider = 'faire',
@@ -3915,6 +4325,12 @@ async function verifyShipmentCompletion(databaseUrl) {
        WHERE organization_id = $1::uuid AND global_id = $2`,
       [faireFixture.organizationId, faireOrder.planned.orderGlobalId],
     )
+    await seedFocusedFaireProviderWriteAuthority({
+      organizationId: faireFixture.organizationId,
+      integrationAccountId: faireCommerceAccount.rows[0].id,
+      externalAccountId: 'b_faire-shipment-acceptance',
+      actorEmail: faireFixture.email,
+    })
     await expectRejected(
       () => persistence.confirmOperationsOrderShipmentFromPostgres({
         organizationId: faireFixture.organizationId,
@@ -4103,7 +4519,23 @@ async function verifyShipmentCompletion(databaseUrl) {
         originalConsumeSandboxAuthorization
     }
     assert.equal(authorizedFaireResult.orderStatus, 'shipped')
-    assert.equal(authorizedFaireResult.commerceExportState, 'succeeded')
+    const authorizedFaireExportEvidence = await pool.query(
+      `SELECT state, error_code, error_message
+       FROM operations_commerce_fulfillment_exports
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        faireFixture.organizationId,
+        authorizedFaireResult.commerceExportGlobalId,
+      ],
+    )
+    assert.equal(
+      authorizedFaireResult.commerceExportState,
+      'succeeded',
+      JSON.stringify({
+        result: authorizedFaireResult,
+        export: authorizedFaireExportEvidence.rows[0],
+      }),
+    )
     assert.equal(faireFulfillmentPreparationCalls, 1)
     assert.equal(faireFulfillmentExecutionCalls, 1)
     assert.equal(faireFulfillmentInputs.length, 1)
@@ -4163,7 +4595,8 @@ async function verifyShipmentCompletion(databaseUrl) {
          redacted_request, redacted_response, state, attempt_number,
          requested_at, created_by
        )
-       SELECT organization_id, integration_account_id, action, adapter_version,
+       SELECT organization_id, integration_account_id, action,
+              'faire-fulfillment-writeback-v1',
               $3, idempotency_key || ':legacy-no-provider-authority',
               request_hash, redacted_request, '{}'::jsonb, 'prepared', 1,
               now() - interval '6 minutes', created_by
@@ -4246,7 +4679,7 @@ async function verifyShipmentCompletion(databaseUrl) {
                 'version', 1,
                 'externalOrderId', $5::text,
                 'expectedShipDate', $6::jsonb->>'shippedAt',
-                'authorizationRevision', 4,
+                'authorizationRevision', 1,
                 'packages', (
                   SELECT jsonb_agg(jsonb_build_object(
                     'packageReference', package->>'packageReference',
@@ -4271,7 +4704,28 @@ async function verifyShipmentCompletion(databaseUrl) {
         faireFixture.email,
       ],
     )
-    faireFulfillmentAuthorizationRevision = 5
+    await pool.query(
+      `INSERT INTO operations_commerce_provider_write_controls (
+         organization_id, integration_account_id, provider, row_version,
+         expected_row_version, requested_mode,
+         bound_credential_generation, bound_granted_scopes,
+         bound_granted_scope_digest, changed_by, changed_role,
+         idempotency_key, request_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'faire', 2, 1, 'on', 1, $3::text[], $4,
+         $5, 'owner', $6, repeat('e', 64)
+       )`,
+      [
+        faireFixture.organizationId,
+        faireCommerceAccount.rows[0].id,
+        focusedProviderWriteGrantedScopes.faire,
+        focusedProviderWriteScopeDigest.faire,
+        faireFixture.email,
+        `focused-faire-provider-writes-revision-2-${randomUUID()}`,
+      ],
+    )
+    focusedProviderWriteControlRowVersion = 2
+    faireFulfillmentAuthorizationRevision = 2
     const revisedFaireResult = await persistence
       .executeOperationsCommerceFulfillmentExportFromPostgres({
         organizationId: faireFixture.organizationId,
@@ -4301,13 +4755,14 @@ async function verifyShipmentCompletion(databaseUrl) {
       [faireFixture.organizationId, rejectedExport.global_id],
     )
     assert.deepEqual(revisedAttempts.rows, [
-      { state: 'failed', attempt_number: 1, revision: '4' },
+      { state: 'failed', attempt_number: 1, revision: '1' },
       {
         state: 'succeeded',
         attempt_number: 2,
         revision: String(focusedProviderWriteControlRowVersion),
       },
     ])
+    focusedProviderWriteControlRowVersion = 1
 
     const sandboxFixture = await createFixture('sandbox')
     const sandbox = await advanceOrderToPacked(persistence, sandboxFixture, 'sandbox')
@@ -4396,6 +4851,28 @@ async function verifyShipmentCompletion(databaseUrl) {
         authorizedFixture.email,
       ],
     )
+    const authorizedShopifyAccount = await pool.query(
+      `SELECT integration.id::text, integration.external_account_id
+       FROM operations_orders source_order
+       JOIN operations_integration_accounts integration
+         ON integration.organization_id = source_order.organization_id
+        AND integration.id = source_order.integration_account_id
+       WHERE source_order.organization_id = $1::uuid
+         AND source_order.global_id = $2`,
+      [
+        authorizedFixture.organizationId,
+        authorized.planned.orderGlobalId,
+      ],
+    )
+    assert.equal(authorizedShopifyAccount.rowCount, 1)
+    await seedFocusedShopifyProviderWriteAuthority({
+      organizationId: authorizedFixture.organizationId,
+      integrationAccountId: authorizedShopifyAccount.rows[0].id,
+      externalAccountId:
+        authorizedShopifyAccount.rows[0].external_account_id,
+      shopDomain: 'focused-shipment.myshopify.com',
+      actorEmail: authorizedFixture.email,
+    })
     const activationTelemetry = await pool.query(
       `UPDATE operations_activation_scopes
          SET state = 'active', revision = revision + 1,
@@ -4565,7 +5042,7 @@ async function verifyShipmentCompletion(databaseUrl) {
         environment: 'sandbox',
         controlRowVersion: focusedProviderWriteControlRowVersion,
         credentialGeneration: 1,
-        grantedScopeDigest: focusedProviderWriteScopeDigest,
+        grantedScopeDigest: focusedProviderWriteScopeDigest.shopify,
       },
       'The first durable provider attempt must seal exact current account, provider, environment, control, credential, and scope authority',
     )
@@ -4611,7 +5088,6 @@ async function verifyShipmentCompletion(databaseUrl) {
       [authorizedFixture.organizationId, zeroAttemptReauthorization.rows[0].global_id],
     )
     assert.equal(noOffAttempt.rows[0].count, 0)
-    focusedProviderCredentialGenerationOverride = 2
     focusedProviderWritesOn = true
     const reboundZeroAttempt = await persistence
       .executeOperationsCommerceFulfillmentExportFromPostgres({
@@ -4636,8 +5112,8 @@ async function verifyShipmentCompletion(databaseUrl) {
       provider: 'shopify',
       environment: 'sandbox',
       controlRowVersion: focusedProviderWriteControlRowVersion,
-      credentialGeneration: 2,
-      grantedScopeDigest: focusedProviderWriteScopeDigest,
+      credentialGeneration: 1,
+      grantedScopeDigest: focusedProviderWriteScopeDigest.shopify,
     })
     assert.equal(
       zeroAttemptReauthorization.rows[0].payload_snapshot
@@ -5201,7 +5677,7 @@ async function verifyShipmentCompletion(databaseUrl) {
          state, attempts, payload_snapshot, idempotency_key, updated_at
        )
        SELECT organization_id, order_id, shipment_id, 'faire',
-              'bo_faire_predispatch_crash_acceptance', 'processing', 1,
+              external_order_id, 'processing', 1,
               jsonb_set(
                 jsonb_set(
                   fulfillment_export.payload_snapshot,
@@ -5249,6 +5725,7 @@ async function verifyShipmentCompletion(databaseUrl) {
     )
     assert.equal(faireCrashClaim.priorState, 'processing')
     assert.equal(faireCrashClaim.attempt, 2)
+    focusedProviderWriteControlRowVersion = 2
     const faireExecutionsBeforeCrashRecovery = faireFulfillmentExecutionCalls
     const faireCrashRecovery = await persistence
       .executeOperationsCommerceFulfillmentExportFromPostgres({
@@ -5296,6 +5773,7 @@ async function verifyShipmentCompletion(databaseUrl) {
       state: 'succeeded',
       attempt_number: 2,
     }])
+    focusedProviderWriteControlRowVersion = 1
 
     await pool.query(
       `UPDATE operations_shipments shipment
@@ -5488,27 +5966,52 @@ async function verifyShipmentCompletion(databaseUrl) {
          organization_id, integration_account_id, action, adapter_version,
          external_object_id, idempotency_key, request_hash,
          redacted_request, redacted_response, state, attempt_number,
-         requested_at, created_by
+         lease_token, lease_expires_at, requested_at, created_by
        )
        SELECT attempt.organization_id, attempt.integration_account_id,
               attempt.action, attempt.adapter_version,
               $3, attempt.idempotency_key || ':stale-shopify-recovery',
               attempt.request_hash, attempt.redacted_request, '{}'::jsonb,
-              'prepared', 1, now() - interval '6 minutes', attempt.created_by
+              'prepared', 1, $4::uuid, now() + interval '5 minutes',
+              now(), attempt.created_by
        FROM operations_commerce_provider_attempts attempt
        WHERE attempt.organization_id = $1::uuid
          AND attempt.external_object_id = $2
          AND attempt.action = 'shopify.fulfillment.create'
        ORDER BY attempt.requested_at DESC
        LIMIT 1
-       RETURNING global_id`,
+       RETURNING id::text, global_id`,
       [
         authorizedFixture.organizationId,
         authorizedResult.commerceExportGlobalId,
         staleShopifyExport.rows[0].global_id,
+        randomUUID(),
       ],
     )
     assert.equal(staleShopifyProviderAttempt.rowCount, 1)
+    const ageStaleShopifyAttempt = await pool.connect()
+    try {
+      await ageStaleShopifyAttempt.query('BEGIN')
+      await ageStaleShopifyAttempt.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      await ageStaleShopifyAttempt.query(
+        `UPDATE operations_commerce_provider_attempts
+         SET requested_at = now() - interval '6 minutes',
+             lease_expires_at = now() - interval '1 minute'
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [
+          authorizedFixture.organizationId,
+          staleShopifyProviderAttempt.rows[0].id,
+        ],
+      )
+      await ageStaleShopifyAttempt.query('COMMIT')
+    } catch (error) {
+      await ageStaleShopifyAttempt.query('ROLLBACK').catch(() => undefined)
+      throw error
+    } finally {
+      ageStaleShopifyAttempt.release()
+    }
     const preparationCallsBeforeStaleRecovery =
       shopifyFulfillmentPreparationCalls
     const executionCallsBeforeStaleRecovery = shopifyFulfillmentExecutionCalls
@@ -5552,7 +6055,7 @@ async function verifyShipmentCompletion(databaseUrl) {
     assert.equal(
       shopifyFulfillmentReconciliationCalls,
       reconciliationCallsBeforeStaleRecovery + 1,
-      'The first stale recovery must perform exactly one read-only reconciliation',
+      `The first stale recovery must perform exactly one read-only reconciliation: ${JSON.stringify(fencedStaleShopifyExport)}`,
     )
     const fencedStaleShopifyEvidence = await pool.query(
       `SELECT state, attempts, error_code

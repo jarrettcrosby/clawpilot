@@ -18,6 +18,9 @@ export const OPERATIONS_SHOPIFY_SINGLE_SAVE_MIGRATION_CHECKSUM =
 export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_MIGRATION_CHECKSUM =
   'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'
 
+export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM =
+  'c6d40d41082fea69cd01966642f824ed56776a1c4efad47bc6d74f75242ab71d'
+
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
          installed_namespace.nspname || '.' || installed_table.relname
@@ -434,6 +437,110 @@ export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL =
   FROM artifacts
 `
 
+export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL =
+  String.raw`
+  artifacts(kind, identity, definition) AS (
+    SELECT 'column'::text,
+           installed.table_name || '.' || installed.ordinal_position::text
+             || '.' || installed.column_name,
+           pg_catalog.concat_ws('|',
+             installed.data_type,
+             installed.udt_schema,
+             installed.udt_name,
+             installed.is_nullable,
+             COALESCE(installed.column_default, '')
+           )
+    FROM information_schema.columns installed
+    WHERE installed.table_schema = 'public'
+      AND (installed.table_name, installed.column_name) IN (
+        ('operations_integration_accounts', 'commerce_fulfillment_lease_count'),
+        ('operations_commerce_credentials', 'commerce_fulfillment_lease_count')
+      )
+    UNION ALL
+    SELECT 'constraint'::text,
+           installed_table.relname || '.' || installed_constraint.conname,
+           pg_catalog.concat_ws('|',
+             installed_constraint.contype::text,
+             installed_constraint.convalidated::text,
+             installed_constraint.connoinherit::text,
+             installed_constraint.condeferrable::text,
+             installed_constraint.condeferred::text,
+             installed_constraint.confdeltype::text,
+             installed_constraint.confupdtype::text,
+             pg_catalog.pg_get_constraintdef(installed_constraint.oid, false)
+           )
+    FROM pg_catalog.pg_constraint installed_constraint
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = installed_constraint.conrelid
+    JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed_table.relnamespace
+    WHERE installed_namespace.nspname = 'public'
+      AND (installed_table.relname, installed_constraint.conname) IN (
+        ('operations_integration_accounts', 'ops_integration_accounts_fulfillment_lease_valid'),
+        ('operations_commerce_credentials', 'ops_commerce_credentials_fulfillment_lease_valid')
+      )
+    UNION ALL
+    ${functionArtifacts([
+      'public.operations_commerce_fulfillment_authority_is_current(uuid,uuid,text,text,text,integer,jsonb,boolean)',
+      'public.maintain_operations_commerce_fulfillment_authority_lease()',
+      'public.protect_operations_commerce_fulfillment_account_authority()',
+      'public.protect_operations_commerce_fulfillment_credential_authority()',
+      'public.protect_shopify_order_webhook_credential_drift()',
+      'public.fence_operations_commerce_fulfillment_expired_leases(uuid,text)',
+    ])}
+    UNION ALL
+    SELECT 'trigger'::text,
+           installed_table.relname || '.' || installed_trigger.tgname,
+           pg_catalog.concat_ws('|',
+             installed_trigger.tgtype::text,
+             installed_trigger.tgenabled::text,
+             installed_trigger.tgisinternal::text,
+             installed_trigger.tgconstraint::text,
+             function_namespace.nspname || '.' || trigger_function.proname
+               || '(' || pg_catalog.pg_get_function_identity_arguments(
+                 trigger_function.oid
+               ) || ')',
+             COALESCE(pg_catalog.pg_get_expr(
+               installed_trigger.tgqual, installed_trigger.tgrelid
+             ), ''),
+             pg_catalog.btrim(pg_catalog.regexp_replace(
+               pg_catalog.pg_get_triggerdef(installed_trigger.oid),
+               '[[:space:]]+', ' ', 'g'
+             ))
+           )
+    FROM pg_catalog.pg_trigger installed_trigger
+    JOIN pg_catalog.pg_class installed_table
+      ON installed_table.oid = installed_trigger.tgrelid
+    JOIN pg_catalog.pg_namespace installed_namespace
+      ON installed_namespace.oid = installed_table.relnamespace
+    JOIN pg_catalog.pg_proc trigger_function
+      ON trigger_function.oid = installed_trigger.tgfoid
+    JOIN pg_catalog.pg_namespace function_namespace
+      ON function_namespace.oid = trigger_function.pronamespace
+    WHERE installed_namespace.nspname = 'public'
+      AND (installed_table.relname, installed_trigger.tgname) IN (
+        ('operations_commerce_provider_attempts', 'maintain_commerce_fulfillment_authority_lease'),
+        ('operations_integration_accounts', 'protect_commerce_fulfillment_account_authority'),
+        ('operations_commerce_credentials', 'protect_commerce_fulfillment_credential_authority'),
+        ('operations_commerce_credentials', 'protect_shopify_order_webhook_credential_drift')
+      )
+      AND NOT installed_trigger.tgisinternal
+  )
+`
+
+export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_FINGERPRINT_SQL =
+  String.raw`
+  WITH ${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_COUNT = 55
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_HASH =
   '72324e014c76e161ee66133f7980aa22620bf76914adc9bbc53a2bad3cf0f164'
@@ -448,6 +555,9 @@ export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_HASH =
 export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_COUNT = 10
 export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_HASH =
   '729f134cd49c97aae0d155d8d49cdc44b16b9eebde242cce016987b257ff75ad'
+export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT = 14
+export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_HASH =
+  '88e112da61f9894dbf031952f1c11bc7dce8b3c0398089e35c79adaeb91b1eae'
 
 export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
   EXISTS (
@@ -554,4 +664,158 @@ export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
       )
     )
   )
+  AND CASE
+    WHEN NOT EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename =
+        '0316_operations_commerce_fulfillment_authority_leases.sql'
+    )
+    THEN true
+    ELSE (
+      EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0316_operations_commerce_fulfillment_authority_leases.sql'
+          AND checksum =
+            '${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM}'
+      )
+      AND (
+        WITH ${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL}
+        SELECT pg_catalog.count(*) =
+                 ${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT}
+          AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              kind || '|' || identity || '|' || definition,
+              pg_catalog.chr(10) ORDER BY kind, identity
+            ), 'UTF8'
+          ), 'sha256'), 'hex') =
+            '${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_HASH}'
+        FROM artifacts
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.operations_commerce_provider_attempts attempt
+        WHERE attempt.state = 'prepared'
+          AND (
+            (
+              attempt.action = 'shopify.fulfillment.create'
+              AND attempt.adapter_version =
+                    'shopify-fulfillment-writeback-v2'
+            ) OR (
+              attempt.action = 'faire.fulfillment.shipments.create'
+              AND attempt.adapter_version =
+                    'faire-fulfillment-writeback-v2'
+            )
+          )
+          AND (
+            attempt.lease_token IS NULL
+            OR attempt.lease_expires_at IS NULL
+            OR attempt.lease_expires_at <= pg_catalog.clock_timestamp()
+            OR attempt.lease_expires_at >
+                 pg_catalog.clock_timestamp() + interval '5 minutes'
+            OR attempt.lease_expires_at >
+                 attempt.requested_at + interval '5 minutes'
+          )
+      )
+      AND COALESCE(
+        (
+          (
+            pg_catalog.xpath(
+              '/table/row/ready/text()',
+              pg_catalog.query_to_xml(
+                $authority_health$
+                  SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM public.operations_commerce_provider_attempts attempt
+                    WHERE attempt.state = 'prepared'
+                      AND (
+                        (
+                          attempt.action = 'shopify.fulfillment.create'
+                          AND attempt.adapter_version =
+                                'shopify-fulfillment-writeback-v2'
+                        ) OR (
+                          attempt.action =
+                                'faire.fulfillment.shipments.create'
+                          AND attempt.adapter_version =
+                                'faire-fulfillment-writeback-v2'
+                        )
+                      )
+                      AND NOT public.operations_commerce_fulfillment_authority_is_current(
+                        attempt.organization_id,
+                        attempt.integration_account_id,
+                        attempt.action,
+                        attempt.adapter_version,
+                        attempt.external_object_id,
+                        attempt.attempt_number,
+                        attempt.redacted_request,
+                        false
+                      )
+                  ) AS ready
+                $authority_health$,
+                false,
+                false,
+                ''
+              )
+            )
+          )[1]::text
+        )::boolean,
+        false
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.operations_integration_accounts account
+        WHERE (
+          pg_catalog.to_jsonb(account)
+            ->>'commerce_fulfillment_lease_count'
+        )::integer IS DISTINCT FROM (
+          SELECT pg_catalog.count(*)::integer
+          FROM public.operations_commerce_provider_attempts attempt
+          WHERE attempt.organization_id = account.organization_id
+            AND attempt.integration_account_id = account.id
+            AND attempt.state = 'prepared'
+            AND (
+              (
+                attempt.action = 'shopify.fulfillment.create'
+                AND attempt.adapter_version =
+                      'shopify-fulfillment-writeback-v2'
+              ) OR (
+                attempt.action = 'faire.fulfillment.shipments.create'
+                AND attempt.adapter_version =
+                      'faire-fulfillment-writeback-v2'
+              )
+            )
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.operations_commerce_credentials credential
+        WHERE (
+          pg_catalog.to_jsonb(credential)
+            ->>'commerce_fulfillment_lease_count'
+        )::integer IS DISTINCT FROM (
+          SELECT pg_catalog.count(*)::integer
+          FROM public.operations_commerce_provider_attempts attempt
+          WHERE attempt.organization_id = credential.organization_id
+            AND attempt.integration_account_id =
+                  credential.integration_account_id
+            AND attempt.state = 'prepared'
+            AND (
+              attempt.redacted_request->'providerWriteAuthority'
+                ->>'credentialGeneration'
+            )::integer = credential.credential_version
+            AND (
+              (
+                attempt.action = 'shopify.fulfillment.create'
+                AND attempt.adapter_version =
+                      'shopify-fulfillment-writeback-v2'
+              ) OR (
+                attempt.action = 'faire.fulfillment.shipments.create'
+                AND attempt.adapter_version =
+                      'faire-fulfillment-writeback-v2'
+              )
+            )
+        )
+      )
+    )
+  END
 `

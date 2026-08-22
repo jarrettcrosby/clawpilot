@@ -12,6 +12,7 @@ import {
 } from './test-commerce-order-revisions-postgres.mjs'
 import {
   OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL,
+  OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_FINGERPRINT_SQL,
   OPERATIONS_COMMERCE_ORDER_WORKBENCH_FINGERPRINT_SQL,
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
   OPERATIONS_ORDER_SHIPMENT_ADDRESS_FINGERPRINT_SQL,
@@ -79,6 +80,23 @@ async function verifyNegativeCases(client) {
     })
   }
 
+  await inRollback(client, async () => {
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = $2
+       WHERE filename = $1`,
+      [
+        '0316_operations_commerce_fulfillment_authority_leases.sql',
+        '0'.repeat(64),
+      ],
+    )
+    assert.equal(
+      await health(client),
+      false,
+      'Wrong 0316 checksum must fail health once the phase is installed',
+    )
+  })
+
   for (const statement of [
     `ALTER TABLE public.operations_commerce_order_workbench
        ADD COLUMN release_health_drift text`,
@@ -145,6 +163,20 @@ async function verifyNegativeCases(client) {
       'Provider-write function drift must fail health with intact ledgers',
     )
   })
+  await inRollback(client, async () => {
+    await client.query(
+      `ALTER FUNCTION
+         public.operations_commerce_fulfillment_authority_is_current(
+           uuid, uuid, text, text, text, integer, jsonb, boolean
+         )
+       VOLATILE`,
+    )
+    assert.equal(
+      await health(client),
+      false,
+      'Fulfillment-authority lease function drift must fail health',
+    )
+  })
 
   for (const statement of [
     `ALTER TABLE public.operations_commerce_order_workbench
@@ -153,6 +185,8 @@ async function verifyNegativeCases(client) {
        DISABLE TRIGGER operations_commerce_provider_write_controls_validate`,
     `ALTER TABLE public.operations_order_shipment_address_working_copies
        DISABLE TRIGGER validate_operations_order_shipment_address_working_copy`,
+    `ALTER TABLE public.operations_commerce_provider_attempts
+       DISABLE TRIGGER maintain_commerce_fulfillment_authority_lease`,
   ]) {
     await inRollback(client, async () => {
       await client.query(statement)
@@ -163,6 +197,51 @@ async function verifyNegativeCases(client) {
       )
     })
   }
+
+  await inRollback(client, async () => {
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `INSERT INTO public.operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify.fulfillment.create',
+         'shopify-fulfillment-writeback-v2', 'gfe9999999', $3,
+         repeat('a', 64), '{}'::jsonb, '{}'::jsonb, 'prepared', 1,
+         $4::uuid, now() + interval '4 minutes', now()
+       )`,
+      [randomUUID(), randomUUID(), `health-invalid-${randomUUID()}`, randomUUID()],
+    )
+    assert.equal(
+      await health(client),
+      false,
+      'A live prepared attempt without exact account authority must fail health',
+    )
+  })
+  await inRollback(client, async () => {
+    await client.query('SET LOCAL session_replication_role = replica')
+    await client.query(
+      `INSERT INTO public.operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         lease_token, lease_expires_at, requested_at
+       ) VALUES (
+         $1::uuid, $2::uuid, 'faire.fulfillment.shipments.create',
+         'faire-fulfillment-writeback-v2', 'gfe9999998', $3,
+         repeat('b', 64), '{}'::jsonb, '{}'::jsonb, 'prepared', 1,
+         $4::uuid, now() + interval '6 minutes', now()
+       )`,
+      [randomUUID(), randomUUID(), `health-overlong-${randomUUID()}`, randomUUID()],
+    )
+    assert.equal(
+      await health(client),
+      false,
+      'An overlong prepared fulfillment lease must fail health',
+    )
+  })
 }
 
 async function main() {
@@ -253,6 +332,10 @@ async function main() {
         carrierWritesIndependentActivation: await fingerprint(
           client,
           OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL,
+        ),
+        commerceFulfillmentAuthorityLeases: await fingerprint(
+          client,
+          OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_FINGERPRINT_SQL,
         ),
       }
       if (process.argv.includes('--print-fingerprints')) {
