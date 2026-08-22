@@ -1,8 +1,30 @@
+import {
+  OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT,
+  OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_HASH,
+  OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL,
+  OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM,
+} from '@/lib/persistence/operationsOrderEditingReleaseHealth'
+
 export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION =
   '0303_operations_shopify_order_webhook_reconciliation.sql' as const
 
 export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_MIGRATION_CHECKSUM =
   '6c1041b8d5dd33a1bdfb68f855d9b5dc7b306e90e9bfbb16fa9ac087d52d42b8' as const
+
+export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION =
+  '0316_operations_commerce_fulfillment_authority_leases.sql' as const
+
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_FUNCTION_HASH =
+  '9ccde1c41904db27900dc0800c0077e7fa1a7ce70d02f1035324d2a60e27bb43'
+
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_FUNCTION_HASH =
+  'aeb0974f7c1c7bd8decaeefa409b8a7cecaffc97e4d66af12aca0790162489b1'
+
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_TRIGGER_HASH =
+  '0ebf3a87d12028aff7bf8252f3c82d3565e654879311f8c427eefd7d5d88c39a'
+
+const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_TRIGGER_HASH =
+  'bab09e9c0408f54b6ce113c9a60e4175d7f529f7bcc2ad53f284aa701222e5a9'
 
 // This expression is shared by runtime health and disposable-PostgreSQL
 // tamper tests. Every name is public-qualified: a search_path lookalike must
@@ -84,7 +106,16 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
           'sha256'
         ),
         'hex'
-      ) = '9ccde1c41904db27900dc0800c0077e7fa1a7ce70d02f1035324d2a60e27bb43'
+      ) = CASE
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations installed_phase
+          WHERE installed_phase.filename =
+            '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION}'
+        )
+        THEN '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_FUNCTION_HASH}'
+        ELSE '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_FUNCTION_HASH}'
+      END
     FROM required_function
     LEFT JOIN pg_catalog.pg_proc installed_function
       ON installed_function.oid = pg_catalog.to_regprocedure(
@@ -377,5 +408,46 @@ export const SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_HEALTH_SQL = String.raw`
         'operations_commerce_credentials',
         'app_user_organization_memberships'
       )
-  ) = '0ebf3a87d12028aff7bf8252f3c82d3565e654879311f8c427eefd7d5d88c39a'
+  ) = CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM public.schema_migrations installed_phase
+      WHERE installed_phase.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION}'
+    )
+    THEN '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_TRIGGER_HASH}'
+    ELSE '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_PRE_LEASE_TRIGGER_HASH}'
+  END
+  AND CASE
+    WHEN NOT EXISTS (
+      SELECT 1
+      FROM public.schema_migrations installed_phase
+      WHERE installed_phase.filename =
+        '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION}'
+    )
+    THEN true
+    ELSE (
+      EXISTS (
+        SELECT 1
+        FROM public.schema_migrations installed_phase
+        WHERE installed_phase.filename =
+          '${SHOPIFY_ORDER_WEBHOOK_RECONCILIATION_LEASE_MIGRATION}'
+          AND installed_phase.checksum =
+            '${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM}'
+      )
+      AND (
+        WITH ${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACTS_SQL}
+        SELECT pg_catalog.count(*) =
+                 ${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT}
+          AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              kind || '|' || identity || '|' || definition,
+              pg_catalog.chr(10) ORDER BY kind, identity
+            ), 'UTF8'
+          ), 'sha256'), 'hex') =
+            '${OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_HASH}'
+        FROM artifacts
+      )
+    )
+  END
 `
