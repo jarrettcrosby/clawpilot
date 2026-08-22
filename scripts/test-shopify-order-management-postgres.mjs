@@ -2085,7 +2085,7 @@ async function verify(databaseUrl) {
       },
       command('git', [
         'show',
-        '9d67c8d:app_src/lib/persistence/shopifyOrderManagement.ts',
+        '9d67c8d097bcd475e0109c3169a61a0885fcf059:app_src/lib/persistence/shopifyOrderManagement.ts',
       ]),
     )
     const legacyAction = {
