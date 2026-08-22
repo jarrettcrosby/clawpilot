@@ -34,7 +34,29 @@ function assertOrder(source, markers, label) {
 }
 
 const migration = read('db/migrations/0098_operations_label_execution.sql')
+const sandboxTrackingMigration = read(
+  'db/migrations/0319_operations_sandbox_label_tracking_uniqueness.sql',
+)
 const persistence = read('app_src/lib/persistence/operationShipping.ts')
+
+assertIncludes(sandboxTrackingMigration, [
+  'DROP CONSTRAINT IF EXISTS operations_labels_tracking_unique',
+  'operations_labels_production_tracking_unique',
+  "WHERE environment = 'production'",
+  "attempt.environment = 'sandbox'",
+  "attempt.error_code = 'OPERATIONS_LABEL_PERSISTENCE_UNKNOWN'",
+  "package_label.status = 'created'",
+  "collision.environment = 'sandbox'",
+  "'persistenceDisposition', 'sandbox_tracking_collision'",
+  "'retryAuthorizedByMigration'",
+  'DROP TRIGGER IF EXISTS protect_operations_label_attempt_write',
+  'CREATE TRIGGER protect_operations_label_attempt_write',
+], 'Sandbox tracking collision migration')
+assert.doesNotMatch(
+  sandboxTrackingMigration,
+  /WHERE environment = 'sandbox'/,
+  'Sandbox tracking must not receive a uniqueness fence',
+)
 
 const attemptTable = section(
   migration,
