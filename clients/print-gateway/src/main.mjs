@@ -65,6 +65,9 @@ let shutdownComplete = false
 const rendererUrl = pathToFileURL(
   path.join(import.meta.dirname, 'renderer', 'index.html'),
 ).href
+const rendererBridgeReleaseSmokeRequested = process.argv.includes(
+  '--release-smoke-renderer-bridge',
+)
 
 function localDevelopmentIsAllowed() {
   return !app.isPackaged && process.env.CLAWPILOT_GATEWAY_ALLOW_LOCAL_DEVELOPMENT === '1'
@@ -142,7 +145,9 @@ function createWindow(hidden = false) {
     title: 'ClawPilot Print Agent',
     backgroundColor: '#f4f0e8',
     webPreferences: {
-      preload: path.join(import.meta.dirname, 'preload.mjs'),
+      // Sandboxed Electron preload scripts use the limited CommonJS loader.
+      // Keep this bridge CommonJS so the packaged app exposes its IPC API.
+      preload: path.join(import.meta.dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -169,6 +174,80 @@ function createWindow(hidden = false) {
       mainWindow.hide()
     }
   })
+}
+
+function runRendererBridgeReleaseSmoke() {
+  const smokePrinterHost = String(
+    process.env.CLAWPILOT_RENDERER_BRIDGE_SMOKE_PRINTER_HOST || '',
+  ).trim()
+  const smokePrinterPort = String(
+    process.env.CLAWPILOT_RENDERER_BRIDGE_SMOKE_PRINTER_PORT || '',
+  ).trim()
+  const smokePrinterInput = smokePrinterHost || smokePrinterPort
+    ? { printerHost: smokePrinterHost, printerPort: smokePrinterPort }
+    : null
+  let completed = false
+  const finish = (error) => {
+    if (completed) return
+    completed = true
+    clearTimeout(timeout)
+    if (error) {
+      process.stderr.write(`Packaged renderer bridge smoke failed: ${safeError(error)}\n`)
+      app.exit(1)
+      return
+    }
+    process.stdout.write('Packaged Electron renderer bridge smoke passed\n')
+    app.exit(0)
+  }
+  const timeout = setTimeout(() => {
+    finish(new Error('Packaged renderer bridge did not answer before its bounded timeout'))
+  }, 15_000)
+  const execute = () => {
+    void mainWindow.webContents.executeJavaScript(`
+      (async () => {
+        const smokePrinterInput = ${JSON.stringify(smokePrinterInput)}
+        const gateway = window.clawpilotGateway
+        const expectedMethods = [
+          'snapshot',
+          'probe',
+          'pair',
+          'setEnabled',
+          'testInstance',
+          'updateEndpoint',
+          'removeLocalInstance',
+          'setAutoStart',
+          'exportDiagnostics',
+          'onStatus',
+        ]
+        if (!gateway || expectedMethods.some((method) => typeof gateway[method] !== 'function')) {
+          throw new Error('The sandboxed preload bridge is unavailable or incomplete')
+        }
+        const snapshot = await gateway.snapshot()
+        if (
+          !snapshot
+          || typeof snapshot.appVersion !== 'string'
+          || !Array.isArray(snapshot.instances)
+        ) {
+          throw new Error('The packaged renderer did not receive its initial gateway snapshot')
+        }
+        if (smokePrinterInput) {
+          const probe = await gateway.probe(smokePrinterInput)
+          if (!probe || probe.ok !== true || probe.bytesSent !== 0) {
+            throw new Error(probe?.error || 'The packaged no-print printer probe failed')
+          }
+        }
+        return true
+      })()
+    `, true).then((passed) => {
+      if (passed !== true) throw new Error('Packaged renderer bridge smoke returned an invalid result')
+      finish()
+    }).catch(finish)
+  }
+  if (mainWindow.webContents.isLoadingMainFrame()) {
+    mainWindow.webContents.once('did-finish-load', execute)
+  } else {
+    execute()
+  }
 }
 
 function createTray() {
@@ -543,7 +622,12 @@ app.whenReady().then(() => runProtectedGatewayStartup({
     const operationReady = installLocationStatus.ready
       && !migration.blocked
     if (operationReady) applyLoginItem(store.publicState().autoStart)
-    createWindow(process.argv.includes('--hidden') && operationReady)
+    createWindow(rendererBridgeReleaseSmokeRequested
+      || (process.argv.includes('--hidden') && operationReady))
+    if (rendererBridgeReleaseSmokeRequested) {
+      runRendererBridgeReleaseSmoke()
+      return
+    }
     createTray()
     if (operationReady) workers.startEnabled()
     legacyMacMigrationGuard.start()

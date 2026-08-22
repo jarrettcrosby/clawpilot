@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('clawpilotGateway', Object.freeze({
   snapshot: () => ipcRenderer.invoke('gateway:snapshot'),
