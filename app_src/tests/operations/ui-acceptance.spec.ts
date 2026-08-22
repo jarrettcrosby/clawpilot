@@ -1,6 +1,9 @@
 import { expect, test } from '@playwright/test'
 import type { Locator, Page } from '@playwright/test'
-import type { OperationsExceptionStatus } from '@/lib/operations/types'
+import type {
+  OperationsExceptionStatus,
+  OperationsImportedOrderWorkingCopy,
+} from '@/lib/operations/types'
 import type {
   OperationsRegressionPackRateStage,
   OperationsRegressionRun,
@@ -363,6 +366,409 @@ async function installOperationsRoutes(page: Page) {
     }
     return route.fulfill({ json: { ok: true, operations: workspace(exceptionStatus, lifecycle) } })
   })
+}
+
+const workbenchCandidateGlobalId = 'gcoc7654321'
+const workbenchLatestCandidateGlobalId = 'gcoc7654322'
+const workbenchCanonicalOrderGlobalId = 'gor8765432'
+const workbenchCustomerGlobalId = 'ga1234567'
+const workbenchProductGlobalId = 'gp1234567'
+const workbenchPackageProfileGlobalId = 'gpp1234567'
+const workbenchLineGlobalId = 'gcol7654321'
+
+const workbenchPartialShipTo = {
+  name: 'Northstar Receiving',
+  line1: '200 Customer Lane',
+  line2: null,
+  city: 'New York',
+  region: null,
+  postalCode: null,
+  country: 'US',
+}
+
+const workbenchCompleteShipTo = {
+  ...workbenchPartialShipTo,
+  region: 'NY',
+  postalCode: '10001',
+}
+
+function importedWorkbenchOrder(
+  details: boolean,
+): OperationsImportedOrderWorkingCopy {
+  return {
+    kind: 'imported_working_copy',
+    globalId: workbenchCandidateGlobalId,
+    candidateGlobalId: workbenchCandidateGlobalId,
+    canonicalOrderGlobalId: null,
+    integrationAccountGlobalId: 'gia9286799',
+    integrationAccountName: 'Pro Bakery Bites',
+    provider: 'shopify',
+    externalOrderId: 'gid://shopify/Order/7710',
+    orderNumber: '#7710',
+    status: 'imported',
+    needsInfo: true,
+    blockerCodes: [
+      'customer_resolution_required',
+      'delivery_decision_required',
+      'product_mapping_required',
+      'line_price_required',
+      'packaging_required',
+      'ship_to_region_required',
+      'ship_to_postal_code_required',
+    ],
+    customerName: 'Northstar Receiving',
+    lineCount: 1,
+    sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
+    candidateRowVersion: 4,
+    rowVersion: 0,
+    providerVersionChanged: false,
+    resolutionDetailsLoaded: details,
+    customer: {
+      status: 'unresolved',
+      resolvedCustomerGlobalId: null,
+      selectedCustomerGlobalId: null,
+      options: details ? [{
+        globalId: workbenchCustomerGlobalId,
+        name: 'Northstar Outfitters',
+        email: 'buyer@northstar.example',
+      }] : [],
+    },
+    delivery: {
+      status: 'not_supplied',
+      providerRequestedDeliveryAt: null,
+      selectedDeliveryAt: null,
+      draftDeliveryAt: null,
+    },
+    lines: details ? [{
+      globalId: workbenchLineGlobalId,
+      title: 'Trail Pack retail unit',
+      sku: 'TRAIL-PROVIDER-001',
+      quantity: 2,
+      requiresShipping: true,
+      mappingStatus: 'unresolved',
+      priceStatus: 'unresolved',
+      packageStatus: 'unresolved',
+      productGlobalId: null,
+      unitPriceMinor: null,
+      currency: 'USD',
+      packageProfileGlobalId: null,
+      blockerCodes: [
+        'product_mapping_required',
+        'line_price_required',
+        'packaging_required',
+      ],
+    }] : [],
+    productOptions: details ? [{
+      globalId: workbenchProductGlobalId,
+      name: 'Trail Pack',
+      sku: 'TRAIL-001',
+      packageProfiles: [{
+        globalId: workbenchPackageProfileGlobalId,
+        name: 'Trail Pack measured single',
+      }],
+    }] : [],
+    shipTo: {
+      value: workbenchPartialShipTo,
+      readiness: 'incomplete',
+      provenance: 'provider',
+      syncStatus: 'provider_snapshot',
+      issues: [
+        { field: 'region', code: 'required' },
+        { field: 'postalCode', code: 'required' },
+      ],
+    },
+    providerWrites: 0,
+  }
+}
+
+function promotedWorkbenchOrder() {
+  return {
+    ...selectedOrder,
+    id: 'canonical-workbench-order-id',
+    globalId: workbenchCanonicalOrderGlobalId,
+    orderNumber: '#7710',
+    externalOrderId: 'gid://shopify/Order/7710',
+    customerName: 'Northstar Outfitters',
+    customerGlobalId: workbenchCustomerGlobalId,
+    sourceProvider: 'shopify',
+    status: 'imported',
+    rowVersion: 0,
+    planStatus: null,
+    waveStatus: null,
+    pickTaskCount: 0,
+    readyPickTaskCount: 0,
+    pickedPickTaskCount: 0,
+    packageCount: 0,
+    plannedPackageCount: 0,
+    packedPackageCount: 0,
+    availableActions: [],
+    warehouseName: null,
+    promisedDeliveryAt: '2026-08-30T15:30:00.000Z',
+    lineCount: 1,
+    expectedCostMinor: '0',
+    expectedRevenueMinor: '2500',
+    expectedMarginMinor: '2500',
+    shipTo: workbenchCompleteShipTo,
+    shipmentShipTo: {
+      ...selectedOrder.shipmentShipTo,
+      orderGlobalId: workbenchCanonicalOrderGlobalId,
+      value: workbenchCompleteShipTo,
+      sourceValue: workbenchCompleteShipTo,
+      readiness: 'carrier_ready',
+      issues: [],
+      editable: true,
+      editBlockedReason: null,
+      providerWrites: 0,
+    },
+    lines: [{
+      globalId: 'gol8765432',
+      productGlobalId: workbenchProductGlobalId,
+      productName: 'Trail Pack',
+      channelSku: 'TRAIL-PROVIDER-001',
+      quantity: 2,
+      reservedQuantity: 0,
+      pickStatus: null,
+    }],
+    packages: [],
+    rates: [],
+    billableEvents: [],
+    events: [],
+    planningPreparation: {
+      accountGlobalId: 'gia9286799',
+      candidateGlobalId: workbenchCandidateGlobalId,
+      candidateRowVersion: 4,
+    },
+    sandboxCommerceE2eAuthorization: null,
+    fulfillmentNotificationPolicy: {
+      mode: 'clawpilot_explicit',
+      notifyCustomerDefault: false,
+      revision: 1,
+    },
+  }
+}
+
+type ImportedWorkbenchRouteRequest = {
+  body: Record<string, unknown>
+  idempotencyKey: string
+}
+
+async function installImportedWorkbenchRoutes(
+  page: Page,
+  options: { refreshConflict?: boolean } = {},
+) {
+  const capture = {
+    patchRequests: [] as ImportedWorkbenchRouteRequest[],
+    patchResults: [] as Array<Record<string, unknown>>,
+    refreshRequests: [] as ImportedWorkbenchRouteRequest[],
+    providerMutationRequests: [] as string[],
+    canonicalWorkspaceReads: 0,
+  }
+  let promoted = false
+  let detailedOrder = importedWorkbenchOrder(true)
+
+  if (options.refreshConflict) {
+    detailedOrder = {
+      ...detailedOrder,
+      providerVersionChanged: true,
+      shipTo: {
+        value: workbenchCompleteShipTo,
+        readiness: 'carrier_ready',
+        provenance: 'local',
+        syncStatus: 'local_only',
+        issues: [],
+      },
+    }
+  }
+
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (
+      url.pathname.startsWith('/api/integrations/commerce/')
+      && !['GET', 'HEAD'].includes(request.method())
+    ) {
+      capture.providerMutationRequests.push(
+        `${request.method()} ${url.pathname}`,
+      )
+    }
+  })
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/training',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        training: {
+          eligible: false,
+          eligibilityCode: 'canonical_order_promoted',
+          run: null,
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-revisions',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: workbenchCanonicalOrderGlobalId,
+          orderRowVersion: 0,
+          orderStatus: 'imported',
+          state: null,
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/shopify-order-management',
+    async (route) => route.fulfill({
+      status: 503,
+      json: {
+        ok: false,
+        code: 'NOT_REQUIRED_FOR_WORKBENCH_ACCEPTANCE',
+        error: 'Provider editor is outside this local handoff test',
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      const request = route.request()
+      if (request.method() === 'GET') {
+        expect(new URL(request.url()).searchParams.get('candidate'))
+          .toBe(detailedOrder.candidateGlobalId)
+        return route.fulfill({ json: { ok: true, orders: [detailedOrder] } })
+      }
+      const captured = {
+        body: request.postDataJSON() as Record<string, unknown>,
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+      }
+      if (request.method() === 'PATCH') {
+        capture.patchRequests.push(captured)
+        promoted = true
+        const result = {
+          candidateGlobalId: workbenchCandidateGlobalId,
+          canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+          rowVersion: 1,
+          readiness: 'carrier_ready',
+          issues: [],
+          changedFields: ['region', 'postalCode'],
+          syncStatus: 'local_only',
+          promotionStatus: 'promoted',
+          remainingBlockerCodes: [],
+          providerVersionChanged: false,
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          replayed: false,
+        }
+        capture.patchResults.push(result)
+        return route.fulfill({
+          json: {
+            ok: true,
+            result,
+            order: null,
+          },
+        })
+      }
+      if (request.method() !== 'POST' || !options.refreshConflict) {
+        throw new Error(`Unexpected order-workbench request: ${request.method()}`)
+      }
+      capture.refreshRequests.push(captured)
+      if (capture.refreshRequests.length === 1) {
+        return route.fulfill({
+          status: 409,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
+            error: 'Choose which changed address values to retain',
+            latestCandidateGlobalId: workbenchLatestCandidateGlobalId,
+            conflicts: [{
+              field: 'line1',
+              localValue: '200 Customer Lane',
+              providerValue: '303 Provider Avenue',
+            }, {
+              field: 'postalCode',
+              localValue: '10001',
+              providerValue: '11201',
+            }],
+          },
+        })
+      }
+      detailedOrder = {
+        ...detailedOrder,
+        globalId: workbenchLatestCandidateGlobalId,
+        candidateGlobalId: workbenchLatestCandidateGlobalId,
+        candidateRowVersion: 5,
+        rowVersion: 1,
+        providerVersionChanged: false,
+        shipTo: {
+          value: {
+            ...workbenchCompleteShipTo,
+            line1: '200 Customer Lane',
+            postalCode: '11201',
+          },
+          readiness: 'carrier_ready',
+          provenance: 'local',
+          syncStatus: 'local_only',
+          issues: [],
+        },
+      }
+      return route.fulfill({
+        json: {
+          ok: true,
+          refreshResult: {
+            previousCandidateGlobalId: workbenchCandidateGlobalId,
+            candidateGlobalId: workbenchLatestCandidateGlobalId,
+            rowVersion: 1,
+            status: 'rebased',
+            providerChangedFields: ['line1', 'postalCode'],
+            preservedLocalFields: ['line1'],
+            providerWrites: 0,
+            providerWriteIntentCreated: false,
+            replayed: false,
+          },
+          order: detailedOrder,
+        },
+      })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    const requestedOrder = new URL(route.request().url()).searchParams
+      .get('order')
+    if (requestedOrder === workbenchCanonicalOrderGlobalId) {
+      capture.canonicalWorkspaceReads += 1
+    }
+    const canonical = promoted ? promotedWorkbenchOrder() : null
+    return route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...workspace(),
+          activation: { ...workspace().activation, state: 'read_only' },
+          summary: {
+            ...workspace().summary,
+            openOrders: 1,
+            exceptions: 0,
+          },
+          importedOrders: promoted ? [] : [{
+            ...detailedOrder,
+            resolutionDetailsLoaded: false,
+            customer: { ...detailedOrder.customer, options: [] },
+            lines: [],
+            productOptions: [],
+          }],
+          orders: canonical ? [canonical] : [],
+          selectedOrder: canonical,
+          exceptions: [],
+          shipping: { sandboxCarrierAccounts: [] },
+        },
+      },
+    })
+  })
+
+  return capture
 }
 
 async function installImportedOrderPreparationRoutes(page: Page) {
@@ -1167,6 +1573,157 @@ async function installReplayRoutes(page: Page) {
     return route.fulfill({ json: { ok: true, walkthrough: walkthrough() } })
   })
 }
+
+test('incomplete imported order saves one local working copy and hands off to canonical Orders', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  const importedRow = page.getByTestId(
+    `imported-order-${workbenchCandidateGlobalId}`,
+  )
+  await expect(importedRow).toBeVisible()
+  await expect(importedRow).toContainText('#7710')
+  await expect(importedRow).toContainText('Needs info')
+  await importedRow.click()
+
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect(page.getByText('Ship-to incomplete for rates')).toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByText('Quantity 2')).toBeVisible()
+
+  const customer = page.getByRole('combobox', { name: 'Customer' })
+  await expect(customer).toBeEnabled()
+  await customer.click()
+  await page.getByRole('option', { name: /Northstar Outfitters/ }).click()
+
+  const product = page.getByRole('combobox', { name: 'ClawPilot product' })
+  await product.click()
+  await page.getByRole('option', { name: /Trail Pack · TRAIL-001/ }).click()
+  await page.getByLabel('Unit price (USD)').fill('12.50')
+
+  const packageProfile = page.getByRole('combobox', {
+    name: 'Package profile',
+  })
+  await packageProfile.click()
+  await page.getByRole('option', {
+    name: 'Trail Pack measured single',
+  }).click()
+
+  const requestedDelivery = page.getByLabel('Requested delivery')
+  await requestedDelivery.fill('2026-08-30T15:30')
+  const requestedDeliveryAt = await requestedDelivery.evaluate((element) => (
+    new Date((element as HTMLInputElement).value).toISOString()
+  ))
+  await page.getByLabel('State / province').fill('NY')
+  await page.getByLabel('Postal code').fill('10001')
+  await expect(page.getByText('Ready for rates')).toBeVisible()
+
+  const save = page.getByRole('button', { name: 'Save', exact: true })
+  await expect(save).toHaveCount(1)
+  await expect(save).toBeEnabled()
+  await save.click()
+
+  await expect(page.getByText('Order #7710 imported')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect.poll(() => capture.canonicalWorkspaceReads)
+    .toBeGreaterThanOrEqual(1)
+
+  expect(capture.patchRequests).toHaveLength(1)
+  expect(capture.patchRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.patchRequests[0].body).toEqual({
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+    shipTo: workbenchCompleteShipTo,
+    resolution: {
+      customerGlobalId: workbenchCustomerGlobalId,
+      requestedDeliveryAt,
+      lines: [{
+        lineGlobalId: workbenchLineGlobalId,
+        productGlobalId: workbenchProductGlobalId,
+        unitPriceMinor: 1250,
+        currency: 'USD',
+        packageProfileGlobalId: workbenchPackageProfileGlobalId,
+      }],
+    },
+  })
+  expect(capture.patchResults).toEqual([expect.objectContaining({
+    canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+    promotionStatus: 'promoted',
+    providerWrites: 0,
+    providerWriteIntentCreated: false,
+  })])
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('imported order provider refresh resolves each address conflict explicitly', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    refreshConflict: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+  const refresh = page.getByRole('button', { name: 'Refresh from Shopify' })
+  await expect(refresh).toBeEnabled()
+  await refresh.click()
+
+  const keepLocalAddress = page.getByRole('button', {
+    name: 'Keep mine: 200 Customer Lane',
+  })
+  const useProviderAddress = page.getByRole('button', {
+    name: 'Use Shopify: 303 Provider Avenue',
+  })
+  const keepLocalPostalCode = page.getByRole('button', {
+    name: 'Keep mine: 10001',
+  })
+  const useProviderPostalCode = page.getByRole('button', {
+    name: 'Use Shopify: 11201',
+  })
+  await expect(keepLocalAddress).toBeVisible()
+  await expect(useProviderAddress).toBeVisible()
+  await expect(keepLocalPostalCode).toBeVisible()
+  await expect(useProviderPostalCode).toBeVisible()
+
+  await keepLocalAddress.click()
+  await useProviderPostalCode.click()
+  await page.getByRole('button', { name: 'Apply choices' }).click()
+
+  await expect(page.getByText(
+    'Order #7710 refreshed; review item matches before saving',
+  )).toBeVisible()
+  await expect(page.getByLabel('Address')).toHaveValue('200 Customer Lane')
+  await expect(page.getByLabel('Postal code')).toHaveValue('11201')
+
+  expect(capture.refreshRequests).toHaveLength(2)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+  })
+  expect(capture.refreshRequests[1].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+    latestCandidateGlobalId: workbenchLatestCandidateGlobalId,
+    resolutions: {
+      line1: 'local',
+      postalCode: 'provider',
+    },
+  })
+  for (const request of capture.refreshRequests) {
+    expect(request.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  }
+  expect(capture.refreshRequests[0].idempotencyKey)
+    .not.toBe(capture.refreshRequests[1].idempotencyKey)
+  expect(capture.providerMutationRequests).toEqual([])
+})
 
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
