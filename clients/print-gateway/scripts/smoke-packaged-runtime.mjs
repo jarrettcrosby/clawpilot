@@ -133,6 +133,46 @@ try {
   assert.equal(Object.values(ledger.deliveries)[0].state, 'acknowledged')
   assert.match(Buffer.concat(stdout).toString('utf8'), /"event":"job_acknowledged"/)
   process.stdout.write('Packaged Electron worker and nested raw-delivery helper smoke passed\n')
+
+  const rendererChild = spawn(executablePath, [
+    '--release-smoke-renderer-bridge',
+    `--user-data-dir=${path.join(temporary, 'renderer-user-data')}`,
+  ], {
+    env: {
+      ...process.env,
+      CLAWPILOT_GATEWAY_TEST_MODE: '1',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    detached: process.platform !== 'win32',
+  })
+  const rendererStdout = []
+  const rendererStderr = []
+  rendererChild.stdout.on('data', (chunk) => rendererStdout.push(chunk))
+  rendererChild.stderr.on('data', (chunk) => rendererStderr.push(chunk))
+  let rendererTimedOut = false
+  const rendererTimeout = setTimeout(() => {
+    rendererTimedOut = true
+    if (process.platform === 'win32') {
+      spawnSync('taskkill.exe', ['/PID', String(rendererChild.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      })
+    } else {
+      try { process.kill(-rendererChild.pid, 'SIGKILL') } catch { /* child already exited */ }
+    }
+  }, smokeTimeoutMs)
+  const [rendererCode, rendererSignal] = await once(rendererChild, 'exit')
+  clearTimeout(rendererTimeout)
+  const rendererError = Buffer.concat(rendererStderr).toString('utf8')
+  assert.equal(rendererTimedOut, false, 'Packaged renderer bridge exceeded its bounded smoke timeout')
+  assert.equal(
+    rendererCode,
+    0,
+    `Packaged renderer bridge failed (${rendererSignal || 'no signal'}): ${rendererError}`,
+  )
+  assert.doesNotMatch(rendererError, /Unable to load preload|Uncaught TypeError/i)
+  process.stdout.write('Packaged Electron renderer bridge smoke passed\n')
 } finally {
   api.close()
   printer.close()

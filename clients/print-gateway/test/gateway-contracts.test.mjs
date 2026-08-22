@@ -920,6 +920,18 @@ test('startup corruption fails closed with a redacted native recovery message', 
 
 test('renderer navigation and privileged IPC are pinned to the exact main frame', () => {
   const rendererUrl = 'file:///Applications/ClawPilot.app/Contents/Resources/app.asar/src/renderer/index.html'
+  const mainSource = readFileSync(
+    path.join(repositoryRoot, 'clients/print-gateway/src/main.mjs'),
+    'utf8',
+  )
+  const preloadSource = readFileSync(
+    path.join(repositoryRoot, 'clients/print-gateway/src/preload.cjs'),
+    'utf8',
+  )
+  assert.match(mainSource, /preload: path\.join\(import\.meta\.dirname, 'preload\.cjs'\)/)
+  assert.doesNotMatch(mainSource, /preload\.mjs/)
+  assert.match(preloadSource, /require\('electron'\)/)
+  assert.doesNotMatch(preloadSource, /^\s*import\s/m)
   assert.equal(rendererNavigationIsTrusted(rendererUrl, rendererUrl), true)
   for (const hostile of [
     'file:///tmp/hostile.html',
