@@ -1698,7 +1698,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       WHERE filename =
         '0306_operations_order_training_independent_control_contract.sql'
         AND checksum =
-          '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+          '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
     )
   )
   AND (
@@ -1714,7 +1714,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
       WHERE filename =
         '0314_operations_local_work_independent_activation.sql'
         AND checksum =
-          '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+          '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
     )
   )
   AND (
@@ -2043,7 +2043,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
           WHERE filename =
             '0306_operations_order_training_independent_control_contract.sql'
             AND checksum =
-              '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+              '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
         ) THEN
           '0c8485310e1dade3adfd8b38128b7ea288975456f2ff796fa9160a5757881dad'
         ELSE
@@ -2079,18 +2079,18 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
           WHERE filename =
             '0314_operations_local_work_independent_activation.sql'
             AND checksum =
-              '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+              '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
         ) THEN
-          '91f77ed50a79257b5540007f89a915fb695f5eb25a4ffb098e692090df0855fa'
+          'ddceac2ff8a9ed2b03757c6111059c78aeba3dcbedd2060315166cf1b0ffda65'
         WHEN EXISTS (
           SELECT 1
           FROM public.schema_migrations
           WHERE filename =
             '0306_operations_order_training_independent_control_contract.sql'
             AND checksum =
-              '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+              '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
         ) THEN
-          'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310'
+          'ddceac2ff8a9ed2b03757c6111059c78aeba3dcbedd2060315166cf1b0ffda65'
         ELSE
           'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3'
         END
@@ -2104,7 +2104,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
           WHERE filename =
             '0306_operations_order_training_independent_control_contract.sql'
             AND checksum =
-              '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+              '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
         ) THEN
           'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053'
         ELSE
@@ -2145,7 +2145,7 @@ const OPERATIONS_SHADOW_TRAINING_HEALTH_SQL = String.raw`
                  WHERE filename =
                    '0306_operations_order_training_independent_control_contract.sql'
                    AND checksum =
-                     '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+                     '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
                )
               THEN 'search_path=pg_catalog, public, pg_temp'
               ELSE ''
@@ -2385,7 +2385,7 @@ const OPERATIONS_SHADOW_TRAINING_AUTHORITY_CONTRACT_SQL = String.raw`
       WHERE filename =
         '0314_operations_local_work_independent_activation.sql'
         AND checksum =
-          '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+          '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
     ) THEN 'local-work-independent'
     WHEN (
       ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
@@ -2396,7 +2396,7 @@ const OPERATIONS_SHADOW_TRAINING_AUTHORITY_CONTRACT_SQL = String.raw`
       WHERE filename =
         '0306_operations_order_training_independent_control_contract.sql'
         AND checksum =
-          '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+          '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
     ) THEN 'independent-strict'
     WHEN (
       ${OPERATIONS_SHADOW_TRAINING_HEALTH_SQL}
@@ -6137,7 +6137,7 @@ export async function GET() {
                 WHERE filename =
                   '0314_operations_local_work_independent_activation.sql'
                   AND checksum =
-                    '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+                    '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
               )
               AND pg_catalog.to_regclass(
                 'public.operations_commerce_store_sync_controls'

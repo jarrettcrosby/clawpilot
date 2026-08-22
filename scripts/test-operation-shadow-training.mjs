@@ -39,7 +39,7 @@ const [
 
 assert.equal(
   createHash('sha256').update(independentControlContract).digest('hex'),
-  '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7',
+  '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1',
   'The frozen 0306 independent-control contract must remain byte-exact',
 )
 assert.equal(

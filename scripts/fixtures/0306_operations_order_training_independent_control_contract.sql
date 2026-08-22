@@ -88,8 +88,36 @@ BEGIN
     ON installed_language.oid = installed.prolang;
 
   IF installed_function_count <> 11
-     OR function_catalog_hash IS DISTINCT FROM
-       'd36fac978d58106ed11e30a2079253fae5b47c54612a4d5901d2de1c71742b33'
+     OR (
+       EXISTS (
+         SELECT 1
+         FROM public.schema_migrations
+         WHERE filename =
+           '0314_operations_local_work_independent_activation.sql'
+           AND checksum =
+             '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+       )
+       AND function_catalog_hash IS DISTINCT FROM
+         '193a1231079de374c3ffe2f8009d750bb8cc70838ce9e5c81a6df9f677883d65'
+     )
+     OR (
+       NOT EXISTS (
+         SELECT 1
+         FROM public.schema_migrations
+         WHERE filename =
+           '0314_operations_local_work_independent_activation.sql'
+       )
+       AND function_catalog_hash IS DISTINCT FROM
+         'd36fac978d58106ed11e30a2079253fae5b47c54612a4d5901d2de1c71742b33'
+     )
+     OR EXISTS (
+       SELECT 1
+       FROM public.schema_migrations
+       WHERE filename =
+         '0314_operations_local_work_independent_activation.sql'
+         AND checksum IS DISTINCT FROM
+           '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
+     )
   THEN
     RAISE EXCEPTION
       'Order Training contract requires exact profile-bound predecessors';
@@ -398,19 +426,14 @@ BEGIN
 END;
 $$;
 
--- Serialize every canonical write with exact-order training authorization.
--- Whichever transaction acquires the organization authority first wins:
--- canonical work makes a later training authorization ineligible, while a
--- committed training run quarantines later canonical work for that order.
+-- Keep exact-order training isolation and evidence quarantine without
+-- restoring the retired organization-wide Shadow gate for unrelated work.
 CREATE OR REPLACE FUNCTION public.guard_shadow_commerce_canonical_write()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
-  activation_state text;
-  order_provider text;
-  account_type text;
   canonical_identity_changed boolean := TG_OP = 'INSERT';
 BEGIN
   PERFORM pg_advisory_xact_lock(
@@ -451,29 +474,6 @@ BEGIN
       USING ERRCODE = 'P0001';
   END IF;
 
-  IF TG_OP = 'UPDATE'
-     AND NEW.order_id IS NOT DISTINCT FROM OLD.order_id THEN
-    RETURN NEW;
-  END IF;
-
-  SELECT activation.state, source_order.source_provider,
-         account.integration_type
-    INTO activation_state, order_provider, account_type
-  FROM operations_orders source_order
-  JOIN operations_integration_accounts account
-    ON account.organization_id = source_order.organization_id
-   AND account.id = source_order.integration_account_id
-  JOIN operations_activation_scopes activation
-    ON activation.organization_id = source_order.organization_id
-  WHERE source_order.organization_id = NEW.organization_id
-    AND source_order.id = NEW.order_id;
-
-  IF activation_state = 'shadow'
-     AND order_provider IN ('shopify', 'faire')
-     AND account_type = 'commerce' THEN
-    RAISE EXCEPTION 'OPERATIONS_SHADOW_TRAINING_OVERLAY_REQUIRED'
-      USING ERRCODE = 'P0001';
-  END IF;
   RETURN NEW;
 END;
 $$;
@@ -596,7 +596,7 @@ BEGIN
 
   IF installed_function_count <> 11
      OR function_catalog_hash IS DISTINCT FROM
-       'a25bf23cb17c2b9fb1b7fb3df3cf08fddbd1c6db041e4af96f467f1c2d52c8ce'
+       '6e65ce001f133f420e3a80621774d55d65119c03609a5b91245596d3635d8503'
   THEN
     RAISE EXCEPTION
       'Order Training contract did not install exact independent functions';

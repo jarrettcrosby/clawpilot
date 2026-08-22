@@ -30,7 +30,7 @@ const futureIndependentControlContract = readFileSync(
   'utf8',
 )
 const futureIndependentControlChecksum =
-  '322e1b15b49ed319e0cd10d0a5b19ff6e98b04eac07aaabeec64c342aa063af7'
+  '0f7bb5f6e2b82569f5ba42822d41e4f42772366fdd572e772c12bfc5d413a4e1'
 assert.equal(
   createHash('sha256').update(futureIndependentControlContract).digest('hex'),
   futureIndependentControlChecksum,
@@ -80,7 +80,7 @@ const requiredStructure = [
   '0306_operations_order_training_independent_control_contract.sql',
   futureIndependentControlChecksum,
   '0314_operations_local_work_independent_activation.sql',
-  '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1',
+  '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c',
   'operations_shadow_training_runs',
   'operations_shadow_training_packages',
   'operations_shadow_training_pick_tasks',
@@ -101,9 +101,8 @@ const requiredStructure = [
   'c1fa92771860f78c76184fae9ffa538cb772d25efd0fadc23d2f72192f106e21',
   'e15f2304f2daa3d4ec1238374d052368f57c68bf6df030bbdd21735e245bf230',
   '786a373981688256f1f83b94208b405a2b6446d04a21678a2a76a4110005d14e',
-  'ca5802ce1dc69f7e6d47f6cb0b5abc44dfac824fb8318610820e03383bedb310',
   'eac242f228f3865c002e492a3e451a519d63c642794ca4c102ac0a7f34e710a3',
-  '91f77ed50a79257b5540007f89a915fb695f5eb25a4ffb098e692090df0855fa',
+  'ddceac2ff8a9ed2b03757c6111059c78aeba3dcbedd2060315166cf1b0ffda65',
   'a5b376395ea46576c38bcd3dabb9e1a57b97aeeb37bef308afdec3ce4fa0e053',
   'b6f80a886cf6d6218b714c8588219464a07c801991fa727de219db515861855f',
   'operations_shadow_training_runs_one_open_order',

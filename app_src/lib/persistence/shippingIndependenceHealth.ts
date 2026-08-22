@@ -22,7 +22,7 @@ export const SHIPPING_INDEPENDENCE_HEALTH_SQL = String.raw`
     WHERE filename =
       '0314_operations_local_work_independent_activation.sql'
       AND checksum =
-        '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+        '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
   )
   AND (
     WITH required_function(signature) AS (

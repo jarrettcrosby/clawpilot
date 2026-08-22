@@ -16,7 +16,7 @@ const migration = read(
 
 assert.equal(
   createHash('sha256').update(migration).digest('hex'),
-  '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1',
+  '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c',
   '0314 local-work authority bytes must remain exact',
 )
 

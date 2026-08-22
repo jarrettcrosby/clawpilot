@@ -19,7 +19,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
             WHERE filename =
               '0314_operations_local_work_independent_activation.sql'
               AND checksum =
-                '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
           ) THEN
             'e3464f9506ab744c174b026ad6d525c711b2f3f5153c42246f112a003174b1c3'
           ELSE
@@ -39,7 +39,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
             WHERE filename =
               '0314_operations_local_work_independent_activation.sql'
               AND checksum =
-                '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
           ) THEN
             '0c8f917c0f8f477eb06e8fc4978e5e74cb85a9a6741c1bbc660a03b96e012d5f'
           ELSE
@@ -69,7 +69,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_FUNCTION_HEALTH_SQL = String.raw`
             WHERE filename =
               '0314_operations_local_work_independent_activation.sql'
               AND checksum =
-                '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+                '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
           ) THEN
             '0b035f56b1645b1c29ebc3fe0f5db2accf017aa742f91d5582c5ef4df9697c33'
           ELSE
@@ -210,7 +210,7 @@ export const OPERATIONS_COMMERCE_STORE_SYNC_REWRITTEN_FUNCTION_HEALTH_SQL =
           WHERE filename =
             '0314_operations_local_work_independent_activation.sql'
             AND checksum =
-              '36e2daed265db2727edc14ebd84e557532cfd8bb7990d8da505f132025a85ee1'
+              '2c69fa93d265ced3a0019cc5f5b6770ae2890146e4bc00d213d9b67ae18d7d3c'
         ) THEN
           '1d86f5c2c2693c949e6de870e0e1f93af2dc5c5b8aa306349c11291e82d6e78f'
         ELSE

@@ -229,6 +229,13 @@ AS $$
 DECLARE
   canonical_identity_changed boolean := TG_OP = 'INSERT';
 BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(
+      'operations:activation:' || NEW.organization_id::text,
+      0
+    )
+  );
+
   IF TG_TABLE_NAME = 'operations_fulfillment_plans'
      AND EXISTS (
        SELECT 1
