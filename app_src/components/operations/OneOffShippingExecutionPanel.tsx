@@ -16,10 +16,7 @@ import {
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
-import type {
-  OperationsActivationState,
-  OperationsOrderDetail,
-} from '@/lib/operations/types'
+import type { OperationsOrderDetail } from '@/lib/operations/types'
 import type { OneOffShipmentExecutionState } from '@/lib/operations/oneOffShipments'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
@@ -49,7 +46,6 @@ export default function OneOffShippingExecutionPanel({
   state,
   loading,
   error,
-  activationState,
   canManage,
   canExecute,
   canPurchaseLivePostage,
@@ -62,7 +58,6 @@ export default function OneOffShippingExecutionPanel({
   state: OneOffShipmentExecutionState | null
   loading: boolean
   error: string
-  activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
   canPurchaseLivePostage: boolean
@@ -83,9 +78,6 @@ export default function OneOffShippingExecutionPanel({
     || (live && !canPurchaseLivePostage
       ? 'Live-postage permission is required for LIVE rating and postage purchase.'
       : null)
-  const activationBlocker = live && activationState !== 'active'
-    ? 'LIVE one-off execution requires Operations Active mode.'
-    : null
   const group = state?.carrierGroup || null
   const unresolved = Boolean(group?.unresolved)
   const activeGroup = Boolean(group?.active)
@@ -111,7 +103,6 @@ export default function OneOffShippingExecutionPanel({
   }, [clock, expiresAtMs])
   const eligibleOffers = state?.packedRate?.offers || []
   const purchaseBlocker = purchasePermissionBlocker
-    || activationBlocker
     || (order.status !== 'packed' ? 'Verify every package before rerating or buying postage.' : null)
     || (packageMismatch ? 'The order detail does not match the complete packed package group. Refresh before continuing.' : null)
     || (unresolved ? 'The carrier group has an unresolved provider outcome and must be reconciled before retrying.' : null)
@@ -121,7 +112,6 @@ export default function OneOffShippingExecutionPanel({
     || (packedRateExpired ? 'The packed rate has expired. Refresh it before purchasing.' : null)
     || (!eligibleOffers.length ? 'The planned carrier service did not return a matching packed rate.' : null)
   const refreshBlocker = purchasePermissionBlocker
-    || activationBlocker
     || (order.status !== 'packed' ? 'Verify every package before refreshing packed rates.' : null)
     || (packageMismatch ? 'The order detail does not match the complete packed package group.' : null)
     || (unresolved ? 'The carrier group has an unresolved provider outcome and must be reconciled first.' : null)
@@ -145,9 +135,9 @@ export default function OneOffShippingExecutionPanel({
         </Typography>
       </Alert>
 
-      {(purchasePermissionBlocker || activationBlocker) && (
+      {purchasePermissionBlocker && (
         <Alert severity="info" data-testid="one-off-group-permission-blocker">
-          {purchasePermissionBlocker || activationBlocker} An already purchased complete
+          {purchasePermissionBlocker} An already purchased complete
           shipment can still be voided with Operations management and warehouse execution
           permission when its original carrier account remains available.
         </Alert>

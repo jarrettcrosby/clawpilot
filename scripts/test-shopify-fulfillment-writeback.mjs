@@ -23,6 +23,16 @@ assert.equal(
   )),
   true,
 )
+assert.match(
+  writebackSource,
+  /from '@\/lib\/persistence\/commerceProviderWrites'/,
+  'Shopify fulfillment writes must use the exact per-account Provider Writes authority',
+)
+assert.doesNotMatch(
+  writebackSource,
+  /commerceActiveTransitionAuthorization|requireCommerceActiveCapabilityClaimInPostgres/,
+  'Shopify fulfillment writes must not depend on the legacy global Operations activation profile',
+)
 function load(mocks) {
   const path = 'app_src/lib/integrations/shopifyFulfillmentWriteback.ts'
   const output = ts.transpileModule(readFileSync(resolve(path), 'utf8'), {
@@ -65,6 +75,40 @@ const fulfillmentOrderLineItemGidA = 'gid://shopify/FulfillmentOrderLineItem/788
 const fulfillmentOrderLineItemGidB = 'gid://shopify/FulfillmentOrderLineItem/789'
 const lineItemGid = 'gid://shopify/LineItem/789'
 const locationGid = 'gid://shopify/Location/321'
+const requiredScope = 'write_merchant_managed_fulfillment_orders'
+const requiredScopes = ['read_orders', requiredScope]
+const currentGrantedScopes = ['write_orders', requiredScope]
+const hasEffectiveShopifyScope = (scopes, scope) => (
+  scopes.includes(scope)
+  || (
+    scope.startsWith('read_')
+    && scopes.includes(`write_${scope.slice('read_'.length)}`)
+  )
+)
+const providerWriteScopeDigest = 'a'.repeat(64)
+const providerAttemptGlobalId = 'gxa1234567'
+const providerAttemptRequestHash = 'c'.repeat(64)
+const providerCommerceExportGlobalId = 'gfe7654321'
+const registeredProviderAttemptEvidence = {
+  providerAttemptGlobalId,
+  providerAttemptRequestHash,
+  commerceExportGlobalId: providerCommerceExportGlobalId,
+  providerWriteAccountGlobalId: accountGlobalId,
+  providerWriteProvider: 'shopify',
+  providerWriteEnvironment: 'production',
+  providerWriteControlRowVersion: 11,
+  providerWriteCredentialGeneration: 7,
+  providerWriteScopeDigest,
+}
+const exactProviderWriteAuthority = (environment = 'production') => ({
+  accountGlobalId,
+  provider: 'shopify',
+  environment,
+  controlRowVersion: 11,
+  credentialGeneration: 7,
+  grantedScopes: currentGrantedScopes,
+  grantedScopeDigest: providerWriteScopeDigest,
+})
 const calls = []
 
 const page = (nodes) => ({ nodes, pageInfo: { hasNextPage: false } })
@@ -111,6 +155,9 @@ let mutationResponse = {
   },
 }
 let mutationError = null
+let providerWritesOn = true
+let providerWriteChecks = 0
+let sealedProviderWriteChecks = 0
 const module = load({
   '@/lib/integrations/commerceCredentialCrypto': {
     normalizeCommerceOrganizationId: String,
@@ -118,15 +165,15 @@ const module = load({
     decryptCommerceCredential: () => ({ provider: 'shopify', clientId: 'id', clientSecret: 'secret' }),
   },
   '@/lib/integrations/commerceCapabilities': {
-    hasEffectiveShopifyScope: (scopes, scope) => scopes.includes(scope),
+    hasEffectiveShopifyScope,
   },
   '@/lib/integrations/shopifyCommerceClient': {
     normalizeShopifyShopDomain: String,
     requestShopifyAccessToken: async () => ({
-      accessToken: 'token', grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+      accessToken: 'token', grantedScopes: currentGrantedScopes,
     }),
     probeShopifyConnection: async () => ({
-      shopId: 'gid://shopify/Shop/123', grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+      shopId: 'gid://shopify/Shop/123', grantedScopes: currentGrantedScopes,
     }),
     shopifyAdminGraphql: async (_credential, request) => {
       calls.push(request)
@@ -144,10 +191,42 @@ const module = load({
       credentialVersion: 7, configuration: { shopDomain: 'ag-alchemy.myshopify.com' }, encrypted: {},
     }),
   },
-  '@/lib/persistence/commerceActiveTransitionAuthorization': {
-    requireCommerceActiveCapabilityClaimInPostgres: async ({ capability }) => ({
-      activationRevision: 4, credentialGeneration: 7, capability,
-    }),
+  '@/lib/persistence/commerceProviderWrites': {
+    requireCurrentCommerceProviderWritesInPostgres: async (request) => {
+      providerWriteChecks += 1
+      assert.equal(request.organizationId, organizationId)
+      assert.equal(request.accountGlobalId, accountGlobalId)
+      assert.equal(request.provider, 'shopify')
+      assert.equal(JSON.stringify(request.requiredScopes), JSON.stringify(requiredScopes))
+      if (!providerWritesOn) {
+        throw Object.assign(new Error('Provider Writes is Off'), {
+          code: 'COMMERCE_PROVIDER_WRITES_OFF',
+          status: 403,
+        })
+      }
+      return exactProviderWriteAuthority()
+    },
+    requireSealedCommerceProviderWritesInPostgres: async (request) => {
+      sealedProviderWriteChecks += 1
+      assert.equal(request.organizationId, organizationId)
+      assert.equal(request.accountGlobalId, accountGlobalId)
+      assert.equal(request.provider, 'shopify')
+      assert.equal(request.environment, 'production')
+      assert.equal(JSON.stringify(request.requiredScopes), JSON.stringify(requiredScopes))
+      assert.equal(request.expectedControlRowVersion, 11)
+      assert.equal(request.expectedCredentialGeneration, 7)
+      assert.equal(request.expectedGrantedScopeDigest, providerWriteScopeDigest)
+      assert.equal(request.providerAttemptGlobalId, providerAttemptGlobalId)
+      assert.equal(
+        request.providerAttemptRequestHash,
+        providerAttemptRequestHash,
+      )
+      assert.equal(
+        request.commerceExportGlobalId,
+        providerCommerceExportGlobalId,
+      )
+      return exactProviderWriteAuthority()
+    },
   },
 })
 
@@ -164,7 +243,104 @@ const input = {
   organizationId, accountGlobalId, externalOrderId: orderGid,
   trackingNumber: '1ZTEST6567', carrier: 'UPS', notifyCustomer: false,
   expectedLineItems: [{ externalLineId: lineItemGid, quantity: 50 }],
+  ...registeredProviderAttemptEvidence,
 }
+
+// Provider Writes Off is the account-exact external-write boundary. It must
+// reject both preparation and execution before runtime credentials are read or
+// decrypted, and before token, probe, query, or mutation provider calls.
+const offBoundaryCalls = {
+  providerWrites: 0,
+  runtimeCredentials: 0,
+  decryptions: 0,
+  accessTokens: 0,
+  probes: 0,
+  graphql: 0,
+}
+const offModule = load({
+  '@/lib/integrations/commerceCredentialCrypto': {
+    normalizeCommerceOrganizationId: String,
+    normalizeCommerceAccountGlobalId: String,
+    decryptCommerceCredential: () => {
+      offBoundaryCalls.decryptions += 1
+      return { provider: 'shopify', clientId: 'id', clientSecret: 'secret' }
+    },
+  },
+  '@/lib/integrations/commerceCapabilities': {
+    hasEffectiveShopifyScope,
+  },
+  '@/lib/integrations/shopifyCommerceClient': {
+    normalizeShopifyShopDomain: String,
+    requestShopifyAccessToken: async () => {
+      offBoundaryCalls.accessTokens += 1
+      return { accessToken: 'token', grantedScopes: currentGrantedScopes }
+    },
+    probeShopifyConnection: async () => {
+      offBoundaryCalls.probes += 1
+      return {
+        shopId: 'gid://shopify/Shop/123',
+        grantedScopes: currentGrantedScopes,
+      }
+    },
+    shopifyAdminGraphql: async () => {
+      offBoundaryCalls.graphql += 1
+      return { order: structuredClone(providerOrder) }
+    },
+  },
+  '@/lib/persistence/commerceIntegrations': {
+    readCommerceRuntimeCredentialFromPostgres: async () => {
+      offBoundaryCalls.runtimeCredentials += 1
+      return {
+        organizationId,
+        globalId: accountGlobalId,
+        provider: 'shopify',
+        environment: 'production',
+        externalAccountId: 'gid://shopify/Shop/123',
+        status: 'active',
+        verificationStatus: 'verified',
+        credentialVersion: 7,
+        configuration: { shopDomain: 'ag-alchemy.myshopify.com' },
+        encrypted: {},
+      }
+    },
+  },
+  '@/lib/persistence/commerceProviderWrites': {
+    requireCurrentCommerceProviderWritesInPostgres: async (request) => {
+      offBoundaryCalls.providerWrites += 1
+      assert.equal(request.organizationId, organizationId)
+      assert.equal(request.accountGlobalId, accountGlobalId)
+      assert.equal(request.provider, 'shopify')
+      assert.equal(JSON.stringify(request.requiredScopes), JSON.stringify(requiredScopes))
+      throw Object.assign(new Error('Provider Writes is Off'), {
+        code: 'COMMERCE_PROVIDER_WRITES_OFF',
+        status: 403,
+      })
+    },
+    requireSealedCommerceProviderWritesInPostgres: async () => {
+      throw new Error('Off-before-registration must not use sealed authority')
+    },
+  },
+})
+await assert.rejects(
+  () => offModule.prepareShopifyFulfillmentWriteback(input),
+  (error) => error?.code === 'COMMERCE_PROVIDER_WRITES_OFF',
+)
+await assert.rejects(
+  () => offModule.executeShopifyFulfillmentWriteback({
+    ...input,
+    providerAttemptGlobalId: undefined,
+  }),
+  (error) => error?.code === 'SHOPIFY_FULFILLMENT_PROVIDER_ATTEMPT_INVALID',
+)
+assert.deepEqual(offBoundaryCalls, {
+  providerWrites: 1,
+  runtimeCredentials: 0,
+  decryptions: 0,
+  accessTokens: 0,
+  probes: 0,
+  graphql: 0,
+})
+
 const preparation = await module.prepareShopifyFulfillmentWriteback(input)
 assert.deepEqual(JSON.parse(JSON.stringify(preparation)), {
   signature: {
@@ -199,6 +375,11 @@ assert.deepEqual(JSON.parse(JSON.stringify(preparation)), {
   existing: null,
 })
 assert.equal(calls.length, 1)
+assert.equal(
+  providerWriteChecks,
+  1,
+  'Provider Writes On must allow preparation without any global activation-profile dependency',
+)
 assert.match(calls[0].query, /fulfillmentOrders\(first: 100\)/)
 assert.match(calls[0].query, /fulfillmentLineItems\(first: 250\)/)
 assert.match(calls[0].query, /lineItem \{ id \} quantity/)
@@ -253,6 +434,49 @@ assert.deepEqual(JSON.parse(JSON.stringify(calls[1].variables.fulfillment)), {
   trackingInfo: { number: '1ZTEST6567', company: 'UPS' },
 })
 
+// Off is the atomic cutoff for new durable provider-attempt registrations.
+// Once the caller has durably registered an exact attempt while On, a later
+// Off decision may not strand that immutable in-flight mutation. The sealed
+// authority path still exact-checks account/provider/environment/credential.
+providerWritesOn = false
+providerOrder = openOrder()
+calls.length = 0
+const providerChecksBeforeRegisteredExecution = providerWriteChecks
+const sealedChecksBeforeRegisteredExecution = sealedProviderWriteChecks
+await assert.rejects(
+  () => module.executeShopifyFulfillmentWriteback({
+    ...input,
+    attemptSignature: preparation.signature,
+    providerWriteAccountGlobalId: 'gia7654321',
+    providerWriteProvider: 'shopify',
+    providerWriteEnvironment: 'production',
+    providerWriteControlRowVersion: 11,
+    providerWriteCredentialGeneration: 7,
+    providerWriteScopeDigest,
+  }),
+  (error) => error?.code === 'SHOPIFY_FULFILLMENT_PROVIDER_AUTHORITY_MISMATCH',
+)
+assert.equal(sealedProviderWriteChecks, sealedChecksBeforeRegisteredExecution)
+assert.equal(calls.length, 0, 'Mismatched sealed identity must make zero provider calls')
+const registeredResult = await module.executeShopifyFulfillmentWriteback({
+  ...input,
+  attemptSignature: preparation.signature,
+  providerWriteAccountGlobalId: accountGlobalId,
+  providerWriteProvider: 'shopify',
+  providerWriteEnvironment: 'production',
+  providerWriteControlRowVersion: 11,
+  providerWriteCredentialGeneration: 7,
+  providerWriteScopeDigest,
+})
+assert.equal(registeredResult.replayed, false)
+assert.equal(providerWriteChecks, providerChecksBeforeRegisteredExecution)
+assert.equal(
+  sealedProviderWriteChecks,
+  sealedChecksBeforeRegisteredExecution + 1,
+)
+assert.equal(calls.length, 2)
+providerWritesOn = true
+
 providerOrder = openOrder()
 providerOrder.fulfillmentOrders.nodes[1].lineItems.nodes[0].remainingQuantity = 19
 calls.length = 0
@@ -272,6 +496,7 @@ const multiResult = await module.executeShopifyFulfillmentWriteback({
   trackingNumbers: ['1ZTEST6567A', '1ZTEST6567B', '1ZTEST6567C'],
   carrier: 'UPS', notifyCustomer: true,
   expectedLineItems: [{ externalLineId: lineItemGid, quantity: 50 }],
+  ...registeredProviderAttemptEvidence,
 })
 assert.deepEqual(JSON.parse(JSON.stringify(multiResult.trackingNumbers)), [
   '1ZTEST6567A', '1ZTEST6567B', '1ZTEST6567C',
@@ -286,6 +511,8 @@ assert.deepEqual(
 assert.equal(calls[1].variables.fulfillment.notifyCustomer, true)
 
 calls.length = 0
+const providerWriteChecksBeforeReconciliation = providerWriteChecks
+providerWritesOn = false
 await assert.rejects(
   () => module.reconcileShopifyFulfillmentWriteback(input),
   (error) => error?.code === 'SHOPIFY_FULFILLMENT_SIGNATURE_REQUIRED',
@@ -299,13 +526,19 @@ const absentReconciliation = await module.reconcileShopifyFulfillmentWriteback({
 assert.equal(absentReconciliation, null)
 assert.equal(calls.length, 1, 'Unknown-outcome reconciliation must remain read-only')
 assert.equal(calls[0].operationName, 'ClawPilotOrderFulfillment')
+assert.equal(
+  providerWriteChecks,
+  providerWriteChecksBeforeReconciliation,
+  'Read-only reconciliation must remain available while Provider Writes is Off',
+)
+providerWritesOn = true
 
 function providerOnlyModule(orderFactory) {
   return load({
     '@/lib/integrations/commerceCredentialCrypto': {},
     '@/lib/integrations/commerceCapabilities': {},
     '@/lib/persistence/commerceIntegrations': {},
-    '@/lib/persistence/commerceActiveTransitionAuthorization': {},
+    '@/lib/persistence/commerceProviderWrites': {},
     '@/lib/integrations/shopifyCommerceClient': {
       shopifyAdminGraphql: async () => ({ order: structuredClone(orderFactory()) }),
     },
@@ -483,7 +716,7 @@ const mismatchedOrderModule = load({
   '@/lib/integrations/commerceCredentialCrypto': {},
   '@/lib/integrations/commerceCapabilities': {},
   '@/lib/persistence/commerceIntegrations': {},
-  '@/lib/persistence/commerceActiveTransitionAuthorization': {},
+  '@/lib/persistence/commerceProviderWrites': {},
   '@/lib/integrations/shopifyCommerceClient': {
     shopifyAdminGraphql: async () => ({ order: {
       ...closedOrderWith(exactObservedFulfillment()),
@@ -510,7 +743,7 @@ const commerceExportGlobalId = 'gfe1234567'
 let authorityEnvironment = 'production'
 let authorityProviderOrder = openOrder()
 const authorityCalls = {
-  capabilities: [],
+  providerWrites: [],
   canonicalClaims: 0,
   legacyClaims: 0,
   provider: 0,
@@ -526,7 +759,7 @@ const authorityModule = load({
     }),
   },
   '@/lib/integrations/commerceCapabilities': {
-    hasEffectiveShopifyScope: (scopes, scope) => scopes.includes(scope),
+    hasEffectiveShopifyScope,
   },
   '@/lib/integrations/shopifyCommerceClient': {
     normalizeShopifyShopDomain: String,
@@ -534,14 +767,14 @@ const authorityModule = load({
       authorityCalls.provider += 1
       return {
         accessToken: 'token',
-        grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+        grantedScopes: currentGrantedScopes,
       }
     },
     probeShopifyConnection: async () => {
       authorityCalls.provider += 1
       return {
         shopId: 'gid://shopify/Shop/123',
-        grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+        grantedScopes: currentGrantedScopes,
       }
     },
     shopifyAdminGraphql: async (_credential, request) => {
@@ -573,10 +806,29 @@ const authorityModule = load({
       encrypted: {},
     }),
   },
-  '@/lib/persistence/commerceActiveTransitionAuthorization': {
-    requireCommerceActiveCapabilityClaimInPostgres: async ({ capability }) => {
-      authorityCalls.capabilities.push(capability)
-      return { activationRevision: 4, credentialGeneration: 7, capability }
+  '@/lib/persistence/commerceProviderWrites': {
+    requireCurrentCommerceProviderWritesInPostgres: async (request) => {
+      authorityCalls.providerWrites.push(request)
+      assert.equal(request.organizationId, organizationId)
+      assert.equal(request.accountGlobalId, accountGlobalId)
+      assert.equal(request.provider, 'shopify')
+      assert.equal(JSON.stringify(request.requiredScopes), JSON.stringify(requiredScopes))
+      return exactProviderWriteAuthority(authorityEnvironment)
+    },
+    requireSealedCommerceProviderWritesInPostgres: async (request) => {
+      authorityCalls.providerWrites.push(request)
+      assert.equal(request.organizationId, organizationId)
+      assert.equal(request.accountGlobalId, accountGlobalId)
+      assert.equal(request.provider, 'shopify')
+      assert.equal(request.environment, authorityEnvironment)
+      assert.equal(JSON.stringify(request.requiredScopes), JSON.stringify(requiredScopes))
+      assert.equal(request.providerAttemptGlobalId, providerAttemptGlobalId)
+      assert.equal(
+        request.providerAttemptRequestHash,
+        providerAttemptRequestHash,
+      )
+      assert.equal(request.commerceExportGlobalId, commerceExportGlobalId)
+      return exactProviderWriteAuthority(authorityEnvironment)
     },
   },
   '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
@@ -628,9 +880,8 @@ assert.equal(
   'legacy_packed',
   'A new legacy attempt must durably bind its exact authority kind',
 )
-assert.deepEqual(authorityCalls.capabilities, [
-  'fulfillment_export', 'tracking_export',
-])
+assert.equal(authorityCalls.providerWrites.length, 1)
+assert.equal(authorityCalls.providerWrites[0].accountGlobalId, accountGlobalId)
 assert.equal(authorityCalls.legacyClaims, 1)
 assert.equal(authorityCalls.canonicalClaims, 0)
 const firstLegacyResult = await authorityModule.executeShopifyFulfillmentWriteback({
@@ -648,7 +899,7 @@ assert.equal(authorityCalls.mutations, 1, 'Exact retry must not duplicate fulfil
 
 authorityEnvironment = 'sandbox'
 authorityProviderOrder = openOrder()
-authorityCalls.capabilities.length = 0
+const providerWriteChecksBeforeCanonical = authorityCalls.providerWrites.length
 const canonicalPreparation =
   await authorityModule.prepareShopifyFulfillmentWriteback({
     ...input,
@@ -661,9 +912,9 @@ assert.equal(
   'shopify_test_store_canonical',
 )
 assert.deepEqual(
-  authorityCalls.capabilities,
-  [],
-  'Canonical Read only authority must not be replaced by Active capabilities',
+  authorityCalls.providerWrites.length,
+  providerWriteChecksBeforeCanonical + 1,
+  'Canonical exact-order authority must remain layered on account-exact Provider Writes',
 )
 let providerCallsBeforeRejection = authorityCalls.provider
 await assert.rejects(

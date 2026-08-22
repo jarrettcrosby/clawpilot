@@ -236,7 +236,7 @@ for (const fragment of [
   'CarrierIntegrationSourceManagedError',
   'CarrierProductionLabelNotReadyError',
   "readonly code = 'CARRIER_PRODUCTION_LABEL_NOT_READY'",
-  'Move Operations to Active before authorizing live postage',
+  'Enable production rating for this carrier connection before authorizing live postage',
   'Verify the production carrier credential before authorizing live postage',
   'Add and enable a production sender-billing account before authorizing live postage',
   'lockedUserManagedCarrierConnection',
@@ -245,6 +245,19 @@ for (const fragment of [
 ]) {
   assert.ok(persistence.includes(fragment), `Carrier persistence contract missing ${fragment}`)
 }
+const productionLabelCapabilityMutation = persistence.slice(
+  persistence.indexOf('export async function setCarrierProductionLabelCapabilityInPostgres'),
+  persistence.indexOf('export async function disconnectCarrierCredentialInPostgres'),
+)
+assert.ok(
+  !productionLabelCapabilityMutation.includes('operations_activation_scopes')
+    && !productionLabelCapabilityMutation.includes('operations:activation'),
+  'Production-label capability must not depend on the global Operations activation profile',
+)
+assert.ok(
+  productionLabelCapabilityMutation.includes("current.includes('production_rate')"),
+  'Production-label authorization must require the existing exact production-rate capability',
+)
 assert.ok(
   !persistence.includes("$1::uuid, $2, 'carrier', $3, $4, 'active'"),
   'A newly connected carrier credential must require explicit enablement',
@@ -1201,7 +1214,7 @@ assert.equal(
 )
 const sanitizedProductionLabelReadiness =
   delegatedCarrierServiceModule.sanitizedCarrierIntegrationError(Object.assign(
-    new Error('Move Operations to Active before authorizing live postage'),
+    new Error('Enable production rating for this carrier connection before authorizing live postage'),
     { status: 409, code: 'CARRIER_PRODUCTION_LABEL_NOT_READY' },
   ))
 assert.equal(sanitizedProductionLabelReadiness.status, 409)
@@ -1211,7 +1224,7 @@ assert.equal(
 )
 assert.equal(
   sanitizedProductionLabelReadiness.message,
-  'Move Operations to Active before authorizing live postage',
+  'Enable production rating for this carrier connection before authorizing live postage',
 )
 
 const previousClawPilotEnvironment = process.env.CLAWPILOT_ENV

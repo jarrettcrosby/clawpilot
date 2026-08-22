@@ -15,7 +15,6 @@ import {
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
 import { writeCarrierProductionRateEvidenceInPostgres } from '@/lib/persistence/carrierIntegrations'
 import { OperationsRequestError } from '@/lib/persistence/operations'
-import { query } from '@/lib/persistence/postgres'
 
 export type CarrierShippingDiagnosticDestination = {
   name: string
@@ -73,25 +72,6 @@ function diagnosticError(error: unknown) {
     sanitized.message,
     sanitized.status,
   )
-}
-
-export async function requireProductionShippingDiagnosticActive(
-  organizationId: string,
-) {
-  const result = await query<{ state: string | null }>(
-    `SELECT state
-       FROM operations_activation_scopes
-      WHERE organization_id = $1::uuid
-      LIMIT 1`,
-    [organizationId],
-  )
-  if (result.rows[0]?.state !== 'active') {
-    throw new OperationsRequestError(
-      'CARRIER_PRODUCTION_LABEL_NOT_READY',
-      'Move Operations to Active before running a LIVE production shipping diagnostic',
-      409,
-    )
-  }
 }
 
 function foundationDestination(

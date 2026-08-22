@@ -11,6 +11,7 @@ import {
   waitForPostgres,
 } from './test-commerce-order-revisions-postgres.mjs'
 import {
+  OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL,
   OPERATIONS_COMMERCE_ORDER_WORKBENCH_FINGERPRINT_SQL,
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
   OPERATIONS_ORDER_SHIPMENT_ADDRESS_FINGERPRINT_SQL,
@@ -50,6 +51,7 @@ async function verifyNegativeCases(client) {
     '0308_operations_commerce_provider_write_controls.sql',
     '0310_operations_order_shipment_address_working_copy.sql',
     '0312_operations_shopify_order_single_save.sql',
+    '0315_operations_carrier_writes_independent_activation.sql',
   ]) {
     await inRollback(client, async () => {
       await client.query(
@@ -105,6 +107,18 @@ async function verifyNegativeCases(client) {
       await health(client),
       false,
       'Workbench function drift must fail health with an intact ledger',
+    )
+  })
+  await inRollback(client, async () => {
+    await client.query(
+      `ALTER FUNCTION
+         public.validate_operations_active_execution_prepare()
+       SECURITY DEFINER`,
+    )
+    assert.equal(
+      await health(client),
+      false,
+      'Carrier-write activation-independence function drift must fail health',
     )
   })
   await inRollback(client, async () => {
@@ -211,6 +225,17 @@ async function main() {
             'The exact 0307/0308/0310/0312 phase must satisfy its health',
           )
         }
+        if (
+          file ===
+            '0315_operations_carrier_writes_independent_activation.sql'
+          && !process.argv.includes('--print-fingerprints')
+        ) {
+          assert.equal(
+            await health(client),
+            true,
+            'The exact post-0315 carrier-write phase must satisfy health',
+          )
+        }
       }
       const fingerprints = {
         workbench: await fingerprint(
@@ -224,6 +249,10 @@ async function main() {
         shipmentAddress: await fingerprint(
           client,
           OPERATIONS_ORDER_SHIPMENT_ADDRESS_FINGERPRINT_SQL,
+        ),
+        carrierWritesIndependentActivation: await fingerprint(
+          client,
+          OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL,
         ),
       }
       if (process.argv.includes('--print-fingerprints')) {

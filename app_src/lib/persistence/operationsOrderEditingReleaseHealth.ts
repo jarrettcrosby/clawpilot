@@ -15,6 +15,9 @@ export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_MIGRATION_CHECKSUM =
 export const OPERATIONS_SHOPIFY_SINGLE_SAVE_MIGRATION_CHECKSUM =
   'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb'
 
+export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_MIGRATION_CHECKSUM =
+  'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'
+
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
          installed_namespace.nspname || '.' || installed_table.relname
@@ -400,6 +403,37 @@ export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_FINGERPRINT_SQL = String.raw`
   FROM artifacts
 `
 
+export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACTS_SQL =
+  String.raw`
+  artifacts(kind, identity, definition) AS (
+    ${functionArtifacts([
+      'public.validate_operations_active_fulfillment_lineage_write()',
+      'public.validate_operations_active_execution_prepare()',
+      'public.validate_operations_production_rerate_run_insert()',
+      'public.validate_operations_production_rerate_attempt_insert()',
+      'public.validate_operations_production_rerate_selection_insert()',
+      'public.validate_operations_active_carrier_group_attempt_prepare()',
+      'public.operations_shopify_test_store_e2e_is_current(uuid,uuid,uuid)',
+      'public.validate_operations_carrier_shipping_diagnostic_lineage()',
+      'public.maintain_operations_carrier_shipping_diagnostic_authority_lease()',
+      'public.protect_operations_carrier_shipping_diagnostic_authority()',
+    ])}
+  )
+`
+
+export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_FINGERPRINT_SQL =
+  String.raw`
+  WITH ${OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACTS_SQL}
+  SELECT pg_catalog.count(*)::integer AS artifact_count,
+         pg_catalog.encode(public.digest(pg_catalog.convert_to(
+           pg_catalog.string_agg(
+             kind || '|' || identity || '|' || definition,
+             pg_catalog.chr(10) ORDER BY kind, identity
+           ), 'UTF8'
+         ), 'sha256'), 'hex') AS artifact_hash
+  FROM artifacts
+`
+
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_COUNT = 55
 export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_HASH =
   '72324e014c76e161ee66133f7980aa22620bf76914adc9bbc53a2bad3cf0f164'
@@ -407,8 +441,13 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT = 74
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH =
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0'
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50
-export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_HASH =
+export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH =
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf'
+export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_HASH =
+  'b778ce078c72111b3b73d2302acc38191ac4af9e9c88e6973ce0cbb1658b03d6'
+export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_COUNT = 10
+export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_HASH =
+  '729f134cd49c97aae0d155d8d49cdc44b16b9eebde242cce016987b257ff75ad'
 
 export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
   EXISTS (
@@ -459,16 +498,60 @@ export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
     FROM artifacts
   )
   AND (
-    WITH ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACTS_SQL}
-    SELECT pg_catalog.count(*) =
-             ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT}
-      AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
-        pg_catalog.string_agg(
-          kind || '|' || identity || '|' || definition,
-          pg_catalog.chr(10) ORDER BY kind, identity
-        ), 'UTF8'
-      ), 'sha256'), 'hex') =
-        '${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_HASH}'
-    FROM artifacts
+    (
+      NOT EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0315_operations_carrier_writes_independent_activation.sql'
+      )
+      AND (
+        WITH ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACTS_SQL}
+        SELECT pg_catalog.count(*) =
+                 ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT}
+          AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              kind || '|' || identity || '|' || definition,
+              pg_catalog.chr(10) ORDER BY kind, identity
+            ), 'UTF8'
+          ), 'sha256'), 'hex') =
+            '${OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH}'
+        FROM artifacts
+      )
+    )
+    OR (
+      EXISTS (
+        SELECT 1 FROM public.schema_migrations
+        WHERE filename =
+          '0315_operations_carrier_writes_independent_activation.sql'
+          AND checksum =
+            '${OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_MIGRATION_CHECKSUM}'
+      )
+      AND (
+        WITH ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACTS_SQL}
+        SELECT pg_catalog.count(*) =
+                 ${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT}
+          AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              kind || '|' || identity || '|' || definition,
+              pg_catalog.chr(10) ORDER BY kind, identity
+            ), 'UTF8'
+          ), 'sha256'), 'hex') =
+            '${OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_HASH}'
+        FROM artifacts
+      )
+      AND (
+        WITH ${OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACTS_SQL}
+        SELECT pg_catalog.count(*) =
+                 ${OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_COUNT}
+          AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
+            pg_catalog.string_agg(
+              kind || '|' || identity || '|' || definition,
+              pg_catalog.chr(10) ORDER BY kind, identity
+            ), 'UTF8'
+          ), 'sha256'), 'hex') =
+            '${OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_HASH}'
+        FROM artifacts
+      )
+    )
   )
 `

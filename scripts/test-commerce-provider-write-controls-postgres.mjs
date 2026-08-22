@@ -135,6 +135,25 @@ function loadPersistenceModule(pool, auditCalls) {
       if (specifier === '@/lib/persistence/postgres') {
         return postgresAdapter(pool)
       }
+      if (specifier === '@/lib/integrations/commerceCapabilities') {
+        const scopes = [
+          'read_orders',
+          'write_orders',
+          'write_merchant_managed_fulfillment_orders',
+        ]
+        return {
+          SHOPIFY_ACCESS_SCOPES: scopes,
+          hasEffectiveShopifyScope(grantedScopes, requiredScope) {
+            return grantedScopes.includes(requiredScope)
+              || (
+                requiredScope.startsWith('read_')
+                && grantedScopes.includes(
+                  `write_${requiredScope.slice('read_'.length)}`,
+                )
+              )
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })
@@ -213,13 +232,31 @@ async function seed(pool) {
      )`,
     [ownerEmail, auxiliaryOrganizationId],
   )
+  const pipeline = await pool.query(
+    `INSERT INTO public.pipeline_spaces (
+       name, owner_email, is_default, workspace_organization_id
+     ) VALUES ($1, $2, true, $3::uuid)
+     RETURNING id::text`,
+    [`Provider writes ${suffix}`, ownerEmail, organizationId],
+  )
+  await pool.query(
+    `INSERT INTO public.operations_activation_scopes (
+       organization_id, data_pipeline_id, state, reason, updated_by
+     ) VALUES ($1::uuid, $2::uuid, 'active', $3, $4)`,
+    [
+      organizationId,
+      pipeline.rows[0].id,
+      'Legacy profile must not authorize connected provider writes',
+      ownerEmail,
+    ],
+  )
 
   async function account(input) {
     const accountOrganizationId = input.organizationId || organizationId
     const externalAccountId = `${input.provider}-${input.environment}-${randomUUID()}`
-    const authMode = input.provider === 'shopify'
+    const authMode = input.authMode || (input.provider === 'shopify'
       ? 'shopify_client_credentials'
-      : 'faire_brand_token'
+      : 'faire_brand_token')
     const result = await pool.query(
       `INSERT INTO public.operations_integration_accounts (
          organization_id, provider, integration_type, environment,
@@ -241,6 +278,17 @@ async function seed(pool) {
       ],
     )
     const row = result.rows[0]
+    await pool.query(
+      `UPDATE public.operations_integration_accounts
+       SET credential_reference = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        accountOrganizationId,
+        row.id,
+        `commerce-credential:${row.id}:v1`,
+      ],
+    )
     await pool.query(
       `INSERT INTO public.operations_commerce_credentials (
          organization_id, integration_account_id, external_account_id,
@@ -273,10 +321,14 @@ async function seed(pool) {
     displayName: 'Test Pro Bakery Shopify',
     configuration: {
       authMode: 'shopify_client_credentials',
-      grantedScopes: ['write_orders', 'read_orders'],
+      grantedScopes: [
+        'write_orders',
+        'write_merchant_managed_fulfillment_orders',
+      ],
     },
   })
   const faire = await account({
+    organizationId: auxiliaryOrganizationId,
     provider: 'faire',
     environment: 'production',
     displayName: 'Test Pro Bakery Faire',
@@ -286,14 +338,120 @@ async function seed(pool) {
       scopeVerification: 'not_exposed_by_provider',
     },
   })
+  const faireScopes = [
+    'READ_BRAND',
+    'READ_ORDERS',
+    'READ_SHIPMENTS',
+    'WRITE_ORDERS',
+  ]
+  const faireCredentialFingerprint = 'd'.repeat(64)
+  const faireOauth = await account({
+    provider: 'faire',
+    environment: 'production',
+    authMode: 'faire_oauth',
+    displayName: 'Test Pro Bakery Faire OAuth',
+    configuration: {
+      authMode: 'faire_oauth',
+      tokenAcquisition: 'authorization_code',
+      requestedScopes: faireScopes,
+      grantedScopes: faireScopes,
+      scopeVerification: 'oauth_grant',
+      oauthGrantTokenType: 'BEARER',
+      oauthGrantCredentialFingerprintSha256: faireCredentialFingerprint,
+      scopeProofProviderReference: faireCredentialFingerprint,
+      scopeProofAttemptGlobalId: 'pending',
+    },
+  })
+  const faireScopeRequest = {
+    provider: 'faire',
+    operation: 'authorizationCodeExchange',
+    grantType: 'AUTHORIZATION_CODE',
+    requestedScopes: faireScopes,
+    credentialFingerprintSha256: faireCredentialFingerprint,
+    providerWrites: 0,
+  }
+  const faireScopeEvidence = {
+    provider: 'faire',
+    operation: 'authorizationCodeExchange',
+    grantType: 'AUTHORIZATION_CODE',
+    tokenType: 'BEARER',
+    externalAccountId: faireOauth.externalAccountId,
+    credentialGeneration: 1,
+    requestedScopes: faireScopes,
+    grantedScopes: faireScopes,
+    credentialFingerprintSha256: faireCredentialFingerprint,
+    providerReference: faireCredentialFingerprint,
+    providerWrites: 0,
+  }
+  const faireScopeAttempt = await pool.query(
+    `INSERT INTO public.operations_commerce_provider_attempts (
+       organization_id, integration_account_id, action, adapter_version,
+       external_object_id, idempotency_key, request_hash, redacted_request,
+       redacted_response, state, attempt_number, provider_reference,
+       requested_at, completed_at, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, 'faire.oauth.authorization_code.exchange',
+       'faire-external-api-v2-oauth-authorization-code-v1', $3,
+       $4, operations_faire_provider_write_request_hash($5::jsonb),
+       $5::jsonb, $6::jsonb, 'succeeded', 1, $7,
+       $9::timestamptz, $9::timestamptz, $8
+     ) RETURNING id::text, global_id, completed_at`,
+    [
+      organizationId,
+      faireOauth.id,
+      `commerce-credential:${faireOauth.id}:v1`,
+      `faire-oauth-grant:1:${faireCredentialFingerprint}`,
+      JSON.stringify(faireScopeRequest),
+      JSON.stringify(faireScopeEvidence),
+      faireCredentialFingerprint,
+      ownerEmail,
+      new Date(),
+    ],
+  )
+  const proof = faireScopeAttempt.rows[0]
+  await pool.query(
+    `UPDATE public.operations_integration_accounts
+     SET configuration = jsonb_set(
+       configuration,
+       '{scopeProofAttemptGlobalId}',
+       to_jsonb($3::text),
+       true
+     )
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid`,
+    [organizationId, faireOauth.id, proof.global_id],
+  )
+  await pool.query(
+    `INSERT INTO public.operations_faire_provider_write_scope_evidence (
+       organization_id, integration_account_id, provider_attempt_id,
+       external_account_id, credential_generation, verified_write_scopes,
+       verification_source, provider_reference, redacted_evidence,
+       evidence_hash, observed_at, recorded_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4, 1, ARRAY['WRITE_ORDERS']::text[],
+       'oauth_grant', $5, $6::jsonb,
+       operations_faire_provider_write_request_hash($6::jsonb),
+       $7::timestamptz, $8
+     )`,
+    [
+      organizationId,
+      faireOauth.id,
+      proof.id,
+      faireOauth.externalAccountId,
+      faireCredentialFingerprint,
+      JSON.stringify(faireScopeEvidence),
+      proof.completed_at,
+      ownerEmail,
+    ],
+  )
   const shopifyProductOnly = await account({
     organizationId: auxiliaryOrganizationId,
     provider: 'shopify',
     environment: 'sandbox',
-    displayName: 'Product-only Shopify',
+    displayName: 'Order-editing-only Shopify',
     configuration: {
       authMode: 'shopify_client_credentials',
-      grantedScopes: ['read_products', 'write_products'],
+      grantedScopes: ['write_orders'],
     },
   })
   const shopifyProduction = await account({
@@ -313,6 +471,7 @@ async function seed(pool) {
     restrictedEmail,
     shopify,
     faire,
+    faireOauth,
     shopifyProductOnly,
     shopifyProduction,
   }
@@ -350,21 +509,27 @@ try {
     .readCommerceProviderWriteControlsFromPostgres({
       organizationId: tenant.auxiliaryOrganizationId,
     })
-  assert.equal(auxiliary.accounts.length, 1)
+  assert.equal(auxiliary.accounts.length, 2)
   const initialShopify = initial.accounts.find(
     (account) => account.accountGlobalId === tenant.shopify.global_id,
   )
-  const initialFaire = initial.accounts.find(
+  const initialFaire = auxiliary.accounts.find(
     (account) => account.accountGlobalId === tenant.faire.global_id,
+  )
+  const initialFaireOauth = initial.accounts.find(
+    (account) => account.accountGlobalId === tenant.faireOauth.global_id,
   )
   assert.equal(initialShopify.requestedMode, 'off')
   assert.equal(initialShopify.rowVersion, 0)
   assert.equal(initialShopify.effectiveFromDefault, true)
   assert.equal(initialShopify.enableAvailable, true)
   assert.equal(initialShopify.providerWritesEffective, false)
-  assert.equal(initialShopify.commandEnforcement, 'shopify_order_management')
+  assert.equal(initialShopify.fulfillmentWritesEffective, false)
+  assert.equal(
+    initialShopify.commandEnforcement,
+    'shopify_order_management_and_fulfillment',
+  )
   for (const [accounts, accountId] of [
-    [auxiliary.accounts, tenant.shopifyProductOnly.global_id],
     [initial.accounts, tenant.shopifyProduction.global_id],
   ]) {
     const disconnected = accounts.find(
@@ -378,12 +543,28 @@ try {
       'COMMERCE_PROVIDER_WRITES_COMMAND_ENFORCEMENT_UNAVAILABLE',
     )
   }
+  const orderEditingOnly = auxiliary.accounts.find(
+    (account) => account.accountGlobalId
+      === tenant.shopifyProductOnly.global_id,
+  )
+  assert.equal(orderEditingOnly.enableAvailable, true)
+  assert.equal(orderEditingOnly.commandEnforcement, 'shopify_order_management')
+  assert.equal(orderEditingOnly.providerWritesEffective, false)
+  assert.equal(orderEditingOnly.fulfillmentWritesEffective, false)
+  assert.match(
+    orderEditingOnly.fulfillmentWritesBlockedReason,
+    /Reconnect Shopify.*write_merchant_managed_fulfillment_orders.*read_orders.*write_orders/iu,
+  )
   assert.equal(initialFaire.requestedMode, 'off')
   assert.equal(initialFaire.bindingStatus, 'unavailable')
   assert.equal(
     initialFaire.blocker.code,
     'COMMERCE_PROVIDER_WRITES_FAIRE_OAUTH_REQUIRED',
   )
+  assert.equal(initialFaireOauth.requestedMode, 'off')
+  assert.equal(initialFaireOauth.enableAvailable, true)
+  assert.equal(initialFaireOauth.commandEnforcement, 'faire_fulfillment')
+  assert.equal(initialFaireOauth.providerWritesEffective, false)
 
   const enableKey = `provider-writes-enable-${randomUUID()}`
   const enabled = await persistence.setCommerceProviderWriteControlInPostgres({
@@ -401,12 +582,218 @@ try {
   assert.equal(enabled.control.bindingStatus, 'current')
   assert.equal(enabled.control.bindingCurrent, true)
   assert.equal(enabled.control.boundCredentialGeneration, 1)
-  assert.equal(enabled.control.commandEnforcement, 'shopify_order_management')
+  assert.equal(
+    enabled.control.commandEnforcement,
+    'shopify_order_management_and_fulfillment',
+  )
   assert.equal(enabled.control.providerWritesEffective, true)
+  assert.equal(enabled.control.fulfillmentWritesEffective, true)
   assert.match(enabled.control.boundGrantedScopeDigest, /^[a-f0-9]{64}$/u)
 
+  const sealedExportClient = await pool.connect()
+  let sealedCommerceExportGlobalId = null
+  try {
+    await sealedExportClient.query('BEGIN')
+    await sealedExportClient.query(
+      'SET LOCAL session_replication_role = replica',
+    )
+    const sealedExport = await sealedExportClient.query(
+      `INSERT INTO public.operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider, external_order_id,
+         state, payload_snapshot, idempotency_key
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', $4,
+         'processing', '{}'::jsonb, $5
+       ) RETURNING global_id`,
+      [
+        tenant.organizationId,
+        randomUUID(),
+        randomUUID(),
+        'gid://shopify/Order/6567',
+        `provider-writes-sealed-export-${randomUUID()}`,
+      ],
+    )
+    sealedCommerceExportGlobalId = sealedExport.rows[0].global_id
+    await sealedExportClient.query('COMMIT')
+  } catch (error) {
+    await sealedExportClient.query('ROLLBACK')
+    throw error
+  } finally {
+    sealedExportClient.release()
+  }
+  assert.match(sealedCommerceExportGlobalId, /^gfe[0-9a-v]+$/u)
+
+  const sealedProviderWriteAuthority = {
+    accountGlobalId: tenant.shopify.global_id,
+    provider: 'shopify',
+    environment: 'sandbox',
+    controlRowVersion: enabled.control.rowVersion,
+    credentialGeneration: enabled.control.boundCredentialGeneration,
+    grantedScopeDigest: enabled.control.boundGrantedScopeDigest,
+  }
+  const sealedProviderAttemptRequestHash = 'e'.repeat(64)
+  const insertSealedProviderAttempt = async ({
+    action = 'shopify.fulfillment.create',
+    adapterVersion = 'shopify-fulfillment-writeback-v2',
+    state = 'prepared',
+    authority = sealedProviderWriteAuthority,
+  } = {}) => {
+    const attempt = await pool.query(
+      `INSERT INTO public.operations_commerce_provider_attempts (
+         organization_id, integration_account_id, action, adapter_version,
+         external_object_id, idempotency_key, request_hash,
+         redacted_request, redacted_response, state, attempt_number,
+         requested_at, completed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
+         jsonb_build_object('providerWriteAuthority', $8::jsonb),
+         '{}'::jsonb, $9, 1, now(),
+         CASE WHEN $9 = 'prepared' THEN NULL ELSE now() END, $10
+       ) RETURNING global_id`,
+      [
+        tenant.organizationId,
+        tenant.shopify.id,
+        action,
+        adapterVersion,
+        sealedCommerceExportGlobalId,
+        `provider-writes-sealed-attempt-${randomUUID()}`,
+        sealedProviderAttemptRequestHash,
+        JSON.stringify(authority),
+        state,
+        tenant.ownerEmail,
+      ],
+    )
+    return attempt.rows[0].global_id
+  }
+  const sealedProviderAttemptGlobalId = await insertSealedProviderAttempt()
+  const sealedAttemptInput = (overrides = {}) => ({
+    organizationId: tenant.organizationId,
+    accountGlobalId: tenant.shopify.global_id,
+    provider: 'shopify',
+    environment: 'sandbox',
+    providerAttemptGlobalId: sealedProviderAttemptGlobalId,
+    providerAttemptRequestHash: sealedProviderAttemptRequestHash,
+    commerceExportGlobalId: sealedCommerceExportGlobalId,
+    requiredScopes: [
+      'read_orders',
+      'write_merchant_managed_fulfillment_orders',
+    ],
+    expectedControlRowVersion: enabled.control.rowVersion,
+    expectedCredentialGeneration: enabled.control.boundCredentialGeneration,
+    expectedGrantedScopeDigest: enabled.control.boundGrantedScopeDigest,
+    ...overrides,
+  })
+  const wrongActionAttemptGlobalId = await insertSealedProviderAttempt({
+    action: 'shopify.orders.update',
+  })
+  const wrongAdapterAttemptGlobalId = await insertSealedProviderAttempt({
+    adapterVersion: 'shopify-fulfillment-writeback-v1',
+  })
+  const terminalAttemptGlobalId = await insertSealedProviderAttempt({
+    state: 'failed',
+  })
+  const wrongAuthorityAttemptGlobalId = await insertSealedProviderAttempt({
+    authority: {
+      ...sealedProviderWriteAuthority,
+      controlRowVersion: enabled.control.rowVersion + 100,
+    },
+  })
+  for (const invalidAttemptInput of [
+    sealedAttemptInput({ providerAttemptGlobalId: 'gxa9999999' }),
+    sealedAttemptInput({ organizationId: tenant.auxiliaryOrganizationId }),
+    sealedAttemptInput({
+      accountGlobalId: tenant.shopifyProduction.global_id,
+      environment: 'production',
+    }),
+    sealedAttemptInput({
+      providerAttemptGlobalId: wrongActionAttemptGlobalId,
+    }),
+    sealedAttemptInput({
+      providerAttemptGlobalId: wrongAdapterAttemptGlobalId,
+    }),
+    sealedAttemptInput({ commerceExportGlobalId: 'gfe9999999' }),
+    sealedAttemptInput({ providerAttemptGlobalId: terminalAttemptGlobalId }),
+    sealedAttemptInput({ providerAttemptRequestHash: 'f'.repeat(64) }),
+    sealedAttemptInput({
+      providerAttemptGlobalId: wrongAuthorityAttemptGlobalId,
+    }),
+  ]) {
+    await rejected(
+      () => persistence.requireSealedCommerceProviderWritesInPostgres(
+        invalidAttemptInput,
+      ),
+      'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_MISMATCH',
+    )
+  }
+  await rejected(
+    () => persistence.requireSealedCommerceProviderWritesInPostgres(
+      sealedAttemptInput({ providerAttemptGlobalId: undefined }),
+    ),
+    'COMMERCE_PROVIDER_WRITES_PROVIDER_ATTEMPT_INVALID',
+  )
+
+  for (const activationState of [
+    'disabled',
+    'shadow',
+    'read_only',
+    'frozen',
+    'active',
+  ]) {
+    await pool.query(
+      `UPDATE public.operations_activation_scopes
+       SET state = $2, revision = revision + 1, updated_by = $3
+       WHERE organization_id = $1::uuid`,
+      [tenant.organizationId, activationState, tenant.ownerEmail],
+    )
+    const authority = await persistence
+      .requireCurrentCommerceProviderWritesInPostgres({
+        organizationId: tenant.organizationId,
+        accountGlobalId: tenant.shopify.global_id,
+        provider: 'shopify',
+        requiredScopes: [
+          'read_orders',
+          'write_merchant_managed_fulfillment_orders',
+        ],
+        expectedControlRowVersion: enabled.control.rowVersion,
+        expectedCredentialGeneration:
+          enabled.control.boundCredentialGeneration,
+        expectedGrantedScopeDigest:
+          enabled.control.boundGrantedScopeDigest,
+      })
+    assert.equal(authority.controlRowVersion, 1)
+    assert.equal(authority.credentialGeneration, 1)
+    assert.ok(
+      authority.grantedScopes.includes(
+        'write_merchant_managed_fulfillment_orders',
+      ),
+    )
+  }
+
+  const orderEditingOnlyEnabled = await persistence
+    .setCommerceProviderWriteControlInPostgres({
+      organizationId: tenant.auxiliaryOrganizationId,
+      accountGlobalId: tenant.shopifyProductOnly.global_id,
+      mode: 'on',
+      expectedRowVersion: 0,
+      actorEmail: tenant.ownerEmail,
+      actorRole: 'owner',
+      idempotencyKey: `provider-writes-order-only-${randomUUID()}`,
+    })
+  assert.equal(orderEditingOnlyEnabled.control.requestedMode, 'on')
+  assert.equal(orderEditingOnlyEnabled.control.bindingStatus, 'current')
+  assert.equal(orderEditingOnlyEnabled.control.providerWritesEffective, true)
+  assert.equal(
+    orderEditingOnlyEnabled.control.fulfillmentWritesEffective,
+    false,
+    'write_orders alone must never enable Confirm shipment',
+  )
+  assert.match(
+    orderEditingOnlyEnabled.control.fulfillmentWritesBlockedReason,
+    /Reconnect Shopify.*write_merchant_managed_fulfillment_orders/iu,
+    'An already-On order-editing control must show scope guidance, not say to turn On again',
+  )
+
   for (const [organizationId, accountGlobalId] of [
-    [tenant.auxiliaryOrganizationId, tenant.shopifyProductOnly.global_id],
     [tenant.organizationId, tenant.shopifyProduction.global_id],
   ]) {
     await rejected(
@@ -516,6 +903,30 @@ try {
   assert.equal(disabled.control.rowVersion, 2)
   assert.equal(disabled.control.boundCredentialGeneration, null)
   assert.equal(disabled.control.boundGrantedScopeDigest, null)
+  const sealedWhileOff = await persistence
+    .requireSealedCommerceProviderWritesInPostgres(sealedAttemptInput())
+  assert.equal(sealedWhileOff.controlRowVersion, enabled.control.rowVersion)
+  assert.equal(sealedWhileOff.accountGlobalId, tenant.shopify.global_id)
+  assert.equal(sealedWhileOff.provider, 'shopify')
+  assert.equal(sealedWhileOff.environment, 'sandbox')
+  await pool.query(
+    `UPDATE public.operations_activation_scopes
+     SET state = 'active', revision = revision + 1, updated_by = $2
+     WHERE organization_id = $1::uuid`,
+    [tenant.organizationId, tenant.ownerEmail],
+  )
+  await rejected(
+    () => persistence.requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.shopify.global_id,
+      provider: 'shopify',
+      requiredScopes: [
+        'read_orders',
+        'write_merchant_managed_fulfillment_orders',
+      ],
+    }),
+    'COMMERCE_PROVIDER_WRITES_OFF',
+  )
 
   await rejectedMessage(
     () => pool.query(
@@ -530,7 +941,7 @@ try {
   )
   await rejected(
     () => persistence.setCommerceProviderWriteControlInPostgres({
-      organizationId: tenant.organizationId,
+      organizationId: tenant.auxiliaryOrganizationId,
       accountGlobalId: tenant.faire.global_id,
       mode: 'on',
       expectedRowVersion: 0,
@@ -640,10 +1051,11 @@ try {
   assert.equal(revisions.rows[1].changed_by, tenant.memberEmail)
   assert.equal(revisions.rows[1].bound_credential_generation, null)
   assert.equal(revisions.rows[1].bound_granted_scope_digest, null)
-  assert.equal(auditCalls.length, 4)
+  assert.equal(auditCalls.length, 5)
   assert.deepEqual(
     auditCalls.map((event) => event.eventType),
     [
+      'commerce.provider_writes.turned_on',
       'commerce.provider_writes.turned_on',
       'commerce.provider_writes.turned_off',
       'commerce.provider_writes.turned_on',
@@ -658,6 +1070,75 @@ try {
     [tenant.organizationId],
   )
   assert.equal(auditRows.rows[0].count, 4)
+
+  await pool.query(
+    `UPDATE public.operations_activation_scopes
+     SET state = 'disabled', revision = revision + 1, updated_by = $2
+     WHERE organization_id = $1::uuid`,
+    [tenant.organizationId, tenant.ownerEmail],
+  )
+  const faireEnabled = await persistence
+    .setCommerceProviderWriteControlInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      mode: 'on',
+      expectedRowVersion: 0,
+      actorEmail: tenant.ownerEmail,
+      actorRole: 'owner',
+      idempotencyKey: `provider-writes-faire-on-${randomUUID()}`,
+    })
+  assert.equal(faireEnabled.control.commandEnforcement, 'faire_fulfillment')
+  assert.equal(faireEnabled.control.providerWritesEffective, true)
+  const faireAuthority = await persistence
+    .requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      provider: 'faire',
+      requiredScopes: [
+        'READ_BRAND',
+        'READ_ORDERS',
+        'READ_SHIPMENTS',
+        'WRITE_ORDERS',
+      ],
+      expectedControlRowVersion: faireEnabled.control.rowVersion,
+      expectedCredentialGeneration:
+        faireEnabled.control.boundCredentialGeneration,
+      expectedGrantedScopeDigest:
+        faireEnabled.control.boundGrantedScopeDigest,
+    })
+  assert.equal(faireAuthority.controlRowVersion, 1)
+  assert.equal(faireAuthority.environment, 'production')
+  await pool.query(
+    `UPDATE public.operations_activation_scopes
+     SET state = 'active', revision = revision + 1, updated_by = $2
+     WHERE organization_id = $1::uuid`,
+    [tenant.organizationId, tenant.ownerEmail],
+  )
+  const faireDisabled = await persistence
+    .setCommerceProviderWriteControlInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      mode: 'off',
+      expectedRowVersion: 1,
+      actorEmail: tenant.ownerEmail,
+      actorRole: 'owner',
+      idempotencyKey: `provider-writes-faire-off-${randomUUID()}`,
+    })
+  assert.equal(faireDisabled.control.providerWritesEffective, false)
+  await rejected(
+    () => persistence.requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: tenant.organizationId,
+      accountGlobalId: tenant.faireOauth.global_id,
+      provider: 'faire',
+      requiredScopes: [
+        'READ_BRAND',
+        'READ_ORDERS',
+        'READ_SHIPMENTS',
+        'WRITE_ORDERS',
+      ],
+    }),
+    'COMMERCE_PROVIDER_WRITES_OFF',
+  )
 
   command('node', ['scripts/test-shopify-order-management-health.mjs'], {
     timeout: 120_000,

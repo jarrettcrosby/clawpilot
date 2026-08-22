@@ -149,6 +149,20 @@ const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String.raw`
         '2e4a2d7b74322bcc4b2a8f5565c9e14da0c2d41961e25bbfd56edfd8c8e2d6cb'
   )
   AND (
+    NOT EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename =
+        '0315_operations_carrier_writes_independent_activation.sql'
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename =
+        '0315_operations_carrier_writes_independent_activation.sql'
+        AND checksum =
+          'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'
+    )
+  )
+  AND (
     SELECT count(installed.oid) = 2
       AND encode(digest(convert_to(string_agg(concat_ws('|',
         required.table_name, installed_namespace.nspname,
@@ -280,8 +294,18 @@ const SHOPIFY_TEST_STORE_CANONICAL_E2E_HEALTH_SQL = String.raw`
         COALESCE(array_to_string(installed.proconfig, ','), ''),
         trim(regexp_replace(installed.prosrc, '[[:space:]]+', ' ', 'g'))
       ), E'\n' ORDER BY required.signature),
-      'UTF8'), 'sha256'), 'hex') =
-        '7916b6b3bea6c7ded0f480fa653f7b21b2ae31f3e217f4520dc1493483bc429a'
+      'UTF8'), 'sha256'), 'hex') = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0315_operations_carrier_writes_independent_activation.sql'
+            AND checksum =
+              'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'
+        ) THEN
+          'e660cd4db9019a22e55ad2e3778650f95cd3b036571bc675338e024ca6ae3e0c'
+        ELSE
+          '7916b6b3bea6c7ded0f480fa653f7b21b2ae31f3e217f4520dc1493483bc429a'
+      END
     FROM (VALUES
       ('operations_shopify_test_store_e2e_is_current(uuid,uuid,uuid)'),
       ('protect_shopify_test_store_e2e_confirmation()'),
@@ -411,6 +435,18 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
         'ad82ca01e9e19cb20c95bfec25588d50ad706419ee3a58db24e0662de85e3618'
   )
   AND (
+    NOT EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename = '0309_operations_measured_packaging_evidence.sql'
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.schema_migrations
+      WHERE filename = '0309_operations_measured_packaging_evidence.sql'
+        AND checksum =
+          '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
+    )
+  )
+  AND (
     SELECT pg_catalog.count(installed.oid) = 34
       AND pg_catalog.encode(public.digest(pg_catalog.convert_to(pg_catalog.string_agg(
         pg_catalog.concat_ws('|',
@@ -438,7 +474,33 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
             AND checksum =
               'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
         )
+        AND EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0309_operations_measured_packaging_evidence.sql'
+            AND checksum =
+              '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
+        )
+        THEN 'ea3ef975be1496c360517e87362141d3a312c36a8d2223d684bd019b57d98eb7'
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0305_operations_commerce_rollout_contract.sql'
+            AND checksum =
+              'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b'
+        )
         THEN 'b28b6980199f9e2fd9af0e43f84b825570fcdda1bed1b35ba1a0891bb5f65ae0'
+        WHEN EXISTS (
+          SELECT 1
+          FROM public.schema_migrations
+          WHERE filename =
+            '0309_operations_measured_packaging_evidence.sql'
+            AND checksum =
+              '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
+        )
+        THEN '7a01e802ed5815e232244cde7a188cfec2ab7685d86789c2685b00d35f96f9f4'
         ELSE '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64'
       END
     FROM (VALUES
@@ -7042,18 +7104,6 @@ export async function GET() {
                   'validate_operations_carrier_shipping_diagnostic_lineage()'
                 )),
                 '[[:space:]]+', ' ', 'g'
-              ) LIKE '%production_label%activation.state = ''active''%'
-              AND regexp_replace(
-                pg_get_functiondef(to_regprocedure(
-                  'validate_operations_carrier_shipping_diagnostic_lineage()'
-                )),
-                '[[:space:]]+', ' ', 'g'
-              ) LIKE '%FOR UPDATE OF integration, credential, carrier_account, activation%'
-              AND regexp_replace(
-                pg_get_functiondef(to_regprocedure(
-                  'validate_operations_carrier_shipping_diagnostic_lineage()'
-                )),
-                '[[:space:]]+', ' ', 'g'
               ) LIKE '%credentialFingerprint%credential.credential_fingerprint%accountNumberFingerprint%carrier_account.account_number_fingerprint%registeredAddressFingerprint%carrier_account.registered_address_fingerprint%senderName%carrier_account.sender_name%'
               AND regexp_replace(
                 pg_get_functiondef(to_regprocedure(
@@ -7067,18 +7117,89 @@ export async function GET() {
                 )),
                 '[[:space:]]+', ' ', 'g'
               ) LIKE '%attempt_row.environment <> ''production''%attempt_row.action <> ''create''%lease_delta := 1%'
-              AND regexp_replace(
-                pg_get_functiondef(to_regprocedure(
-                  'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
-                )),
-                '[[:space:]]+', ' ', 'g'
-              ) LIKE '%UPDATE operations_activation_scopes%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
-              AND regexp_replace(
-                pg_get_functiondef(to_regprocedure(
-                  'protect_operations_carrier_shipping_diagnostic_authority()'
-                )),
-                '[[:space:]]+', ' ', 'g'
-              ) LIKE '%production_shipping_diagnostic_lease_count%operations_activation_scopes%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+              AND (
+                (
+                  NOT EXISTS (
+                    SELECT 1 FROM schema_migrations
+                    WHERE filename =
+                      '0315_operations_carrier_writes_independent_activation.sql'
+                  )
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'validate_operations_carrier_shipping_diagnostic_lineage()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%production_label%activation.state = ''active''%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'validate_operations_carrier_shipping_diagnostic_lineage()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%FOR UPDATE OF integration, credential, carrier_account, activation%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%UPDATE operations_activation_scopes%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'protect_operations_carrier_shipping_diagnostic_authority()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%production_shipping_diagnostic_lease_count%operations_activation_scopes%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+                )
+                OR (
+                  EXISTS (
+                    SELECT 1 FROM schema_migrations
+                    WHERE filename =
+                      '0315_operations_carrier_writes_independent_activation.sql'
+                      AND checksum =
+                        'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d'
+                  )
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'validate_operations_carrier_shipping_diagnostic_lineage()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%production_rate%production_label%FOR UPDATE OF integration, credential, carrier_account%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'validate_operations_carrier_shipping_diagnostic_lineage()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) NOT LIKE '%operations_activation_scopes%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%UPDATE operations_integration_accounts%UPDATE operations_carrier_credentials%UPDATE operations_carrier_accounts%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'maintain_operations_carrier_shipping_diagnostic_authority_lease()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) NOT LIKE '%operations_activation_scopes%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'protect_operations_carrier_shipping_diagnostic_authority()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) LIKE '%production_shipping_diagnostic_lease_count%operations_integration_accounts%operations_carrier_credentials%operations_carrier_accounts%'
+                  AND regexp_replace(
+                    pg_get_functiondef(to_regprocedure(
+                      'protect_operations_carrier_shipping_diagnostic_authority()'
+                    )), '[[:space:]]+', ' ', 'g'
+                  ) NOT LIKE '%operations_activation_scopes%'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM pg_trigger diagnostic_activation_trigger
+                    WHERE diagnostic_activation_trigger.tgrelid =
+                      to_regclass('operations_activation_scopes')
+                      AND diagnostic_activation_trigger.tgname =
+                        'protect_operations_carrier_shipping_diagnostic_activation'
+                      AND NOT diagnostic_activation_trigger.tgisinternal
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM public.operations_activation_scopes
+                      diagnostic_activation_scope
+                    WHERE diagnostic_activation_scope
+                      .production_shipping_diagnostic_lease_count <> 0
+                  )
+                )
+              )
               AND regexp_replace(
                 pg_get_functiondef(to_regprocedure(
                   'protect_operations_carrier_shipping_diagnostic_authority()'
@@ -7125,12 +7246,6 @@ export async function GET() {
                     29
                   ),
                   (
-                    'operations_activation_scopes',
-                    'protect_operations_carrier_shipping_diagnostic_activation',
-                    'protect_operations_carrier_shipping_diagnostic_authority()',
-                    19
-                  ),
-                  (
                     'operations_integration_accounts',
                     'protect_operations_carrier_shipping_diagnostic_integration',
                     'protect_operations_carrier_shipping_diagnostic_authority()',
@@ -7166,6 +7281,27 @@ export async function GET() {
                     AND installed_diagnostic_trigger.tgenabled = 'O'
                     AND installed_diagnostic_trigger.tgtype =
                       required_diagnostic_trigger.trigger_type
+                    AND installed_diagnostic_trigger.tgconstraint = 0
+                )
+              )
+              AND (
+                EXISTS (
+                  SELECT 1 FROM schema_migrations
+                  WHERE filename =
+                    '0315_operations_carrier_writes_independent_activation.sql'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM pg_trigger installed_diagnostic_trigger
+                  WHERE installed_diagnostic_trigger.tgrelid =
+                    to_regclass('operations_activation_scopes')
+                    AND installed_diagnostic_trigger.tgname =
+                      'protect_operations_carrier_shipping_diagnostic_activation'
+                    AND installed_diagnostic_trigger.tgfoid = to_regprocedure(
+                      'protect_operations_carrier_shipping_diagnostic_authority()'
+                    )
+                    AND NOT installed_diagnostic_trigger.tgisinternal
+                    AND installed_diagnostic_trigger.tgenabled = 'O'
+                    AND installed_diagnostic_trigger.tgtype = 19
                     AND installed_diagnostic_trigger.tgconstraint = 0
                 )
               ) AS carrier_shipping_diagnostics_applied,

@@ -2031,7 +2031,7 @@ async function verifyRouteBehavior() {
   assert.equal(deniedProductionRerate.status, 403)
   assert.equal(
     (await payload(deniedProductionRerate)).code,
-    'OPERATIONS_EXECUTE_REQUIRED',
+    'OPERATIONS_LIVE_POSTAGE_REQUIRED',
   )
   assert.equal(calls.productionRerates.length, 0)
 
@@ -4120,6 +4120,17 @@ async function verifyPostgresAcceptance(databaseUrl) {
           cartonizationRateEvidence,
         '@/lib/persistence/commerceOrderWorkbench': {
           readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
+        '@/lib/persistence/commerceProviderWrites': {
+          CommerceProviderWriteControlError: class extends Error {},
+          readCommerceProviderWriteControlsFromPostgres: async () => ({
+            accounts: [],
+          }),
+          requireCurrentCommerceProviderWritesInPostgres: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not authorize commerce provider writes',
+            )
+          },
         },
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,

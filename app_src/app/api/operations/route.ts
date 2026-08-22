@@ -2070,11 +2070,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'prepare-active-fulfillment-execution') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
-          error: 'You do not have permission to prepare Active fulfillment execution',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          error: 'You do not have permission to prepare production carrier execution',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -2123,11 +2126,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'execute-production-rerate') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to execute production carrier rating',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -2222,11 +2228,14 @@ export async function POST(req: NextRequest) {
       return json({ ok: true, capabilities, result }, 201)
     }
     if (action === 'select-production-rerate-offer') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to select a production carrier service',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(

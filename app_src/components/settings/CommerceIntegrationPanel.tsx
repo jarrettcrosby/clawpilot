@@ -198,8 +198,15 @@ type ProviderWriteControl = {
   changedBy: string | null
   changedRole: 'owner' | 'admin' | 'member' | null
   updatedAt: string | null
-  commandEnforcement: 'shopify_order_management' | 'not_connected'
+  commandEnforcement:
+    | 'shopify_order_management'
+    | 'shopify_fulfillment'
+    | 'shopify_order_management_and_fulfillment'
+    | 'faire_fulfillment'
+    | 'not_connected'
   providerWritesEffective: boolean
+  fulfillmentWritesEffective: boolean
+  fulfillmentWritesBlockedReason: string | null
 }
 
 type ProviderWritePayload = {
@@ -2919,23 +2926,34 @@ export default function CommerceIntegrationPanel({
                 === `provider-writes:${account.globalId}`
               const providerWriteStatusLabel = !providerWriteControl
                 ? 'Loading'
-                : providerWriteControl.commandEnforcement
-                    !== 'shopify_order_management'
-                  ? 'Not connected'
-                  : providerWriteControl.providerWritesEffective
-                    ? 'On'
+                : providerWriteControl.providerWritesEffective
+                    ? providerWriteControl.fulfillmentWritesEffective
+                      ? 'On'
+                      : 'On · Order editing only'
                     : providerWriteControl.requestedMode === 'on'
                       ? 'Revalidation required'
-                      : 'Off'
-              const providerWriteDetail = !providerWriteControl
+                      : providerWriteControl.commandEnforcement
+                          === 'not_connected'
+                        ? 'Not connected'
+                        : 'Off'
+              const providerWriteDetailBase = !providerWriteControl
                 ? 'Loading this connection control.'
                 : providerWriteControl.bindingStatus
                   === 'revalidation_required'
                   ? providerWriteControl.blocker?.message
                     || 'The saved credential or scope binding is stale.'
-                  : providerWriteControl.commandEnforcement === 'shopify_order_management'
-                    ? 'Controls Shopify order changes for this connection. Imports and refresh remain available while Off.'
-                    : 'Provider write commands are not connected for this provider yet. Imports and refresh remain available.'
+                  : providerWriteControl.commandEnforcement === 'not_connected'
+                    ? 'Provider write commands are not connected for this provider yet. Imports and refresh remain available.'
+                    : providerWriteControl.commandEnforcement === 'faire_fulfillment'
+                      ? 'Controls Faire fulfillment and tracking updates for this connection. Imports and refresh remain available while Off.'
+                      : providerWriteControl.commandEnforcement === 'shopify_fulfillment'
+                        ? 'Controls Shopify fulfillment and tracking updates for this connection. Imports and refresh remain available while Off.'
+                        : providerWriteControl.commandEnforcement === 'shopify_order_management_and_fulfillment'
+                          ? 'Controls Shopify order changes, fulfillment, and tracking updates. Imports and refresh remain available while Off.'
+                          : 'Controls Shopify order changes for this connection. Imports and refresh remain available while Off.'
+              const providerWriteDetail = providerWriteControl
+                ? `${providerWriteDetailBase} Turning Off blocks new attempts; an already authorized in-flight attempt may finish.`
+                : providerWriteDetailBase
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -3057,8 +3075,12 @@ export default function CommerceIntegrationPanel({
                               {providerWriteDetail}
                             </Typography>
                           </Box>
-                          {providerWriteControl?.commandEnforcement
-                            === 'shopify_order_management' ? (
+                          {providerWriteControl
+                            && (
+                              providerWriteControl.requestedMode === 'on'
+                              || providerWriteControl.commandEnforcement
+                                !== 'not_connected'
+                            ) ? (
                               <Switch
                                 checked={providerWriteControl.requestedMode
                                   === 'on'}
@@ -3091,6 +3113,22 @@ export default function CommerceIntegrationPanel({
                               sx={{ mt: 0.5 }}
                             >
                               {providerWriteControl.blocker.message}
+                            </Typography>
+                          ) : null}
+                        {providerWriteControl
+                          && !providerWriteControl.fulfillmentWritesEffective
+                          && providerWriteControl.fulfillmentWritesBlockedReason
+                          && (
+                            providerWriteControl.providerWritesEffective
+                            || providerWriteControl.requestedMode === 'on'
+                          ) ? (
+                            <Typography
+                              variant="caption"
+                              color="warning.main"
+                              display="block"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {providerWriteControl.fulfillmentWritesBlockedReason}
                             </Typography>
                           ) : null}
                         {providerWritePending ? (

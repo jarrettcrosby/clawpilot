@@ -1167,12 +1167,10 @@ function OrderDetailDrawer({
     (item) => item.action === 'reconcile_external_fulfillment',
   )
   const verifyPackAction = order?.availableActions?.find((item) => item.action === 'verify_pack')
-  const prepareFulfillmentAction = order?.availableActions?.find((item) => item.action === 'prepare_fulfillment')
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const canonicalShopifyTestLane = Boolean(
-    activationState === 'read_only'
-    && order?.sourceProvider === 'shopify',
+    order?.sourceProvider === 'shopify',
   )
   const canonicalShopifyAuthorization =
     sandboxE2eAuthorization?.authorityKind === 'shopify_test_store_canonical'
@@ -1198,9 +1196,7 @@ function OrderDetailDrawer({
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
-          ? activationState === 'shadow' && !nativeOneOff
-            ? prepareFulfillmentAction
-            : confirmShipmentAction
+          ? confirmShipmentAction
           : order && !['shipped', 'cancelled'].includes(order.status)
             ? releaseAction
             : undefined
@@ -1787,8 +1783,8 @@ function OrderDetailDrawer({
                           fallback: sandboxE2eAuthorization.expiresAt,
                         },
                       )}. {canonicalShopifyAuthorization
-                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order while Operations remains Read only.'
-                        : `It permits only this order's package-specific sandbox labels, reserved-inventory consumption, and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback.`}
+                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order. Provider writes must also be On before fulfillment is sent to Shopify.'
+                        : `It permits only this order's package-specific sandbox labels and reserved-inventory consumption. Provider writes must be On before ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment or tracking is sent.`}
                     </Alert>
                     {canonicalShopifyAuthorization && order.status === 'packed' && (
                       canonicalShopifyAuthorization.fulfillmentConfirmedAt ? (
@@ -1876,7 +1872,6 @@ function OrderDetailDrawer({
                     state={oneOffExecutionState}
                     loading={oneOffExecutionLoading}
                     error={oneOffExecutionError}
-                    activationState={activationState}
                     canManage={canManage}
                     canExecute={canExecute}
                     canPurchaseLivePostage={canPurchaseLivePostage}
@@ -4386,8 +4381,7 @@ export default function OperationsSection({
   const authorizeSandboxE2e = async (event: FormEvent) => {
     event.preventDefault()
     const canonicalShopifyTestLane = Boolean(
-      workspace?.activation.state === 'read_only'
-      && detail?.sourceProvider === 'shopify',
+      detail?.sourceProvider === 'shopify',
     )
     if (
       !detail
@@ -4751,10 +4745,6 @@ export default function OperationsSection({
     && (
       detail?.oneOffShippingMode !== 'live'
       || capabilities.canPurchaseLivePostage === true
-    )
-    && (
-      detail?.oneOffShippingMode !== 'live'
-      || workspace?.activation.state === 'active'
     )
   )
 
@@ -7309,8 +7299,7 @@ export default function OperationsSection({
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
           <DialogTitle>
-            {workspace?.activation.state === 'read_only'
-              && detail?.sourceProvider === 'shopify'
+            {detail?.sourceProvider === 'shopify'
               ? detail.status === 'imported'
                 ? 'Authorize verified Shopify test order'
                 : 'Renew or resume verified Shopify test order'
@@ -7319,9 +7308,8 @@ export default function OperationsSection({
           <DialogContent dividers>
             <Stack spacing={2}>
               <Alert severity="error">
-                {workspace?.activation.state === 'read_only'
-                  && detail?.sourceProvider === 'shopify'
-                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, local order revision, and Read only activation revision. It expires after two hours and never permits production postage or customer notification.`
+                {detail?.sourceProvider === 'shopify'
+                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, and local order revision. It expires after two hours and never permits production postage or customer notification.`
                   : `This authority is limited to ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). It permits non-tracking sandbox labels followed by real reserved inventory consumption and ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback. The authorization expires after two hours and is consumed by a successful shipment confirmation.`}
               </Alert>
               <Box
@@ -7332,14 +7320,12 @@ export default function OperationsSection({
                 }}
               >
                 <Typography variant="body2">
-                  {workspace?.activation.state === 'read_only'
-                    && detail?.sourceProvider === 'shopify'
+                  {detail?.sourceProvider === 'shopify'
                     ? SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
                     : SANDBOX_COMMERCE_E2E_CONFIRMATION}
                 </Typography>
               </Box>
-              {workspace?.activation.state === 'read_only'
-                && detail?.sourceProvider === 'shopify' ? (
+              {detail?.sourceProvider === 'shopify' ? (
                 <TextField
                   required
                   multiline
@@ -7395,8 +7381,7 @@ export default function OperationsSection({
               disabled={
                 authorizingSandboxE2e
                 || (
-                  workspace?.activation.state === 'read_only'
-                    && detail?.sourceProvider === 'shopify'
+                  detail?.sourceProvider === 'shopify'
                     ? sandboxE2eConfirmationText
                       !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
                     : !sandboxE2eAuthorizationConfirmed
@@ -7512,7 +7497,9 @@ export default function OperationsSection({
                 plan as shipped, creates immutable shipment and packing-slip evidence, seeds
                 tracking, and attempts the commerce fulfillment export for
                 {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
-                readiness checks are repeated when you confirm.
+                readiness checks are repeated when you confirm. For Shopify and Faire,
+                the exact connection&apos;s Provider writes control must still be On and
+                bound to its current credential and scopes.
               </Alert>
               {detail?.sandboxCommerceE2eAuthorization && (
                 <Alert severity="error" data-testid="sandbox-commerce-e2e-confirm-shipment-warning">

@@ -69,7 +69,6 @@ class MockSandboxLabelError extends Error {
 }
 
 const events = []
-let productionActiveChecks = 0
 const organizationId = '28600000-0000-4000-8000-000000000001'
 const integrationAccountId = '28600000-0000-4000-8000-000000000010'
 const carrierAccountId = '28600000-0000-4000-8000-000000000020'
@@ -313,12 +312,7 @@ const actions = loadTypeScriptModule(
         return { destinationFingerprint: destinationHash }
       },
     },
-    '@/lib/integrations/carrierShippingDiagnosticRate': {
-      async requireProductionShippingDiagnosticActive() {
-        productionActiveChecks += 1
-        events.push('require-active')
-      },
-    },
+    '@/lib/integrations/carrierShippingDiagnosticRate': {},
     '@/lib/integrations/carrierSandboxRate': {
       buildCarrierSandboxRateFixture: () => ({ shipment: 'fixture' }),
       carrierSandboxPartyFingerprint: () => destinationHash,
@@ -413,6 +407,36 @@ const parcel = {
   weightUnit: 'LB',
 }
 
+const eventsBeforePermissionRejection = events.length
+await assert.rejects(
+  actions.createCarrierRateTestLabel({
+    organizationId,
+    actorEmail: 'admin@example.com',
+    rateEvidenceGlobalId: context.rateEvidenceGlobalId,
+    selectedRate,
+    destination,
+    destinationResidential: true,
+    parcel,
+    shipFromPhone: '8605550100',
+    shipToPhone: '2035550100',
+    operatorConfirmation: confirmation,
+    productionAuthorizedByOwnerAdmin: true,
+    productionLivePostageAuthorized: false,
+    outputFormat: 'ZPL',
+    reason: 'Must fail before provider or durable attempt',
+    idempotencyKey: 'diagnostic-create-forbidden-0001',
+  }),
+  (error) => (
+    error.code === 'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN'
+    && error.status === 403
+  ),
+)
+assert.deepEqual(
+  events.slice(eventsBeforePermissionRejection),
+  ['read-rate-evidence'],
+  'Missing live-postage permission must fail before credential runtime, attempt, or provider access',
+)
+
 const created = await actions.createCarrierRateTestLabel({
   organizationId,
   actorEmail: 'owner@example.com',
@@ -425,6 +449,7 @@ const created = await actions.createCarrierRateTestLabel({
   shipToPhone: '2035550100',
   operatorConfirmation: confirmation,
   productionAuthorizedByOwnerAdmin: true,
+  productionLivePostageAuthorized: true,
   outputFormat: 'ZPL',
   reason: 'Verify live production account then void',
   idempotencyKey: 'diagnostic-create-0001',
@@ -435,13 +460,6 @@ assert.ok(
     < events.indexOf('execute-provider-create'),
   'The durable create attempt must precede the mocked provider adapter',
 )
-assert.equal(
-  productionActiveChecks,
-  2,
-  'Production create must recheck Active before and after durable preparation',
-)
-
-const activeChecksBeforeVoid = productionActiveChecks
 const voided = await actions.voidCarrierRateTestLabel({
   organizationId,
   actorEmail: 'owner@example.com',
@@ -455,10 +473,9 @@ assert.ok(
     < events.indexOf('execute-provider-void'),
   'The durable void attempt must precede the mocked provider adapter',
 )
-assert.equal(
-  productionActiveChecks,
-  activeChecksBeforeVoid,
-  'Production void must not recheck Operations Active or purchase capability',
+assert.ok(
+  !events.includes('require-active'),
+  'Production create and void must not consult the global Operations activation profile',
 )
 
 await assert.rejects(

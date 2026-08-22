@@ -23,6 +23,10 @@ const orderEditingReleaseMigrations = new Map([
     'db/migrations/0312_operations_shopify_order_single_save.sql',
     'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb',
   ],
+  [
+    'db/migrations/0315_operations_carrier_writes_independent_activation.sql',
+    'a83731e62dc6253952800709b37db83cdebf593539049b0b0791a64544f34b8d',
+  ],
 ])
 
 function fail(message) {
@@ -88,6 +92,9 @@ for (const requiredFragment of [
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0',
   'OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50',
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf',
+  'b778ce078c72111b3b73d2302acc38191ac4af9e9c88e6973ce0cbb1658b03d6',
+  'OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_ARTIFACT_COUNT = 10',
+  '729f134cd49c97aae0d155d8d49cdc44b16b9eebde242cce016987b257ff75ad',
   'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
 ]) {
   if (!orderEditingHealth.includes(requiredFragment)) {
@@ -358,6 +365,7 @@ for (const requiredPath of [
   'db/migrations/0312_operations_shopify_order_single_save.sql',
   'db/migrations/0313_shipping_one_off_documents_minimal_fields.sql',
   'db/migrations/0314_operations_local_work_independent_activation.sql',
+  'db/migrations/0315_operations_carrier_writes_independent_activation.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
   'db/migrations/0309_operations_measured_packaging_evidence.sql',
   'app_src/components/shipping/ShippingSection.tsx',
@@ -800,6 +808,7 @@ for (const requiredPath of [
   'scripts/test-operation-active-multi-package-execution-contracts.mjs',
   'scripts/test-operation-production-fulfillment-rerate-contracts.mjs',
   'scripts/test-operation-production-fulfillment-rerates-postgres.mjs',
+  'scripts/test-operation-carrier-activation-independence.mjs',
   'scripts/test-carrier-whole-shipment-rate-foundation.mjs',
   'scripts/fixtures/carrier-rates/ups-whole-shipment-recorded.json',
   'scripts/fixtures/carrier-rates/fedex-whole-shipment-recorded.json',
@@ -1058,6 +1067,10 @@ if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-
 }
 
 run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
+run(process.execPath, ['scripts/test-operation-carrier-activation-independence.mjs'])
+run(process.execPath, [
+  'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',
+])
 run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e.mjs'])
 run(process.execPath, ['scripts/test-shopify-test-store-canonical-e2e-health.mjs'])
 run('npm', ['run', 'build'])

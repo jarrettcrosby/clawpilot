@@ -428,7 +428,8 @@ assertIncludes(carrierIntegrations, [
 
 assertIncludes(operationsRoute, [
   "if (action === 'execute-production-rerate')",
-  '!capabilities.canManage || !capabilities.canExecute',
+  '!shippingCapabilities(actor).canPurchaseLivePostage',
+  "code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED'",
   'executeProductionFulfillmentRerate({',
   'expectedActivationRevision:',
   'idempotencyKey: idempotencyKeyValue(req)',
@@ -439,8 +440,8 @@ assertIncludes(operationsRoute, [
   'const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/',
   'const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/',
   "if (action === 'select-production-rerate-offer')",
-  '!capabilities.canManage || !capabilities.canExecute',
-  "code: 'OPERATIONS_EXECUTE_REQUIRED'",
+  '!shippingCapabilities(actor).canPurchaseLivePostage',
+  "code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED'",
   "'rerateRunGlobalId'",
   "'offerGlobalId'",
   "'selectionReason'",
@@ -464,7 +465,6 @@ assertIncludes(application, [
   'result_global_id = $2',
   'This is a historical command replay, not fresh dispatch authority.',
   'Lock every mutable row used as current selection authority in one',
-  'FROM operations_activation_scopes',
   'FROM operations_orders orders',
   'FROM operations_integration_accounts',
   'FROM operations_carrier_accounts',
@@ -486,7 +486,6 @@ assert.ok(
   'Same-offer immutable replay must precede expiration and current-authority validation',
 )
 const mutableAuthorityLockOrder = [
-  'FROM operations_activation_scopes',
   'FROM operations_orders orders',
   'FROM operations_integration_accounts',
   'FROM operations_carrier_accounts',
@@ -501,8 +500,13 @@ for (let index = 1; index < mutableAuthorityLockOrder.length; index += 1) {
 }
 assert.equal(
   (selectionImplementation.match(/LIMIT 1\n         FOR SHARE/g) || []).length,
-  7,
-  'Selection must lock historical/candidate evidence plus all five mutable authority rows',
+  6,
+  'Selection must lock historical/candidate evidence plus the four real mutable authority rows',
+)
+assert.doesNotMatch(
+  application,
+  /operations_activation_scopes|current_activation_state|current_activation_revision/u,
+  'Production carrier rerate and selection must be independent of the legacy Operations profile',
 )
 
 console.log('Production fulfillment rerate static contracts passed')

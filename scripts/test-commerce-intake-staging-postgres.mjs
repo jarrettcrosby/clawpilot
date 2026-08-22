@@ -1105,6 +1105,15 @@ function loadOperationalWarehouseServices(pool) {
           return []
         },
       },
+      '@/lib/persistence/commerceProviderWrites': {
+        CommerceProviderWriteControlError: class extends Error {},
+        async readCommerceProviderWriteControlsFromPostgres() {
+          return { accounts: [] }
+        },
+        requireCurrentCommerceProviderWritesInPostgres: mustNotRun(
+          'requireCurrentCommerceProviderWritesInPostgres',
+        ),
+      },
       '@/lib/persistence/operationsOrderShipmentAddress': shipmentAddress,
       '@/lib/persistence/commerceOrderRevisions': {
         async assertCommerceOrderRevisionExecutionCurrent() {},

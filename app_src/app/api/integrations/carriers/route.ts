@@ -35,7 +35,10 @@ import {
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { listOperationsPrinterProfilesInPostgres } from '@/lib/persistence/operationPrinting'
 import { OperationsRequestError } from '@/lib/persistence/operations'
-import { operationsCapabilities } from '@/lib/operations/authorization'
+import {
+  operationsCapabilities,
+  shippingCapabilities,
+} from '@/lib/operations/authorization'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 
@@ -476,6 +479,7 @@ export async function GET(req: NextRequest) {
     requireManager(actor)
     const organization = organizationId(actor)
     const capabilities = operationsCapabilities(actor)
+    const shipping = shippingCapabilities(actor)
     const [integrations, rateTestLabels, rateTestAttempts, printers] = await Promise.all([
       getCarrierIntegrationsState(organization),
       listCarrierRateTestLabels({ organizationId: organization }),
@@ -487,6 +491,7 @@ export async function GET(req: NextRequest) {
       ok: true,
       canManage: true,
       canExecute: capabilities.canExecute,
+      canPurchaseLivePostage: shipping.canPurchaseLivePostage,
       canRevealCredentials: canRevealCredential(actor),
       canReconcile: capabilities.canExecute && canRevealCredential(actor),
       productionLabelAuthorizationAllowed:
@@ -627,6 +632,16 @@ export async function PATCH(req: NextRequest) {
       ])
       const provider = directShippingProvider(body.provider)
       const environment = diagnosticEnvironment(body.environment)
+      if (
+        environment === 'production'
+        && !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
+        throw new CarrierIntegrationRequestError(
+          'Live-postage permission is required to run a LIVE production shipping diagnostic',
+          403,
+          'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
+        )
+      }
       const carrierAccountGlobalId = plainText(
         body.carrierAccountGlobalId,
         'Carrier account reference',
@@ -725,6 +740,8 @@ export async function PATCH(req: NextRequest) {
           ? undefined
           : plainText(body.operatorConfirmation, 'REAL POSTAGE confirmation', 300),
         productionAuthorizedByOwnerAdmin: canRevealCredential(actor),
+        productionLivePostageAuthorized:
+          shippingCapabilities(actor).canPurchaseLivePostage,
         outputFormat: labelOutputFormat(body.outputFormat),
         reason: plainText(body.reason, 'Test-label reason', 500),
         idempotencyKey: idempotencyKey(body.idempotencyKey),
@@ -890,10 +907,12 @@ export async function PATCH(req: NextRequest) {
         'action', 'provider', 'enabled', 'reason', 'confirmation',
       ])
       requireCredentialViewer(actor)
-      const capabilities = operationsCapabilities(actor)
-      if (!capabilities.canActivate) {
+      if (
+        body.enabled === true
+        && !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         throw new CarrierIntegrationRequestError(
-          'Operations activation permission is required to authorize live postage',
+          'Live-postage permission is required to authorize live postage',
           403,
           'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
         )

@@ -2499,8 +2499,6 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = account.organization_id
      WHERE receipt.provider = 'shopify'
        AND receipt.topic = 'products/delete'
        AND receipt.state = 'held'

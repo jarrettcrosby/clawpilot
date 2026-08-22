@@ -3307,6 +3307,17 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/persistence/commerceOrderWorkbench': {
             readCommerceOrderWorkbenchFromPostgres: async () => [],
           },
+          '@/lib/persistence/commerceProviderWrites': {
+            CommerceProviderWriteControlError: class extends Error {},
+            readCommerceProviderWriteControlsFromPostgres: async () => ({
+              accounts: [],
+            }),
+            requireCurrentCommerceProviderWritesInPostgres: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize Provider writes',
+              )
+            },
+          },
           '@/lib/persistence/commerceOrderRevisions': {
             async assertCommerceOrderRevisionExecutionCurrent() {},
             CommerceOrderRevisionGateError: class extends Error {},

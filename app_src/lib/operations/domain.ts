@@ -35,6 +35,8 @@ export function availableOperationsOrderActions(input: {
   canExecute: boolean
   canManage?: boolean
   canPurchaseLivePostage?: boolean
+  fulfillmentWritesEnabled?: boolean
+  fulfillmentWritesBlockedReason?: string | null
   planStatus: string | null
   waveStatus: string | null
   lineCount: number
@@ -63,8 +65,8 @@ export function availableOperationsOrderActions(input: {
   shopifyExternalFulfillmentReconciliationRequired?: boolean
   replanningCorrection?: OperationsOrderActionAvailability | null
 }): OperationsOrderActionAvailability[] {
-  const canonicalReadOnlyAuthorized = input.activationState === 'read_only'
-    && input.sandboxE2eAuthorityKind === 'shopify_test_store_canonical'
+  const canonicalShopifyAuthorized =
+    input.sandboxE2eAuthorityKind === 'shopify_test_store_canonical'
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
     releaseBlockedReason = 'Operations execute permission is required.'
@@ -145,17 +147,11 @@ export function availableOperationsOrderActions(input: {
   if (!input.canExecute) {
     shipmentBlockedReason = 'Operations execute permission is required.'
   } else if (
-    !isNativeOneOff
-    && input.activationState !== 'active'
-    && !canonicalReadOnlyAuthorized
+    ['shopify', 'faire'].includes(input.sourceProvider || '')
+    && input.fulfillmentWritesEnabled !== true
   ) {
-    shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
-  } else if (
-    isNativeOneOff
-    && input.oneOffShippingMode === 'live'
-    && input.activationState !== 'active'
-  ) {
-    shipmentBlockedReason = 'LIVE one-off shipments can be confirmed only in Operations Active.'
+    shipmentBlockedReason = input.fulfillmentWritesBlockedReason
+      || `Reconnect the ${input.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} connection and verify its fulfillment-write scopes before confirming shipment.`
   } else if (
     isNativeOneOff
     && input.oneOffShippingMode === 'live'
@@ -186,7 +182,7 @@ export function availableOperationsOrderActions(input: {
   } else if ((input.unresolvedLabelAttemptCount || 0) > 0) {
     shipmentBlockedReason = 'Resolve the pending carrier label attempt before confirming shipment.'
   } else if (
-    canonicalReadOnlyAuthorized
+    canonicalShopifyAuthorized
     && input.sandboxE2eFulfillmentConfirmed !== true
   ) {
     shipmentBlockedReason = 'Confirm this exact Shopify test fulfillment before creating fulfillmentCreate.'

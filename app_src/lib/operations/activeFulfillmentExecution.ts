@@ -162,12 +162,6 @@ function freezeExecution(
 export function prepareActiveFulfillmentExecution(
   input: PrepareActiveFulfillmentExecutionInput,
 ): PreparedActiveFulfillmentExecution {
-  if (input.activationState !== 'active') {
-    fail(
-      'OPERATIONS_ACTIVE_AUTHORITY_REQUIRED',
-      'Active fulfillment execution requires Operations Active',
-    )
-  }
   if (!Number.isInteger(input.activationRevision) || input.activationRevision < 1) {
     fail(
       'OPERATIONS_ACTIVE_EXECUTION_INPUT_INVALID',

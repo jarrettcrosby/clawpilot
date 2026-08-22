@@ -204,6 +204,10 @@ includes(receiptFunction, [
   "current.webhook_verification_status !== 'verified'",
   "const errorCode = 'SHOPIFY_PRODUCT_DELETE_REPLAY_FAILED'",
 ], 'Atomic Shopify delete image reconciliation')
+assert.ok(
+  !receiptFunction.includes('operations_activation_scopes'),
+  'Held Shopify product deletion replay must not depend on the legacy Operations activation row',
+)
 assert.match(
   receiptFunction,
   /If the catalog worker is disabled while Store sync alone resumes,[\s\S]*?immutable receipt intentionally remains held/,
@@ -305,6 +309,7 @@ const receiptPersistenceModule = loadTypeScriptModule(
             assert.match(sql, /receipt\.topic = 'products\/delete'/)
             assert.match(sql, /receipt\.state = 'held'/)
             assert.match(sql, /receipt\.attempts < receipt\.max_attempts/)
+            assert.doesNotMatch(sql, /operations_activation_scopes/)
             assert.match(
               sql,
               /credential\.external_account_id = account\.external_account_id/,

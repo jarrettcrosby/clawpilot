@@ -4,6 +4,12 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
 import { readCommerceOrderWorkbenchFromPostgres } from '@/lib/persistence/commerceOrderWorkbench'
 import {
+  CommerceProviderWriteControlError,
+  readCommerceProviderWriteControlsFromPostgres,
+  requireCurrentCommerceProviderWritesInPostgres,
+  type CommerceProviderWriteAuthority,
+} from '@/lib/persistence/commerceProviderWrites'
+import {
   readOperationsOrderShipmentAddressInPostgres,
 } from '@/lib/persistence/operationsOrderShipmentAddress'
 import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
@@ -2422,7 +2428,6 @@ async function readNativeOneOffShipmentAvailability(input: {
   orderId: string
   planId: string | null
   executionMode: 'test' | 'live' | null
-  activationState: OperationsActivationState
 }): Promise<NativeOneOffShipmentAvailability> {
   if (!input.planId || !input.executionMode) {
     return {
@@ -2563,17 +2568,13 @@ async function readNativeOneOffShipmentAvailability(input: {
     : 'production'
   if (
     row.environment !== expectedEnvironment
-    || (
-      input.executionMode === 'live'
-      && input.activationState !== 'active'
-    )
     || !row.authority_exact
   ) {
     return {
       ready: false,
       blockedReason: input.executionMode === 'test'
         ? 'TEST confirmation requires exact sandbox authority.'
-        : 'LIVE confirmation requires exact production authority in Operations Active.',
+        : 'LIVE confirmation requires exact production carrier authority.',
     }
   }
   const packageCount = Number(row.package_count)
@@ -3420,11 +3421,25 @@ async function readOrderDetail(
   const row = orderResult.rows[0]
   if (!row) return null
 
-  const shipmentShipTo =
-    await readOperationsOrderShipmentAddressInPostgres({
+  const [shipmentShipTo, providerWriteControls] = await Promise.all([
+    readOperationsOrderShipmentAddressInPostgres({
       organizationId,
       orderGlobalId: row.global_id,
-    })
+    }),
+    readCommerceProviderWriteControlsFromPostgres({ organizationId }),
+  ])
+  const fulfillmentProviderWriteControl =
+    providerWriteControls.accounts.find((account) => (
+      account.accountGlobalId === row.integration_account_global_id
+      && account.provider === row.source_provider
+    ))
+  const fulfillmentWritesEnabled = !['shopify', 'faire'].includes(
+    row.source_provider,
+  ) || fulfillmentProviderWriteControl?.fulfillmentWritesEffective === true
+  const fulfillmentWritesBlockedReason = fulfillmentWritesEnabled
+    ? null
+    : fulfillmentProviderWriteControl?.fulfillmentWritesBlockedReason
+      || `Reconnect the ${row.source_provider === 'faire' ? 'Faire' : 'Shopify'} connection and verify its fulfillment-write scopes before confirming shipment.`
 
   const [
     lineResult,
@@ -3766,7 +3781,6 @@ async function readOrderDetail(
           orderId: row.id,
           planId: row.plan_id,
           executionMode: row.one_off_shipping_mode,
-          activationState: context.activationState,
         })
       : Promise.resolve<NativeOneOffShipmentAvailability>({
           ready: false,
@@ -3838,6 +3852,8 @@ async function readOrderDetail(
       canExecute: context.canExecute,
       canManage: context.canManage,
       canPurchaseLivePostage: context.canPurchaseLivePostage,
+      fulfillmentWritesEnabled,
+      fulfillmentWritesBlockedReason,
       planStatus: row.plan_status,
       waveStatus: row.wave_status,
       lineCount: Number(row.line_count),
@@ -18489,6 +18505,7 @@ type CommerceFulfillmentExportExecutionRow = QueryResultRow & {
   updated_at: Date
   integration_account_id: string | null
   account_global_id: string | null
+  account_environment: string | null
   provider_attempt_id: string | null
   provider_attempt_global_id: string | null
   provider_attempt_state: string | null
@@ -18507,6 +18524,16 @@ const FAIRE_FULFILLMENT_PROVIDER_ATTEMPT_ADAPTER =
   'faire-fulfillment-writeback-v2'
 const FAIRE_FULFILLMENT_PROVIDER_WRITE_PROTOCOL =
   'faire-fulfillment-attempt-v1'
+const SHOPIFY_FULFILLMENT_PROVIDER_WRITE_SCOPES = [
+  'read_orders',
+  'write_merchant_managed_fulfillment_orders',
+] as const
+const FAIRE_FULFILLMENT_PROVIDER_WRITE_SCOPES = [
+  'READ_BRAND',
+  'READ_ORDERS',
+  'READ_SHIPMENTS',
+  'WRITE_ORDERS',
+] as const
 
 type FaireFulfillmentAttemptRequest = {
   version: 1
@@ -18699,11 +18726,84 @@ function requireFaireFulfillmentAttemptRequestHash(
   }
 }
 
+function fulfillmentProviderWriteExpectation(value: unknown) {
+  const authority = json(value)
+  const accountGlobalId = String(authority.accountGlobalId || '')
+    .trim()
+    .toLowerCase()
+  const provider = String(authority.provider || '').trim()
+  const environment = String(authority.environment || '').trim()
+  const controlRowVersion = Number(authority.controlRowVersion)
+  const credentialGeneration = Number(authority.credentialGeneration)
+  const grantedScopeDigest = String(authority.grantedScopeDigest || '')
+    .trim()
+    .toLowerCase()
+  if (
+    !Number.isSafeInteger(controlRowVersion)
+    || controlRowVersion < 1
+    || !/^gia(?:[0-9]{7}|[0-9a-v]{12})$/.test(accountGlobalId)
+    || !['shopify', 'faire'].includes(provider)
+    || !['sandbox', 'production'].includes(environment)
+    || !Number.isSafeInteger(credentialGeneration)
+    || credentialGeneration < 1
+    || !/^[a-f0-9]{64}$/.test(grantedScopeDigest)
+  ) {
+    return null
+  }
+  return {
+    providerWriteAccountGlobalId: accountGlobalId,
+    providerWriteProvider: provider as 'shopify' | 'faire',
+    providerWriteEnvironment: environment as 'sandbox' | 'production',
+    providerWriteControlRowVersion: controlRowVersion,
+    providerWriteCredentialGeneration: credentialGeneration,
+    providerWriteScopeDigest: grantedScopeDigest,
+  }
+}
+
+type FulfillmentProviderWriteExpectation = NonNullable<ReturnType<
+  typeof fulfillmentProviderWriteExpectation
+>>
+
+function fulfillmentProviderWriteAuthoritySnapshot(
+  authority: CommerceProviderWriteAuthority,
+) {
+  return {
+    accountGlobalId: authority.accountGlobalId,
+    provider: authority.provider,
+    environment: authority.environment,
+    controlRowVersion: authority.controlRowVersion,
+    credentialGeneration: authority.credentialGeneration,
+    grantedScopeDigest: authority.grantedScopeDigest,
+  }
+}
+
+function fulfillmentProviderWriteExpectationFromAuthority(
+  authority: CommerceProviderWriteAuthority,
+): FulfillmentProviderWriteExpectation {
+  return {
+    providerWriteAccountGlobalId: authority.accountGlobalId,
+    providerWriteProvider: authority.provider,
+    providerWriteEnvironment: authority.environment,
+    providerWriteControlRowVersion: authority.controlRowVersion,
+    providerWriteCredentialGeneration: authority.credentialGeneration,
+    providerWriteScopeDigest: authority.grantedScopeDigest,
+  }
+}
+
+function fulfillmentProviderWriteAuthorityHash(
+  authority: CommerceProviderWriteAuthority,
+) {
+  return createHash('sha256')
+    .update(JSON.stringify(fulfillmentProviderWriteAuthoritySnapshot(authority)))
+    .digest('hex')
+}
+
 async function registerShopifyFulfillmentProviderAttempt(input: {
   organizationId: string
   actorEmail: string | null
   commerceExportGlobalId: string
   integrationAccountId: string
+  accountGlobalId: string
   exportIdempotencyKey: string
   exportAttempt: number
   preparedRequest: unknown
@@ -18719,11 +18819,31 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
       409,
     )
   }
-  const serializedRequest = JSON.stringify(input.preparedRequest)
+  const serializedSignature = JSON.stringify(input.preparedRequest)
   const requestHash = createHash('sha256')
-    .update(serializedRequest)
+    .update(serializedSignature)
     .digest('hex')
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const providerWriteAuthority =
+      await requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      provider: 'shopify',
+      requiredScopes: SHOPIFY_FULFILLMENT_PROVIDER_WRITE_SCOPES,
+      client,
+    })
+    const providerWriteExpectation =
+      fulfillmentProviderWriteExpectationFromAuthority(providerWriteAuthority)
+    const providerWriteAuthoritySnapshot =
+      fulfillmentProviderWriteAuthoritySnapshot(providerWriteAuthority)
+    const serializedRequest = JSON.stringify({
+      ...(input.preparedRequest as Record<string, unknown>),
+      providerWriteAuthority: providerWriteAuthoritySnapshot,
+    })
     await acquireTransactionAdvisoryLock(
       client,
       `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
@@ -18800,10 +18920,29 @@ async function registerShopifyFulfillmentProviderAttempt(input: {
         input.actorEmail,
       ],
     )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.commerce_fulfillment.provider_write_authority_sealed',
+      aggregateType: 'operations.commerce_provider_attempt',
+      aggregateId: attempt.rows[0].global_id,
+      subject: `Commerce provider attempt ${attempt.rows[0].global_id}`,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:commerce-provider-attempt:${attempt.rows[0].global_id}:provider-write-authority`,
+      payload: {
+        commerceExportGlobalId: input.commerceExportGlobalId,
+        providerAttemptGlobalId: attempt.rows[0].global_id,
+        ...providerWriteAuthoritySnapshot,
+        providerWriteAuthorityHash:
+          fulfillmentProviderWriteAuthorityHash(providerWriteAuthority),
+      },
+    }, client)
     return {
       id: attempt.rows[0].id,
       globalId: attempt.rows[0].global_id,
       requestHash,
+      providerWriteExpectation,
     }
   })
 }
@@ -18813,15 +18952,37 @@ async function registerFaireFulfillmentProviderAttempt(input: {
   actorEmail: string | null
   commerceExportGlobalId: string
   integrationAccountId: string
+  accountGlobalId: string
   exportIdempotencyKey: string
   exportAttempt: number
   preparedRequest: FaireFulfillmentAttemptRequest
 }) {
-  const serializedRequest = JSON.stringify(input.preparedRequest)
-  const requestHash = faireFulfillmentAttemptRequestHash(
-    input.preparedRequest,
-  )
   return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`,
+    )
+    const providerWriteAuthority =
+      await requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      provider: 'faire',
+      requiredScopes: FAIRE_FULFILLMENT_PROVIDER_WRITE_SCOPES,
+      client,
+    })
+    const providerWriteExpectation =
+      fulfillmentProviderWriteExpectationFromAuthority(providerWriteAuthority)
+    const providerWriteAuthoritySnapshot =
+      fulfillmentProviderWriteAuthoritySnapshot(providerWriteAuthority)
+    const preparedRequest = normalizeFaireFulfillmentAttemptRequest({
+      ...input.preparedRequest,
+      authorizationRevision: providerWriteAuthority.controlRowVersion,
+    }, input.preparedRequest.externalOrderId)
+    const serializedRequest = JSON.stringify({
+      ...preparedRequest,
+      providerWriteAuthority: providerWriteAuthoritySnapshot,
+    })
+    const requestHash = faireFulfillmentAttemptRequestHash(preparedRequest)
     await acquireTransactionAdvisoryLock(
       client,
       `operations:commerce-fulfillment-export:${input.organizationId}:${input.commerceExportGlobalId}`,
@@ -18878,7 +19039,7 @@ async function registerFaireFulfillmentProviderAttempt(input: {
         prior.state === 'failed'
         && prior.error_code === 'FAIRE_REQUEST_REJECTED'
         && Number.isSafeInteger(priorRevision)
-        && input.preparedRequest.authorizationRevision > priorRevision
+        && preparedRequest.authorizationRevision > priorRevision
         && requestHash !== prior.request_hash
       )
       if (!revisedKnownRejection) {
@@ -18918,10 +19079,30 @@ async function registerFaireFulfillmentProviderAttempt(input: {
         input.actorEmail,
       ],
     )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType:
+        'operations.commerce_fulfillment.provider_write_authority_sealed',
+      aggregateType: 'operations.commerce_provider_attempt',
+      aggregateId: attempt.rows[0].global_id,
+      subject: `Commerce provider attempt ${attempt.rows[0].global_id}`,
+      organizationId: input.organizationId,
+      eventKey:
+        `operations:commerce-provider-attempt:${attempt.rows[0].global_id}:provider-write-authority`,
+      payload: {
+        commerceExportGlobalId: input.commerceExportGlobalId,
+        providerAttemptGlobalId: attempt.rows[0].global_id,
+        ...providerWriteAuthoritySnapshot,
+        providerWriteAuthorityHash:
+          fulfillmentProviderWriteAuthorityHash(providerWriteAuthority),
+      },
+    }, client)
     return {
       id: attempt.rows[0].id,
       globalId: attempt.rows[0].global_id,
       requestHash,
+      preparedRequest,
+      providerWriteExpectation,
     }
   })
 }
@@ -18958,6 +19139,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
               fulfillment_export.updated_at,
               integration.id::text AS integration_account_id,
               integration.global_id AS account_global_id,
+              integration.environment AS account_environment,
               provider_attempt.id::text AS provider_attempt_id,
               provider_attempt.global_id AS provider_attempt_global_id,
               provider_attempt.state AS provider_attempt_state,
@@ -19082,6 +19264,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
                    provider_reference, error_code, error_message, updated_at,
                    NULL::text AS integration_account_id,
                    NULL::text AS account_global_id,
+                   NULL::text AS account_environment,
                    NULL::text AS provider_attempt_id,
                    NULL::text AS provider_attempt_global_id,
                    NULL::text AS provider_attempt_state,
@@ -19108,6 +19291,7 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
         order_currency: row.order_currency,
         integration_account_id: row.integration_account_id,
         account_global_id: row.account_global_id,
+        account_environment: row.account_environment,
         provider_attempt_id: row.provider_attempt_id,
         provider_attempt_global_id: row.provider_attempt_global_id,
         provider_attempt_state: row.provider_attempt_state,
@@ -19179,9 +19363,111 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
     id: string
     globalId: string
     requestHash: string
+    providerWriteExpectation?: FulfillmentProviderWriteExpectation
   } | null = null
   let providerAttemptResponse: Record<string, unknown> | null = null
+  let providerWriteExpectation: ReturnType<
+    typeof fulfillmentProviderWriteExpectation
+  > = null
   try {
+    const exportProviderWriteAuthorityPresent = (
+      snapshot.providerWriteAuthority !== undefined
+      && snapshot.providerWriteAuthority !== null
+    )
+    providerWriteExpectation = fulfillmentProviderWriteExpectation(
+      snapshot.providerWriteAuthority,
+    )
+    if (claimed.row.provider === 'shopify' || claimed.row.provider === 'faire') {
+      if (exportProviderWriteAuthorityPresent && !providerWriteExpectation) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_WRITE_AUTHORITY_INVALID',
+          'The fulfillment export Provider writes authority is malformed',
+          409,
+        )
+      }
+      if (
+        providerWriteExpectation
+        && (
+          !claimed.row.account_global_id
+          || providerWriteExpectation.providerWriteAccountGlobalId
+            !== claimed.row.account_global_id
+          || providerWriteExpectation.providerWriteProvider
+            !== claimed.row.provider
+          || providerWriteExpectation.providerWriteEnvironment
+            !== claimed.row.account_environment
+        )
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_WRITE_AUTHORITY_MISMATCH',
+          'The fulfillment export Provider writes authority does not match its exact account, provider, or environment',
+          409,
+        )
+      }
+      const providerAttemptRequest = json(
+        claimed.row.provider_attempt_request,
+      )
+      const providerAttemptAuthorityPresent = (
+        providerAttemptRequest.providerWriteAuthority !== undefined
+        && providerAttemptRequest.providerWriteAuthority !== null
+      )
+      const providerAttemptWriteExpectation =
+        fulfillmentProviderWriteExpectation(
+          providerAttemptRequest.providerWriteAuthority,
+        )
+      if (
+        providerAttemptAuthorityPresent
+        && !providerAttemptWriteExpectation
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_WRITE_AUTHORITY_INVALID',
+          'The durable provider attempt Provider writes authority is malformed',
+          409,
+        )
+      }
+      if (
+        providerAttemptWriteExpectation
+        && (
+          !claimed.row.account_global_id
+          || providerAttemptWriteExpectation.providerWriteAccountGlobalId
+            !== claimed.row.account_global_id
+          || providerAttemptWriteExpectation.providerWriteProvider
+            !== claimed.row.provider
+          || providerAttemptWriteExpectation.providerWriteEnvironment
+            !== claimed.row.account_environment
+        )
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_WRITE_AUTHORITY_MISMATCH',
+          'The durable provider attempt authority does not match its exact account, provider, or environment',
+          409,
+        )
+      }
+      if (
+        claimed.recoveryMode !== 'reconcile_only'
+        && !providerWriteExpectation
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PROVIDER_WRITE_AUTHORITY_REQUIRED',
+          'The fulfillment export is missing exact Provider writes authority and cannot be submitted',
+          409,
+        )
+      }
+      if (
+        claimed.recoveryMode === 'reconcile_only'
+        && !providerWriteExpectation
+        && (
+          !claimed.row.provider_attempt_id
+          || !claimed.row.provider_attempt_global_id
+          || !claimed.row.provider_attempt_request
+        )
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_EVIDENCE_REQUIRED',
+          'A legacy fulfillment export requires an exact durable provider attempt for read-only reconciliation',
+          409,
+        )
+      }
+    }
     if (!carrier || trackingNumbers.length === 0) {
       throw new OperationsRequestError(
         'OPERATIONS_COMMERCE_EXPORT_SNAPSHOT_INVALID',
@@ -19271,24 +19557,39 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           )
         }
       } else {
+        // New provider mutations always require the exact self-bound snapshot.
+        // Legacy no-snapshot exports are accepted only in the GET-only branch.
+        if (!providerWriteExpectation) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PROVIDER_WRITE_AUTHORITY_REQUIRED',
+            'The Shopify fulfillment export is missing exact Provider writes authority and cannot be submitted',
+            409,
+          )
+        }
         const prepared = await prepareShopifyFulfillmentWriteback(writebackInput)
         if (prepared.existing) {
           state = 'succeeded'
           providerReference = prepared.existing.providerReference
         } else {
-          registeredProviderAttempt =
+          const registeredAttempt =
             await registerShopifyFulfillmentProviderAttempt({
               organizationId: input.organizationId,
               actorEmail: input.actorEmail,
               commerceExportGlobalId: input.commerceExportGlobalId,
               integrationAccountId: claimed.row.integration_account_id,
+              accountGlobalId: claimed.row.account_global_id,
               exportIdempotencyKey: claimed.row.idempotency_key,
               exportAttempt: claimed.row.attempts,
               preparedRequest: prepared.signature,
             })
+          registeredProviderAttempt = registeredAttempt
           const result = await executeShopifyFulfillmentWriteback({
             ...writebackInput,
+            ...registeredAttempt.providerWriteExpectation,
             attemptSignature: prepared.signature,
+            providerAttemptGlobalId: registeredAttempt.globalId,
+            providerAttemptRequestHash: registeredAttempt.requestHash,
+            commerceExportGlobalId: input.commerceExportGlobalId,
           })
           state = 'succeeded'
           providerReference = result.providerReference
@@ -19349,6 +19650,15 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           }
         }
       } else {
+        // New provider mutations always require the exact self-bound snapshot.
+        // Legacy no-snapshot exports are accepted only in the GET-only branch.
+        if (!providerWriteExpectation) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PROVIDER_WRITE_AUTHORITY_REQUIRED',
+            'The Faire fulfillment export is missing exact Provider writes authority and cannot be submitted',
+            409,
+          )
+        }
         const packages = await requireFaireFulfillmentPackageMakerCosts({
           organizationId: input.organizationId,
           orderId: claimed.row.order_id,
@@ -19366,19 +19676,22 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
           authorizationRevision: authority.authorizationRevision,
           packages,
         }, claimed.row.external_order_id)
-        registeredProviderAttempt =
+        const registeredAttempt =
           await registerFaireFulfillmentProviderAttempt({
             organizationId: input.organizationId,
             actorEmail: input.actorEmail,
             commerceExportGlobalId: input.commerceExportGlobalId,
             integrationAccountId: claimed.row.integration_account_id,
+            accountGlobalId: claimed.row.account_global_id,
             exportIdempotencyKey: claimed.row.idempotency_key,
             exportAttempt: claimed.row.attempts,
             preparedRequest: attemptRequest,
           })
+        registeredProviderAttempt = registeredAttempt
+        attemptRequest = registeredAttempt.preparedRequest
         mode = 'execute'
         writeAttempt = {
-          attemptId: registeredProviderAttempt.globalId,
+          attemptId: registeredAttempt.globalId,
           authorizationRevision: attemptRequest.authorizationRevision,
           state: 'authorized',
         }
@@ -19386,6 +19699,16 @@ export async function executeOperationsCommerceFulfillmentExportFromPostgres(inp
       const result = await executeCurrentFaireFulfillmentWriteback({
         organizationId: input.organizationId,
         accountGlobalId: claimed.row.account_global_id,
+        ...(mode === 'execute' && registeredProviderAttempt
+          ? registeredProviderAttempt.providerWriteExpectation || {}
+          : {}),
+        ...(mode === 'execute' && registeredProviderAttempt
+          ? {
+              providerAttemptGlobalId: registeredProviderAttempt.globalId,
+              providerAttemptRequestHash: registeredProviderAttempt.requestHash,
+              commerceExportGlobalId: input.commerceExportGlobalId,
+            }
+          : {}),
         mode,
         writeAttempt,
         externalOrderId: attemptRequest.externalOrderId,
@@ -19688,13 +20011,46 @@ type NativeOneOffShipmentAuthority = {
   allocatedCostByPackageId: Map<string, number>
 }
 
+async function requireShipmentProviderWriteAuthority(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    accountGlobalId: string
+    provider: 'shopify' | 'faire'
+  },
+) {
+  await acquireTransactionAdvisoryLock(
+    client,
+    `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`,
+  )
+  try {
+    return await requireCurrentCommerceProviderWritesInPostgres({
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+      provider: input.provider,
+      requiredScopes: input.provider === 'shopify'
+        ? SHOPIFY_FULFILLMENT_PROVIDER_WRITE_SCOPES
+        : FAIRE_FULFILLMENT_PROVIDER_WRITE_SCOPES,
+      client,
+    })
+  } catch (error) {
+    if (error instanceof CommerceProviderWriteControlError) {
+      throw new OperationsRequestError(
+        error.code,
+        error.message,
+        error.status,
+      )
+    }
+    throw error
+  }
+}
+
 async function lockNativeOneOffShipmentAuthority(
   client: PoolClient,
   input: {
     organizationId: string
     orderId: string
     planId: string
-    activationState: OperationsActivationState
     canPurchaseLivePostage: boolean
     packages: Array<{ id: string; global_id: string; status: string }>
   },
@@ -19748,13 +20104,6 @@ async function lockNativeOneOffShipmentAuthority(
   }
 
   const executionMode = attempt.environment === 'sandbox' ? 'test' : 'live'
-  if (executionMode === 'live' && input.activationState !== 'active') {
-    throw new OperationsRequestError(
-      'OPERATIONS_ONE_OFF_GROUP_ACTIVATION_MISMATCH',
-      'LIVE confirmation requires Operations Active',
-      409,
-    )
-  }
   if (executionMode === 'live' && !input.canPurchaseLivePostage) {
     throw new OperationsRequestError(
       'OPERATIONS_LIVE_POSTAGE_REQUIRED',
@@ -20100,7 +20449,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
-      const activation = await resolveActivation(client, organizationId)
       const orderResult = await client.query<OrderIdentityRow & {
         pipeline_id: string
         customer_id: string
@@ -20179,17 +20527,18 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
       }
       const nativeOneOff = order.source_provider === 'clawpilot_native'
         && order.order_type === 'one_off'
-      if (
-        !nativeOneOff
-        && !['shadow', 'active'].includes(activation.state)
-        && !(activation.state === 'read_only' && sandboxE2eAuthorizationGlobalId)
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_EXECUTION_STATE_INVALID',
-          'Set Operations to Shadow or Active before confirming connected-commerce shipments',
-          409,
-        )
-      }
+      const connectedProvider = order.source_provider === 'shopify'
+        || order.source_provider === 'faire'
+        ? order.source_provider
+        : null
+      const providerWriteAuthority: CommerceProviderWriteAuthority | null =
+        connectedProvider
+          ? await requireShipmentProviderWriteAuthority(client, {
+              organizationId,
+              accountGlobalId: order.integration_account_global_id,
+              provider: connectedProvider,
+            })
+          : null
       if (nativeOneOff && sandboxE2eAuthorizationGlobalId) {
         throw new OperationsRequestError(
           'OPERATIONS_ONE_OFF_SANDBOX_AUTHORITY_CONFLICT',
@@ -20239,17 +20588,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           )
         }
         sandboxE2eAuthorizationValidated = true
-      }
-      if (
-        !nativeOneOff
-        && activation.state === 'read_only'
-        && !canonicalShopifyTestAuthorizationValidated
-      ) {
-        throw new OperationsRequestError(
-          'OPERATIONS_SHOPIFY_TEST_E2E_AUTHORIZATION_REQUIRED',
-          'Read only shipment confirmation requires the exact current Shopify test-store authorization and second fulfillment confirmation',
-          403,
-        )
       }
       if (order.source_provider === 'shopify') {
         if (!order.integration_account_id) {
@@ -20453,7 +20791,6 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
             organizationId,
             orderId: order.id,
             planId: plan.id,
-            activationState: activation.state,
             canPurchaseLivePostage: input.canPurchaseLivePostage === true,
             packages: packageResult.rows,
           })
@@ -20488,12 +20825,18 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
         internal_cost_minor: string
         package_id: string
         package_global_id: string
+        active_fulfillment_execution_id: string | null
+        active_shipment_group_id: string | null
+        active_carrier_group_attempt_id: string | null
       }>(
         `SELECT label.id::text, label.global_id, label.environment,
                 label.tracking_number, label.carrier, label.service_code,
                 rate.internal_cost_minor::text,
                 package.id::text AS package_id,
-                package.global_id AS package_global_id
+                package.global_id AS package_global_id,
+                label.active_fulfillment_execution_id::text,
+                label.active_shipment_group_id::text,
+                label.active_carrier_group_attempt_id::text
          FROM operations_labels label
          JOIN operations_packages package
            ON package.organization_id = label.organization_id
@@ -20566,6 +20909,32 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           'Every package must use the same carrier and service',
           409,
         )
+      }
+      for (const label of labelResult.rows) {
+        const activeLineage = [
+          label.active_fulfillment_execution_id,
+          label.active_shipment_group_id,
+          label.active_carrier_group_attempt_id,
+        ]
+        const activeLineageCount = activeLineage.filter(Boolean).length
+        if (activeLineageCount > 0 && activeLineageCount !== 3) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PRODUCTION_CARRIER_AUTHORITY_INVALID',
+            'Carrier label authority lineage is incomplete',
+            409,
+          )
+        }
+        if (
+          label.environment === 'production'
+          && !nativeOneOffAuthority
+          && activeLineageCount !== 3
+        ) {
+          throw new OperationsRequestError(
+            'OPERATIONS_PRODUCTION_CARRIER_AUTHORITY_REQUIRED',
+            'Production shipment confirmation requires exact carrier execution, shipment-group, and attempt authority',
+            409,
+          )
+        }
       }
       if (
         canonicalShopifyTestAuthorizationValidated
@@ -20778,10 +21147,13 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           `INSERT INTO operations_shipments (
              organization_id, order_id, plan_id, package_id, label_id, status,
              tracking_number, shipped_at, quoted_carrier_cost_minor, confirmed_by,
-             one_off_carrier_group_attempt_id
+             one_off_carrier_group_attempt_id,
+             active_fulfillment_execution_id, active_shipment_group_id,
+             active_carrier_group_attempt_id
            ) VALUES (
              $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
-             $6, now(), $7, $8, $9::uuid
+             $6, now(), $7, $8, $9::uuid,
+             $10::uuid, $11::uuid, $12::uuid
            )
            RETURNING id::text, global_id, shipped_at`,
           [
@@ -20798,6 +21170,9 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
                 : packageLabel.internal_cost_minor,
             actorEmail,
             nativeOneOffAuthority?.groupAttemptId || null,
+            packageLabel.active_fulfillment_execution_id,
+            packageLabel.active_shipment_group_id,
+            packageLabel.active_carrier_group_attempt_id,
           ],
         )
         shipments.push({
@@ -21025,6 +21400,19 @@ export async function confirmOperationsOrderShipmentFromPostgres(input: {
           nativeOneOffAuthority?.selectedAmountMinor ?? null,
         oneOffSelectedCurrency: nativeOneOffAuthority?.currency || null,
         customerNotification: resolvedCustomerNotification,
+        providerWriteAuthority: providerWriteAuthority
+          ? {
+              accountGlobalId: providerWriteAuthority.accountGlobalId,
+              provider: providerWriteAuthority.provider,
+              environment: providerWriteAuthority.environment,
+              controlRowVersion:
+                providerWriteAuthority.controlRowVersion,
+              credentialGeneration:
+                providerWriteAuthority.credentialGeneration,
+              grantedScopeDigest:
+                providerWriteAuthority.grantedScopeDigest,
+            }
+          : null,
         ...(order.source_provider === 'shopify'
           ? {
               providerWriteProtocol: 'shopify-fulfillment-attempt-v2',

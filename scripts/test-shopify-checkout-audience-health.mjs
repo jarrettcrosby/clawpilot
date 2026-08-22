@@ -127,6 +127,8 @@ for (const fragment of [
 for (const fragment of [
   '0299_operations_shopify_checkout_rate_control.sql',
   'ad82ca01e9e19cb20c95bfec25588d50ad706419ee3a58db24e0662de85e3618',
+  '0309_operations_measured_packaging_evidence.sql',
+  '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2',
   'derive_operations_shopify_checkout_rate_source_compat()',
   'derive_operations_shopify_checkout_rate_source_compat_write',
   '35818f8af90aa04cc95a7fecbf10f3af0fcb31f708e14c374db7e4521b01c698',
@@ -134,6 +136,8 @@ for (const fragment of [
   'e5ad3008d637149bc5e1d86f6d4345c6aa42d50420f0af09afae312f32f8145b',
   '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64',
   'b28b6980199f9e2fd9af0e43f84b825570fcdda1bed1b35ba1a0891bb5f65ae0',
+  '7a01e802ed5815e232244cde7a188cfec2ab7685d86789c2685b00d35f96f9f4',
+  'ea3ef975be1496c360517e87362141d3a312c36a8d2223d684bd019b57d98eb7',
   'df473e7836235c04c828539deb912ecb65c57709b489d07458d09f0b7bbcf490',
   'fde4be4596b4ee46d81af6b2b22bc92548e63a427877e2f1e2f055d212e0d57e',
   'd57e00e735e7bb4e86f6b88827c50360007cccefd98573de58ed3733c889ea38',
@@ -764,6 +768,13 @@ async function exercise(pool) {
      SET checksum = repeat('0', 64)
      WHERE filename = '0299_operations_shopify_checkout_rate_control.sql'`,
     'A changed 0299 migration checksum must fail health',
+  )
+  await tamperRateControl(
+    pool,
+    `UPDATE schema_migrations
+     SET checksum = repeat('0', 64)
+     WHERE filename = '0309_operations_measured_packaging_evidence.sql'`,
+    'A changed 0309 measured-packaging phase checksum must fail health',
   )
   await tamperRateControl(
     pool,

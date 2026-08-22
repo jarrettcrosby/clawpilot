@@ -103,6 +103,15 @@ function persistenceFor(pool) {
     '@/lib/persistence/commerceOrderWorkbench': {
       readCommerceOrderWorkbenchFromPostgres: async () => [],
     },
+    '@/lib/persistence/commerceProviderWrites': {
+      CommerceProviderWriteControlError: class extends Error {},
+      readCommerceProviderWriteControlsFromPostgres: async () => ({
+        accounts: [],
+      }),
+      requireCurrentCommerceProviderWritesInPostgres: async () => {
+        throw new Error('Unexpected Provider writes authority check')
+      },
+    },
     '@/lib/persistence/commerceStoreSync': {
       readCommerceStoreSyncControlsFromPostgres: async () => [],
     },

@@ -29,10 +29,7 @@ import {
   carrierWholeShipmentRateAddressFingerprints,
   prepareCarrierWholeShipmentRateRequest,
 } from '@/lib/integrations/carrierWholeShipmentRateFoundation'
-import {
-  requireProductionShippingDiagnosticActive,
-  type CarrierShippingDiagnosticParcel,
-} from '@/lib/integrations/carrierShippingDiagnosticRate'
+import type { CarrierShippingDiagnosticParcel } from '@/lib/integrations/carrierShippingDiagnosticRate'
 import {
   buildCarrierSandboxRateFixture,
   carrierSandboxPartyFingerprint,
@@ -608,6 +605,7 @@ async function createCarrierProductionDiagnosticLabel(input: {
   idempotencyKey: string
   operatorConfirmation: string
   productionAuthorizedByOwnerAdmin: boolean
+  productionLivePostageAuthorized: boolean
   context: CarrierRateTestCreateContext
 }) {
   if (!input.parcel) {
@@ -624,6 +622,13 @@ async function createCarrierProductionDiagnosticLabel(input: {
       403,
     )
   }
+  if (!input.productionLivePostageAuthorized) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
+      'Live-postage permission is required to buy REAL POSTAGE',
+      403,
+    )
+  }
   assertFreshProductionRate(input.context)
   const expectedConfirmation = carrierProductionDiagnosticConfirmation({
     provider: input.context.provider,
@@ -637,7 +642,6 @@ async function createCarrierProductionDiagnosticLabel(input: {
       400,
     )
   }
-  await requireProductionShippingDiagnosticActive(input.organizationId)
   const shipDate = new Date().toISOString().slice(0, 10)
   let runtime: Awaited<ReturnType<typeof resolveCarrierProductionShippingRuntime>>
   let preparedProvider: ReturnType<typeof productionDiagnosticPrepared>
@@ -692,7 +696,6 @@ async function createCarrierProductionDiagnosticLabel(input: {
   if (prepared.disposition === 'replayed') return prepared.label
 
   try {
-    await requireProductionShippingDiagnosticActive(input.organizationId)
     runtime = await resolveCarrierProductionShippingRuntime({
       organizationId: input.organizationId,
       provider: input.context.provider,
@@ -842,6 +845,7 @@ export async function createCarrierRateTestLabel(input: {
   shipToPhone?: string
   operatorConfirmation?: string
   productionAuthorizedByOwnerAdmin?: boolean
+  productionLivePostageAuthorized?: boolean
   outputFormat: CarrierLabelOutputFormat
   reason: string
   idempotencyKey: string
@@ -865,6 +869,8 @@ export async function createCarrierRateTestLabel(input: {
       operatorConfirmation: input.operatorConfirmation || '',
       productionAuthorizedByOwnerAdmin:
         input.productionAuthorizedByOwnerAdmin === true,
+      productionLivePostageAuthorized:
+        input.productionLivePostageAuthorized === true,
     })
   }
   const destinationFingerprint = carrierSandboxPartyFingerprint(destination)

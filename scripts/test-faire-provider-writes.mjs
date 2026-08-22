@@ -1022,10 +1022,15 @@ const runtime = load(
     '@/lib/persistence/commerceIntegrations': {
       readCommerceRuntimeCredentialFromPostgres: async () => null,
     },
-    '@/lib/persistence/commerceActiveTransitionAuthorization': {
-      requireCommerceActiveCapabilityClaimInPostgres: async () => {
-        throw new Error('default capability reader must be replaced in this test')
+    '@/lib/persistence/commerceProviderWrites': {
+      requireCurrentCommerceProviderWritesInPostgres: async () => {
+        throw new Error('default Provider writes reader must be replaced in this test')
       },
+      requireSealedCommerceProviderWritesInPostgres: async () => {
+        throw new Error('default sealed Provider writes reader must be replaced in this test')
+      },
+    },
+    '@/lib/persistence/commerceActiveTransitionAuthorization': {
       requireCurrentFaireFulfillmentScopeEvidenceInPostgres: async () => {
         throw new Error('default scope-evidence reader must be replaced in this test')
       },
@@ -1049,43 +1054,92 @@ const runtimeCredential = {
   configuration: {},
   encrypted: {},
 }
-const runtimeClaim = (capability) => ({
-  transitionGlobalId: 'gcat1234567',
-  authorizationGlobalId: 'gcaa1234567',
-  preparationGlobalId: 'gcap1234567',
-  cohortHash: 'a'.repeat(64),
-  activationRevision: 6,
+const runtimeProviderWriteAuthority = {
   accountGlobalId: runtimeAccountGlobalId,
   provider: 'faire',
   environment: 'production',
-  externalAccountId: runtimeExternalAccountId,
   credentialGeneration: 9,
+  controlRowVersion: 6,
+  grantedScopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
   grantedScopeDigest: 'b'.repeat(64),
-  capability,
-  capabilityDigest: 'c'.repeat(64),
-  authorizedBy: 'owner@example.com',
-  authorizedRole: 'owner',
-  activatedAt: new Date().toISOString(),
-})
+}
+const runtimeProviderAttemptRequestHash = 'c'.repeat(64)
+const runtimeCommerceExportGlobalId = 'gfe1234567'
+function runtimeProviderAttemptEvidence(providerAttemptGlobalId) {
+  return {
+    providerAttemptGlobalId,
+    providerAttemptRequestHash: runtimeProviderAttemptRequestHash,
+    commerceExportGlobalId: runtimeCommerceExportGlobalId,
+    providerWriteAccountGlobalId: runtimeAccountGlobalId,
+    providerWriteProvider: 'faire',
+    providerWriteEnvironment: 'production',
+    providerWriteControlRowVersion: 6,
+    providerWriteCredentialGeneration: 9,
+    providerWriteScopeDigest: 'b'.repeat(64),
+  }
+}
 let runtimeExecutions = 0
 let runtimeExecutionInput = null
 let runtimeTrustedEvidenceChecks = 0
+let runtimeProviderWriteChecks = 0
+let runtimeSealedProviderWriteChecks = 0
+let runtimeCredentialReads = 0
+let runtimeDecryptions = 0
 let runtimeReadClientOptions = null
 let runtimeReadMutations = 0
 const runtimeDependencies = {
-  readRuntimeCredential: async () => runtimeCredential,
-  requireCapability: async ({ capability }) => runtimeClaim(capability),
+  readRuntimeCredential: async () => {
+    runtimeCredentialReads += 1
+    return runtimeCredential
+  },
+  requireProviderWrites: async (input) => {
+    runtimeProviderWriteChecks += 1
+    assert.equal(input.accountGlobalId, runtimeAccountGlobalId)
+    assert.equal(input.provider, 'faire')
+    assert.deepEqual(Array.from(input.requiredScopes), [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ])
+    return runtimeProviderWriteAuthority
+  },
+  requireSealedProviderWrites: async (input) => {
+    runtimeSealedProviderWriteChecks += 1
+    assert.equal(input.accountGlobalId, runtimeAccountGlobalId)
+    assert.equal(input.provider, 'faire')
+    assert.equal(input.environment, 'production')
+    assert.match(input.providerAttemptGlobalId, /^gxa[0-9a-z]{7}$/u)
+    assert.equal(
+      input.providerAttemptRequestHash,
+      runtimeProviderAttemptRequestHash,
+    )
+    assert.equal(input.commerceExportGlobalId, runtimeCommerceExportGlobalId)
+    assert.equal(input.expectedControlRowVersion, 6)
+    assert.equal(input.expectedCredentialGeneration, 9)
+    assert.equal(input.expectedGrantedScopeDigest, 'b'.repeat(64))
+    assert.deepEqual(Array.from(input.requiredScopes), [
+      'READ_BRAND',
+      'READ_ORDERS',
+      'READ_SHIPMENTS',
+      'WRITE_ORDERS',
+    ])
+    return runtimeProviderWriteAuthority
+  },
   requireTrustedScopeEvidence: async () => {
     runtimeTrustedEvidenceChecks += 1
   },
-  decryptCredential: () => ({
-    provider: 'faire',
-    authMode: 'faire_oauth',
-    applicationId: 'app-id-for-runtime-acceptance',
-    applicationSecret: 'application-secret-for-runtime-acceptance',
-    accessToken: 'oauth-access-token-for-runtime-acceptance',
-    scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
-  }),
+  decryptCredential: () => {
+    runtimeDecryptions += 1
+    return {
+      provider: 'faire',
+      authMode: 'faire_oauth',
+      applicationId: 'app-id-for-runtime-acceptance',
+      applicationSecret: 'application-secret-for-runtime-acceptance',
+      accessToken: 'oauth-access-token-for-runtime-acceptance',
+      scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS', 'WRITE_ORDERS'],
+    }
+  },
   executeWriteback: async (input) => {
     runtimeExecutions += 1
     runtimeExecutionInput = input
@@ -1142,9 +1196,11 @@ assert.deepEqual(
   },
 )
 assert.equal(runtimeTrustedEvidenceChecks, 1)
+assert.equal(runtimeProviderWriteChecks, 1)
 await runtime.executeCurrentFaireFulfillmentWriteback({
   organizationId: runtimeOrganizationId,
   accountGlobalId: runtimeAccountGlobalId,
+  ...runtimeProviderAttemptEvidence('gxa1234567'),
   mode: 'execute',
   writeAttempt: {
     attemptId: 'gxa1234567',
@@ -1161,6 +1217,8 @@ await runtime.executeCurrentFaireFulfillmentWriteback({
 }, runtimeDependencies)
 assert.equal(runtimeExecutions, 1)
 assert.equal(runtimeTrustedEvidenceChecks, 2)
+assert.equal(runtimeProviderWriteChecks, 1)
+assert.equal(runtimeSealedProviderWriteChecks, 1)
 assert.deepEqual(
   JSON.parse(JSON.stringify(runtimeExecutionInput.authorization)),
   {
@@ -1211,8 +1269,8 @@ const rotatedReconciliation = await runtime
       accessToken: 'rotated-oauth-access-token',
       scopes: ['READ_BRAND', 'READ_ORDERS', 'READ_SHIPMENTS'],
     }),
-    requireCapability: async () => {
-      throw new Error('read-only recovery must not require stale write claims')
+    requireProviderWrites: async () => {
+      throw new Error('read-only recovery must not require Provider writes')
     },
     requireTrustedScopeEvidence: async () => {
       throw new Error('read-only recovery must not require write-scope evidence')
@@ -1232,6 +1290,41 @@ assert.equal(
 assert.equal(runtimeReadMutations, 0, 'rotated recovery must issue GETs only')
 assert.equal(runtimeExecutions, 1)
 assert.equal(runtimeTrustedEvidenceChecks, 2)
+assert.equal(runtimeProviderWriteChecks, 1)
+
+let offRuntimeCredentialReads = 0
+let offRuntimeDecryptions = 0
+let offRuntimeExecutions = 0
+await assert.rejects(
+  () => runtime.prepareCurrentFaireFulfillmentAuthority({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+  }, {
+    ...runtimeDependencies,
+    requireProviderWrites: async () => {
+      const error = new Error('Provider writes is Off')
+      error.code = 'COMMERCE_PROVIDER_WRITES_OFF'
+      throw error
+    },
+    readRuntimeCredential: async () => {
+      offRuntimeCredentialReads += 1
+      return runtimeCredential
+    },
+    decryptCredential: () => {
+      offRuntimeDecryptions += 1
+      throw new Error('Off must reject before credential decryption')
+    },
+    executeWriteback: async () => {
+      offRuntimeExecutions += 1
+      throw new Error('Off must reject before the provider executor')
+    },
+  }),
+  (error) => error?.code === 'COMMERCE_PROVIDER_WRITES_OFF',
+  'Provider writes Off must reject before credential access or provider intent',
+)
+assert.equal(offRuntimeCredentialReads, 0)
+assert.equal(offRuntimeDecryptions, 0)
+assert.equal(offRuntimeExecutions, 0)
 
 await assert.rejects(
   () => runtime.prepareCurrentFaireFulfillmentAuthority({
@@ -1256,6 +1349,7 @@ await assert.rejects(
   () => runtime.executeCurrentFaireFulfillmentWriteback({
     organizationId: runtimeOrganizationId,
     accountGlobalId: runtimeAccountGlobalId,
+    ...runtimeProviderAttemptEvidence('gxa1234568'),
     mode: 'execute',
     writeAttempt: {
       attemptId: 'gxa1234568',
@@ -1298,5 +1392,59 @@ await assert.rejects(
   (error) => error?.code === 'FAIRE_FULFILLMENT_OAUTH_SCOPE_REQUIRED',
 )
 assert.equal(runtimeExecutions, 1)
+
+const readsBeforeRegisteredFaire = runtimeCredentialReads
+const decryptionsBeforeRegisteredFaire = runtimeDecryptions
+await assert.rejects(
+  () => runtime.executeCurrentFaireFulfillmentWriteback({
+    organizationId: runtimeOrganizationId,
+    accountGlobalId: runtimeAccountGlobalId,
+    ...runtimeProviderAttemptEvidence('gxa1234571'),
+    providerWriteAccountGlobalId: 'gia7654321',
+    mode: 'execute',
+    writeAttempt: {
+      attemptId: 'gxa1234571',
+      authorizationRevision: 6,
+      state: 'authorized',
+    },
+    externalOrderId: 'bo_runtime_registered_mismatch',
+    packages: [{
+      packageReference: 'gpa1234571',
+      carrier: 'UPS',
+      trackingCode: '1ZMISMATCH',
+    }],
+  }, runtimeDependencies),
+  (error) => error?.code === 'FAIRE_FULFILLMENT_PROVIDER_AUTHORITY_MISMATCH',
+)
+assert.equal(runtimeSealedProviderWriteChecks, 2)
+assert.equal(runtimeCredentialReads, readsBeforeRegisteredFaire)
+assert.equal(runtimeDecryptions, decryptionsBeforeRegisteredFaire)
+
+// A later Off blocks new attempt registration, but an exact attempt already
+// registered while On may finish through its immutable sealed authority.
+await runtime.executeCurrentFaireFulfillmentWriteback({
+  organizationId: runtimeOrganizationId,
+  accountGlobalId: runtimeAccountGlobalId,
+  ...runtimeProviderAttemptEvidence('gxa1234572'),
+  mode: 'execute',
+  writeAttempt: {
+    attemptId: 'gxa1234572',
+    authorizationRevision: 6,
+    state: 'authorized',
+  },
+  externalOrderId: 'bo_runtime_registered',
+  packages: [{
+    packageReference: 'gpa1234572',
+    carrier: 'UPS',
+    trackingCode: '1ZREGISTERED',
+  }],
+}, {
+  ...runtimeDependencies,
+  requireProviderWrites: async () => {
+    throw new Error('Registered execution must not re-require current On')
+  },
+})
+assert.equal(runtimeSealedProviderWriteChecks, 3)
+assert.equal(runtimeExecutions, 2)
 
 console.log('Faire provider-write foundation tests passed')

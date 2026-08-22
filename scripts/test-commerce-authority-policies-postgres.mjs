@@ -1296,14 +1296,20 @@ async function verify(databaseUrl) {
       (policy) => policy.accountGlobalId === primary.shopify.global_id
         && policy.resource === 'orders',
     )
-    assert.equal(frozenShopifyOrders.actualReadiness.state, 'unavailable')
+    assert.equal(frozenShopifyOrders.actualReadiness.state, 'ready')
     assert.equal(frozenShopifyOrders.actualReadiness.evidence.activationState, 'frozen')
-    assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
-      'COMMERCE_AUTHORITY_STORE_SYNC_PAUSED',
-    ))
-    assert.ok(frozenShopifyOrders.actualReadiness.blockerCodes.includes(
-      'OPERATIONS_FROZEN_OVERRIDE',
-    ))
+    assert.ok(
+      !frozenShopifyOrders.actualReadiness.blockerCodes.includes(
+        'COMMERCE_AUTHORITY_STORE_SYNC_PAUSED',
+      ),
+      'Global Operations telemetry must not pause an independently Running Store Sync control',
+    )
+    assert.ok(
+      !frozenShopifyOrders.actualReadiness.blockerCodes.includes(
+        'OPERATIONS_FROZEN_OVERRIDE',
+      ),
+      'Global Operations telemetry must not override independent provider reads',
+    )
     await pool.query(
       `UPDATE operations_activation_scopes
        SET state = 'shadow', updated_at = now()

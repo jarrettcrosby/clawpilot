@@ -50,6 +50,25 @@ function loadPersistenceModule() {
       if (specifier === '@/lib/auditWriter') {
         return { recordAuditEvent: async () => undefined }
       }
+      if (specifier === '@/lib/integrations/commerceCapabilities') {
+        const scopes = [
+          'read_orders',
+          'write_orders',
+          'write_merchant_managed_fulfillment_orders',
+        ]
+        return {
+          SHOPIFY_ACCESS_SCOPES: scopes,
+          hasEffectiveShopifyScope(grantedScopes, requiredScope) {
+            return grantedScopes.includes(requiredScope)
+              || (
+                requiredScope.startsWith('read_')
+                && grantedScopes.includes(
+                  `write_${requiredScope.slice('read_'.length)}`,
+                )
+              )
+          },
+        }
+      }
       if (specifier === '@/lib/persistence/postgres') {
         return {
           acquireTransactionAdvisoryLock: async () => undefined,
@@ -87,6 +106,15 @@ const orderRoute = read(
 const orderPanel = read(
   'app_src/components/operations/ShopifyOrderManagementPanel.tsx',
 )
+const shopifyFulfillment = read(
+  'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
+)
+const faireFulfillment = read(
+  'app_src/lib/integrations/faireFulfillmentRuntime.ts',
+)
+const operationsPersistence = read(
+  'app_src/lib/persistence/operations.ts',
+)
 
 assert.match(migration, /COALESCE\(control\.requested_mode, 'off'::text\)/u)
 assert.match(migration, /requested_mode = 'off'[\s\S]*bound_credential_generation IS NULL/u)
@@ -114,7 +142,7 @@ assert.doesNotMatch(migration, /operations_commerce_active_transition/u)
 
 assert.match(
   persistence,
-  /commandEnforcement: 'shopify_order_management' \| 'not_connected'/u,
+  /\| 'shopify_order_management'[\s\S]*\| 'shopify_fulfillment'[\s\S]*\| 'shopify_order_management_and_fulfillment'[\s\S]*\| 'faire_fulfillment'[\s\S]*\| 'not_connected'/u,
 )
 assert.match(
   persistence,
@@ -122,8 +150,53 @@ assert.match(
 )
 assert.match(
   persistence,
-  /row\.environment === 'sandbox'[\s\S]*scopes\?\.includes\('write_orders'\)/u,
+  /const fulfillmentWritesEffective = fulfillmentConnected && bindingCurrent/u,
 )
+assert.match(persistence, /fulfillmentWritesBlockedReason/u)
+assert.match(
+  persistence,
+  /Reconnect Shopify and approve write_merchant_managed_fulfillment_orders plus read_orders \(or write_orders\)/u,
+)
+assert.match(
+  persistence,
+  /row\.environment === 'sandbox'[\s\S]*scopes\.includes\('write_orders'\)/u,
+)
+assert.match(
+  persistence,
+  /SHOPIFY_FULFILLMENT_SCOPE[\s\S]*write_merchant_managed_fulfillment_orders/u,
+)
+assert.match(
+  persistence,
+  /FAIRE_FULFILLMENT_SCOPES[\s\S]*'READ_BRAND'[\s\S]*'READ_ORDERS'[\s\S]*'READ_SHIPMENTS'[\s\S]*'WRITE_ORDERS'/u,
+)
+assert.match(
+  persistence,
+  /export async function requireCurrentCommerceProviderWritesInPostgres/u,
+)
+assert.match(
+  persistence,
+  /export async function requireSealedCommerceProviderWritesInPostgres/u,
+)
+assert.match(
+  persistence,
+  /FROM public\.operations_commerce_provider_attempts provider_attempt[\s\S]*JOIN public\.operations_integration_accounts account[\s\S]*JOIN public\.operations_commerce_fulfillment_exports fulfillment_export/u,
+)
+assert.match(persistence, /provider_attempt\.state = 'prepared'/u)
+assert.match(persistence, /provider_attempt\.request_hash = \$9/u)
+assert.match(
+  persistence,
+  /provider_attempt\.redacted_request->'providerWriteAuthority'[\s\S]*= \$10::jsonb/u,
+)
+assert.match(
+  persistence,
+  /shopify: \{[\s\S]*action: 'shopify\.fulfillment\.create'[\s\S]*adapterVersion: 'shopify-fulfillment-writeback-v2'/u,
+)
+assert.match(
+  persistence,
+  /faire: \{[\s\S]*action: 'faire\.fulfillment\.shipments\.create'[\s\S]*adapterVersion: 'faire-fulfillment-writeback-v2'/u,
+)
+assert.match(persistence, /COMMERCE_PROVIDER_WRITES_OFF/u)
+assert.match(persistence, /COMMERCE_PROVIDER_WRITES_AUTHORITY_CHANGED/u)
 assert.match(persistence, /COMMERCE_PROVIDER_WRITES_BINDING_STALE/u)
 assert.match(persistence, /commerce\.provider_writes\.turned_on/u)
 assert.match(persistence, /commerce\.provider_writes\.turned_off/u)
@@ -134,12 +207,23 @@ assert.match(route, /idempotencyKey\(req\)/u)
 assert.match(panel, /Provider writes/u)
 assert.match(panel, /\/api\/integrations\/commerce\/provider-writes/u)
 assert.match(panel, /Controls Shopify order changes for this connection/u)
+assert.match(panel, /Controls Shopify fulfillment and tracking updates/u)
+assert.match(panel, /Controls Faire fulfillment and tracking updates/u)
+assert.match(panel, /On · Order editing only/u)
+assert.match(panel, /fulfillmentWritesBlockedReason/u)
 assert.match(panel, /Imports and refresh remain available while Off/u)
 assert.match(
   panel,
-  /providerWriteControl\?\.commandEnforcement[\s\S]*=== 'shopify_order_management' \? \([\s\S]*<Switch[\s\S]*checked=/u,
+  /providerWriteControl\.requestedMode === 'on'[\s\S]*\|\| providerWriteControl\.commandEnforcement[\s\S]*!== 'not_connected'[\s\S]*\? \([\s\S]*<Switch[\s\S]*checked=/u,
 )
-assert.match(panel, /\? 'Not connected'[\s\S]*providerWritesEffective/u)
+assert.match(
+  panel,
+  /Turning Off blocks new attempts; an already authorized in-flight attempt may finish/u,
+)
+assert.match(
+  panel,
+  /providerWritesEffective[\s\S]*requestedMode === 'on'[\s\S]*\? 'Revalidation required'[\s\S]*commandEnforcement[\s\S]*=== 'not_connected'[\s\S]*\? 'Not connected'/u,
+)
 assert.match(orderCommands, /assertProviderWritesEnabled\(target\)/u)
 assert.match(orderCommands, /saveShopifyOrderManagementCommand/u)
 assert.doesNotMatch(
@@ -157,6 +241,42 @@ assert.doesNotMatch(orderPanel, />\s*Save tag\s*</u)
 assert.doesNotMatch(orderPanel, />\s*Save quantity\s*</u)
 assert.doesNotMatch(orderPanel, /Type the exact confirmation statement/u)
 assert.doesNotMatch(orderPanel, /Reason for this exact Shopify change/u)
+assert.match(
+  shopifyFulfillment,
+  /requireCurrentCommerceProviderWritesInPostgres/u,
+)
+assert.doesNotMatch(
+  shopifyFulfillment,
+  /requireCommerceActiveCapabilityClaimInPostgres/u,
+)
+assert.doesNotMatch(shopifyFulfillment, /providerAttemptRegistered/u)
+assert.match(shopifyFulfillment, /providerAttemptGlobalId/u)
+assert.match(shopifyFulfillment, /providerAttemptRequestHash/u)
+assert.match(shopifyFulfillment, /commerceExportGlobalId/u)
+assert.match(
+  faireFulfillment,
+  /requireCurrentCommerceProviderWritesInPostgres/u,
+)
+assert.doesNotMatch(
+  faireFulfillment,
+  /requireCommerceActiveCapabilityClaimInPostgres/u,
+)
+assert.doesNotMatch(faireFulfillment, /providerAttemptRegistered/u)
+assert.match(faireFulfillment, /providerAttemptGlobalId/u)
+assert.match(faireFulfillment, /providerAttemptRequestHash/u)
+assert.match(faireFulfillment, /commerceExportGlobalId/u)
+assert.match(
+  operationsPersistence,
+  /requireShipmentProviderWriteAuthority[\s\S]*providerWriteAuthority/u,
+)
+assert.match(
+  operationsPersistence,
+  /executeShopifyFulfillmentWriteback\(\{[\s\S]*providerAttemptGlobalId: registeredAttempt\.globalId,[\s\S]*providerAttemptRequestHash: registeredAttempt\.requestHash,[\s\S]*commerceExportGlobalId: input\.commerceExportGlobalId/u,
+)
+assert.match(
+  operationsPersistence,
+  /executeCurrentFaireFulfillmentWriteback\(\{[\s\S]*providerAttemptGlobalId: registeredProviderAttempt\.globalId,[\s\S]*providerAttemptRequestHash: registeredProviderAttempt\.requestHash,[\s\S]*commerceExportGlobalId: input\.commerceExportGlobalId/u,
+)
 
 const loaded = loadPersistenceModule()
 const canonical = loaded.canonicalCommerceGrantedScopes([
