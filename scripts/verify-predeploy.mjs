@@ -373,6 +373,7 @@ for (const requiredPath of [
   'db/migrations/0314_operations_local_work_independent_activation.sql',
   'db/migrations/0315_operations_carrier_writes_independent_activation.sql',
   'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
+  'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
   'db/migrations/0309_operations_measured_packaging_evidence.sql',
   'app_src/components/shipping/ShippingSection.tsx',
@@ -388,6 +389,9 @@ for (const requiredPath of [
   'db/migrations/0291_operations_order_replanning_corrections.sql',
   'app_src/app/api/operations/print-agent/pair/route.ts',
   'app_src/app/api/operations/print-agent/cleanup-status/route.ts',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
   'scripts/test-operation-print-agent-cleanup-status.mjs',
   'app_src/app/api/operations/print-agents/route.ts',
   'app_src/app/api/operations/order-revisions/route.ts',
@@ -405,8 +409,11 @@ for (const requiredPath of [
   'app_src/lib/integrations/shopifyOrderManagementRuntime.ts',
   'app_src/lib/integrations/carrierShippingDiagnosticRate.ts',
   'scripts/lib/deterministic-zip.mjs',
+  'scripts/build-macos-print-agent-download.mjs',
   'scripts/lib/macos-print-agent-credential.mjs',
+  'scripts/lib/macos-print-agent-pairing.mjs',
   'scripts/manage-macos-print-agent.mjs',
+  'scripts/pair-macos-print-agent.mjs',
   'app_src/lib/integrations/commerceOrderHistoryRequestFence.ts',
   'app_src/lib/integrations/commerceOrderHistoryPresentation.ts',
   'app_src/lib/integrations/commerceOrderHistoryHealth.ts',
@@ -448,6 +455,8 @@ for (const requiredPath of [
   'scripts/test-carrier-shipping-diagnostic-health.mjs',
   'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',
   'scripts/test-operation-print-agent-pairing.mjs',
+  'scripts/test-macos-print-agent-download.mjs',
+  'scripts/test-macos-print-agent-pairing.mjs',
   'scripts/test-macos-print-agent-pairing-grant.mjs',
   'scripts/test-submit-raw-print.mjs',
   'scripts/test-shipping-ui-fixture.mjs',
@@ -1058,22 +1067,14 @@ for (const requiredPath of [
   }
 }
 
-for (const forbiddenUnsignedPrintAgentArtifact of [
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
-  'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
-]) {
-  if (existsSync(resolve(root, forbiddenUnsignedPrintAgentArtifact))) {
-    fail(`unsigned print-agent preview must not ship: ${forbiddenUnsignedPrintAgentArtifact}`)
-  }
-}
-
 const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
 if (String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download')) {
-  fail('application build must not regenerate the unsigned macOS print-agent preview')
+  fail('application build must not regenerate the tracked developer print-agent preview')
 }
 
 run(process.execPath, ['scripts/test-print-agent-release-download.mjs'])
+run(process.execPath, ['scripts/test-macos-print-agent-download.mjs'])
+run(process.execPath, ['scripts/test-macos-print-agent-pairing.mjs'])
 run(process.execPath, ['scripts/test-operation-carrier-activation-independence.mjs'])
 run(process.execPath, [
   'scripts/test-carrier-shipping-account-diagnostics-postgres.mjs',

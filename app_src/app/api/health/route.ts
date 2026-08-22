@@ -424,15 +424,22 @@ const SHOPIFY_CHECKOUT_AUDIENCE_POLICY_HEALTH_SQL = String.raw`
   )
 `
 
-// Exact structural attestation for 0299. The migration checksum pins every
-// backfill/rewrite, while function hashes and catalog checks detect runtime
-// drift after migration application.
+// Exact structural attestation for 0299 plus the 0317 simulation-readiness
+// correction. Migration checksums pin every backfill/rewrite, while function
+// hashes and catalog checks detect runtime drift after migration application.
 const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
   EXISTS (
     SELECT 1 FROM public.schema_migrations
     WHERE filename = '0299_operations_shopify_checkout_rate_control.sql'
       AND checksum =
         'ad82ca01e9e19cb20c95bfec25588d50ad706419ee3a58db24e0662de85e3618'
+  )
+  AND EXISTS (
+    SELECT 1 FROM public.schema_migrations
+    WHERE filename =
+      '0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql'
+      AND checksum =
+        '8b6de19ad2fa428edd087100e1cb73c851ba59a7fdff248ce71eedd9d3b3e3bb'
   )
   AND (
     NOT EXISTS (
@@ -482,7 +489,7 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
             AND checksum =
               '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
         )
-        THEN 'ea3ef975be1496c360517e87362141d3a312c36a8d2223d684bd019b57d98eb7'
+        THEN 'ed9536637383e8d5a4a62c2a99ef4daca73b1a746e558e9dc409b2bf19baf29d'
         WHEN EXISTS (
           SELECT 1
           FROM public.schema_migrations
@@ -500,7 +507,7 @@ const SHOPIFY_CHECKOUT_RATE_CONTROL_HEALTH_SQL = String.raw`
             AND checksum =
               '52b83a83329d8f4f60e2f0ff539d54849e5e4c69c88ad80917970f880b754da2'
         )
-        THEN '7a01e802ed5815e232244cde7a188cfec2ab7685d86789c2685b00d35f96f9f4'
+        THEN 'f0c296dbf7f1d67b8a99e2f98c1b097c54ea876da83a01d7aad3191b4e7c8823'
         ELSE '363d0bf6435f60092e96d225d38b01ecb123e9e42b525e3200fd067b7494ec64'
       END
     FROM (VALUES

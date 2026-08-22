@@ -20,7 +20,7 @@ function read(file) {
   return readFileSync(file, 'utf8')
 }
 
-const host = '192.0.2.55'
+const host = '192.168.2.55'
 const output = execFileSync(process.execPath, [
   'scripts/pair-macos-print-agent.mjs',
   '--dry-run',
