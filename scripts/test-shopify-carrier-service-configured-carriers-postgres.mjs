@@ -20,6 +20,8 @@ const checkoutRateControlMigration =
   '0299_operations_shopify_checkout_rate_control.sql'
 const measuredPackagingEvidenceMigration =
   '0309_operations_measured_packaging_evidence.sql'
+const carrierActivationIndependenceMigration =
+  '0315_operations_carrier_writes_independent_activation.sql'
 
 const repeatHex = (digit) => String(digit).repeat(64)
 
@@ -1540,6 +1542,17 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       ),
     ),
   ).digest('hex')
+  const carrierActivationIndependenceChecksum = crypto
+    .createHash('sha256')
+    .update(
+      readFileSync(
+        new URL(
+          `../db/migrations/${carrierActivationIndependenceMigration}`,
+          import.meta.url,
+        ),
+      ),
+    )
+    .digest('hex')
   await legacyPool.query(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        filename text PRIMARY KEY,
@@ -1550,7 +1563,8 @@ async function runRollingMigrationAcceptance(databaseUrl) {
   await legacyPool.query(
     `INSERT INTO schema_migrations (filename, checksum)
      VALUES
-       ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10)`,
+       ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10),
+       ($11, $12)`,
     [
       migration,
       migrationChecksum,
@@ -1562,6 +1576,8 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       checkoutRateControlChecksum,
       measuredPackagingEvidenceMigration,
       measuredPackagingEvidenceChecksum,
+      carrierActivationIndependenceMigration,
+      carrierActivationIndependenceChecksum,
     ],
   )
   command('node', ['scripts/db-migrate.mjs'], {
@@ -1581,6 +1597,7 @@ async function runRollingMigrationAcceptance(databaseUrl) {
         diagnosticMigration,
         registeredRateSourceMigration,
         measuredPackagingEvidenceMigration,
+        carrierActivationIndependenceMigration,
       ]],
     )
   } finally {
