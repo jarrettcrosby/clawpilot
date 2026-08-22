@@ -24,6 +24,8 @@ import ShopifyCustomerRatePolicyPanel
 import {
   CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
 } from '@/lib/integrations/carrierCheckoutRate'
+import { packagingRatedOuterEvidenceReady } from '@/lib/operations/packagingMaterials'
+import type { PackagingDimensionEvidenceType } from '@/lib/operations/packagingMaterials'
 import type {
   CommerceStoreSyncControl,
   CommerceStoreSyncDesiredState,
@@ -365,8 +367,11 @@ type ShopifyCarrierServiceSetup = {
         width: number | null
         height: number | null
       }
-      ratedOuterDimensionEvidenceType: string | null
+      ratedOuterDimensionEvidenceType:
+        | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+        | null
       ratedOuterDimensionEvidenceReference: string | null
+      ratedOuterDimensionConfirmedAt: string | null
       tareWeightGrams: number | null
       maxWeightGrams: number | null
       stock: Array<{
@@ -472,8 +477,11 @@ function materialReadinessIssues(
     issues.push('add outside dimensions')
   }
   if (
-    !material.ratedOuterDimensionEvidenceType
-    || !material.ratedOuterDimensionEvidenceReference
+    !packagingRatedOuterEvidenceReady({
+      evidenceType: material.ratedOuterDimensionEvidenceType,
+      evidenceReference: material.ratedOuterDimensionEvidenceReference,
+      confirmedAt: material.ratedOuterDimensionConfirmedAt,
+    })
   ) {
     issues.push('add dimension evidence')
   }

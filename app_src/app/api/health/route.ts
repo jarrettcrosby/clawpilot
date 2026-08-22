@@ -78,6 +78,9 @@ import {
   SHIPPING_ONE_OFF_PACK_HEALTH_SQL,
 } from '@/lib/persistence/shippingOneOffPackHealth'
 import {
+  OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL,
+} from '@/lib/persistence/operationsMeasuredPackagingEvidenceHealth'
+import {
   reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
 } from '@/lib/persistence/commerceStoreSync'
 import {
@@ -3196,6 +3199,7 @@ export async function GET() {
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
           operations_commerce_provider_write_controls_applied: boolean
+          operations_measured_packaging_evidence_applied: boolean
           operations_commerce_store_sync_controls_applied: boolean
           operations_commerce_store_sync_authority_contract: string | null
           operations_shopify_order_webhook_reconciliation_applied: boolean
@@ -5914,6 +5918,9 @@ export async function GET() {
                     '86e39d6e19962894b94466a6fad367682093dc6271e0df92c9cade112ad075b6'
               )
                 AS operations_commerce_provider_write_controls_applied,
+              (
+                ${OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL}
+              ) AS operations_measured_packaging_evidence_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -7437,6 +7444,7 @@ export async function GET() {
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
+            && row?.operations_measured_packaging_evidence_applied
             && row?.operations_commerce_store_sync_controls_applied
             && row?.operations_shopify_order_webhook_reconciliation_applied
             && row?.migration_checksums_present
@@ -7940,6 +7948,7 @@ export async function GET() {
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied
+          || !row?.operations_measured_packaging_evidence_applied
           || !row?.operations_commerce_store_sync_controls_applied
           || !row?.operations_shopify_order_webhook_reconciliation_applied
           || !row?.migration_checksums_present

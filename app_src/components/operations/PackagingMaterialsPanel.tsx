@@ -793,11 +793,16 @@ export default function PackagingMaterialsPanel() {
       hasAllOuter
       && (
         !materialDraft.ratedOuterDimensionEvidenceType
-        || !materialDraft.ratedOuterDimensionEvidenceReference.trim()
+        || (
+          packagingDimensionEvidenceReferenceRequired(
+            materialDraft.ratedOuterDimensionEvidenceType,
+          )
+          && !materialDraft.ratedOuterDimensionEvidenceReference.trim()
+        )
       )
     ) {
       errors.ratedOuterLength =
-        'Select evidence and describe the rated outer measurements'
+        'Select evidence and retain its required reference'
     }
     return errors
   }, [editingMaterial?.status, materialDraft, materialMeasurementDraft])
@@ -1997,7 +2002,17 @@ export default function PackagingMaterialsPanel() {
                     ratedOuterDimensionEvidenceReference:
                       event.target.value,
                   })}
-                  helperText="For example: customer box specification dated 2026-07-29"
+                  helperText={
+                    materialDraft.ratedOuterDimensionEvidenceType === 'measured'
+                      ? 'Optional note; exact outer measurements retain the confirming actor and time automatically'
+                      : 'Required for provider, customer-confirmed, and legacy evidence'
+                  }
+                  required={Boolean(
+                    materialDraft.ratedOuterDimensionEvidenceType
+                    && packagingDimensionEvidenceReferenceRequired(
+                      materialDraft.ratedOuterDimensionEvidenceType,
+                    )
+                  )}
                 />
               </Box>
               {materialMeasurementsValid && (

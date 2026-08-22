@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -81,6 +82,7 @@ const {
   packagingDimensionEvidenceReady,
   packagingDimensionEvidenceReferenceRequired,
   packagingMaterialReadiness,
+  packagingRatedOuterEvidenceReady,
 } = loadDomain()
 const {
   SHOPIFY_PACKAGING_IMPORT_HEADERS,
@@ -110,6 +112,43 @@ assert.equal(
   packagingDimensionEvidenceReferenceRequired('customer_confirmed'),
   true,
 )
+assert.equal(
+  packagingRatedOuterEvidenceReady({
+    evidenceType: 'measured',
+    evidenceReference: null,
+    confirmedAt: '2026-08-21T12:00:00.000Z',
+  }),
+  true,
+  'Exact timestamped measured exteriors do not require a redundant note',
+)
+for (const incompleteRatedOuterEvidence of [
+  {
+    evidenceType: 'measured',
+    evidenceReference: null,
+    confirmedAt: null,
+  },
+  {
+    evidenceType: 'provider',
+    evidenceReference: null,
+    confirmedAt: '2026-08-21T12:00:00.000Z',
+  },
+  {
+    evidenceType: 'customer_confirmed',
+    evidenceReference: '   ',
+    confirmedAt: '2026-08-21T12:00:00.000Z',
+  },
+  {
+    evidenceType: 'legacy',
+    evidenceReference: 'Retained legacy record',
+    confirmedAt: '2026-08-21T12:00:00.000Z',
+  },
+]) {
+  assert.equal(
+    packagingRatedOuterEvidenceReady(incompleteRatedOuterEvidence),
+    false,
+    'Incomplete, nonfactual, or legacy rated exteriors remain fail-closed',
+  )
+}
 assert.ok(PACKAGING_MATERIAL_SOURCES.includes('customer_supplied'))
 assert.ok(PACKAGING_MATERIAL_SOURCES.includes('shopify_import'))
 assert.equal(STARTER_PACKAGING_MATERIALS.length, 6)
@@ -366,6 +405,30 @@ const packRuntimeAssociationMigration = read(
 const measuredEvidenceMigration = read(
   'db/migrations/0309_operations_measured_packaging_evidence.sql',
 )
+const measuredEvidenceHealth = read(
+  'app_src/lib/persistence/operationsMeasuredPackagingEvidenceHealth.ts',
+)
+const measuredEvidenceChecksum = createHash('sha256')
+  .update(measuredEvidenceMigration)
+  .digest('hex')
+assert.ok(
+  measuredEvidenceHealth.includes(measuredEvidenceChecksum),
+  '0309 health must pin the exact measured-packaging migration checksum',
+)
+for (const fragment of [
+  'operations_packaging_materials_dimension_evidence_valid',
+  'operations_packaging_materials_rated_outer_evidence_valid',
+  'operations_shopify_carrier_service_config_environment_is_ready(uuid,uuid,text)',
+  'operations_shopify_carrier_service_rating_environment_is_ready(uuid,uuid,text)',
+  'validate_operations_approved_pack_recipe()',
+  'pg_catalog.pg_get_constraintdef(installed.oid, true)',
+  'installed.prosrc',
+]) {
+  assert.ok(
+    measuredEvidenceHealth.includes(fragment),
+    `0309 structural health is missing ${fragment}`,
+  )
+}
 for (const fragment of [
   'ALTER COLUMN inner_length_mm DROP NOT NULL',
   "dimension_basis IN ('inner', 'outer', 'unspecified')",
@@ -382,13 +445,20 @@ for (const fragment of [
 }
 for (const fragment of [
   'operations_packaging_materials_dimension_evidence_valid',
+  'operations_packaging_materials_rated_outer_evidence_valid',
   "dimension_evidence_type <> 'measured'",
   "dimension_evidence_type NOT IN ('customer_confirmed', 'provider')",
   "material.dimension_evidence_type = 'measured'",
+  "rated_outer_dimension_evidence_type = 'measured'",
+  "'customer_confirmed', 'measured', 'provider'",
   'inner_length_mm > 0',
+  'rated_outer_length_mm > 0',
   'dimension_confirmed_at IS NOT NULL',
+  'rated_outer_dimension_confirmed_at IS NOT NULL',
   'NOT VALID',
   'CREATE OR REPLACE FUNCTION public.validate_operations_approved_pack_recipe()',
+  'public.operations_shopify_carrier_service_config_environment_is_ready(',
+  'public.operations_shopify_carrier_service_rating_environment_is_ready(',
   'SET search_path = pg_catalog, public, pg_temp',
   'FROM public.operations_packaging_materials AS material',
 ]) {
@@ -499,6 +569,8 @@ for (const fragment of [
   'PACKAGING_MATERIAL_PHYSICAL_FACTS_REQUIRED',
   'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
   'dimensionEvidenceReference',
+  'ratedOuterDimensionEvidenceReference',
+  'packagingDimensionEvidenceReferenceRequired(',
   "['customer_confirmed', 'provider'].includes(dimensionEvidenceType)",
   "dimensionEvidenceType === 'measured'",
   'Measured evidence requires exact positive length, width, and height',
@@ -535,6 +607,8 @@ for (const fragment of [
   'globalThis.crypto.randomUUID()',
   "materialDraft.dimensionEvidenceType === 'measured'",
   'exact measurements retain the confirming actor and time automatically',
+  "materialDraft.ratedOuterDimensionEvidenceType === 'measured'",
+  'exact outer measurements retain the confirming actor and time automatically',
   'const starterCommandKey = useRef<string | null>(null)',
   'if (terminalResponse) starterCommandKey.current = null',
   'if (terminalResponse) importCommandKey.current = null',
@@ -600,7 +674,14 @@ const measuredEvidenceConsumers = [
   ],
   [
     'app_src/lib/persistence/productPackManagement.ts',
-    ["material.dimension_evidence_type !== 'measured'"],
+    [
+      "material.dimension_evidence_type !== 'measured'",
+      "material.rated_outer_dimension_evidence_type !== 'measured'",
+    ],
+  ],
+  [
+    'app_src/lib/persistence/cartonizationRateEvidence.ts',
+    ["material.rated_outer_dimension_evidence_type !== 'measured'"],
   ],
 ]
 for (const [path, fragments] of measuredEvidenceConsumers) {
@@ -641,6 +722,10 @@ for (const fragment of [
   'evidenceReference: material.dimensionEvidenceReference',
   'confirmedAt: material.dimensionConfirmedAt',
   "blockers.push('factual inner evidence missing')",
+  'packagingRatedOuterEvidenceReady({',
+  'evidenceType: material.ratedOuterDimensionEvidenceType',
+  'evidenceReference: material.ratedOuterDimensionEvidenceReference',
+  'confirmedAt: material.ratedOuterDimensionConfirmedAt',
 ]) {
   assert.ok(
     operationalMaterialBlocker.includes(fragment),
@@ -659,6 +744,9 @@ for (const fragment of [
   'row?.operations_packaging_materials_migration_applied',
   "'0279_operations_packaging_material_lifecycle.sql'",
   'row?.operations_packaging_material_lifecycle_migration_applied',
+  'OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL',
+  'operations_measured_packaging_evidence_applied',
+  'row?.operations_measured_packaging_evidence_applied',
 ]) {
   assert.ok(health.includes(fragment), `Health migration gate missing ${fragment}`)
 }

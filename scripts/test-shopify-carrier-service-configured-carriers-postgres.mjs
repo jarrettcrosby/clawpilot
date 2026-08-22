@@ -18,6 +18,8 @@ const registeredRateSourceMigration =
   '0292_shopify_registered_rate_source_refresh.sql'
 const checkoutRateControlMigration =
   '0299_operations_shopify_checkout_rate_control.sql'
+const measuredPackagingEvidenceMigration =
+  '0309_operations_measured_packaging_evidence.sql'
 
 const repeatHex = (digit) => String(digit).repeat(64)
 
@@ -205,7 +207,7 @@ async function seedFixture(client) {
          'CS-BOX', 'Carrier readiness box', 'carton',
          200, 150, 100, 100, 10000, 100, 'USD', 'active', 'manual', 1,
          'inner', 'measured', 'disposable acceptance fixture', now(),
-         210, 160, 110, 'measured', 'disposable acceptance fixture', now()
+         210, 160, 110, 'measured', NULL, now()
        )`,
     )
     await client.query(
@@ -1530,6 +1532,14 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       ),
     ),
   ).digest('hex')
+  const measuredPackagingEvidenceChecksum = crypto.createHash('sha256').update(
+    readFileSync(
+      new URL(
+        `../db/migrations/${measuredPackagingEvidenceMigration}`,
+        import.meta.url,
+      ),
+    ),
+  ).digest('hex')
   await legacyPool.query(
     `CREATE TABLE IF NOT EXISTS schema_migrations (
        filename text PRIMARY KEY,
@@ -1539,7 +1549,8 @@ async function runRollingMigrationAcceptance(databaseUrl) {
   )
   await legacyPool.query(
     `INSERT INTO schema_migrations (filename, checksum)
-     VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8)`,
+     VALUES
+       ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10)`,
     [
       migration,
       migrationChecksum,
@@ -1549,6 +1560,8 @@ async function runRollingMigrationAcceptance(databaseUrl) {
       registeredRateSourceChecksum,
       checkoutRateControlMigration,
       checkoutRateControlChecksum,
+      measuredPackagingEvidenceMigration,
+      measuredPackagingEvidenceChecksum,
     ],
   )
   command('node', ['scripts/db-migrate.mjs'], {
@@ -1567,6 +1580,7 @@ async function runRollingMigrationAcceptance(databaseUrl) {
         migration,
         diagnosticMigration,
         registeredRateSourceMigration,
+        measuredPackagingEvidenceMigration,
       ]],
     )
   } finally {

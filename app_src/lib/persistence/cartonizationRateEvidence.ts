@@ -2233,7 +2233,10 @@ export async function writeCartonizationRateEvidenceInPostgres(
           || !['customer_confirmed', 'measured', 'provider'].includes(
             material.rated_outer_dimension_evidence_type || '',
           )
-          || !material.rated_outer_dimension_evidence_reference?.trim()
+          || (
+            material.rated_outer_dimension_evidence_type !== 'measured'
+            && !material.rated_outer_dimension_evidence_reference?.trim()
+          )
           || material.rated_outer_dimension_confirmed_at === null
           || material.tare_weight_grams !== packageInput.tareWeightGrams
         )

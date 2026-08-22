@@ -1017,7 +1017,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             innerDimensionsMm: { length: 280, width: 220, height: 190 },
             ratedOuterDimensionsMm: { length: 292, width: 229, height: 203 },
             ratedOuterDimensionEvidenceType: 'measured',
-            ratedOuterDimensionEvidenceReference: 'warehouse measurement',
+            ratedOuterDimensionEvidenceReference: null,
             ratedOuterDimensionConfirmedAt: '2026-08-01T12:00:00.000Z',
             ratedOuterDimensionConfirmedBy: 'manager@example.com',
             dimensionBasis: 'inner',
@@ -1764,6 +1764,93 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+})
+
+test('measured outer dimensions save without a redundant evidence note', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOperationsRoutes(page)
+  const requests: Array<Record<string, unknown>> = []
+  const packagingMaterials = {
+    capabilities: { canView: true, canManage: true },
+    warehouses: [{
+      id: 'warehouse-id',
+      globalId: 'gwh5366613',
+      name: 'Ag-Alchemy',
+      status: 'active',
+    }],
+    materials: [],
+    shopifyPackageImport: {
+      providerListApiAvailable: false,
+      importMethod: 'csv',
+      accounts: [],
+    },
+    optimizerReadiness: {
+      historyWindowDays: 365,
+      shippedDemandSampleCount: 0,
+      eligibleShippedDemandSampleCount: 0,
+      missingProductDimensionCount: 0,
+      missingMaterialCostCount: 0,
+      missingWarehouseStockCount: 0,
+      outOfStockAvailabilityCount: 0,
+      eligibleMaterialCount: 0,
+      reorderDueCount: 0,
+    },
+  }
+  await page.route(
+    (url) => url.pathname === '/api/operations/packaging-materials',
+    async (route) => {
+      if (route.request().method() === 'POST') {
+        requests.push(route.request().postDataJSON())
+        return route.fulfill({
+          json: {
+            ok: true,
+            result: {
+              globalId: 'gmat0309001',
+              rowVersion: 0,
+              status: 'draft',
+            },
+          },
+        })
+      }
+      return route.fulfill({
+        json: { ok: true, packagingMaterials },
+      })
+    },
+  )
+  await gotoApp(page, '/#operations')
+  await page.getByRole('tab', { name: 'Packaging materials' }).click()
+  await page.getByRole('button', { name: 'Add material' }).click()
+
+  await page.getByLabel('Code').fill('MEASURED-OUTER')
+  await page.getByLabel('Name').fill('Measured outer carton')
+  await page.getByLabel(/^Outer length/).fill('12')
+  await page.getByLabel(/^Outer width/).fill('8')
+  await page.getByLabel(/^Outer height/).fill('6')
+  await page.getByRole('combobox', {
+    name: 'Outer-dimension evidence',
+  }).click()
+  await page.getByRole('option', { name: 'Measured' }).click()
+  const reference = page.getByLabel('Outer-dimension evidence reference')
+  await expect(reference).not.toHaveAttribute('required')
+  await expect(page.getByText(
+    'Optional note; exact outer measurements retain the confirming actor and time automatically',
+  )).toBeVisible()
+  await page.getByRole('button', { name: 'Create draft' }).click()
+
+  await expect.poll(() => requests.length).toBe(1)
+  expect(requests[0]).toMatchObject({
+    action: 'save-material',
+    code: 'MEASURED-OUTER',
+    name: 'Measured outer carton',
+    ratedOuterDimensionEvidenceType: 'measured',
+    ratedOuterDimensionEvidenceReference: null,
+    status: 'draft',
+  })
+  expect(Number(requests[0].ratedOuterLengthMm)).toBeGreaterThan(0)
+  expect(Number(requests[0].ratedOuterWidthMm)).toBeGreaterThan(0)
+  expect(Number(requests[0].ratedOuterHeightMm)).toBeGreaterThan(0)
+  await expect(page.getByText('Measured outer carton was created as a draft.'))
+    .toBeVisible()
 })
 
 test('imported order preparation cartonizes, compares rates, and plans without releasing', async ({ page }) => {

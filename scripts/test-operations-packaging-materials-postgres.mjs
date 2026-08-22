@@ -57,7 +57,41 @@ async function verify(databaseUrl) {
   const warehouseId = randomUUID()
   const auditEvents = []
   const { persistence, parser } = packagingModules(pool, auditEvents)
+  const {
+    OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL,
+  } = loadTypeScriptModule(
+    'app_src/lib/persistence/operationsMeasuredPackagingEvidenceHealth.ts',
+  )
   try {
+    const exactHealth = await pool.query(
+      `SELECT (${OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL}) AS ready`,
+    )
+    assert.equal(
+      exactHealth.rows[0]?.ready,
+      true,
+      'Fresh 0309 must pass exact checksum and structural health attestation',
+    )
+    const driftClient = await pool.connect()
+    try {
+      await driftClient.query('BEGIN')
+      await driftClient.query(
+        `ALTER TABLE operations_packaging_materials
+         RENAME CONSTRAINT
+           operations_packaging_materials_rated_outer_evidence_valid
+         TO operations_packaging_materials_rated_outer_evidence_drifted`,
+      )
+      const driftedHealth = await driftClient.query(
+        `SELECT (${OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL}) AS ready`,
+      )
+      assert.equal(
+        driftedHealth.rows[0]?.ready,
+        false,
+        '0309 structural drift must fail health despite an intact ledger row',
+      )
+    } finally {
+      await driftClient.query('ROLLBACK')
+      driftClient.release()
+    }
     const evidenceConstraint = await pool.query(
       `SELECT convalidated
        FROM pg_constraint
@@ -70,6 +104,19 @@ async function verify(databaseUrl) {
       evidenceConstraint.rows[0].convalidated,
       false,
       'Migration 0309 must enforce new writes without scanning or fabricating legacy evidence rows',
+    )
+    const ratedOuterEvidenceConstraint = await pool.query(
+      `SELECT convalidated
+       FROM pg_constraint
+       WHERE conrelid = 'operations_packaging_materials'::regclass
+         AND conname =
+           'operations_packaging_materials_rated_outer_evidence_valid'`,
+    )
+    assert.equal(ratedOuterEvidenceConstraint.rowCount, 1)
+    assert.equal(
+      ratedOuterEvidenceConstraint.rows[0].convalidated,
+      false,
+      'Migration 0309 must enforce measured rated-outer writes without scanning or fabricating legacy evidence rows',
     )
     const recipeFunction = await pool.query(
       `SELECT function.proconfig
@@ -353,6 +400,17 @@ async function verify(databaseUrl) {
         (error) => error?.code === '23514',
         `${evidenceType} evidence must retain a nonblank reference`,
       )
+      await assert.rejects(
+        pool.query(
+          `UPDATE operations_packaging_materials
+           SET rated_outer_dimension_evidence_type = $3,
+               rated_outer_dimension_evidence_reference = NULL
+           WHERE organization_id = $1::uuid AND global_id = $2`,
+          [organizationId, createdProvider.globalId, evidenceType],
+        ),
+        (error) => error?.code === '23514',
+        `${evidenceType} rated-outer evidence must retain a nonblank reference`,
+      )
     }
 
     const measuredMaterial = {
@@ -366,8 +424,7 @@ async function verify(databaseUrl) {
       ratedOuterWidthMm: 310,
       ratedOuterHeightMm: 190,
       ratedOuterDimensionEvidenceType: 'measured',
-      ratedOuterDimensionEvidenceReference:
-        'Measured rated exterior acceptance fixture',
+      ratedOuterDimensionEvidenceReference: null,
       dimensionBasis: 'inner',
       dimensionEvidenceType: 'measured',
       dimensionEvidenceReference: null,
@@ -385,7 +442,10 @@ async function verify(databaseUrl) {
     })
     const createdMeasuredRow = await pool.query(
       `SELECT dimension_evidence_reference, dimension_confirmed_at,
-              dimension_confirmed_by
+              dimension_confirmed_by,
+              rated_outer_dimension_evidence_reference,
+              rated_outer_dimension_confirmed_at,
+              rated_outer_dimension_confirmed_by
        FROM operations_packaging_materials
        WHERE organization_id = $1::uuid AND global_id = $2`,
       [organizationId, createdMeasured.globalId],
@@ -396,6 +456,20 @@ async function verify(databaseUrl) {
     )
     assert.ok(createdMeasuredRow.rows[0].dimension_confirmed_at instanceof Date)
     assert.equal(createdMeasuredRow.rows[0].dimension_confirmed_by, actorEmail)
+    assert.equal(
+      createdMeasuredRow.rows[0].rated_outer_dimension_evidence_reference,
+      null,
+    )
+    assert.ok(
+      createdMeasuredRow.rows[0].rated_outer_dimension_confirmed_at
+        instanceof Date,
+      'Measured rated exteriors retain their confirmation timestamp',
+    )
+    assert.equal(
+      createdMeasuredRow.rows[0].rated_outer_dimension_confirmed_by,
+      actorEmail,
+      'Measured rated exteriors retain their confirming actor',
+    )
     await assert.rejects(
       pool.query(
         `UPDATE operations_packaging_materials
@@ -405,6 +479,16 @@ async function verify(databaseUrl) {
       ),
       (error) => error?.code === '23514',
       'Measured evidence must retain exact positive dimensions',
+    )
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_packaging_materials
+         SET rated_outer_height_mm = NULL
+         WHERE organization_id = $1::uuid AND global_id = $2`,
+        [organizationId, createdMeasured.globalId],
+      ),
+      (error) => error?.code === '23514',
+      'Measured rated-outer evidence must retain exact positive dimensions',
     )
     await persistence.savePackagingMaterialStockInPostgres({
       organizationId,
@@ -429,6 +513,27 @@ async function verify(databaseUrl) {
       },
     })
     assert.equal(activatedMeasured.status, 'active')
+    const activatedMeasuredRow = await pool.query(
+      `SELECT rated_outer_dimension_evidence_reference,
+              rated_outer_dimension_confirmed_at,
+              rated_outer_dimension_confirmed_by
+       FROM operations_packaging_materials
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [organizationId, createdMeasured.globalId],
+    )
+    assert.equal(
+      activatedMeasuredRow.rows[0].rated_outer_dimension_evidence_reference,
+      null,
+    )
+    assert.equal(
+      activatedMeasuredRow.rows[0].rated_outer_dimension_confirmed_at.getTime(),
+      createdMeasuredRow.rows[0].rated_outer_dimension_confirmed_at.getTime(),
+      'Status-only activation preserves the exact retained outer confirmation',
+    )
+    assert.equal(
+      activatedMeasuredRow.rows[0].rated_outer_dimension_confirmed_by,
+      actorEmail,
+    )
     const measuredWorkspace = await persistence
       .readPackagingMaterialsWorkspaceFromPostgres({
         organizationId,
@@ -449,6 +554,8 @@ async function verify(databaseUrl) {
       ...measuredMaterial,
       code: `LEGACY-${suffix}`,
       name: 'Legacy evidence rollback acceptance',
+      ratedOuterDimensionEvidenceType: 'legacy',
+      ratedOuterDimensionEvidenceReference: 'Retained legacy outer record',
       dimensionEvidenceType: 'legacy',
       dimensionEvidenceReference: 'Retained legacy packaging record',
       status: 'draft',

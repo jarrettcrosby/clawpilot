@@ -2804,7 +2804,10 @@ function mapSelectedMaterials(
         || !['customer_confirmed', 'measured', 'provider'].includes(
           row.rated_outer_dimension_evidence_type || '',
         )
-        || !row.rated_outer_dimension_evidence_reference
+        || (
+          row.rated_outer_dimension_evidence_type !== 'measured'
+          && !row.rated_outer_dimension_evidence_reference?.trim()
+        )
         || !ratedOuterConfirmedAt
       )
     ) {

@@ -34,6 +34,7 @@ type MaterialRow = QueryResultRow & {
   rated_outer_height_mm: number | null
   rated_outer_dimension_evidence_type: string | null
   rated_outer_dimension_evidence_reference: string | null
+  rated_outer_dimension_confirmed_at: Date | null
   tare_weight_grams: number | null
   max_weight_grams: number | null
   warehouse_global_id: string | null
@@ -102,6 +103,7 @@ export type ShopifyCarrierServiceSetupReference = {
     }
     ratedOuterDimensionEvidenceType: string | null
     ratedOuterDimensionEvidenceReference: string | null
+    ratedOuterDimensionConfirmedAt: string | null
     tareWeightGrams: number | null
     maxWeightGrams: number | null
     stock: Array<{
@@ -259,6 +261,7 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
          material.rated_outer_height_mm,
          material.rated_outer_dimension_evidence_type,
          material.rated_outer_dimension_evidence_reference,
+         material.rated_outer_dimension_confirmed_at,
          material.tare_weight_grams,
          material.max_weight_grams,
          warehouse.global_id AS warehouse_global_id,
@@ -382,6 +385,8 @@ export async function readShopifyCarrierServiceSetupReferenceFromPostgres(
           row.rated_outer_dimension_evidence_type,
         ratedOuterDimensionEvidenceReference:
           row.rated_outer_dimension_evidence_reference,
+        ratedOuterDimensionConfirmedAt:
+          iso(row.rated_outer_dimension_confirmed_at),
         tareWeightGrams: row.tare_weight_grams,
         maxWeightGrams: row.max_weight_grams,
         stock: [],

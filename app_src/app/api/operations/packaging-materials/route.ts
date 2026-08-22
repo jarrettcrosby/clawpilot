@@ -257,9 +257,9 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     )
   }
   const ratedOuterDimensionEvidenceType =
-    ratedOuterEvidenceValue as PackagingMaterialInput[
+    ratedOuterEvidenceValue as NonNullable<PackagingMaterialInput[
       'ratedOuterDimensionEvidenceType'
-    ]
+    ]> | null
   const ratedOuterDimensionEvidenceReference = optionalTextValue(
     value.ratedOuterDimensionEvidenceReference,
     'Rated outer dimension evidence reference',
@@ -280,10 +280,15 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
     hasAnyOuterDimension !== hasAllOuterDimensions
     || (
       hasAllOuterDimensions
-      && (
-        ratedOuterDimensionEvidenceType === null
-        || ratedOuterDimensionEvidenceReference === null
+      && ratedOuterDimensionEvidenceType === null
+    )
+    || (
+      hasAllOuterDimensions
+      && ratedOuterDimensionEvidenceType !== null
+      && packagingDimensionEvidenceReferenceRequired(
+        ratedOuterDimensionEvidenceType,
       )
+      && ratedOuterDimensionEvidenceReference === null
     )
     || (
       !hasAnyOuterDimension
@@ -295,7 +300,7 @@ function materialInput(value: Record<string, unknown>): PackagingMaterialInput {
   ) {
     fail(
       'PACKAGING_MATERIAL_RATED_OUTER_FACTS_REQUIRED',
-      'Rated outer dimensions require length, width, height, evidence type, and evidence reference together',
+      'Rated outer dimensions require length, width, height, and evidence type together; measured evidence does not require a note',
       409,
     )
   }

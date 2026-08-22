@@ -2570,14 +2570,20 @@ async function verifyFaireExactVariantPackBinding(
          220, 170, 70, 20, 1000, 55,
          'USD', 'active', 'manual',
          'inner', 'measured', $2, now(), $3,
-         230, 180, 80, 'measured', $2, now(), $3,
+         230, 180, 80, 'measured', NULL, now(), $3,
          $3, $3
-       ) RETURNING id::text, global_id, row_version::integer`,
+       ) RETURNING id::text, global_id, row_version::integer,
+                   rated_outer_dimension_evidence_reference`,
       [
         ids.organization,
         'Disposable PostgreSQL measured Faire carton',
         actorEmail,
       ],
+    )
+    assert.equal(
+      material.rows[0].rated_outer_dimension_evidence_reference,
+      null,
+      'Exact measured exterior facts do not need a redundant note',
     )
     const materialStock = await operationalSeed.query(
       `INSERT INTO operations_packaging_material_stock (

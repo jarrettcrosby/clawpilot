@@ -140,6 +140,7 @@ import {
 import { formatUserDateTime } from '@/lib/userDateTime'
 import {
   packagingDimensionEvidenceReady,
+  packagingRatedOuterEvidenceReady,
   type PackagingMaterial,
   type PackagingMaterialsWorkspace,
 } from '@/lib/operations/packagingMaterials'
@@ -702,12 +703,11 @@ function operationalPlanningMaterialBlockers(
     blockers.push('rated exterior dimensions missing')
   }
   if (
-    !['customer_confirmed', 'measured', 'provider'].includes(
-      material.ratedOuterDimensionEvidenceType || '',
-    )
-    || !material.ratedOuterDimensionEvidenceReference
-    || !material.ratedOuterDimensionConfirmedAt
-    || !Number.isFinite(Date.parse(material.ratedOuterDimensionConfirmedAt))
+    !packagingRatedOuterEvidenceReady({
+      evidenceType: material.ratedOuterDimensionEvidenceType,
+      evidenceReference: material.ratedOuterDimensionEvidenceReference,
+      confirmedAt: material.ratedOuterDimensionConfirmedAt,
+    })
   ) {
     blockers.push('factual exterior evidence missing')
   }

@@ -58,6 +58,26 @@ export function packagingDimensionEvidenceReady(input: {
   )
 }
 
+export function packagingRatedOuterEvidenceReady(input: {
+  evidenceType:
+    | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+    | null
+  evidenceReference?: string | null
+  confirmedAt?: string | Date | null
+}) {
+  return (
+    input.evidenceType !== null
+    && ['customer_confirmed', 'measured', 'provider'].includes(
+      input.evidenceType,
+    )
+    && packagingDimensionEvidenceReady({
+      evidenceType: input.evidenceType,
+      evidenceReference: input.evidenceReference,
+      confirmedAt: input.confirmedAt,
+    })
+  )
+}
+
 export type PackagingMaterialStock = {
   id: string
   globalId: string
