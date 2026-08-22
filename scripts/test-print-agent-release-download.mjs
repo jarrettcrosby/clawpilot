@@ -304,29 +304,43 @@ try {
     'utf8',
   )
   const proxySource = readFileSync(resolve(root, 'app_src/proxy.ts'), 'utf8')
-  for (const forbiddenArtifact of [
+  for (const developerArtifact of [
     'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip',
     'app_src/public/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
     'app_src/public/downloads/ClawPilot-Print-Agent-macOS.json',
   ]) {
     assert.equal(
-      existsSync(resolve(root, forbiddenArtifact)),
-      false,
-      `Unsigned preview must not ship: ${forbiddenArtifact}`,
+      existsSync(resolve(root, developerArtifact)),
+      true,
+      `Default-off developer preview artifact is missing: ${developerArtifact}`,
     )
   }
   assert.ok(!String(applicationPackage.scripts?.build || '').includes('build-macos-print-agent-download'))
-  assert.equal(rootPackage.scripts?.['print-agent:build:macos-download'], undefined)
-  assert.equal(rootPackage.scripts?.['print-agent:pair:macos'], undefined)
-  for (const forbiddenPreviewContract of [
+  assert.equal(
+    rootPackage.scripts?.['print-agent:build:macos-download'],
+    'node scripts/build-macos-print-agent-download.mjs',
+  )
+  assert.equal(
+    rootPackage.scripts?.['print-agent:pair:macos'],
+    'node scripts/pair-macos-print-agent.mjs',
+  )
+  for (const requiredPreviewContract of [
     'ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW',
     'Download developer preview',
     'Advanced terminal pairing',
     '/downloads/ClawPilot-Print-Agent-macOS.zip',
   ]) {
-    assert.ok(!printerPanel.includes(forbiddenPreviewContract))
-    assert.ok(!proxySource.includes(forbiddenPreviewContract))
+    assert.ok(
+      printerPanel.includes(requiredPreviewContract)
+        || proxySource.includes(requiredPreviewContract),
+      `Developer preview contract is missing: ${requiredPreviewContract}`,
+    )
   }
+  assert.ok(printerPanel.includes('unsigned and not notarized'))
+  assert.ok(printerPanel.includes('never distribute to operators'))
+  assert.ok(proxySource.includes('DEVELOPER_PRINT_AGENT_PREVIEW_ARTIFACTS'))
+  assert.ok(proxySource.includes('&& !DEVELOPER_PRINT_AGENT_PREVIEW_ENABLED)'))
+  assert.ok(!proxySource.includes('isPublicCredentialFreePrintAgentDownload'))
 
   console.log('print-agent release download contract tests passed')
 } finally {

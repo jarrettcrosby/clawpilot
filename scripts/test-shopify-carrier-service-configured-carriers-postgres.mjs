@@ -22,6 +22,8 @@ const measuredPackagingEvidenceMigration =
   '0309_operations_measured_packaging_evidence.sql'
 const carrierActivationIndependenceMigration =
   '0315_operations_carrier_writes_independent_activation.sql'
+const simulationRuntimeReadinessMigration =
+  '0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql'
 
 const repeatHex = (digit) => String(digit).repeat(64)
 
@@ -2110,6 +2112,15 @@ async function main() {
       [migration],
     )
     assert.equal(applied.rows[0]?.applied, true, `${migration} was not applied`)
+    const simulationReadinessApplied = await pool.query(
+      'SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename = $1) AS applied',
+      [simulationRuntimeReadinessMigration],
+    )
+    assert.equal(
+      simulationReadinessApplied.rows[0]?.applied,
+      true,
+      `${simulationRuntimeReadinessMigration} was not applied`,
+    )
 
     const identityConstraints = await pool.query(
       `SELECT conname, pg_get_constraintdef(oid) AS definition
@@ -2177,6 +2188,83 @@ async function main() {
     const client = await pool.connect()
     try {
       await seedFixture(client)
+      await client.query('SET session_replication_role = replica')
+      await client.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'read_only'
+         WHERE organization_id =
+           '28500000-0000-4000-8000-000000000001'::uuid`,
+      )
+      await client.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET registration_state = 'unconfigured', service_gid = NULL
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+      )
+      await client.query('SET session_replication_role = origin')
+      const independentReadiness = await client.query(
+        `SELECT
+           operations_shopify_carrier_service_config_is_ready(
+             '28500000-0000-4000-8000-000000000001'::uuid,
+             '28500000-0000-4000-8000-000000000090'::uuid
+           ) AS legacy_callback_ready,
+           operations_shopify_carrier_service_rating_environment_is_ready(
+             '28500000-0000-4000-8000-000000000001'::uuid,
+             '28500000-0000-4000-8000-000000000090'::uuid,
+             'sandbox'
+           ) AS saved_test_environment_ready`,
+      )
+      assert.deepEqual(independentReadiness.rows, [{
+        legacy_callback_ready: false,
+        saved_test_environment_ready: false,
+      }], 'an unconfigured row must not be runnable before simulation')
+      const simulated = await client.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET registration_state = 'shadow_simulated',
+             row_version = row_version + 1,
+             updated_at = now()
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000090'::uuid
+         RETURNING registration_state`,
+      )
+      assert.deepEqual(
+        simulated.rows,
+        [{ registration_state: 'shadow_simulated' }],
+        'zero-write simulation must validate the saved TEST lane in Read only without requiring Shadow',
+      )
+      const simulatedReadiness = await client.query(
+        `SELECT
+           operations_shopify_carrier_service_config_is_ready(
+             '28500000-0000-4000-8000-000000000001'::uuid,
+             '28500000-0000-4000-8000-000000000090'::uuid
+           ) AS legacy_callback_ready,
+           operations_shopify_carrier_service_rating_environment_is_ready(
+             '28500000-0000-4000-8000-000000000001'::uuid,
+             '28500000-0000-4000-8000-000000000090'::uuid,
+             'sandbox'
+           ) AS saved_test_environment_ready`,
+      )
+      assert.deepEqual(simulatedReadiness.rows, [{
+        legacy_callback_ready: false,
+        saved_test_environment_ready: true,
+      }], 'simulation readiness must be independent from the legacy global mode')
+      await client.query('SET session_replication_role = replica')
+      await client.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'shadow'
+         WHERE organization_id =
+           '28500000-0000-4000-8000-000000000001'::uuid`,
+      )
+      await client.query(
+        `UPDATE operations_shopify_carrier_service_configs
+         SET row_version = 1
+         WHERE organization_id =
+             '28500000-0000-4000-8000-000000000001'::uuid
+           AND id = '28500000-0000-4000-8000-000000000090'::uuid`,
+      )
+      await client.query('SET session_replication_role = origin')
       assert.equal(
         await isReady(client),
         true,

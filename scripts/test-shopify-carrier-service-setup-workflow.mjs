@@ -58,6 +58,9 @@ const configuredCarriersMigration = read(
 const checkoutRateControlMigration = read(
   'db/migrations/0299_operations_shopify_checkout_rate_control.sql',
 )
+const simulationRuntimeReadinessMigration = read(
+  'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+)
 const checkoutRateControlDomain = read(
   'app_src/lib/operations/shopifyCheckoutRateControl.ts',
 )
@@ -1201,6 +1204,33 @@ requireAll(configuredCarriersMigration, [
   ') BETWEEN 1 AND 8',
   'one through eight selected unique verified direct UPS/FedEx accounts',
 ], 'paired TEST and LIVE multi-account canonical database readiness')
+requireAll(simulationRuntimeReadinessMigration, [
+  'public.validate_operations_shopify_carrier_service_config_ready()',
+  "NEW.registration_state = 'shadow_simulated'",
+  'public.operations_shopify_carrier_service_rating_environment_is_ready(',
+  "NEW.policy_snapshot #>> '{checkoutRateControl,rateSource}'",
+  "NEW.registration_state = 'registered'",
+  'public.operations_shopify_carrier_service_config_is_ready(',
+  'AND NOT exact_finalization_link_exists',
+  'AND NOT exact_name_finalization_exists',
+], 'simulation-specific saved rating environment readiness')
+const simulationReadinessStart = simulationRuntimeReadinessMigration.indexOf(
+  "NEW.registration_state = 'shadow_simulated'",
+)
+const registeredReadinessStart = simulationRuntimeReadinessMigration.indexOf(
+  "NEW.registration_state = 'registered'",
+  simulationReadinessStart + 1,
+)
+assert.ok(
+  simulationReadinessStart >= 0
+    && registeredReadinessStart > simulationReadinessStart,
+  'simulation readiness must remain separate from registered provider readiness',
+)
+assert.doesNotMatch(
+  simulationRuntimeReadinessMigration,
+  /NEW\.registration_state IN \('shadow_simulated', 'registered'\)/u,
+  'simulation and registered state must not share the legacy activation-coupled predicate',
+)
 assert.doesNotMatch(
   configuredCarriersMigration,
   /selected\.carrier_provider = '(?:ups_rest|fedex_rest)'/u,
@@ -1213,6 +1243,7 @@ requireAll(healthRoute, [
 ], 'configured-carrier migration health gate')
 requireAll(predeployVerification, [
   'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+  'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
 ], 'configured-carrier predeploy path gate')
 assert.equal(
   /[A-Z0-9._%+-]+@(?:episcs\.com|gmail\.com)/iu.test(setupPanel),
