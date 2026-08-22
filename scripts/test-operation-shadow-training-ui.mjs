@@ -67,10 +67,14 @@ for (const fragment of [
   'No new carrier request, commerce-provider',
   'This evidence is reused exactly as sealed',
   'store writes',
-  "order.sourceProvider === 'shopify' && activationState !== 'shadow'",
 ]) {
   assert.ok(operations.includes(fragment), `Operations training integration is missing ${fragment}`)
 }
+assert.doesNotMatch(
+  operations,
+  /order\.sourceProvider === 'shopify' && activationState !== 'shadow'/,
+  'global Operations Shadow must not hide the per-account Shopify editor',
+)
 assert.match(
   operations,
   /const assignmentRequest = order\.sourceProvider === 'shopify'\s*&& !localTraining\s*\? fetch/,
