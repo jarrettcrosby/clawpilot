@@ -11,6 +11,7 @@ const [
   operations,
   types,
   intake,
+  candidateResolver,
   drawer,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
@@ -20,6 +21,7 @@ const [
   read('app_src/lib/persistence/operations.ts'),
   read('app_src/lib/operations/types.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
+  read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
 ])
 
@@ -39,6 +41,12 @@ for (const fragment of [
   'accepted provider binding is immutable',
   'operations.commerce_order_workbench.refresh',
   'matching durable refresh receipt',
+  'customer_global_id_draft text',
+  'requested_delivery_at_draft timestamptz',
+  'line_resolution_drafts jsonb',
+  'operations_commerce_order_workbench_line_drafts_valid',
+  'Commerce order working copy customer draft is invalid',
+  'Commerce order working copy line draft is invalid',
 ]) {
   assert.ok(migration.includes(fragment), `0307 is missing ${fragment}`)
 }
@@ -79,6 +87,12 @@ for (const fragment of [
   'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
   'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
   'provider_rebased',
+  'resolveCommerceCandidateCustomerInPostgres',
+  'resolveCommerceCandidateDeliveryInPostgres',
+  'resolveCommerceCandidateProductInPostgres',
+  'resolveCommerceCandidatePackageInPostgres',
+  'applyWorkbenchResolutionDraft',
+  'includeResolutionDetails',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
@@ -107,7 +121,9 @@ for (const fragment of [
   'export async function GET',
   'export async function PATCH',
   'export async function POST',
-  "new Set(['candidateGlobalId', 'expectedRowVersion', 'shipTo'])",
+  "'resolution'",
+  'resolutionDraftValue(body.resolution)',
+  'includeResolutionDetails: true',
   'refreshCommerceOrderWorkbenchCandidate',
   'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
   'capabilities.canManage',
@@ -124,6 +140,12 @@ for (const fragment of [
 ]) {
   assert.ok(intake.includes(fragment), `Intake refresh is missing ${fragment}`)
 }
+assert.ok(
+  candidateResolver.includes(
+    "WHEN $2 = 'provider' THEN provider_requested_delivery_at",
+  ),
+  'Provider delivery resolution must preserve exact stored timestamp precision',
+)
 for (const fragment of [
   'Choose a value for each field changed in both places.',
   'Keep mine:',
@@ -158,6 +180,9 @@ for (const fragment of [
   'canonicalOrderGlobalId: string | null',
   "promotionStatus: 'not_ready' | 'needs_info' | 'promoted'",
   'remainingBlockerCodes: string[]',
+  'resolutionDetailsLoaded: boolean',
+  'OperationsImportedOrderWorkingCopyDraft',
+  'requestedDeliveryAt: string | null',
 ]) {
   assert.ok(types.includes(fragment), `Result contract is missing ${fragment}`)
 }

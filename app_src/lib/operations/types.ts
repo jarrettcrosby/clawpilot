@@ -1122,12 +1122,65 @@ export type OperationsImportedOrderWorkingCopy = {
   orderNumber: string
   status: 'imported'
   needsInfo: boolean
+  blockerCodes: string[]
   customerName: string | null
   lineCount: number
   sourceUpdatedAt: string
   candidateRowVersion: number
   rowVersion: number
   providerVersionChanged: boolean
+  resolutionDetailsLoaded: boolean
+  customer: {
+    status: 'unresolved' | 'suggested' | 'resolved' | 'unsupported'
+    resolvedCustomerGlobalId: string | null
+    selectedCustomerGlobalId: string | null
+    options: Array<{
+      globalId: string
+      name: string
+      email: string | null
+    }>
+  }
+  delivery: {
+    status:
+      | 'unresolved'
+      | 'provider'
+      | 'manual'
+      | 'policy'
+      | 'not_required'
+      | 'not_supplied'
+    providerRequestedDeliveryAt: string | null
+    selectedDeliveryAt: string | null
+    draftDeliveryAt: string | null
+  }
+  lines: Array<{
+    globalId: string
+    title: string
+    sku: string | null
+    quantity: number
+    requiresShipping: boolean
+    mappingStatus:
+      | 'unresolved'
+      | 'suggested'
+      | 'resolved'
+      | 'not_required'
+      | 'unsupported'
+    priceStatus: 'unresolved' | 'provider' | 'manual' | 'unsupported'
+    packageStatus: 'unresolved' | 'resolved' | 'not_required' | 'unsupported'
+    productGlobalId: string | null
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+    blockerCodes: string[]
+  }>
+  productOptions: Array<{
+    globalId: string
+    name: string
+    sku: string | null
+    packageProfiles: Array<{
+      globalId: string
+      name: string
+    }>
+  }>
   shipTo: {
     value: OrderShipToDraft
     readiness: OrderShipToReadiness
@@ -1141,6 +1194,23 @@ export type OperationsImportedOrderWorkingCopy = {
     issues: OrderShipToIssue[]
   }
   providerWrites: 0
+}
+
+export type OperationsImportedOrderResolutionDraft = {
+  customerGlobalId: string | null
+  requestedDeliveryAt: string | null
+  lines: Array<{
+    lineGlobalId: string
+    productGlobalId: string
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+  }>
+}
+
+export type OperationsImportedOrderWorkingCopyDraft = {
+  shipTo: OrderShipToDraft
+  resolution: OperationsImportedOrderResolutionDraft
 }
 
 export type OperationsImportedOrderShipToUpdateResult = {

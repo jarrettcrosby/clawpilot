@@ -10,6 +10,7 @@ import {
   Divider,
   Drawer,
   IconButton,
+  MenuItem,
   Stack,
   TextField,
   Tooltip,
@@ -22,6 +23,7 @@ import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SaveRounded from '@mui/icons-material/SaveRounded'
 import type {
   OperationsImportedOrderRefreshConflict,
+  OperationsImportedOrderWorkingCopyDraft,
   OperationsImportedOrderWorkingCopy,
 } from '@/lib/operations/types'
 import {
@@ -29,6 +31,10 @@ import {
   orderShipToReadiness,
   type OrderShipToDraft,
 } from '@/lib/operations/orderShipTo'
+import {
+  formatCommerceMoneyMajor,
+  parseCommerceMoneyMajor,
+} from '@/lib/integrations/commerceIntakeCsv'
 
 type ImportedOrderWorkingCopyDrawerProps = {
   open: boolean
@@ -38,7 +44,7 @@ type ImportedOrderWorkingCopyDrawerProps = {
   error?: string
   refreshing?: boolean
   onClose: () => void
-  onSave: (shipTo: OrderShipToDraft) => Promise<void> | void
+  onSave: (draft: OperationsImportedOrderWorkingCopyDraft) => Promise<void> | void
   onRefresh?: (input?: {
     latestCandidateGlobalId: string
     resolutions: Partial<Record<keyof OrderShipToDraft, 'local' | 'provider'>>
@@ -52,6 +58,63 @@ type ImportedOrderWorkingCopyDrawerProps = {
 }
 
 const EMPTY_SHIP_TO = normalizeOrderShipToDraft(null)
+
+type LineEditorDraft = {
+  productGlobalId: string
+  unitPriceMajor: string
+  currency: string
+  packageProfileGlobalId: string
+}
+
+function dateTimeInputValue(value: string | null) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+  return local.toISOString().slice(0, 23)
+}
+
+function requestedDeliveryIso(value: string) {
+  if (!value) return null
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+function initialLineDrafts(order: OperationsImportedOrderWorkingCopy | null) {
+  return Object.fromEntries((order?.lines || []).map((line) => [line.globalId, {
+    productGlobalId: line.productGlobalId || '',
+    unitPriceMajor: line.unitPriceMinor === null
+      ? ''
+      : formatCommerceMoneyMajor(line.unitPriceMinor, line.currency),
+    currency: line.currency,
+    packageProfileGlobalId: line.packageProfileGlobalId || '',
+  }])) as Record<string, LineEditorDraft>
+}
+
+function editorFingerprint(input: {
+  shipTo: OrderShipToDraft
+  customerGlobalId: string
+  requestedDeliveryAt: string
+  lines: Record<string, LineEditorDraft>
+}) {
+  return JSON.stringify({
+    shipTo: normalizeOrderShipToDraft(input.shipTo),
+    customerGlobalId: input.customerGlobalId,
+    requestedDeliveryAt: input.requestedDeliveryAt,
+    lines: Object.entries(input.lines).sort(([left], [right]) => (
+      left.localeCompare(right)
+    )),
+  })
+}
+
+function blockerLabel(code: string) {
+  if (code === 'product_mapping_required') return 'Select product'
+  if (code === 'line_price_required') return 'Enter price'
+  if (code === 'packaging_required') return 'Select package profile'
+  if (code === 'customer_resolution_required') return 'Select customer'
+  if (code === 'delivery_decision_required') return 'Choose delivery date'
+  return code.replaceAll('_', ' ')
+}
 
 function providerLabel(provider: OperationsImportedOrderWorkingCopy['provider']) {
   return provider === 'shopify' ? 'Shopify' : 'Faire'
@@ -79,6 +142,15 @@ export default function ImportedOrderWorkingCopyDrawer({
   const [shipTo, setShipTo] = useState<OrderShipToDraft>(() => (
     order ? normalizeOrderShipToDraft(order.shipTo.value) : EMPTY_SHIP_TO
   ))
+  const [customerGlobalId, setCustomerGlobalId] = useState(
+    order?.customer.selectedCustomerGlobalId || '',
+  )
+  const [requestedDeliveryAt, setRequestedDeliveryAt] = useState(
+    dateTimeInputValue(order?.delivery.draftDeliveryAt || null),
+  )
+  const [lineDrafts, setLineDrafts] = useState<Record<string, LineEditorDraft>>(
+    () => initialLineDrafts(order),
+  )
   const [refreshConflict, setRefreshConflict] = useState<{
     latestCandidateGlobalId: string
     conflicts: OperationsImportedOrderRefreshConflict[]
@@ -87,18 +159,77 @@ export default function ImportedOrderWorkingCopyDrawer({
     Record<keyof OrderShipToDraft, 'local' | 'provider'>
   >>({})
 
-  const changed = useMemo(() => {
-    if (!order) return false
-    const original = normalizeOrderShipToDraft(order.shipTo.value)
-    return Object.keys(original).some((field) => (
-      original[field as keyof OrderShipToDraft]
-      !== shipTo[field as keyof OrderShipToDraft]
-    ))
-  }, [order, shipTo])
+  const changed = useMemo(() => order ? editorFingerprint({
+    shipTo,
+    customerGlobalId,
+    requestedDeliveryAt,
+    lines: lineDrafts,
+  }) !== editorFingerprint({
+    shipTo: normalizeOrderShipToDraft(order.shipTo.value),
+    customerGlobalId: order.customer.selectedCustomerGlobalId || '',
+    requestedDeliveryAt: dateTimeInputValue(order.delivery.draftDeliveryAt),
+    lines: initialLineDrafts(order),
+  }) : false, [
+    customerGlobalId,
+    lineDrafts,
+    order,
+    requestedDeliveryAt,
+    shipTo,
+  ])
   const draftReadiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
+  const invalidLinePrices = useMemo(() => new Set((order?.lines || [])
+    .filter((line) => {
+      const draft = lineDrafts[line.globalId]
+      if (!draft?.unitPriceMajor.trim()) return false
+      try {
+        parseCommerceMoneyMajor(draft.unitPriceMajor, draft.currency)
+        return false
+      } catch {
+        return true
+      }
+    })
+    .map((line) => line.globalId)), [lineDrafts, order?.lines])
 
   const update = (field: keyof OrderShipToDraft, value: string) => {
     setShipTo((current) => ({ ...current, [field]: value || null }))
+  }
+
+  const updateLine = (
+    lineGlobalId: string,
+    changes: Partial<LineEditorDraft>,
+  ) => {
+    setLineDrafts((current) => ({
+      ...current,
+      [lineGlobalId]: { ...current[lineGlobalId], ...changes },
+    }))
+  }
+
+  const save = () => {
+    if (!order || invalidLinePrices.size) return
+    void onSave({
+      shipTo,
+      resolution: {
+        customerGlobalId: customerGlobalId || null,
+        requestedDeliveryAt: requestedDeliveryIso(requestedDeliveryAt),
+        lines: order.lines.flatMap((line) => {
+          const draft = lineDrafts[line.globalId]
+          if (!draft?.productGlobalId) return []
+          return [{
+            lineGlobalId: line.globalId,
+            productGlobalId: draft.productGlobalId,
+            unitPriceMinor: draft.unitPriceMajor.trim()
+              ? parseCommerceMoneyMajor(
+                  draft.unitPriceMajor,
+                  draft.currency,
+                )
+              : null,
+            currency: draft.currency,
+            packageProfileGlobalId:
+              draft.packageProfileGlobalId || null,
+          }]
+        }),
+      },
+    })
   }
 
   const refresh = async (resolveConflict = false) => {
@@ -177,6 +308,11 @@ export default function ImportedOrderWorkingCopyDrawer({
 
         <Stack spacing={2.5} sx={{ flex: 1, overflowY: 'auto', px: { xs: 2, sm: 3 }, py: 2.5 }}>
           {error && <Alert severity="error">{error}</Alert>}
+          {order && !order.resolutionDetailsLoaded && (
+            <Alert severity="info" icon={<CircularProgress size={18} />}>
+              Loading editable order details…
+            </Alert>
+          )}
           {order?.providerVersionChanged && (
             <Alert severity="warning">
               {providerLabel(order.provider)} changed this order after the local draft was saved.
@@ -273,6 +409,205 @@ export default function ImportedOrderWorkingCopyDrawer({
 
           <Divider />
 
+          <Stack spacing={1.5}>
+            <Box>
+              <Typography fontWeight={700}>Customer and delivery</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Choose the existing ClawPilot customer for this order.
+              </Typography>
+            </Box>
+            <TextField
+              select
+              size="small"
+              label="Customer"
+              value={customerGlobalId}
+              onChange={(event) => setCustomerGlobalId(event.target.value)}
+              disabled={
+                !order?.resolutionDetailsLoaded
+                || !canManage
+                || saving
+                || !order.customer.options.length
+              }
+              helperText={order?.customer.options.length
+                ? order.customer.status === 'resolved'
+                  ? 'Existing customer linked to this order'
+                  : 'Required before this order can be imported'
+                : order?.resolutionDetailsLoaded
+                  ? 'No active customer is available in this workspace'
+                  : 'Loading customers…'}
+              fullWidth
+            >
+              <MenuItem value=""><em>Select customer</em></MenuItem>
+              {(order?.customer.options || []).map((customer) => (
+                <MenuItem key={customer.globalId} value={customer.globalId}>
+                  {customer.name}{customer.email ? ` · ${customer.email}` : ''}
+                </MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              size="small"
+              type="datetime-local"
+              label="Requested delivery"
+              value={requestedDeliveryAt}
+              onChange={(event) => setRequestedDeliveryAt(event.target.value)}
+              disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+              InputLabelProps={{ shrink: true }}
+              inputProps={{ step: 0.001 }}
+              helperText={order?.delivery.status === 'not_required'
+                ? 'Optional for this order'
+                : order?.delivery.status === 'unresolved'
+                    || order?.delivery.status === 'not_supplied'
+                  ? 'Choose the delivery date requested for this order'
+                  : order?.delivery.status === 'provider'
+                    ? `Imported from ${providerLabel(order.provider)}`
+                    : 'Saved in ClawPilot'}
+              fullWidth
+            />
+          </Stack>
+
+          <Divider />
+
+          <Stack spacing={1.5}>
+            <Box>
+              <Typography fontWeight={700}>Items</Typography>
+              <Typography variant="caption" color="text.secondary">
+                Provider SKU and quantity stay visible while you match each item.
+              </Typography>
+            </Box>
+            {(order?.lines || []).map((line) => {
+              const draft = lineDrafts[line.globalId]
+              const product = order?.productOptions.find((option) => (
+                option.globalId === draft?.productGlobalId
+              ))
+              const packageProfiles = product?.packageProfiles || []
+              return (
+                <Box
+                  key={line.globalId}
+                  sx={{
+                    border: 1,
+                    borderColor: 'divider',
+                    borderRadius: 2,
+                    p: 1.5,
+                  }}
+                >
+                  <Stack spacing={1.25}>
+                    <Box>
+                      <Typography fontWeight={700}>{line.title}</Typography>
+                      <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 0.5 }}>
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={`SKU ${line.sku || 'not supplied'}`}
+                        />
+                        <Chip
+                          size="small"
+                          variant="outlined"
+                          label={`Quantity ${line.quantity}`}
+                        />
+                        {line.blockerCodes.map((code) => (
+                          <Chip
+                            key={code}
+                            size="small"
+                            color="warning"
+                            variant="outlined"
+                            label={blockerLabel(code)}
+                          />
+                        ))}
+                      </Stack>
+                    </Box>
+                    <TextField
+                      select
+                      size="small"
+                      label="ClawPilot product"
+                      value={draft?.productGlobalId || ''}
+                      onChange={(event) => updateLine(line.globalId, {
+                        productGlobalId: event.target.value,
+                        packageProfileGlobalId: '',
+                      })}
+                      disabled={
+                        !order?.resolutionDetailsLoaded
+                        || !canManage
+                        || saving
+                        || !order.productOptions.length
+                      }
+                      helperText={order?.productOptions.length
+                        ? 'Match this provider item to an existing product'
+                        : 'No active product is available in this workspace'}
+                      fullWidth
+                    >
+                      <MenuItem value=""><em>Select product</em></MenuItem>
+                      {(order?.productOptions || []).map((option) => (
+                        <MenuItem key={option.globalId} value={option.globalId}>
+                          {option.name}{option.sku ? ` · ${option.sku}` : ''}
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                    <TextField
+                      size="small"
+                      label={`Unit price (${draft?.currency || line.currency})`}
+                      value={draft?.unitPriceMajor || ''}
+                      onChange={(event) => updateLine(line.globalId, {
+                        unitPriceMajor: event.target.value,
+                      })}
+                      disabled={
+                        !order?.resolutionDetailsLoaded
+                        || !canManage
+                        || saving
+                        || !draft?.productGlobalId
+                      }
+                      error={invalidLinePrices.has(line.globalId)}
+                      helperText={invalidLinePrices.has(line.globalId)
+                        ? 'Enter a valid non-negative amount'
+                        : draft?.productGlobalId && !draft.unitPriceMajor.trim()
+                          ? 'Enter a price to finish matching this item'
+                          : 'Exact per-unit order price'}
+                      inputProps={{ inputMode: 'decimal' }}
+                      fullWidth
+                    />
+                    {line.requiresShipping && (
+                      <TextField
+                        select
+                        size="small"
+                        label="Package profile"
+                        value={draft?.packageProfileGlobalId || ''}
+                        onChange={(event) => updateLine(line.globalId, {
+                          packageProfileGlobalId: event.target.value,
+                        })}
+                        disabled={
+                          !order?.resolutionDetailsLoaded
+                          || !canManage
+                          || saving
+                          || !draft?.productGlobalId
+                          || !packageProfiles.length
+                        }
+                        helperText={draft?.productGlobalId
+                          ? packageProfiles.length
+                            ? 'Choose the measured package profile for this product'
+                            : 'This product has no active package profile'
+                          : 'Select a product first'}
+                        fullWidth
+                      >
+                        <MenuItem value=""><em>Select package profile</em></MenuItem>
+                        {packageProfiles.map((profile) => (
+                          <MenuItem key={profile.globalId} value={profile.globalId}>
+                            {profile.name}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                    )}
+                  </Stack>
+                </Box>
+              )
+            })}
+            {order?.resolutionDetailsLoaded && !order.lines.length && (
+              <Typography variant="body2" color="text.secondary">
+                No open order items were supplied by {providerLabel(order.provider)}.
+              </Typography>
+            )}
+          </Stack>
+
+          <Divider />
+
           <Box>
             <Stack
               direction={{ xs: 'column', sm: 'row' }}
@@ -303,7 +638,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Recipient name"
                 value={shipTo.name || ''}
                 onChange={(event) => update('name', event.target.value)}
-                disabled={!canManage || saving}
+                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                 fullWidth
               />
               <TextField
@@ -311,7 +646,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Address"
                 value={shipTo.line1 || ''}
                 onChange={(event) => update('line1', event.target.value)}
-                disabled={!canManage || saving}
+                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                 fullWidth
               />
               <TextField
@@ -319,7 +654,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Apartment, suite, etc."
                 value={shipTo.line2 || ''}
                 onChange={(event) => update('line2', event.target.value)}
-                disabled={!canManage || saving}
+                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                 fullWidth
               />
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -328,7 +663,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="City"
                   value={shipTo.city || ''}
                   onChange={(event) => update('city', event.target.value)}
-                  disabled={!canManage || saving}
+                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                   fullWidth
                 />
                 <TextField
@@ -336,7 +671,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="State / province"
                   value={shipTo.region || ''}
                   onChange={(event) => update('region', event.target.value)}
-                  disabled={!canManage || saving}
+                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                   fullWidth
                 />
               </Stack>
@@ -346,7 +681,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="Postal code"
                   value={shipTo.postalCode || ''}
                   onChange={(event) => update('postalCode', event.target.value)}
-                  disabled={!canManage || saving}
+                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                   fullWidth
                 />
                 <TextField
@@ -354,7 +689,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="Country code"
                   value={shipTo.country || ''}
                   onChange={(event) => update('country', event.target.value.toUpperCase())}
-                  disabled={!canManage || saving}
+                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
                   inputProps={{ maxLength: 2 }}
                   fullWidth
                 />
@@ -380,8 +715,15 @@ export default function ImportedOrderWorkingCopyDrawer({
             <Button
               variant="contained"
               startIcon={saving ? <CircularProgress size={16} /> : <SaveRounded />}
-              disabled={!order || !canManage || saving || !changed}
-              onClick={() => void onSave(shipTo)}
+              disabled={
+                !order
+                || !order.resolutionDetailsLoaded
+                || !canManage
+                || saving
+                || !changed
+                || invalidLinePrices.size > 0
+              }
+              onClick={save}
             >
               Save
             </Button>

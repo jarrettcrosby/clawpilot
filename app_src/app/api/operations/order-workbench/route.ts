@@ -14,6 +14,9 @@ import {
   type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
+import type {
+  OperationsImportedOrderResolutionDraft,
+} from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   CommerceOrderWorkbenchError,
@@ -33,6 +36,10 @@ export const maxDuration = 60
 const MAX_REQUEST_BYTES = 64 * 1024
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
+const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u
+const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
+const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
+const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
 const SHIP_TO_LIMITS: Record<OrderShipToField, number> = {
   name: 120,
@@ -162,6 +169,111 @@ function shipToPatchValue(value: unknown): OrderShipToPatch {
     changes[field] = raw
   }
   return changes
+}
+
+function resolutionDraftValue(
+  value: unknown,
+): OperationsImportedOrderResolutionDraft {
+  if (value === undefined) {
+    return { customerGlobalId: null, requestedDeliveryAt: null, lines: [] }
+  }
+  const input = record(value, 'Order details')
+  assertFields(
+    input,
+    new Set(['customerGlobalId', 'requestedDeliveryAt', 'lines']),
+    'Order details',
+  )
+  const customerGlobalId = input.customerGlobalId === null
+    ? null
+    : String(input.customerGlobalId || '').trim()
+  if (customerGlobalId && !CUSTOMER_GLOBAL_ID.test(customerGlobalId)) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_CUSTOMER_INVALID',
+      'Select an active customer',
+    )
+  }
+  let requestedDeliveryAt: string | null = null
+  if (
+    input.requestedDeliveryAt !== null
+    && input.requestedDeliveryAt !== undefined
+  ) {
+    if (typeof input.requestedDeliveryAt !== 'string') {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_DELIVERY_INVALID',
+        'Requested delivery date is invalid',
+      )
+    }
+    const parsed = new Date(input.requestedDeliveryAt)
+    if (Number.isNaN(parsed.getTime())) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_DELIVERY_INVALID',
+        'Requested delivery date is invalid',
+      )
+    }
+    requestedDeliveryAt = parsed.toISOString()
+  }
+  const rawLines = input.lines === undefined ? [] : input.lines
+  if (!Array.isArray(rawLines) || rawLines.length > 250) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_LINES_INVALID',
+      'Order lines are invalid',
+    )
+  }
+  const seen = new Set<string>()
+  const lines = rawLines.map((value) => {
+    const line = record(value, 'Order line')
+    assertFields(
+      line,
+      new Set([
+        'lineGlobalId',
+        'productGlobalId',
+        'unitPriceMinor',
+        'currency',
+        'packageProfileGlobalId',
+      ]),
+      'Order line',
+    )
+    const lineGlobalId = String(line.lineGlobalId || '').trim()
+    const productGlobalId = String(line.productGlobalId || '').trim()
+    const currency = String(line.currency || '').trim().toUpperCase()
+    const packageProfileGlobalId = line.packageProfileGlobalId === null
+      ? null
+      : String(line.packageProfileGlobalId || '').trim()
+    if (
+      !LINE_GLOBAL_ID.test(lineGlobalId)
+      || seen.has(lineGlobalId)
+      || !PRODUCT_GLOBAL_ID.test(productGlobalId)
+      || (
+        line.unitPriceMinor !== null
+        && (
+          !Number.isSafeInteger(line.unitPriceMinor)
+          || Number(line.unitPriceMinor) < 0
+          || Number(line.unitPriceMinor) > 9_000_000_000_000
+        )
+      )
+      || !/^[A-Z]{3}$/u.test(currency)
+      || (
+        packageProfileGlobalId
+        && !PACKAGE_PROFILE_GLOBAL_ID.test(packageProfileGlobalId)
+      )
+    ) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_LINE_INVALID',
+        'Complete each selected line with a real product and valid unit price',
+      )
+    }
+    seen.add(lineGlobalId)
+    return {
+      lineGlobalId,
+      productGlobalId,
+      unitPriceMinor: line.unitPriceMinor === null
+        ? null
+        : Number(line.unitPriceMinor),
+      currency,
+      packageProfileGlobalId,
+    }
+  })
+  return { customerGlobalId, requestedDeliveryAt, lines }
 }
 
 function refreshResolutionsValue(
@@ -296,6 +408,7 @@ export async function GET(req: NextRequest) {
       candidateGlobalId: candidateValue
         ? candidateGlobalIdValue(candidateValue)
         : null,
+      includeResolutionDetails: Boolean(candidateValue),
     })
     return response({ ok: true, orders })
   } catch (error) {
@@ -318,7 +431,12 @@ export async function PATCH(req: NextRequest) {
     const body = await requestBody(req)
     assertFields(
       body,
-      new Set(['candidateGlobalId', 'expectedRowVersion', 'shipTo']),
+      new Set([
+        'candidateGlobalId',
+        'expectedRowVersion',
+        'shipTo',
+        'resolution',
+      ]),
       'Order edit',
     )
     const candidateGlobalId = candidateGlobalIdValue(body.candidateGlobalId)
@@ -329,10 +447,12 @@ export async function PATCH(req: NextRequest) {
       candidateGlobalId,
       expectedRowVersion: rowVersionValue(body.expectedRowVersion),
       changes: shipToPatchValue(body.shipTo),
+      resolutionDraft: resolutionDraftValue(body.resolution),
     })
     const [order] = await readCommerceOrderWorkbenchFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       candidateGlobalId,
+      includeResolutionDetails: true,
     })
     return response({ ok: true, result, order: order || null })
   } catch (error) {
@@ -421,6 +541,7 @@ export async function POST(req: NextRequest) {
     const [order] = await readCommerceOrderWorkbenchFromPostgres({
       organizationId,
       candidateGlobalId: result.candidateGlobalId,
+      includeResolutionDetails: true,
     })
     if (!order) {
       requestError(

@@ -74,6 +74,7 @@ import type {
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
+  OperationsImportedOrderWorkingCopyDraft,
   OperationsImportedOrderWorkingCopy,
   OperationsOrderCommandResult,
   OperationsOrderDetail,
@@ -403,16 +404,10 @@ const COMMERCE_FULFILLMENT_RECONCILIATION_REQUIRED =
   'OPERATIONS_COMMERCE_EXPORT_RECONCILIATION_REQUIRED'
 const COMMERCE_FULFILLMENT_AUTOMATIC_ATTEMPT_LIMIT = 8
 
-function importedOrderShipToFingerprint(shipTo: OrderShipToDraft) {
-  return JSON.stringify([
-    shipTo.name,
-    shipTo.line1,
-    shipTo.line2,
-    shipTo.city,
-    shipTo.region,
-    shipTo.postalCode,
-    shipTo.country,
-  ])
+function importedOrderDraftFingerprint(
+  draft: OperationsImportedOrderWorkingCopyDraft,
+) {
+  return JSON.stringify(draft)
 }
 
 function isCommerceFulfillmentReconciliationPending(input: {
@@ -2890,6 +2885,51 @@ export default function OperationsSection({
     }
   }, [loadWorkspace, search, selectedGlobalId])
 
+  useEffect(() => {
+    if (!importedDrawerOpen || !selectedImportedGlobalId) return
+    const selected = workspace?.importedOrders.find((order) => (
+      order.candidateGlobalId === selectedImportedGlobalId
+    ))
+    if (!selected || selected.resolutionDetailsLoaded) return
+    const controller = new AbortController()
+    const loadDetails = async () => {
+      try {
+        const params = new URLSearchParams({
+          candidate: selected.candidateGlobalId,
+        })
+        const response = await fetch(
+          `/api/operations/order-workbench?${params.toString()}`,
+          { cache: 'no-store', signal: controller.signal },
+        )
+        const payload = await response.json().catch(() => ({})) as
+          ImportedOrderWorkbenchPayload
+        const detailed = payload.orders?.[0]
+        if (!response.ok || !payload.ok || !detailed) {
+          throw new Error(payload.error || 'Editable order details are unavailable')
+        }
+        setWorkspace((current) => current ? {
+          ...current,
+          importedOrders: current.importedOrders.map((order) => (
+            order.candidateGlobalId === detailed.candidateGlobalId
+              ? detailed
+              : order
+          )),
+        } : current)
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === 'AbortError') return
+        setImportedOrderError(caught instanceof Error
+          ? caught.message
+          : 'Editable order details are unavailable')
+      }
+    }
+    void loadDetails()
+    return () => controller.abort()
+  }, [
+    importedDrawerOpen,
+    selectedImportedGlobalId,
+    workspace?.importedOrders,
+  ])
+
   const chooseOrder = (order: OperationsOrderListItem) => {
     setSelectedImportedGlobalId(null)
     setImportedDrawerOpen(false)
@@ -2937,12 +2977,14 @@ export default function OperationsSection({
     }
   }
 
-  const saveImportedOrderShipTo = async (shipTo: OrderShipToDraft) => {
+  const saveImportedOrderDraft = async (
+    draft: OperationsImportedOrderWorkingCopyDraft,
+  ) => {
     const order = workspace?.importedOrders.find(
       (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
     )
     if (!order || savingImportedOrder) return
-    const fingerprint = importedOrderShipToFingerprint(shipTo)
+    const fingerprint = importedOrderDraftFingerprint(draft)
     const retained = pendingImportedOrderSave.current
     const pending = retained
       && retained.candidateGlobalId === order.candidateGlobalId
@@ -2968,7 +3010,8 @@ export default function OperationsSection({
         body: JSON.stringify({
           candidateGlobalId: pending.candidateGlobalId,
           expectedRowVersion: pending.expectedRowVersion,
-          shipTo,
+          shipTo: draft.shipTo,
+          resolution: draft.resolution,
         }),
       })
       const payload = await response.json().catch(() => ({})) as ImportedOrderWorkbenchPayload
@@ -3094,7 +3137,7 @@ export default function OperationsSection({
       window.history.replaceState(window.history.state, '', nextUrl)
       setNotice(
         payload.refreshResult.status === 'rebased'
-          ? `Order ${refreshed.orderNumber} refreshed; local edits preserved`
+          ? `Order ${refreshed.orderNumber} refreshed; review item matches before saving`
           : `Order ${refreshed.orderNumber} is current`,
       )
       return null
@@ -6092,7 +6135,9 @@ export default function OperationsSection({
 
       <ImportedOrderWorkingCopyDrawer
         key={importedDetail
-          ? `${importedDetail.candidateGlobalId}:${importedDetail.rowVersion}`
+          ? `${importedDetail.candidateGlobalId}:${importedDetail.rowVersion}:${
+              importedDetail.resolutionDetailsLoaded ? 'details' : 'summary'
+            }`
           : 'no-imported-order'}
         open={importedDrawerOpen}
         order={importedDetail}
@@ -6101,7 +6146,7 @@ export default function OperationsSection({
         refreshing={refreshingImportedOrder}
         error={importedOrderError}
         onClose={closeImportedDrawer}
-        onSave={saveImportedOrderShipTo}
+        onSave={saveImportedOrderDraft}
         onRefresh={refreshImportedOrder}
       />
       <OrderDetailDrawer

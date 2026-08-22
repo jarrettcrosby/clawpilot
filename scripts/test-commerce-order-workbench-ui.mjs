@@ -23,6 +23,9 @@ for (const fragment of [
   'await loadWorkspace(canonicalOrderGlobalId)',
   'setImportedDrawerOpen(false)',
   'setDrawerOpen(true)',
+  "candidate: selected.candidateGlobalId",
+  'resolution: draft.resolution',
+  'resolutionDetailsLoaded',
 ]) {
   assert.ok(operations.includes(fragment), `Operations UI is missing ${fragment}`)
 }
@@ -43,6 +46,14 @@ for (const fragment of [
   'Ship-to needed for rates',
   'Ship-to incomplete for rates',
   'Ready for rates',
+  'Customer and delivery',
+  'Requested delivery',
+  'ClawPilot product',
+  'Unit price',
+  'Package profile',
+  'Provider SKU and quantity stay visible',
+  'SKU ${line.sku || \'not supplied\'}',
+  'Quantity ${line.quantity}',
 ]) {
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }
@@ -52,6 +63,11 @@ assert.equal(
   /confirmationStatement|reasonValue|canActivate|canExecute/u.test(drawer),
   false,
   'Ordinary order editing must not expose execution ceremony',
+)
+assert.equal(
+  /Create customer|Create product|placeholder customer|placeholder product/iu.test(drawer),
+  false,
+  'The ordinary workbench must only bind real existing catalog identities',
 )
 assert.equal(
   /disabled=\{[^}]*draftReadiness/u.test(drawer),

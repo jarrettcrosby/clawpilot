@@ -11849,7 +11849,10 @@ export async function resolveCommerceCandidateDeliveryInPostgres(input: {
     await client.query(
       `UPDATE operations_commerce_order_candidates
        SET delivery_resolution_state = $2,
-           requested_delivery_at = $3::timestamptz,
+           requested_delivery_at = CASE
+             WHEN $2 = 'provider' THEN provider_requested_delivery_at
+             ELSE $3::timestamptz
+           END,
            delivery_policy_version = $4,
            workflow_state = 'resolving',
            blocking_codes = array_remove(

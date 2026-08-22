@@ -41,7 +41,13 @@ function ids(suffix) {
     candidate: randomUUID(),
     customer: randomUUID(),
     product: randomUUID(),
+    line: randomUUID(),
+    packageProfile: randomUUID(),
     organizationReference: `ga${suffix}`,
+    customerGlobalId: `ga1${suffix.slice(1)}`,
+    productGlobalId: `gp1${suffix.slice(1)}`,
+    lineGlobalId: `gcol1${suffix.slice(1)}`,
+    packageProfileGlobalId: `gpp1${suffix.slice(1)}`,
     integrationGlobalId: `gia${suffix}`,
     runGlobalId: `gcir${suffix}`,
     candidateGlobalId: `gcoc${suffix}`,
@@ -294,7 +300,145 @@ async function seedReadyFacts(client, fixture) {
   )
 }
 
-async function seedFixtures(pool, primary, other, ready) {
+async function seedNeedsInfoFacts(client, fixture) {
+  await client.query(
+    `INSERT INTO crm_reference_registry (
+       reference_code, prefix, canonical_code, status, entity_type
+     ) VALUES
+       ($1, 'ga', $1, 'active', 'crm.organization'),
+       ($2, 'gp', $2, 'active', 'crm.product'),
+       ($3, 'gpp', $3, 'active', 'operations.product_package_profile'),
+       ($4, 'gcol', $4, 'active',
+        'operations.commerce_order_candidate_line')`,
+    [
+      fixture.customerGlobalId,
+      fixture.productGlobalId,
+      fixture.packageProfileGlobalId,
+      fixture.lineGlobalId,
+    ],
+  )
+  await client.query(
+    `INSERT INTO crm_organizations (
+       id, reference_code, pipeline_id, source_key, name, email,
+       source_payload, source_hash, identity_key, relationship_type,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3::uuid, $4, 'Pro Bakery Bites',
+       'orders@probakery.example', '{}'::jsonb, $5, $6, 'customer', $7, $7
+     )`,
+    [
+      fixture.customer,
+      fixture.customerGlobalId,
+      fixture.pipeline,
+      `workbench-customer-${fixture.candidateGlobalId}`,
+      '4'.repeat(64),
+      `customer:workbench:${fixture.candidateGlobalId}`,
+      actorEmail,
+    ],
+  )
+  await client.query(
+    `INSERT INTO crm_products (
+       id, reference_code, pipeline_id, source_key, name, sku, price,
+       currency, source_payload, source_hash, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3::uuid, $4, 'Bakery Bites Variety Box',
+       'BB-VARIETY', 12.50, 'USD', '{}'::jsonb, $5, $6, $6
+     )`,
+    [
+      fixture.product,
+      fixture.productGlobalId,
+      fixture.pipeline,
+      `workbench-product-${fixture.candidateGlobalId}`,
+      '5'.repeat(64),
+      actorEmail,
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_product_package_profiles (
+       id, global_id, organization_id, pipeline_id, product_id,
+       profile_key, profile_name, package_type, unit_of_measure,
+       units_per_package, measurement_system, length_mm, width_mm,
+       height_mm, weight_grams, is_default, active, source,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+       'measured-each', 'Measured each', 'each', 'each', 1, 'imperial',
+       254, 203, 152, 907, true, true, 'manual', $6, $6
+     )`,
+    [
+      fixture.packageProfile,
+      fixture.packageProfileGlobalId,
+      fixture.organization,
+      fixture.pipeline,
+      fixture.product,
+      actorEmail,
+    ],
+  )
+  await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET header_money_state = 'complete',
+         header_money_gaps = '{}'::text[],
+         provider_requested_delivery_at =
+           date_trunc('second', now() + interval '5 days')
+           + interval '0.123456 seconds',
+         blocking_codes = ARRAY[
+           'customer_resolution_required',
+           'ship_to_unavailable',
+           'delivery_decision_required',
+           'product_mapping_required',
+           'line_price_required',
+           'packaging_required'
+         ]::text[]
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_order_candidate_lines (
+       id, global_id, organization_id, integration_account_id, pipeline_id,
+       run_id, order_candidate_id, provider, external_line_id,
+       external_product_id, external_variant_id, sku_snapshot,
+       product_title_snapshot, provider_status_raw, normalized_status,
+       ordered_quantity, current_quantity, cancelled_quantity,
+       fulfilled_quantity, unfulfilled_quantity, returned_quantity,
+       unit_multiplier, physical_quantity, currency_code, unit_price_minor,
+       subtotal_minor, discount_minor, brand_discount_minor, tax_minor,
+       other_adjustment_minor, total_minor, price_resolution_state,
+       requires_shipping, mapping_state, packaging_state, packaging_source,
+       observed_at, source_revision, source_hash, provider_api_version,
+       normalizer_version, workflow_state, blocking_codes,
+       created_by, updated_by, expires_at
+     ) VALUES (
+       $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+       $6::uuid, $7::uuid, 'shopify', $8, $9, $10, 'PB-BOX-12',
+       'Bakery Bites Provider Box', 'OPEN', 'open',
+       2, 2, 0, 0, 2, 0, 1, 2, 'USD', 1250,
+       2500, 0, 0, 0, 0, 2500, 'unresolved',
+       true, 'unresolved', 'unresolved', 'none',
+       now(), $11, $12, '2026-07',
+       'commerce-order-workbench-postgres-v1', 'held', ARRAY[
+         'product_mapping_required', 'line_price_required',
+         'packaging_required'
+       ]::text[], $13, $13, now() + interval '7 days'
+     )`,
+    [
+      fixture.line,
+      fixture.lineGlobalId,
+      fixture.organization,
+      fixture.integration,
+      fixture.pipeline,
+      fixture.run,
+      fixture.candidate,
+      `gid://shopify/LineItem/${fixture.lineGlobalId.slice(-7)}`,
+      `gid://shopify/Product/${fixture.productGlobalId.slice(-7)}`,
+      `gid://shopify/ProductVariant/${fixture.productGlobalId.slice(-7)}`,
+      `workbench-line-${fixture.candidateGlobalId}`,
+      '6'.repeat(64),
+      actorEmail,
+    ],
+  )
+}
+
+async function seedFixtures(pool, primary, other, ready, needsInfo) {
   const client = await pool.connect()
   try {
     await client.query('SET session_replication_role = replica')
@@ -306,7 +450,9 @@ async function seedFixtures(pool, primary, other, ready) {
     await seedTenant(client, primary, 'Primary workbench')
     await seedTenant(client, other, 'Other tenant')
     await seedTenant(client, ready, 'Ready workbench')
+    await seedTenant(client, needsInfo, 'Needs info workbench')
     await seedReadyFacts(client, ready)
+    await seedNeedsInfoFacts(client, needsInfo)
   } finally {
     await client.query('SET session_replication_role = origin')
     client.release()
@@ -512,9 +658,9 @@ function candidateResolverPersistence(pool) {
       '@/lib/integrations/commerceIntegrations': {
         CommerceIntegrationRequestError,
       },
-      '@/lib/integrations/commerceProductMappingPolicy': {
-        exactProductMappingMutation: mustNotRun('exactProductMappingMutation'),
-      },
+      '@/lib/integrations/commerceProductMappingPolicy': loadTypeScriptModule(
+        'app_src/lib/integrations/commerceProductMappingPolicy.ts',
+      ),
       '@/lib/integrations/commerceProductNaming': {
         commerceProductDisplayName({ productTitle, variantTitle }) {
           return [productTitle, variantTitle].filter(Boolean).join(' · ')
@@ -679,12 +825,18 @@ async function stateCounts(pool, fixture) {
   return plain(result.rows[0])
 }
 
-async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
+async function verifyAcceptance(
+  databaseUrl,
+  primary,
+  other,
+  readyFixture,
+  needsInfoFixture,
+) {
   process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY =
     'commerce-order-workbench-postgres-encryption-key-material-0001'
   const pool = new Pool({ connectionString: databaseUrl, max: 4 })
   try {
-    await seedFixtures(pool, primary, other, readyFixture)
+    await seedFixtures(pool, primary, other, readyFixture, needsInfoFixture)
     const persistence = workbenchPersistence(pool)
     const emptyAddress = {
       name: null,
@@ -751,6 +903,216 @@ async function verifyAcceptance(databaseUrl, primary, other, readyFixture) {
       !initial.some((row) => row.candidateGlobalId === other.candidateGlobalId),
       'tenant list must not leak another organization candidate',
     )
+
+    const needsInfoBefore = await candidateSnapshot(pool, needsInfoFixture)
+    const [needsInfoDetailed] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: needsInfoFixture.organization,
+        candidateGlobalId: needsInfoFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(needsInfoDetailed.resolutionDetailsLoaded, true)
+    assert.equal(needsInfoDetailed.customer.status, 'unresolved')
+    assert.equal(needsInfoDetailed.customer.selectedCustomerGlobalId, null)
+    assert.deepEqual(needsInfoDetailed.customer.options, [{
+      globalId: needsInfoFixture.customerGlobalId,
+      name: 'Pro Bakery Bites',
+      email: 'orders@probakery.example',
+    }])
+    assert.ok(needsInfoDetailed.delivery.providerRequestedDeliveryAt)
+    assert.equal(needsInfoDetailed.lines.length, 1)
+    assert.equal(needsInfoDetailed.lines[0].globalId, needsInfoFixture.lineGlobalId)
+    assert.equal(needsInfoDetailed.lines[0].sku, 'PB-BOX-12')
+    assert.equal(needsInfoDetailed.lines[0].quantity, 2)
+    assert.equal(needsInfoDetailed.lines[0].requiresShipping, true)
+    assert.equal(needsInfoDetailed.lines[0].productGlobalId, null)
+    assert.equal(needsInfoDetailed.lines[0].unitPriceMinor, 1250)
+    assert.deepEqual(needsInfoDetailed.productOptions, [{
+      globalId: needsInfoFixture.productGlobalId,
+      name: 'Bakery Bites Variety Box',
+      sku: 'BB-VARIETY',
+      packageProfiles: [{
+        globalId: needsInfoFixture.packageProfileGlobalId,
+        name: 'Measured each',
+      }],
+    }])
+
+    const needsInfoPartial = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: needsInfoFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-needs-info-partial-0001',
+        candidateGlobalId: needsInfoFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: { name: 'Pro Bakery Receiving' },
+        resolutionDraft: {
+          customerGlobalId: needsInfoFixture.customerGlobalId,
+          requestedDeliveryAt:
+            needsInfoDetailed.delivery.providerRequestedDeliveryAt,
+          lines: [{
+            lineGlobalId: needsInfoFixture.lineGlobalId,
+            productGlobalId: needsInfoFixture.productGlobalId,
+            unitPriceMinor: null,
+            currency: 'USD',
+            packageProfileGlobalId:
+              needsInfoFixture.packageProfileGlobalId,
+          }],
+        },
+      }))
+    assert.equal(needsInfoPartial.rowVersion, 1)
+    assert.equal(needsInfoPartial.promotionStatus, 'not_ready')
+    assert.deepEqual(
+      await candidateSnapshot(pool, needsInfoFixture),
+      needsInfoBefore,
+      'partial Needs info edits must remain local',
+    )
+    const [savedNeedsInfo] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: needsInfoFixture.organization,
+        candidateGlobalId: needsInfoFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(
+      savedNeedsInfo.customer.selectedCustomerGlobalId,
+      needsInfoFixture.customerGlobalId,
+    )
+    assert.equal(
+      savedNeedsInfo.delivery.draftDeliveryAt,
+      needsInfoDetailed.delivery.providerRequestedDeliveryAt,
+    )
+    assert.equal(
+      savedNeedsInfo.lines[0].productGlobalId,
+      needsInfoFixture.productGlobalId,
+    )
+    assert.equal(savedNeedsInfo.lines[0].unitPriceMinor, null)
+    assert.equal(
+      savedNeedsInfo.lines[0].packageProfileGlobalId,
+      needsInfoFixture.packageProfileGlobalId,
+    )
+    await expectDatabaseError(
+      () => pool.query(
+        `UPDATE operations_commerce_order_workbench
+         SET customer_global_id_draft = 'ga9999999'
+         WHERE organization_id = $1::uuid`,
+        [needsInfoFixture.organization],
+      ),
+      /customer draft is invalid/iu,
+    )
+    await expectDatabaseError(
+      () => pool.query(
+        `UPDATE operations_commerce_order_workbench
+         SET line_resolution_drafts = jsonb_build_object(
+           $2::text,
+           jsonb_build_object(
+             'productGlobalId', 'gp9999999',
+             'unitPriceMinor', 1250,
+             'currency', 'USD',
+             'packageProfileGlobalId', null
+           )
+         )
+         WHERE organization_id = $1::uuid`,
+        [needsInfoFixture.organization, needsInfoFixture.lineGlobalId],
+      ),
+      /line draft is invalid/iu,
+    )
+
+    const needsInfoPromoted = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: needsInfoFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-needs-info-promote-0002',
+        candidateGlobalId: needsInfoFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+        changes: {
+          line1: '12 Bakery Lane',
+          city: 'Charlotte',
+          region: 'NC',
+          postalCode: '28202',
+          country: 'US',
+        },
+        resolutionDraft: {
+          customerGlobalId: needsInfoFixture.customerGlobalId,
+          requestedDeliveryAt:
+            needsInfoDetailed.delivery.providerRequestedDeliveryAt,
+          lines: [{
+            lineGlobalId: needsInfoFixture.lineGlobalId,
+            productGlobalId: needsInfoFixture.productGlobalId,
+            unitPriceMinor: 1250,
+            currency: 'USD',
+            packageProfileGlobalId:
+              needsInfoFixture.packageProfileGlobalId,
+          }],
+        },
+      }))
+    assert.equal(needsInfoPromoted.promotionStatus, 'promoted')
+    assert.deepEqual(needsInfoPromoted.remainingBlockerCodes, [])
+    assert.match(
+      needsInfoPromoted.canonicalOrderGlobalId,
+      /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u,
+    )
+    const needsInfoState = await pool.query(
+      `SELECT candidate.customer_resolution_state,
+              candidate.delivery_resolution_state,
+              candidate.ship_to_snapshot_state,
+              candidate.workflow_state,
+              customer.reference_code AS customer_global_id,
+              line.mapping_state, line.price_resolution_state,
+              line.packaging_state,
+              product.reference_code AS product_global_id,
+              profile.global_id AS package_profile_global_id,
+              (extract(microseconds FROM
+                candidate.provider_requested_delivery_at)::bigint % 1000
+              )::integer AS provider_submillisecond,
+              (candidate.requested_delivery_at =
+                candidate.provider_requested_delivery_at
+              ) AS exact_provider_delivery,
+              (SELECT count(*)::integer FROM crm_organizations scoped
+               WHERE scoped.pipeline_id = $2::uuid
+                 AND scoped.relationship_type = 'customer') AS customers,
+              (SELECT count(*)::integer FROM crm_products scoped
+               WHERE scoped.pipeline_id = $2::uuid) AS products,
+              (SELECT count(*)::integer
+               FROM operations_commerce_external_effect_intents effect
+               WHERE effect.organization_id = $1::uuid) AS effects
+       FROM operations_commerce_order_candidates candidate
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = candidate.pipeline_id
+        AND customer.id = candidate.customer_id
+       JOIN operations_commerce_order_candidate_lines line
+         ON line.organization_id = candidate.organization_id
+        AND line.order_candidate_id = candidate.id
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id
+        AND product.id = line.product_id
+       JOIN operations_product_package_profiles profile
+         ON profile.organization_id = line.organization_id
+        AND profile.id = line.package_profile_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.pipeline_id = $2::uuid
+         AND candidate.id = $3::uuid`,
+      [
+        needsInfoFixture.organization,
+        needsInfoFixture.pipeline,
+        needsInfoFixture.candidate,
+      ],
+    )
+    assert.deepEqual(plain(needsInfoState.rows[0]), {
+      customer_resolution_state: 'resolved',
+      delivery_resolution_state: 'provider',
+      ship_to_snapshot_state: 'confirmed',
+      workflow_state: 'promoted',
+      customer_global_id: needsInfoFixture.customerGlobalId,
+      mapping_state: 'resolved',
+      price_resolution_state: 'provider',
+      packaging_state: 'resolved',
+      product_global_id: needsInfoFixture.productGlobalId,
+      package_profile_global_id: needsInfoFixture.packageProfileGlobalId,
+      provider_submillisecond: 456,
+      exact_provider_delivery: true,
+      customers: 1,
+      products: 1,
+      effects: 0,
+    })
 
     await seedSearchBoundaryCandidates(pool, primary)
     const boundaryCount = await pool.query(
@@ -1405,6 +1767,7 @@ async function main() {
       ids('0009701'),
       ids('0009702'),
       ids('0009704'),
+      ids('0009705'),
     )
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {

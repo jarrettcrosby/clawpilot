@@ -21,11 +21,16 @@ import type {
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
+  OperationsImportedOrderResolutionDraft,
   OperationsImportedOrderWorkingCopy,
 } from '@/lib/operations/types'
 import {
   confirmCommerceCandidateAddressInPostgres,
   promoteCommerceCandidateInPostgres,
+  resolveCommerceCandidateCustomerInPostgres,
+  resolveCommerceCandidateDeliveryInPostgres,
+  resolveCommerceCandidatePackageInPostgres,
+  resolveCommerceCandidateProductInPostgres,
   validateCommerceCandidateInPostgres,
 } from '@/lib/persistence/commerceIntake'
 import {
@@ -40,6 +45,10 @@ import {
 const COMMAND_TYPE = 'operations.commerce_order_workbench.update_ship_to'
 const REFRESH_COMMAND_TYPE = 'operations.commerce_order_workbench.refresh'
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/u
+const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u
+const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
+const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
+const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 
@@ -65,6 +74,24 @@ type WorkbenchReadRow = {
   observed_at: Date
   candidate_row_version: string
   blocking_codes: string[]
+  pipeline_id: string
+  currency_code: string
+  requires_shipping: boolean
+  customer_resolution_state:
+    | 'unresolved'
+    | 'suggested'
+    | 'resolved'
+    | 'unsupported'
+  customer_global_id: string | null
+  delivery_resolution_state:
+    | 'unresolved'
+    | 'provider'
+    | 'manual'
+    | 'policy'
+    | 'not_required'
+    | 'not_supplied'
+  provider_requested_delivery_at: Date | null
+  requested_delivery_at: Date | null
   canonical_order_global_id: string | null
   customer_name: string | null
   line_count: string
@@ -92,6 +119,9 @@ type WorkbenchReadRow = {
   local_ship_to_iv: Buffer | null
   local_ship_to_tag: Buffer | null
   local_ship_to_source_hash: string | null
+  customer_global_id_draft: string | null
+  requested_delivery_at_draft: Date | null
+  line_resolution_drafts: Record<string, WorkbenchLineResolutionDraft>
   sync_state:
     | 'provider_snapshot'
     | 'local_only'
@@ -129,6 +159,59 @@ type LockedCandidateRow = {
   live_for_new_draft: boolean
 }
 
+type WorkbenchLineResolutionDraft = {
+  productGlobalId: string
+  unitPriceMinor: number | null
+  currency: string
+  packageProfileGlobalId: string | null
+}
+
+type WorkbenchLineReadRow = {
+  candidate_id: string
+  global_id: string
+  product_title_snapshot: string
+  sku_snapshot: string | null
+  unfulfilled_quantity: string
+  requires_shipping: boolean
+  mapping_state:
+    | 'unresolved'
+    | 'suggested'
+    | 'resolved'
+    | 'not_required'
+    | 'unsupported'
+  price_resolution_state: 'unresolved' | 'provider' | 'manual' | 'unsupported'
+  packaging_state: 'unresolved' | 'resolved' | 'not_required' | 'unsupported'
+  product_global_id: string | null
+  resolved_unit_price_minor: string | null
+  provider_unit_price_minor: string | null
+  resolved_currency_code: string | null
+  provider_currency_code: string | null
+  package_profile_global_id: string | null
+  blocking_codes: string[]
+}
+
+type CustomerOptionRow = {
+  reference_code: string
+  name: string
+  email: string | null
+}
+
+type ProductOptionRow = {
+  product_id: string
+  reference_code: string
+  name: string
+  sku: string | null
+  package_profile_global_id: string | null
+  package_profile_name: string | null
+  package_profile_is_default: boolean | null
+}
+
+type WorkbenchResolutionDetails = {
+  lines: WorkbenchLineReadRow[]
+  customers: CustomerOptionRow[]
+  products: ProductOptionRow[]
+}
+
 type LockedWorkbenchRow = {
   id: string
   candidate_id: string
@@ -146,6 +229,9 @@ type LockedWorkbenchRow = {
   canonical_order_id: string | null
   last_command_receipt_id: string
   last_request_hash: string
+  customer_global_id_draft: string | null
+  requested_delivery_at_draft: Date | null
+  line_resolution_drafts: Record<string, WorkbenchLineResolutionDraft>
   row_version: string
 }
 
@@ -224,6 +310,89 @@ function requireCandidateGlobalId(value: string) {
     )
   }
   return candidateGlobalId
+}
+
+function normalizedResolutionDraft(
+  value: OperationsImportedOrderResolutionDraft | undefined,
+): OperationsImportedOrderResolutionDraft {
+  if (!value) return {
+    customerGlobalId: null,
+    requestedDeliveryAt: null,
+    lines: [],
+  }
+  const customerGlobalId = value.customerGlobalId
+    ? String(value.customerGlobalId).trim()
+    : null
+  if (customerGlobalId && !CUSTOMER_GLOBAL_ID.test(customerGlobalId)) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_CUSTOMER_INVALID',
+      'Select an active customer',
+      400,
+    )
+  }
+  let requestedDeliveryAt: string | null = null
+  if (value.requestedDeliveryAt) {
+    const date = new Date(value.requestedDeliveryAt)
+    if (Number.isNaN(date.getTime())) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_DELIVERY_INVALID',
+        'Requested delivery date is invalid',
+        400,
+      )
+    }
+    requestedDeliveryAt = date.toISOString()
+  }
+  const seen = new Set<string>()
+  const lines = value.lines.map((line) => {
+    const lineGlobalId = String(line.lineGlobalId || '').trim()
+    const productGlobalId = String(line.productGlobalId || '').trim()
+    const currency = String(line.currency || '').trim().toUpperCase()
+    const packageProfileGlobalId = line.packageProfileGlobalId
+      ? String(line.packageProfileGlobalId).trim()
+      : null
+    if (
+      !LINE_GLOBAL_ID.test(lineGlobalId)
+      || seen.has(lineGlobalId)
+      || !PRODUCT_GLOBAL_ID.test(productGlobalId)
+      || (
+        line.unitPriceMinor !== null
+        && (
+          !Number.isSafeInteger(line.unitPriceMinor)
+          || line.unitPriceMinor < 0
+          || line.unitPriceMinor > 9_000_000_000_000
+        )
+      )
+      || !/^[A-Z]{3}$/u.test(currency)
+      || (
+        packageProfileGlobalId
+        && !PACKAGE_PROFILE_GLOBAL_ID.test(packageProfileGlobalId)
+      )
+    ) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_LINE_INVALID',
+        'Complete each selected line with a real product and valid unit price',
+        400,
+      )
+    }
+    seen.add(lineGlobalId)
+    return {
+      lineGlobalId,
+      productGlobalId,
+      unitPriceMinor: line.unitPriceMinor,
+      currency,
+      packageProfileGlobalId,
+    }
+  })
+  return { customerGlobalId, requestedDeliveryAt, lines }
+}
+
+function lineDraftRecord(value: OperationsImportedOrderResolutionDraft) {
+  return Object.fromEntries(value.lines.map((line) => [line.lineGlobalId, {
+    productGlobalId: line.productGlobalId,
+    unitPriceMinor: line.unitPriceMinor,
+    currency: line.currency,
+    packageProfileGlobalId: line.packageProfileGlobalId,
+  }]))
 }
 
 function protectedDataUnreadable(): never {
@@ -370,6 +539,7 @@ function customerSnapshotName(row: WorkbenchReadRow) {
 
 function mappedWorkingCopy(
   row: WorkbenchReadRow,
+  details: WorkbenchResolutionDetails | null,
 ): OperationsImportedOrderWorkingCopy {
   const local = Boolean(
     row.workbench_id
@@ -402,6 +572,25 @@ function mappedWorkingCopy(
   const otherMissingFacts = row.blocking_codes.some((code) => (
     !ADDRESS_BLOCKERS.has(code)
   ))
+  const productOptions = new Map<string, OperationsImportedOrderWorkingCopy[
+    'productOptions'
+  ][number]>()
+  for (const product of details?.products || []) {
+    const option = productOptions.get(product.product_id) || {
+      globalId: product.reference_code,
+      name: product.name,
+      sku: product.sku,
+      packageProfiles: [],
+    }
+    if (product.package_profile_global_id && product.package_profile_name) {
+      option.packageProfiles.push({
+        globalId: product.package_profile_global_id,
+        name: product.package_profile_name,
+      })
+    }
+    productOptions.set(product.product_id, option)
+  }
+  const lineDrafts = row.line_resolution_drafts || {}
   return {
     kind: 'imported_working_copy',
     globalId: row.candidate_global_id,
@@ -414,6 +603,7 @@ function mappedWorkingCopy(
     orderNumber: row.order_number_snapshot,
     status: 'imported',
     needsInfo: issues.length > 0 || otherMissingFacts,
+    blockerCodes: row.blocking_codes,
     customerName: customerSnapshotName(row),
     lineCount: Number(row.line_count),
     sourceUpdatedAt: (
@@ -421,11 +611,70 @@ function mappedWorkingCopy(
     ).toISOString(),
     candidateRowVersion: Number(row.candidate_row_version),
     rowVersion: Number(row.workbench_row_version || 0),
+    resolutionDetailsLoaded: details !== null,
     providerVersionChanged: Boolean(
       row.accepted_provider_source_hash
       && row.accepted_provider_source_hash
         !== row.latest_provider_source_hash,
     ),
+    customer: {
+      status: row.customer_resolution_state,
+      resolvedCustomerGlobalId: row.customer_global_id,
+      selectedCustomerGlobalId: row.customer_global_id_draft
+        || row.customer_global_id,
+      options: (details?.customers || []).map((customer) => ({
+        globalId: customer.reference_code,
+        name: customer.name,
+        email: customer.email,
+      })),
+    },
+    delivery: {
+      status: row.delivery_resolution_state,
+      providerRequestedDeliveryAt:
+        row.provider_requested_delivery_at?.toISOString() || null,
+      selectedDeliveryAt: row.requested_delivery_at?.toISOString() || null,
+      draftDeliveryAt:
+        row.requested_delivery_at_draft?.toISOString()
+        || row.requested_delivery_at?.toISOString()
+        || row.provider_requested_delivery_at?.toISOString()
+        || null,
+    },
+    lines: (details?.lines || []).map((line) => {
+      const draft = lineDrafts[line.global_id]
+      return {
+        globalId: line.global_id,
+        title: line.product_title_snapshot,
+        sku: line.sku_snapshot,
+        quantity: Number(line.unfulfilled_quantity),
+        requiresShipping: line.requires_shipping,
+        mappingStatus: line.mapping_state,
+        priceStatus: line.price_resolution_state,
+        packageStatus: line.packaging_state,
+        productGlobalId: draft?.productGlobalId
+          || line.product_global_id,
+        unitPriceMinor: draft
+          ? draft.unitPriceMinor
+          : Number(
+            line.resolved_unit_price_minor
+            || line.provider_unit_price_minor
+            || Number.NaN,
+          ),
+        currency: draft?.currency
+          || line.resolved_currency_code
+          || line.provider_currency_code
+          || row.currency_code,
+        packageProfileGlobalId: draft
+          ? draft.packageProfileGlobalId
+          : line.package_profile_global_id,
+        blockerCodes: line.blocking_codes,
+      }
+    }).map((line) => ({
+      ...line,
+      unitPriceMinor: Number.isSafeInteger(line.unitPriceMinor)
+        ? line.unitPriceMinor
+        : null,
+    })),
+    productOptions: [...productOptions.values()],
     shipTo: {
       value: shipTo,
       readiness: orderShipToReadiness(shipTo),
@@ -441,6 +690,7 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
   organizationId: string
   search?: string | null
   candidateGlobalId?: string | null
+  includeResolutionDetails?: boolean
 }): Promise<OperationsImportedOrderWorkingCopy[]> {
   const organizationId = requireOrganizationId(input.organizationId)
   const candidateGlobalId = input.candidateGlobalId
@@ -513,6 +763,14 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        candidate.observed_at,
        candidate.row_version::text AS candidate_row_version,
        candidate.blocking_codes,
+       candidate.pipeline_id::text,
+       candidate.currency_code,
+       candidate.requires_shipping,
+       candidate.customer_resolution_state,
+       resolved_customer.reference_code AS customer_global_id,
+       candidate.delivery_resolution_state,
+       candidate.provider_requested_delivery_at,
+       candidate.requested_delivery_at,
        canonical_order.global_id AS canonical_order_global_id,
        customer.name AS customer_name,
        line_count.line_count,
@@ -531,6 +789,12 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        workbench.ship_to_iv AS local_ship_to_iv,
        workbench.ship_to_tag AS local_ship_to_tag,
        workbench.ship_to_source_hash AS local_ship_to_source_hash,
+       workbench.customer_global_id_draft,
+       workbench.requested_delivery_at_draft,
+       COALESCE(
+         workbench.line_resolution_drafts,
+         '{}'::jsonb
+       ) AS line_resolution_drafts,
        workbench.sync_state,
        workbench.row_version::text AS workbench_row_version,
        COALESCE(
@@ -556,6 +820,9 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
      LEFT JOIN crm_organizations customer
        ON customer.pipeline_id = candidate.pipeline_id
       AND customer.id = candidate.customer_id
+     LEFT JOIN crm_organizations resolved_customer
+       ON resolved_customer.pipeline_id = candidate.pipeline_id
+      AND resolved_customer.id = candidate.customer_id
      CROSS JOIN LATERAL (
        SELECT count(*)::text AS line_count
        FROM operations_commerce_order_candidate_lines line
@@ -596,8 +863,91 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
      LIMIT 200`,
     [organizationId, candidateGlobalId, searchPattern],
   )
+  const detailsByCandidate = new Map<string, WorkbenchResolutionDetails>()
+  if (input.includeResolutionDetails && result.rows.length) {
+    const candidateIds = result.rows.map((row) => row.candidate_id)
+    const [lines, customers, products] = await Promise.all([
+      query<WorkbenchLineReadRow>(
+        `SELECT line.order_candidate_id::text AS candidate_id,
+                line.global_id, line.product_title_snapshot,
+                line.sku_snapshot, line.unfulfilled_quantity::text,
+                line.requires_shipping,
+                line.mapping_state, line.price_resolution_state,
+                line.packaging_state,
+                product.reference_code AS product_global_id,
+                line.resolved_unit_price_minor::text,
+                line.unit_price_minor::text AS provider_unit_price_minor,
+                line.resolved_currency_code, line.currency_code
+                  AS provider_currency_code,
+                profile.global_id AS package_profile_global_id,
+                line.blocking_codes
+         FROM operations_commerce_order_candidate_lines line
+         LEFT JOIN crm_products product
+           ON product.pipeline_id = line.pipeline_id
+          AND product.id = line.product_id
+         LEFT JOIN operations_product_package_profiles profile
+           ON profile.organization_id = line.organization_id
+          AND profile.pipeline_id = line.pipeline_id
+          AND profile.product_id = line.product_id
+          AND profile.id = line.package_profile_id
+         WHERE line.organization_id = $1::uuid
+           AND line.order_candidate_id = ANY($2::uuid[])
+           AND line.unfulfilled_quantity > 0
+         ORDER BY line.created_at, line.id`,
+        [organizationId, candidateIds],
+      ),
+      query<CustomerOptionRow>(
+        `SELECT DISTINCT customer.reference_code, customer.name, customer.email
+         FROM operations_commerce_order_candidates candidate
+         JOIN crm_organizations customer
+           ON customer.pipeline_id = candidate.pipeline_id
+          AND customer.relationship_type = 'customer'
+          AND COALESCE(lower(customer.source_payload->>'archived'), 'false')
+              NOT IN ('true', '1', 'yes')
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.id = ANY($2::uuid[])
+         ORDER BY customer.name, customer.reference_code
+         LIMIT 1000`,
+        [organizationId, candidateIds],
+      ),
+      query<ProductOptionRow>(
+        `SELECT DISTINCT product.id::text AS product_id,
+                product.reference_code, product.name, product.sku,
+                profile.global_id AS package_profile_global_id,
+                profile.profile_name AS package_profile_name,
+                profile.is_default AS package_profile_is_default
+         FROM operations_commerce_order_candidates candidate
+         JOIN crm_products product
+           ON product.pipeline_id = candidate.pipeline_id
+          AND COALESCE(lower(product.source_payload->>'archived'), 'false')
+              NOT IN ('true', '1', 'yes')
+         LEFT JOIN operations_product_package_profiles profile
+           ON profile.organization_id = candidate.organization_id
+          AND profile.pipeline_id = product.pipeline_id
+          AND profile.product_id = product.id
+          AND profile.active = true
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.id = ANY($2::uuid[])
+         ORDER BY product.name, product.reference_code,
+                  profile.is_default DESC NULLS LAST,
+                  profile.profile_name
+         LIMIT 3000`,
+        [organizationId, candidateIds],
+      ),
+    ])
+    for (const row of result.rows) {
+      detailsByCandidate.set(row.candidate_id, {
+        lines: lines.rows.filter((line) => line.candidate_id === row.candidate_id),
+        customers: customers.rows,
+        products: products.rows,
+      })
+    }
+  }
   return result.rows
-    .map(mappedWorkingCopy)
+    .map((row) => mappedWorkingCopy(
+      row,
+      detailsByCandidate.get(row.candidate_id) || null,
+    ))
     .slice(0, 100)
 }
 
@@ -726,6 +1076,7 @@ type SavedDraft = {
   receipt: CommandReceiptRow
   result: OperationsImportedOrderShipToUpdateResult
   address: OrderShipToDraft
+  resolution: OperationsImportedOrderResolutionDraft
   candidate: LockedCandidateRow
 }
 
@@ -767,6 +1118,241 @@ function blockerCodes(values: unknown[] | undefined) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
     return String((value as Record<string, unknown>).code || '').trim()
   }).filter(Boolean))].sort()
+}
+
+type HandoffResolutionState = {
+  row_version: string
+  customer_resolution_state: string
+  customer_global_id: string | null
+  delivery_resolution_state: string
+  provider_requested_delivery_at: Date | null
+  requested_delivery_at: Date | null
+  lines: Array<{
+    globalId: string
+    mappingState: string
+    priceResolutionState: string
+    packagingState: string
+    productGlobalId: string | null
+    unitPriceMinor: string | null
+    currency: string | null
+    packageProfileGlobalId: string | null
+  }>
+}
+
+async function readHandoffResolutionState(input: {
+  organizationId: string
+  candidateGlobalId: string
+}): Promise<HandoffResolutionState> {
+  const selected = await query<{
+    row_version: string
+    customer_resolution_state: string
+    customer_global_id: string | null
+    delivery_resolution_state: string
+    provider_requested_delivery_at: Date | null
+    requested_delivery_at: Date | null
+  }>(
+    `SELECT candidate.row_version::text,
+            candidate.customer_resolution_state,
+            customer.reference_code AS customer_global_id,
+            candidate.delivery_resolution_state,
+            candidate.provider_requested_delivery_at,
+            candidate.requested_delivery_at
+     FROM operations_commerce_order_candidates candidate
+     LEFT JOIN crm_organizations customer
+       ON customer.pipeline_id = candidate.pipeline_id
+      AND customer.id = candidate.customer_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [input.organizationId, input.candidateGlobalId],
+  )
+  const candidate = selected.rows[0]
+  if (!candidate) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_NOT_FOUND',
+      'Imported order is no longer available',
+      404,
+    )
+  }
+  const lines = await query<{
+    global_id: string
+    mapping_state: string
+    price_resolution_state: string
+    packaging_state: string
+    product_global_id: string | null
+    unit_price_minor: string | null
+    currency: string | null
+    package_profile_global_id: string | null
+  }>(
+    `SELECT line.global_id, line.mapping_state,
+            line.price_resolution_state, line.packaging_state,
+            product.reference_code AS product_global_id,
+            line.resolved_unit_price_minor::text AS unit_price_minor,
+            line.resolved_currency_code AS currency,
+            profile.global_id AS package_profile_global_id
+     FROM operations_commerce_order_candidate_lines line
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = line.organization_id
+      AND candidate.integration_account_id = line.integration_account_id
+      AND candidate.id = line.order_candidate_id
+     LEFT JOIN crm_products product
+       ON product.pipeline_id = line.pipeline_id
+      AND product.id = line.product_id
+     LEFT JOIN operations_product_package_profiles profile
+       ON profile.organization_id = line.organization_id
+      AND profile.pipeline_id = line.pipeline_id
+      AND profile.product_id = line.product_id
+      AND profile.id = line.package_profile_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2
+       AND line.unfulfilled_quantity > 0
+     ORDER BY line.created_at, line.id`,
+    [input.organizationId, input.candidateGlobalId],
+  )
+  return {
+    ...candidate,
+    lines: lines.rows.map((line) => ({
+      globalId: line.global_id,
+      mappingState: line.mapping_state,
+      priceResolutionState: line.price_resolution_state,
+      packagingState: line.packaging_state,
+      productGlobalId: line.product_global_id,
+      unitPriceMinor: line.unit_price_minor,
+      currency: line.currency,
+      packageProfileGlobalId: line.package_profile_global_id,
+    })),
+  }
+}
+
+function sameTimestamp(left: Date | null, right: string | null) {
+  if (!left || !right) return false
+  return left.toISOString() === new Date(right).toISOString()
+}
+
+async function applyWorkbenchResolutionDraft(input: {
+  organizationId: string
+  actorEmail: string
+  receiptId: string
+  candidateGlobalId: string
+  runtime: NonNullable<Awaited<ReturnType<
+    typeof readCommerceRuntimeCredentialFromPostgres
+  >>>
+  resolution: OperationsImportedOrderResolutionDraft
+}) {
+  let state = await readHandoffResolutionState(input)
+  let rowVersion = Number(state.row_version)
+  if (
+    input.resolution.customerGlobalId
+    && (
+      state.customer_resolution_state !== 'resolved'
+      || state.customer_global_id !== input.resolution.customerGlobalId
+    )
+  ) {
+    const result = await resolveCommerceCandidateCustomerInPostgres({
+      runtime: input.runtime,
+      actorEmail: input.actorEmail,
+      idempotencyKey: `workbench:${input.receiptId}:resolve-customer`,
+      candidateGlobalId: input.candidateGlobalId,
+      candidateRowVersion: rowVersion,
+      customer: {
+        mode: 'existing',
+        customerGlobalId: input.resolution.customerGlobalId,
+      },
+    }) as CandidateCommandResult
+    rowVersion = Number(result.rowVersion)
+  }
+  if (input.resolution.requestedDeliveryAt) {
+    state = await readHandoffResolutionState(input)
+    rowVersion = Number(state.row_version)
+    if (!sameTimestamp(
+      state.requested_delivery_at,
+      input.resolution.requestedDeliveryAt,
+    )) {
+      const providerSelected = sameTimestamp(
+        state.provider_requested_delivery_at,
+        input.resolution.requestedDeliveryAt,
+      )
+      const result = await resolveCommerceCandidateDeliveryInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey: `workbench:${input.receiptId}:resolve-delivery`,
+        candidateGlobalId: input.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        decision: {
+          mode: providerSelected ? 'provider' : 'manual',
+          requestedDeliveryAt: providerSelected
+            ? null
+            : input.resolution.requestedDeliveryAt,
+        },
+      }) as CandidateCommandResult
+      rowVersion = Number(result.rowVersion)
+    }
+  }
+  for (const draft of input.resolution.lines) {
+    if (draft.unitPriceMinor === null) continue
+    state = await readHandoffResolutionState(input)
+    rowVersion = Number(state.row_version)
+    let line = state.lines.find((candidate) => (
+      candidate.globalId === draft.lineGlobalId
+    ))
+    if (!line) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_LINE_CHANGED',
+        'An order line changed. Refresh the order before saving',
+        409,
+      )
+    }
+    if (
+      line.mappingState !== 'resolved'
+      || line.productGlobalId !== draft.productGlobalId
+      || line.priceResolutionState === 'unresolved'
+      || line.unitPriceMinor !== String(draft.unitPriceMinor)
+      || line.currency !== draft.currency
+    ) {
+      const result = await resolveCommerceCandidateProductInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey:
+          `workbench:${input.receiptId}:resolve-product:${draft.lineGlobalId}`,
+        candidateGlobalId: input.candidateGlobalId,
+        candidateRowVersion: rowVersion,
+        lineGlobalId: draft.lineGlobalId,
+        product: {
+          mode: 'existing',
+          productGlobalId: draft.productGlobalId,
+          unitPriceMinor: draft.unitPriceMinor,
+          currency: draft.currency,
+        },
+      }) as CandidateCommandResult
+      rowVersion = Number(result.rowVersion)
+      state = await readHandoffResolutionState(input)
+      line = state.lines.find((candidate) => (
+        candidate.globalId === draft.lineGlobalId
+      ))!
+    }
+    if (
+      draft.packageProfileGlobalId
+      && (
+        line.packagingState !== 'resolved'
+        || line.packageProfileGlobalId !== draft.packageProfileGlobalId
+      )
+    ) {
+      const result = await resolveCommerceCandidatePackageInPostgres({
+        runtime: input.runtime,
+        actorEmail: input.actorEmail,
+        idempotencyKey:
+          `workbench:${input.receiptId}:resolve-package:${draft.lineGlobalId}`,
+        candidateGlobalId: input.candidateGlobalId,
+        candidateRowVersion: Number(state.row_version),
+        lineGlobalId: draft.lineGlobalId,
+        package: {
+          mode: 'profile',
+          packageProfileGlobalId: draft.packageProfileGlobalId,
+        },
+      }) as CandidateCommandResult
+      rowVersion = Number(result.rowVersion)
+    }
+  }
+  return rowVersion
 }
 
 async function completeWorkbenchReceipt(input: {
@@ -960,12 +1546,20 @@ async function handoffCarrierReadyDraft(input: {
       409,
     )
   }
+  const resolvedRowVersion = await applyWorkbenchResolutionDraft({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    receiptId: saved.receipt.id,
+    candidateGlobalId: saved.result.candidateGlobalId,
+    runtime,
+    resolution: saved.resolution,
+  })
   const preflightValidation = await validateCommerceCandidateInPostgres({
     runtime,
     actorEmail: input.actorEmail,
     idempotencyKey: `workbench:${saved.receipt.id}:preflight-validate`,
     candidateGlobalId: saved.result.candidateGlobalId,
-    candidateRowVersion: Number(saved.candidate.row_version),
+    candidateRowVersion: resolvedRowVersion,
   }) as CandidateCommandResult
   const preflightRowVersion = Number(preflightValidation.rowVersion)
   if (!Number.isSafeInteger(preflightRowVersion)) {
@@ -1073,6 +1667,7 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
   candidateGlobalId: string
   expectedRowVersion: number
   changes: OrderShipToPatch
+  resolutionDraft?: OperationsImportedOrderResolutionDraft
   /** Test-only crash seam after the durable local checkpoint commits. */
   afterLocalSaveBeforeHandoff?: () => void | Promise<void>
 }): Promise<OperationsImportedOrderShipToUpdateResult> {
@@ -1099,10 +1694,16 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
       400,
     )
   }
-  if (!Object.keys(input.changes).length) {
+  const resolution = normalizedResolutionDraft(input.resolutionDraft)
+  if (
+    !Object.keys(input.changes).length
+    && !resolution.customerGlobalId
+    && !resolution.requestedDeliveryAt
+    && !resolution.lines.length
+  ) {
     requestError(
       'OPERATIONS_IMPORTED_ORDER_EDIT_EMPTY',
-      'Choose at least one ship-to field to update',
+      'Choose at least one order field to update',
       400,
     )
   }
@@ -1110,6 +1711,7 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
     candidateGlobalId,
     expectedRowVersion: input.expectedRowVersion,
     changes: input.changes,
+    resolution,
   })
   const saved = await withTransaction<
     SavedDraft | OperationsImportedOrderShipToUpdateResult
@@ -1191,6 +1793,8 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
               accepted_provider_updated_at, ship_to_edit_state,
               ship_to_ciphertext, ship_to_iv, ship_to_tag,
               ship_to_source_hash, canonical_order_id::text,
+              customer_global_id_draft, requested_delivery_at_draft,
+              line_resolution_drafts,
               last_command_receipt_id::text, last_request_hash,
               row_version::text
        FROM operations_commerce_order_workbench
@@ -1227,6 +1831,15 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
         receipt: prepared.receipt,
         result: checkpointResult(prepared.receipt),
         address,
+        resolution: {
+          customerGlobalId: current!.customer_global_id_draft,
+          requestedDeliveryAt:
+            current!.requested_delivery_at_draft?.toISOString() || null,
+          lines: Object.entries(current!.line_resolution_drafts).map(([
+            lineGlobalId,
+            draft,
+          ]) => ({ lineGlobalId, ...draft })),
+        },
         candidate,
       }
     }
@@ -1354,18 +1967,21 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
              ship_to_hash = $8,
              ship_to_source_hash = $9,
              ship_to_encryption_version = $10,
+             customer_global_id_draft = $11,
+             requested_delivery_at_draft = $12::timestamptz,
+             line_resolution_drafts = $13::jsonb,
              sync_state = 'local_only',
-             last_command_receipt_id = $11::uuid,
-             last_idempotency_key = $12,
-             last_request_hash = $13,
+             last_command_receipt_id = $14::uuid,
+             last_idempotency_key = $15,
+             last_request_hash = $16,
              row_version = row_version + 1,
-             updated_by = $14,
+             updated_by = $17,
              updated_at = now()
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
            AND external_order_id = $3
            AND canonical_order_id IS NULL
-           AND row_version = $15::bigint
+           AND row_version = $18::bigint
          RETURNING row_version::text`,
         [
           organizationId,
@@ -1378,6 +1994,9 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
           encrypted.hash,
           candidate.source_hash,
           encrypted.encryptionVersion,
+          resolution.customerGlobalId,
+          resolution.requestedDeliveryAt,
+          JSON.stringify(lineDraftRecord(resolution)),
           prepared.receipt.id,
           input.idempotencyKey,
           exactRequestHash,
@@ -1400,12 +2019,15 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
            accepted_provider_source_hash, accepted_provider_updated_at,
            ship_to_edit_state, ship_to_ciphertext, ship_to_iv, ship_to_tag,
            ship_to_hash, ship_to_source_hash, ship_to_encryption_version,
+           customer_global_id_draft, requested_delivery_at_draft,
+           line_resolution_drafts,
            sync_state, last_command_receipt_id, last_idempotency_key,
            last_request_hash, created_by, updated_by
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4, NULL, $5, $6,
            $7, $8, $9, $10, $11, $12, $13,
-           'local_only', $14::uuid, $15, $16, $17, $17
+           $14, $15::timestamptz, $16::jsonb,
+           'local_only', $17::uuid, $18, $19, $20, $20
          )
          RETURNING row_version::text`,
         [
@@ -1422,6 +2044,9 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
           encrypted.hash,
           candidate.source_hash,
           encrypted.encryptionVersion,
+          resolution.customerGlobalId,
+          resolution.requestedDeliveryAt,
+          JSON.stringify(lineDraftRecord(resolution)),
           prepared.receipt.id,
           input.idempotencyKey,
           exactRequestHash,
@@ -1475,6 +2100,18 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
         readiness,
         issueFields: issues.map((issue) => issue.field),
         changedFields,
+        resolutionDraftFields: [
+          ...(resolution.customerGlobalId ? ['customer'] : []),
+          ...(resolution.requestedDeliveryAt ? ['requested_delivery'] : []),
+          ...(resolution.lines.length ? ['line_product'] : []),
+          ...(resolution.lines.some((line) => line.unitPriceMinor !== null)
+            ? ['line_price']
+            : []),
+          ...(resolution.lines.some((line) => line.packageProfileGlobalId)
+            ? ['line_package_profile']
+            : []),
+        ],
+        resolutionLineCount: resolution.lines.length,
         syncStatus: 'local_only',
         providerVersionChanged,
         providerWrites: 0,
@@ -1483,7 +2120,13 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
         correlationId: prepared.receipt.correlation_id,
       },
     }, client)
-    return { receipt: prepared.receipt, result, address: after, candidate }
+    return {
+      receipt: prepared.receipt,
+      result,
+      address: after,
+      resolution,
+      candidate,
+    }
   })
   if (!('receipt' in saved)) return saved
   if (saved.result.readiness !== 'carrier_ready') {
@@ -1998,6 +2641,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
            ship_to_hash = $11,
            ship_to_source_hash = $12,
            ship_to_encryption_version = $13,
+           line_resolution_drafts = '{}'::jsonb,
            sync_state = $14,
            last_command_receipt_id = $15::uuid,
            last_idempotency_key = $16,
