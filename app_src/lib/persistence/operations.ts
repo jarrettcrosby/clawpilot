@@ -682,7 +682,10 @@ function estimatedDeliveryAt(
   evidenceCompletedAt: string,
   deliveryDate: string | null,
   transitDays: number | null,
-): { deliveryAt: string; transitDays: number } | null {
+): {
+  deliveryAt: string | null
+  transitDays: number | null
+} | null {
   if (deliveryDate) {
     const delivery = /^\d{4}-\d{2}-\d{2}$/.test(deliveryDate)
       ? new Date(`${deliveryDate}T23:59:59.000Z`)
@@ -706,6 +709,9 @@ function estimatedDeliveryAt(
           : derivedTransit,
       }
     }
+  }
+  if (deliveryDate === null && transitDays === null) {
+    return { deliveryAt: null, transitDays: null }
   }
   if (!Number.isSafeInteger(transitDays) || Number(transitDays) < 0) {
     return null
@@ -1887,7 +1893,7 @@ async function transitionOrder(
     correlationId: string
     eventKey: string
     payload?: Record<string, unknown>
-    promisedDeliveryAt?: string
+    promisedDeliveryAt?: string | null
   },
 ) {
   await client.query(
@@ -3601,7 +3607,7 @@ async function readOrderDetail(
       service_name: string
       internal_cost_minor: string
       customer_charge_minor: string | null
-      estimated_delivery_at: Date
+      estimated_delivery_at: Date | null
       meets_promise: boolean
       selected: boolean
     }>(
@@ -3990,7 +3996,8 @@ async function readOrderDetail(
       serviceName: item.service_name,
       internalCostMinor: item.internal_cost_minor,
       customerChargeMinor: item.customer_charge_minor,
-      estimatedDeliveryAt: item.estimated_delivery_at.toISOString(),
+      estimatedDeliveryAt:
+        item.estimated_delivery_at?.toISOString() || null,
       meetsPromise: item.meets_promise,
       selected: item.selected,
     })),
@@ -13294,8 +13301,11 @@ export async function planOperationsOrderFromPostgres(input: {
             offer.transitDays,
             offer.estimatedDeliveryAt,
             order.requested_delivery_at === null
-              || new Date(offer.estimatedDeliveryAt).getTime()
-                <= order.requested_delivery_at.getTime(),
+              || (
+                offer.estimatedDeliveryAt !== null
+                && new Date(offer.estimatedDeliveryAt).getTime()
+                  <= order.requested_delivery_at.getTime()
+              ),
             selected,
             JSON.stringify({
               version: 'canonical-whole-shipment-rate-evidence-v1',
