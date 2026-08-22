@@ -559,6 +559,8 @@ async function installImportedWorkbenchRoutes(
   const capture = {
     patchRequests: [] as ImportedWorkbenchRouteRequest[],
     patchResults: [] as Array<Record<string, unknown>>,
+    acceptRequests: [] as ImportedWorkbenchRouteRequest[],
+    acceptResults: [] as Array<Record<string, unknown>>,
     refreshRequests: [] as ImportedWorkbenchRouteRequest[],
     providerMutationRequests: [] as string[],
     canonicalWorkspaceReads: 0,
@@ -647,14 +649,91 @@ async function installImportedWorkbenchRoutes(
       }
       if (request.method() === 'PATCH') {
         capture.patchRequests.push(captured)
-        promoted = true
+        const draft = captured.body as {
+          shipTo: typeof workbenchCompleteShipTo
+          resolution: {
+            customerGlobalId: string | null
+            requestedDeliveryAt: string | null
+            lines: Array<{
+              lineGlobalId: string
+              productGlobalId: string
+              unitPriceMinor: number | null
+              currency: string
+              packageProfileGlobalId: string | null
+            }>
+          }
+        }
+        const lineDraft = draft.resolution.lines[0]
+        detailedOrder = {
+          ...detailedOrder,
+          rowVersion: 1,
+          customer: {
+            ...detailedOrder.customer,
+            selectedCustomerGlobalId: draft.resolution.customerGlobalId,
+          },
+          delivery: {
+            ...detailedOrder.delivery,
+            draftDeliveryAt: draft.resolution.requestedDeliveryAt,
+          },
+          lines: detailedOrder.lines.map((line) => (
+            line.globalId === lineDraft?.lineGlobalId
+              ? {
+                  ...line,
+                  productGlobalId: lineDraft.productGlobalId,
+                  unitPriceMinor: lineDraft.unitPriceMinor,
+                  currency: lineDraft.currency,
+                  packageProfileGlobalId: lineDraft.packageProfileGlobalId,
+                }
+              : line
+          )),
+          shipTo: {
+            value: draft.shipTo,
+            readiness: 'carrier_ready',
+            provenance: 'local',
+            syncStatus: 'local_only',
+            issues: [],
+          },
+        }
         const result = {
           candidateGlobalId: workbenchCandidateGlobalId,
-          canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+          canonicalOrderGlobalId: null,
           rowVersion: 1,
           readiness: 'carrier_ready',
           issues: [],
           changedFields: ['region', 'postalCode'],
+          syncStatus: 'local_only',
+          promotionStatus: 'needs_info',
+          remainingBlockerCodes: detailedOrder.blockerCodes.filter((code) => (
+            !code.startsWith('ship_to_')
+          )),
+          providerVersionChanged: false,
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          replayed: false,
+        }
+        capture.patchResults.push(result)
+        return route.fulfill({
+          json: {
+            ok: true,
+            result,
+            order: detailedOrder,
+          },
+        })
+      }
+      if (
+        request.method() === 'POST'
+        && captured.body.action === 'accept'
+        && !options.refreshConflict
+      ) {
+        capture.acceptRequests.push(captured)
+        promoted = true
+        const result = {
+          candidateGlobalId: workbenchCandidateGlobalId,
+          canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+          rowVersion: 2,
+          readiness: 'carrier_ready',
+          issues: [],
+          changedFields: [],
           syncStatus: 'local_only',
           promotionStatus: 'promoted',
           remainingBlockerCodes: [],
@@ -663,7 +742,7 @@ async function installImportedWorkbenchRoutes(
           providerWriteIntentCreated: false,
           replayed: false,
         }
-        capture.patchResults.push(result)
+        capture.acceptResults.push(result)
         return route.fulfill({
           json: {
             ok: true,
@@ -693,6 +772,7 @@ async function installImportedWorkbenchRoutes(
               localValue: '10001',
               providerValue: '11201',
             }],
+            lineConflicts: [],
           },
         })
       }
@@ -725,6 +805,7 @@ async function installImportedWorkbenchRoutes(
             status: 'rebased',
             providerChangedFields: ['line1', 'postalCode'],
             preservedLocalFields: ['line1'],
+            preservedLineDrafts: [],
             providerWrites: 0,
             providerWriteIntentCreated: false,
             replayed: false,
@@ -1574,7 +1655,7 @@ async function installReplayRoutes(page: Page) {
   })
 }
 
-test('incomplete imported order saves one local working copy and hands off to canonical Orders', async ({ page }) => {
+test('incomplete imported order saves locally before explicit acceptance into canonical Orders', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   const capture = await installImportedWorkbenchRoutes(page)
   await gotoApp(page, '/#operations')
@@ -1625,6 +1706,20 @@ test('incomplete imported order saves one local working copy and hands off to ca
   await expect(save).toBeEnabled()
   await save.click()
 
+  await expect(page.getByText('Order #7710 saved locally')).toBeVisible()
+  await expect(page.getByText('Saved locally', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  expect(capture.canonicalWorkspaceReads).toBe(0)
+
+  const accept = page.getByRole('button', {
+    name: 'Accept & import',
+    exact: true,
+  })
+  await expect(accept).toBeEnabled()
+  await expect(save).toBeDisabled()
+  await accept.click()
+
   await expect(page.getByText('Order #7710 imported')).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Order #7710' }))
     .toBeVisible()
@@ -1652,6 +1747,21 @@ test('incomplete imported order saves one local working copy and hands off to ca
     },
   })
   expect(capture.patchResults).toEqual([expect.objectContaining({
+    canonicalOrderGlobalId: null,
+    promotionStatus: 'needs_info',
+    providerWrites: 0,
+    providerWriteIntentCreated: false,
+  })])
+  expect(capture.acceptRequests).toHaveLength(1)
+  expect(capture.acceptRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.acceptRequests[0].body).toEqual({
+    action: 'accept',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 1,
+  })
+  expect(capture.acceptResults).toEqual([expect.objectContaining({
     canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
     promotionStatus: 'promoted',
     providerWrites: 0,
@@ -1694,7 +1804,7 @@ test('imported order provider refresh resolves each address conflict explicitly'
   await page.getByRole('button', { name: 'Apply choices' }).click()
 
   await expect(page.getByText(
-    'Order #7710 refreshed; review item matches before saving',
+    'Order #7710 refreshed; review provider item changes',
   )).toBeVisible()
   await expect(page.getByLabel('Address')).toHaveValue('200 Customer Lane')
   await expect(page.getByLabel('Postal code')).toHaveValue('11201')
@@ -1714,6 +1824,7 @@ test('imported order provider refresh resolves each address conflict explicitly'
       line1: 'local',
       postalCode: 'provider',
     },
+    lineResolutions: {},
   })
   for (const request of capture.refreshRequests) {
     expect(request.idempotencyKey).toMatch(
