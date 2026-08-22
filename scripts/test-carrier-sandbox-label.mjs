@@ -105,9 +105,26 @@ function loadLabelModule() {
       if (specifier === '@/lib/integrations/carrierSandboxRate') {
         return {
           CARRIER_SANDBOX_RATE_FIXTURE: fixture,
-          carrierSandboxPartyFingerprint: (value) => (
-            createHash('sha256').update(JSON.stringify(value)).digest('hex')
-          ),
+          carrierSandboxPartyFingerprint: (value) => {
+            const allowed = new Set([
+              'name',
+              'line1',
+              'line2',
+              'city',
+              'region',
+              'postalCode',
+              'countryCode',
+            ])
+            const unsupported = Object.keys(value).find(
+              (field) => !allowed.has(field),
+            )
+            if (unsupported) {
+              throw new Error(
+                `Carrier sandbox destination field is not supported: ${unsupported}`,
+              )
+            }
+            return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+          },
           normalizeCarrierSandboxParty: (value) => ({
             name: String(value.name).trim(),
             line1: String(value.line1).trim(),
@@ -259,6 +276,41 @@ assert.ok(
 assert.ok(
   !JSON.stringify(legacyEvidence.redactedRequest).includes('101 Academy Drive'),
   'Redacted label evidence must omit the destination street',
+)
+
+const commercialShipmentEvidence = carrierSandboxLabelRequestEvidence(
+  'ups_rest',
+  '03',
+  'sender',
+  undefined,
+  normalizedShipmentFixture,
+)
+const residentialShipmentEvidence = carrierSandboxLabelRequestEvidence(
+  'ups_rest',
+  '03',
+  'sender',
+  undefined,
+  {
+    ...normalizedShipmentFixture,
+    destination: {
+      ...normalizedShipmentFixture.destination,
+      residential: true,
+    },
+  },
+)
+assert.match(
+  commercialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  /^[a-f0-9]{64}$/,
+)
+assert.equal(
+  residentialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  commercialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  'Residential classification must not enter the address-only fingerprint',
+)
+assert.notEqual(
+  residentialShipmentEvidence.requestHash,
+  commercialShipmentEvidence.requestHash,
+  'Residential classification must remain sealed into full request evidence',
 )
 
 const upsZpl = '^XA^FO50,50^FDSANDBOX^FS^XZ'
