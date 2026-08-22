@@ -43,6 +43,10 @@ const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
+const REFRESH_FIELDS = new Set<string>([
+  ...ORDER_SHIP_TO_FIELDS,
+  'requestedDeliveryAt',
+])
 const SHIP_TO_LIMITS: Record<OrderShipToField, number> = {
   name: 120,
   line1: 160,
@@ -283,9 +287,9 @@ function refreshResolutionsValue(
 ): CommerceOrderWorkbenchRefreshResolution {
   if (value === undefined || value === null) return {}
   const input = record(value, 'Refresh choices')
-  assertFields(input, SHIP_TO_FIELDS, 'Refresh choices')
+  assertFields(input, REFRESH_FIELDS, 'Refresh choices')
   const resolutions: CommerceOrderWorkbenchRefreshResolution = {}
-  for (const field of ORDER_SHIP_TO_FIELDS) {
+  for (const field of REFRESH_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(input, field)) continue
     if (!['local', 'provider'].includes(String(input[field] || ''))) {
       requestError(
@@ -293,7 +297,8 @@ function refreshResolutionsValue(
         'Choose whether to keep the local or provider value',
       )
     }
-    resolutions[field] = input[field] as 'local' | 'provider'
+    resolutions[field as keyof CommerceOrderWorkbenchRefreshResolution] =
+      input[field] as 'local' | 'provider'
   }
   return resolutions
 }

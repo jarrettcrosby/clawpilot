@@ -84,6 +84,7 @@ for (const fragment of [
   'retained_candidate.canonical_order_id IS NULL',
   'canonical_order_id = canonical.canonical_order_id',
   'mergeCommerceOrderWorkbenchProviderAddress',
+  'mergeCommerceOrderWorkbenchRequestedDelivery',
   'mergeCommerceOrderWorkbenchLineDrafts',
   'rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres',
   'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
@@ -96,6 +97,11 @@ for (const fragment of [
   'applyWorkbenchResolutionDraft',
   'includeResolutionDetails',
   'preservedLineDrafts',
+  "input.action === 'save'",
+  'AS requires_carrier_address',
+  'saved.candidate.requires_carrier_address',
+  'requested_delivery_at_draft = $15::timestamptz',
+  "field: 'requestedDeliveryAt'",
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
@@ -158,6 +164,10 @@ for (const fragment of [
   'It has not been discarded.',
   'Apply choices',
   'Accept &amp; import',
+  "field === 'requestedDeliveryAt'",
+  'savedDraftComplete',
+  "shippingRequired && draftReadiness !== 'carrier_ready'",
+  '!line.requiresShipping || draft.packageProfileGlobalId',
 ]) {
   assert.ok(drawer.includes(fragment), `Drawer refresh is missing ${fragment}`)
 }
@@ -165,6 +175,10 @@ assert.equal(
   /reasonValue|confirmationStatement|canActivate/u.test(route),
   false,
   'Ordinary local order edits must not require activation ceremony',
+)
+assert.ok(
+  route.includes("'requestedDeliveryAt'"),
+  'Refresh choices must accept an explicit requested-delivery resolution',
 )
 assert.ok(
   operationsRoute.includes('error instanceof CommerceOrderWorkbenchError'),

@@ -65,6 +65,13 @@ type ImportedOrderWorkingCopyDrawerProps = {
 
 const EMPTY_SHIP_TO = normalizeOrderShipToDraft(null)
 
+type RefreshResolutionField = keyof OrderShipToDraft | 'requestedDeliveryAt'
+type RefreshConflict = OperationsImportedOrderRefreshConflict | {
+  field: 'requestedDeliveryAt'
+  localValue: string | null
+  providerValue: string | null
+}
+
 type LineEditorDraft = {
   productGlobalId: string
   unitPriceMajor: string
@@ -132,6 +139,21 @@ function readinessLabel(readiness: ReturnType<typeof orderShipToReadiness>) {
   return 'Ship-to incomplete for rates'
 }
 
+function refreshConflictLabel(field: RefreshResolutionField) {
+  if (field === 'requestedDeliveryAt') return 'Requested delivery'
+  if (field === 'postalCode') return 'Postal code'
+  if (field === 'line1') return 'Address'
+  if (field === 'line2') return 'Address line 2'
+  return field[0].toUpperCase() + field.slice(1)
+}
+
+function refreshConflictValue(field: RefreshResolutionField, value: string | null) {
+  if (!value) return 'blank'
+  if (field !== 'requestedDeliveryAt') return value
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+}
+
 export default function ImportedOrderWorkingCopyDrawer({
   open,
   order,
@@ -160,11 +182,11 @@ export default function ImportedOrderWorkingCopyDrawer({
   )
   const [refreshConflict, setRefreshConflict] = useState<{
     latestCandidateGlobalId: string
-    conflicts: OperationsImportedOrderRefreshConflict[]
+    conflicts: RefreshConflict[]
     lineConflicts: OperationsImportedOrderLineRefreshConflict[]
   } | null>(null)
   const [refreshChoices, setRefreshChoices] = useState<Partial<
-    Record<keyof OrderShipToDraft, 'local' | 'provider'>
+    Record<RefreshResolutionField, 'local' | 'provider'>
   >>({})
   const [lineRefreshChoices, setLineRefreshChoices] = useState<
     Record<string, 'provider'>
@@ -200,6 +222,31 @@ export default function ImportedOrderWorkingCopyDrawer({
       }
     })
     .map((line) => line.globalId)), [lineDrafts, order?.lines])
+  const savedDraftComplete = useMemo(() => {
+    if (!order?.resolutionDetailsLoaded) return false
+    const shippingRequired = order.lines.some((line) => line.requiresShipping)
+    if (!customerGlobalId) return false
+    if (shippingRequired && draftReadiness !== 'carrier_ready') return false
+    if (
+      shippingRequired
+      && !requestedDeliveryAt
+      && !['not_required', 'not_supplied'].includes(order.delivery.status)
+    ) return false
+    return order.lines.length > 0 && order.lines.every((line) => {
+      const draft = lineDrafts[line.globalId]
+      return Boolean(
+        draft?.productGlobalId
+        && draft.unitPriceMajor.trim()
+        && (!line.requiresShipping || draft.packageProfileGlobalId),
+      )
+    })
+  }, [
+    customerGlobalId,
+    draftReadiness,
+    lineDrafts,
+    order,
+    requestedDeliveryAt,
+  ])
 
   const update = (field: keyof OrderShipToDraft, value: string) => {
     setShipTo((current) => ({ ...current, [field]: value || null }))
@@ -252,7 +299,9 @@ export default function ImportedOrderWorkingCopyDrawer({
     const conflict = await onRefresh(resolveConflict && refreshConflict
       ? {
           latestCandidateGlobalId: refreshConflict.latestCandidateGlobalId,
-          resolutions: refreshChoices,
+          resolutions: refreshChoices as Partial<
+            Record<keyof OrderShipToDraft, 'local' | 'provider'>
+          >,
           lineResolutions: lineRefreshChoices,
         }
       : undefined)
@@ -347,14 +396,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 {refreshConflict.conflicts.map((conflict) => (
                   <Stack key={conflict.field} spacing={0.5}>
                     <Typography variant="caption" fontWeight={700}>
-                      {conflict.field === 'postalCode'
-                        ? 'Postal code'
-                        : conflict.field === 'line1'
-                          ? 'Address'
-                          : conflict.field === 'line2'
-                            ? 'Address line 2'
-                            : conflict.field[0].toUpperCase()
-                              + conflict.field.slice(1)}
+                      {refreshConflictLabel(conflict.field)}
                     </Typography>
                     <Stack direction={{ xs: 'column', sm: 'row' }} gap={0.75}>
                       <Button
@@ -367,7 +409,10 @@ export default function ImportedOrderWorkingCopyDrawer({
                           [conflict.field]: 'local',
                         }))}
                       >
-                        Keep mine: {conflict.localValue || 'blank'}
+                        Keep mine: {refreshConflictValue(
+                          conflict.field,
+                          conflict.localValue,
+                        )}
                       </Button>
                       <Button
                         size="small"
@@ -379,7 +424,10 @@ export default function ImportedOrderWorkingCopyDrawer({
                           [conflict.field]: 'provider',
                         }))}
                       >
-                        Use {providerLabel(order!.provider)}: {conflict.providerValue || 'blank'}
+                        Use {providerLabel(order!.provider)}: {refreshConflictValue(
+                          conflict.field,
+                          conflict.providerValue,
+                        )}
                       </Button>
                     </Stack>
                   </Stack>
@@ -776,9 +824,8 @@ export default function ImportedOrderWorkingCopyDrawer({
                 || !canManage
                 || saving
                 || changed
-                || order.needsInfo
+                || !savedDraftComplete
                 || order.providerVersionChanged
-                || draftReadiness !== 'carrier_ready'
                 || invalidLinePrices.size > 0
               }
               onClick={() => void onAccept()}

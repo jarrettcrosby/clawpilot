@@ -64,6 +64,8 @@ for (const fragment of [
   'order.providerVersionChanged',
   'Use refreshed provider item',
   'lineRefreshChoices[conflict.lineGlobalId]',
+  "field === 'requestedDeliveryAt'",
+  'savedDraftComplete',
 ]) {
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }
@@ -90,6 +92,27 @@ assert.equal(
 assert.ok(
   drawer.includes("order?.shipTo.syncStatus === 'local_only' ? 'Saved locally'"),
   'The drawer must report local-save state plainly',
+)
+const acceptActionStart = drawer.indexOf(': <MoveToInboxRounded />}')
+const acceptActionEnd = drawer.indexOf('</Button>', acceptActionStart)
+assert.ok(acceptActionStart >= 0 && acceptActionEnd > acceptActionStart)
+const acceptAction = drawer.slice(acceptActionStart, acceptActionEnd)
+assert.ok(
+  acceptAction.includes('!savedDraftComplete'),
+  'Accept must use the actual saved draft completeness',
+)
+assert.equal(
+  acceptAction.includes('order.needsInfo'),
+  false,
+  'Stale provider blockers must not disable an otherwise complete saved draft',
+)
+assert.ok(
+  drawer.includes("shippingRequired && draftReadiness !== 'carrier_ready'"),
+  'Only orders with an actual shippable line may require a carrier-ready address before Accept',
+)
+assert.ok(
+  drawer.includes("!line.requiresShipping || draft.packageProfileGlobalId"),
+  'A non-shipping line must not require a fabricated package profile',
 )
 
 console.log('Commerce order workbench UI contract passed')

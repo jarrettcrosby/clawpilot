@@ -300,6 +300,52 @@ async function seedReadyFacts(client, fixture) {
   )
 }
 
+async function seedNonShippingReadyFacts(client, fixture) {
+  await seedReadyFacts(client, fixture)
+  await client.query(
+    `INSERT INTO crm_reference_registry (
+       reference_code, prefix, canonical_code, status, entity_type
+     ) VALUES
+       ($1, 'ga', $1, 'active', 'crm.organization'),
+       ($2, 'gp', $2, 'active', 'crm.product')`,
+    [fixture.customerGlobalId, fixture.productGlobalId],
+  )
+  await client.query(
+    `UPDATE crm_organizations SET reference_code = $3
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+    [fixture.pipeline, fixture.customer, fixture.customerGlobalId],
+  )
+  await client.query(
+    `UPDATE crm_products SET reference_code = $3
+     WHERE pipeline_id = $1::uuid AND id = $2::uuid`,
+    [fixture.pipeline, fixture.product, fixture.productGlobalId],
+  )
+  await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET requires_shipping = false,
+         delivery_resolution_state = 'not_required',
+         requested_delivery_at = NULL,
+         delivery_policy_version = NULL,
+         blocking_codes = '{}'::text[]
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+  await client.query(
+    `UPDATE operations_commerce_order_candidate_lines
+     SET requires_shipping = false,
+         packaging_state = 'not_required',
+         packaging_source = 'none',
+         weight_grams = NULL,
+         length_mm = NULL,
+         width_mm = NULL,
+         height_mm = NULL,
+         blocking_codes = '{}'::text[]
+     WHERE organization_id = $1::uuid
+       AND order_candidate_id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+}
+
 async function seedNeedsInfoFacts(client, fixture) {
   await client.query(
     `INSERT INTO crm_reference_registry (
@@ -446,6 +492,7 @@ async function seedFixtures(
   needsInfo,
   accept,
   refresh,
+  nonShipping,
 ) {
   const client = await pool.connect()
   try {
@@ -461,10 +508,12 @@ async function seedFixtures(
     await seedTenant(client, needsInfo, 'Needs info workbench')
     await seedTenant(client, accept, 'Accept workbench')
     await seedTenant(client, refresh, 'Refresh workbench')
+    await seedTenant(client, nonShipping, 'Non shipping workbench')
     await seedReadyFacts(client, ready)
     await seedNeedsInfoFacts(client, needsInfo)
     await seedReadyFacts(client, accept)
     await seedNeedsInfoFacts(client, refresh)
+    await seedNonShippingReadyFacts(client, nonShipping)
   } finally {
     await client.query('SET session_replication_role = origin')
     client.release()
@@ -771,6 +820,14 @@ async function seedProviderLineRevision(pool, fixture, input) {
         actorEmail,
       ],
     )
+    if (Object.hasOwn(input, 'providerRequestedDeliveryAt')) {
+      await client.query(
+        `UPDATE operations_commerce_order_candidates
+         SET provider_requested_delivery_at = $3::timestamptz
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organization, candidateId, input.providerRequestedDeliveryAt],
+      )
+    }
     return { candidateGlobalId, lineGlobalId }
   } finally {
     await client.query('SET session_replication_role = origin')
@@ -990,6 +1047,7 @@ async function verifyAcceptance(
   needsInfoFixture,
   acceptFixture,
   refreshFixture,
+  nonShippingFixture,
 ) {
   process.env.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY =
     'commerce-order-workbench-postgres-encryption-key-material-0001'
@@ -1003,6 +1061,7 @@ async function verifyAcceptance(
       needsInfoFixture,
       acceptFixture,
       refreshFixture,
+      nonShippingFixture,
     )
     const persistence = workbenchPersistence(pool)
     const emptyAddress = {
@@ -1041,6 +1100,55 @@ async function verifyAcceptance(
     assert.equal(resolvedMerge.merged.line1, '20 New Way')
     assert.ok(resolvedMerge.preservedLocalFields.includes('city'))
     assert.ok(resolvedMerge.preservedLocalFields.includes('region'))
+    const deliveryBase = '2026-08-25T12:00:00.123Z'
+    const deliveryLocal = '2026-08-26T12:00:00.123Z'
+    const deliveryLatest = '2026-08-27T12:00:00.123Z'
+    assert.deepEqual(
+      plain(persistence.mergeCommerceOrderWorkbenchRequestedDelivery({
+        acceptedProvider: deliveryBase,
+        local: deliveryBase,
+        latestProvider: deliveryLatest,
+      })),
+      {
+        merged: deliveryLatest,
+        localChanged: false,
+        providerChanged: true,
+        requiresResolution: false,
+        preservedLocal: false,
+        conflict: null,
+      },
+      'provider-only requested-delivery changes must be adopted',
+    )
+    assert.equal(
+      persistence.mergeCommerceOrderWorkbenchRequestedDelivery({
+        acceptedProvider: deliveryBase,
+        local: deliveryLocal,
+        latestProvider: deliveryBase,
+      }).merged,
+      deliveryLocal,
+      'local-only requested-delivery changes must be preserved',
+    )
+    const deliveryConflict = plain(
+      persistence.mergeCommerceOrderWorkbenchRequestedDelivery({
+        acceptedProvider: deliveryBase,
+        local: deliveryLocal,
+        latestProvider: deliveryLatest,
+      }),
+    )
+    assert.deepEqual(deliveryConflict.conflict, {
+      field: 'requestedDeliveryAt',
+      localValue: deliveryLocal,
+      providerValue: deliveryLatest,
+    })
+    assert.equal(
+      persistence.mergeCommerceOrderWorkbenchRequestedDelivery({
+        acceptedProvider: deliveryBase,
+        local: deliveryLocal,
+        latestProvider: deliveryLatest,
+        resolution: 'provider',
+      }).merged,
+      deliveryLatest,
+    )
     const savedLineDraft = {
       productGlobalId: 'gp0009701',
       unitPriceMinor: 1250,
@@ -1239,7 +1347,7 @@ async function verifyAcceptance(
       /line draft is invalid/iu,
     )
 
-    const needsInfoPromoted = plain(await persistence
+    const needsInfoCompletedDraft = plain(await persistence
       .updateCommerceOrderWorkbenchShipToInPostgres({
         organizationId: needsInfoFixture.organization,
         actorEmail,
@@ -1266,6 +1374,27 @@ async function verifyAcceptance(
               needsInfoFixture.packageProfileGlobalId,
           }],
         },
+      }))
+    assert.equal(needsInfoCompletedDraft.promotionStatus, 'needs_info')
+    assert.equal(needsInfoCompletedDraft.canonicalOrderGlobalId, null)
+    assert.ok(
+      needsInfoCompletedDraft.remainingBlockerCodes.includes(
+        'customer_resolution_required',
+      ),
+      'Save may report stale provider blockers but must remain local',
+    )
+    assert.deepEqual(
+      await candidateSnapshot(pool, needsInfoFixture),
+      needsInfoBefore,
+      'a complete Save must not hand off or mutate the provider candidate',
+    )
+    const needsInfoPromoted = plain(await persistence
+      .acceptCommerceOrderWorkbenchInPostgres({
+        organizationId: needsInfoFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-needs-info-accept-0003',
+        candidateGlobalId: needsInfoFixture.candidateGlobalId,
+        expectedRowVersion: 2,
       }))
     assert.equal(needsInfoPromoted.promotionStatus, 'promoted')
     assert.deepEqual(needsInfoPromoted.remainingBlockerCodes, [])
@@ -1528,8 +1657,11 @@ async function verifyAcceptance(
     assert.equal(ready.providerWriteIntentCreated, false)
     assert.equal(ready.promotionStatus, 'needs_info')
     assert.equal(ready.canonicalOrderGlobalId, null)
-    assert.ok(ready.remainingBlockerCodes.includes('customer_resolution_required'))
-    assert.ok(ready.remainingBlockerCodes.includes('line_items_empty'))
+    assert.deepEqual(
+      ready.remainingBlockerCodes,
+      [],
+      'Save must not run provider-candidate preflight as a hidden handoff',
+    )
     const addressConfirmed = await candidateSnapshot(pool, primary)
     assert.equal(
       addressConfirmed.ship_to_snapshot_state,
@@ -1552,15 +1684,17 @@ async function verifyAcceptance(
         country: 'US',
       },
     }
-    await assert.rejects(
-      () => persistence.updateCommerceOrderWorkbenchShipToInPostgres({
+    let saveTriedToHandoff = false
+    const preparedForAccept = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
         ...acceptPreparation,
         afterLocalSaveBeforeHandoff() {
-          throw new Error('leave carrier-ready draft for explicit accept')
+          saveTriedToHandoff = true
         },
-      }),
-      /leave carrier-ready draft for explicit accept/u,
-    )
+      }))
+    assert.equal(saveTriedToHandoff, false)
+    assert.equal(preparedForAccept.promotionStatus, 'needs_info')
+    assert.equal(preparedForAccept.canonicalOrderGlobalId, null)
     const [unchangedReadyDraft] = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({
         organizationId: acceptFixture.organization,
@@ -1608,6 +1742,56 @@ async function verifyAcceptance(
     )
     assert.equal(acceptedCanonicalCount.rows[0].count, 1)
 
+    const nonShippingBefore = await candidateSnapshot(pool, nonShippingFixture)
+    assert.equal(nonShippingBefore.ship_to_snapshot_state, 'missing')
+    const [nonShippingDetailed] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: nonShippingFixture.organization,
+        candidateGlobalId: nonShippingFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(nonShippingDetailed.shipTo.readiness, 'missing')
+    assert.equal(nonShippingDetailed.customer.selectedCustomerGlobalId,
+      nonShippingFixture.customerGlobalId)
+    assert.equal(nonShippingDetailed.lines.length, 1)
+    assert.equal(nonShippingDetailed.lines[0].requiresShipping, false)
+    assert.equal(nonShippingDetailed.lines[0].productGlobalId,
+      nonShippingFixture.productGlobalId)
+    assert.equal(nonShippingDetailed.lines[0].packageProfileGlobalId, null)
+    assert.equal(nonShippingDetailed.delivery.status, 'not_required')
+    assert.equal(nonShippingDetailed.delivery.draftDeliveryAt, null)
+    const nonShippingAccepted = plain(await persistence
+      .acceptCommerceOrderWorkbenchInPostgres({
+        organizationId: nonShippingFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-non-shipping-accept-0001',
+        candidateGlobalId: nonShippingFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+      }))
+    assert.equal(nonShippingAccepted.promotionStatus, 'promoted')
+    assert.equal(nonShippingAccepted.readiness, 'missing')
+    assert.match(
+      nonShippingAccepted.canonicalOrderGlobalId,
+      /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u,
+    )
+    const nonShippingAfter = await candidateSnapshot(pool, nonShippingFixture)
+    assert.equal(
+      nonShippingAfter.ship_to_snapshot_state,
+      'missing',
+      'Accept must not fabricate or confirm an address for a non-shipping order',
+    )
+    assert.equal(nonShippingAfter.ship_to_ciphertext, null)
+    const nonShippingDelivery = await pool.query(
+      `SELECT delivery_resolution_state, requested_delivery_at
+       FROM operations_commerce_order_candidates
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [nonShippingFixture.organization, nonShippingFixture.candidate],
+    )
+    assert.deepEqual(plain(nonShippingDelivery.rows[0]), {
+      delivery_resolution_state: 'not_required',
+      requested_delivery_at: null,
+    })
+
     const [refreshDetailed] = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({
         organizationId: refreshFixture.organization,
@@ -1640,6 +1824,7 @@ async function verifyAcceptance(
     const providerExternalLineId = (
       `gid://shopify/LineItem/${refreshFixture.lineGlobalId.slice(-7)}`
     )
+    const stableProviderDelivery = '2026-09-01T16:30:00.456Z'
     const stableLineRevision = await seedProviderLineRevision(
       pool,
       refreshFixture,
@@ -1648,6 +1833,7 @@ async function verifyAcceptance(
         sourceCharacter: '7',
         order: 1,
         externalLineId: providerExternalLineId,
+        providerRequestedDeliveryAt: stableProviderDelivery,
       },
     )
     const lineRebased = plain(await persistence
@@ -1680,7 +1866,36 @@ async function verifyAcceptance(
       stableLineOrder.lines[0].packageProfileGlobalId,
       refreshFixture.packageProfileGlobalId,
     )
+    assert.equal(
+      stableLineOrder.delivery.draftDeliveryAt,
+      stableProviderDelivery,
+      'provider-only requested-delivery changes must be adopted on refresh',
+    )
 
+    const localRequestedDelivery = '2026-09-02T17:45:00.789Z'
+    const locallyRescheduled = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: refreshFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-delivery-local-0003',
+        candidateGlobalId: stableLineRevision.candidateGlobalId,
+        expectedRowVersion: 2,
+        changes: {},
+        resolutionDraft: {
+          customerGlobalId: refreshFixture.customerGlobalId,
+          requestedDeliveryAt: localRequestedDelivery,
+          lines: [{
+            lineGlobalId: stableLineRevision.lineGlobalId,
+            productGlobalId: refreshFixture.productGlobalId,
+            unitPriceMinor: 1250,
+            currency: 'USD',
+            packageProfileGlobalId: refreshFixture.packageProfileGlobalId,
+          }],
+        },
+      }))
+    assert.equal(locallyRescheduled.rowVersion, 3)
+
+    const changedProviderDelivery = '2026-09-03T18:00:00.321Z'
     const changedLineRevision = await seedProviderLineRevision(
       pool,
       refreshFixture,
@@ -1689,6 +1904,7 @@ async function verifyAcceptance(
         sourceCharacter: '8',
         order: 2,
         externalLineId: `${providerExternalLineId}-replacement`,
+        providerRequestedDeliveryAt: changedProviderDelivery,
       },
     )
     let lineConflict = null
@@ -1698,7 +1914,7 @@ async function verifyAcceptance(
         actorEmail,
         idempotencyKey: 'workbench-line-conflict-0003',
         candidateGlobalId: stableLineRevision.candidateGlobalId,
-        expectedRowVersion: 2,
+        expectedRowVersion: 3,
       })
     } catch (error) {
       lineConflict = error
@@ -1707,6 +1923,11 @@ async function verifyAcceptance(
     assert.equal(lineConflict?.status, 409)
     assert.equal(lineConflict?.details?.latestCandidateGlobalId,
       changedLineRevision.candidateGlobalId)
+    assert.deepEqual(plain(lineConflict?.details?.conflicts), [{
+      field: 'requestedDeliveryAt',
+      localValue: localRequestedDelivery,
+      providerValue: changedProviderDelivery,
+    }])
     assert.deepEqual(plain(lineConflict?.details?.lineConflicts), [{
       lineGlobalId: stableLineRevision.lineGlobalId,
       externalLineId: providerExternalLineId,
@@ -1722,7 +1943,9 @@ async function verifyAcceptance(
     }])
     const retainedLineDraft = await pool.query(
       `SELECT candidate.global_id AS candidate_global_id,
-              workbench.line_resolution_drafts
+              workbench.line_resolution_drafts,
+              workbench.requested_delivery_at_draft,
+              workbench.row_version::integer
        FROM operations_commerce_order_workbench workbench
        JOIN operations_commerce_order_candidates candidate
          ON candidate.organization_id = workbench.organization_id
@@ -1740,15 +1963,22 @@ async function verifyAcceptance(
       ],
       'a changed provider line identity must not silently discard its draft',
     )
+    assert.equal(
+      retainedLineDraft.rows[0].requested_delivery_at_draft.toISOString(),
+      localRequestedDelivery,
+      'a requested-delivery conflict must preserve the database draft',
+    )
+    assert.equal(retainedLineDraft.rows[0].row_version, 3)
     const reviewedLineRebase = plain(await persistence
       .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
         organizationId: refreshFixture.organization,
         actorEmail,
         idempotencyKey: 'workbench-line-review-0004',
         candidateGlobalId: stableLineRevision.candidateGlobalId,
-        expectedRowVersion: 2,
+        expectedRowVersion: 3,
         expectedLatestCandidateGlobalId:
           changedLineRevision.candidateGlobalId,
+        resolutions: { requestedDeliveryAt: 'local' },
         lineResolutions: {
           [stableLineRevision.lineGlobalId]: 'provider',
         },
@@ -1765,6 +1995,17 @@ async function verifyAcceptance(
       [refreshFixture.organization],
     )
     assert.deepEqual(reviewedLineDraft.rows[0].line_resolution_drafts, {})
+    const [reviewedLineOrder] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: refreshFixture.organization,
+        candidateGlobalId: changedLineRevision.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(
+      reviewedLineOrder.delivery.draftDeliveryAt,
+      localRequestedDelivery,
+      'the explicit local requested-delivery choice must survive rebase',
+    )
 
     const readyCandidateBefore = await candidateSnapshot(pool, readyFixture)
     const promotableInput = {
@@ -1782,9 +2023,25 @@ async function verifyAcceptance(
         country: 'US',
       },
     }
+    const promotableDraft = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres(promotableInput))
+    assert.equal(promotableDraft.promotionStatus, 'needs_info')
+    assert.equal(promotableDraft.canonicalOrderGlobalId, null)
+    assert.deepEqual(
+      await candidateSnapshot(pool, readyFixture),
+      readyCandidateBefore,
+      'Save must remain local even when every saved field is complete',
+    )
+    const interruptedAcceptInput = {
+      organizationId: readyFixture.organization,
+      actorEmail,
+      idempotencyKey: 'workbench-promotable-accept-crash-0002',
+      candidateGlobalId: readyFixture.candidateGlobalId,
+      expectedRowVersion: 1,
+    }
     await assert.rejects(
-      () => persistence.updateCommerceOrderWorkbenchShipToInPostgres({
-        ...promotableInput,
+      () => persistence.acceptCommerceOrderWorkbenchInPostgres({
+        ...interruptedAcceptInput,
         afterLocalSaveBeforeHandoff() {
           throw new Error('simulated workbench handoff interruption')
         },
@@ -1794,7 +2051,7 @@ async function verifyAcceptance(
     assert.deepEqual(
       await candidateSnapshot(pool, readyFixture),
       readyCandidateBefore,
-      'the durable local checkpoint commits before candidate handoff begins',
+      'the explicit Accept checkpoint commits before candidate handoff begins',
     )
     const interrupted = await pool.query(
       `SELECT receipt.status, receipt.result_payload,
@@ -1810,17 +2067,17 @@ async function verifyAcceptance(
       [
         readyFixture.organization,
         commandType,
-        promotableInput.idempotencyKey,
+        interruptedAcceptInput.idempotencyKey,
       ],
     )
     assert.equal(interrupted.rowCount, 1)
     assert.equal(interrupted.rows[0].status, 'processing')
-    assert.equal(interrupted.rows[0].row_version, 1)
+    assert.equal(interrupted.rows[0].row_version, 2)
     assert.equal(interrupted.rows[0].canonical_order_id, null)
     assert.equal(interrupted.rows[0].result_payload.readiness, 'carrier_ready')
 
     const promoted = plain(await persistence
-      .updateCommerceOrderWorkbenchShipToInPostgres(promotableInput))
+      .acceptCommerceOrderWorkbenchInPostgres(interruptedAcceptInput))
     assert.equal(promoted.promotionStatus, 'promoted')
     assert.match(promoted.canonicalOrderGlobalId, /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u)
     assert.deepEqual(promoted.remainingBlockerCodes, [])
@@ -1874,12 +2131,16 @@ async function verifyAcceptance(
       'a canonical-linked workbench row must not duplicate the canonical Orders row',
     )
     const promotedReplay = plain(await persistence
-      .updateCommerceOrderWorkbenchShipToInPostgres(promotableInput))
+      .acceptCommerceOrderWorkbenchInPostgres(interruptedAcceptInput))
     assert.equal(promotedReplay.replayed, true)
     assert.equal(
       promotedReplay.canonicalOrderGlobalId,
       promoted.canonicalOrderGlobalId,
     )
+    const savedReplay = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres(promotableInput))
+    assert.equal(savedReplay.replayed, true)
+    assert.equal(savedReplay.canonicalOrderGlobalId, null)
     const canonicalCountAfterReplay = await pool.query(
       `SELECT count(*)::integer AS count
        FROM operations_orders
@@ -1946,7 +2207,11 @@ async function verifyAcceptance(
       }))
     assert.equal(after.length, 1)
     assert.equal(after[0].rowVersion, 4)
-    assert.equal(after[0].needsInfo, true)
+    assert.equal(
+      after[0].needsInfo,
+      false,
+      'provider blocker summaries may be stale; UI eligibility uses saved facts',
+    )
     assert.equal(after[0].shipTo.readiness, 'carrier_ready')
     assert.equal(after[0].shipTo.provenance, 'local')
     assert.equal(after[0].shipTo.syncStatus, 'local_only')
@@ -2067,7 +2332,11 @@ async function verifyAcceptance(
     assert.equal(providerAfter.source_hash, providerBefore.source_hash)
     assert.equal(providerAfter.source_revision, providerBefore.source_revision)
     assert.equal(providerAfter.ship_to_snapshot_state, 'missing')
-    assert.ok(Number(providerAfter.row_version) > Number(providerBefore.row_version))
+    assert.equal(
+      providerAfter.row_version,
+      providerBefore.row_version,
+      'draft saves and refreshes must not mutate the accepted provider candidate',
+    )
     const finalCounts = await stateCounts(pool, primary)
     assert.equal(finalCounts.working_copies, 1)
     assert.equal(finalCounts.receipts, 6)
@@ -2223,6 +2492,7 @@ async function main() {
       ids('0009705'),
       ids('0009706'),
       ids('0009707'),
+      ids('0009708'),
     )
   } finally {
     spawnSync('docker', ['stop', '-t', '1', container], {

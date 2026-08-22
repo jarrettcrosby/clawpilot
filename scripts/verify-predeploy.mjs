@@ -2,8 +2,28 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 const root = process.cwd()
+
+const orderEditingReleaseMigrations = new Map([
+  [
+    'db/migrations/0307_operations_commerce_order_workbench.sql',
+    'b4dd10ac0d4c220730b682db3753710cfacb627090ebc30e4075b28e7265fe6c',
+  ],
+  [
+    'db/migrations/0308_operations_commerce_provider_write_controls.sql',
+    '86e39d6e19962894b94466a6fad367682093dc6271e0df92c9cade112ad075b6',
+  ],
+  [
+    'db/migrations/0310_operations_order_shipment_address_working_copy.sql',
+    '6ad6749c89effe427baef8bbdfe51d3a04e8be6bc2ce8922916e901c069b9d06',
+  ],
+  [
+    'db/migrations/0312_operations_shopify_order_single_save.sql',
+    'b0f591edc2dd10c6f9a8e88ef3291b9b8b1bd056fcafa159c2686d00cde44dcb',
+  ],
+])
 
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
@@ -38,6 +58,57 @@ if (!existsSync(resolve(root, 'package.json'))) {
 
 if (!existsSync(resolve(root, 'app_src/package.json'))) {
   fail('missing app_src/package.json')
+}
+
+for (const [relativePath, expectedChecksum] of orderEditingReleaseMigrations) {
+  if (!existsSync(resolve(root, relativePath))) {
+    fail(`missing order-editing release migration: ${relativePath}`)
+  }
+  const actualChecksum = createHash('sha256')
+    .update(readFileSync(resolve(root, relativePath)))
+    .digest('hex')
+  if (actualChecksum !== expectedChecksum) {
+    fail(
+      `order-editing release migration checksum drifted: ${relativePath}`,
+    )
+  }
+}
+
+const orderEditingHealthPath =
+  'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts'
+const orderEditingHealth = readFileSync(
+  resolve(root, orderEditingHealthPath),
+  'utf8',
+)
+for (const requiredFragment of [
+  ...orderEditingReleaseMigrations.values(),
+  'OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_COUNT = 55',
+  '72324e014c76e161ee66133f7980aa22620bf76914adc9bbc53a2bad3cf0f164',
+  'OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT = 74',
+  '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0',
+  'OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50',
+  'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf',
+  'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
+]) {
+  if (!orderEditingHealth.includes(requiredFragment)) {
+    fail(`order-editing release health is missing ${requiredFragment}`)
+  }
+}
+
+const healthRoute = readFileSync(
+  resolve(root, 'app_src/app/api/health/route.ts'),
+  'utf8',
+)
+for (const requiredFragment of [
+  "from '@/lib/persistence/operationsOrderEditingReleaseHealth'",
+  '${OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL}',
+  'AS operations_order_editing_release_applied',
+  '&& row?.operations_order_editing_release_applied',
+  '|| !row?.operations_order_editing_release_applied',
+]) {
+  if (!healthRoute.includes(requiredFragment)) {
+    fail(`runtime health is missing order-editing gate ${requiredFragment}`)
+  }
 }
 
 const rootPackage = readJson('package.json')
@@ -281,6 +352,10 @@ for (const requiredPath of [
   'db/migrations/0290_operations_shadow_training_runs.sql',
   'db/migrations/0300_operations_order_training_independent_control.sql',
   'db/migrations/0301_shipping_independent_one_off_items.sql',
+  'db/migrations/0307_operations_commerce_order_workbench.sql',
+  'db/migrations/0308_operations_commerce_provider_write_controls.sql',
+  'db/migrations/0310_operations_order_shipment_address_working_copy.sql',
+  'db/migrations/0312_operations_shopify_order_single_save.sql',
   'db/migrations/0313_shipping_one_off_documents_minimal_fields.sql',
   'db/migrations/0314_operations_local_work_independent_activation.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
@@ -329,6 +404,7 @@ for (const requiredPath of [
   'app_src/lib/operations/shopifyPackagingImport.ts',
   'app_src/lib/persistence/packagingMaterials.ts',
   'app_src/lib/persistence/operationsMeasuredPackagingEvidenceHealth.ts',
+  'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
   'app_src/app/api/operations/packaging-materials/import/route.ts',
   'scripts/test-operations-packaging-materials.mjs',
   'scripts/test-operations-packaging-materials-postgres.mjs',
@@ -351,6 +427,7 @@ for (const requiredPath of [
   'scripts/test-shopify-order-management-api.mjs',
   'scripts/test-shopify-order-management-ui.mjs',
   'scripts/test-shopify-order-management-health.mjs',
+  'scripts/test-operations-order-editing-release-health-postgres.mjs',
   'scripts/test-carrier-shipping-account-diagnostics.mjs',
   'scripts/test-carrier-shipping-diagnostic-actions.mjs',
   'scripts/test-carrier-shipping-diagnostic-health.mjs',

@@ -157,6 +157,8 @@ type LockedCandidateRow = {
   ship_to_snapshot_ciphertext: Buffer | null
   ship_to_snapshot_iv: Buffer | null
   ship_to_snapshot_tag: Buffer | null
+  provider_requested_delivery_at?: Date | null
+  requires_carrier_address: boolean
   live_for_new_draft: boolean
 }
 
@@ -484,8 +486,12 @@ function decryptAddress(input: {
   })
 }
 
+export type CommerceOrderWorkbenchRefreshField =
+  | OrderShipToField
+  | 'requestedDeliveryAt'
+
 export type CommerceOrderWorkbenchRefreshResolution = Partial<
-  Record<OrderShipToField, 'local' | 'provider'>
+  Record<CommerceOrderWorkbenchRefreshField, 'local' | 'provider'>
 >
 
 export function mergeCommerceOrderWorkbenchProviderAddress(input: {
@@ -538,6 +544,53 @@ export function mergeCommerceOrderWorkbenchProviderAddress(input: {
       merged[field] === local[field]
     )),
     conflicts,
+  }
+}
+
+function requestedDeliveryIso(value: Date | string | null | undefined) {
+  if (!value) return null
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    requestError(
+      'OPERATIONS_IMPORTED_ORDER_DELIVERY_INVALID',
+      'Requested delivery date is invalid',
+      500,
+    )
+  }
+  return date.toISOString()
+}
+
+export function mergeCommerceOrderWorkbenchRequestedDelivery(input: {
+  acceptedProvider: Date | string | null | undefined
+  local: Date | string | null | undefined
+  latestProvider: Date | string | null | undefined
+  resolution?: 'local' | 'provider' | null
+}) {
+  const acceptedProvider = requestedDeliveryIso(input.acceptedProvider)
+  const local = requestedDeliveryIso(input.local)
+  const latestProvider = requestedDeliveryIso(input.latestProvider)
+  const localChanged = local !== acceptedProvider
+  const providerChanged = latestProvider !== acceptedProvider
+  const requiresResolution = localChanged
+    && providerChanged
+    && local !== latestProvider
+  const conflict = requiresResolution && !input.resolution
+    ? {
+        field: 'requestedDeliveryAt' as const,
+        localValue: local,
+        providerValue: latestProvider,
+      }
+    : null
+  const merged = requiresResolution
+    ? input.resolution === 'provider' ? latestProvider : local
+    : localChanged ? local : latestProvider
+  return {
+    merged,
+    localChanged,
+    providerChanged,
+    requiresResolution,
+    preservedLocal: localChanged && merged === local,
+    conflict,
   }
 }
 
@@ -722,11 +775,11 @@ function mappedWorkingCopy(
       providerRequestedDeliveryAt:
         row.provider_requested_delivery_at?.toISOString() || null,
       selectedDeliveryAt: row.requested_delivery_at?.toISOString() || null,
-      draftDeliveryAt:
-        row.requested_delivery_at_draft?.toISOString()
-        || row.requested_delivery_at?.toISOString()
-        || row.provider_requested_delivery_at?.toISOString()
-        || null,
+      draftDeliveryAt: row.workbench_id
+        ? row.requested_delivery_at_draft?.toISOString() || null
+        : row.requested_delivery_at?.toISOString()
+          || row.provider_requested_delivery_at?.toISOString()
+          || null,
     },
     lines: (details?.lines || []).map((line) => {
       const draft = lineDrafts[line.global_id]
@@ -1579,7 +1632,7 @@ async function completeWorkbenchReceipt(input: {
   })
 }
 
-async function handoffCarrierReadyDraft(input: {
+async function handoffCompleteDraft(input: {
   organizationId: string
   actorEmail: string
   exactRequestHash: string
@@ -1677,21 +1730,24 @@ async function handoffCarrierReadyDraft(input: {
       },
     })
   }
-  const addressResult = await confirmCommerceCandidateAddressInPostgres({
-    runtime,
-    actorEmail: input.actorEmail,
-    idempotencyKey: `workbench:${saved.receipt.id}:confirm-address`,
-    candidateGlobalId: saved.result.candidateGlobalId,
-    candidateRowVersion: preflightRowVersion,
-    address: carrierAddress(saved.address),
-  }) as CandidateCommandResult
-  const confirmedRowVersion = Number(addressResult.rowVersion)
-  if (!Number.isSafeInteger(confirmedRowVersion)) {
-    requestError(
-      'OPERATIONS_IMPORTED_ORDER_HANDOFF_INVALID',
-      'The address confirmation result was invalid',
-      500,
-    )
+  let confirmedRowVersion = preflightRowVersion
+  if (saved.candidate.requires_carrier_address) {
+    const addressResult = await confirmCommerceCandidateAddressInPostgres({
+      runtime,
+      actorEmail: input.actorEmail,
+      idempotencyKey: `workbench:${saved.receipt.id}:confirm-address`,
+      candidateGlobalId: saved.result.candidateGlobalId,
+      candidateRowVersion: preflightRowVersion,
+      address: carrierAddress(saved.address),
+    }) as CandidateCommandResult
+    confirmedRowVersion = Number(addressResult.rowVersion)
+    if (!Number.isSafeInteger(confirmedRowVersion)) {
+      requestError(
+        'OPERATIONS_IMPORTED_ORDER_HANDOFF_INVALID',
+        'The address confirmation result was invalid',
+        500,
+      )
+    }
   }
   const validationResult = await validateCommerceCandidateInPostgres({
     runtime,
@@ -1841,6 +1897,19 @@ async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
          candidate.ship_to_snapshot_ciphertext,
          candidate.ship_to_snapshot_iv,
          candidate.ship_to_snapshot_tag,
+         (
+           candidate.requires_shipping
+           AND EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_candidate_lines shipping_line
+             WHERE shipping_line.organization_id = candidate.organization_id
+               AND shipping_line.integration_account_id
+                 = candidate.integration_account_id
+               AND shipping_line.order_candidate_id = candidate.id
+               AND shipping_line.unfulfilled_quantity > 0
+               AND shipping_line.requires_shipping
+           )
+         ) AS requires_carrier_address,
          (
            candidate.canonical_order_id IS NULL
            AND candidate.workflow_state IN ('held', 'resolving', 'ready')
@@ -2233,7 +2302,13 @@ async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
     }
   })
   if (!('receipt' in saved)) return saved
-  if (saved.result.readiness !== 'carrier_ready') {
+  if (
+    input.action === 'save'
+    || (
+      saved.candidate.requires_carrier_address
+      && saved.result.readiness !== 'carrier_ready'
+    )
+  ) {
     return completeWorkbenchReceipt({
       organizationId,
       actorEmail,
@@ -2242,7 +2317,7 @@ async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
     })
   }
   await input.afterLocalSaveBeforeHandoff?.()
-  return handoffCarrierReadyDraft({
+  return handoffCompleteDraft({
     organizationId,
     actorEmail,
     exactRequestHash,
@@ -2258,8 +2333,6 @@ export async function updateCommerceOrderWorkbenchShipToInPostgres(input: {
   expectedRowVersion: number
   changes: OrderShipToPatch
   resolutionDraft?: OperationsImportedOrderResolutionDraft
-  /** Test-only crash seam after the durable local checkpoint commits. */
-  afterLocalSaveBeforeHandoff?: () => void | Promise<void>
 }): Promise<OperationsImportedOrderShipToUpdateResult> {
   return saveOrAcceptCommerceOrderWorkbenchInPostgres({
     ...input,
@@ -2273,6 +2346,8 @@ export async function acceptCommerceOrderWorkbenchInPostgres(input: {
   idempotencyKey: string
   candidateGlobalId: string
   expectedRowVersion: number
+  /** Test-only crash seam after the durable local checkpoint commits. */
+  afterLocalSaveBeforeHandoff?: () => void | Promise<void>
 }): Promise<OperationsImportedOrderShipToUpdateResult> {
   return saveOrAcceptCommerceOrderWorkbenchInPostgres({
     ...input,
@@ -2493,7 +2568,10 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
   const resolutions = input.resolutions || {}
   for (const [field, resolution] of Object.entries(resolutions)) {
     if (
-      !ORDER_SHIP_TO_FIELDS.includes(field as OrderShipToField)
+      ![
+        ...ORDER_SHIP_TO_FIELDS,
+        'requestedDeliveryAt',
+      ].includes(field as CommerceOrderWorkbenchRefreshField)
       || !['local', 'provider'].includes(String(resolution || ''))
     ) {
       requestError(
@@ -2534,6 +2612,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               candidate.ship_to_snapshot_ciphertext,
               candidate.ship_to_snapshot_iv,
               candidate.ship_to_snapshot_tag,
+              candidate.provider_requested_delivery_at,
+              false AS requires_carrier_address,
               false AS live_for_new_draft
        FROM operations_commerce_order_candidates candidate
        JOIN operations_integration_accounts account
@@ -2567,6 +2647,7 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               accepted_provider_updated_at, ship_to_edit_state,
               ship_to_ciphertext, ship_to_iv, ship_to_tag,
               ship_to_source_hash, canonical_order_id::text,
+              requested_delivery_at_draft,
               line_resolution_drafts,
               last_command_receipt_id::text, last_request_hash,
               row_version::text
@@ -2593,6 +2674,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               candidate.ship_to_snapshot_ciphertext,
               candidate.ship_to_snapshot_iv,
               candidate.ship_to_snapshot_tag,
+              candidate.provider_requested_delivery_at,
+              false AS requires_carrier_address,
               true AS live_for_new_draft
        FROM operations_commerce_order_candidates candidate
        JOIN operations_commerce_intake_runs run
@@ -2752,6 +2835,12 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       latestProvider,
       resolutions,
     })
+    const deliveryMerge = mergeCommerceOrderWorkbenchRequestedDelivery({
+      acceptedProvider: accepted.provider_requested_delivery_at,
+      local: current.requested_delivery_at_draft,
+      latestProvider: latest.provider_requested_delivery_at,
+      resolution: resolutions.requestedDeliveryAt,
+    })
     const lineResult = await client.query<RefreshCandidateLineRow>(
       `SELECT line.order_candidate_id::text AS candidate_id,
               line.global_id, line.external_line_id,
@@ -2778,21 +2867,27 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       localDrafts: current.line_resolution_drafts,
       resolutions: lineResolutions,
     })
-    if (merge.conflicts.length || lineMerge.conflicts.length) {
+    const conflicts = [
+      ...merge.conflicts,
+      ...(deliveryMerge.conflict ? [deliveryMerge.conflict] : []),
+    ]
+    if (conflicts.length || lineMerge.conflicts.length) {
       requestError(
         'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
         'Review each local value that changed in the refreshed provider order',
         409,
         {
           latestCandidateGlobalId: latest.global_id,
-          conflicts: merge.conflicts,
+          conflicts,
           lineConflicts: lineMerge.conflicts,
           providerWrites: 0,
         },
       )
     }
     const unexpectedResolutions = Object.keys(resolutions).filter((field) => (
-      !merge.providerChangedFields.includes(field as OrderShipToField)
+      field === 'requestedDeliveryAt'
+        ? !deliveryMerge.requiresResolution
+        : !merge.providerChangedFields.includes(field as OrderShipToField)
     ))
     if (unexpectedResolutions.length) {
       requestError(
@@ -2824,6 +2919,10 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
       latestProvider,
       merge.merged,
     ).length > 0
+    const retainsLocalDraft = retainsLocalAddress
+      || deliveryMerge.merged !== requestedDeliveryIso(
+        latest.provider_requested_delivery_at,
+      )
     const encrypted = retainsLocalAddress
       ? encryptCommerceCandidateSnapshot(
           orderShipToStorageValue(merge.merged),
@@ -2847,18 +2946,19 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
            ship_to_source_hash = $12,
            ship_to_encryption_version = $13,
            line_resolution_drafts = $14::jsonb,
-           sync_state = $15,
-           last_command_receipt_id = $16::uuid,
-           last_idempotency_key = $17,
-           last_request_hash = $18,
+           requested_delivery_at_draft = $15::timestamptz,
+           sync_state = $16,
+           last_command_receipt_id = $17::uuid,
+           last_idempotency_key = $18,
+           last_request_hash = $19,
            row_version = row_version + 1,
-           updated_by = $19,
+           updated_by = $20,
            updated_at = now()
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
          AND external_order_id = $3
-         AND candidate_id = $20::uuid
-         AND row_version = $21::bigint
+         AND candidate_id = $21::uuid
+         AND row_version = $22::bigint
        RETURNING row_version::text`,
       [
         organizationId,
@@ -2875,7 +2975,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         retainsLocalAddress ? latest.source_hash : null,
         encrypted?.encryptionVersion || null,
         JSON.stringify(lineMerge.drafts),
-        retainsLocalAddress ? 'local_only' : 'provider_snapshot',
+        deliveryMerge.merged,
+        retainsLocalDraft ? 'local_only' : 'provider_snapshot',
         prepared.receipt.id,
         input.idempotencyKey,
         exactRequestHash,
@@ -2925,6 +3026,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         providerChangedFields: result.providerChangedFields,
         preservedLocalFields: result.preservedLocalFields,
         preservedLineDrafts: result.preservedLineDrafts,
+        providerRequestedDeliveryChanged: deliveryMerge.providerChanged,
+        preservedLocalRequestedDelivery: deliveryMerge.preservedLocal,
         providerWrites: 0,
         providerWriteIntentCreated: false,
         commandReceiptId: prepared.receipt.id,
