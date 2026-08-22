@@ -2963,6 +2963,38 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Canonical planning acceptance reads sealed address evidence only',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not edit shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -2985,6 +3017,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3266,8 +3301,12 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
+          '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
+          '@/lib/persistence/commerceOrderWorkbench': {
+            readCommerceOrderWorkbenchFromPostgres: async () => [],
+          },
           '@/lib/persistence/commerceOrderRevisions': {
             async assertCommerceOrderRevisionExecutionCurrent() {},
             CommerceOrderRevisionGateError: class extends Error {},
@@ -3312,6 +3351,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
             assertNoOpenOperationsShadowTrainingRunsForActivation:
               async () => {},
           },
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/sandboxCommerceE2eAuthorization': {
             requireActiveSandboxCommerceE2eAuthorization: async () => {
               throw new Error(
