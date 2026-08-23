@@ -4,6 +4,7 @@ const REPOSITORY = 'jarrettcrosby/clawpilot'
 const SHA256 = /^[0-9a-f]{64}$/
 const COMMIT = /^[0-9a-f]{40}$/
 const MAX_INDEX_BYTES = 128 * 1024
+const MAX_GITHUB_ASSET_REDIRECT_LIFETIME_MS = 60 * 60_000
 const TOP_LEVEL_FIELDS = [
   'artifacts',
   'customerReleaseReady',
@@ -379,7 +380,9 @@ export function validateGitHubAssetRedirect(location, nowMs = Date.now()) {
       }
     }
   }
-  if (!Number.isFinite(expiresAt) || expiresAt <= nowMs || expiresAt > nowMs + 10 * 60_000) {
+  if (!Number.isFinite(expiresAt)
+    || expiresAt <= nowMs
+    || expiresAt > nowMs + MAX_GITHUB_ASSET_REDIRECT_LIFETIME_MS) {
     fail('PRINT_AGENT_RELEASE_REDIRECT_INVALID', 'GitHub asset redirect is expired or not short-lived')
   }
   return location
