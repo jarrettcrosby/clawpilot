@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.0-preview.3",
+  "platform": "macos",
+  "architecture": "node-runtime-portable",
+  "artifactHref": "/downloads/ClawPilot-Print-Agent-macOS.zip",
+  "filename": "ClawPilot-Print-Agent-macOS.zip",
+  "byteLength": 95955,
+  "sha256": "f58ba2fdf7ca8de3efd0cce3d995c3cbc529d5c19b5a18e6d2cbea0381c47c6b",
+  "checksumHref": "/downloads/ClawPilot-Print-Agent-macOS.zip.sha256",
+  "credentialEmbedded": false,
+  "releaseChannel": "developer-preview",
+  "distributionAudience": "developers-only",
+  "customerReleaseReady": false,
+  "signed": false,
+  "notarized": false,
+  "requiresDeveloperIdSigning": true,
+  "requiresAppleNotarization": true,
+  "nodeMinimumMajor": 20,
+  "nodeRuntimeBundled": false,
+  "deliveryBackend": "raw-network-zpl"
+}

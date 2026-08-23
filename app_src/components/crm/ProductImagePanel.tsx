@@ -51,6 +51,22 @@ type ProductImageAsset = {
 
 type ProductImageState = {
   imageImportAvailable: boolean
+  storeSync: Array<{
+    accountGlobalId: string
+    effectiveState: 'running' | 'paused'
+    effectiveReason:
+      | 'OPERATIONS_DISABLED_OVERRIDE'
+      | 'OPERATIONS_FROZEN_OVERRIDE'
+      | 'STORE_SYNC_CONTROL_MISSING'
+      | 'STORE_SYNC_ACCOUNT_UNAVAILABLE'
+      | 'STORE_SYNC_EXPLICIT_RUNNING'
+      | 'STORE_SYNC_EXPLICIT_PAUSED_DRAINING'
+      | 'STORE_SYNC_EXPLICIT_PAUSED'
+      | 'STORE_SYNC_LEGACY_SHADOW_RUNNING'
+      | 'STORE_SYNC_LEGACY_ACTIVE_RUNNING'
+      | 'STORE_SYNC_LEGACY_READ_ONLY_PAUSED'
+    effectiveReasonLabel: string
+  }>
   product: {
     id: string
     referenceCode: string
@@ -236,6 +252,16 @@ const MAX_ALT_TEXT_LENGTH = 500
 const EFFECT_GLOBAL_ID = /^gcef(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_REFERENCE = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const CHANNEL_GLOBAL_ID = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
+const MANUAL_FAIRE_READ_ALLOWED_REASONS = new Set<ProductImageState[
+  'storeSync'
+][number]['effectiveReason']>([
+  'STORE_SYNC_EXPLICIT_RUNNING',
+  'STORE_SYNC_EXPLICIT_PAUSED_DRAINING',
+  'STORE_SYNC_EXPLICIT_PAUSED',
+  'STORE_SYNC_LEGACY_SHADOW_RUNNING',
+  'STORE_SYNC_LEGACY_ACTIVE_RUNNING',
+  'STORE_SYNC_LEGACY_READ_ONLY_PAUSED',
+])
 const RECOVERY_OUTCOMES = new Set([
   'succeeded',
   'failed',
@@ -268,9 +294,11 @@ function assetState(payload: ProductImagePayload): ProductImageState | null {
     typeof payload.imageImportAvailable !== 'boolean'
     || !payload.product
     || !Array.isArray(payload.assets)
+    || !Array.isArray(payload.storeSync)
   ) return null
   return {
     imageImportAvailable: payload.imageImportAvailable,
+    storeSync: payload.storeSync,
     product: payload.product,
     assets: payload.assets,
   }
@@ -396,6 +424,10 @@ export default function ProductImagePanel({
 }) {
   const fileInput = useRef<HTMLInputElement | null>(null)
   const faireRecoveryLoadGeneration = useRef(0)
+  const pendingFaireRefresh = useRef<{
+    fingerprint: string
+    idempotencyKey: string
+  } | null>(null)
   const [state, setState] = useState<ProductImageState | null>(null)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [altText, setAltText] = useState('')
@@ -594,6 +626,22 @@ export default function ProductImagePanel({
   const selectedFaireChannelEvidence = faireChannels.find(
     (channel) => channel.globalId === selectedFaireChannel,
   ) || null
+  const selectedFaireStoreSync = state?.storeSync.find(
+    (control) => control.accountGlobalId
+      === selectedFaireChannelEvidence?.integrationAccountGlobalId,
+  ) || null
+  const selectedFaireStoreSyncRunning =
+    selectedFaireStoreSync?.effectiveState === 'running'
+  const selectedFaireManualReadAllowed = Boolean(
+    selectedFaireStoreSync
+    && MANUAL_FAIRE_READ_ALLOWED_REASONS.has(
+      selectedFaireStoreSync.effectiveReason,
+    ),
+  )
+  const selectedFaireStoreSyncNormallyPaused = Boolean(
+    selectedFaireManualReadAllowed
+    && !selectedFaireStoreSyncRunning,
+  )
   const selectedFaireAssetEvidence = state?.assets.find(
     (asset) => asset.id === selectedFaireAsset,
   ) || null
@@ -913,6 +961,13 @@ export default function ProductImagePanel({
       )
       return
     }
+    if (!selectedFaireManualReadAllowed) {
+      setError(
+        selectedFaireStoreSync?.effectiveReasonLabel
+          || 'The selected Faire connection is unavailable for an explicit provider read.',
+      )
+      return
+    }
     const channel = selectedFaireChannelEvidence
     if (!channel || !state?.product) {
       setError('Refresh and choose one exact mapped Faire listing.')
@@ -926,6 +981,28 @@ export default function ProductImagePanel({
     setError('')
     setNotice('')
     try {
+      const command = {
+        action: 'refresh-faire-product-images' as const,
+        channelStateGlobalId: channel.globalId,
+        expectedProductReferenceCode: state.product.referenceCode,
+        expectedIntegrationAccountGlobalId:
+          channel.integrationAccountGlobalId,
+        expectedChannelStateRowVersion: channel.rowVersion,
+        expectedChannelSourceRevision: channel.sourceRevision,
+        expectedExternalProductId: channel.externalProductId,
+        expectedExternalVariantId: channel.externalVariantId,
+        expectedProviderSku: channel.providerSku,
+        confirmReadOnlyProviderRequest: true as const,
+      }
+      const fingerprint = JSON.stringify(command)
+      if (pendingFaireRefresh.current?.fingerprint !== fingerprint) {
+        pendingFaireRefresh.current = {
+          fingerprint,
+          idempotencyKey:
+            `faire-product-image-refresh:${globalThis.crypto.randomUUID()}`,
+        }
+      }
+      const idempotencyKey = pendingFaireRefresh.current.idempotencyKey
       const response = await fetch(
         `/api/crm/products/${encodeURIComponent(productId)}/faire-product-images`,
         {
@@ -935,29 +1012,21 @@ export default function ProductImagePanel({
             Accept: 'application/json',
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            action: 'refresh-faire-product-images',
-            channelStateGlobalId: channel.globalId,
-            expectedProductReferenceCode: state.product.referenceCode,
-            expectedIntegrationAccountGlobalId:
-              channel.integrationAccountGlobalId,
-            expectedChannelStateRowVersion: channel.rowVersion,
-            expectedChannelSourceRevision: channel.sourceRevision,
-            expectedExternalProductId: channel.externalProductId,
-            expectedExternalVariantId: channel.externalVariantId,
-            expectedProviderSku: channel.providerSku,
-            confirmReadOnlyProviderRequest: true,
-          }),
+          body: JSON.stringify({ ...command, idempotencyKey }),
         },
       )
       const payload = (
         await response.json().catch(() => ({}))
       ) as FaireProductImageRefreshPayload
       if (!response.ok || payload.ok !== true || !payload.refresh) {
+        if (response.status >= 400 && response.status < 500) {
+          pendingFaireRefresh.current = null
+        }
         throw new Error(
           payload.error || 'Faire Product images were not refreshed',
         )
       }
+      pendingFaireRefresh.current = null
       const queued = Number(payload.refresh.jobs.queued || 0)
       const succeeded = Number(payload.refresh.jobs.succeeded || 0)
       await load()
@@ -1450,6 +1519,28 @@ export default function ProductImagePanel({
               </Alert>
             ) : null}
 
+            {selectedFaireChannelEvidence
+            && selectedFaireStoreSyncNormallyPaused ? (
+              <Alert severity="info">
+                {selectedFaireStoreSync?.effectiveReasonLabel}
+                {' '}Automatic Store sync remains paused, while this explicit
+                owner or administrator refresh remains available. It performs
+                only the bounded read-only requests shown above and makes zero
+                Faire writes.
+              </Alert>
+            ) : null}
+
+            {selectedFaireChannelEvidence
+            && !selectedFaireManualReadAllowed ? (
+              <Alert severity="warning">
+                {selectedFaireStoreSync?.effectiveReasonLabel
+                  || 'This Faire connection is unavailable.'}
+                {' '}Existing mirrored images remain available, but this exact
+                provider read is blocked until the emergency override or
+                connection issue is resolved.
+              </Alert>
+            ) : null}
+
             <TextField
               select
               fullWidth
@@ -1490,6 +1581,7 @@ export default function ProductImagePanel({
               disabled={
                 refreshingFaire
                 || state?.imageImportAvailable !== true
+                || !selectedFaireManualReadAllowed
                 || !selectedFaireChannelEvidence
                 || !selectedFaireChannelEvidence.providerSku
               }

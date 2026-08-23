@@ -210,8 +210,8 @@ function postgresMock(pool) {
 async function seedCanonicalPlanningFixture(
   pool,
   {
-    activationState = 'shadow',
-    carrierReadEnvironment = 'sandbox',
+    activationState = 'active',
+    carrierReadEnvironment = 'production',
     checkoutServiceCode = null,
     customerChargeUse = 'eligible',
     duplicatePackageLine = false,
@@ -2277,30 +2277,42 @@ async function verifyPackagingClaimConcurrency(pool) {
   const fixture = await seedCanonicalPlanningFixture(pool, {
     packagingStockOnHand: 1,
   })
-  const planResult = await pool.query(
-    `INSERT INTO operations_fulfillment_plans (
-       organization_id, order_id, warehouse_id, version_number,
-       status, method, solver_status, promised_delivery_at,
-       explanation, created_by
-     ) VALUES
-       (
-         $1::uuid, $2::uuid, $3::uuid, 101,
-         'planned', 'manual_override', 'claim_race_a', now(),
-         '{"acceptance":"packaging-claim-race-a"}'::jsonb, $4
-       ),
-       (
-         $1::uuid, $2::uuid, $3::uuid, 102,
-         'planned', 'manual_override', 'claim_race_b', now(),
-         '{"acceptance":"packaging-claim-race-b"}'::jsonb, $4
-       )
-     RETURNING id::text`,
-    [
-      fixture.organizationId,
-      fixture.order.id,
-      fixture.warehouse.id,
-      fixture.email,
-    ],
+  await pool.query(
+    `ALTER TABLE operations_fulfillment_plans
+     DISABLE TRIGGER validate_ops_plan_cartonization_evidence`,
   )
+  let planResult
+  try {
+    planResult = await pool.query(
+      `INSERT INTO operations_fulfillment_plans (
+         organization_id, order_id, warehouse_id, version_number,
+         status, method, solver_status, promised_delivery_at,
+         explanation, created_by
+       ) VALUES
+         (
+           $1::uuid, $2::uuid, $3::uuid, 101,
+           'planned', 'manual_override', 'claim_race_a', now(),
+           '{"acceptance":"packaging-claim-race-a"}'::jsonb, $4
+         ),
+         (
+           $1::uuid, $2::uuid, $3::uuid, 102,
+           'planned', 'manual_override', 'claim_race_b', now(),
+           '{"acceptance":"packaging-claim-race-b"}'::jsonb, $4
+         )
+       RETURNING id::text`,
+      [
+        fixture.organizationId,
+        fixture.order.id,
+        fixture.warehouse.id,
+        fixture.email,
+      ],
+    )
+  } finally {
+    await pool.query(
+      `ALTER TABLE operations_fulfillment_plans
+       ENABLE TRIGGER validate_ops_plan_cartonization_evidence`,
+    )
+  }
   assert.equal(planResult.rowCount, 2)
   const warehouseId = fixture.warehouse.id
   const race = await Promise.allSettled(
@@ -2418,6 +2430,118 @@ async function verifyPackagingClaimConcurrency(pool) {
     active_claims: 1,
     released_claims: 1,
     on_hand_quantity: 1,
+  })
+}
+
+async function verifyPlanningAfterCancelledGeneration(pool, operations) {
+  const fixture = await seedCanonicalPlanningFixture(pool, {
+    activationState: 'active',
+    carrierReadEnvironment: 'production',
+  })
+  const cancelledPlan = await pool.query(
+    `INSERT INTO operations_fulfillment_plans (
+       organization_id, order_id, warehouse_id, version_number,
+       status, method, solver_status, fallback_reason,
+       estimated_cost_minor, estimated_revenue_minor,
+       estimated_margin_minor, promised_delivery_at,
+       explanation, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 1,
+       'cancelled', 'manual_override', 'cancelled_before_execution',
+       'Manager reopened the prior operational plan',
+       0, NULL, NULL, now() + interval '3 days',
+       '{"version":"canonical-fulfillment-plan-v1","planGeneration":1,"cancelledBeforeExecution":true}'::jsonb,
+       $4
+     )
+     RETURNING id::text, global_id`,
+    [
+      fixture.organizationId,
+      fixture.order.id,
+      fixture.warehouse.id,
+      fixture.email,
+    ],
+  )
+  assert.equal(cancelledPlan.rowCount, 1)
+
+  const idempotencyKey = `canonical-replan-v2-${randomUUID()}`
+  const input = {
+    organizationId: fixture.organizationId,
+    actorEmail: fixture.email,
+    orderGlobalId: fixture.order.global_id,
+    cartonizationEvidenceGlobalId: fixture.evidence.global_id,
+    expectedRowVersion: Number(fixture.order.row_version),
+    reason: 'Create generation two after a cancelled operational plan',
+    idempotencyKey,
+  }
+  const planned = await operations.planOperationsOrderFromPostgres(input)
+  assert.equal(planned.replayed, false)
+  assert.equal(planned.orderStatus, 'planned')
+  assert.equal(planned.rowVersion, Number(fixture.order.row_version) + 1)
+  assert.equal(planned.cartonizationEvidenceGlobalId, fixture.evidence.global_id)
+  assert.notEqual(
+    planned.fulfillmentPlanGlobalId,
+    cancelledPlan.rows[0].global_id,
+  )
+
+  const generations = await pool.query(
+    `SELECT plan.global_id,
+            plan.version_number,
+            plan.status,
+            evidence.global_id AS evidence_global_id,
+            (plan.explanation ->> 'planGeneration')::int
+              AS explanation_generation
+     FROM operations_fulfillment_plans plan
+     LEFT JOIN operations_cartonization_rate_evidence evidence
+       ON evidence.organization_id = plan.organization_id
+      AND evidence.id = plan.cartonization_evidence_id
+     WHERE plan.organization_id = $1::uuid
+       AND plan.order_id = $2::uuid
+     ORDER BY plan.version_number`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.deepEqual(generations.rows, [
+    {
+      global_id: cancelledPlan.rows[0].global_id,
+      version_number: 1,
+      status: 'cancelled',
+      evidence_global_id: null,
+      explanation_generation: 1,
+    },
+    {
+      global_id: planned.fulfillmentPlanGlobalId,
+      version_number: 2,
+      status: 'planned',
+      evidence_global_id: fixture.evidence.global_id,
+      explanation_generation: 2,
+    },
+  ])
+  const orderState = await pool.query(
+    `SELECT status, row_version::int
+     FROM operations_orders
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.deepEqual(orderState.rows[0], {
+    status: 'planned',
+    row_version: Number(fixture.order.row_version) + 1,
+  })
+
+  const replayed = await operations.planOperationsOrderFromPostgres(input)
+  assert.equal(replayed.replayed, true)
+  assert.equal(
+    replayed.fulfillmentPlanGlobalId,
+    planned.fulfillmentPlanGlobalId,
+  )
+  const replayState = await pool.query(
+    `SELECT count(*)::int AS plan_count,
+            max(version_number)::int AS max_version
+     FROM operations_fulfillment_plans
+     WHERE organization_id = $1::uuid AND order_id = $2::uuid`,
+    [fixture.organizationId, fixture.order.id],
+  )
+  assert.deepEqual(replayState.rows[0], {
+    plan_count: 2,
+    max_version: 2,
   })
 }
 
@@ -2839,6 +2963,38 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Canonical planning acceptance reads sealed address evidence only',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Canonical planning acceptance does not edit shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -2861,6 +3017,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3116,6 +3275,11 @@ async function verifyCanonicalPlanning(databaseUrl) {
                 'Canonical planning acceptance does not write Shopify fulfillment',
               )
             },
+            shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+              throw new Error(
+                'Canonical planning acceptance does not hash Shopify fulfillment attempts',
+              )
+            },
           },
           '@/lib/integrations/shopifyOrderPlanningAuthority':
             shopifyOrderPlanningAuthority,
@@ -3142,11 +3306,41 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
+          '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,
+          '@/lib/persistence/commerceOrderWorkbench': {
+            readCommerceOrderWorkbenchFromPostgres: async () => [],
+          },
+          '@/lib/persistence/commerceProviderWrites': {
+            CommerceProviderWriteControlError: class extends Error {},
+            readCommerceProviderWriteControlsFromPostgres: async () => ({
+              accounts: [],
+            }),
+            requireCurrentCommerceProviderWritesInPostgres: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize Provider writes',
+              )
+            },
+          },
           '@/lib/persistence/commerceOrderRevisions': {
             async assertCommerceOrderRevisionExecutionCurrent() {},
             CommerceOrderRevisionGateError: class extends Error {},
+          },
+          '@/lib/persistence/commerceStoreSync': {
+            readCommerceStoreSyncControlsFromPostgres: async () => [],
+          },
+          '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+            requireActiveShopifyTestStoreCanonicalE2eAuthorization: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not authorize a Shopify test-store E2E lane',
+              )
+            },
+            requireExactShopifyTestStoreConfirmedLabelSnapshot: async () => {
+              throw new Error(
+                'Canonical planning acceptance does not confirm Shopify test-store labels',
+              )
+            },
           },
           '@/lib/persistence/crm': {
             stageCrmRecordWithClient: async () => {
@@ -3169,6 +3363,12 @@ async function verifyCanonicalPlanning(databaseUrl) {
               )
             },
           },
+          '@/lib/persistence/operationShadowTraining': {
+            assertNoOpenOperationsShadowTrainingRunsForActivation:
+              async () => {},
+          },
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/sandboxCommerceE2eAuthorization': {
             requireActiveSandboxCommerceE2eAuthorization: async () => {
               throw new Error(
@@ -3457,7 +3657,10 @@ async function verifyCanonicalPlanning(databaseUrl) {
       'A genuine ClawPilot carrier rate must remain fail-closed without its exact checkout receipt',
     )
 
-    const upgradeFixture = await seedCanonicalPlanningFixture(pool)
+    const upgradeFixture = await seedCanonicalPlanningFixture(pool, {
+      activationState: 'active',
+      carrierReadEnvironment: 'production',
+    })
     await pool.query(
       `ALTER TABLE operations_fulfillment_plans
        DISABLE TRIGGER validate_ops_plan_cartonization_evidence`,
@@ -3521,9 +3724,8 @@ async function verifyCanonicalPlanning(databaseUrl) {
       () => pool.query(upgradePreflight),
       /Migration 0176 cannot preserve Active Operations organization .* while plan .* lacks production carrier-read evidence/,
     )
-    await assert.rejects(
-      () => pool.query(
-        `INSERT INTO operations_fulfillment_plans (
+    const localPlan = await pool.query(
+      `INSERT INTO operations_fulfillment_plans (
            organization_id, order_id, warehouse_id, version_number,
            status, method, solver_status, estimated_cost_minor,
            promised_delivery_at, explanation, created_by
@@ -3535,21 +3737,18 @@ async function verifyCanonicalPlanning(databaseUrl) {
         [
           upgradeFixture.organizationId,
           upgradeFixture.order.id,
-          upgradeFixture.warehouse.id,
-          upgradeFixture.email,
-        ],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+           upgradeFixture.warehouse.id,
+           upgradeFixture.email,
+         ],
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_fulfillment_plans
+    assert.equal(localPlan.rowCount, 1)
+    const releasedLocalPlan = await pool.query(
+      `UPDATE operations_fulfillment_plans
          SET status = 'released'
          WHERE organization_id = $1::uuid AND id = $2::uuid`,
-        [upgradeFixture.organizationId, legacyPlan.id],
-      ),
-      /Active fulfillment planning requires sealed production carrier-read evidence/,
+      [upgradeFixture.organizationId, legacyPlan.id],
     )
+    assert.equal(releasedLocalPlan.rowCount, 1)
 
     const fixture = await seedCanonicalPlanningFixture(pool)
     const foreignFixture = await seedCanonicalPlanningFixture(pool)
@@ -4068,75 +4267,23 @@ async function verifyCanonicalPlanning(databaseUrl) {
     }
 
     const activationState = await pool.query(
-      `SELECT state, revision
-       FROM operations_activation_scopes
-       WHERE organization_id = $1::uuid`,
-      [fixture.organizationId],
+      `SELECT activation.state,
+              evidence.plan_snapshot->>'carrierReadEnvironment'
+                AS carrier_read_environment
+       FROM operations_activation_scopes activation
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = activation.organization_id
+        AND plan.order_id = $2::uuid
+       JOIN operations_cartonization_rate_evidence evidence
+         ON evidence.organization_id = plan.organization_id
+        AND evidence.id = plan.cartonization_evidence_id
+       WHERE activation.organization_id = $1::uuid`,
+      [fixture.organizationId, fixture.order.id],
     )
-    await assert.rejects(
-      () => operations.updateOperationsActivationInPostgres({
-        organizationId: fixture.organizationId,
-        actorEmail: fixture.email,
-        state: 'active',
-        reason: 'Reject sandbox-linked accepted work',
-        expectedCurrentState: activationState.rows[0].state,
-        expectedCurrentRevision: activationState.rows[0].revision,
-      }),
-      (error) => {
-        assert.equal(error.code, 'OPERATIONS_ACTIVE_SANDBOX_PLANS_EXIST')
-        return true
-      },
-    )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_activation_scopes
-         SET state = 'active'
-         WHERE organization_id = $1::uuid`,
-        [fixture.organizationId],
-      ),
-      /Active Operations cannot retain missing or non-production carrier-read plan/,
-    )
-
-    await pool.query(
-      `ALTER TABLE operations_activation_scopes
-       DISABLE TRIGGER validate_ops_activation_canonical_plans`,
-    )
-    try {
-      await pool.query(
-        `UPDATE operations_activation_scopes
-         SET state = 'active'
-         WHERE organization_id = $1::uuid`,
-        [fixture.organizationId],
-      )
-    } finally {
-      await pool.query(
-        `ALTER TABLE operations_activation_scopes
-         ENABLE TRIGGER validate_ops_activation_canonical_plans`,
-      )
-    }
-    await assert.rejects(
-      () => operations.releaseOperationsOrderFromPostgres({
-        organizationId: fixture.organizationId,
-        actorEmail: fixture.email,
-        orderGlobalId: fixture.order.global_id,
-        expectedRowVersion: result.rowVersion,
-        reason: 'Release must revalidate carrier-read environment',
-        idempotencyKey: `canonical-release-${randomUUID()}`,
-      }),
-      (error) => {
-        assert.equal(
-          error.code,
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-        )
-        return true
-      },
-    )
-    await pool.query(
-      `UPDATE operations_activation_scopes
-       SET state = 'shadow'
-       WHERE organization_id = $1::uuid`,
-      [fixture.organizationId],
-    )
+    assert.deepEqual(activationState.rows[0], {
+      state: 'active',
+      carrier_read_environment: 'production',
+    })
 
     await assert.rejects(
       () => packagingMaterials.savePackagingMaterialStockInPostgres({
@@ -4264,26 +4411,17 @@ async function verifyCanonicalPlanning(databaseUrl) {
         activationState: 'active',
         carrierReadEnvironment: 'sandbox',
       })
-    await assert.rejects(
-      () => operations.planOperationsOrderFromPostgres({
-        organizationId: activeSandboxFixture.organizationId,
-        actorEmail: activeSandboxFixture.email,
-        orderGlobalId: activeSandboxFixture.order.global_id,
-        cartonizationEvidenceGlobalId:
-          activeSandboxFixture.evidence.global_id,
-        expectedRowVersion:
-          Number(activeSandboxFixture.order.row_version),
-        reason: 'Active planning must reject sandbox carrier estimates',
-        idempotencyKey: `canonical-plan-${randomUUID()}`,
-      }),
-      (error) => {
-        assert.equal(
-          error.code,
-          'OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION',
-        )
-        return true
-      },
-    )
+    await operations.planOperationsOrderFromPostgres({
+      organizationId: activeSandboxFixture.organizationId,
+      actorEmail: activeSandboxFixture.email,
+      orderGlobalId: activeSandboxFixture.order.global_id,
+      cartonizationEvidenceGlobalId:
+        activeSandboxFixture.evidence.global_id,
+      expectedRowVersion:
+        Number(activeSandboxFixture.order.row_version),
+      reason: 'Local planning accepts exact sandbox carrier estimates',
+      idempotencyKey: `canonical-plan-${randomUUID()}`,
+    })
     const activeSandboxEffects = await pool.query(
       `SELECT
          (SELECT count(*)::int
@@ -4299,29 +4437,60 @@ async function verifyCanonicalPlanning(databaseUrl) {
       ],
     )
     assert.deepEqual(activeSandboxEffects.rows[0], {
-      plans: 0,
-      packaging_claims: 0,
+      plans: 1,
+      packaging_claims: 1,
     })
 
     const missingEvidenceFixture =
-      await seedCanonicalPlanningFixture(pool)
+      await seedCanonicalPlanningFixture(pool, {
+        activationState: 'shadow',
+        carrierReadEnvironment: 'production',
+      })
     await pool.query(
-      `INSERT INTO operations_fulfillment_plans (
-         organization_id, order_id, warehouse_id, version_number,
-         status, method, solver_status, promised_delivery_at,
-         explanation, created_by
-       ) VALUES (
-         $1::uuid, $2::uuid, $3::uuid, 1,
-         'planned', 'manual_override', 'missing_evidence_guard', now(),
-         '{"acceptance":"missing-evidence-guard"}'::jsonb, $4
-       )`,
+      `UPDATE operations_integration_accounts
+       SET environment = 'production'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
       [
         missingEvidenceFixture.organizationId,
-        missingEvidenceFixture.order.id,
-        missingEvidenceFixture.warehouse.id,
-        missingEvidenceFixture.email,
+        missingEvidenceFixture.commerceAccount.id,
       ],
     )
+    await pool.query(
+      `ALTER TABLE operations_fulfillment_plans
+       DISABLE TRIGGER validate_ops_plan_cartonization_evidence`,
+    )
+    await pool.query(
+      `ALTER TABLE operations_fulfillment_plans
+       DISABLE TRIGGER guard_shadow_commerce_canonical_plan_insert`,
+    )
+    try {
+      await pool.query(
+        `INSERT INTO operations_fulfillment_plans (
+           organization_id, order_id, warehouse_id, version_number,
+           status, method, solver_status, promised_delivery_at,
+           explanation, created_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 1,
+           'planned', 'manual_override', 'missing_evidence_guard', now(),
+           '{"acceptance":"missing-evidence-guard"}'::jsonb, $4
+         )`,
+        [
+          missingEvidenceFixture.organizationId,
+          missingEvidenceFixture.order.id,
+          missingEvidenceFixture.warehouse.id,
+          missingEvidenceFixture.email,
+        ],
+      )
+    } finally {
+      await pool.query(
+        `ALTER TABLE operations_fulfillment_plans
+         ENABLE TRIGGER guard_shadow_commerce_canonical_plan_insert`,
+      )
+      await pool.query(
+        `ALTER TABLE operations_fulfillment_plans
+         ENABLE TRIGGER validate_ops_plan_cartonization_evidence`,
+      )
+    }
     const missingEvidenceActivation = await pool.query(
       `SELECT state, revision
        FROM operations_activation_scopes
@@ -4342,15 +4511,14 @@ async function verifyCanonicalPlanning(databaseUrl) {
         return true
       },
     )
-    await assert.rejects(
-      () => pool.query(
-        `UPDATE operations_activation_scopes
+    const localProfileTransition = await pool.query(
+      `UPDATE operations_activation_scopes
          SET state = 'active'
-         WHERE organization_id = $1::uuid`,
-        [missingEvidenceFixture.organizationId],
-      ),
-      /Active Operations cannot retain missing or non-production carrier-read plan/,
+         WHERE organization_id = $1::uuid
+         RETURNING state`,
+      [missingEvidenceFixture.organizationId],
     )
+    assert.equal(localProfileTransition.rows[0]?.state, 'active')
 
     const packagingShortageFixture =
       await seedCanonicalPlanningFixture(pool, {
@@ -4458,6 +4626,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
       operations,
       hybridCartonizationPersistence,
     )
+    await verifyPlanningAfterCancelledGeneration(pool, operations)
     await verifyLocalSplitPlanning(pool, operations)
     await verifyPackagingClaimConcurrency(pool)
   } finally {

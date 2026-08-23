@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   decryptCommerceCredential,
   type FaireCommerceCredential,
@@ -778,6 +778,9 @@ export async function executeFaireProductImagePublish(
       credentialGeneration: grant.credentialGeneration,
       externalProductId: grant.externalProductId,
       requireExactOrderedSet: true,
+      intentKey:
+        `${claim.providerAttemptId}:${claim.leaseToken}:predispatch-image-set`,
+      acquiredBy: input.actorEmail,
     })
     if (providerImages.length >= MAX_PROVIDER_IMAGES) {
       fail(
@@ -1087,6 +1090,9 @@ export async function reconcileFaireProductImagePublish(
       credentialGeneration: context.credentialGeneration,
       externalProductId: context.externalProductId,
       requireExactOrderedSet: true,
+      intentKey:
+        `${context.externalEffectGlobalId}:reconcile:${randomUUID()}`,
+      acquiredBy: reconciledBy,
     })
   } catch (error) {
     const errorCode = safeCode(

@@ -32,6 +32,52 @@ export type PackagingDimensionEvidenceType =
   typeof PACKAGING_DIMENSION_EVIDENCE_TYPES[number]
 export type PackagingMaterialSource = typeof PACKAGING_MATERIAL_SOURCES[number]
 
+export function packagingDimensionEvidenceReferenceRequired(
+  evidenceType: PackagingDimensionEvidenceType,
+) {
+  return evidenceType !== 'unknown' && evidenceType !== 'measured'
+}
+
+export function packagingDimensionEvidenceReady(input: {
+  evidenceType: PackagingDimensionEvidenceType
+  evidenceReference?: string | null
+  confirmedAt?: string | Date | null
+}) {
+  const confirmedAtTime = input.confirmedAt instanceof Date
+    ? input.confirmedAt.getTime()
+    : input.confirmedAt
+      ? Date.parse(input.confirmedAt)
+      : Number.NaN
+  return (
+    input.evidenceType !== 'unknown'
+    && (
+      !packagingDimensionEvidenceReferenceRequired(input.evidenceType)
+      || Boolean(input.evidenceReference?.trim())
+    )
+    && Number.isFinite(confirmedAtTime)
+  )
+}
+
+export function packagingRatedOuterEvidenceReady(input: {
+  evidenceType:
+    | Exclude<PackagingDimensionEvidenceType, 'unknown'>
+    | null
+  evidenceReference?: string | null
+  confirmedAt?: string | Date | null
+}) {
+  return (
+    input.evidenceType !== null
+    && ['customer_confirmed', 'measured', 'provider'].includes(
+      input.evidenceType,
+    )
+    && packagingDimensionEvidenceReady({
+      evidenceType: input.evidenceType,
+      evidenceReference: input.evidenceReference,
+      confirmedAt: input.confirmedAt,
+    })
+  )
+}
+
 export type PackagingMaterialStock = {
   id: string
   globalId: string
@@ -302,6 +348,8 @@ export function packagingMaterialReadiness(input: {
   }
   dimensionBasis?: PackagingDimensionBasis
   dimensionEvidenceType?: PackagingDimensionEvidenceType
+  dimensionEvidenceReference?: string | null
+  dimensionConfirmedAt?: string | null
   tareWeightGrams?: number | null
   maxWeightGrams?: number | null
   unitCostMinor: number | null
@@ -315,9 +363,12 @@ export function packagingMaterialReadiness(input: {
   if (
     input.innerDimensionsMm
     && (
-      input.innerDimensionsMm.length === null
-      || input.innerDimensionsMm.width === null
-      || input.innerDimensionsMm.height === null
+      !Number.isSafeInteger(input.innerDimensionsMm.length)
+      || Number(input.innerDimensionsMm.length) < 1
+      || !Number.isSafeInteger(input.innerDimensionsMm.width)
+      || Number(input.innerDimensionsMm.width) < 1
+      || !Number.isSafeInteger(input.innerDimensionsMm.height)
+      || Number(input.innerDimensionsMm.height) < 1
     )
   ) {
     missing.push('dimensions')
@@ -330,7 +381,11 @@ export function packagingMaterialReadiness(input: {
   }
   if (
     input.dimensionEvidenceType !== undefined
-    && input.dimensionEvidenceType === 'unknown'
+    && !packagingDimensionEvidenceReady({
+      evidenceType: input.dimensionEvidenceType,
+      evidenceReference: input.dimensionEvidenceReference,
+      confirmedAt: input.dimensionConfirmedAt,
+    })
   ) {
     missing.push('dimension_evidence')
   }

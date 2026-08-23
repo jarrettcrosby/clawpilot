@@ -14,7 +14,15 @@ import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
+import Dialog from '@mui/material/Dialog'
+import DialogActions from '@mui/material/DialogActions'
+import DialogContent from '@mui/material/DialogContent'
+import DialogTitle from '@mui/material/DialogTitle'
 import Divider from '@mui/material/Divider'
+import FormControl from '@mui/material/FormControl'
+import InputLabel from '@mui/material/InputLabel'
+import MenuItem from '@mui/material/MenuItem'
+import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
@@ -30,7 +38,9 @@ import Typography from '@mui/material/Typography'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import OpenInNewRounded from '@mui/icons-material/OpenInNewRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
+import WarehouseRounded from '@mui/icons-material/WarehouseRounded'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
+import ShopifyLocationAdministrationPanel from '@/components/operations/ShopifyLocationAdministrationPanel'
 import {
   formatDimensionsMm,
   formatGrams,
@@ -72,6 +82,27 @@ type InventoryLocation = {
     country?: string
     countryCode?: string
   }
+  ownershipClassification?: 'merchant_managed' | 'fulfillment_service'
+  mappingEligible?: boolean
+  mappingIneligibleReason?: string | null
+  mappingGlobalId?: string | null
+}
+
+type InventoryWarehouseLocation = {
+  globalId: string
+  code: string
+  zone: string
+  locationType: string
+  active: boolean
+}
+
+type InventoryWarehouse = {
+  globalId: string
+  code: string
+  name: string
+  address?: Record<string, unknown>
+  status: string
+  locations: InventoryWarehouseLocation[]
 }
 
 type DimensionDefinition = {
@@ -140,41 +171,69 @@ type InventoryLevel = {
   inventoryPositionGlobalId: string | null
 }
 
+type InventoryRun = {
+  globalId: string
+  providerFetchedAt: string | null
+  completedAt: string | null
+  providerLocationName: string
+  warehouseGlobalId: string
+  warehouseName: string
+  locationGlobalId: string
+  locationCode: string
+  levelsSeen: number
+  levelsMapped: number
+  levelsProjected: number
+  levelsUnmapped: number
+  levelsUntracked: number
+  negativeAvailableLevels: number
+  equationMismatchLevels: number
+  providerAvailableQuantity: number
+  providerCommittedQuantity: number
+  providerOnHandQuantity: number
+  operationalAvailableQuantity: number
+  positionsCreated: number
+  positionsUpdated: number
+  positionsZeroed: number
+  providerWrites: number
+  orderQuantityAdjustment: number
+  snapshotHashPrefix: string
+  providerLocation?: InventoryLocation
+  enrichment?: InventoryEnrichment
+  warnings?: string[]
+}
+
+type InventoryLocationMapping = {
+  globalId: string
+  externalLocationId: string
+  externalLocationName: string
+  externalLocationAddress?: Record<string, unknown> | null
+  ownershipClassification: 'merchant_managed' | 'fulfillment_service'
+  inventoryImportEnabled: boolean
+  rowVersion: number
+  providerObservedAt: string | null
+  warehouse: {
+    globalId: string
+    code: string
+    name: string
+  }
+  location: {
+    globalId: string
+    code: string
+    zone: string
+    locationType: string
+  }
+  latestRun: InventoryRun | null
+}
+
 type InventoryState = {
   accountGlobalId: string
   status: 'never_synced' | 'synced'
-  latestRun: null | {
-    globalId: string
-    providerFetchedAt: string | null
-    completedAt: string | null
-    providerLocationName: string
-    warehouseGlobalId: string
-    warehouseName: string
-    locationGlobalId: string
-    locationCode: string
-    levelsSeen: number
-    levelsMapped: number
-    levelsProjected: number
-    levelsUnmapped: number
-    levelsUntracked: number
-    negativeAvailableLevels: number
-    equationMismatchLevels: number
-    providerAvailableQuantity: number
-    providerCommittedQuantity: number
-    providerOnHandQuantity: number
-    operationalAvailableQuantity: number
-    positionsCreated: number
-    positionsUpdated: number
-    positionsZeroed: number
-    providerWrites: number
-    orderQuantityAdjustment: number
-    snapshotHashPrefix: string
-    providerLocation?: InventoryLocation
-    enrichment?: InventoryEnrichment
-    warnings?: string[]
-  }
+  latestRun: InventoryRun | null
   levels: InventoryLevel[]
   providerLocation?: InventoryLocation
+  providerLocations?: InventoryLocation[]
+  warehouses?: InventoryWarehouse[]
+  mappings?: InventoryLocationMapping[]
   enrichment?: InventoryEnrichment
   warnings?: string[]
   refreshRecovery?: {
@@ -207,7 +266,54 @@ type InventoryPayload = {
   code?: string
   replayed?: boolean
   inventory?: InventoryState
+  mapping?: InventoryLocationMapping
+  providerWrites?: number
 }
+
+type LocationRoutingMode = 'existing' | 'create'
+
+type WarehouseImportForm = {
+  code: string
+  name: string
+  facilityType:
+    | 'distribution_center'
+    | 'store'
+    | 'dark_store'
+    | 'micro_fulfillment'
+    | 'cross_dock'
+    | 'supplier'
+    | 'drop_ship'
+    | 'third_party'
+  timezone: string
+}
+
+const WAREHOUSE_FACILITY_OPTIONS: Array<{
+  value: WarehouseImportForm['facilityType']
+  label: string
+}> = [
+  { value: 'distribution_center', label: 'Distribution center' },
+  { value: 'store', label: 'Store' },
+  { value: 'dark_store', label: 'Dark store' },
+  { value: 'micro_fulfillment', label: 'Micro-fulfillment center' },
+  { value: 'cross_dock', label: 'Cross-dock facility' },
+  { value: 'supplier', label: 'Supplier facility' },
+  { value: 'drop_ship', label: 'Drop-ship node' },
+  { value: 'third_party', label: 'Third-party warehouse' },
+]
+
+const WAREHOUSE_TIMEZONE_OPTIONS = [
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Phoenix',
+  'America/Los_Angeles',
+  'America/Anchorage',
+  'Pacific/Honolulu',
+  'America/Toronto',
+  'America/Vancouver',
+  'Europe/London',
+  'UTC',
+]
 
 class InventoryRequestError extends Error {
   constructor(
@@ -590,6 +696,25 @@ function idempotencyKey() {
   return `shopify-inventory:${id}`
 }
 
+function suggestedWarehouseCode(location: InventoryLocation) {
+  const stem = String(location.name || 'SHOPIFY')
+    .normalize('NFKD')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toUpperCase()
+    .slice(0, 24)
+  return `${stem || 'SHOPIFY'}-01`.slice(0, 32)
+}
+
+function warehouseImportForm(location: InventoryLocation): WarehouseImportForm {
+  return {
+    code: suggestedWarehouseCode(location),
+    name: String(location.name || 'Shopify warehouse').trim(),
+    facilityType: 'distribution_center',
+    timezone: '',
+  }
+}
+
 export default function ShopifyInventoryPanel({
   accountGlobalId,
   displayName,
@@ -609,26 +734,67 @@ export default function ShopifyInventoryPanel({
   } = useMeasurementSystem()
   const [inventory, setInventory] = useState<InventoryState | null>(null)
   const [loading, setLoading] = useState(true)
-  const [syncing, setSyncing] = useState(false)
+  const [loadingMappingGlobalId, setLoadingMappingGlobalId] = useState('')
+  const [syncingMappingGlobalId, setSyncingMappingGlobalId] = useState('')
+  const [selectedMappingGlobalId, setSelectedMappingGlobalId] = useState('')
+  const [mappingLocation, setMappingLocation] =
+    useState<InventoryLocation | null>(null)
+  const [locationRoutingMode, setLocationRoutingMode] =
+    useState<LocationRoutingMode>('existing')
+  const [warehouseImport, setWarehouseImport] =
+    useState<WarehouseImportForm | null>(null)
+  const [mappingWarehouseGlobalId, setMappingWarehouseGlobalId] = useState('')
+  const [mappingInternalLocationGlobalId, setMappingInternalLocationGlobalId] =
+    useState('')
+  const [mappingBusy, setMappingBusy] = useState(false)
   const [measurementPreferenceBusy, setMeasurementPreferenceBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(0)
-  const syncIdempotencyKey = useRef<string | null>(null)
+  const syncIdempotencyKeys = useRef(new Map<string, string>())
+  const mappingIdempotencyKeys = useRef(new Map<string, string>())
+  const loadIdempotencyKeys = useRef(new Map<string, string>())
   const rowsPerPage = 10
 
-  const load = useCallback(async (signal?: AbortSignal) => {
+  const load = useCallback(async (
+    signal?: AbortSignal,
+    mappingGlobalId?: string,
+  ) => {
+    const loadKey = mappingGlobalId || 'summary'
+    const requestIdempotencyKey =
+      loadIdempotencyKeys.current.get(loadKey) || idempotencyKey()
+    loadIdempotencyKeys.current.set(loadKey, requestIdempotencyKey)
     const params = new URLSearchParams({ accountGlobalId })
+    if (mappingGlobalId) params.set('mappingGlobalId', mappingGlobalId)
     const response = await fetch(
       `/api/integrations/commerce/inventory?${params.toString()}`,
-      { cache: 'no-store', signal },
+      {
+        cache: 'no-store',
+        signal,
+        headers: { 'Idempotency-Key': requestIdempotencyKey },
+      },
     )
     const payload = await response.json() as InventoryPayload
     if (!response.ok || !payload.inventory) {
       throw new Error(payload.error || 'Shopify inventory is unavailable.')
     }
     setInventory(payload.inventory)
+    loadIdempotencyKeys.current.delete(loadKey)
+    setSelectedMappingGlobalId((current) => {
+      const mappings = payload.inventory?.mappings || []
+      if (mappingGlobalId && mappings.some(
+        (mapping) => mapping.globalId === mappingGlobalId,
+      )) return mappingGlobalId
+      if (current && mappings.some(
+        (mapping) => mapping.globalId === current,
+      )) return current
+      const latestRunGlobalId = payload.inventory?.latestRun?.globalId
+      return mappings.find(
+        (mapping) => mapping.latestRun?.globalId === latestRunGlobalId,
+      )?.globalId || mappings[0]?.globalId || ''
+    })
+    return payload.inventory
   }, [accountGlobalId])
 
   useEffect(() => {
@@ -639,7 +805,13 @@ export default function ShopifyInventoryPanel({
     setInventory(null)
     setSearch('')
     setPage(0)
-    syncIdempotencyKey.current = null
+    setSelectedMappingGlobalId('')
+    setMappingLocation(null)
+    setLocationRoutingMode('existing')
+    setWarehouseImport(null)
+    syncIdempotencyKeys.current.clear()
+    mappingIdempotencyKeys.current.clear()
+    loadIdempotencyKeys.current.clear()
     load(controller.signal)
       .catch((caught) => {
         if (
@@ -702,12 +874,32 @@ export default function ShopifyInventoryPanel({
     }
   }
 
-  async function sync() {
-    if (syncing) return
+  async function showMappingDetails(mappingGlobalId: string) {
+    if (!mappingGlobalId || loadingMappingGlobalId) return
+    setLoadingMappingGlobalId(mappingGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      await load(undefined, mappingGlobalId)
+      setSearch('')
+      setPage(0)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'The selected Shopify inventory import is unavailable.',
+      )
+    } finally {
+      setLoadingMappingGlobalId('')
+    }
+  }
+
+  async function sync(mapping: InventoryLocationMapping) {
+    if (syncingMappingGlobalId) return
     const requestIdempotencyKey =
-      syncIdempotencyKey.current || idempotencyKey()
-    syncIdempotencyKey.current = requestIdempotencyKey
-    setSyncing(true)
+      syncIdempotencyKeys.current.get(mapping.globalId) || idempotencyKey()
+    syncIdempotencyKeys.current.set(mapping.globalId, requestIdempotencyKey)
+    setSyncingMappingGlobalId(mapping.globalId)
     setError('')
     setNotice('')
     try {
@@ -718,6 +910,8 @@ export default function ShopifyInventoryPanel({
         body: JSON.stringify({
           action: 'sync',
           accountGlobalId,
+          mappingGlobalId: mapping.globalId,
+          expectedMappingRowVersion: mapping.rowVersion,
           idempotencyKey: requestIdempotencyKey,
         }),
       })
@@ -730,19 +924,20 @@ export default function ShopifyInventoryPanel({
         )
       }
       setInventory(payload.inventory)
-      syncIdempotencyKey.current = null
+      setSelectedMappingGlobalId(mapping.globalId)
+      syncIdempotencyKeys.current.delete(mapping.globalId)
       setSearch('')
       setPage(0)
       setNotice(
         payload.replayed
           ? 'The request was replayed without another Shopify read; the current inventory state is shown.'
           : payload.inventory.latestRun?.levelsProjected
-            ? `Shopify inventory was read successfully; ${
+            ? `${mapping.externalLocationName} inventory was read successfully; ${
               payload.inventory.latestRun.levelsProjected
             } item${
               payload.inventory.latestRun.levelsProjected === 1 ? '' : 's'
             } projected into the selected warehouse.`
-            : 'Shopify inventory was read successfully, but no item passed every mapping and quantity check for projection.',
+            : `${mapping.externalLocationName} inventory was read successfully, but no item passed every mapping and quantity check for projection.`,
       )
     } catch (caught) {
       if (
@@ -750,7 +945,7 @@ export default function ShopifyInventoryPanel({
         && caught.status < 500
         && !RETAIN_IDEMPOTENCY_CODES.has(caught.code)
       ) {
-        syncIdempotencyKey.current = null
+        syncIdempotencyKeys.current.delete(mapping.globalId)
       }
       setError(
         caught instanceof Error
@@ -758,10 +953,219 @@ export default function ShopifyInventoryPanel({
           : 'Shopify inventory could not be synchronized.',
       )
     } finally {
-      setSyncing(false)
+      setSyncingMappingGlobalId('')
     }
   }
 
+  const providerLocations = inventory?.providerLocations || []
+  const mappings = inventory?.mappings || []
+  const warehouses = inventory?.warehouses || []
+  const selectedMapping = mappings.find(
+    (mapping) => mapping.globalId === selectedMappingGlobalId,
+  ) || null
+  const selectedMappingWarehouse = warehouses.find(
+    (warehouse) => warehouse.globalId === mappingWarehouseGlobalId,
+  ) || null
+  const selectedWarehouseLocations = (
+    selectedMappingWarehouse?.locations || []
+  ).filter((location) => location.active)
+
+  function mappingForLocation(location: InventoryLocation) {
+    return mappings.find((mapping) => (
+      mapping.globalId === location.mappingGlobalId
+      || mapping.externalLocationId === location.id
+    )) || null
+  }
+
+  function openMapping(
+    location: InventoryLocation,
+    mode: LocationRoutingMode = 'existing',
+  ) {
+    const current = mappingForLocation(location)
+    setMappingLocation(location)
+    setLocationRoutingMode(current ? 'existing' : mode)
+    setWarehouseImport(current ? null : warehouseImportForm(location))
+    setMappingWarehouseGlobalId(current?.warehouse.globalId || '')
+    setMappingInternalLocationGlobalId(current?.location.globalId || '')
+    setError('')
+    setNotice('')
+  }
+
+  function closeMapping() {
+    if (mappingBusy) return
+    setMappingLocation(null)
+    setLocationRoutingMode('existing')
+    setWarehouseImport(null)
+    setMappingWarehouseGlobalId('')
+    setMappingInternalLocationGlobalId('')
+  }
+
+  function openWarehouseSetup() {
+    closeMapping()
+    window.location.hash = '#operations/warehouses'
+  }
+
+  async function saveMapping() {
+    if (
+      !mappingLocation?.id
+      || mappingLocation.mappingEligible !== true
+      || !mappingWarehouseGlobalId
+      || !mappingInternalLocationGlobalId
+      || mappingBusy
+    ) return
+    const current = mappingForLocation(mappingLocation)
+    const requestIdempotencyKey =
+      mappingIdempotencyKeys.current.get(`map:${mappingLocation.id}`)
+      || idempotencyKey()
+    mappingIdempotencyKeys.current.set(
+      `map:${mappingLocation.id}`,
+      requestIdempotencyKey,
+    )
+    setMappingBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/integrations/commerce/inventory', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'map-location',
+          accountGlobalId,
+          externalLocationId: mappingLocation.id,
+          warehouseGlobalId: mappingWarehouseGlobalId,
+          locationGlobalId: mappingInternalLocationGlobalId,
+          mappingGlobalId: current?.globalId || null,
+          expectedRowVersion: current?.rowVersion ?? null,
+          idempotencyKey: requestIdempotencyKey,
+        }),
+      })
+      const payload = await response.json() as InventoryPayload
+      if (!response.ok || !payload.inventory || !payload.mapping) {
+        throw new InventoryRequestError(
+          payload.error || 'The Shopify location could not be mapped.',
+          payload.code || 'SHOPIFY_INVENTORY_LOCATION_MAPPING_FAILED',
+          response.status,
+        )
+      }
+      if (payload.providerWrites !== 0) {
+        throw new InventoryRequestError(
+          'The location mapping response did not preserve the zero-write boundary.',
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_WRITE_BOUNDARY_FAILED',
+          502,
+        )
+      }
+      setInventory(payload.inventory)
+      setSelectedMappingGlobalId(payload.mapping.globalId)
+      mappingIdempotencyKeys.current.delete(`map:${mappingLocation.id}`)
+      setMappingLocation(null)
+      setMappingWarehouseGlobalId('')
+      setMappingInternalLocationGlobalId('')
+      setNotice(
+        `${payload.mapping.externalLocationName} now imports into ${
+          payload.mapping.warehouse.name
+        } / ${payload.mapping.location.code}. No Shopify inventory was changed.`,
+      )
+    } catch (caught) {
+      if (
+        caught instanceof InventoryRequestError
+        && caught.status < 500
+        && mappingLocation?.id
+      ) {
+        mappingIdempotencyKeys.current.delete(`map:${mappingLocation.id}`)
+      }
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'The Shopify location could not be mapped.',
+      )
+    } finally {
+      setMappingBusy(false)
+    }
+  }
+
+  async function createWarehouseFromShopifyLocation() {
+    if (
+      !mappingLocation?.id
+      || mappingLocation.mappingEligible !== true
+      || !warehouseImport?.code.trim()
+      || !warehouseImport.name.trim()
+      || !warehouseImport.timezone
+      || mappingBusy
+    ) return
+    const key = `create:${mappingLocation.id}`
+    const requestIdempotencyKey =
+      mappingIdempotencyKeys.current.get(key) || idempotencyKey()
+    mappingIdempotencyKeys.current.set(key, requestIdempotencyKey)
+    setMappingBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/integrations/commerce/inventory', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'create-warehouse-and-map',
+          accountGlobalId,
+          externalLocationId: mappingLocation.id,
+          warehouse: {
+            code: warehouseImport.code.trim(),
+            name: warehouseImport.name.trim(),
+            facilityType: warehouseImport.facilityType,
+            timezone: warehouseImport.timezone,
+          },
+          idempotencyKey: requestIdempotencyKey,
+        }),
+      })
+      const payload = await response.json() as InventoryPayload
+      if (!response.ok || !payload.inventory || !payload.mapping) {
+        throw new InventoryRequestError(
+          payload.error || 'The ClawPilot warehouse could not be created.',
+          payload.code || 'SHOPIFY_INVENTORY_WAREHOUSE_CREATE_FAILED',
+          response.status,
+        )
+      }
+      if (payload.providerWrites !== 0) {
+        throw new InventoryRequestError(
+          'The warehouse import response did not preserve the zero-write boundary.',
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_WRITE_BOUNDARY_FAILED',
+          502,
+        )
+      }
+      setInventory(payload.inventory)
+      setSelectedMappingGlobalId(payload.mapping.globalId)
+      mappingIdempotencyKeys.current.delete(key)
+      setMappingLocation(null)
+      setLocationRoutingMode('existing')
+      setWarehouseImport(null)
+      setMappingWarehouseGlobalId('')
+      setMappingInternalLocationGlobalId('')
+      setNotice(
+        `${payload.mapping.warehouse.name} was created from ${
+          payload.mapping.externalLocationName
+        } and routed to ${payload.mapping.location.code}. Shopify was not changed.`,
+      )
+    } catch (caught) {
+      if (
+        caught instanceof InventoryRequestError
+        && caught.status < 500
+      ) {
+        mappingIdempotencyKeys.current.delete(key)
+      }
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'The ClawPilot warehouse could not be created.',
+      )
+    } finally {
+      setMappingBusy(false)
+    }
+  }
+
+  const mappingLocationCurrent = mappingLocation
+    ? mappingForLocation(mappingLocation)
+    : null
   const run = inventory?.latestRun
   const refreshRecovery = inventory?.refreshRecovery
   const affectedOrders = refreshRecovery?.affectedOrders || []
@@ -855,81 +1259,294 @@ export default function ShopifyInventoryPanel({
                 Shopify inventory
               </Typography>
               <Typography variant="body2" color="text.secondary">
-                Read the current {displayName} location balances and build
-                source-bound inventory in the selected warehouse.
+                Route each {displayName} location into the matching ClawPilot
+                warehouse and internal stock location.
               </Typography>
             </Box>
-            <Stack
-              direction={{ xs: 'column', sm: 'row' }}
-              alignItems={{ sm: 'center' }}
-              spacing={1}
-            >
-              <Box>
-                <ToggleButtonGroup
-                  exclusive
-                  size="small"
-                  value={measurementSystem}
-                  onChange={(_event, next: MeasurementSystem | null) => {
-                    void changeMeasurementPreference(next)
-                  }}
-                  disabled={
-                    !preferencesWritable
-                    || measurementPreferenceLoading
-                    || measurementPreferenceBusy
-                  }
-                  aria-label="Shopify inventory measurement system"
-                >
-                  <ToggleButton value="imperial">Imperial</ToggleButton>
-                  <ToggleButton value="metric">Metric</ToggleButton>
-                </ToggleButtonGroup>
-                <Typography
-                  variant="caption"
-                  color="text.secondary"
-                  display="block"
-                  sx={{ mt: 0.5, textAlign: { sm: 'right' } }}
-                >
-                  {measurementPreferenceSource === 'user'
-                    ? 'Your display preference'
-                    : measurementPreferenceSource === 'organization'
-                      ? 'Organization default'
-                      : preferencesWritable
-                        ? 'System default'
-                        : 'System default · no active organization'}
-                </Typography>
-              </Box>
-              <Button
-                variant="contained"
-                startIcon={syncing
-                  ? <CircularProgress size={16} color="inherit" />
-                  : <RefreshRounded />}
+            <Box>
+              <ToggleButtonGroup
+                exclusive
+                size="small"
+                value={measurementSystem}
+                onChange={(_event, next: MeasurementSystem | null) => {
+                  void changeMeasurementPreference(next)
+                }}
                 disabled={
-                  loading
-                  || syncing
-                  || automaticRefreshBusy
-                  || providerCommitmentRecovery
+                  !preferencesWritable
+                  || measurementPreferenceLoading
+                  || measurementPreferenceBusy
                 }
-                onClick={() => { void sync() }}
-                sx={{ minHeight: 40, flexShrink: 0 }}
+                aria-label="Shopify inventory measurement system"
               >
-                {syncing
-                  ? 'Syncing inventory…'
-                  : providerCommitmentRecovery
-                    ? 'Resolve affected order first'
-                  : refreshRecovery?.managerRecoveryRequired
-                    ? 'Retry inventory sync'
-                    : automaticRefreshBusy
-                      ? 'Automatic sync in progress'
-                      : 'Sync inventory'}
+                <ToggleButton value="imperial">Imperial</ToggleButton>
+                <ToggleButton value="metric">Metric</ToggleButton>
+              </ToggleButtonGroup>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                display="block"
+                sx={{ mt: 0.5, textAlign: { md: 'right' } }}
+              >
+                {measurementPreferenceSource === 'user'
+                  ? 'Your display preference'
+                  : measurementPreferenceSource === 'organization'
+                    ? 'Organization default'
+                    : preferencesWritable
+                      ? 'System default'
+                      : 'System default · no active organization'}
+              </Typography>
+            </Box>
+          </Stack>
+
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            justifyContent="space-between"
+            alignItems={{ sm: 'center' }}
+            spacing={1}
+          >
+            <Stack direction="row" spacing={0.75} alignItems="center">
+              <Inventory2Rounded color="action" fontSize="small" />
+              <Typography variant="caption" color="text.secondary">
+                Inventory import is Shopify → ClawPilot and makes zero Shopify
+                writes. Shopify committed units remain already reserved.
+              </Typography>
+            </Stack>
+            <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+              <ShopifyLocationAdministrationPanel
+                accountGlobalId={accountGlobalId}
+                onProviderLocationsChanged={async () => {
+                  await load()
+                }}
+              />
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<WarehouseRounded />}
+                onClick={openWarehouseSetup}
+                sx={{ minHeight: 36, flexShrink: 0 }}
+              >
+                Manage warehouses
               </Button>
             </Stack>
           </Stack>
 
-          <Alert severity="info" icon={<Inventory2Rounded />}>
-            Shopify already moves placed-order units from available to
-            committed. ClawPilot preserves committed as already reserved and
-            does not subtract imported orders again. This workflow is
-            read-only and performs zero Shopify writes.
-          </Alert>
+          {!loading && providerLocations.length ? (
+            <TableContainer sx={{ maxWidth: '100%', overflowX: 'auto' }}>
+              <Table size="small" aria-label="Shopify location routing">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>Shopify location</TableCell>
+                    <TableCell>Control</TableCell>
+                    <TableCell>ClawPilot route</TableCell>
+                    <TableCell>Import</TableCell>
+                    <TableCell>Latest refresh</TableCell>
+                    <TableCell align="right">Actions</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {providerLocations.map((location) => {
+                    const mapping = mappingForLocation(location)
+                    const fulfillmentService =
+                      location.ownershipClassification
+                        === 'fulfillment_service'
+                      || location.isFulfillmentService === true
+                    const mappingEligible =
+                      location.mappingEligible === true && !fulfillmentService
+                    const syncingThis =
+                      syncingMappingGlobalId === mapping?.globalId
+                    const loadingThis =
+                      loadingMappingGlobalId === mapping?.globalId
+                    return (
+                      <TableRow
+                        key={location.id || location.name}
+                        selected={Boolean(
+                          mapping
+                          && mapping.globalId === selectedMappingGlobalId,
+                        )}
+                      >
+                        <TableCell sx={{ minWidth: 220, verticalAlign: 'top' }}>
+                          <Typography variant="body2" fontWeight={700}>
+                            {location.name || 'Unnamed Shopify location'}
+                          </Typography>
+                          {locationAddress(location) ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                            >
+                              {locationAddress(location)}
+                            </Typography>
+                          ) : null}
+                        </TableCell>
+                        <TableCell sx={{ minWidth: 150, verticalAlign: 'top' }}>
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color={fulfillmentService ? 'default' : 'success'}
+                            label={fulfillmentService
+                              ? 'Provider / app managed'
+                              : 'Merchant managed'}
+                          />
+                          {fulfillmentService ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {location.fulfillmentService?.serviceName
+                                || 'External fulfillment service'}
+                            </Typography>
+                          ) : null}
+                        </TableCell>
+                        <TableCell sx={{ minWidth: 210, verticalAlign: 'top' }}>
+                          {mapping ? (
+                            <>
+                              <Typography variant="body2" fontWeight={700}>
+                                {mapping.warehouse.name}
+                              </Typography>
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                display="block"
+                              >
+                                {mapping.location.code}
+                                {mapping.location.zone
+                                  ? ` · ${mapping.location.zone}`
+                                  : ''}
+                              </Typography>
+                            </>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              Not mapped
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell sx={{ minWidth: 125, verticalAlign: 'top' }}>
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color={mapping?.inventoryImportEnabled
+                              ? 'success'
+                              : 'default'}
+                            label={fulfillmentService
+                              ? 'Read only'
+                              : mapping?.inventoryImportEnabled
+                                ? 'Enabled'
+                                : 'Not configured'}
+                          />
+                          {!mappingEligible && !mapping ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.5, maxWidth: 220 }}
+                            >
+                              {location.mappingIneligibleReason
+                                || 'This location cannot be mapped by default.'}
+                            </Typography>
+                          ) : null}
+                        </TableCell>
+                        <TableCell sx={{ minWidth: 170, verticalAlign: 'top' }}>
+                          <Typography variant="body2">
+                            {mapping?.latestRun
+                              ? formatDate(
+                                mapping.latestRun.completedAt
+                                  || mapping.latestRun.providerFetchedAt,
+                              )
+                              : 'Never imported'}
+                          </Typography>
+                          {mapping?.latestRun ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                            >
+                              {mapping.latestRun.levelsProjected} projected
+                            </Typography>
+                          ) : null}
+                        </TableCell>
+                        <TableCell
+                          align="right"
+                          sx={{ minWidth: 250, verticalAlign: 'top' }}
+                        >
+                          <Stack
+                            direction="row"
+                            spacing={0.75}
+                            justifyContent="flex-end"
+                            flexWrap="wrap"
+                            useFlexGap
+                          >
+                            {mapping?.latestRun ? (
+                              <Button
+                                size="small"
+                                disabled={Boolean(loadingMappingGlobalId)}
+                                startIcon={loadingThis
+                                  ? <CircularProgress size={14} />
+                                  : <OpenInNewRounded />}
+                                onClick={() => {
+                                  void showMappingDetails(mapping.globalId)
+                                }}
+                              >
+                                View import
+                              </Button>
+                            ) : null}
+                            {mappingEligible ? (
+                              <Button
+                                size="small"
+                                variant={mapping ? 'text' : 'outlined'}
+                                onClick={() => openMapping(location, 'existing')}
+                              >
+                                {mapping ? 'Change route' : 'Map existing'}
+                              </Button>
+                            ) : null}
+                            {mappingEligible && !mapping ? (
+                              <Button
+                                size="small"
+                                variant="contained"
+                                startIcon={<WarehouseRounded />}
+                                onClick={() => openMapping(location, 'create')}
+                              >
+                                Create warehouse
+                              </Button>
+                            ) : null}
+                            {mapping?.inventoryImportEnabled ? (
+                              <Button
+                                size="small"
+                                variant="contained"
+                                startIcon={syncingThis
+                                  ? (
+                                    <CircularProgress
+                                      size={14}
+                                      color="inherit"
+                                    />
+                                  )
+                                  : <RefreshRounded />}
+                                disabled={
+                                  Boolean(syncingMappingGlobalId)
+                                  || automaticRefreshBusy
+                                  || providerCommitmentRecovery
+                                }
+                                onClick={() => { void sync(mapping) }}
+                              >
+                                {syncingThis ? 'Refreshing…' : 'Refresh this'}
+                              </Button>
+                            ) : null}
+                          </Stack>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          ) : null}
+
+          {!loading && !providerLocations.length ? (
+            <Typography variant="body2" color="text.secondary">
+              No Shopify locations are available for this connection.
+            </Typography>
+          ) : null}
 
           {providerCommitmentRecovery ? (
             <Alert severity="error">
@@ -963,7 +1580,8 @@ export default function ShopifyInventoryPanel({
               {refreshRecovery.lastErrorCode
                 ? ` (${refreshRecovery.lastErrorCode})`
                 : ''}. Correct the connection, scope, location, or warehouse
-              blocker, then choose <strong>Retry inventory sync</strong>.
+              blocker, then choose <strong>Refresh this</strong> for the mapped
+              location.
               The failed job remains preserved as audit evidence.
             </Alert>
           ) : automaticRefreshBusy ? (
@@ -983,11 +1601,31 @@ export default function ShopifyInventoryPanel({
             <Alert severity="warning">{measurementPreferenceError}</Alert>
           ) : null}
           {notice ? <Alert severity="success">{notice}</Alert> : null}
-          {enrichmentWarnings.map((warning) => (
-            <Alert key={warning} severity="warning">
-              {warning}
-            </Alert>
-          ))}
+          {enrichmentWarnings.length ? (
+            <Box component="details" sx={{ '& summary': { cursor: 'pointer' } }}>
+              <Typography
+                component="summary"
+                variant="caption"
+                color="warning.main"
+              >
+                {enrichmentWarnings.length} import note{
+                  enrichmentWarnings.length === 1 ? '' : 's'
+                }
+              </Typography>
+              <Stack spacing={0.25} sx={{ mt: 0.5, pl: 2 }}>
+                {enrichmentWarnings.map((warning) => (
+                  <Typography
+                    key={warning}
+                    component="span"
+                    variant="caption"
+                    color="text.secondary"
+                  >
+                    {warning}
+                  </Typography>
+                ))}
+              </Stack>
+            </Box>
+          ) : null}
 
           {loading && !inventory ? (
             <Box sx={{ minHeight: 120, display: 'grid', placeItems: 'center' }}>
@@ -995,15 +1633,26 @@ export default function ShopifyInventoryPanel({
             </Box>
           ) : null}
 
-          {!loading && inventory?.status === 'never_synced' ? (
-            <Alert severity="warning">
-              No Shopify inventory snapshot has been imported for this
-              connection. Run the first read-only sync above.
-            </Alert>
+          {!loading && selectedMapping && !run ? (
+            <Typography variant="body2" color="text.secondary">
+              {selectedMapping.externalLocationName} is routed but has not been
+              imported yet. Choose <strong>Refresh this</strong> in the location
+              table when you are ready.
+            </Typography>
           ) : null}
 
           {run ? (
             <>
+              <Divider />
+              <Box>
+                <Typography variant="overline" color="text.secondary">
+                  Selected location import
+                </Typography>
+                <Typography variant="h6" fontWeight={700}>
+                  {selectedMapping?.externalLocationName
+                    || run.providerLocationName}
+                </Typography>
+              </Box>
               {providerLocation ? (
                 <Card variant="outlined">
                   <CardContent sx={{ '&:last-child': { pb: 1.5 } }}>
@@ -1533,6 +2182,256 @@ export default function ShopifyInventoryPanel({
             </>
           ) : null}
         </Stack>
+
+        <Dialog
+          open={Boolean(mappingLocation)}
+          onClose={closeMapping}
+          fullWidth
+          maxWidth="sm"
+        >
+          <DialogTitle>
+            Route {mappingLocation?.name || 'Shopify location'}
+          </DialogTitle>
+          <DialogContent>
+            <Stack spacing={2} sx={{ pt: 1 }}>
+              <Typography variant="body2" color="text.secondary">
+                Use this merchant-managed Shopify location as the source for a
+                ClawPilot warehouse route. Shopify is reread before the route
+                is saved, and this setup never changes Shopify inventory.
+              </Typography>
+              {mappingLocation ? (
+                <Box
+                  sx={{
+                    border: 1,
+                    borderColor: 'divider',
+                    borderRadius: 1.5,
+                    p: 1.5,
+                  }}
+                >
+                  <Typography variant="body2" fontWeight={700}>
+                    {mappingLocation.name}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {locationAddress(mappingLocation)
+                      || 'Shopify did not provide a complete street address.'}
+                  </Typography>
+                </Box>
+              ) : null}
+              {!mappingLocationCurrent ? (
+                <ToggleButtonGroup
+                  exclusive
+                  fullWidth
+                  size="small"
+                  value={locationRoutingMode}
+                  onChange={(_event, next: LocationRoutingMode | null) => {
+                    if (next) setLocationRoutingMode(next)
+                  }}
+                  aria-label="Shopify location routing choice"
+                >
+                  <ToggleButton value="existing">
+                    Map existing
+                  </ToggleButton>
+                  <ToggleButton value="create">
+                    Create ClawPilot warehouse
+                  </ToggleButton>
+                </ToggleButtonGroup>
+              ) : null}
+              {locationRoutingMode === 'existing' ? (
+                <>
+                  <FormControl fullWidth>
+                    <InputLabel id="shopify-inventory-warehouse-label">
+                      ClawPilot warehouse
+                    </InputLabel>
+                    <Select
+                      labelId="shopify-inventory-warehouse-label"
+                      label="ClawPilot warehouse"
+                      value={mappingWarehouseGlobalId}
+                      onChange={(event) => {
+                        setMappingWarehouseGlobalId(event.target.value)
+                        setMappingInternalLocationGlobalId('')
+                      }}
+                    >
+                      {warehouses.map((warehouse) => (
+                        <MenuItem
+                          key={warehouse.globalId}
+                          value={warehouse.globalId}
+                          disabled={warehouse.status !== 'active'}
+                        >
+                          {warehouse.name} · {warehouse.code}
+                          {warehouse.status !== 'active' ? ' · inactive' : ''}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <FormControl
+                    fullWidth
+                    disabled={!mappingWarehouseGlobalId}
+                  >
+                    <InputLabel id="shopify-inventory-location-label">
+                      Internal stock location
+                    </InputLabel>
+                    <Select
+                      labelId="shopify-inventory-location-label"
+                      label="Internal stock location"
+                      value={mappingInternalLocationGlobalId}
+                      onChange={(event) => {
+                        setMappingInternalLocationGlobalId(event.target.value)
+                      }}
+                    >
+                      {selectedWarehouseLocations.map((location) => (
+                        <MenuItem
+                          key={location.globalId}
+                          value={location.globalId}
+                        >
+                          {location.code}
+                          {location.zone ? ` · ${location.zone}` : ''}
+                          {location.locationType
+                            ? ` · ${location.locationType}`
+                            : ''}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  {!warehouses.some(
+                    (warehouse) => warehouse.status === 'active',
+                  ) ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No active warehouse is available. Create one from this
+                      Shopify location or open the full warehouse setup.
+                    </Typography>
+                  ) : mappingWarehouseGlobalId
+                      && !selectedWarehouseLocations.length ? (
+                      <Typography variant="body2" color="text.secondary">
+                        This warehouse has no active internal stock location.
+                        Add one in Operations before mapping it.
+                      </Typography>
+                    ) : null}
+                  <Button
+                    size="small"
+                    startIcon={<WarehouseRounded />}
+                    onClick={openWarehouseSetup}
+                    sx={{ alignSelf: 'flex-start' }}
+                  >
+                    Open full warehouse setup
+                  </Button>
+                </>
+              ) : warehouseImport ? (
+                <>
+                  <Typography variant="body2" color="text.secondary">
+                    ClawPilot will create the standard receiving, storage,
+                    picking, packing, and shipping topology and route this
+                    Shopify location to its RESERVE-01 stock location.
+                  </Typography>
+                  <TextField
+                    fullWidth
+                    label="Warehouse code"
+                    value={warehouseImport.code}
+                    inputProps={{ maxLength: 32 }}
+                    onChange={(event) => setWarehouseImport({
+                      ...warehouseImport,
+                      code: event.target.value.toUpperCase(),
+                    })}
+                  />
+                  <TextField
+                    fullWidth
+                    label="Warehouse name"
+                    value={warehouseImport.name}
+                    inputProps={{ maxLength: 160 }}
+                    onChange={(event) => setWarehouseImport({
+                      ...warehouseImport,
+                      name: event.target.value,
+                    })}
+                  />
+                  <FormControl fullWidth>
+                    <InputLabel id="shopify-inventory-facility-type-label">
+                      Facility type
+                    </InputLabel>
+                    <Select
+                      labelId="shopify-inventory-facility-type-label"
+                      label="Facility type"
+                      value={warehouseImport.facilityType}
+                      onChange={(event) => setWarehouseImport({
+                        ...warehouseImport,
+                        facilityType: event.target.value as WarehouseImportForm[
+                          'facilityType'
+                        ],
+                      })}
+                    >
+                      {WAREHOUSE_FACILITY_OPTIONS.map((option) => (
+                        <MenuItem key={option.value} value={option.value}>
+                          {option.label}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <FormControl fullWidth>
+                    <InputLabel id="shopify-inventory-timezone-label">
+                      Warehouse timezone
+                    </InputLabel>
+                    <Select
+                      labelId="shopify-inventory-timezone-label"
+                      label="Warehouse timezone"
+                      value={warehouseImport.timezone}
+                      onChange={(event) => setWarehouseImport({
+                        ...warehouseImport,
+                        timezone: event.target.value,
+                      })}
+                    >
+                      {WAREHOUSE_TIMEZONE_OPTIONS.map((timezone) => (
+                        <MenuItem key={timezone} value={timezone}>
+                          {timezone}
+                        </MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <Typography variant="caption" color="text.secondary">
+                    Shopify does not provide a warehouse timezone, so choose
+                    the location’s actual timezone before creating it.
+                  </Typography>
+                </>
+              ) : null}
+              <Typography variant="caption" color="text.secondary">
+                Provider / app-managed fulfillment-service locations remain
+                visible in the routing table but cannot be mapped here.
+              </Typography>
+            </Stack>
+          </DialogContent>
+          <DialogActions sx={{ flexWrap: 'wrap', gap: 0.75 }}>
+            <Button onClick={closeMapping} disabled={mappingBusy}>
+              Cancel
+            </Button>
+            <Button
+              variant="contained"
+              disabled={
+                mappingBusy
+                || (locationRoutingMode === 'existing'
+                  ? !mappingWarehouseGlobalId
+                    || !mappingInternalLocationGlobalId
+                  : !warehouseImport?.code.trim()
+                    || !warehouseImport?.name.trim()
+                    || !warehouseImport?.timezone)
+              }
+              startIcon={mappingBusy
+                ? <CircularProgress size={16} color="inherit" />
+                : undefined}
+              onClick={() => {
+                if (locationRoutingMode === 'create') {
+                  void createWarehouseFromShopifyLocation()
+                } else {
+                  void saveMapping()
+                }
+              }}
+            >
+              {mappingBusy
+                ? locationRoutingMode === 'create'
+                  ? 'Creating warehouse…'
+                  : 'Saving route…'
+                : locationRoutingMode === 'create'
+                  ? 'Create warehouse and route'
+                  : 'Save route'}
+            </Button>
+          </DialogActions>
+        </Dialog>
       </CardContent>
     </Card>
   )

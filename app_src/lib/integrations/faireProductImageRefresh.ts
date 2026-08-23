@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import {
-  readCurrentCommerceProviderImageSources,
   CommerceProviderImageSourceError,
+  withCurrentCommerceProviderImageSources,
 } from '@/lib/integrations/commerceProviderImageSource'
 import {
   FaireProductImageRefreshError,
@@ -23,6 +23,7 @@ const CHANNEL_GLOBAL_PATTERN = /^gpcs(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_REFERENCE_PATTERN = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
 const FAIRE_PRODUCT_PATTERN = /^p_[A-Za-z0-9_-]+$/
 const SAFE_TEXT_PATTERN = /^[^\u0000-\u001f\u007f]+$/u
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/u
 
 export type FaireProductImageRefreshResult = Readonly<{
   productId: string
@@ -48,14 +49,14 @@ export type FaireProductImageRefreshResult = Readonly<{
 
 type Dependencies = {
   readTarget: typeof readFaireProductImageRefreshTargetInPostgres
-  readSources: typeof readCurrentCommerceProviderImageSources
+  withSources: typeof withCurrentCommerceProviderImageSources
   reconcile: typeof reconcileExactFaireProductImageRefreshInPostgres
   now: () => Date
 }
 
 const DEFAULT_DEPENDENCIES: Dependencies = {
   readTarget: readFaireProductImageRefreshTargetInPostgres,
-  readSources: readCurrentCommerceProviderImageSources,
+  withSources: withCurrentCommerceProviderImageSources,
   reconcile: reconcileExactFaireProductImageRefreshInPostgres,
   now: () => new Date(),
 }
@@ -190,6 +191,7 @@ export async function refreshExactFaireProductImages(
     expectedExternalVariantId: unknown
     expectedProviderSku: unknown
     confirmReadOnlyProviderRequest: unknown
+    idempotencyKey: unknown
     actorEmail: string
   },
   overrides: Partial<Dependencies> = {},
@@ -242,6 +244,11 @@ export async function refreshExactFaireProductImages(
       255,
     ),
     actorEmail: exactText(rawInput.actorEmail, 'Actor email', 255),
+    idempotencyKey: exactText(
+      rawInput.idempotencyKey,
+      'Idempotency key',
+      200,
+    ),
   }
   if (
     !CHANNEL_GLOBAL_PATTERN.test(input.channelStateGlobalId)
@@ -252,6 +259,7 @@ export async function refreshExactFaireProductImages(
     || !Number.isSafeInteger(input.expectedChannelStateRowVersion)
     || input.expectedChannelStateRowVersion < 0
     || !FAIRE_PRODUCT_PATTERN.test(input.expectedExternalProductId)
+    || !IDEMPOTENCY_KEY_PATTERN.test(input.idempotencyKey)
   ) {
     fail(
       'FAIRE_PRODUCT_IMAGE_REFRESH_SELECTION_INVALID',
@@ -275,66 +283,72 @@ export async function refreshExactFaireProductImages(
         500,
       )
     }
-    const sources = await dependencies.readSources({
+    return await dependencies.withSources({
       organizationId: target.organizationId,
       accountGlobalId: target.integrationAccountGlobalId,
       provider: 'faire',
       credentialGeneration: target.credentialGeneration,
       externalProductId: target.externalProductId,
-    })
-    const safeImages = sources.map((source) => ({
-      providerImageId: source.providerImageId,
-      locatorSha256: source.locatorSha256,
-      sequence: source.sequence,
-      altText: target.productName,
-      pixelWidth: null,
-      pixelHeight: null,
-      sourceHash: evidenceHash({
-        schema: 'faire-targeted-product-image-observation-v1',
-        providerImageId: source.providerImageId,
-        locatorSha256: source.locatorSha256,
-        sequence: source.sequence,
-        altText: target.productName,
-      }),
-    }))
-    const productSourceHash = evidenceHash({
-      schema: 'faire-targeted-product-image-refresh-v1',
-      account: target.integrationAccountGlobalId,
-      credentialGeneration: target.credentialGeneration,
-      externalProductId: target.externalProductId,
-      externalVariantId: target.externalVariantId,
-      providerSku: target.providerSku,
-      images: safeImages,
-    })
-    const reconciled = await dependencies.reconcile({
-      target,
-      observedAt,
-      productSourceHash,
-      actorEmail: input.actorEmail,
-      images: safeImages,
-    })
-    const jobs = emptyJobCounts()
-    for (const receipt of reconciled.active) jobs[receipt.jobState] += 1
-    return Object.freeze({
-      productId: target.productId,
-      productReferenceCode: target.productReferenceCode,
-      channelStateGlobalId: target.channelStateGlobalId,
-      integrationAccountGlobalId: target.integrationAccountGlobalId,
-      externalProductId: target.externalProductId,
-      externalVariantId: target.externalVariantId,
-      providerSku: target.providerSku,
-      credentialGeneration: target.credentialGeneration,
-      channelStateRowVersion: target.channelStateRowVersion,
-      channelSourceRevision: target.channelSourceRevision,
-      logicalReadOperations: 1,
-      providerRequests: 2,
-      providerWrites: 0,
-      imageSetComplete: false,
-      removalsInferred: false,
-      staleSnapshotIgnored: reconciled.staleSnapshotIgnored,
-      observedImages: reconciled.active.length,
-      jobs,
-      nextAction: 'background_import',
+      authorityKind: 'manual_read_only',
+      intentKey: `faire-product-image-refresh:${input.idempotencyKey}`,
+      acquiredBy: input.actorEmail,
+      consume: async (sources, providerReadLease) => {
+        const safeImages = sources.map((source) => ({
+          providerImageId: source.providerImageId,
+          locatorSha256: source.locatorSha256,
+          sequence: source.sequence,
+          altText: target.productName,
+          pixelWidth: null,
+          pixelHeight: null,
+          sourceHash: evidenceHash({
+            schema: 'faire-targeted-product-image-observation-v1',
+            providerImageId: source.providerImageId,
+            locatorSha256: source.locatorSha256,
+            sequence: source.sequence,
+            altText: target.productName,
+          }),
+        }))
+        const productSourceHash = evidenceHash({
+          schema: 'faire-targeted-product-image-refresh-v1',
+          account: target.integrationAccountGlobalId,
+          credentialGeneration: target.credentialGeneration,
+          externalProductId: target.externalProductId,
+          externalVariantId: target.externalVariantId,
+          providerSku: target.providerSku,
+          images: safeImages,
+        })
+        const reconciled = await dependencies.reconcile({
+          target,
+          observedAt,
+          productSourceHash,
+          actorEmail: input.actorEmail,
+          images: safeImages,
+          providerReadLease,
+        })
+        const jobs = emptyJobCounts()
+        for (const receipt of reconciled.active) jobs[receipt.jobState] += 1
+        return Object.freeze({
+          productId: target.productId,
+          productReferenceCode: target.productReferenceCode,
+          channelStateGlobalId: target.channelStateGlobalId,
+          integrationAccountGlobalId: target.integrationAccountGlobalId,
+          externalProductId: target.externalProductId,
+          externalVariantId: target.externalVariantId,
+          providerSku: target.providerSku,
+          credentialGeneration: target.credentialGeneration,
+          channelStateRowVersion: target.channelStateRowVersion,
+          channelSourceRevision: target.channelSourceRevision,
+          logicalReadOperations: 1 as const,
+          providerRequests: 2 as const,
+          providerWrites: 0 as const,
+          imageSetComplete: false as const,
+          removalsInferred: false as const,
+          staleSnapshotIgnored: reconciled.staleSnapshotIgnored,
+          observedImages: reconciled.active.length,
+          jobs,
+          nextAction: 'background_import' as const,
+        })
+      },
     })
   } catch (error) {
     sanitizedFailure(error)

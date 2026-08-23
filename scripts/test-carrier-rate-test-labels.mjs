@@ -27,6 +27,10 @@ const outputMigrationSource = read(
   'db/migrations/0118_operations_carrier_label_output_artifacts.sql',
 )
 const outputMigration = compactSql(outputMigrationSource)
+const diagnosticMigrationSource = read(
+  'db/migrations/0286_carrier_shipping_account_diagnostics.sql',
+)
+const diagnosticMigration = compactSql(diagnosticMigrationSource)
 
 for (const fragment of [
   "('gsl', 'operations.carrier_rate_test_label'",
@@ -77,6 +81,22 @@ assert.ok(
   !/label_payload\s+text\b/i.test(migrationSource),
   'Rate-test label bytes must use bytea rather than encoded text',
 )
+
+for (const fragment of [
+  "'shipping_account_diagnostic'",
+  "environment IN ('sandbox', 'production')",
+  'validate_operations_carrier_shipping_diagnostic_lineage',
+  "diagnostic_row->>'action' = 'create'",
+  "NEW.environment = 'production'",
+  "? 'production_rate'",
+  "? 'production_label'",
+  "activation.state = 'active'",
+]) {
+  assert.ok(
+    diagnosticMigration.includes(fragment),
+    `Missing LIVE shipping diagnostic migration contract: ${fragment}`,
+  )
+}
 
 for (const fragment of [
   'ADD COLUMN IF NOT EXISTS source_kind text',
@@ -180,7 +200,7 @@ for (const fragment of [
   ') AS requested_output_format',
   'attempt.requested_output_format !== input.format',
   'CARRIER_RATE_TEST_LABEL_OUTPUT_MISMATCH',
-  "rate.purpose = 'sandbox_rate_test'",
+  "rate.purpose IN ('sandbox_rate_test', 'shipping_account_diagnostic')",
 ]) {
   assert.ok(
     labelPersistence.includes(fragment),
@@ -188,8 +208,8 @@ for (const fragment of [
   )
 }
 assert.ok(
-  labelPersistence.match(/rate\.purpose = 'sandbox_rate_test'/g)?.length >= 5,
-  'Every rate-evidence join in carrierRateTestLabels must reject cartonization-only rate evidence',
+  labelPersistence.match(/shipping_account_diagnostic/g)?.length >= 5,
+  'Every rate-evidence join must accept only sandbox or exact shipping-account diagnostic evidence',
 )
 assert.ok(
   !labelPersistence.includes("'cartonization_package_rate'"),
@@ -337,7 +357,8 @@ for (const fragment of [
   'providerStockType: label.providerStockType',
   'printArtifactGlobalId: label.printArtifactGlobalId',
   'artifactGlobalId: job.artifactGlobalId',
-  'lifecycleMode: carrierSandboxLabelLifecycleMode',
+  "label.environment === 'production'",
+  'carrierSandboxLabelLifecycleMode(',
   'providerErrorCodes: attempt.providerErrorCodes',
   'providerHttpStatus: attempt.providerHttpStatus',
   "action === 'close-rate-test-sample-label'",
@@ -376,7 +397,7 @@ for (const fragment of [
   "'close-rate-test-sample-label'",
   'provider code',
   'Step 3 · Print stored label',
-  'Create a sandbox label or select one from Stored test labels before printing.',
+  "Create or select a stored {environment === 'production' ? 'LIVE production' : 'sandbox'} label before printing.",
   'Warehouse-execution permission is required to test print stored labels.',
   'No available printer profiles are configured in an active warehouse for this organization.',
   'Printer profiles are configured, but none supports shipping labels in',

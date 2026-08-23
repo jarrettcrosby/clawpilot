@@ -3,13 +3,14 @@
 import { isIso4217CurrencyCode } from '../currency.ts'
 
 export const CANONICAL_FULFILLMENT_RATE_POLICY_VERSION =
-  'canonical-fulfillment-whole-shipment-rate-v1' as const
+  'canonical-fulfillment-whole-shipment-rate-v3' as const
 
 export const CANONICAL_FULFILLMENT_RATE_OBJECTIVE_SEQUENCE = [
   'whole_shipment_delivery_feasible',
   'lowest_carrier_cost_minor',
   'fewest_transit_days',
   'stable_provider_id',
+  'stable_carrier_account_id',
   'stable_service_id',
 ] as const
 
@@ -23,6 +24,7 @@ const HASH = /^[a-f0-9]{64}$/
 const PACKAGE_KEY = /^[A-Za-z0-9][A-Za-z0-9_.:#-]{0,127}$/
 const SERVICE_CODE = /^[A-Za-z0-9][A-Za-z0-9_.:#-]{0,127}$/
 const RATE_EVIDENCE_GLOBAL_ID = /^grq(?:[0-9]{7}|[0-9a-v]{12})$/
+const CARRIER_ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/
 const ISO_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/
 
@@ -37,13 +39,14 @@ export type CanonicalWholeShipmentRateOffer = Readonly<{
   packagePlanHash: string
   packageCount: number
   packageKeys: readonly string[]
+  carrierAccountGlobalId: string
   provider: CanonicalFulfillmentCarrierProvider
   serviceCode: string
   serviceName: string
   carrierCostMinor: number
   currency: string
-  transitDays: number
-  estimatedDeliveryAt: string
+  transitDays: number | null
+  estimatedDeliveryAt: string | null
 }>
 
 export type CanonicalFulfillmentPlanningInput = Readonly<{
@@ -79,14 +82,15 @@ export type CanonicalFulfillmentRateSelection = Readonly<{
   packageCount: number
   packageKeys: readonly string[]
   rateEvidenceGlobalId: string
+  carrierAccountGlobalId: string
   carrierProvider: CanonicalFulfillmentCarrierProvider
   carrierName: 'UPS' | 'FedEx'
   serviceCode: string
   serviceName: string
   carrierCostMinor: number
   currency: string
-  transitDays: number
-  estimatedDeliveryAt: string
+  transitDays: number | null
+  estimatedDeliveryAt: string | null
   requestedDeliveryAt: string | null
   meetsRequestedDelivery: true
   actualCheckoutShippingChargeMinor: number | null
@@ -280,6 +284,12 @@ function normalizeOffer(
       'Canonical selection supports configured UPS and FedEx offers',
     )
   }
+  if (!CARRIER_ACCOUNT_GLOBAL_ID.test(offer.carrierAccountGlobalId)) {
+    fail(
+      'CANONICAL_FULFILLMENT_RATE_ACCOUNT_INVALID',
+      'Canonical selection requires an exact configured carrier account',
+    )
+  }
   if (
     typeof offer.serviceCode !== 'string'
     || !SERVICE_CODE.test(offer.serviceCode)
@@ -320,10 +330,21 @@ function normalizeOffer(
       'Carrier offer currency does not match the canonical order currency',
     )
   }
+  const transitUnknown = offer.transitDays === null
+  const deliveryUnknown = offer.estimatedDeliveryAt === null
+  if (transitUnknown !== deliveryUnknown) {
+    fail(
+      'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
+      'Carrier transit days and estimated delivery must both be known or both be unavailable',
+    )
+  }
   if (
-    !Number.isSafeInteger(offer.transitDays)
-    || offer.transitDays < 0
-    || offer.transitDays > 365
+    !transitUnknown
+    && (
+      !Number.isSafeInteger(offer.transitDays)
+      || Number(offer.transitDays) < 0
+      || Number(offer.transitDays) > 365
+    )
   ) {
     fail(
       'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
@@ -340,10 +361,10 @@ function normalizeOffer(
     ),
     currency: offerCurrency,
     packageKeys: offerPackageKeys,
-    estimatedDeliveryAt: timestamp(
-      offer.estimatedDeliveryAt,
-      'Estimated delivery',
-    ),
+    transitDays: transitUnknown ? null : Number(offer.transitDays),
+    estimatedDeliveryAt: deliveryUnknown
+      ? null
+      : timestamp(offer.estimatedDeliveryAt, 'Estimated delivery'),
   }
 }
 
@@ -411,11 +432,15 @@ export function selectCanonicalFulfillmentRate(
       packageKeys: expectedPackageKeys,
       currency: expectedCurrency,
     })
-    const serviceKey = `${normalized.provider}:${normalized.serviceCode}`
+    const serviceKey = [
+      normalized.carrierAccountGlobalId,
+      normalized.provider,
+      normalized.serviceCode,
+    ].join(':')
     if (services.has(serviceKey)) {
       fail(
         'CANONICAL_FULFILLMENT_RATE_SERVICE_DUPLICATE',
-        'Canonical carrier offers cannot repeat a provider service',
+        'Canonical carrier offers cannot repeat an account service',
       )
     }
     services.add(serviceKey)
@@ -428,12 +453,19 @@ export function selectCanonicalFulfillmentRate(
   const feasibleOffers = normalizedOffers
     .filter((offer) => (
       requestedDeliveryMs === null
-      || new Date(offer.estimatedDeliveryAt).getTime() <= requestedDeliveryMs
+      || (
+        offer.estimatedDeliveryAt !== null
+        && new Date(offer.estimatedDeliveryAt).getTime()
+          <= requestedDeliveryMs
+      )
     ))
     .sort((left, right) => (
       left.carrierCostMinor - right.carrierCostMinor
-      || left.transitDays - right.transitDays
+      || (left.transitDays ?? 366) - (right.transitDays ?? 366)
       || left.provider.localeCompare(right.provider)
+      || left.carrierAccountGlobalId.localeCompare(
+        right.carrierAccountGlobalId,
+      )
       || left.serviceCode.localeCompare(right.serviceCode)
     ))
   const selected = feasibleOffers[0]
@@ -450,6 +482,7 @@ export function selectCanonicalFulfillmentRate(
     packageCount: expectedPackageCount,
     packageKeys: [...expectedPackageKeys],
     rateEvidenceGlobalId: selected.rateEvidenceGlobalId,
+    carrierAccountGlobalId: selected.carrierAccountGlobalId,
     carrierProvider: selected.provider,
     carrierName: selected.provider === 'ups_rest' ? 'UPS' : 'FedEx',
     serviceCode: selected.serviceCode,

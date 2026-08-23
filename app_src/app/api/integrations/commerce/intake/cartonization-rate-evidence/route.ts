@@ -9,6 +9,9 @@ import {
   normalizeCarrierSandboxParcel,
 } from '@/lib/integrations/carrierSandboxRate'
 import {
+  carrierSenderOriginMatches,
+} from '@/lib/integrations/carrierOriginBinding'
+import {
   assertCommerceIntakeRuntime,
 } from '@/lib/integrations/commerceIntake'
 import {
@@ -36,6 +39,9 @@ import {
 import {
   planSandboxGeometryRatePackages,
 } from '@/lib/operations/sandboxCartonizationRatePlan'
+import {
+  OperationsShadowTrainingError,
+} from '@/lib/operations/shadowTraining'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   CARTONIZATION_RATE_EVIDENCE_CARRIER_PROVIDERS,
@@ -60,6 +66,13 @@ import {
   readOperationalOrderPlanningProviderFromPostgres,
   ShopifyOrderPlanningAuthorityPersistenceError,
 } from '@/lib/persistence/shopifyOrderPlanningAuthority'
+import {
+  assertOperationsShadowTrainingEvidenceRequestInPostgres,
+} from '@/lib/persistence/operationShadowTraining'
+import {
+  assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres,
+  ShopifyTestStoreCanonicalE2ePersistenceError,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
 import { requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
@@ -79,6 +92,11 @@ type NormalizedRateEvidenceRequestBase = {
   expectedCandidateRowVersion: number
   warehouseGlobalId: string
   idempotencyKey: string
+  sandboxE2eAuthorizationGlobalId: string | null
+  shadowTraining: null | {
+    runGlobalId: string
+    expectedRowVersion: number
+  }
 }
 
 type NormalizedOperationalRateEvidenceRequest =
@@ -348,6 +366,36 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
       8,
       160,
     ),
+    sandboxE2eAuthorizationGlobalId:
+      input.sandboxE2eAuthorizationGlobalId === undefined
+        || input.sandboxE2eAuthorizationGlobalId === null
+        || input.sandboxE2eAuthorizationGlobalId === ''
+        ? null
+        : exactReference(
+            input.sandboxE2eAuthorizationGlobalId,
+            /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+            'Shopify test-store authorization Global ID',
+          ),
+    shadowTraining: input.shadowTraining === undefined
+      || input.shadowTraining === null
+      ? null
+      : (() => {
+          const shadowTraining = record(
+            input.shadowTraining,
+            'Shadow training authorization',
+          )
+          return {
+            runGlobalId: exactReference(
+              shadowTraining.runGlobalId,
+              /^gtrn(?:[0-9]{7}|[0-9a-v]{12})$/,
+              'Shadow training run Global ID',
+            ),
+            expectedRowVersion: exactInteger(
+              shadowTraining.expectedRowVersion,
+              'Shadow training run row version',
+            ),
+          }
+        })(),
   }
   if (evidenceMode === 'operational') {
     if (
@@ -359,11 +407,29 @@ function normalizeRequest(value: unknown): NormalizedRateEvidenceRequest {
         'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_ASSUMPTIONS_FORBIDDEN',
       )
     }
+    if (base.shadowTraining && base.sandboxE2eAuthorizationGlobalId) {
+      requestError(
+        'Shopify test-store authorization cannot be combined with a Shadow training run',
+        'SHOPIFY_TEST_E2E_SHADOW_TRAINING_FORBIDDEN',
+      )
+    }
     return {
       ...base,
       evidenceMode,
       selectedMaterials,
     } as NormalizedOperationalRateEvidenceRequest
+  }
+  if (base.shadowTraining) {
+    requestError(
+      'Shadow training authorization is accepted only with factual operational evidence',
+      'CARTONIZATION_RATE_EVIDENCE_SHADOW_TRAINING_MODE_INVALID',
+    )
+  }
+  if (base.sandboxE2eAuthorizationGlobalId) {
+    requestError(
+      'Shopify test-store authorization is accepted only with factual operational evidence',
+      'SHOPIFY_TEST_E2E_EVIDENCE_MODE_INVALID',
+    )
   }
   if (!Array.isArray(input.assumedCommittedQuantities)) {
     requestError('Committed inventory assumptions must be an array')
@@ -442,6 +508,9 @@ function cartonizationRateEvidenceCommandHash(
       request.expectedCandidateRowVersion,
     warehouseGlobalId: request.warehouseGlobalId,
     evidenceMode: request.evidenceMode,
+    shadowTraining: request.shadowTraining,
+    sandboxE2eAuthorizationGlobalId:
+      request.sandboxE2eAuthorizationGlobalId,
     selectedMaterials,
   }
   if (request.evidenceMode === 'operational') {
@@ -484,9 +553,16 @@ function errorResponse(error: unknown) {
       error.status,
     )
   }
+  if (error instanceof ShopifyTestStoreCanonicalE2ePersistenceError) {
+    return json(
+      { ok: false, error: error.message, code: error.code },
+      error.status,
+    )
+  }
   if (
     error instanceof RateEvidenceRequestError
     || error instanceof HybridCartonizationPersistenceError
+    || error instanceof OperationsShadowTrainingError
     || error instanceof ShopifyOrderPlanningAuthorityError
     || error instanceof ShopifyOrderPlanningAuthorityPersistenceError
   ) {
@@ -643,7 +719,8 @@ export async function POST(req: NextRequest) {
   } | null = null
   try {
     const actor = await requireRequestUser(req)
-    if (!operationsCapabilities(actor).canManage) {
+    const capabilities = operationsCapabilities(actor)
+    if (!capabilities.canManage) {
       return json(
         {
           ok: false,
@@ -658,6 +735,60 @@ export async function POST(req: NextRequest) {
     assertCommerceIntakeRuntime()
     const organizationId = activeOperationsOrganizationId(actor)
     const request = normalizeRequest(await requestBody(req))
+    if (request.shadowTraining) {
+      if (!capabilities.canExecute) {
+        return json(
+          {
+            ok: false,
+            error: 'Warehouse-execution permission is required to prepare a local training simulation',
+            code: 'OPERATIONS_SHADOW_TRAINING_EXECUTE_REQUIRED',
+          },
+          403,
+        )
+      }
+      await assertOperationsShadowTrainingEvidenceRequestInPostgres({
+        organizationId,
+        runGlobalId: request.shadowTraining.runGlobalId,
+        expectedRunRowVersion: request.shadowTraining.expectedRowVersion,
+        accountGlobalId: request.accountGlobalId,
+        candidateGlobalId: request.candidateGlobalId,
+        expectedCandidateRowVersion: request.expectedCandidateRowVersion,
+        warehouseGlobalId: request.warehouseGlobalId,
+      })
+    }
+    const operationalProvider = request.evidenceMode === 'operational'
+      ? await readOperationalOrderPlanningProviderFromPostgres({
+          organizationId,
+          accountGlobalId: request.accountGlobalId,
+          candidateGlobalId: request.candidateGlobalId,
+          expectedCandidateRowVersion:
+            request.expectedCandidateRowVersion,
+        })
+      : null
+    if (operationalProvider === 'shopify' && !request.shadowTraining) {
+      if (
+        request.sandboxE2eAuthorizationGlobalId
+        && (!capabilities.canActivate || !capabilities.canExecute)
+      ) {
+        return json(
+          {
+            ok: false,
+            error: 'Owner/admin warehouse-execution permission is required for the exact Shopify test-store lane',
+            code: 'SHOPIFY_TEST_E2E_PERMISSION_REQUIRED',
+          },
+          403,
+        )
+      }
+      await assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        accountGlobalId: request.accountGlobalId,
+        candidateGlobalId: request.candidateGlobalId,
+        expectedCandidateRowVersion: request.expectedCandidateRowVersion,
+        authorizationGlobalId:
+          request.sandboxE2eAuthorizationGlobalId,
+      })
+    }
     const semanticRequestHash =
       cartonizationRateEvidenceCommandHash(organizationId, request)
     const claim = await claimCartonizationRateEvidenceCommandInPostgres({
@@ -713,17 +844,9 @@ export async function POST(req: NextRequest) {
       idempotencyKey: request.idempotencyKey,
       semanticRequestHash,
     }
-    const operationalProvider = request.evidenceMode === 'operational'
-      ? await readOperationalOrderPlanningProviderFromPostgres({
-          organizationId,
-          accountGlobalId: request.accountGlobalId,
-          candidateGlobalId: request.candidateGlobalId,
-          expectedCandidateRowVersion:
-            request.expectedCandidateRowVersion,
-        })
-      : null
     const shopifyOrderPlanningAuthority =
       operationalProvider === 'shopify'
+      && !request.shadowTraining
         ? await inspectShopifyOrderPlanningAuthority({
             organizationId,
             accountGlobalId: request.accountGlobalId,
@@ -740,9 +863,11 @@ export async function POST(req: NextRequest) {
       expectedCandidateRowVersion:
         request.expectedCandidateRowVersion,
       warehouseGlobalId: request.warehouseGlobalId,
-      mode: request.evidenceMode === 'operational'
-        ? 'production'
-        : 'sandbox_demo',
+      mode: request.shadowTraining
+        ? 'shadow_training_simulated'
+        : request.evidenceMode === 'operational'
+          ? 'production'
+          : 'sandbox_demo',
       selectedMaterials: request.selectedMaterials.map((material) => ({
         materialGlobalId: material.materialGlobalId,
         expectedRowVersion: material.expectedRowVersion,
@@ -762,12 +887,17 @@ export async function POST(req: NextRequest) {
               || !material.maximumGrossWeightGrams
               || !material.unitCostMinor
               || !material.currency
-              || material.stockRowVersion === null
-              || material.stockRowVersion === undefined
-              || material.stockOnHandQuantity === null
-              || material.stockOnHandQuantity === undefined
-              || material.activeClaimedQuantity === undefined
-              || !material.availableQuantity
+              || (
+                !request.shadowTraining
+                && (
+                  material.stockRowVersion === null
+                  || material.stockRowVersion === undefined
+                  || material.stockOnHandQuantity === null
+                  || material.stockOnHandQuantity === undefined
+                  || material.activeClaimedQuantity === undefined
+                  || !material.availableQuantity
+                )
+              )
             ) {
               throw new RateEvidenceRequestError(
                 `${material.materialGlobalId} lacks factual rated exterior dimensions or tare`,
@@ -788,13 +918,15 @@ export async function POST(req: NextRequest) {
                   material.maximumGrossWeightGrams,
                 unitCostMinor: material.unitCostMinor,
                 currency: material.currency,
-                stock: {
-                  rowVersion: material.stockRowVersion,
-                  onHandQuantity: material.stockOnHandQuantity,
-                  activeClaimedQuantity:
-                    material.activeClaimedQuantity,
-                  availableQuantity: material.availableQuantity,
-                },
+                stock: request.shadowTraining
+                  ? null
+                  : {
+                      rowVersion: material.stockRowVersion!,
+                      onHandQuantity: material.stockOnHandQuantity!,
+                      activeClaimedQuantity:
+                        material.activeClaimedQuantity!,
+                      availableQuantity: material.availableQuantity!,
+                    },
               },
             }
           }).sort((left, right) => (
@@ -874,13 +1006,6 @@ export async function POST(req: NextRequest) {
       request.evidenceMode === 'operational'
       && plan.geometryFallbackLines.length > 0
     ) {
-      if (read.activationState !== 'shadow') {
-        throw new RateEvidenceRequestError(
-          'Operational OR-Tools cartonization with sandbox carrier reads is limited to Operations Shadow mode',
-          422,
-          'CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED',
-        )
-      }
       let optimizer = null
       try {
         optimizer = configuredOrToolsFulfillmentOptimizer()
@@ -901,6 +1026,9 @@ export async function POST(req: NextRequest) {
           recipePackages: plan.recipePackages,
           materials: read.input.materials,
           inventoryProducts: read.inventory.products,
+          availabilityMode: request.shadowTraining
+            ? 'shadow_training_simulated'
+            : 'operational',
           startingSequence: (
             Math.max(
               0,
@@ -1105,10 +1233,22 @@ export async function POST(req: NextRequest) {
           'CARTONIZATION_RATE_EVIDENCE_CARRIER_REQUIRED',
         )
       }
-      if (
-        connection.senderOriginWarehouseGlobalId
-        !== read.warehouse.globalId
-      ) {
+      const senderAccounts = connection.carrierAccounts.filter(
+        (account) => (
+          account.status === 'active'
+          && account.allowSenderBilling
+        ),
+      )
+      const senderAccount = senderAccounts.length === 1
+        ? senderAccounts[0]
+        : null
+      if (!carrierSenderOriginMatches({
+        senderOriginWarehouseGlobalId:
+          connection.senderOriginWarehouseGlobalId,
+        warehouseGlobalId: read.warehouse.globalId,
+        warehouseAddress: read.warehouse.address,
+        registeredCarrierAddress: senderAccount?.registeredAddress,
+      })) {
         throw new RateEvidenceRequestError(
           `${
             provider === 'ups_rest' ? 'UPS' : 'FedEx'
@@ -1117,12 +1257,6 @@ export async function POST(req: NextRequest) {
           'CARTONIZATION_RATE_EVIDENCE_ORIGIN_MISMATCH',
         )
       }
-      const senderAccounts = connection.carrierAccounts.filter(
-        (account) => (
-          account.status === 'active'
-          && account.allowSenderBilling
-        ),
-      )
       if (senderAccounts.length !== 1) {
         throw new RateEvidenceRequestError(
           `Exactly one active sender-billing ${
@@ -1367,7 +1501,9 @@ export async function POST(req: NextRequest) {
     ))
 
     const planSnapshot = {
-      mode: request.evidenceMode === 'operational'
+      mode: request.shadowTraining
+        ? 'shadow_training'
+        : request.evidenceMode === 'operational'
         ? 'production'
         : 'sandbox_demo',
       carrierReadEnvironment: 'sandbox',
@@ -1398,6 +1534,20 @@ export async function POST(req: NextRequest) {
           : null,
       assumptions: plan.assumptions,
       blockers: plan.blockers,
+      ...(request.shadowTraining
+        ? {
+            shadowTraining: {
+              version: 'shadow-training-evidence-v1',
+              runGlobalId: request.shadowTraining.runGlobalId,
+              runRowVersion: request.shadowTraining.expectedRowVersion,
+              assignmentPolicy: 'local_simulation_only',
+              commerceProviderWrites: 0,
+              inventoryWrites: 0,
+              packagingStockWrites: 0,
+              productionPostage: 0,
+            },
+          }
+        : {}),
       ...(shopifyOrderPlanningAuthority
         ? {
             shopifyOrderPlanningAuthorityHash:
@@ -1428,7 +1578,24 @@ export async function POST(req: NextRequest) {
         shopifyOrderPlanningAuthority?.providerReads || 0,
     }
     const assumptionSnapshot = request.evidenceMode === 'operational'
-      ? {
+      ? request.shadowTraining
+        ? {
+            boundary:
+              'EXACT-ORDER SHADOW TRAINING OVERLAY WITH FACTUAL INPUTS AND READ-ONLY SANDBOX CARRIER ESTIMATES',
+            operatorSuppliedAssumptions: false,
+            operationalMaterialFacts: selectedMaterialRateAssumptions,
+            minimumOverrides: [],
+            inventoryAuthority:
+              'shadow_training_simulated_order_and_material_availability',
+            orderEligibilityAuthority: 'exact_order_shadow_training_authorization',
+            shopifyOrderPlanningAuthorityHash: null,
+            providerOrderReads: 0,
+            planClaimAuthority: 'training_overlay_only_no_inventory_claim',
+            committedInventory: read.inventory.lines,
+            inventoryProducts: read.inventory.products,
+            databaseEffects,
+          }
+        : {
           boundary:
             'OPERATIONAL PACK FACTS WITH READ-ONLY SANDBOX CARRIER ESTIMATES',
           operatorSuppliedAssumptions: false,

@@ -36,6 +36,7 @@ import {
 import {
   oneOffProviderLabel,
   oneOffRateEnvironment,
+  oneOffShippingExecutionModes,
   oneOffShipmentHash,
   canonicalOneOffCarrierSelections,
   oneOffCarrierSelectionKey,
@@ -240,6 +241,60 @@ function line(value: unknown, index: number): OneOffShipmentLineInput {
         PRODUCT_GLOBAL_ID,
       ),
       quantity: integer(source.quantity, `Line ${index + 1} quantity`, 1, 1_000_000),
+    }
+  }
+  if (kind === 'ad_hoc') {
+    exactFields(
+      source,
+      [
+        'kind', 'lineKey', 'name', 'sku', 'quantity', 'unitPriceMinor',
+        'unitWeightGrams', 'unitDimensionsMm',
+      ],
+      `Line ${index + 1}`,
+    )
+    const sku = String(source.sku ?? '').trim()
+    if (sku.length > 80 || /[\u0000-\u001f\u007f]/.test(sku)) {
+      requestError(
+        'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+        `Line ${index + 1} item reference is invalid`,
+      )
+    }
+    const unitWeightGrams = source.unitWeightGrams === null
+      || source.unitWeightGrams === undefined
+      ? null
+      : integer(
+          source.unitWeightGrams,
+          `Line ${index + 1} unit weight`,
+          1,
+          100_000_000,
+        )
+    const unitDimensionsMm = source.unitDimensionsMm === null
+      || source.unitDimensionsMm === undefined
+      ? null
+      : dimensions(
+          source.unitDimensionsMm,
+          `Line ${index + 1} unit dimensions`,
+        )
+    if ((unitWeightGrams === null) !== (unitDimensionsMm === null)) {
+      requestError(
+        'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+        `Line ${index + 1} unit weight and dimensions must both be supplied or both be omitted`,
+      )
+    }
+    return {
+      kind,
+      lineKey: text(source.lineKey, `Line ${index + 1} key`, 80),
+      name: text(source.name, `Line ${index + 1} item description`, 255),
+      sku: sku || null,
+      quantity: integer(source.quantity, `Line ${index + 1} quantity`, 1, 1_000_000),
+      unitPriceMinor: integer(
+        source.unitPriceMinor,
+        `Line ${index + 1} unit value`,
+        0,
+        Number.MAX_SAFE_INTEGER,
+      ),
+      unitWeightGrams,
+      unitDimensionsMm,
     }
   }
   if (kind !== 'new') {
@@ -475,6 +530,20 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
     )
   }
   const lines = source.lines.map(line)
+  const pureAdHoc = lines.every((entry) => entry.kind === 'ad_hoc')
+  if (
+    !pureAdHoc
+    && lines.some((entry) => (
+      entry.kind === 'ad_hoc'
+      && (entry.unitWeightGrams === null || entry.unitDimensionsMm === null)
+    ))
+  ) {
+    requestError(
+      'OPERATIONS_ONE_OFF_AD_HOC_PHYSICAL_FACTS_REQUIRED',
+      'Productless lines mixed with inventory-backed lines require factual unit weight and dimensions',
+      409,
+    )
+  }
   const packages = source.packages.map(parcel)
   for (const [packageIndex, shipmentPackage] of packages.entries()) {
     for (const selection of selectedCarriers) {
@@ -578,18 +647,28 @@ export function validateOneOffShipmentQuoteInput(value: unknown): OneOffShipment
           'OPERATIONS_ONE_OFF_EXECUTION_MODE_INVALID',
           'Choose test or live shipping explicitly',
         ),
-    customerGlobalId: globalId(source.customerGlobalId, 'Customer', CUSTOMER_GLOBAL_ID),
+    customerGlobalId: pureAdHoc && (
+      source.customerGlobalId === null
+      || source.customerGlobalId === undefined
+      || source.customerGlobalId === ''
+    )
+      ? null
+      : globalId(source.customerGlobalId, 'Customer', CUSTOMER_GLOBAL_ID),
     warehouseGlobalId: globalId(source.warehouseGlobalId, 'Warehouse', WAREHOUSE_GLOBAL_ID),
-    inventoryPoolGlobalId: globalId(
-      source.inventoryPoolGlobalId,
-      'Inventory pool',
-      INVENTORY_POOL_GLOBAL_ID,
-    ),
-    receivingLocationGlobalId: globalId(
-      source.receivingLocationGlobalId,
-      'Receiving or pick location',
-      LOCATION_GLOBAL_ID,
-    ),
+    inventoryPoolGlobalId: pureAdHoc
+      ? null
+      : globalId(
+          source.inventoryPoolGlobalId,
+          'Inventory pool',
+          INVENTORY_POOL_GLOBAL_ID,
+        ),
+    receivingLocationGlobalId: pureAdHoc
+      ? null
+      : globalId(
+          source.receivingLocationGlobalId,
+          'Receiving or pick location',
+          LOCATION_GLOBAL_ID,
+        ),
     referenceNumber: text(source.referenceNumber, 'Shipment reference', 120),
     currency,
     requestedDeliveryAt,
@@ -895,27 +974,126 @@ async function insertLoosePackagePlanForQuote(input: {
   return planId
 }
 
-type ActivationRow = QueryResultRow & {
+type ShippingScopeRow = QueryResultRow & {
   pipeline_id: string
-  state: 'disabled' | 'shadow' | 'read_only' | 'active' | 'frozen'
 }
 
-async function activation(client: PoolClient, organizationId: string, lock = false) {
-  const result = await client.query<ActivationRow>(
-    `SELECT data_pipeline_id::text AS pipeline_id, state
-     FROM operations_activation_scopes
-     WHERE organization_id = $1::uuid
-     ${lock ? 'FOR UPDATE' : ''}`,
+async function shippingScope(
+  client: PoolClient,
+  organizationId: string,
+  lock = false,
+  actorEmail?: string,
+): Promise<ShippingScopeRow> {
+  const read = () => client.query<ShippingScopeRow>(
+    `SELECT scope.data_pipeline_id::text AS pipeline_id
+     FROM operations_shipping_scopes scope
+     JOIN pipeline_spaces pipeline
+       ON pipeline.workspace_organization_id = scope.organization_id
+      AND pipeline.id = scope.data_pipeline_id
+     WHERE scope.organization_id = $1::uuid
+     ${lock ? 'FOR UPDATE OF scope' : ''}`,
     [organizationId],
   )
-  if (!result.rows[0]) {
+  const existing = await read()
+  if (existing.rows[0]) return existing.rows[0]
+  await acquireTransactionAdvisoryLock(
+    client,
+    `shipping:scope:${organizationId}`,
+  )
+  const lockedExisting = await read()
+  if (lockedExisting.rows[0]) return lockedExisting.rows[0]
+  const selected = await client.query<{ id: string }>(
+    `SELECT pipeline.id::text
+     FROM pipeline_spaces pipeline
+     LEFT JOIN app_user_organization_memberships membership
+       ON membership.user_email = pipeline.owner_email
+      AND membership.organization_id = pipeline.workspace_organization_id
+     WHERE pipeline.workspace_organization_id = $1::uuid
+     ORDER BY
+       CASE
+         WHEN membership.status = 'active' AND membership.role = 'owner' THEN 0
+         WHEN membership.status = 'active' AND membership.role = 'admin' THEN 1
+         WHEN membership.status = 'active' AND membership.role = 'member' THEN 2
+         ELSE 3
+       END,
+       pipeline.is_default DESC,
+       pipeline.updated_at DESC,
+       pipeline.id
+     LIMIT 1`,
+    [organizationId],
+  )
+  let selectedPipelineId = selected.rows[0]?.id || null
+  if (!selectedPipelineId && actorEmail) {
+    const pipelineOwner = await client.query<{ user_email: string }>(
+      `SELECT membership.user_email
+       FROM app_user_organization_memberships membership
+       WHERE membership.organization_id = $1::uuid
+         AND membership.status = 'active'
+       ORDER BY
+         CASE membership.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+         (membership.user_email = $2) DESC,
+         membership.created_at,
+         membership.user_email
+       LIMIT 1
+       FOR SHARE`,
+      [organizationId, actorEmail],
+    )
+    if (!pipelineOwner.rows[0]) {
+      requestError(
+        'SHIPPING_SCOPE_UNAVAILABLE',
+        'Shipping could not establish an internal workspace scope',
+        409,
+      )
+    }
+    const createdPipeline = await client.query<{ id: string }>(
+      `INSERT INTO pipeline_spaces (
+         name, owner_email, workspace_organization_id,
+         is_default, sheet_id, sync_enabled
+       ) VALUES (
+         'Shipping records', $1, $2::uuid, false, NULL, false
+       )
+       RETURNING id::text`,
+      [pipelineOwner.rows[0].user_email, organizationId],
+    )
+    selectedPipelineId = createdPipeline.rows[0]?.id || null
+    if (selectedPipelineId) {
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'shipping.scope.created',
+        aggregateType: 'pipeline_space',
+        aggregateId: selectedPipelineId,
+        organizationId,
+        eventKey: `shipping:scope:${organizationId}:pipeline:${selectedPipelineId}`,
+        payload: {
+          purpose: 'one_off_shipping_internal_scope',
+          operatorSetupRequired: false,
+        },
+      }, client)
+    }
+  }
+  if (!selectedPipelineId) {
     requestError(
-      'OPERATIONS_ACTIVATION_UNAVAILABLE',
-      'Initialize Operations before creating a one-off shipment',
+      'SHIPPING_SCOPE_UNAVAILABLE',
+      'Shipping could not establish an internal workspace scope',
       409,
     )
   }
-  return result.rows[0]
+  await client.query(
+    `INSERT INTO operations_shipping_scopes (
+       organization_id, data_pipeline_id
+     ) VALUES ($1::uuid, $2::uuid)
+     ON CONFLICT (organization_id) DO NOTHING`,
+    [organizationId, selectedPipelineId],
+  )
+  const created = await read()
+  if (!created.rows[0]) {
+    requestError(
+      'SHIPPING_SCOPE_UNAVAILABLE',
+      'Shipping could not select a workspace pipeline',
+      409,
+    )
+  }
+  return created.rows[0]
 }
 
 type EnabledCarrier = {
@@ -1087,9 +1265,13 @@ function workspaceAddress(value: unknown): Address {
 
 export async function readOneOffShipmentWorkspaceFromPostgres(input: {
   organizationId: string
+  actorEmail: string
+  canPurchaseLivePostage?: boolean
 }): Promise<OneOffShipmentWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const resolvedActivation = await withTransaction((client) => activation(client, organizationId))
+  const resolvedShippingScope = await withTransaction((client) => (
+    shippingScope(client, organizationId, false, input.actorEmail)
+  ))
   const [customers, warehouses, pools, locations, products, sandboxCarriers, productionCarriers] = await Promise.all([
     query<{ global_id: string; name: string }>(
       `SELECT reference_code AS global_id, name
@@ -1099,7 +1281,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
            NOT IN ('true', '1', 'yes')
        ORDER BY lower(name), id
        LIMIT 500`,
-      [resolvedActivation.pipeline_id],
+      [resolvedShippingScope.pipeline_id],
     ),
     query<{ global_id: string; name: string; address: unknown }>(
       `SELECT global_id, name, address
@@ -1116,7 +1298,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
          AND pipeline_id = $2::uuid
          AND active = true
        ORDER BY lower(name), id`,
-      [organizationId, resolvedActivation.pipeline_id],
+      [organizationId, resolvedShippingScope.pipeline_id],
     ),
     query<{
       global_id: string
@@ -1207,7 +1389,7 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
        WHERE product.pipeline_id = $2::uuid AND product.active = true
        ORDER BY lower(product.name), product.id
        LIMIT 1000`,
-      [organizationId, resolvedActivation.pipeline_id],
+      [organizationId, resolvedShippingScope.pipeline_id],
     ),
     enabledOneOffRateSources(organizationId, undefined, 'sandbox'),
     enabledOneOffRateSources(organizationId, undefined, 'production'),
@@ -1227,39 +1409,12 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
   const idByGlobal = new Map(warehouseIds.rows.map((row) => [row.global_id, row.id]))
   return {
     environment: oneOffRateEnvironment(),
-    executionModes: [
-      {
-        mode: 'test',
-        environment: 'sandbox',
-        enabled: resolvedActivation.state === 'shadow' && sandboxCarriers.length > 0,
-        blockers: [
-          ...(resolvedActivation.state === 'shadow'
-            ? []
-            : ['TEST execution requires Operations Shadow']),
-          ...(sandboxCarriers.length
-            ? []
-            : ['Enable a verified sandbox parcel rate account']),
-        ],
-      },
-      {
-        mode: 'live',
-        environment: 'production',
-        enabled: oneOffRateEnvironment() === 'production'
-          && resolvedActivation.state === 'active'
-          && productionCarriers.length > 0,
-        blockers: [
-          ...(oneOffRateEnvironment() === 'production'
-            ? []
-            : ['Live postage is available only in the production runtime']),
-          ...(resolvedActivation.state === 'active'
-            ? []
-            : ['Activate Operations before buying live postage']),
-          ...(productionCarriers.length
-            ? []
-            : ['Enable a verified production parcel rate account']),
-        ],
-      },
-    ],
+    executionModes: oneOffShippingExecutionModes({
+      runtimeEnvironment: oneOffRateEnvironment(),
+      canPurchaseLivePostage: input.canPurchaseLivePostage === true,
+      sandboxCarrierCount: sandboxCarriers.length,
+      productionCarrierCount: productionCarriers.length,
+    }),
     customers: customers.rows.map((customer) => ({
       globalId: customer.global_id,
       name: customer.name,
@@ -1311,11 +1466,10 @@ export async function readOneOffShipmentWorkspaceFromPostgres(input: {
 
 type ResolvedQuoteScope = {
   pipelineId: string
-  activationState: ActivationRow['state']
-  customerId: string
+  customerId: string | null
   warehouseId: string
-  poolId: string
-  locationId: string
+  poolId: string | null
+  locationId: string | null
   warehouseAddress: Address
   linesSnapshot: ResolvedLineSnapshot[]
   packedRerateOrderId: string | null
@@ -1323,7 +1477,7 @@ type ResolvedQuoteScope = {
 }
 
 type ResolvedLineSnapshot = {
-  kind: 'existing' | 'new'
+  kind: 'existing' | 'new' | 'ad_hoc'
   lineKey: string
   quantity: number
   productGlobalId?: string
@@ -1331,8 +1485,8 @@ type ResolvedLineSnapshot = {
   productName: string
   sku: string
   unitPriceMinor: number
-  unitWeightGrams: number
-  unitDimensionsMm: Millimeters
+  unitWeightGrams: number | null
+  unitDimensionsMm: Millimeters | null
   productSourceHash?: string
   packageProfileGlobalId?: string
   packageProfileRowVersion?: number
@@ -1355,19 +1509,25 @@ async function resolveQuoteScope(
   client: PoolClient,
   organizationId: string,
   quote: OneOffShipmentQuoteInput,
+  actorEmail: string,
   inventoryReservationOrderGlobalId: string | null = null,
 ): Promise<ResolvedQuoteScope> {
-  const resolvedActivation = await activation(client, organizationId)
-  const customer = await client.query<{ id: string }>(
+  const resolvedShippingScope = await shippingScope(
+    client,
+    organizationId,
+    false,
+    actorEmail,
+  )
+  const customer = quote.customerGlobalId ? await client.query<{ id: string }>(
     `SELECT id::text
      FROM crm_organizations
      WHERE pipeline_id = $1::uuid AND reference_code = $2
        AND COALESCE(lower(source_payload->>'archived'), 'false')
          NOT IN ('true', '1', 'yes')
      LIMIT 1`,
-    [resolvedActivation.pipeline_id, quote.customerGlobalId],
-  )
-  if (!customer.rows[0]) {
+    [resolvedShippingScope.pipeline_id, quote.customerGlobalId],
+  ) : { rows: [] as Array<{ id: string }> }
+  if (quote.customerGlobalId && !customer.rows[0]) {
     requestError('OPERATIONS_ONE_OFF_CUSTOMER_NOT_FOUND', 'Select an active CRM customer', 404)
   }
   const warehouse = await client.query<{ id: string; name: string; address: unknown }>(
@@ -1529,7 +1689,8 @@ async function resolveQuoteScope(
       )
     }
   }
-  const pool = await client.query<{
+  const requiresInventoryScope = quote.lines.some((item) => item.kind !== 'ad_hoc')
+  const pool = requiresInventoryScope ? await client.query<{
     id: string
     pool_type: 'shared' | 'customer_dedicated'
     owner_customer_id: string | null
@@ -1539,14 +1700,18 @@ async function resolveQuoteScope(
      WHERE organization_id = $1::uuid AND pipeline_id = $2::uuid
        AND global_id = $3 AND active = true
      LIMIT 1`,
-    [organizationId, resolvedActivation.pipeline_id, quote.inventoryPoolGlobalId],
-  )
-  if (!pool.rows[0]) {
+    [organizationId, resolvedShippingScope.pipeline_id, quote.inventoryPoolGlobalId],
+  ) : { rows: [] as Array<{
+    id: string
+    pool_type: 'shared' | 'customer_dedicated'
+    owner_customer_id: string | null
+  }> }
+  if (requiresInventoryScope && !pool.rows[0]) {
     requestError('OPERATIONS_ONE_OFF_POOL_NOT_FOUND', 'Select an active inventory pool', 404)
   }
   if (
-    pool.rows[0].pool_type === 'customer_dedicated'
-    && pool.rows[0].owner_customer_id !== customer.rows[0].id
+    pool.rows[0]?.pool_type === 'customer_dedicated'
+    && pool.rows[0].owner_customer_id !== customer.rows[0]?.id
   ) {
     requestError(
       'OPERATIONS_ONE_OFF_POOL_CUSTOMER_MISMATCH',
@@ -1554,7 +1719,7 @@ async function resolveQuoteScope(
       409,
     )
   }
-  const location = await client.query<{ id: string }>(
+  const location = requiresInventoryScope ? await client.query<{ id: string }>(
     `SELECT id::text
      FROM operations_locations
      WHERE organization_id = $1::uuid AND warehouse_id = $2::uuid
@@ -1562,8 +1727,8 @@ async function resolveQuoteScope(
        AND location_type IN ('receiving', 'pick')
      LIMIT 1`,
     [organizationId, warehouse.rows[0].id, quote.receivingLocationGlobalId],
-  )
-  if (!location.rows[0]) {
+  ) : { rows: [] as Array<{ id: string }> }
+  if (requiresInventoryScope && !location.rows[0]) {
     requestError(
       'OPERATIONS_ONE_OFF_LOCATION_NOT_FOUND',
       'Select an active receiving or pick location in this warehouse',
@@ -1610,7 +1775,7 @@ async function resolveQuoteScope(
          WHERE product.pipeline_id = $2::uuid
            AND product.reference_code = ANY($3::text[])
            AND product.active = true`,
-        [organizationId, resolvedActivation.pipeline_id, existingGlobalIds],
+        [organizationId, resolvedShippingScope.pipeline_id, existingGlobalIds],
       )
     : { rows: [] as Array<{
         id: string
@@ -1648,7 +1813,7 @@ async function resolveQuoteScope(
          )
        LIMIT 1`,
       [
-        resolvedActivation.pipeline_id,
+        resolvedShippingScope.pipeline_id,
         newSkus.map((sku) => sku.toLowerCase()),
         newNames.map((name) => name.toLowerCase()),
       ],
@@ -1703,9 +1868,9 @@ async function resolveQuoteScope(
                   position.created_at, position.id`,
         [
           organizationId,
-          resolvedActivation.pipeline_id,
+          resolvedShippingScope.pipeline_id,
           warehouse.rows[0].id,
-          pool.rows[0].id,
+          pool.rows[0]!.id,
           productIds,
           inventoryReservationOrderGlobalId || '',
         ],
@@ -1737,6 +1902,18 @@ async function resolveQuoteScope(
     inventoryByProductId.set(position.product_id, current)
   }
   const linesSnapshot = quote.lines.map((item): ResolvedLineSnapshot => {
+    if (item.kind === 'ad_hoc') {
+      return {
+        kind: item.kind,
+        lineKey: item.lineKey,
+        quantity: item.quantity,
+        productName: item.name,
+        sku: item.sku || '',
+        unitPriceMinor: item.unitPriceMinor,
+        unitWeightGrams: item.unitWeightGrams,
+        unitDimensionsMm: item.unitDimensionsMm,
+      }
+    }
     if (item.kind === 'new') {
       return {
         kind: item.kind,
@@ -1794,7 +1971,8 @@ async function resolveQuoteScope(
   const lineByKey = new Map(linesSnapshot.map((item) => [item.lineKey, item]))
   for (const shipmentPackage of quote.packages) {
     const allocatedUnitWeight = shipmentPackage.allocations.reduce((sum, allocation) => (
-      sum + lineByKey.get(allocation.lineKey)!.unitWeightGrams * allocation.quantity
+      sum + (lineByKey.get(allocation.lineKey)!.unitWeightGrams || 0)
+        * allocation.quantity
     ), 0)
     if (shipmentPackage.grossWeightGrams < allocatedUnitWeight) {
       requestError(
@@ -1805,12 +1983,11 @@ async function resolveQuoteScope(
     }
   }
   return {
-    pipelineId: resolvedActivation.pipeline_id,
-    activationState: resolvedActivation.state,
-    customerId: customer.rows[0].id,
+    pipelineId: resolvedShippingScope.pipeline_id,
+    customerId: customer.rows[0]?.id || null,
     warehouseId: warehouse.rows[0].id,
-    poolId: pool.rows[0].id,
-    locationId: location.rows[0].id,
+    poolId: pool.rows[0]?.id || null,
+    locationId: location.rows[0]?.id || null,
     warehouseAddress: {
       ...workspaceAddress(warehouse.rows[0].address),
       name: workspaceAddress(warehouse.rows[0].address).name || warehouse.rows[0].name,
@@ -2768,7 +2945,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
   if (quote.executionMode === 'live' && oneOffRateEnvironment() !== 'production') {
     requestError(
       'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
-      'Live carrier rating and postage are available only in the production runtime',
+      'Live carrier rating and postage are available only in production or the trusted Railway development service',
       409,
     )
   }
@@ -2798,6 +2975,7 @@ export async function quoteOneOffShipmentInPostgres(input: {
         client,
         organizationId,
         quote,
+        input.actorEmail,
         inventoryReservationOrderGlobalId,
       )),
       enabledOneOffRateSources(
@@ -2832,20 +3010,6 @@ export async function quoteOneOffShipmentInPostgres(input: {
       }
       return carrier
     })
-    if (
-      (quote.executionMode === 'live' && scope.activationState !== 'active')
-      || (quote.executionMode === 'test' && scope.activationState !== 'shadow')
-    ) {
-      requestError(
-        quote.executionMode === 'live'
-          ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
-          : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
-        quote.executionMode === 'live'
-          ? 'Live one-off rating requires Active Operations'
-          : 'Test one-off rating requires Operations Shadow',
-        409,
-      )
-    }
     const attempts = await Promise.all(selectedCarriers.map((carrier) => (
       carrier.provider === 'wwex_speedship'
         ? attemptWwexCarrierQuote({
@@ -3224,14 +3388,18 @@ function replayedCreateResult(payload: Record<string, unknown> | null): OneOffSh
   const createdProductGlobalIds = Array.isArray(payload.createdProductGlobalIds)
     ? payload.createdProductGlobalIds.map(String)
     : []
+  const adHocItemGlobalIds = Array.isArray(payload.adHocItemGlobalIds)
+    ? payload.adHocItemGlobalIds.map(String)
+    : []
   const result: OneOffShipmentCreateResult = {
     orderGlobalId: String(payload.orderGlobalId || ''),
-    orderStatus: 'planned',
+    orderStatus: payload.orderStatus === 'packed' ? 'packed' : 'planned',
     rowVersion: Number(payload.rowVersion),
     fulfillmentPlanGlobalId: String(payload.fulfillmentPlanGlobalId || ''),
     quoteGlobalId: String(payload.quoteGlobalId || ''),
     selectedOfferGlobalId: String(payload.selectedOfferGlobalId || ''),
     createdProductGlobalIds,
+    adHocItemGlobalIds,
     receiptGlobalId: payload.receiptGlobalId === null
       ? null
       : String(payload.receiptGlobalId || ''),
@@ -3360,10 +3528,10 @@ type LockedQuoteRow = QueryResultRow & {
   id: string
   global_id: string
   pipeline_id: string
-  customer_id: string
+  customer_id: string | null
   warehouse_id: string
-  inventory_pool_id: string
-  receiving_location_id: string
+  inventory_pool_id: string | null
+  receiving_location_id: string | null
   rate_environment: OneOffRateEnvironment
   execution_mode: 'test' | 'live'
   reference_number: string
@@ -3643,11 +3811,20 @@ async function createNewProductsAndReceipt(
       receiptGlobalId: null as string | null,
     }
   }
+  if (!input.quote.inventory_pool_id || !input.quote.receiving_location_id) {
+    requestError(
+      'OPERATIONS_ONE_OFF_INVENTORY_SCOPE_REQUIRED',
+      'New products require an inventory pool and receiving location',
+      409,
+    )
+  }
   const products = new Map<string, CreatedProduct>()
   for (const shipmentLine of newLines) {
     if (
       shipmentLine.physicalUnitsOnHandConfirmed !== true
       || !shipmentLine.productSourceKey
+      || shipmentLine.unitWeightGrams === null
+      || shipmentLine.unitDimensionsMm === null
     ) {
       requestError(
         'OPERATIONS_ONE_OFF_PHYSICAL_UNITS_REQUIRED',
@@ -3921,6 +4098,13 @@ async function lockExistingProductForCreate(
       409,
     )
   }
+  if (!input.quote.inventory_pool_id || !input.quote.receiving_location_id) {
+    requestError(
+      'OPERATIONS_ONE_OFF_INVENTORY_SCOPE_REQUIRED',
+      'Existing products require an inventory pool and physical location',
+      409,
+    )
+  }
   const product = await client.query<{
     id: string
     global_id: string
@@ -4011,6 +4195,13 @@ async function lockExistingProductForCreate(
       409,
     )
   }
+  if (line.unitWeightGrams === null || line.unitDimensionsMm === null) {
+    requestError(
+      'OPERATIONS_ONE_OFF_PRODUCT_PROFILE_REQUIRED',
+      `${line.productName} no longer has complete package measurements`,
+      409,
+    )
+  }
   return {
     product: {
       id: currentProduct.id,
@@ -4031,7 +4222,7 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
   idempotencyKey: string
   quoteGlobalId: string
   selectedOfferGlobalId: string
-  reason: string
+  reason?: string
 }): Promise<OneOffShipmentCreateResult> {
   const organizationId = requireOrganizationId(input.organizationId)
   const idempotencyKey = requireIdempotencyKey(input.idempotencyKey)
@@ -4041,11 +4232,13 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
     'One-off shipment offer',
     OFFER_GLOBAL_ID,
   )
-  const reason = text(input.reason, 'Planning reason', 500, 3)
   const selectedOfferCapability = await query<{
     provider: OneOffCarrierProvider
+    pure_ad_hoc: boolean
   }>(
-    `SELECT offer.provider
+    `SELECT offer.provider,
+            operations_one_off_lines_are_pure_ad_hoc(quote.lines_snapshot)
+              AS pure_ad_hoc
      FROM operations_one_off_shipment_quotes quote
      JOIN operations_one_off_shipment_quote_offers offer
        ON offer.organization_id = quote.organization_id
@@ -4056,6 +4249,10 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
      LIMIT 1`,
     [organizationId, quoteGlobalId, selectedOfferGlobalId],
   )
+  const requestedReason = String(input.reason || '').trim()
+  const reason = selectedOfferCapability.rows[0]?.pure_ad_hoc && !requestedReason
+    ? 'Created from the selected one-off parcel rate'
+    : text(requestedReason, 'Planning reason', 500, 3)
   if (selectedOfferCapability.rows[0]?.provider === 'wwex_speedship') {
     requestError(
       'OPERATIONS_ONE_OFF_RATE_ONLY_OFFER',
@@ -4078,8 +4275,7 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
   if (command.completed) return command.completed
   try {
     return await withTransaction(async (client) => {
-      await acquireTransactionAdvisoryLock(client, `operations:activation:${organizationId}`)
-      const active = await activation(client, organizationId, true)
+      const currentShippingScope = await shippingScope(client, organizationId, true)
       const quoteResult = await client.query<LockedQuoteRow>(
         `SELECT id::text, global_id, pipeline_id::text, customer_id::text,
                 warehouse_id::text, inventory_pool_id::text,
@@ -4098,20 +4294,12 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
         requestError('OPERATIONS_ONE_OFF_QUOTE_NOT_FOUND', 'One-off shipment quote was not found', 404)
       }
       if (
-        (quote.execution_mode === 'test' && (
-          quote.rate_environment !== 'sandbox' || active.state !== 'shadow'
-        ))
-        || (quote.execution_mode === 'live' && (
-          quote.rate_environment !== 'production' || active.state !== 'active'
-        ))
+        (quote.execution_mode === 'test' && quote.rate_environment !== 'sandbox')
+        || (quote.execution_mode === 'live' && quote.rate_environment !== 'production')
       ) {
         requestError(
-          quote.execution_mode === 'live'
-            ? 'OPERATIONS_ONE_OFF_ACTIVE_REQUIRED'
-            : 'OPERATIONS_ONE_OFF_SHADOW_REQUIRED',
-          quote.execution_mode === 'live'
-            ? 'Live one-off shipment plans require Active Operations and production rate evidence'
-            : 'Test one-off shipment plans require Operations Shadow and sandbox rate evidence',
+          'OPERATIONS_ONE_OFF_RATE_ENVIRONMENT_INVALID',
+          'One-off shipment execution mode does not match its carrier rate environment',
           409,
         )
       }
@@ -4129,10 +4317,10 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           409,
         )
       }
-      if (quote.pipeline_id !== active.pipeline_id) {
+      if (quote.pipeline_id !== currentShippingScope.pipeline_id) {
         requestError(
           'OPERATIONS_ONE_OFF_QUOTE_STALE',
-          'The authoritative Operations pipeline changed; request a new quote',
+          'The Shipping workspace pipeline changed; request a new quote',
           409,
         )
       }
@@ -4233,7 +4421,27 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           409,
         )
       }
-      const scopeState = await client.query<{ ok: boolean }>(
+      if (!Array.isArray(quote.lines_snapshot) || !Array.isArray(quote.packages_snapshot)) {
+        requestError(
+          'OPERATIONS_ONE_OFF_QUOTE_SNAPSHOT_INVALID',
+          'The immutable one-off shipment snapshot is invalid',
+          409,
+        )
+      }
+      const pureAdHoc = quote.lines_snapshot.length > 0
+        && quote.lines_snapshot.every((line) => line.kind === 'ad_hoc')
+      const scopeState = pureAdHoc
+        ? await client.query<{ ok: boolean }>(
+          `SELECT true AS ok
+           FROM operations_warehouses warehouse
+           WHERE warehouse.organization_id = $1::uuid
+             AND warehouse.id = $2::uuid
+             AND warehouse.status = 'active'
+           LIMIT 1
+           FOR UPDATE OF warehouse`,
+          [organizationId, quote.warehouse_id],
+        )
+        : await client.query<{ ok: boolean }>(
         `SELECT true AS ok
          FROM crm_organizations customer
          JOIN operations_warehouses warehouse
@@ -4266,18 +4474,13 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           quote.customer_id,
           quote.receiving_location_id,
         ],
-      )
+        )
       if (!scopeState.rows[0]) {
         requestError(
           'OPERATIONS_ONE_OFF_QUOTE_STALE',
-          'The customer, warehouse, inventory pool, or location changed; request a new quote',
-          409,
-        )
-      }
-      if (!Array.isArray(quote.lines_snapshot) || !Array.isArray(quote.packages_snapshot)) {
-        requestError(
-          'OPERATIONS_ONE_OFF_QUOTE_SNAPSHOT_INVALID',
-          'The immutable one-off shipment snapshot is invalid',
+          pureAdHoc
+            ? 'The Shipping origin warehouse changed; request a new quote'
+            : 'The customer, warehouse, inventory pool, or location changed; request a new quote',
           409,
         )
       }
@@ -4454,7 +4657,59 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
         positions: InventoryPosition[]
         quantity: number
       }>()
+      const adHocLines = new Map<string, {
+        id: string
+        globalId: string
+        quantity: number
+      }>()
       for (const shipmentLine of quote.lines_snapshot) {
+        if (shipmentLine.kind === 'ad_hoc') {
+          const itemSnapshot = {
+            kind: 'ad_hoc',
+            lineKey: shipmentLine.lineKey,
+            name: shipmentLine.productName,
+            sku: shipmentLine.sku || null,
+            quantity: shipmentLine.quantity,
+            unitPriceMinor: shipmentLine.unitPriceMinor,
+            unitWeightGrams: shipmentLine.unitWeightGrams,
+            unitDimensionsMm: shipmentLine.unitDimensionsMm,
+          }
+          const adHocLine = await client.query<{ id: string; global_id: string }>(
+            `INSERT INTO operations_one_off_ad_hoc_order_lines (
+               organization_id, quote_id, order_id, line_key,
+               description, item_reference, quantity, unit_price_minor,
+               unit_weight_grams, unit_dimensions_mm, item_snapshot,
+               item_snapshot_hash, created_by
+             ) VALUES (
+               $1::uuid, $2::uuid, $3::uuid, $4,
+               $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13
+             )
+             RETURNING id::text, global_id`,
+            [
+              organizationId,
+              quote.id,
+              order.id,
+              shipmentLine.lineKey,
+              shipmentLine.productName,
+              shipmentLine.sku || null,
+              shipmentLine.quantity,
+              shipmentLine.unitPriceMinor,
+              shipmentLine.unitWeightGrams,
+              shipmentLine.unitDimensionsMm
+                ? JSON.stringify(shipmentLine.unitDimensionsMm)
+                : null,
+              JSON.stringify(itemSnapshot),
+              oneOffShipmentHash(itemSnapshot),
+              input.actorEmail,
+            ],
+          )
+          adHocLines.set(shipmentLine.lineKey, {
+            id: adHocLine.rows[0].id,
+            globalId: adHocLine.rows[0].global_id,
+            quantity: shipmentLine.quantity,
+          })
+          continue
+        }
         const existing = existingProducts.get(shipmentLine.lineKey)
         const created = newProductResult.products.get(shipmentLine.lineKey)
         const product = existing?.product || created
@@ -4783,7 +5038,8 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
              cartonization_evidence_id, evidence_package_key
            ) VALUES (
              $1::uuid, $2::uuid, $3, $4, $5, $6, $7,
-             'planned', NULL, NULL
+             CASE WHEN $8::boolean THEN 'packed' ELSE 'planned' END,
+             NULL, NULL
            )
            RETURNING id::text, global_id`,
           [
@@ -4794,35 +5050,58 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
             shipmentPackage.dimensionsMm.width,
             shipmentPackage.dimensionsMm.height,
             shipmentPackage.grossWeightGrams,
+            pureAdHoc,
           ],
         )
         for (const packageAllocation of shipmentPackage.allocations) {
           const orderLine = orderLines.get(packageAllocation.lineKey)
-          if (!orderLine) {
+          const adHocLine = adHocLines.get(packageAllocation.lineKey)
+          if (!orderLine && !adHocLine) {
             requestError(
               'OPERATIONS_ONE_OFF_QUOTE_SNAPSHOT_INVALID',
               `Parcel ${shipmentPackage.packageKey} references an unknown line`,
               409,
             )
           }
-          await client.query(
-            `INSERT INTO operations_package_contents (
-               organization_id, plan_id, order_id, package_id,
-               order_line_id, quantity, created_by
-             ) VALUES (
-               $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-               $5::uuid, $6, $7
-             )`,
-            [
-              organizationId,
-              plan.rows[0].id,
-              order.id,
-              packageResult.rows[0].id,
-              orderLine.id,
-              packageAllocation.quantity,
-              input.actorEmail,
-            ],
-          )
+          if (orderLine) {
+            await client.query(
+              `INSERT INTO operations_package_contents (
+                 organization_id, plan_id, order_id, package_id,
+                 order_line_id, quantity, created_by
+               ) VALUES (
+                 $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+                 $5::uuid, $6, $7
+               )`,
+              [
+                organizationId,
+                plan.rows[0].id,
+                order.id,
+                packageResult.rows[0].id,
+                orderLine.id,
+                packageAllocation.quantity,
+                input.actorEmail,
+              ],
+            )
+          } else {
+            await client.query(
+              `INSERT INTO operations_one_off_ad_hoc_package_contents (
+                 organization_id, plan_id, order_id, package_id,
+                 ad_hoc_order_line_id, quantity, created_by
+               ) VALUES (
+                 $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+                 $5::uuid, $6, $7
+               )`,
+              [
+                organizationId,
+                plan.rows[0].id,
+                order.id,
+                packageResult.rows[0].id,
+                adHocLine!.id,
+                packageAllocation.quantity,
+                input.actorEmail,
+              ],
+            )
+          }
           packagedQuantity.set(
             packageAllocation.lineKey,
             (packagedQuantity.get(packageAllocation.lineKey) || 0)
@@ -4839,9 +5118,19 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           )
         }
       }
+      for (const [lineKey, adHocLine] of adHocLines) {
+        if (packagedQuantity.get(lineKey) !== adHocLine.quantity) {
+          requestError(
+            'OPERATIONS_ONE_OFF_PACKAGE_ALLOCATION_INVALID',
+            `Parcel allocations do not cover ad-hoc line ${lineKey}`,
+            409,
+          )
+        }
+      }
       const updatedOrder = await client.query<{ row_version: string }>(
         `UPDATE operations_orders
-         SET status = 'planned', promised_delivery_at = $3::timestamptz,
+         SET status = CASE WHEN $5::boolean THEN 'packed' ELSE 'planned' END,
+             promised_delivery_at = $3::timestamptz,
              row_version = row_version + 1, updated_by = $4, updated_at = now()
          WHERE organization_id = $1::uuid AND id = $2::uuid
            AND status = 'imported' AND row_version = 0
@@ -4851,6 +5140,7 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
           order.id,
           selectedOffer.estimated_delivery_at,
           input.actorEmail,
+          pureAdHoc,
         ],
       )
       if (!updatedOrder.rows[0]) {
@@ -4904,13 +5194,14 @@ export async function createAndPlanOneOffShipmentInPostgres(input: {
       })
       const result: OneOffShipmentCreateResult = {
         orderGlobalId: order.global_id,
-        orderStatus: 'planned',
+        orderStatus: pureAdHoc ? 'packed' : 'planned',
         rowVersion: numberValue(updatedOrder.rows[0].row_version),
         fulfillmentPlanGlobalId: plan.rows[0].global_id,
         quoteGlobalId: quote.global_id,
         selectedOfferGlobalId: selectedOffer.global_id,
         createdProductGlobalIds: [...newProductResult.products.values()]
           .map((product) => product.globalId),
+        adHocItemGlobalIds: [...adHocLines.values()].map((line) => line.globalId),
         receiptGlobalId: newProductResult.receiptGlobalId,
         packageCount: quote.packages_snapshot.length,
         replayed: false,

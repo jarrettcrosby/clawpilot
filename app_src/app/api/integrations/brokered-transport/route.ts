@@ -133,7 +133,11 @@ export async function GET(req: NextRequest) {
     const integrations = await getBrokeredTransportIntegrations(
       organizationId(actor),
     )
-    return json({ ok: true, integrations })
+    return json({
+      ok: true,
+      canActivate: operationsCapabilities(actor).canActivate,
+      integrations,
+    })
   } catch (error) {
     return errorResponse(error)
   }
@@ -144,6 +148,7 @@ export async function PATCH(req: NextRequest) {
     const actor = await requireRequestUser(req)
     requirePostgres()
     requireManager(actor)
+    const canActivate = operationsCapabilities(actor).canActivate
     const organization = organizationId(actor)
     const body = await requestBody(req)
     const action = String(body.action || '').trim()
@@ -164,7 +169,7 @@ export async function PATCH(req: NextRequest) {
         idempotencyKey: req.headers.get('idempotency-key'),
         actorEmail: actor.email,
       })
-      return json({ ok: true, integrations })
+      return json({ ok: true, canActivate, integrations })
     }
     if (action === 'disconnect') {
       only(body, ['action', 'provider', 'environment'])
@@ -174,7 +179,7 @@ export async function PATCH(req: NextRequest) {
         environment: body.environment,
         actorEmail: actor.email,
       })
-      return json({ ok: true, integrations })
+      return json({ ok: true, canActivate, integrations })
     }
     if (action === 'verify-and-activate-rates') {
       requireActivator(actor)
@@ -195,7 +200,7 @@ export async function PATCH(req: NextRequest) {
         verificationCountryCode: body.verificationCountryCode,
         actorEmail: actor.email,
       })
-      return json({ ok: true, integrations })
+      return json({ ok: true, canActivate, integrations })
     }
     throw new BrokeredTransportIntegrationError(
       'Unsupported transport integration action',

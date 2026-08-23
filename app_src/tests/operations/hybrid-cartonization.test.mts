@@ -173,6 +173,62 @@ function input(
   }
 }
 
+test('exact measured material evidence needs no redundant reference', () => {
+  const sourceLine = line(1)
+  const measuredMaterial = material({
+    dimensionEvidenceType: 'measured',
+    dimensionEvidenceReference: null,
+  })
+  const result = planHybridCartonization(input(
+    [sourceLine],
+    [recipe(sourceLine, { minimumInputQuantity: 1 })],
+    { materials: [measuredMaterial] },
+  ))
+
+  assert.equal(result.status, 'ready')
+  assert.equal(result.recipePackages.length, 1)
+  assert.equal(
+    result.recipePackages[0].materialEvidence.dimensionEvidenceReference,
+    null,
+  )
+
+  for (const dimensionEvidenceType of [
+    'provider',
+    'customer_confirmed',
+  ] as const) {
+    const missingReference = planHybridCartonization(input(
+      [sourceLine],
+      [recipe(sourceLine, { minimumInputQuantity: 1 })],
+      {
+        materials: [material({
+          dimensionEvidenceType,
+          dimensionEvidenceReference: null,
+        })],
+      },
+    ))
+    assert.equal(missingReference.status, 'blocked')
+    assert.ok(missingReference.blockers.some(
+      ({ code }) => code === 'MATERIAL_EVIDENCE_MISSING',
+    ))
+  }
+
+  const missingTimestamp = planHybridCartonization(input(
+    [sourceLine],
+    [recipe(sourceLine, { minimumInputQuantity: 1 })],
+    {
+      materials: [material({
+        dimensionEvidenceType: 'measured',
+        dimensionEvidenceReference: null,
+        dimensionConfirmedAt: null,
+      })],
+    },
+  ))
+  assert.equal(missingTimestamp.status, 'blocked')
+  assert.ok(missingTimestamp.blockers.some(
+    ({ code }) => code === 'MATERIAL_EVIDENCE_MISSING',
+  ))
+})
+
 test('six mixed 6 oz lines use one AG12V2 only with an explicit sandbox minimum assumption', () => {
   const lines = Array.from({ length: 6 }, (_, index) => line(index + 1))
   const withoutAssumption = planHybridCartonization(

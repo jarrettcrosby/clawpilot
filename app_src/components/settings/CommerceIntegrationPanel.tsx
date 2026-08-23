@@ -30,6 +30,7 @@ import InputAdornment from '@mui/material/InputAdornment'
 import MenuItem from '@mui/material/MenuItem'
 import Select from '@mui/material/Select'
 import Stack from '@mui/material/Stack'
+import Switch from '@mui/material/Switch'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
@@ -50,6 +51,7 @@ import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
 import SyncRounded from '@mui/icons-material/SyncRounded'
 import VisibilityOffRounded from '@mui/icons-material/VisibilityOffRounded'
 import VisibilityRounded from '@mui/icons-material/VisibilityRounded'
+import AddRounded from '@mui/icons-material/AddRounded'
 import IntegrationSetupJourney, {
   type IntegrationSetupStepState,
 } from '@/components/settings/IntegrationSetupJourney'
@@ -61,6 +63,14 @@ import { SHOPIFY_DISTRIBUTED_OPERATIONS_SCOPES }
   from '@/lib/integrations/commerceCapabilities'
 import { resolveCommerceSetupPermissionGuidance }
   from '@/lib/integrations/commerceSetupGuidance'
+import {
+  clearShopifyOrderWebhookRecoveryDraft,
+  isShopifyOrderWebhookRecoveryKey,
+  loadShopifyOrderWebhookRecoveryDraft,
+  resolveShopifyOrderWebhookRecovery,
+  saveShopifyOrderWebhookRecoveryDraft,
+  shopifyOrderWebhookRecoveryKeyHash,
+} from '@/lib/integrations/shopifyOrderWebhookRecovery'
 
 type CommerceProvider = 'shopify' | 'faire'
 type CommerceEnvironment = 'sandbox' | 'production'
@@ -169,6 +179,52 @@ type CommerceState = {
   accounts: CommerceAccount[]
 }
 
+type ProviderWriteControl = {
+  accountGlobalId: string
+  accountDisplayName: string
+  provider: CommerceProvider
+  environment: 'mock' | CommerceEnvironment
+  requestedMode: 'off' | 'on'
+  rowVersion: number
+  effectiveFromDefault: boolean
+  bindingStatus: 'off' | 'current' | 'unavailable' | 'revalidation_required'
+  bindingCurrent: boolean
+  enableAvailable: boolean
+  blocker: { code: string; message: string } | null
+  boundCredentialGeneration: number | null
+  boundGrantedScopeDigest: string | null
+  currentCredentialGeneration: number
+  currentGrantedScopeDigest: string | null
+  changedBy: string | null
+  changedRole: 'owner' | 'admin' | 'member' | null
+  updatedAt: string | null
+  commandEnforcement:
+    | 'shopify_order_management'
+    | 'shopify_fulfillment'
+    | 'shopify_order_management_and_fulfillment'
+    | 'faire_fulfillment'
+    | 'not_connected'
+  providerWritesEffective: boolean
+  fulfillmentWritesEffective: boolean
+  fulfillmentWritesBlockedReason: string | null
+}
+
+type ProviderWritePayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  state?: {
+    organizationId: string
+    accounts: ProviderWriteControl[]
+  }
+  result?: {
+    control: ProviderWriteControl
+    replayed: boolean
+  }
+  canManage?: boolean
+  canEnable?: boolean
+}
+
 type CapabilityDefinition = {
   capability: string
   category: string
@@ -261,6 +317,7 @@ type CommercePayload = {
   expiresAt?: string
   requestedScopes?: string[]
   credential?: RevealedCommerceCredential
+  recoveryIdempotencyKey?: string | null
 }
 
 type RevealedCommerceCredential = {
@@ -374,6 +431,20 @@ type FaireForm = {
   confirmLiveAccess: boolean
 }
 
+const COMMERCE_PROVIDER_OPTIONS: readonly {
+  provider: CommerceProvider
+  description: string
+}[] = [
+  {
+    provider: 'shopify',
+    description: 'Connect a merchant-owned Shopify Dev Dashboard app.',
+  },
+  {
+    provider: 'faire',
+    description: 'Connect a Faire brand API key or approved Custom App.',
+  },
+]
+
 const fieldSx = {
   '& .MuiOutlinedInput-root': {
     borderRadius: '8px',
@@ -470,6 +541,24 @@ async function requestCommerce(init?: RequestInit): Promise<CommercePayload> {
   if (!response.ok || !result.ok) {
     throw new CommerceRequestError(
       result.error || 'Sales-channel integration request failed',
+      result.code,
+    )
+  }
+  return result
+}
+
+async function requestProviderWrites(
+  init?: RequestInit,
+): Promise<ProviderWritePayload> {
+  const response = await fetch('/api/integrations/commerce/provider-writes', {
+    cache: 'no-store',
+    ...init,
+  })
+  const result = await response.json().catch(() => ({})) as
+    ProviderWritePayload
+  if (!response.ok || !result.ok) {
+    throw new CommerceRequestError(
+      result.error || 'Provider writes control request failed',
       result.code,
     )
   }
@@ -586,7 +675,59 @@ function webhookSubscriptionReadiness(
   }
 }
 
-export default function CommerceIntegrationPanel() {
+function orderWebhookSubscriptionReadiness(account: CommerceAccount) {
+  const value = account.configuration.orderWebhookSubscriptions
+  const desiredTopics = [
+    'orders/create',
+    'orders/updated',
+    'orders/edited',
+    'orders/cancelled',
+    'orders/paid',
+    'orders/fulfilled',
+    'orders/partially_fulfilled',
+  ]
+  const desiredFields = ['admin_graphql_api_id', 'updated_at']
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      desiredTopics,
+      desiredFields,
+      observed: false,
+      observedCount: 0,
+      matchingCount: 0,
+      missingTopics: desiredTopics,
+      conflictingTopics: [] as string[],
+      effective: false,
+      observedAt: null as string | null,
+    }
+  }
+  const state = value as Record<string, unknown>
+  const observedAt = typeof state.observedAt === 'string'
+    ? state.observedAt
+    : null
+  const observedTime = observedAt ? Date.parse(observedAt) : Number.NaN
+  const currentEvidence = Number.isFinite(observedTime)
+    && observedTime >= Date.now() - 24 * 60 * 60 * 1_000
+  const bindingCurrent = state.accountGlobalId === account.globalId
+    && state.credentialGeneration === account.credentialVersion
+    && state.desiredUri === account.webhookUrl
+  return {
+    desiredTopics,
+    desiredFields,
+    observed: true,
+    observedCount: Number(state.observedCount || 0),
+    matchingCount: Number(state.matchingCount || 0),
+    missingTopics: valueStrings(state.missingTopics),
+    conflictingTopics: valueStrings(state.conflictingTopics),
+    effective: state.ready === true && bindingCurrent && currentEvidence,
+    observedAt,
+  }
+}
+
+export default function CommerceIntegrationPanel({
+  onNavigate,
+}: {
+  onNavigate?: (hash: string) => void
+} = {}) {
   const [integrations, setIntegrations] = useState<CommerceState>({
     organizationId: '',
     accounts: [],
@@ -596,6 +737,10 @@ export default function CommerceIntegrationPanel() {
   const [canActivate, setCanActivate] = useState(false)
   const [canRevealCredentials, setCanRevealCredentials] = useState(false)
   const [intakeAvailable, setIntakeAvailable] = useState(false)
+  const [providerWriteControls, setProviderWriteControls] = useState<
+    Record<string, ProviderWriteControl>
+  >({})
+  const [providerWritesError, setProviderWritesError] = useState('')
   const [loading, setLoading] = useState(true)
   const [pendingAction, setPendingAction] = useState('')
   const [notificationPolicyDrafts, setNotificationPolicyDrafts] = useState<
@@ -605,11 +750,16 @@ export default function CommerceIntegrationPanel() {
       confirmed: boolean
     }>
   >({})
+  const [orderWebhookDrafts, setOrderWebhookDrafts] = useState<Record<
+    string,
+    { confirmation: string; idempotencyKey: string | null }
+  >>({})
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [revealedCredential, setRevealedCredential] =
     useState<RevealedCommerceCredential | null>(null)
   const organizationIdRef = useRef(integrations.organizationId)
+  const orderWebhookRequestRef = useRef('')
   const [shopifyPreviews, setShopifyPreviews] = useState<
     Record<string, ShopifyOrderPreviewState>
   >({})
@@ -630,6 +780,9 @@ export default function CommerceIntegrationPanel() {
     scopeProfile: 'connection_test',
     confirmLiveAccess: false,
   })
+  const [providerCatalogOpen, setProviderCatalogOpen] = useState(false)
+  const [selectedSetupProvider, setSelectedSetupProvider] =
+    useState<CommerceProvider | null>(null)
   const [setupChecklistProvider, setSetupChecklistProvider] = useState<CommerceProvider | null>(null)
   const setupScopeInputRef = useRef<
     HTMLInputElement | HTMLTextAreaElement | null
@@ -656,8 +809,28 @@ export default function CommerceIntegrationPanel() {
     }
   }
 
+  function applyProviderWritePayload(payload: ProviderWritePayload) {
+    if (!payload.state) return
+    setProviderWriteControls(Object.fromEntries(
+      payload.state.accounts.map((control) => [
+        control.accountGlobalId,
+        control,
+      ]),
+    ))
+    setProviderWritesError('')
+  }
+
   useEffect(() => {
     let active = true
+    requestProviderWrites()
+      .then((payload) => {
+        if (active) applyProviderWritePayload(payload)
+      })
+      .catch((requestError) => {
+        if (active) {
+          setProviderWritesError(actionableCommerceError(requestError))
+        }
+      })
     requestCommerce()
       .then((payload) => {
         if (active) {
@@ -729,10 +902,40 @@ export default function CommerceIntegrationPanel() {
     }
   }, [revealedCredential])
 
+  useEffect(() => {
+    if (!integrations.organizationId || typeof window === 'undefined') return
+    let recoveryStorage: Storage
+    try {
+      recoveryStorage = window.sessionStorage
+    } catch {
+      return
+    }
+    setOrderWebhookDrafts((current) => {
+      const next = { ...current }
+      let changed = false
+      for (const account of integrations.accounts) {
+        if (account.provider !== 'shopify' || next[account.globalId]) continue
+        const recovered = loadShopifyOrderWebhookRecoveryDraft(
+          recoveryStorage,
+          {
+            organizationId: integrations.organizationId,
+            accountGlobalId: account.globalId,
+          },
+        )
+        if (recovered) {
+          next[account.globalId] = recovered
+          changed = true
+        }
+      }
+      return changed ? next : current
+    })
+  }, [integrations.accounts, integrations.organizationId])
+
   async function action(
     key: string,
     body: Record<string, unknown>,
     successMessage: string,
+    additionalHeaders: Record<string, string> = {},
   ) {
     setPendingAction(key)
     setError('')
@@ -740,10 +943,20 @@ export default function CommerceIntegrationPanel() {
     try {
       const payload = await requestCommerce({
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...additionalHeaders,
+        },
         body: JSON.stringify(body),
       })
       applyPayload(payload)
+      void requestProviderWrites()
+        .then((providerWritePayload) => {
+          applyProviderWritePayload(providerWritePayload)
+        })
+        .catch((requestError) => {
+          setProviderWritesError(actionableCommerceError(requestError))
+        })
       setNotice(successMessage)
       return payload
     } catch (requestError) {
@@ -753,6 +966,62 @@ export default function CommerceIntegrationPanel() {
         .catch(() => undefined)
       setError(actionError)
       return false
+    } finally {
+      setPendingAction('')
+    }
+  }
+
+  async function setProviderWrites(
+    account: CommerceAccount,
+    mode: 'off' | 'on',
+  ) {
+    const current = providerWriteControls[account.globalId]
+    if (!current) return
+    const key = `provider-writes:${account.globalId}`
+    setPendingAction(key)
+    setProviderWritesError('')
+    setError('')
+    setNotice('')
+    try {
+      const payload = await requestProviderWrites({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': [
+            'provider-writes',
+            account.globalId,
+            current.rowVersion,
+            mode,
+            crypto.randomUUID(),
+          ].join(':'),
+        },
+        body: JSON.stringify({
+          accountGlobalId: account.globalId,
+          mode,
+          expectedRowVersion: current.rowVersion,
+        }),
+      })
+      const saved = payload.result?.control
+      if (!saved) {
+        throw new CommerceRequestError(
+          'Provider writes control response was incomplete',
+          'COMMERCE_PROVIDER_WRITES_RESPONSE_INVALID',
+        )
+      }
+      setProviderWriteControls((controls) => ({
+        ...controls,
+        [saved.accountGlobalId]: saved,
+      }))
+      setNotice(
+        mode === 'on'
+          ? `${account.displayName} Provider writes set to On for the current credential and granted scopes.`
+          : `${account.displayName} Provider writes set to Off.`,
+      )
+    } catch (requestError) {
+      setProviderWritesError(actionableCommerceError(requestError))
+      await requestProviderWrites()
+        .then((payload) => applyProviderWritePayload(payload))
+        .catch(() => undefined)
     } finally {
       setPendingAction('')
     }
@@ -885,6 +1154,7 @@ export default function CommerceIntegrationPanel() {
     )
     if (saved) {
       setRevealedCredential(null)
+      setSelectedSetupProvider(null)
       setShopify((current) => ({
         ...current,
         clientId: '',
@@ -909,6 +1179,7 @@ export default function CommerceIntegrationPanel() {
       )
       if (saved) {
         setRevealedCredential(null)
+        setSelectedSetupProvider(null)
         setFaire((current) => ({
           ...current,
           apiKey: '',
@@ -1035,6 +1306,208 @@ export default function CommerceIntegrationPanel() {
       },
       `${account.displayName} catalog webhook subscriptions registered and verified.`,
     )
+  }
+
+  async function reconcileOrderWebhooks(account: CommerceAccount) {
+    if (!canRevealCredentials || pendingAction) return
+    if (!account.webhookUrl) {
+      setError('The exact public Shopify callback is not available.')
+      return
+    }
+    const expected = `RECONCILE 7 ORDER WEBHOOKS FOR ${account.globalId}`
+    const draft = orderWebhookDrafts[account.globalId]
+      || { confirmation: '', idempotencyKey: null }
+    if (draft.confirmation !== expected) {
+      setError(`Type exactly: ${expected}`)
+      return
+    }
+    if (orderWebhookRequestRef.current) return
+    orderWebhookRequestRef.current = account.globalId
+    const finishPending = () => {
+      orderWebhookRequestRef.current = ''
+      setPendingAction('')
+    }
+    let recoveredKey: string | null = null
+    if (!draft.idempotencyKey) {
+      setPendingAction(`reconcile-order-webhooks:${account.globalId}`)
+      setError('')
+      setNotice('')
+      try {
+        const recovery = await requestCommerce({
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'recover-shopify-order-webhook-command',
+            accountGlobalId: account.globalId,
+            confirmation: draft.confirmation,
+          }),
+        })
+        if (
+          recovery.recoveryIdempotencyKey !== null
+          && recovery.recoveryIdempotencyKey !== undefined
+          && !isShopifyOrderWebhookRecoveryKey(
+            recovery.recoveryIdempotencyKey,
+          )
+        ) {
+          throw new CommerceRequestError(
+            'ClawPilot received an invalid open-command recovery key.',
+            'SHOPIFY_ORDER_WEBHOOK_RECOVERY_KEY_INVALID',
+          )
+        }
+        recoveredKey = recovery.recoveryIdempotencyKey || null
+      } catch (requestError) {
+        finishPending()
+        setError(actionableCommerceError(requestError))
+        return
+      }
+    }
+    const stableKey = draft.idempotencyKey
+      || recoveredKey
+      || crypto.randomUUID()
+    const stableKeyHash = await shopifyOrderWebhookRecoveryKeyHash(stableKey)
+    if (!stableKeyHash) {
+      finishPending()
+      setError(
+        'ClawPilot could not bind the safe retry key to this browser; order webhooks were not changed.',
+      )
+      return
+    }
+    let recoveryStorage: Storage
+    try {
+      recoveryStorage = window.sessionStorage
+    } catch {
+      finishPending()
+      setError(
+        'ClawPilot could not access safe retry storage for this tab; order webhooks were not changed.',
+      )
+      return
+    }
+    const storedForRecovery = saveShopifyOrderWebhookRecoveryDraft(
+      recoveryStorage,
+      {
+        organizationId: integrations.organizationId,
+        accountGlobalId: account.globalId,
+        confirmation: draft.confirmation,
+        idempotencyKey: stableKey,
+      },
+    )
+    if (!storedForRecovery) {
+      finishPending()
+      setError(
+        'ClawPilot could not store the safe retry key for this tab; order webhooks were not changed.',
+      )
+      return
+    }
+    setOrderWebhookDrafts((current) => ({
+      ...current,
+      [account.globalId]: { ...draft, idempotencyKey: stableKey },
+    }))
+    const organizationId = integrations.organizationId
+    const recoveryIdentity = {
+      organizationId,
+      accountGlobalId: account.globalId,
+      credentialGeneration: account.credentialVersion,
+      callbackUri: account.webhookUrl,
+      idempotencyKeyHash: stableKeyHash,
+    }
+    setPendingAction(`reconcile-order-webhooks:${account.globalId}`)
+    setError('')
+    setNotice('')
+    const outcome = await resolveShopifyOrderWebhookRecovery({
+      identity: recoveryIdentity,
+      patch: async () => {
+        let response: Response
+        try {
+          response = await fetch('/api/integrations/commerce', {
+            cache: 'no-store',
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key': stableKey,
+            },
+            body: JSON.stringify({
+              action: 'reconcile-shopify-order-webhooks',
+              accountGlobalId: account.globalId,
+              confirmation: draft.confirmation,
+            }),
+          })
+        } catch (requestError) {
+          return {
+            status: null,
+            code: null,
+            message: requestError instanceof Error
+              ? requestError.message
+              : 'The reconciliation response was lost.',
+            payload: null,
+            transportError: true,
+            malformed: false,
+          }
+        }
+        let decoded: unknown
+        let malformed = false
+        try {
+          decoded = await response.json()
+        } catch {
+          decoded = null
+          malformed = true
+        }
+        const payload = decoded
+          && typeof decoded === 'object'
+          && !Array.isArray(decoded)
+          ? decoded as CommercePayload
+          : null
+        if (!payload || typeof payload.ok !== 'boolean') malformed = true
+        return {
+          status: response.status,
+          code: typeof payload?.code === 'string' ? payload.code : null,
+          message: typeof payload?.error === 'string'
+            ? payload.error
+            : response.ok
+              ? 'ClawPilot received an incomplete reconciliation response.'
+              : 'Shopify order webhook reconciliation failed.',
+          payload,
+          transportError: false,
+          malformed,
+        }
+      },
+      refresh: () => requestCommerce(),
+    })
+    finishPending()
+    if (outcome.payload) applyPayload(outcome.payload as CommercePayload)
+    if (outcome.disposition === 'retain') {
+      setError(actionableCommerceError(new CommerceRequestError(
+        outcome.message,
+        outcome.code,
+      )))
+      return
+    }
+    const cleared = clearShopifyOrderWebhookRecoveryDraft(
+      recoveryStorage,
+      {
+        organizationId,
+        accountGlobalId: account.globalId,
+      },
+    )
+    if (outcome.disposition === 'succeeded') {
+      setOrderWebhookDrafts((current) => {
+        const next = { ...current }
+        delete next[account.globalId]
+        return next
+      })
+      setNotice(
+        `${account.displayName} order webhooks are registered with the exact minimized two-field JSON profile.${cleared ? '' : ' Browser recovery storage could not be cleared; close this tab before another attempt.'}`,
+      )
+      return
+    }
+    setOrderWebhookDrafts((current) => {
+      const next = { ...current }
+      delete next[account.globalId]
+      return next
+    })
+    setError(actionableCommerceError(new CommerceRequestError(
+      `${outcome.message} The rejected command was released; review the refreshed account state and confirm again.${cleared ? '' : ' Browser recovery storage could not be cleared; close this tab before another attempt.'}`,
+      outcome.code,
+    )))
   }
 
   async function revealCredential(account: CommerceAccount) {
@@ -1165,39 +1638,46 @@ export default function CommerceIntegrationPanel() {
   const setupPermissionGuidanceKey = setupChecklistProvider === 'faire'
     ? `faire:${faire.authPath}:${faire.scopeProfile}`
     : setupChecklistProvider || ''
+  const configuredAccounts = integrations.accounts.filter(
+    (account) => account.configured,
+  )
+  const setupInProgressAccounts = integrations.accounts.filter(
+    (account) => !account.configured,
+  )
+  const configuredProviders = COMMERCE_PROVIDER_OPTIONS
+    .map(({ provider }) => provider)
+    .filter((provider) => configuredAccounts.some(
+      (account) => account.provider === provider,
+    ))
 
   return (
     <Stack spacing={3}>
       <Box>
-        <Stack direction="row" spacing={1} alignItems="center">
-          <StorefrontRounded color="primary" />
-          <Typography variant="h6">Sales channels</Typography>
+        <Stack
+          direction={{ xs: 'column', sm: 'row' }}
+          spacing={1.5}
+          alignItems={{ sm: 'center' }}
+          justifyContent="space-between"
+        >
+          <Stack direction="row" spacing={1} alignItems="center">
+            <StorefrontRounded color="primary" />
+            <Typography variant="h6">Sales channels</Typography>
+          </Stack>
+          <Button
+            variant="contained"
+            startIcon={<AddRounded />}
+            onClick={() => setProviderCatalogOpen(true)}
+            sx={actionButtonSx}
+          >
+            Add sales channel
+          </Button>
         </Stack>
         <Typography color="text.secondary" sx={{ mt: 0.75, maxWidth: 900 }}>
-          Shopify stores and Faire brands are commerce channels for distributed
-          order operations. They are separate from restaurant POS and
+          Connect and manage the commerce channels used for distributed order
+          operations. Sales channels are separate from restaurant POS and
           accounting integrations such as Toast.
         </Typography>
       </Box>
-
-      <Alert severity="info">
-        These are user-owned custom integrations. Create the application in
-        the provider portal first. Shopify verifies the installed
-        merchant-owned app credentials directly. For a single Faire brand,
-        generate the final API key in Faire Brand Portal and paste it below.
-        Custom App OAuth remains available when Faire accepts that app&apos;s
-        authorization flow.
-      </Alert>
-      <Alert severity="warning">
-        A verified connection authorizes automatic read-only product catalog
-        synchronization with no second approval. ClawPilot initializes the
-        resumed policy and queues work only when product-read access, the
-        development runtime, and the Operations product target are eligible.
-        It may create exact product records and mappings in this workspace but
-        cannot write to Shopify or Faire. Canonical order import, inventory
-        mutation, fulfillment export, multi-merchant OAuth, and production
-        provider writes remain unavailable or separately controlled.
-      </Alert>
       <Dialog
         open={setupChecklistProvider !== null}
         onClose={() => setSetupChecklistProvider(null)}
@@ -1377,17 +1857,184 @@ export default function CommerceIntegrationPanel() {
           <Button onClick={() => setSetupChecklistProvider(null)}>Close</Button>
         </DialogActions>
       </Dialog>
+      <Dialog
+        open={providerCatalogOpen}
+        onClose={() => setProviderCatalogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Add sales channel</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Choose a provider to begin its existing connection journey. A
+            connected provider stays managed below instead of opening another
+            connection from this catalog.
+          </Typography>
+          {!canManage ? (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              Manage-integration access is required to start or resume setup.
+            </Alert>
+          ) : null}
+          <Stack spacing={1.5}>
+            {COMMERCE_PROVIDER_OPTIONS.map(({ provider, description }) => {
+              const providerConfigured = configuredAccounts.some(
+                (account) => account.provider === provider,
+              )
+              const providerSetupInProgress = setupInProgressAccounts.some(
+                (account) => account.provider === provider,
+              )
+              return (
+                <Card key={provider} variant="outlined">
+                  <CardContent>
+                    <Stack
+                      direction={{ xs: 'column', sm: 'row' }}
+                      spacing={1.5}
+                      justifyContent="space-between"
+                      alignItems={{ sm: 'center' }}
+                    >
+                      <Box>
+                        <Stack direction="row" spacing={1} alignItems="center">
+                          <Typography fontWeight={700}>
+                            {providerLabel(provider)}
+                          </Typography>
+                          <Chip
+                            size="small"
+                            color={providerConfigured
+                              ? 'success'
+                              : providerSetupInProgress
+                                ? 'warning'
+                                : 'default'}
+                            label={providerConfigured
+                              ? 'Connected'
+                              : providerSetupInProgress
+                                ? 'Setup in progress'
+                                : 'Available'}
+                          />
+                        </Stack>
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+                          {description}
+                        </Typography>
+                      </Box>
+                      <Button
+                        variant="outlined"
+                        disabled={!canManage || providerConfigured}
+                        onClick={() => {
+                          setSelectedSetupProvider(provider)
+                          setProviderCatalogOpen(false)
+                          setSetupChecklistProvider(null)
+                        }}
+                      >
+                        {providerConfigured
+                          ? 'Connected'
+                          : providerSetupInProgress
+                            ? 'Resume setup'
+                            : 'Set up'}
+                      </Button>
+                    </Stack>
+                  </CardContent>
+                </Card>
+              )
+            })}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProviderCatalogOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
       {error ? <Alert severity="error">{error}</Alert> : null}
+      {providerWritesError ? (
+        <Alert severity="warning">{providerWritesError}</Alert>
+      ) : null}
       {notice ? <Alert severity="success">{notice}</Alert> : null}
 
-      <Box
+      {setupInProgressAccounts.length ? (
+        <Box>
+          <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
+            Setup in progress
+          </Typography>
+          <Stack spacing={1.5}>
+            {setupInProgressAccounts.map((account) => (
+              <Card key={account.globalId} variant="outlined">
+                <CardContent>
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1.5}
+                    justifyContent="space-between"
+                    alignItems={{ sm: 'center' }}
+                  >
+                    <Box>
+                      <Typography fontWeight={700}>{account.displayName}</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {providerLabel(account.provider)} · {account.environment}
+                        {' · '}{account.verificationStatus === 'failed'
+                          ? 'Connection needs attention'
+                          : 'Connection not completed'}
+                      </Typography>
+                    </Box>
+                    <Button
+                      variant="outlined"
+                      disabled={!canManage || pendingAction !== ''}
+                      onClick={() => setSelectedSetupProvider(account.provider)}
+                    >
+                      Resume setup
+                    </Button>
+                  </Stack>
+                </CardContent>
+              </Card>
+            ))}
+          </Stack>
+        </Box>
+      ) : null}
+
+      {selectedSetupProvider ? (
+        <Stack spacing={2}>
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            spacing={1}
+            justifyContent="space-between"
+            alignItems={{ sm: 'center' }}
+          >
+            <Box>
+              <Typography variant="subtitle1" fontWeight={700}>
+                Set up {providerLabel(selectedSetupProvider)}
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                Complete this provider&apos;s connection journey, then manage the
+                connected channel below.
+              </Typography>
+            </Box>
+            <Button
+              variant="text"
+              onClick={() => {
+                setSelectedSetupProvider(null)
+                setSetupChecklistProvider(null)
+              }}
+            >
+              Close setup
+            </Button>
+          </Stack>
+          <Alert severity="info">
+            These are user-owned custom integrations. Create the application in
+            the provider portal first. {selectedSetupProvider === 'shopify'
+              ? 'Shopify verifies the installed merchant-owned app credentials directly.'
+              : 'For one Faire brand, generate the final API key in Faire Brand Portal, or use Custom App OAuth when Faire accepts that flow.'}
+          </Alert>
+          <Alert severity="warning">
+            A verified connection authorizes automatic read-only product catalog
+            synchronization with no second approval. ClawPilot queues work only
+            when product-read access, the development runtime, and the Operations
+            product target are eligible. Canonical order import, inventory mutation,
+            fulfillment export, and provider writes remain separately controlled.
+          </Alert>
+          <Box
         sx={{
           display: 'grid',
           gridTemplateColumns: 'minmax(0, 1fr)',
           gap: 2,
         }}
       >
-        <Card variant="outlined">
+        {selectedSetupProvider === 'shopify' ? (
+          <Card variant="outlined">
           <CardContent>
             <Stack
               component="form"
@@ -1610,7 +2257,7 @@ export default function CommerceIntegrationPanel() {
                   },
                   {
                     key: 'shopify-receipts',
-                    label: 'Choose signed receipt handling',
+                    label: 'Signed receipt setup',
                     state: shopifyReceiptState,
                     optional: true,
                     description:
@@ -1745,9 +2392,11 @@ export default function CommerceIntegrationPanel() {
               </Button>
             </Stack>
           </CardContent>
-        </Card>
+          </Card>
+        ) : null}
 
-        <Card variant="outlined">
+        {selectedSetupProvider === 'faire' ? (
+          <Card variant="outlined">
           <CardContent>
             <Stack component="form" spacing={2} onSubmit={connectFaire}>
               <Box>
@@ -2141,20 +2790,24 @@ export default function CommerceIntegrationPanel() {
               </Button>
             </Stack>
           </CardContent>
-        </Card>
-      </Box>
+          </Card>
+        ) : null}
+          </Box>
+        </Stack>
+      ) : null}
 
       <Box>
         <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
-          Connected channel identities
+          Connected sales channels
         </Typography>
-        {integrations.accounts.length === 0 ? (
+        {configuredAccounts.length === 0 ? (
           <Alert severity="info">
-            No Shopify store or Faire brand is connected for this organization.
+            No sales channels are connected yet. Choose Add sales channel to
+            start a provider setup.
           </Alert>
         ) : (
           <Stack spacing={2}>
-            {integrations.accounts.map((account) => {
+            {configuredAccounts.map((account) => {
               const accountName = typeof account.configuration.accountName === 'string'
                 ? account.configuration.accountName
                 : account.displayName
@@ -2200,6 +2853,16 @@ export default function CommerceIntegrationPanel() {
                 webhookSubscriptionGroups
                   .filter((group) => !group.ready)
                   .map((group) => group.label)
+              const orderWebhookReadiness = account.provider === 'shopify'
+                ? orderWebhookSubscriptionReadiness(account)
+                : null
+              const orderWebhookConfirmation = account.provider === 'shopify'
+                ? `RECONCILE 7 ORDER WEBHOOKS FOR ${account.globalId}`
+                : ''
+              const orderWebhookDraft = orderWebhookDrafts[account.globalId]
+                || { confirmation: '', idempotencyKey: null }
+              const orderWebhookPending = pendingAction
+                === `reconcile-order-webhooks:${account.globalId}`
               const webhookReceiptHealth =
                 account.evidence.webhookReceiptHealth
               const preview = shopifyPreviews[account.globalId]
@@ -2257,6 +2920,40 @@ export default function CommerceIntegrationPanel() {
                 === `fulfillment-notifications:${account.globalId}`
               const fulfillmentReadiness =
                 account.fulfillmentWriteReadiness
+              const providerWriteControl =
+                providerWriteControls[account.globalId]
+              const providerWritePending = pendingAction
+                === `provider-writes:${account.globalId}`
+              const providerWriteStatusLabel = !providerWriteControl
+                ? 'Loading'
+                : providerWriteControl.providerWritesEffective
+                    ? providerWriteControl.fulfillmentWritesEffective
+                      ? 'On'
+                      : 'On · Order editing only'
+                    : providerWriteControl.requestedMode === 'on'
+                      ? 'Revalidation required'
+                      : providerWriteControl.commandEnforcement
+                          === 'not_connected'
+                        ? 'Not connected'
+                        : 'Off'
+              const providerWriteDetailBase = !providerWriteControl
+                ? 'Loading this connection control.'
+                : providerWriteControl.bindingStatus
+                  === 'revalidation_required'
+                  ? providerWriteControl.blocker?.message
+                    || 'The saved credential or scope binding is stale.'
+                  : providerWriteControl.commandEnforcement === 'not_connected'
+                    ? 'Provider write commands are not connected for this provider yet. Imports and refresh remain available.'
+                    : providerWriteControl.commandEnforcement === 'faire_fulfillment'
+                      ? 'Controls Faire fulfillment and tracking updates for this connection. Imports and refresh remain available while Off.'
+                      : providerWriteControl.commandEnforcement === 'shopify_fulfillment'
+                        ? 'Controls Shopify fulfillment and tracking updates for this connection. Imports and refresh remain available while Off.'
+                        : providerWriteControl.commandEnforcement === 'shopify_order_management_and_fulfillment'
+                          ? 'Controls Shopify order changes, fulfillment, and tracking updates. Imports and refresh remain available while Off.'
+                          : 'Controls Shopify order changes for this connection. Imports and refresh remain available while Off.'
+              const providerWriteDetail = providerWriteControl
+                ? `${providerWriteDetailBase} Turning Off blocks new attempts; an already authorized in-flight attempt may finish.`
+                : providerWriteDetailBase
               return (
                 <Card key={account.globalId} variant="outlined">
                   <CardContent>
@@ -2339,6 +3036,107 @@ export default function CommerceIntegrationPanel() {
                           ? 'This connection authorizes automatic product catalog sync with no second approval. The signed receipt control below only chooses whether new verified webhook receipts are queued for intake or retained as held evidence. It does not change the API credential, product-catalog authorization, Operations activation, or provider-write authority.'
                           : 'This connection authorizes automatic product catalog sync with no second approval. Eligibility and worker status appear below; the control only pauses or resumes sync. Orders and inventory remain separate.'}
                       </Alert>
+
+                      <Box
+                        sx={{
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 1.5,
+                          px: 1.5,
+                          py: 1,
+                        }}
+                      >
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          alignItems={{ xs: 'stretch', sm: 'center' }}
+                          justifyContent="space-between"
+                          spacing={1}
+                        >
+                          <Box>
+                            <Stack direction="row" spacing={1} alignItems="center">
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Provider writes
+                              </Typography>
+                              <Chip
+                                size="small"
+                                color={providerWriteControl?.bindingStatus
+                                  === 'revalidation_required'
+                                  ? 'warning'
+                                  : 'default'}
+                                label={providerWriteStatusLabel}
+                              />
+                            </Stack>
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.25 }}
+                            >
+                              {providerWriteDetail}
+                            </Typography>
+                          </Box>
+                          {providerWriteControl
+                            && (
+                              providerWriteControl.requestedMode === 'on'
+                              || providerWriteControl.commandEnforcement
+                                !== 'not_connected'
+                            ) ? (
+                              <Switch
+                                checked={providerWriteControl.requestedMode
+                                  === 'on'}
+                                disabled={providerWritePending
+                                  || pendingAction !== ''
+                                  || (providerWriteControl.requestedMode
+                                      !== 'on'
+                                    && (!canActivate
+                                      || !providerWriteControl.enableAvailable))}
+                                onChange={(_, checked) => {
+                                  void setProviderWrites(
+                                    account,
+                                    checked ? 'on' : 'off',
+                                  )
+                                }}
+                                slotProps={{
+                                  input: {
+                                    'aria-label': `Provider writes for ${account.displayName}`,
+                                  },
+                                }}
+                              />
+                            ) : null}
+                        </Stack>
+                        {providerWriteControl?.blocker
+                          && !providerWriteControl.providerWritesEffective ? (
+                            <Typography
+                              variant="caption"
+                              color="text.secondary"
+                              display="block"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {providerWriteControl.blocker.message}
+                            </Typography>
+                          ) : null}
+                        {providerWriteControl
+                          && !providerWriteControl.fulfillmentWritesEffective
+                          && providerWriteControl.fulfillmentWritesBlockedReason
+                          && (
+                            providerWriteControl.providerWritesEffective
+                            || providerWriteControl.requestedMode === 'on'
+                          ) ? (
+                            <Typography
+                              variant="caption"
+                              color="warning.main"
+                              display="block"
+                              sx={{ mt: 0.5 }}
+                            >
+                              {providerWriteControl.fulfillmentWritesBlockedReason}
+                            </Typography>
+                          ) : null}
+                        {providerWritePending ? (
+                          <Typography variant="caption" color="text.secondary">
+                            Saving…
+                          </Typography>
+                        ) : null}
+                      </Box>
 
                       {account.provider === 'shopify'
                         && webhookReceiptHealth
@@ -2549,6 +3347,49 @@ export default function CommerceIntegrationPanel() {
                       </Box>
 
                       {account.provider === 'shopify' ? (
+                        <Box
+                          sx={{
+                            border: 1,
+                            borderColor: 'divider',
+                            borderRadius: 2,
+                            p: 1.5,
+                          }}
+                        >
+                          <Stack
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1}
+                            alignItems={{ sm: 'center' }}
+                            justifyContent="space-between"
+                          >
+                            <Box>
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Fulfillment locations &amp; warehouses
+                              </Typography>
+                              <Typography variant="body2" color="text.secondary">
+                                Read Shopify locations, map an existing warehouse,
+                                or create a ClawPilot warehouse from an eligible
+                                merchant-managed Shopify location.
+                              </Typography>
+                            </Box>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              onClick={() => {
+                                if (onNavigate) {
+                                  onNavigate('#operations/imports')
+                                } else {
+                                  window.location.hash = '#operations/imports'
+                                }
+                              }}
+                              sx={{ flexShrink: 0 }}
+                            >
+                              Configure locations
+                            </Button>
+                          </Stack>
+                        </Box>
+                      ) : null}
+
+                      {account.provider === 'shopify' ? (
                         <ShopifyCarrierServiceSetupPanel
                           accountGlobalId={account.globalId}
                           displayName={account.displayName}
@@ -2558,22 +3399,25 @@ export default function CommerceIntegrationPanel() {
                       {account.provider === 'shopify' && account.webhookUrl ? (
                         <Box>
                           <Typography variant="subtitle2" fontWeight={700}>
-                            Signed receipt setup
+                            Shopify event webhook setup
                           </Typography>
                           <Typography
                             variant="body2"
                             color="text.secondary"
                             sx={{ mb: 1 }}
                           >
-                            Use the account-specific URL below for shop-specific
-                            webhook subscriptions. Test connection performs a
+                            Use the account-specific URL below only for Shopify
+                            event subscriptions such as app scope, inventory,
+                            and product changes. It is separate from the
+                            CarrierService POST callback used for live cart and
+                            checkout rates above. Test connection performs a
                             live, read-only discovery and reports whether every
-                            required subscription points to this exact URL. One
-                            valid signed delivery separately verifies the stored
-                            app secret; neither check writes to Shopify. Run Test
-                            connection at least every 24 hours until automated
-                            subscription rediscovery is available; readiness
-                            fails closed when that evidence expires.
+                            required event subscription points to this exact
+                            URL. One valid signed delivery separately verifies
+                            the stored app secret; neither check writes to
+                            Shopify. Test connection refreshes the 24-hour
+                            operational status, but an older exact discovery
+                            alone does not block a valid signed order event.
                           </Typography>
                           <Stack spacing={1} sx={{ mb: 1 }}>
                             {webhookSubscriptionGroups.map((group) => (
@@ -2594,11 +3438,131 @@ export default function CommerceIntegrationPanel() {
                               </Alert>
                             ))}
                           </Stack>
+                          {orderWebhookReadiness ? (
+                            <Box
+                              sx={{
+                                border: 1,
+                                borderColor: orderWebhookReadiness.effective
+                                  ? 'success.main'
+                                  : 'warning.main',
+                                borderRadius: 2,
+                                p: 1.5,
+                                mb: 1,
+                              }}
+                            >
+                              <Typography variant="subtitle2" fontWeight={700}>
+                                Order event subscriptions
+                              </Typography>
+                              <Stack spacing={0.75} sx={{ mt: 1 }}>
+                                <Alert severity="info">
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Desired · seven minimized JSON topics
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    Fields: {orderWebhookReadiness.desiredFields.join(', ')}
+                                  </Typography>
+                                  <Typography variant="caption" display="block">
+                                    {orderWebhookReadiness.desiredTopics.join(', ')}
+                                  </Typography>
+                                </Alert>
+                                <Alert severity={
+                                  orderWebhookReadiness.observed ? 'info' : 'warning'
+                                }>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Current · {orderWebhookReadiness.observed
+                                      ? `${orderWebhookReadiness.matchingCount} of 7 exact`
+                                      : 'not discovered'}
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    {orderWebhookReadiness.observed
+                                      ? `${orderWebhookReadiness.observedCount} observed · ${orderWebhookReadiness.missingTopics.length} missing · ${orderWebhookReadiness.conflictingTopics.length} conflicting`
+                                      : 'Test the connection or run the single reconciliation action below.'}
+                                  </Typography>
+                                </Alert>
+                                <Alert severity={
+                                  orderWebhookReadiness.effective
+                                    ? 'success'
+                                    : 'warning'
+                                }>
+                                  <Typography variant="body2" fontWeight={700}>
+                                    Effective · {orderWebhookReadiness.effective
+                                      ? 'ready'
+                                      : 'not ready'}
+                                  </Typography>
+                                  <Typography variant="body2">
+                                    {orderWebhookReadiness.effective
+                                      ? 'All seven topics match this account, credential generation, callback URL, JSON format, and two-field profile with current discovery evidence.'
+                                      : 'Operational status needs refresh or the topic, credential generation, callback URL, or two-field profile has drifted. Only exact binding/profile drift blocks signed delivery; age alone does not.'}
+                                  </Typography>
+                                </Alert>
+                              </Stack>
+                              <TextField
+                                fullWidth
+                                size="small"
+                                label="Typed order webhook confirmation"
+                                value={orderWebhookDraft.confirmation}
+                                disabled={
+                                  !canRevealCredentials
+                                  || orderWebhookPending
+                                  || orderWebhookDraft.idempotencyKey !== null
+                                }
+                                onChange={(event) => {
+                                  setOrderWebhookDrafts((current) => ({
+                                    ...current,
+                                    [account.globalId]: {
+                                      confirmation: event.target.value,
+                                      idempotencyKey: null,
+                                    },
+                                  }))
+                                }}
+                                helperText={orderWebhookDraft.idempotencyKey
+                                  ? 'Safe retry is retained for this tab. Ambiguous outcomes stay read-only; a deterministic rejection may resume only the discovered residual plan. The key clears after bound success.'
+                                  : `Type exactly: ${orderWebhookConfirmation}`}
+                                inputProps={{
+                                  autoComplete: 'off',
+                                  spellCheck: false,
+                                  maxLength: 96,
+                                }}
+                                sx={{ mt: 1 }}
+                              />
+                              <Stack
+                                direction={{ xs: 'column', sm: 'row' }}
+                                spacing={1}
+                                alignItems={{ sm: 'center' }}
+                                sx={{ mt: 1 }}
+                              >
+                                <Button
+                                  variant="contained"
+                                  disabled={
+                                    !canRevealCredentials
+                                    || pendingAction !== ''
+                                    || orderWebhookDraft.confirmation
+                                      !== orderWebhookConfirmation
+                                  }
+                                  startIcon={orderWebhookPending
+                                    ? <CircularProgress size={16} />
+                                    : <SyncRounded />}
+                                  onClick={() => {
+                                    void reconcileOrderWebhooks(account)
+                                  }}
+                                >
+                                  {orderWebhookPending
+                                    ? 'Reconciling order webhooks'
+                                    : 'Reconcile order webhooks'}
+                                </Button>
+                                <Typography variant="caption" color="text.secondary">
+                                  Creates missing or updates one mismatched required
+                                  subscription. It never deletes subscriptions or
+                                  touches other topics.
+                                </Typography>
+                              </Stack>
+                            </Box>
+                          ) : null}
                           <Accordion disableGutters sx={{ mb: 1 }}>
                             <AccordionSummary expandIcon={<ExpandMoreRounded />}>
                               <Box>
                                 <Typography variant="subtitle2" fontWeight={700}>
-                                  Webhook setup plan
+                                  Event webhook setup plan
                                 </Typography>
                                 <Typography variant="caption" color="text.secondary">
                                   Provider registration and ClawPilot processing readiness are tracked separately.
@@ -2640,10 +3604,10 @@ export default function CommerceIntegrationPanel() {
                           >
                             <TextField
                               fullWidth
-                              label="Signed webhook receipt URL"
+                              label="Signed Shopify event webhook URL"
                               value={account.webhookUrl}
                               InputProps={{ readOnly: true }}
-                              helperText="Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
+                              helperText="Do not use this URL for Shopify CarrierService cart rates. Core order topics use a separate payload-free exact-read lane. Customer-bearing topics remain rejected until their protected-data lifecycle is implemented."
                               sx={fieldSx}
                             />
                             <Button
@@ -3343,7 +4307,7 @@ export default function CommerceIntegrationPanel() {
         )}
       </Box>
 
-      {catalog ? (
+      {catalog && configuredProviders.length ? (
         <Accordion disableGutters>
           <AccordionSummary expandIcon={<ExpandMoreRounded />}>
             <Box>
@@ -3366,8 +4330,11 @@ export default function CommerceIntegrationPanel() {
                 <TableHead>
                   <TableRow>
                     <TableCell>Capability</TableCell>
-                    <TableCell>Shopify</TableCell>
-                    <TableCell>Faire</TableCell>
+                    {configuredProviders.map((provider) => (
+                      <TableCell key={provider}>
+                        {providerLabel(provider)}
+                      </TableCell>
+                    ))}
                   </TableRow>
                 </TableHead>
                 <TableBody>
@@ -3382,7 +4349,7 @@ export default function CommerceIntegrationPanel() {
                           {definition.owner}
                         </Typography>
                       </TableCell>
-                      {(['shopify', 'faire'] as const).map((provider) => {
+                      {configuredProviders.map((provider) => {
                         const descriptor = catalog.providers[provider]
                         const available =
                           descriptor.providerAvailableCapabilities.includes(
@@ -3437,12 +4404,15 @@ export default function CommerceIntegrationPanel() {
             <Divider sx={{ my: 2 }} />
             <Typography variant="subtitle2">Provider scopes and permissions</Typography>
             <Stack direction="row" gap={0.75} flexWrap="wrap" sx={{ mt: 1 }}>
-              {(catalog.providers.shopify.providerScopes || []).map((scope) => (
-                <Chip key={`shopify-${scope}`} size="small" label={`Shopify: ${scope}`} />
-              ))}
-              {(catalog.providers.faire.providerScopes || []).map((scope) => (
-                <Chip key={scope} size="small" label={scope} />
-              ))}
+              {configuredProviders.flatMap((provider) => (
+                catalog.providers[provider].providerScopes || []
+              ).map((scope) => (
+                <Chip
+                  key={`${provider}-${scope}`}
+                  size="small"
+                  label={`${providerLabel(provider)}: ${scope}`}
+                />
+              )))}
             </Stack>
             <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
               Scope chips are shown for setup reference only; ClawPilot verifies scope evidence
@@ -3452,18 +4422,15 @@ export default function CommerceIntegrationPanel() {
         </Accordion>
       ) : null}
 
-      <Typography variant="caption" color="text.secondary">
-        Shopify custom integrations exchange merchant-owned Dev Dashboard app
-        credentials for short-lived tokens when needed. A Faire single-brand
-        connection sends its encrypted generated API key only in the
-        provider-required access-token header. Faire OAuth uses an
-        authorization-code exchange when the provider accepts that path.
-        Application credentials are encrypted and masked by default; an
-        authorized owning-organization administrator can request an audited
-        30-second reveal of current Shopify or Faire OAuth application
-        credentials. Provider API keys, access tokens, and refresh tokens are
-        never returned.
-      </Typography>
+      {configuredProviders.length ? (
+        <Typography variant="caption" color="text.secondary">
+          Connected sales-channel application credentials are encrypted and
+          masked by default. An authorized owning-organization administrator
+          can request an audited 30-second reveal only where the provider
+          credential type supports it. Provider API keys, access tokens, and
+          refresh tokens are never returned.
+        </Typography>
+      ) : null}
     </Stack>
   )
 }

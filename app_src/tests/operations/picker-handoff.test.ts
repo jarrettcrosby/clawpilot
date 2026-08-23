@@ -431,6 +431,7 @@ mock.module('@/lib/integrations/shopifyFulfillmentWriteback', {
     executeShopifyFulfillmentWriteback: providerCall,
     prepareShopifyFulfillmentWriteback: providerCall,
     reconcileShopifyFulfillmentWriteback: providerCall,
+    shopifyFulfillmentAttemptSignatureHashCandidates: providerCall,
   },
 })
 

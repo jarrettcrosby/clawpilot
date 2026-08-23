@@ -110,27 +110,30 @@ async function assertEligibilityTruthTable(databaseUrl) {
         provider_active,
         requires_shipping,
         weight_grams,
-        expected
+        expected_legacy,
+        expected_rating
       ) AS (VALUES
-        ('active sandbox', 'shopify', 'sandbox', 'ACTIVE', 'active', true, true, 170, true),
-        ('unlisted sandbox', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, 170, true),
-        ('unlisted production', 'shopify', 'production', 'UNLISTED', 'unlisted', false, true, 170, false),
-        ('unlisted mock', 'shopify', 'mock', 'UNLISTED', 'unlisted', false, true, 170, false),
-        ('wrong provider', 'faire', 'sandbox', 'UNLISTED', 'unlisted', false, true, 170, false),
-        ('unlisted marked active', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', true, true, 170, false),
-        ('unlisted raw mismatch', 'shopify', 'sandbox', 'ACTIVE', 'unlisted', false, true, 170, false),
-        ('active raw mismatch', 'shopify', 'sandbox', 'UNLISTED', 'active', true, true, 170, false),
-        ('draft', 'shopify', 'sandbox', 'DRAFT', 'draft', false, true, 170, false),
-        ('archived', 'shopify', 'sandbox', 'ARCHIVED', 'archived', false, true, 170, false),
-        ('unavailable', 'shopify', 'sandbox', 'UNAVAILABLE', 'unavailable', false, true, 170, false),
-        ('unknown', 'shopify', 'sandbox', 'UNKNOWN', 'unknown', NULL, true, 170, false),
-        ('not shipping', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, false, 170, false),
-        ('zero weight', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, 0, false),
-        ('missing weight', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, NULL, false)
+        ('active sandbox', 'shopify', 'sandbox', 'ACTIVE', 'active', true, true, 170, true, true),
+        ('active production', 'shopify', 'production', 'ACTIVE', 'active', true, true, 170, false, true),
+        ('unlisted sandbox', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, 170, true, true),
+        ('unlisted production', 'shopify', 'production', 'UNLISTED', 'unlisted', false, true, 170, false, true),
+        ('unlisted mock', 'shopify', 'mock', 'UNLISTED', 'unlisted', false, true, 170, false, false),
+        ('wrong provider', 'faire', 'sandbox', 'UNLISTED', 'unlisted', false, true, 170, false, false),
+        ('unlisted marked active', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', true, true, 170, false, false),
+        ('unlisted raw mismatch', 'shopify', 'sandbox', 'ACTIVE', 'unlisted', false, true, 170, false, false),
+        ('active raw mismatch', 'shopify', 'sandbox', 'UNLISTED', 'active', true, true, 170, false, false),
+        ('draft', 'shopify', 'sandbox', 'DRAFT', 'draft', false, true, 170, false, false),
+        ('archived', 'shopify', 'sandbox', 'ARCHIVED', 'archived', false, true, 170, false, false),
+        ('unavailable', 'shopify', 'sandbox', 'UNAVAILABLE', 'unavailable', false, true, 170, false, false),
+        ('unknown', 'shopify', 'sandbox', 'UNKNOWN', 'unknown', NULL, true, 170, false, false),
+        ('not shipping', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, false, 170, false, false),
+        ('zero weight', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, 0, false, false),
+        ('missing weight', 'shopify', 'sandbox', 'UNLISTED', 'unlisted', false, true, NULL, false, false)
       )
       SELECT
         case_name,
-        expected,
+        expected_legacy,
+        expected_rating,
         operations_shopify_checkout_channel_is_eligible(
           provider,
           environment,
@@ -139,12 +142,30 @@ async function assertEligibilityTruthTable(databaseUrl) {
           provider_active,
           requires_shipping,
           weight_grams
-        ) AS actual
+        ) AS actual_legacy,
+        operations_shopify_checkout_rating_channel_is_eligible(
+          provider,
+          environment,
+          provider_status_raw,
+          normalized_status,
+          provider_active,
+          requires_shipping,
+          weight_grams
+        ) AS actual_rating
       FROM cases
       ORDER BY case_name
     `)
     for (const row of result.rows) {
-      assert.equal(row.actual, row.expected, row.case_name)
+      assert.equal(
+        row.actual_legacy,
+        row.expected_legacy,
+        `${row.case_name}: legacy publication predicate`,
+      )
+      assert.equal(
+        row.actual_rating,
+        row.expected_rating,
+        `${row.case_name}: rating-only predicate`,
+      )
     }
     const metadata = await pool.query(`
       SELECT
@@ -398,6 +419,15 @@ async function seedTriggerFixture(pool) {
 
   const policySnapshot = {
     version: 'shopify-checkout-rating-policy-v1',
+    shadowCheckoutAudience: {
+      version: 'shopify-checkout-audience-v1',
+      mode: 'all_eligible',
+    },
+    checkoutRateControl: {
+      version: 'shopify-checkout-rate-control-v1',
+      audience: 'all_eligible',
+      rateSource: 'sandbox',
+    },
     planRateOptimization: {
       version: 'shopify-checkout-plan-rate-objective-v2',
       maxCandidates: 4,
@@ -608,6 +638,7 @@ async function seedTriggerFixture(pool) {
     pipelineId,
     productId,
     shopifyAccountId,
+    configId,
     carrierAccounts,
     externalProductId,
     externalVariantId,
@@ -677,6 +708,121 @@ async function assertMappingRejected(
   }
 }
 
+async function assertProductionRatingMappingAccepted(pool, fixture) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Convert only this disposable fixture to an exact LIVE rating setup while
+    // bypassing unrelated provider-write mutation guards. The mapping insert
+    // itself runs with every production trigger enabled.
+    await client.query(`SET LOCAL session_replication_role = 'replica'`)
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET environment = 'production'
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, fixture.shopifyAccountId],
+    )
+    await client.query(
+      `UPDATE operations_integration_accounts
+       SET environment = 'production',
+           configuration = jsonb_build_object(
+             'allowedCapabilities', jsonb_build_array('production_rate')
+           )
+       WHERE organization_id = $1::uuid
+         AND id = ANY($2::uuid[])`,
+      [
+        fixture.organizationId,
+        Object.values(fixture.carrierAccounts).map(
+          (entry) => entry.integrationAccountId,
+        ),
+      ],
+    )
+    await client.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_snapshot = jsonb_set(
+             policy_snapshot,
+             '{checkoutRateControl,rateSource}',
+             '"production"'::jsonb,
+             false
+           )
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, fixture.configId],
+    )
+    await client.query(`SET LOCAL session_replication_role = 'origin'`)
+
+    const readiness = await client.query(
+      `SELECT
+         operations_shopify_carrier_service_rating_environment_is_ready(
+           $1::uuid, $2::uuid, 'production'
+         ) AS environment_ready,
+         operations_shopify_carrier_service_rating_runtime_is_ready(
+           $1::uuid, $2::uuid
+         ) AS runtime_ready`,
+      [fixture.organizationId, fixture.configId],
+    )
+    assert.deepEqual(
+      readiness.rows[0],
+      { environment_ready: true, runtime_ready: true },
+      'the production fixture must satisfy rating-only readiness without widening provider-write readiness',
+    )
+
+    await client.query(`SET LOCAL session_replication_role = 'replica'`)
+    await client.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_snapshot = jsonb_set(
+             policy_snapshot,
+             '{checkoutRateControl,audience}',
+             '"restricted_customers"'::jsonb,
+             false
+           )
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, fixture.configId],
+    )
+    await client.query(`SET LOCAL session_replication_role = 'origin'`)
+    const restrictedLiveReadiness = await client.query(
+      `SELECT
+         operations_shopify_carrier_service_rating_environment_is_ready(
+           $1::uuid, $2::uuid, 'production'
+         ) AS environment_ready,
+         operations_shopify_carrier_service_rating_runtime_is_ready(
+           $1::uuid, $2::uuid
+         ) AS runtime_ready`,
+      [fixture.organizationId, fixture.configId],
+    )
+    assert.deepEqual(
+      restrictedLiveReadiness.rows[0],
+      { environment_ready: true, runtime_ready: false },
+      'Restricted LIVE must be rejected by authoritative SQL runtime readiness even when every carrier fact is ready',
+    )
+
+    await client.query(`SET LOCAL session_replication_role = 'replica'`)
+    await client.query(
+      `UPDATE operations_shopify_carrier_service_configs
+       SET policy_snapshot = jsonb_set(
+             policy_snapshot,
+             '{checkoutRateControl,audience}',
+             '"all_eligible"'::jsonb,
+             false
+           )
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [fixture.organizationId, fixture.configId],
+    )
+    await client.query(`SET LOCAL session_replication_role = 'origin'`)
+
+    const accepted = await insertCheckoutMapping(client, fixture)
+    assert.equal(accepted.rowCount, 1)
+    assert.equal(accepted.rows[0].provider_lifecycle_state, 'unlisted')
+    assert.equal(accepted.rows[0].projection_state, 'current')
+  } finally {
+    await client.query('ROLLBACK').catch(() => undefined)
+    client.release()
+  }
+}
+
 async function assertMappingTriggerContract(databaseUrl) {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 })
   try {
@@ -691,7 +837,7 @@ async function assertMappingTriggerContract(databaseUrl) {
            AND integration_account_id = $2::uuid`,
         [fixture.organizationId, fixture.shopifyAccountId],
       ),
-      message: /exact eligible sandbox shipping and pack evidence/u,
+      message: /exact eligible Shopify rating-channel and pack evidence/u,
     })
     await assertMappingRejected(pool, fixture, {
       overrides: { packEvidenceHash: sha('stale-pack-evidence') },
@@ -709,7 +855,7 @@ async function assertMappingTriggerContract(databaseUrl) {
            AND id = $2::uuid`,
         [fixture.organizationId, fixture.channelStateId],
       ),
-      message: /exact eligible sandbox shipping and pack evidence/u,
+      message: /exact eligible Shopify rating-channel and pack evidence/u,
     })
     await assertMappingRejected(pool, fixture, {
       mutate: (client) => client.query(
@@ -724,6 +870,7 @@ async function assertMappingTriggerContract(databaseUrl) {
       ),
       message: /registered ready CarrierService/u,
     })
+    await assertProductionRatingMappingAccepted(pool, fixture)
     const accepted = await insertCheckoutMapping(pool, fixture)
     assert.equal(accepted.rowCount, 1)
     assert.deepEqual(

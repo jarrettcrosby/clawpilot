@@ -34,7 +34,9 @@ export function availableOperationsOrderActions(input: {
   activationState: OperationsActivationState
   canExecute: boolean
   canManage?: boolean
-  canActivate?: boolean
+  canPurchaseLivePostage?: boolean
+  fulfillmentWritesEnabled?: boolean
+  fulfillmentWritesBlockedReason?: string | null
   planStatus: string | null
   waveStatus: string | null
   lineCount: number
@@ -56,15 +58,18 @@ export function availableOperationsOrderActions(input: {
   unresolvedLabelAttemptCount?: number
   existingShipmentCount?: number
   sandboxE2eAuthorized?: boolean
+  sandboxE2eAuthorityKind?: 'legacy_packed' | 'shopify_test_store_canonical' | null
+  sandboxE2eFulfillmentConfirmed?: boolean
   nativeOneOffGroupReady?: boolean
   nativeOneOffGroupBlockedReason?: string | null
   shopifyExternalFulfillmentReconciliationRequired?: boolean
+  replanningCorrection?: OperationsOrderActionAvailability | null
 }): OperationsOrderActionAvailability[] {
+  const canonicalShopifyAuthorized =
+    input.sandboxE2eAuthorityKind === 'shopify_test_store_canonical'
   let releaseBlockedReason: string | null = null
   if (!input.canExecute) {
     releaseBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    releaseBlockedReason = 'Set Operations to Shadow or Active before releasing warehouse work.'
   } else if (input.status !== 'planned') {
     releaseBlockedReason = input.status === 'released' || input.status === 'picking'
       ? 'This order is already released to warehouse execution.'
@@ -82,8 +87,6 @@ export function availableOperationsOrderActions(input: {
   let pickBlockedReason: string | null = null
   if (!input.canExecute) {
     pickBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    pickBlockedReason = 'Set Operations to Shadow or Active before confirming warehouse work.'
   } else if (input.status !== 'released') {
     pickBlockedReason = input.status === 'picking'
       ? 'Every pick on this wave is already confirmed.'
@@ -103,8 +106,6 @@ export function availableOperationsOrderActions(input: {
     externalFulfillmentBlockedReason = 'Operations manage permission is required.'
   } else if (!input.canExecute) {
     externalFulfillmentBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    externalFulfillmentBlockedReason = 'Set Operations to Shadow or Active before reconciling warehouse work.'
   } else if (input.sourceProvider !== 'shopify') {
     externalFulfillmentBlockedReason = 'External fulfillment reconciliation requires a Shopify order.'
   } else if (!input.shopifyExternalFulfillmentReconciliationRequired) {
@@ -124,8 +125,6 @@ export function availableOperationsOrderActions(input: {
   let packBlockedReason: string | null = null
   if (!input.canExecute) {
     packBlockedReason = 'Operations execute permission is required.'
-  } else if (!['shadow', 'active'].includes(input.activationState)) {
-    packBlockedReason = 'Set Operations to Shadow or Active before verifying packages.'
   } else if (input.status !== 'picking') {
     packBlockedReason = input.status === 'packed' || input.status === 'shipped'
       ? 'Package verification is already complete.'
@@ -148,28 +147,17 @@ export function availableOperationsOrderActions(input: {
   if (!input.canExecute) {
     shipmentBlockedReason = 'Operations execute permission is required.'
   } else if (
-    !isNativeOneOff
-    && input.activationState !== 'active'
+    ['shopify', 'faire'].includes(input.sourceProvider || '')
+    && input.fulfillmentWritesEnabled !== true
   ) {
-    shipmentBlockedReason = 'Set Operations to Active before confirming a shipment.'
-  } else if (
-    isNativeOneOff
-    && input.oneOffShippingMode === 'test'
-    && input.activationState !== 'shadow'
-  ) {
-    shipmentBlockedReason = 'TEST one-off shipments can be confirmed only in Operations Shadow.'
+    shipmentBlockedReason = input.fulfillmentWritesBlockedReason
+      || `Reconnect the ${input.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} connection and verify its fulfillment-write scopes before confirming shipment.`
   } else if (
     isNativeOneOff
     && input.oneOffShippingMode === 'live'
-    && input.activationState !== 'active'
+    && input.canPurchaseLivePostage !== true
   ) {
-    shipmentBlockedReason = 'LIVE one-off shipments can be confirmed only in Operations Active.'
-  } else if (
-    isNativeOneOff
-    && input.oneOffShippingMode === 'live'
-    && input.canActivate !== true
-  ) {
-    shipmentBlockedReason = 'Operations activation permission is required to confirm LIVE postage.'
+    shipmentBlockedReason = 'Live-postage permission is required to confirm LIVE postage.'
   } else if (isNativeOneOff && !input.oneOffShippingMode) {
     shipmentBlockedReason = 'Select TEST or LIVE and create the exact one-off shipment group first.'
   } else if ((input.existingShipmentCount || 0) > 0 || input.status === 'shipped') {
@@ -193,6 +181,11 @@ export function availableOperationsOrderActions(input: {
       || 'Purchase one complete one-off carrier group before confirming shipment.'
   } else if ((input.unresolvedLabelAttemptCount || 0) > 0) {
     shipmentBlockedReason = 'Resolve the pending carrier label attempt before confirming shipment.'
+  } else if (
+    canonicalShopifyAuthorized
+    && input.sandboxE2eFulfillmentConfirmed !== true
+  ) {
+    shipmentBlockedReason = 'Confirm this exact Shopify test fulfillment before creating fulfillmentCreate.'
   } else if (isNativeOneOff) {
     // Exact TEST/LIVE environment, selected-rate authority, group membership,
     // result, and active-label coverage are verified by the durable group read.
@@ -242,7 +235,7 @@ export function availableOperationsOrderActions(input: {
       || 'Exact checkout, carton, allocation, and UPS/FedEx sandbox evidence is required.'
   }
 
-  return [
+  const actions: OperationsOrderActionAvailability[] = [
     {
       action: 'release_to_warehouse',
       label: 'Release to warehouse',
@@ -280,6 +273,86 @@ export function availableOperationsOrderActions(input: {
       blockedReason: shipmentBlockedReason,
     },
   ]
+  if (input.replanningCorrection) actions.push(input.replanningCorrection)
+  return actions
+}
+
+export function operationsOrderReplanningProfileAllowsCorrection() {
+  return true
+}
+
+export function operationsOrderReplanningActionAvailability(input: {
+  activationState: OperationsActivationState
+  canManage: boolean
+  canExecute: boolean
+  sourceProvider: string
+  orderType: string
+  status: OperationsOrderStatus
+  planStatus: string | null
+  waveStatus: string | null
+  exactStateReady: boolean
+  exactStateBlockedCode?: string | null
+  exactStateBlockedReason?: string | null
+  expectedPlanGlobalId?: string | null
+  expectedPlanVersion?: number | null
+  expectedCorrectionFingerprint?: string | null
+}): OperationsOrderActionAvailability {
+  let blockedCode: string | null = null
+  let blockedReason: string | null = null
+  if (!input.canManage) {
+    blockedCode = 'OPERATIONS_MANAGE_REQUIRED'
+    blockedReason = 'Operations manage permission is required.'
+  } else if (!input.canExecute) {
+    blockedCode = 'OPERATIONS_EXECUTE_REQUIRED'
+    blockedReason = 'Operations execute permission is required.'
+  } else if (!['shopify', 'faire'].includes(input.sourceProvider)) {
+    blockedCode = 'OPERATIONS_REPLANNING_PROVIDER_INVALID'
+    blockedReason = 'Only a connected Shopify or Faire order can be reopened for replanning.'
+  } else if (input.orderType === 'one_off' || input.sourceProvider === 'clawpilot_native') {
+    blockedCode = 'OPERATIONS_REPLANNING_ORDER_TYPE_INVALID'
+    blockedReason = 'Native one-off and mock orders use their own correction workflow.'
+  } else if (input.status === 'released') {
+    blockedCode = 'OPERATIONS_REPLANNING_RELEASED_RECALL_REQUIRED'
+    blockedReason = 'Released work cannot be reopened until ClawPilot can recall and receive acknowledgement from every picker device holding this wave.'
+  } else if (input.status !== 'planned') {
+    blockedCode = 'OPERATIONS_REPLANNING_STATUS_INVALID'
+    blockedReason = 'Only a planned order that has not been released to pickers can be reopened.'
+  } else if (
+    input.planStatus !== 'planned'
+    || input.waveStatus !== null
+  ) {
+    blockedCode = 'OPERATIONS_REPLANNING_PLAN_STATE_INVALID'
+    blockedReason = 'The current planned order has already entered warehouse release state.'
+  } else if (!input.exactStateReady) {
+    blockedCode = input.exactStateBlockedCode || 'OPERATIONS_REPLANNING_STATE_INVALID'
+    blockedReason = input.exactStateBlockedReason
+      || 'Warehouse or execution evidence prevents this order from being reopened safely.'
+  } else if (
+    !input.expectedPlanGlobalId
+    || !Number.isSafeInteger(input.expectedPlanVersion)
+    || Number(input.expectedPlanVersion) < 1
+    || !/^[a-f0-9]{64}$/.test(input.expectedCorrectionFingerprint || '')
+  ) {
+    blockedCode = 'OPERATIONS_REPLANNING_FINGERPRINT_UNAVAILABLE'
+    blockedReason = 'Refresh the order before reopening it for replanning.'
+  }
+
+  const enabled = blockedReason === null
+  return {
+    action: 'reopen_for_replanning',
+    label: 'Reopen for replanning',
+    enabled,
+    blockedCode,
+    blockedReason,
+    consequenceSummary: enabled
+      ? 'Cancels the unreleased local plan, releases active inventory and packaging claims, and returns the unchanged provider order to Imported. No carrier or storefront calls are made.'
+      : null,
+    expectedPlanGlobalId: input.expectedPlanGlobalId || null,
+    expectedPlanVersion: input.expectedPlanVersion || null,
+    expectedCorrectionFingerprint: enabled
+      ? input.expectedCorrectionFingerprint || null
+      : null,
+  }
 }
 
 function integer(value: unknown, fallback = 0): number {

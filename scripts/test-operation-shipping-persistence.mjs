@@ -34,7 +34,64 @@ function assertOrder(source, markers, label) {
 }
 
 const migration = read('db/migrations/0098_operations_label_execution.sql')
+const sandboxTrackingMigration = read(
+  'db/migrations/0319_operations_sandbox_label_tracking_uniqueness.sql',
+)
+const maskedTrackingMigration = read(
+  'db/migrations/0320_operations_standard_sandbox_masked_tracking.sql',
+)
 const persistence = read('app_src/lib/persistence/operationShipping.ts')
+
+assertIncludes(sandboxTrackingMigration, [
+  'DROP CONSTRAINT IF EXISTS operations_labels_tracking_unique',
+  'operations_labels_production_tracking_unique',
+  "WHERE environment = 'production'",
+  "attempt.environment = 'sandbox'",
+  "attempt.error_code = 'OPERATIONS_LABEL_PERSISTENCE_UNKNOWN'",
+  "package_label.status = 'created'",
+  "collision.environment = 'sandbox'",
+  "'persistenceDisposition', 'sandbox_tracking_collision'",
+  "'retryAuthorizedByMigration'",
+  'DROP TRIGGER IF EXISTS protect_operations_label_attempt_write',
+  'CREATE TRIGGER protect_operations_label_attempt_write',
+], 'Sandbox tracking collision migration')
+assert.doesNotMatch(
+  sandboxTrackingMigration,
+  /WHERE environment = 'sandbox'/,
+  'Sandbox tracking must not receive a uniqueness fence',
+)
+
+assertIncludes(maskedTrackingMigration, [
+  'CREATE OR REPLACE FUNCTION validate_operations_one_off_group_label()',
+  "NEW.environment = 'sandbox'",
+  "NEW.tracking_number ~* '^1Z[X]{16}$'",
+  'NEW.one_off_carrier_group_attempt_id IS NULL',
+  'NEW.create_attempt_id IS NOT NULL',
+  'masked_standard_attempt.id = NEW.create_attempt_id',
+  'masked_standard_attempt.package_id = NEW.package_id',
+  'masked_standard_attempt.carrier_rate_id = NEW.carrier_rate_id',
+  'masked_standard_attempt.integration_account_id =',
+  'NEW.integration_account_id',
+  'masked_standard_attempt.carrier_account_id =',
+  'NEW.carrier_account_id',
+  "masked_standard_attempt.state = 'prepared'",
+  "masked_standard_attempt.environment = 'sandbox'",
+  "masked_standard_attempt.provider = 'ups_rest'",
+  'masked_plan.one_off_quote_id IS NULL',
+  'UPS CIE masked tracking requires an exact sandbox one-off group or standard label attempt',
+  "attempt.error_code = 'OPERATIONS_LABEL_PERSISTENCE_UNKNOWN'",
+  "attempt.redacted_response ->> 'trackingNumber' ~* '^1Z[X]{16}$'",
+  "error_code = 'OPERATIONS_SANDBOX_MASKED_TRACKING_RETRYABLE'",
+  "'persistenceDisposition', 'sandbox_masked_tracking_rejected'",
+  "'0320_operations_standard_sandbox_masked_tracking'",
+  'DROP TRIGGER IF EXISTS protect_operations_label_attempt_write',
+  'CREATE TRIGGER protect_operations_label_attempt_write',
+], 'Standard sandbox masked-tracking migration')
+assert.doesNotMatch(
+  maskedTrackingMigration,
+  /NEW\.environment = 'production'[\s\S]{0,300}\^1Z\[X\]\{16\}\$/u,
+  'Production masked tracking must not be admitted',
+)
 
 const attemptTable = section(
   migration,
@@ -115,25 +172,36 @@ const createContextGuard = section(
   persistence,
   'function assertCreateContext(',
   'function assertVoidContext(',
-  'Create-label activation guard',
+  'Create-label local safeguards',
 )
 assertIncludes(createContextGuard, [
-  "context.order.activation_state !== 'active'",
-  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
-  'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
-], 'Create-label activation guard')
+  "'OPERATIONS_LABEL_ORDER_NOT_PACKED'",
+  "'OPERATIONS_ORDER_VERSION_CONFLICT'",
+  "'OPERATIONS_LABEL_RERATE_REQUIRED'",
+  "'OPERATIONS_LABEL_ALREADY_CREATED'",
+], 'Create-label local safeguards')
+assert.doesNotMatch(
+  createContextGuard,
+  /activation_state|OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED/u,
+  'Sandbox label creation must not depend on workspace activation',
+)
 
 const voidContextGuard = section(
   persistence,
   'function assertVoidContext(',
   'function commandHash(',
-  'Void-label activation guard',
+  'Void-label local safeguards',
 )
 assertIncludes(voidContextGuard, [
-  "context.order.activation_state !== 'active'",
-  "'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED'",
-  'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
-], 'Void-label activation guard')
+  "'OPERATIONS_LABEL_ORDER_NOT_PACKED'",
+  "'OPERATIONS_ORDER_VERSION_CONFLICT'",
+  "'OPERATIONS_LABEL_VOID_UNAVAILABLE'",
+], 'Void-label local safeguards')
+assert.doesNotMatch(
+  voidContextGuard,
+  /activation_state|OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED/u,
+  'Sandbox label void must not depend on workspace activation',
+)
 
 const replay = section(
   persistence,

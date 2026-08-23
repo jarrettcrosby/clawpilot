@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 
 import {
   activeOperationsOrganizationId,
-  operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { readShippingWorkspaceFromPostgres } from '@/lib/persistence/shipping'
@@ -32,7 +32,7 @@ export async function GET(req: NextRequest) {
       }, 503)
     }
     const actor = await requireRequestUser(req)
-    const capabilities = operationsCapabilities(actor)
+    const capabilities = shippingCapabilities(actor)
     if (!capabilities.canView) {
       return json({
         ok: false,
@@ -43,8 +43,8 @@ export async function GET(req: NextRequest) {
     const shipping = await readShippingWorkspaceFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       canView: capabilities.canView,
-      canCreate: capabilities.canManage && capabilities.canExecute,
-      canActivate: capabilities.canActivate,
+      canCreate: capabilities.canCreate,
+      canPurchaseLivePostage: capabilities.canPurchaseLivePostage,
     })
     return json({ ok: true, shipping })
   } catch (error) {

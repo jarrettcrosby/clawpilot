@@ -424,32 +424,31 @@ async function verifyAcceptance(databaseUrl) {
       /not found|shadow preparation|organization/iu,
       () => prepare({ ...baseInput, organizationId: ids.otherOrganization }),
     )
-    await mutateFixture(
-      client,
-      `UPDATE operations_activation_scopes
-       SET state = 'shadow'
-       WHERE organization_id = $1`,
-      [ids.organization],
-    )
-    await expectServiceError(
-      client,
-      'non_active_authority',
-      /Operations Active|active authority|activation/iu,
-      () => prepare(baseInput),
-    )
-    await mutateFixture(
-      client,
-      `UPDATE operations_activation_scopes
-       SET state = 'active'
-       WHERE organization_id = $1`,
-      [ids.organization],
-    )
-    await expectServiceError(
-      client,
-      'stale_activation_revision',
-      /revision|Operations Active|activation/iu,
-      () => prepare({ ...baseInput, expectedActivationRevision: 6 }),
-    )
+    for (const profile of [
+      'disabled',
+      'shadow',
+      'read_only',
+      'active',
+      'frozen',
+    ]) {
+      await mutateFixture(
+        client,
+        `UPDATE operations_activation_scopes
+         SET state = $2
+         WHERE organization_id = $1`,
+        [ids.organization, profile],
+      )
+      const savepoint = `profile_independent_${profile}`
+      await client.query(`SAVEPOINT ${savepoint}`)
+      const profileResult = await prepare({
+        ...baseInput,
+        idempotencyKey: `active-preparation-${profile}`,
+      })
+      assert.equal(profileResult.state, 'prepared')
+      assert.equal(profileResult.activationRevision, 7)
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`)
+    }
 
     await expectServiceError(
       client,

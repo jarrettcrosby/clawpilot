@@ -40,6 +40,16 @@ const destination = Object.freeze({
   countryCode: 'US',
   residential: true,
 })
+const sourceDestination = Object.freeze({
+  name: 'Original provider recipient',
+  contactName: 'Original provider recipient',
+  line1: '1 Provider Source Lane',
+  city: 'Stamford',
+  region: 'CT',
+  postalCode: '06901',
+  countryCode: 'US',
+  residential: true,
+})
 const registeredOrigin = Object.freeze({
   line1: '7009 S 108th Street',
   city: 'La Vista',
@@ -143,6 +153,52 @@ const commerceOrderRevisionGate = {
   async assertCommerceOrderRevisionExecutionCurrent() {},
   CommerceOrderRevisionGateError: class extends Error {},
 }
+const orderShipTo = loadTypeScriptModule(
+  'app_src/lib/operations/orderShipTo.ts',
+)
+const carrierSandboxRate = loadTypeScriptModule(
+  'app_src/lib/integrations/carrierSandboxRate.ts',
+  {
+    '@/lib/integrations/carrierCredentialClient': {
+      CarrierCredentialClientError: class extends Error {},
+      requestCarrierAccessToken() {
+        throw new Error('Production rerate fixture does not request carrier credentials')
+      },
+    },
+    '@/lib/integrations/carrierWholeShipmentRateFoundation': {
+      FEDEX_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+      UPS_WHOLE_SHIPMENT_PACKAGING_TYPES: {},
+    },
+  },
+)
+const operationsOrderShipmentAddress = loadTypeScriptModule(
+  'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+  {
+    '@/lib/auditWriter': { recordAuditEvent: async () => {} },
+    '@/lib/integrations/commerceCredentialCrypto': {
+      decryptCommerceCandidateSnapshot(fields) {
+        return JSON.parse(fields.ciphertext.toString('utf8'))
+      },
+      encryptCommerceCandidateSnapshot() {
+        throw new Error('Production rerate fixture does not edit addresses')
+      },
+    },
+    '@/lib/integrations/carrierSandboxRate': carrierSandboxRate,
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/postgres': {
+      acquireTransactionAdvisoryLock: (client, key) => client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))',
+        [key],
+      ),
+      query() {
+        throw new Error('Production rerate must supply its transaction client')
+      },
+      withTransaction() {
+        throw new Error('Production rerate must supply its transaction client')
+      },
+    },
+  },
+)
 
 const productionRerates = loadTypeScriptModule(
   'app_src/lib/operations/productionFulfillmentRerates.ts',
@@ -169,6 +225,9 @@ const productionRerates = loadTypeScriptModule(
         throw new Error('Unexpected dispatch binding in finalizer test')
       },
     },
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/operationsOrderShipmentAddress':
+      operationsOrderShipmentAddress,
     '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -202,6 +261,9 @@ const productionReratesForDispatch = loadTypeScriptModule(
       },
     },
     '@/lib/operations/activeCarrierDispatchSnapshot': activeDispatchSnapshot,
+    '@/lib/operations/orderShipTo': orderShipTo,
+    '@/lib/persistence/operationsOrderShipmentAddress':
+      operationsOrderShipmentAddress,
     '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisionGate,
     '@/lib/persistence/postgres': {
       acquireTransactionAdvisoryLock: (client, key) => client.query(
@@ -450,6 +512,19 @@ async function seedPrerequisiteLineage(client, ids) {
       ],
     )
     await client.query(
+      `INSERT INTO operations_integration_accounts (
+         id, global_id, organization_id, provider, integration_type,
+         environment, display_name, status, configuration,
+         external_account_id, commerce_credential_generation,
+         created_by, updated_by
+       ) VALUES (
+         $1, 'gia0008999', $2, 'shopify', 'commerce', 'sandbox',
+         'Shopify source fixture', 'active', '{}'::jsonb,
+         'gid://shopify/Shop/rerate-fixture', 1, $3, $3
+       )`,
+      [ids.commerceIntegration, ids.organization, actorEmail],
+    )
+    await client.query(
       `INSERT INTO operations_orders (
          id, global_id, organization_id, pipeline_id, customer_id,
          integration_account_id, source_provider, external_order_id,
@@ -466,7 +541,46 @@ async function seedPrerequisiteLineage(client, ids) {
         ids.pipeline,
         ids.customer,
         ids.commerceIntegration,
+        JSON.stringify(sourceDestination),
+      ],
+    )
+    const sourceOrderHash = operationsOrderShipmentAddress
+      .operationsOrderShipmentAddressSourceHash({
+        orderGlobalId: 'gor0009001',
+        sourceProvider: 'shopify',
+        externalOrderId: 'rerate-order-1',
+        sourceShipTo: orderShipTo.normalizeOrderShipToDraft(sourceDestination),
+      })
+    await client.query(
+      `INSERT INTO operations_order_shipment_address_working_copies (
+         organization_id, order_id,
+         source_order_row_version, source_order_hash,
+         ship_to_state, ship_to_ciphertext, ship_to_iv, ship_to_tag,
+         ship_to_hash, dispatch_core_fingerprint,
+         ship_to_encryption_version,
+         last_command_receipt_id, last_idempotency_key,
+         last_request_hash, created_by, updated_by
+       ) VALUES (
+         $1, $2, 0, $3, 'local_carrier_ready', $4, $5, $6,
+         $7, operations_dispatch_address_core_fingerprint($8::jsonb),
+         1, gen_random_uuid(), 'rerate-local-address-proof',
+         $9, $10, $10
+       )`,
+      [
+        ids.organization,
+        ids.order,
+        sourceOrderHash,
+        Buffer.from(JSON.stringify(
+          orderShipTo.orderShipToStorageValue(
+            orderShipTo.normalizeOrderShipToDraft(destination),
+          ),
+        ), 'utf8'),
+        Buffer.from('010203040506070809101112', 'hex'),
+        Buffer.from('01020304050607080910111213141516', 'hex'),
+        '8'.repeat(64),
         JSON.stringify(destination),
+        '9'.repeat(64),
+        actorEmail,
       ],
     )
     await client.query(
@@ -698,6 +812,17 @@ async function seedPrerequisiteLineage(client, ids) {
        )`,
       [ids.organization, ids.carrierIntegration],
     )
+    await client.query(
+      `INSERT INTO operations_carrier_rates (
+         id, organization_id, plan_id, carrier, service_code, service_name,
+         internal_cost_minor, customer_charge_minor, transit_days,
+         estimated_delivery_at, meets_promise, selected, quote_snapshot
+       ) VALUES (
+         $1, $2, $3, 'UPS', '03', 'UPS Ground', 1800, 1800, 3,
+         now() + interval '3 days', true, true, '{}'::jsonb
+       )`,
+      [ids.carrierRate, ids.organization, ids.plan],
+    )
   } finally {
     await client.query('SET LOCAL session_replication_role = origin').catch(() => {})
   }
@@ -832,8 +957,8 @@ async function insertSelection(client, ids, options) {
        ordered_package_set_fingerprint, expires_at, selection_reason,
        selected_at
      ) VALUES (
-       $1, $2, $3, $4, $5, $6, $7, $8, 'ups_rest', '02',
-       'UPS 2nd Day Air', 4200, 'USD', $9, $10, 1, $11, $12, 1,
+       $1, $2, $3, $4, $5, $6, $7, $8, 'ups_rest', $22,
+       $23, $24, 'USD', $9, $10, 1, $11, $12, 1,
        $13, 'ups-rest-rerate-v1', 'UPS-RATE-1', $14, $15, $16,
        $17, $18, $19, $20, 'lowest valid whole-shipment cost',
        COALESCE($21::timestamptz, now())
@@ -860,8 +985,413 @@ async function insertSelection(client, ids, options) {
       binding.orderedPackageSetFingerprint,
       options.expiresAt,
       options.selectedAt ?? null,
+      options.serviceCode ?? '02',
+      options.serviceName ?? 'UPS 2nd Day Air',
+      options.amountMinor ?? 4200,
     ],
   )
+}
+
+async function verifyCarrierActivationIndependenceProfiles(client, ids) {
+  const profiles = ['disabled', 'shadow', 'read_only', 'active', 'frozen']
+  for (const profile of profiles) {
+    const savepoint = `carrier_activation_profile_${profile}`
+    await client.query(`SAVEPOINT ${savepoint}`)
+    try {
+      await client.query('SET LOCAL session_replication_role = replica')
+      await client.query(
+        `UPDATE operations_activation_scopes
+         SET state = $2
+         WHERE organization_id = $1::uuid`,
+        [ids.organization, profile],
+      )
+      await client.query(
+        `DELETE FROM operations_active_execution_packages
+         WHERE organization_id = $1::uuid
+           AND active_fulfillment_execution_id = $2::uuid`,
+        [ids.organization, ids.activeExecution],
+      )
+      await client.query(
+        `DELETE FROM operations_active_shipment_groups
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [ids.organization, ids.activeGroup],
+      )
+      await client.query(
+        `DELETE FROM operations_active_fulfillment_executions
+         WHERE organization_id = $1::uuid
+           AND id = $2::uuid`,
+        [ids.organization, ids.activeExecution],
+      )
+      await client.query('SET LOCAL session_replication_role = origin')
+
+      await client.query(
+        `INSERT INTO operations_active_fulfillment_executions (
+           id, organization_id, shadow_fulfillment_execution_id,
+           order_id, plan_id, warehouse_id, authority_mode, state,
+           activation_revision, expected_order_row_version, reason,
+           idempotency_key, request_hash
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, 'active', 'prepared', 7, 0,
+           $7, $8, $9
+         )`,
+        [
+          ids.activeExecution,
+          ids.organization,
+          ids.shadowExecution,
+          ids.order,
+          ids.plan,
+          ids.warehouse,
+          `Carrier authority remains exact in ${profile}`,
+          `carrier-profile-${profile}-execution`,
+          HASH.request,
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_active_shipment_groups (
+           id, organization_id, active_fulfillment_execution_id,
+           shadow_shipment_group_id, selected_provider,
+           selected_service_code, selected_service_name,
+           selected_carrier_cost_minor, currency, package_count, state
+         ) VALUES (
+           $1, $2, $3, $4, 'ups_rest', '03', 'UPS Ground',
+           1800, 'USD', 2, 'prepared'
+         )`,
+        [
+          ids.activeGroup,
+          ids.organization,
+          ids.activeExecution,
+          ids.shadowGroup,
+        ],
+      )
+      for (const [index, packageId] of ids.packages.entries()) {
+        await client.query(
+          `INSERT INTO operations_active_execution_packages (
+             organization_id, active_fulfillment_execution_id,
+             active_shipment_group_id, shadow_fulfillment_execution_id,
+             package_id, package_key, package_number
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            ids.organization,
+            ids.activeExecution,
+            ids.activeGroup,
+            ids.shadowExecution,
+            packageId,
+            `box-${index + 1}`,
+            index + 1,
+          ],
+        )
+      }
+
+      const runId = randomUUID()
+      const attemptId = randomUUID()
+      const resultId = randomUUID()
+      const offerId = randomUUID()
+      const selectionId = randomUUID()
+      const carrierAttemptId = randomUUID()
+      const labelAttemptId = randomUUID()
+      const labelId = randomUUID()
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000)
+      await insertRun(
+        client,
+        ids,
+        runId,
+        `carrier-profile-${profile}-rerate-run`,
+      )
+      await insertRunPackages(client, ids, runId)
+      await insertAttempt(client, ids, {
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        idempotencyKey: `carrier-profile-${profile}-rerate-attempt`,
+      })
+      await client.query(
+        `INSERT INTO operations_production_fulfillment_rerate_results (
+           id, organization_id, rerate_run_id, attempt_id, state,
+           provider_reference, result_hash, redacted_response,
+           completed_at, expires_at
+         ) VALUES (
+           $1, $2, $3, $4, 'succeeded', $5, $6,
+           '{"offerCount":1}'::jsonb, now(), $7
+         )`,
+        [
+          resultId,
+          ids.organization,
+          runId,
+          attemptId,
+          'UPS-RATE-1',
+          HASH.result,
+          expiresAt,
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_production_fulfillment_rerate_offers (
+           id, organization_id, rerate_run_id, attempt_id, result_id,
+           provider, service_code, service_name, amount_minor, currency,
+           transit_days, offer_hash, normalized_offer, expires_at
+         ) VALUES (
+           $1, $2, $3, $4, $5, 'ups_rest', '03', 'UPS Ground',
+           1800, 'USD', 3, $6, '{"packageCount":2}'::jsonb, $7
+         )`,
+        [
+          offerId,
+          ids.organization,
+          runId,
+          attemptId,
+          resultId,
+          HASH.offer,
+          expiresAt,
+        ],
+      )
+      await insertSelection(client, ids, {
+        selectionId,
+        runId,
+        attemptId,
+        resultId,
+        offerId,
+        expiresAt,
+        serviceCode: '03',
+        serviceName: 'UPS Ground',
+        amountMinor: 1800,
+      })
+      await client.query(
+        `INSERT INTO operations_active_carrier_group_attempts (
+           id, organization_id, active_fulfillment_execution_id,
+           active_shipment_group_id, production_rerate_selection_id,
+           attempt_number, state, environment, selected_provider,
+           selected_service_code, selected_service_name, package_count,
+           adapter_version, idempotency_key, request_hash,
+           redacted_request, actor_email
+         ) VALUES (
+           $1, $2, $3, $4, $5, 1, 'prepared', 'production',
+           'ups_rest', '03', 'UPS Ground', 2, 'ups-label-v1',
+           $6, $7, '{}'::jsonb, $8
+         )`,
+        [
+          carrierAttemptId,
+          ids.organization,
+          ids.activeExecution,
+          ids.activeGroup,
+          selectionId,
+          `carrier-profile-${profile}-dispatch`,
+          HASH.request,
+          actorEmail,
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_label_attempts (
+           id, organization_id, order_id, package_id, carrier_rate_id,
+           integration_account_id, carrier_account_id, action, state,
+           environment, provider, adapter_version, idempotency_key,
+           request_hash, redacted_request, redacted_response,
+           provider_reference, completed_at,
+           active_fulfillment_execution_id, active_shipment_group_id,
+           active_carrier_group_attempt_id
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, 'create', 'succeeded',
+           'production', 'ups_rest', 'ups-label-v1', $8, $9,
+           '{}'::jsonb, '{}'::jsonb, $10, now(), $11, $12, $13
+         )`,
+        [
+          labelAttemptId,
+          ids.organization,
+          ids.order,
+          ids.packages[0],
+          ids.carrierRate,
+          ids.carrierIntegration,
+          ids.carrierAccount,
+          `carrier-profile-${profile}-label-attempt`,
+          HASH.request,
+          `UPS-${profile}-LABEL`,
+          ids.activeExecution,
+          ids.activeGroup,
+          carrierAttemptId,
+        ],
+      )
+      await client.query(
+        `INSERT INTO operations_labels (
+           id, organization_id, package_id, carrier_rate_id, carrier,
+           service_code, tracking_number, format, label_payload,
+           provider_label_id, idempotency_key, status,
+           integration_account_id, carrier_account_id, environment,
+           request_hash, redacted_provider_evidence, create_attempt_id,
+           active_fulfillment_execution_id, active_shipment_group_id,
+           active_carrier_group_attempt_id
+         ) VALUES (
+           $1, $2, $3, $4, 'UPS', '03', $5, 'ZPL', '^XA^XZ',
+           $6, $7, 'created', $8, $9, 'production', $10,
+           '{}'::jsonb, $11, $12, $13, $14
+         )`,
+        [
+          labelId,
+          ids.organization,
+          ids.packages[0],
+          ids.carrierRate,
+          `1ZPROFILE${profile.toUpperCase()}`,
+          `UPS-${profile}-LABEL`,
+          `carrier-profile-${profile}-label`,
+          ids.carrierIntegration,
+          ids.carrierAccount,
+          HASH.request,
+          labelAttemptId,
+          ids.activeExecution,
+          ids.activeGroup,
+          carrierAttemptId,
+        ],
+      )
+      const shipment = await client.query(
+        `INSERT INTO operations_shipments (
+           organization_id, order_id, plan_id, package_id, label_id,
+           status, tracking_number, shipped_at,
+           quoted_carrier_cost_minor, confirmed_by,
+           one_off_carrier_group_attempt_id
+         ) VALUES (
+           $1, $2, $3, $4, $5, 'confirmed', $6, now(), 1800, $7, NULL
+         )
+         RETURNING active_fulfillment_execution_id::text,
+                   active_shipment_group_id::text,
+                   active_carrier_group_attempt_id::text`,
+        [
+          ids.organization,
+          ids.order,
+          ids.plan,
+          ids.packages[0],
+          labelId,
+          `1ZPROFILE${profile.toUpperCase()}`,
+          actorEmail,
+        ],
+      )
+      assert.deepEqual(shipment.rows[0], {
+        active_fulfillment_execution_id: ids.activeExecution,
+        active_shipment_group_id: ids.activeGroup,
+        active_carrier_group_attempt_id: carrierAttemptId,
+      })
+
+      if (profile === 'active') {
+        await expectDatabaseError(
+          client,
+          'generic_production_label_attempt_without_authority',
+          /exact carrier authority lineage/,
+          () => client.query(
+            `INSERT INTO operations_label_attempts (
+               organization_id, order_id, package_id, carrier_rate_id,
+               integration_account_id, carrier_account_id, action, state,
+               environment, provider, adapter_version, idempotency_key,
+               request_hash, redacted_request, redacted_response
+             ) VALUES (
+               $1, $2, $3, $4, $5, $6, 'create', 'prepared',
+               'production', 'ups_rest', 'ups-label-v1',
+               'generic-production-label-attempt', $7,
+               '{}'::jsonb, '{}'::jsonb
+             )`,
+            [
+              ids.organization,
+              ids.order,
+              ids.packages[1],
+              ids.carrierRate,
+              ids.carrierIntegration,
+              ids.carrierAccount,
+              HASH.request,
+            ],
+          ),
+        )
+        await expectDatabaseError(
+          client,
+          'generic_production_label_without_authority',
+          /exact carrier authority lineage/,
+          () => client.query(
+            `INSERT INTO operations_labels (
+               organization_id, package_id, carrier_rate_id, carrier,
+               service_code, tracking_number, format, label_payload,
+               provider_label_id, idempotency_key, status, environment
+             ) VALUES (
+               $1, $2, $3, 'UPS', '03', '1ZGENERICLABEL', 'ZPL',
+               '^XA^XZ', 'generic-label', 'generic-production-label',
+               'created', 'production'
+             )`,
+            [
+              ids.organization,
+              ids.packages[1],
+              ids.carrierRate,
+            ],
+          ),
+        )
+        await expectDatabaseError(
+          client,
+          'production_shipment_missing_label_authority',
+          /exact carrier authority lineage/,
+          async () => {
+            const genericLabelId = randomUUID()
+            await client.query('SET LOCAL session_replication_role = replica')
+            await client.query(
+              `INSERT INTO operations_labels (
+                 id, organization_id, package_id, carrier_rate_id, carrier,
+                 service_code, tracking_number, format, label_payload,
+                 provider_label_id, idempotency_key, status, environment
+               ) VALUES (
+                 $1, $2, $3, $4, 'UPS', '03', '1ZGENERICSHIP', 'ZPL',
+                 '^XA^XZ', 'generic-shipment-label',
+                 'generic-shipment-label', 'created', 'production'
+               )`,
+              [
+                genericLabelId,
+                ids.organization,
+                ids.packages[1],
+                ids.carrierRate,
+              ],
+            )
+            await client.query('SET LOCAL session_replication_role = origin')
+            await client.query(
+              `INSERT INTO operations_shipments (
+                 organization_id, order_id, plan_id, package_id, label_id,
+                 status, tracking_number, quoted_carrier_cost_minor,
+                 confirmed_by
+               ) VALUES (
+                 $1, $2, $3, $4, $5, 'confirmed', '1ZGENERICSHIP',
+                 1800, $6
+               )`,
+              [
+                ids.organization,
+                ids.order,
+                ids.plan,
+                ids.packages[1],
+                genericLabelId,
+                actorEmail,
+              ],
+            )
+          },
+        )
+        await expectDatabaseError(
+          client,
+          'production_shipment_mismatched_label_package',
+          /must match its production label/,
+          () => client.query(
+            `INSERT INTO operations_shipments (
+               organization_id, order_id, plan_id, package_id, label_id,
+               status, tracking_number, quoted_carrier_cost_minor,
+               confirmed_by
+             ) VALUES (
+               $1, $2, $3, $4, $5, 'confirmed', $6, 1800, $7
+             )`,
+            [
+              ids.organization,
+              ids.order,
+              ids.plan,
+              ids.packages[1],
+              labelId,
+              `1ZPROFILE${profile.toUpperCase()}`,
+              actorEmail,
+            ],
+          ),
+        )
+      }
+    } finally {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`).catch(() => {})
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`).catch(() => {})
+      await client.query('SET CONSTRAINTS ALL DEFERRED').catch(() => {})
+      await client.query('SET LOCAL session_replication_role = origin').catch(() => {})
+    }
+  }
 }
 
 async function verifyAcceptance(databaseUrl) {
@@ -890,10 +1420,12 @@ async function verifyAcceptance(databaseUrl) {
     packages: [randomUUID(), randomUUID()],
     carrierIntegration: randomUUID(),
     carrierAccount: randomUUID(),
+    carrierRate: randomUUID(),
   }
   try {
     await client.query('BEGIN')
     await seedPrerequisiteLineage(client, ids)
+    await verifyCarrierActivationIndependenceProfiles(client, ids)
 
     const activeDispatchSafetyConstraintNames = [
       'operations_active_carrier_attempt_safety_valid',
@@ -1026,8 +1558,8 @@ async function verifyAcceptance(databaseUrl) {
     )
     await expectDatabaseError(
       client,
-      'stale_activation_revision',
-      /current Operations Active revision/,
+      'mismatched_execution_lineage_revision',
+      /exact Active execution and shipment group/,
       () => client.query(
         `INSERT INTO operations_production_fulfillment_rerate_runs (
            organization_id, active_fulfillment_execution_id,
@@ -1630,6 +2162,34 @@ async function verifyAcceptance(databaseUrl) {
           selectedBy: actorEmail,
         }, client)
       },
+    )
+    const effectiveDestinationAfterCurrencyRollback = await client.query(
+      `SELECT orders.currency,
+              operations_order_dispatch_destination_matches(
+                orders.organization_id, orders.id, $3::jsonb
+              ) AS destination_matches,
+              operations_dispatch_address_matches_core(
+                $3::jsonb, orders.ship_to
+              ) AS source_matches
+       FROM operations_orders orders
+       WHERE orders.organization_id = $1::uuid
+         AND orders.id = $2::uuid`,
+      [ids.organization, ids.order, JSON.stringify(destination)],
+    )
+    assert.deepEqual(effectiveDestinationAfterCurrencyRollback.rows[0], {
+      currency: 'USD',
+      destination_matches: true,
+      source_matches: false,
+    })
+    const appEffectiveDestination = await operationsOrderShipmentAddress
+      .readOperationsOrderShipmentAddressInPostgres({
+        organizationId: ids.organization,
+        orderGlobalId: 'gor0009001',
+        client,
+      })
+    assert.equal(
+      JSON.stringify(appEffectiveDestination.value),
+      JSON.stringify(orderShipTo.normalizeOrderShipToDraft(destination)),
     )
     await expectServiceError(
       client,
@@ -2258,6 +2818,7 @@ async function verifySelectionAuthorityLocks(databaseUrl) {
     packages: [randomUUID(), randomUUID()],
     carrierIntegration: randomUUID(),
     carrierAccount: randomUUID(),
+    carrierRate: randomUUID(),
   }
   try {
     await setup.query('BEGIN')
@@ -2332,14 +2893,16 @@ async function verifySelectionAuthorityLocks(databaseUrl) {
       }, selector)
     assert.equal(selection.replayed, false)
 
+    const independentProfileChange = await updater.query(
+      `UPDATE operations_activation_scopes
+       SET state = 'frozen'
+       WHERE organization_id = $1::uuid
+       RETURNING state`,
+      [ids.organization],
+    )
+    assert.equal(independentProfileChange.rows[0].state, 'frozen')
+
     const lockedUpdates = [
-      [
-        'activation authority',
-        `UPDATE operations_activation_scopes
-         SET updated_at = updated_at
-         WHERE organization_id = $1::uuid`,
-        [ids.organization],
-      ],
       [
         'order destination and currency authority',
         `UPDATE operations_orders

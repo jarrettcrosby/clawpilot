@@ -20,4 +20,5 @@ npx playwright test \
   tests/mobile-workflows/ui-acceptance.spec.ts \
   tests/pos/ui-acceptance.spec.ts \
   tests/operations/ui-acceptance.spec.ts \
+  tests/carrier-connections/ui-acceptance.spec.ts \
   "$@"

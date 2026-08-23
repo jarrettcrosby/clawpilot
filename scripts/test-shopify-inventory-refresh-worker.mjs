@@ -59,6 +59,27 @@ function loadTypeScriptModule(path, { mocks = {} } = {}) {
           'app_src/lib/integrations/commerceReadRuntime.ts',
         )
       }
+      if (specifier === '@/lib/operations/commerceStoreSync') {
+        return loadTypeScriptModule(
+          'app_src/lib/operations/commerceStoreSync.ts',
+        )
+      }
+      if (specifier === '@/lib/persistence/commerceStoreSync') {
+        return {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+            return input.read({
+              id: '11111111-1111-4111-8111-111111111111',
+              authorityKind: input.authorityKind,
+              readKind: input.readKind,
+              intentFingerprintSha256: 'a'.repeat(64),
+              controlRevision: 1,
+              activationRevision: 1,
+              expiresAt: '2026-08-15T12:00:00.000Z',
+            })
+          },
+        }
+      }
       return nodeRequire(specifier)
     },
   }
@@ -142,9 +163,8 @@ includes(persistence, [
   'completeShopifyInventoryRefreshJobInPostgres',
   'failShopifyInventoryRefreshJobInPostgres',
   'FOR UPDATE OF job SKIP LOCKED',
-  'operations_shopify_carrier_service_config_is_ready',
+  'operations_shopify_inventory_read_config_is_ready',
   'credential.verification_status =',
-  'activation.revision =',
   'config.row_version = job.config_row_version',
   'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
   "actor: 'system'",
@@ -257,7 +277,7 @@ includes(recoveryQueries[0].sql, [
   'job.policy_revision = current.policy_revision',
   'job.policy_hash = current.policy_hash',
   'job.inventory_max_age_seconds =',
-  "job.status <> 'dead'",
+  "job.status NOT IN ('dead', 'mapped_dead')",
   "recovered.status = 'succeeded'",
   'recovered.completed_at > job.completed_at',
   "reservation.reservation_authority = 'provider_commitment'",
@@ -268,7 +288,9 @@ includes(recoveryQueries[0].sql, [
   'operations_shopify_external_fulfillment_reconciliation_required(',
   'latest_plan.id',
   'source_level.integration_account_id =',
-  'position.warehouse_id = current.warehouse_id',
+  'position.warehouse_id = job.warehouse_id',
+  'position.location_id = job.inventory_location_id',
+  'position.pool_id = job.inventory_pool_id',
   "job.last_error_code =",
   "'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'",
   'source_order.archived_at IS NULL',
@@ -391,6 +413,11 @@ const stoppedConflict = await refreshPersistence
       carrierServiceConfigId:
         '44444444-4444-4444-8444-444444444444',
       warehouseId: '55555555-5555-4555-8555-555555555555',
+      locationMappingId: null,
+      locationMappingRowVersion: null,
+      providerLocationId: null,
+      inventoryLocationId: null,
+      inventoryPoolId: null,
       credentialGeneration: 2,
       activationRevision: 3,
       configRowVersion: 4,
@@ -496,6 +523,11 @@ includes(inventoryPersistence, [
   "actor: input.actorEmail || 'system'",
   'isSystem: !input.actorEmail',
 ], 'Shopify inventory single-flight persistence')
+assert.match(
+  inventoryPersistence,
+  /AND job\.status = CASE[\s\S]*?WHEN \$14::uuid IS NULL THEN 'processing'[\s\S]*?ELSE 'mapped_processing'[\s\S]*?END/,
+  'The projection fence must accept both legacy processing and mapped processing jobs without weakening the mapping fence',
+)
 assert.match(
   inventoryPersistence,
   /const reservedLocally = await client\.query\([\s\S]*?reservation\.status = 'active'[\s\S]*?reservation\.reservation_authority = 'local_balance'[\s\S]*?SHOPIFY_INVENTORY_LOCAL_RESERVATION_CONFLICT/,
@@ -800,9 +832,10 @@ includes(inventoryPanel, [
   'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT',
   'Open order {order.orderNumber}',
   'onOpenOrder(order.globalId)',
-  'Resolve affected order first',
-  'Retry inventory sync',
-  'Automatic sync in progress',
+  'reconcile the Shopify fulfillment, then retry inventory sync',
+  '<strong>Refresh this</strong>',
+  'Shopify inventory refresh is queued or retrying automatically.',
+  'Wait for that bounded attempt instead of starting another read.',
   'window.setInterval',
   'automatic scheduling is eligible again',
   'The failed job remains preserved as audit evidence.',
@@ -840,6 +873,11 @@ const job = {
   accountGlobalId: 'gia0000001',
   carrierServiceConfigId: '44444444-4444-4444-8444-444444444444',
   warehouseId: '55555555-5555-4555-8555-555555555555',
+  locationMappingId: null,
+  locationMappingRowVersion: null,
+  providerLocationId: null,
+  inventoryLocationId: null,
+  inventoryPoolId: null,
   credentialGeneration: 2,
   activationRevision: 4,
   configRowVersion: 6,
@@ -955,6 +993,11 @@ assert.deepEqual(
     jobId: job.id,
     carrierServiceConfigId: job.carrierServiceConfigId,
     warehouseId: job.warehouseId,
+    locationMappingId: job.locationMappingId,
+    locationMappingRowVersion: job.locationMappingRowVersion,
+    providerLocationId: job.providerLocationId,
+    inventoryLocationId: job.inventoryLocationId,
+    inventoryPoolId: job.inventoryPoolId,
     credentialGeneration: job.credentialGeneration,
     activationRevision: job.activationRevision,
     configRowVersion: job.configRowVersion,

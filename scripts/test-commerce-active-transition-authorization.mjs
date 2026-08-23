@@ -162,14 +162,6 @@ function verifySourceContracts() {
     'isClawPilotCommerceCapabilityImplemented',
     'COMMERCE_ACTIVE_CAPABILITY_NOT_IMPLEMENTED',
     'requireImplementedCohort',
-    'lockShopifyCarrierServiceConfigurationWriters',
-    'registeredShopifyCarrierServiceRebindings',
-    'applyRegisteredShopifyCarrierServiceRebindings',
-    "writeCapabilities.includes('shipping_rate_callbacks')",
-    'operations_shopify_carrier_service_config_is_ready(',
-    "'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_MUTATION_UNRESOLVED'",
-    'operations.shopify_carrier_service.activation_revision_rebound',
-    'callbackTokenRotations: 0',
     'commerceActiveCohortHash',
     'providerWrites: 0',
     'credentialDecryptions: 0',
@@ -193,74 +185,19 @@ function verifySourceContracts() {
       `Commerce Active preparation must not access ${forbidden}`,
     )
   }
-  const rebindStart = persistence.indexOf(
-    'async function applyRegisteredShopifyCarrierServiceRebindings(',
-  )
-  const rebindEnd = persistence.indexOf(
-    'export async function consumeCommerceActiveTransitionAuthorizationInPostgres(',
-    rebindStart,
-  )
-  const rebindPreflightStart = persistence.indexOf(
-    'async function registeredShopifyCarrierServiceRebindings(',
-  )
-  const rebindPreflight = persistence.slice(
-    rebindPreflightStart,
-    rebindStart,
-  )
-  assert.equal(
-    rebindPreflight.includes('JOIN operations_commerce_credentials'),
-    false,
-    'Active rebind must enumerate every registered CarrierService even when its credential row is missing',
-  )
-  assert.ok(
-    rebindPreflight.includes(
-      'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
-    ),
-    'Active rebind must reject a callback capability claim without a registered CarrierService',
-  )
-  assert.ok(
-    rebindPreflight.includes('matchedCallbackAccountIds'),
-    'Active rebind must prove exact registered-config coverage in both directions',
-  )
-  assert.equal(
-    rebindPreflight.includes('row.callback_ready'),
-    false,
-    'Active rebind preflight must allow an explicitly authorized disabled account to become active before canonical readiness is evaluated',
-  )
-  assert.ok(
-    rebindStart >= 0 && rebindEnd > rebindStart,
-    'Commerce Active CarrierService rebind boundary is invalid',
-  )
-  const rebind = persistence.slice(rebindStart, rebindEnd)
-  assert.ok(
-    rebind.includes('callback_ready'),
-    'Active rebind must prove canonical callback readiness after account activation and revision rebinding',
-  )
-  assert.ok(
-    rebind.includes(
-      'SELECT operations_shopify_carrier_service_config_is_ready(',
-    ),
-    'Active rebind must evaluate stable callback readiness in a separate command after the config update',
-  )
-  assert.equal(
-    /RETURNING[\s\S]*operations_shopify_carrier_service_config_is_ready\(/.test(
-      rebind.slice(0, rebind.indexOf('const readiness')),
-    ),
-    false,
-    'Active rebind must not evaluate stable callback readiness from the UPDATE command snapshot',
-  )
-  for (const forbiddenMutation of [
-    'SET service_gid =',
-    'SET callback_token_version =',
-    'SET callback_token_hash =',
-    'SET registered_service_name =',
-    'SET policy_snapshot =',
-    'SET warehouse_id =',
+  for (const obsoleteCheckoutLatch of [
+    'lockShopifyCarrierServiceConfigurationWriters',
+    'registeredShopifyCarrierServiceRebindings',
+    'applyRegisteredShopifyCarrierServiceRebindings',
+    'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
+    'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_MUTATION_UNRESOLVED',
+    'operations.shopify_carrier_service.activation_revision_rebound',
+    'carrierServiceRebindings:',
   ]) {
     assert.equal(
-      rebind.includes(forbiddenMutation),
+      persistence.includes(obsoleteCheckoutLatch),
       false,
-      `Commerce Active rebind must not mutate ${forbiddenMutation}`,
+      `global Active transition must not inspect or mutate checkout state via ${obsoleteCheckoutLatch}`,
     )
   }
 
@@ -285,7 +222,7 @@ function verifySourceContracts() {
     'implementation?: Record<',
     'selectable: implemented && scopeEligible',
     'disabled={!option.selectable}',
-    "option.unavailableReason === 'not_implemented'",
+    "reason === 'not_implemented'",
     'Provider-supported capabilities remain',
     'commerceActiveInitialSelection({',
     'preservationBlockers.length',
@@ -294,6 +231,19 @@ function verifySourceContracts() {
     assert.ok(
       operationsUi.includes(fragment),
       `Commerce Active UI truthfulness guard missing ${fragment}`,
+    )
+  }
+  for (const obsoleteUiLatch of [
+    'readShopifyCarrierServiceActivationSetups(',
+    'carrierServiceUnavailableReason',
+    'SHOPIFY_CARRIER_SERVICE_GID_PATTERN',
+    'Set up CarrierService first',
+    'CarrierService status unavailable',
+  ]) {
+    assert.equal(
+      operationsUi.includes(obsoleteUiLatch),
+      false,
+      `global Active capability review must not depend on checkout setup via ${obsoleteUiLatch}`,
     )
   }
 
@@ -662,6 +612,172 @@ async function seedWorkspace(pool) {
   }
 }
 
+async function seedCheckoutTransitionInvariant(pool, shopifyAccountId) {
+  const warehouse = await pool.query(
+    `INSERT INTO operations_warehouses (
+       organization_id, code, name, created_by, updated_by
+     ) VALUES (
+       $1::uuid, 'ACTIVE-CHECKOUT',
+       'Active checkout transition invariant warehouse', $2, $2
+     ) RETURNING id::text`,
+    [organizationId, ownerEmail],
+  )
+  const policySnapshot = {
+    version: 'shopify-checkout-rating-policy-v1',
+    planRateOptimization: {
+      version: 'shopify-checkout-plan-rate-objective-v2',
+      maxCandidates: 4,
+      objectivePriority: ['landed_price', 'package_count', 'unused_cube'],
+      handlingCostMinorPerPackage: 0,
+      handlingCostCurrency: 'USD',
+    },
+    checkoutRateWarm: {
+      version: 'shopify-checkout-rate-warm-v1',
+      enabled: false,
+      mode: 'hosted_ajax',
+      zoneScope: 'all_saved_rate_zones',
+      concurrency: 2,
+      debounceMs: 350,
+      minIntervalMs: 1_000,
+      supportedCountries: ['US'],
+      staleCartAbort: true,
+    },
+    shadowCheckoutAudience: {
+      version: 'shopify-checkout-audience-v1',
+      mode: 'all_eligible',
+    },
+    checkoutRateControl: {
+      version: 'shopify-checkout-rate-control-v1',
+      audience: 'all_eligible',
+      rateSource: 'production',
+    },
+  }
+  await pool.query(`SET session_replication_role = 'replica'`)
+  try {
+    const config = await pool.query(
+      `INSERT INTO operations_shopify_carrier_service_configs (
+         organization_id, integration_account_id, warehouse_id,
+         registration_state, service_gid, registered_service_name,
+         credential_generation, activation_revision,
+         callback_token_version, callback_token_hash, policy_revision,
+         policy_hash, policy_snapshot, inventory_max_age_seconds,
+         quote_ttl_seconds, order_reconciliation_window_seconds,
+         algorithm_version, row_version, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'registered',
+         'gid://shopify/DeliveryCarrierService/299900001',
+         'Active transition invariant CarrierService',
+         1, 1, 1, repeat('a', 64), 1, repeat('b', 64), $4::jsonb,
+         900, 900, 86400, 'active-transition-invariant-v1', 7,
+         $5, $5
+       ) RETURNING id::text, global_id, row_version::text`,
+      [
+        organizationId,
+        shopifyAccountId,
+        warehouse.rows[0].id,
+        JSON.stringify(policySnapshot),
+        ownerEmail,
+      ],
+    )
+    const aggregateHash = 'c'.repeat(64)
+    const requestHash = 'd'.repeat(64)
+    await pool.query(
+      `INSERT INTO operations_commerce_external_effect_aggregate_fences (
+         organization_id, integration_account_id, provider,
+         aggregate_type, aggregate_id, aggregate_revision, aggregate_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify',
+         'shopify_carrier_service_configuration', $3, 7, $4
+       )`,
+      [organizationId, shopifyAccountId, config.rows[0].global_id, aggregateHash],
+    )
+    const simulation = await pool.query(
+      `INSERT INTO operations_commerce_external_effect_intents (
+         organization_id, integration_account_id, provider, action,
+         desired_mode, credential_generation, activation_revision,
+         aggregate_type, aggregate_id, aggregate_revision, aggregate_hash,
+         idempotency_key, request_hash, redacted_request, state,
+         redacted_result, terminal_evidence_hash, provider_write_count,
+         completed_at, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify',
+         'shopify.carrier_service.create', 'shadow', 1, 1,
+         'shopify_carrier_service_configuration', $3, 7, $4,
+         'active-transition-unresolved-simulation', $5,
+         '{"mutation":{"operation":"create"}}'::jsonb,
+         'simulated', '{"providerWrites":0}'::jsonb, repeat('f', 64),
+         0, now(), $6
+       ) RETURNING id::text`,
+      [
+        organizationId,
+        shopifyAccountId,
+        config.rows[0].global_id,
+        aggregateHash,
+        requestHash,
+        ownerEmail,
+      ],
+    )
+    await pool.query(
+      `INSERT INTO operations_shopify_carrier_service_mutation_authorizations (
+         organization_id, integration_account_id, config_id,
+         simulation_effect_id, operation, account_environment,
+         credential_generation, config_row_version, activation_state,
+         activation_revision, aggregate_hash, request_hash,
+         expected_service_gid, confirmation_hash,
+         confirmation_statement_version, idempotency_key,
+         authorized_by, authorized_role, expires_at,
+         simulation_activation_revision, provider_write_activation_revision
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'create', 'production',
+         1, 7, 'shadow', 1, $5, $6, NULL, repeat('e', 64),
+         'shopify-carrier-service-mutation-v1',
+         'active-transition-unresolved-authorization',
+         $7, 'owner', now() + interval '5 minutes', 1, 1
+       )`,
+      [
+        organizationId,
+        shopifyAccountId,
+        config.rows[0].id,
+        simulation.rows[0].id,
+        aggregateHash,
+        requestHash,
+        ownerEmail,
+      ],
+    )
+    return config.rows[0]
+  } finally {
+    await pool.query(`SET session_replication_role = 'origin'`)
+  }
+}
+
+async function checkoutTransitionEvidence(pool, configId) {
+  const result = await pool.query(
+    `SELECT
+       to_jsonb(config) AS config,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(simulation) ORDER BY simulation.id)
+         FROM operations_commerce_external_effect_intents simulation
+         WHERE simulation.organization_id = config.organization_id
+           AND simulation.aggregate_type =
+             'shopify_carrier_service_configuration'
+           AND simulation.aggregate_id = config.global_id
+       ), '[]'::jsonb) AS simulations,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(auth) ORDER BY auth.id)
+         FROM operations_shopify_carrier_service_mutation_authorizations
+           auth
+         WHERE auth.organization_id = config.organization_id
+           AND auth.config_id = config.id
+       ), '[]'::jsonb) AS authorizations
+     FROM operations_shopify_carrier_service_configs config
+     WHERE config.organization_id = $1::uuid
+       AND config.id = $2::uuid`,
+    [organizationId, configId],
+  )
+  assert.ok(result.rows[0], 'Checkout transition invariant fixture is missing')
+  return result.rows[0]
+}
+
 async function verifyDisposablePostgres() {
   command('docker', ['info'], { timeout: 30_000 })
   const container = [
@@ -763,6 +879,10 @@ async function verifyDisposablePostgres() {
             },
           },
           '@/lib/integrations/commerceCapabilities': capabilityCatalog,
+          '@/lib/persistence/operationShadowTraining': {
+            assertNoOpenOperationsShadowTrainingRunsForActivation:
+              async () => {},
+          },
           '@/lib/persistence/postgres': postgresMock,
         },
       },
@@ -771,6 +891,45 @@ async function verifyDisposablePostgres() {
     assert.ok(accounts.shopify)
     assert.ok(accounts.faire)
     assert.ok(accounts.otherShopify)
+    const checkoutInvariant = await seedCheckoutTransitionInvariant(
+      pool,
+      accounts.shopify.id,
+    )
+    const checkoutEvidenceBeforeModes = await checkoutTransitionEvidence(
+      pool,
+      checkoutInvariant.id,
+    )
+    await pool.query('BEGIN')
+    try {
+      await pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'disabled', revision = revision + 1,
+             reason = 'Exercise checkout-independent emergency mode',
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      assert.deepEqual(
+        await checkoutTransitionEvidence(pool, checkoutInvariant.id),
+        checkoutEvidenceBeforeModes,
+        'entering Disabled must not mutate registered checkout evidence',
+      )
+      await pool.query(
+        `UPDATE operations_activation_scopes
+         SET state = 'shadow', revision = revision + 1,
+             reason = 'Resume checkout-independent Shadow mode',
+             updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid`,
+        [organizationId],
+      )
+      assert.deepEqual(
+        await checkoutTransitionEvidence(pool, checkoutInvariant.id),
+        checkoutEvidenceBeforeModes,
+        'Disabled to Shadow must leave config, simulation, and unresolved authorization byte-stable',
+      )
+    } finally {
+      await pool.query('ROLLBACK')
+    }
 
     const selectedAccounts = [{
       accountGlobalId: accounts.shopify.global_id,
@@ -1170,65 +1329,34 @@ async function verifyDisposablePostgres() {
         expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'authorize-main',
       })
-    await expectCode(
-      persistence.consumeCommerceActiveTransitionAuthorizationInPostgres({
-        organizationId,
-        actorEmail: ownerEmail,
-        authorizationGlobalId:
-          authorizedWithoutCarrierService.authorizationGlobalId,
-        expectedCohortHash: preparedForExpiry.cohortHash,
-        idempotencyKey: 'consume-missing-carrier-service',
-        reason: 'Reject callback authority without a registered service',
-      }),
-      'COMMERCE_ACTIVE_SHOPIFY_CALLBACK_CONFIG_MISSING',
-    )
-    const selectedAccountsWithoutCallbacks = [{
-      accountGlobalId: accounts.shopify.global_id,
-      capabilities: [
-        'fulfillment_export',
-        'tracking_export',
-      ],
-    }]
-    const preparedWithoutCallbacks = await persistence
-      .prepareCommerceActiveTransitionInPostgres({
-        organizationId,
-        actorEmail: ownerEmail,
-        expectedActivationState: 'shadow',
-        expectedActivationRevision: 1,
-        selectedAccounts: selectedAccountsWithoutCallbacks,
-        idempotencyKey: 'prepare-without-callbacks',
-      })
-    const authorized = await persistence
-      .authorizeCommerceActiveTransitionInPostgres({
-        organizationId,
-        actorEmail: ownerEmail,
-        preparationGlobalId:
-          preparedWithoutCallbacks.preparationGlobalId,
-        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
-        idempotencyKey: 'authorize-without-callbacks',
-      })
+    const authorized = authorizedWithoutCarrierService
     const activated = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
+        expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-main',
-        reason: 'Activate exact verified commerce cohort',
+        reason: 'Activate commerce authority independent of checkout setup',
       })
     assert.equal(activated.replayed, false)
     assert.equal(activated.state, 'active')
     assert.equal(activated.revision, 2)
     assert.equal(activated.accountCount, 1)
-    assert.equal(activated.capabilityCount, 2)
+    assert.equal(activated.capabilityCount, 3)
+    assert.deepEqual(
+      await checkoutTransitionEvidence(pool, checkoutInvariant.id),
+      checkoutEvidenceBeforeModes,
+      'Shadow to Active must not rebind checkout revision, churn rowVersion, or consume unresolved checkout evidence',
+    )
     const activatedReplay = await persistence
       .consumeCommerceActiveTransitionAuthorizationInPostgres({
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
+        expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-main',
-        reason: 'Activate exact verified commerce cohort',
+        reason: 'Activate commerce authority independent of checkout setup',
       })
     assert.equal(activatedReplay.replayed, true)
     assert.equal(
@@ -1240,9 +1368,9 @@ async function verifyDisposablePostgres() {
         organizationId,
         actorEmail: ownerEmail,
         authorizationGlobalId: authorized.authorizationGlobalId,
-        expectedCohortHash: preparedWithoutCallbacks.cohortHash,
+        expectedCohortHash: preparedForExpiry.cohortHash,
         idempotencyKey: 'consume-second-time',
-        reason: 'Activate exact verified commerce cohort',
+        reason: 'Activate commerce authority independent of checkout setup',
       }),
       'COMMERCE_ACTIVE_CONSUMPTION_IDEMPOTENCY_CONFLICT',
     )
@@ -1435,6 +1563,11 @@ async function verifyDisposablePostgres() {
       state: 'shadow',
       revision: 3,
     })
+    assert.deepEqual(
+      await checkoutTransitionEvidence(pool, checkoutInvariant.id),
+      checkoutEvidenceBeforeModes,
+      'Active to Shadow must not mutate registered checkout config or unresolved mutation evidence',
+    )
     const continuation = await persistence
       .readCommerceActiveContinuationInPostgres({ organizationId })
     assert.equal(
@@ -1447,13 +1580,21 @@ async function verifyDisposablePostgres() {
       JSON.parse(JSON.stringify(continuation.shopifyAccounts)),
       [{
         accountGlobalId: accounts.shopify.global_id,
-        writeCapabilities: ['fulfillment_export', 'tracking_export'],
+        writeCapabilities: [
+          'fulfillment_export',
+          'shipping_rate_callbacks',
+          'tracking_export',
+        ],
       }],
     )
     const combinedSelection = [
       {
         accountGlobalId: accounts.shopify.global_id,
-        capabilities: ['fulfillment_export', 'tracking_export'],
+        capabilities: [
+          'fulfillment_export',
+          'shipping_rate_callbacks',
+          'tracking_export',
+        ],
       },
       {
         accountGlobalId: accounts.faire.global_id,
@@ -1478,7 +1619,11 @@ async function verifyDisposablePostgres() {
       combinedPreparation.accounts.find(
         (account) => account.provider === 'shopify',
       )?.writeCapabilities,
-      ['fulfillment_export', 'tracking_export'],
+      [
+        'fulfillment_export',
+        'shipping_rate_callbacks',
+        'tracking_export',
+      ],
     )
     assert.deepEqual(
       combinedPreparation.accounts.find(
@@ -1507,9 +1652,13 @@ async function verifyDisposablePostgres() {
     assert.equal(combinedActivation.state, 'active')
     assert.equal(combinedActivation.revision, 4)
     assert.equal(combinedActivation.accountCount, 2)
-    assert.equal(combinedActivation.capabilityCount, 5)
+    assert.equal(combinedActivation.capabilityCount, 6)
     for (const [accountGlobalId, capabilities] of [
-      [accounts.shopify.global_id, ['fulfillment_export', 'tracking_export']],
+      [accounts.shopify.global_id, [
+        'fulfillment_export',
+        'shipping_rate_callbacks',
+        'tracking_export',
+      ]],
       [accounts.faire.global_id, [
         'order_update',
         'fulfillment_export',

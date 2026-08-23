@@ -16,10 +16,7 @@ import {
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
-import type {
-  OperationsActivationState,
-  OperationsOrderDetail,
-} from '@/lib/operations/types'
+import type { OperationsOrderDetail } from '@/lib/operations/types'
 import type { OneOffShipmentExecutionState } from '@/lib/operations/oneOffShipments'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime } from '@/lib/userDateTime'
@@ -49,10 +46,9 @@ export default function OneOffShippingExecutionPanel({
   state,
   loading,
   error,
-  activationState,
   canManage,
   canExecute,
-  canActivate,
+  canPurchaseLivePostage,
   busy,
   onRefreshPackedRates,
   onReviewPurchase,
@@ -62,10 +58,9 @@ export default function OneOffShippingExecutionPanel({
   state: OneOffShipmentExecutionState | null
   loading: boolean
   error: string
-  activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
-  canActivate: boolean
+  canPurchaseLivePostage: boolean
   busy: boolean
   onRefreshPackedRates: () => void
   onReviewPurchase: () => void
@@ -74,19 +69,15 @@ export default function OneOffShippingExecutionPanel({
   const dateTime = useUserDateTime()
   const [clock, setClock] = useState(() => Date.now())
   const live = order.oneOffShippingMode === 'live'
-  const requiredActivation: OperationsActivationState = live ? 'active' : 'shadow'
   const basePermissionBlocker = !canManage
     ? 'Operations management permission is required.'
     : !canExecute
       ? 'Warehouse execution permission is required.'
       : null
   const purchasePermissionBlocker = basePermissionBlocker
-    || (live && !canActivate
-      ? 'Operations activation permission is required for LIVE rating and postage purchase.'
+    || (live && !canPurchaseLivePostage
+      ? 'Live-postage permission is required for LIVE rating and postage purchase.'
       : null)
-  const activationBlocker = activationState !== requiredActivation
-    ? `${live ? 'LIVE' : 'TEST'} one-off execution requires Operations ${live ? 'Active' : 'Shadow'} mode.`
-    : null
   const group = state?.carrierGroup || null
   const unresolved = Boolean(group?.unresolved)
   const activeGroup = Boolean(group?.active)
@@ -112,7 +103,6 @@ export default function OneOffShippingExecutionPanel({
   }, [clock, expiresAtMs])
   const eligibleOffers = state?.packedRate?.offers || []
   const purchaseBlocker = purchasePermissionBlocker
-    || activationBlocker
     || (order.status !== 'packed' ? 'Verify every package before rerating or buying postage.' : null)
     || (packageMismatch ? 'The order detail does not match the complete packed package group. Refresh before continuing.' : null)
     || (unresolved ? 'The carrier group has an unresolved provider outcome and must be reconciled before retrying.' : null)
@@ -122,7 +112,6 @@ export default function OneOffShippingExecutionPanel({
     || (packedRateExpired ? 'The packed rate has expired. Refresh it before purchasing.' : null)
     || (!eligibleOffers.length ? 'The planned carrier service did not return a matching packed rate.' : null)
   const refreshBlocker = purchasePermissionBlocker
-    || activationBlocker
     || (order.status !== 'packed' ? 'Verify every package before refreshing packed rates.' : null)
     || (packageMismatch ? 'The order detail does not match the complete packed package group.' : null)
     || (unresolved ? 'The carrier group has an unresolved provider outcome and must be reconciled first.' : null)
@@ -146,9 +135,9 @@ export default function OneOffShippingExecutionPanel({
         </Typography>
       </Alert>
 
-      {(purchasePermissionBlocker || activationBlocker) && (
+      {purchasePermissionBlocker && (
         <Alert severity="info" data-testid="one-off-group-permission-blocker">
-          {purchasePermissionBlocker || activationBlocker} An already purchased complete
+          {purchasePermissionBlocker} An already purchased complete
           shipment can still be voided with Operations management and warehouse execution
           permission when its original carrier account remains available.
         </Alert>

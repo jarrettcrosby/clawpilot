@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
+  shippingCapabilities,
 } from '@/lib/operations/authorization'
 import type {
   Address,
@@ -14,8 +15,19 @@ import type {
   OperationsOrderStatus,
   OperationsWorkspace,
 } from '@/lib/operations/types'
+import { OperationsShadowTrainingError } from '@/lib/operations/shadowTraining'
 import { canRequestOperationsPickHandoff } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import {
+  CommerceStoreSyncPersistenceError,
+  updateCommerceStoreSyncControlInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
+import {
+  CommerceOrderWorkbenchError,
+} from '@/lib/persistence/commerceOrderWorkbench'
+import {
+  OperationsOrderShipmentAddressError,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
@@ -26,6 +38,14 @@ import {
   authorizeSandboxCommerceE2eInPostgres,
   SandboxCommerceE2eAuthorizationError,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
+  authorizeShopifyTestStoreCanonicalE2e,
+  ShopifyTestStoreCanonicalE2eError,
+} from '@/lib/integrations/shopifyTestStoreCanonicalE2e'
+import {
+  confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres,
+  ShopifyTestStoreCanonicalE2ePersistenceError,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
 import {
   cancelUnstartedCommerceOrderFromProviderRevisionInPostgres,
   CommerceOrderRevisionDispositionError,
@@ -49,6 +69,7 @@ import {
   recordWearablePickScanEvidenceFromPostgres,
   reconcileShopifyExternalFulfillmentFromPostgres,
   releaseOperationsOrderFromPostgres,
+  reopenOperationsOrderForReplanningInPostgres,
   requestOperationsPickHandoffFromPostgres,
   retryOperationsCommerceFulfillmentExportFromPostgres,
   runMockOperationsProofFromPostgres,
@@ -58,6 +79,7 @@ import {
   updateOperationsWarehouseInPostgres,
   verifyOperationsOrderPackFromPostgres,
 } from '@/lib/persistence/operations'
+import { assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres } from '@/lib/persistence/operationShadowTraining'
 import {
   createOperationsSandboxLabelInPostgres,
   voidOperationsSandboxLabelInPostgres,
@@ -119,6 +141,24 @@ const ORDER_STATUSES = new Set<OperationsOrderStatus>([
 ])
 const EXCEPTION_STATUSES = new Set<OperationsExceptionStatus>([
   'open', 'acknowledged', 'resolved', 'dismissed',
+])
+// Canonical commands remain isolated only from an exact open training overlay.
+// The legacy workspace activation profile is not local-work authority.
+const SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS = new Set([
+  'plan-order',
+  'release-order',
+  'assign-picks',
+  'manage-pick-assignment',
+  'request-pick-handoff',
+  'record-pick-scan-evidence',
+  'confirm-picks',
+  'verify-pack',
+  'authorize-sandbox-commerce-e2e',
+  'prepare-shipment-execution',
+  'generate-packing-slip',
+  'confirm-shipment',
+  'create-sandbox-label',
+  'void-sandbox-label',
 ])
 const ACTIVATION_STATES = new Set<OperationsActivationState>([
   'disabled', 'shadow', 'read_only', 'active', 'frozen',
@@ -956,10 +996,42 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && 'status' in error
+    && error.code === 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'
+    && error.status === 409
+  ) {
+    return json({
+      ok: false,
+      error: 'Pack confirmation is using this exact evidence; retry after refreshing status',
+      code: error.code,
+    }, error.status)
+  }
+  if (error instanceof CommerceStoreSyncPersistenceError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof CommerceOrderWorkbenchError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof OperationsOrderShipmentAddressError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof OperationsShadowTrainingError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (error instanceof CommerceActiveTransitionPersistenceError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof SandboxCommerceE2eAuthorizationError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (
+    error instanceof ShopifyTestStoreCanonicalE2eError
+    || error instanceof ShopifyTestStoreCanonicalE2ePersistenceError
+  ) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (error instanceof CommerceOrderRevisionDispositionError) {
@@ -1029,6 +1101,8 @@ export async function GET(req: NextRequest) {
       organizationId: activeOperationsOrganizationId(actor),
       actorEmail: actor.email,
       capabilities,
+      canPurchaseLivePostage:
+        shippingCapabilities(actor).canPurchaseLivePostage,
       search,
       status: statusValue || null,
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
@@ -1054,6 +1128,16 @@ export async function POST(req: NextRequest) {
     const capabilities = operationsCapabilities(actor)
     const body = await requestBody(req)
     const action = textValue(body.action, 'Operations action', 50)
+    if (SHADOW_COMMERCE_CANONICAL_ORDER_ACTIONS.has(action)) {
+      await assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+      })
+    }
     if (action === 'create-warehouse') {
       if (!capabilities.canManage) {
         return json({ ok: false, error: 'You do not have permission to configure warehouses', code: 'OPERATIONS_MANAGE_REQUIRED' }, 403)
@@ -1379,18 +1463,21 @@ export async function POST(req: NextRequest) {
           'cartonizationEvidenceGlobalId',
           'expectedRowVersion',
           'reason',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
+      const organizationId = activeOperationsOrganizationId(actor)
+      const orderGlobalId = globalIdValue(
+        body.orderGlobalId,
+        'Operations order',
+        ORDER_GLOBAL_ID,
+      )
       const result = await planOperationsOrderFromPostgres({
-        organizationId: activeOperationsOrganizationId(actor),
+        organizationId,
         actorEmail: actor.email,
-        orderGlobalId: globalIdValue(
-          body.orderGlobalId,
-          'Operations order',
-          ORDER_GLOBAL_ID,
-        ),
+        orderGlobalId,
         cartonizationEvidenceGlobalId: globalIdValue(
           body.cartonizationEvidenceGlobalId,
           'Cartonization evidence',
@@ -1404,6 +1491,11 @@ export async function POST(req: NextRequest) {
         ),
         reason: textValue(body.reason, 'Planning reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }
@@ -1417,7 +1509,10 @@ export async function POST(req: NextRequest) {
       }
       assertFields(
         body,
-        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason', 'assignedTo']),
+        new Set([
+          'action', 'orderGlobalId', 'expectedRowVersion', 'reason',
+          'assignedTo', 'sandboxE2eAuthorizationGlobalId',
+        ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
@@ -1429,8 +1524,84 @@ export async function POST(req: NextRequest) {
         reason: textValue(body.reason, 'Release reason', 500),
         assignedTo: textValue(body.assignedTo, 'Assigned picker', 254, false) || undefined,
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
+    }
+    if (action === 'reopen-order-for-replanning') {
+      if (!capabilities.canManage) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to correct warehouse work',
+          code: 'OPERATIONS_MANAGE_REQUIRED',
+        }, 403)
+      }
+      if (!capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'You do not have permission to execute warehouse work corrections',
+          code: 'OPERATIONS_EXECUTE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'orderGlobalId',
+          'expectedRowVersion',
+          'expectedPlanGlobalId',
+          'expectedPlanVersion',
+          'expectedCorrectionFingerprint',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const expectedCorrectionFingerprint = textValue(
+        body.expectedCorrectionFingerprint,
+        'Correction fingerprint',
+        64,
+      ).toLowerCase()
+      if (!SHA256.test(expectedCorrectionFingerprint)) {
+        requestError(
+          'OPERATIONS_REPLANNING_FINGERPRINT_INVALID',
+          'Correction fingerprint is invalid',
+        )
+      }
+      const result = await reopenOperationsOrderForReplanningInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        expectedPlanGlobalId: globalIdValue(
+          body.expectedPlanGlobalId,
+          'Fulfillment plan',
+          /^gfp(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
+        expectedPlanVersion: integerValue(
+          body.expectedPlanVersion,
+          'Fulfillment plan version',
+          1,
+          2_147_483_647,
+        ),
+        expectedCorrectionFingerprint,
+        reason: textValue(body.reason, 'Correction reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
     }
     if (action === 'assign-picks') {
       if (!capabilities.canManage || !capabilities.canExecute) {
@@ -1448,6 +1619,7 @@ export async function POST(req: NextRequest) {
           'expectedRowVersion',
           'assignedTo',
           'reason',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1460,6 +1632,11 @@ export async function POST(req: NextRequest) {
         assignedTo: textValue(body.assignedTo, 'Assigned picker', 254),
         reason: textValue(body.reason, 'Assignment reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }
@@ -1588,6 +1765,7 @@ export async function POST(req: NextRequest) {
           'orderGlobalId',
           'expectedRowVersion',
           'scanEvidence',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1599,6 +1777,11 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         scanEvidence: wearablePickScanEvidenceValue(body.scanEvidence),
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }
@@ -1620,6 +1803,7 @@ export async function POST(req: NextRequest) {
           'scanEvidenceIdempotencyKey',
           'countEvidenceIdempotencyKey',
           'countEvidence',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -1654,6 +1838,11 @@ export async function POST(req: NextRequest) {
         countEvidenceIdempotencyKey,
         countEvidence,
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
     }
@@ -1667,7 +1856,9 @@ export async function POST(req: NextRequest) {
       }
       assertFields(
         body,
-        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        new Set([
+          'action', 'orderGlobalId', 'expectedRowVersion', 'reason',
+        ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
@@ -1700,7 +1891,10 @@ export async function POST(req: NextRequest) {
       }
       assertFields(
         body,
-        new Set(['action', 'orderGlobalId', 'expectedRowVersion', 'reason']),
+        new Set([
+          'action', 'orderGlobalId', 'expectedRowVersion', 'reason',
+          'sandboxE2eAuthorizationGlobalId',
+        ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
       )
@@ -1711,8 +1905,96 @@ export async function POST(req: NextRequest) {
         expectedRowVersion: integerValue(body.expectedRowVersion, 'Order version', 0, 2_147_483_647),
         reason: textValue(body.reason, 'Package verification reason', 500),
         idempotencyKey: idempotencyKeyValue(req),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+        ),
       })
       return json({ ok: true, capabilities, result })
+    }
+    if (action === 'authorize-shopify-test-store-canonical-e2e') {
+      if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or administrator may authorize the exact Shopify test-store lane',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action', 'orderGlobalId', 'expectedRowVersion',
+          'confirmationStatement', 'reason', 'lifetimeMinutes',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result = await authorizeShopifyTestStoreCanonicalE2e({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        idempotencyKey: idempotencyKeyValue(req),
+        orderGlobalId: globalIdValue(
+          body.orderGlobalId,
+          'Operations order',
+          ORDER_GLOBAL_ID,
+        ),
+        expectedOrderRowVersion: integerValue(
+          body.expectedRowVersion,
+          'Order version',
+          0,
+          2_147_483_647,
+        ),
+        confirmationStatement: body.confirmationStatement,
+        reason: textValue(body.reason, 'Test-store authorization reason', 500),
+        lifetimeMinutes: body.lifetimeMinutes === undefined
+          ? undefined
+          : integerValue(body.lifetimeMinutes, 'Authorization lifetime', 5, 240),
+      })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
+    }
+    if (action === 'confirm-shopify-test-store-e2e-fulfillment') {
+      if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or administrator may confirm the exact Shopify test fulfillment',
+          code: 'OPERATIONS_ACTIVATION_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action', 'authorizationGlobalId', 'orderGlobalId',
+          'expectedRowVersion', 'confirmationStatement', 'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Operations command',
+      )
+      const result =
+        await confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres({
+          organizationId: activeOperationsOrganizationId(actor),
+          actorEmail: actor.email,
+          idempotencyKey: idempotencyKeyValue(req),
+          authorizationGlobalId: globalIdValue(
+            body.authorizationGlobalId,
+            'Shopify test-store authorization',
+            /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
+          ),
+          orderGlobalId: globalIdValue(
+            body.orderGlobalId,
+            'Operations order',
+            ORDER_GLOBAL_ID,
+          ),
+          expectedOrderRowVersion: integerValue(
+            body.expectedRowVersion,
+            'Order version',
+            0,
+            2_147_483_647,
+          ),
+          confirmationStatement: body.confirmationStatement,
+          reason: textValue(body.reason, 'Fulfillment confirmation reason', 500),
+        })
+      return json({ ok: true, capabilities, result }, result.replayed ? 200 : 201)
     }
     if (action === 'authorize-sandbox-commerce-e2e') {
       if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
@@ -1788,11 +2070,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'prepare-active-fulfillment-execution') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
-          error: 'You do not have permission to prepare Active fulfillment execution',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          error: 'You do not have permission to prepare production carrier execution',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -1841,11 +2126,14 @@ export async function POST(req: NextRequest) {
       )
     }
     if (action === 'execute-production-rerate') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to execute production carrier rating',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -1940,11 +2228,14 @@ export async function POST(req: NextRequest) {
       return json({ ok: true, capabilities, result }, 201)
     }
     if (action === 'select-production-rerate-offer') {
-      if (!capabilities.canManage || !capabilities.canExecute) {
+      if (
+        !capabilities.canManage
+        || !shippingCapabilities(actor).canPurchaseLivePostage
+      ) {
         return json({
           ok: false,
           error: 'You do not have permission to select a production carrier service',
-          code: 'OPERATIONS_EXECUTE_REQUIRED',
+          code: 'OPERATIONS_LIVE_POSTAGE_REQUIRED',
         }, 403)
       }
       assertFields(
@@ -1998,6 +2289,7 @@ export async function POST(req: NextRequest) {
           'orderGlobalId',
           'packageGlobalId',
           'expectedRowVersion',
+          'sandboxE2eAuthorizationGlobalId',
         ]),
         'OPERATIONS_REQUEST_INVALID',
         'Operations command',
@@ -2020,6 +2312,11 @@ export async function POST(req: NextRequest) {
           'Order version',
           0,
           2_147_483_647,
+        ),
+        sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
+          body.sandboxE2eAuthorizationGlobalId,
+          'Shopify test-store authorization',
+          /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),
       })
@@ -2087,7 +2384,8 @@ export async function POST(req: NextRequest) {
               'Customer notification exception reason',
               500,
             ),
-        canActivate: capabilities.canActivate,
+        canPurchaseLivePostage:
+          shippingCapabilities(actor).canPurchaseLivePostage,
         idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
@@ -2450,6 +2748,65 @@ export async function POST(req: NextRequest) {
           1,
           2_147_483_647,
         ),
+      })
+      return json({ ok: true, capabilities, result })
+    }
+    if (action === 'update-commerce-store-sync') {
+      if (!capabilities.canActivate) {
+        return json({
+          ok: false,
+          error: 'Only an organization owner or authorized administrator may change Store sync',
+          code: 'COMMERCE_STORE_SYNC_MANAGE_REQUIRED',
+        }, 403)
+      }
+      assertFields(
+        body,
+        new Set([
+          'action',
+          'accountGlobalId',
+          'desiredState',
+          'expectedDesiredState',
+          'expectedRevision',
+          'reason',
+        ]),
+        'OPERATIONS_REQUEST_INVALID',
+        'Store sync command',
+      )
+      const desiredState = textValue(
+        body.desiredState,
+        'Store sync state',
+        20,
+      )
+      const expectedDesiredState = textValue(
+        body.expectedDesiredState,
+        'Expected Store sync state',
+        20,
+      )
+      if (!['running', 'paused'].includes(desiredState)
+          || !['running', 'paused'].includes(expectedDesiredState)) {
+        requestError(
+          'COMMERCE_STORE_SYNC_STATE_INVALID',
+          'Store sync state is invalid',
+        )
+      }
+      const result = await updateCommerceStoreSyncControlInPostgres({
+        organizationId: activeOperationsOrganizationId(actor),
+        actorEmail: actor.email,
+        accountGlobalId: globalIdValue(
+          body.accountGlobalId,
+          'Commerce connection',
+          INTEGRATION_ACCOUNT_GLOBAL_ID,
+        ),
+        desiredState: desiredState as 'running' | 'paused',
+        expectedDesiredState: expectedDesiredState as 'running' | 'paused',
+        expectedRevision: integerValue(
+          body.expectedRevision,
+          'Expected Store sync revision',
+          1,
+          2_147_483_647,
+        ),
+        reason: textValue(body.reason, 'Store sync reason', 500),
+        idempotencyKey: idempotencyKeyValue(req),
       })
       return json({ ok: true, capabilities, result })
     }

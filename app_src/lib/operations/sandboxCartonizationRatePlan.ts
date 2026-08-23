@@ -55,7 +55,7 @@ export type SandboxGeometryRatePackage = {
     materialDimensionBasis: HybridCartonizationMaterial['dimensionBasis']
     materialDimensionEvidenceType:
       HybridCartonizationMaterial['dimensionEvidenceType']
-    materialDimensionEvidenceReference: string
+    materialDimensionEvidenceReference: string | null
     materialDimensionConfirmedAt: string
   }
 }
@@ -186,8 +186,13 @@ export function planSandboxGeometryRatePackages(input: {
         || material.capturedRowVersion !== material.currentRowVersion
         || material.isCurrent !== true
         || material.dimensionEvidenceType === 'unknown'
-        || typeof material.dimensionEvidenceReference !== 'string'
-        || material.dimensionEvidenceReference.trim().length < 1
+        || (
+          material.dimensionEvidenceType !== 'measured'
+          && (
+            typeof material.dimensionEvidenceReference !== 'string'
+            || material.dimensionEvidenceReference.trim().length < 1
+          )
+        )
         || typeof material.dimensionConfirmedAt !== 'string'
         || !Number.isFinite(Date.parse(material.dimensionConfirmedAt))
         || !dimensionsAreExact(material.innerDimensionsMm)
@@ -329,7 +334,7 @@ export function planSandboxGeometryRatePackages(input: {
           materialDimensionEvidenceType:
             selected.material.dimensionEvidenceType,
           materialDimensionEvidenceReference:
-            selected.material.dimensionEvidenceReference || '',
+            selected.material.dimensionEvidenceReference,
           materialDimensionConfirmedAt:
             selected.material.dimensionConfirmedAt || '',
         },

@@ -32,6 +32,8 @@ function offer(
     packagePlanHash,
     packageCount: 2,
     packageKeys,
+    carrierAccountGlobalId:
+      provider === 'ups_rest' ? 'gac0000001' : 'gac0000002',
     provider,
     serviceCode,
     serviceName: serviceCode,
@@ -121,6 +123,7 @@ test('selects the lowest-cost feasible service for the complete package set', ()
   ]))
 
   assert.equal(selection.carrierProvider, 'fedex_rest')
+  assert.equal(selection.carrierAccountGlobalId, 'gac0000002')
   assert.equal(selection.carrierName, 'FedEx')
   assert.equal(selection.serviceCode, 'fedex_ground')
   assert.equal(selection.carrierCostMinor, 900)
@@ -167,6 +170,53 @@ test('selects across all services when no delivery promise or checkout charge ex
   assert.equal(selection.actualCheckoutShippingChargeMinor, null)
   assert.equal(selection.customerPaidVarianceMinor, null)
   assert.equal(selection.policy.rejectedForPromiseCount, 0)
+})
+
+test('selects a sealed undated service only when the order has no delivery promise', () => {
+  const selection = selectCanonicalFulfillmentRate(planningInput([
+    offer('ups_rest', 'GROUND', {
+      carrierCostMinor: 700,
+      transitDays: null,
+      estimatedDeliveryAt: null,
+    }),
+    offer('fedex_rest', 'FEDEX_GROUND', {
+      carrierCostMinor: 900,
+      transitDays: 3,
+    }),
+  ], {
+    requestedDeliveryAt: null,
+  }))
+
+  assert.equal(selection.carrierProvider, 'ups_rest')
+  assert.equal(selection.serviceCode, 'ground')
+  assert.equal(selection.transitDays, null)
+  assert.equal(selection.estimatedDeliveryAt, null)
+  assert.equal(selection.meetsRequestedDelivery, true)
+})
+
+test('rejects undated services for a promised order', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        transitDays: null,
+        estimatedDeliveryAt: null,
+      }),
+    ])),
+    'CANONICAL_FULFILLMENT_RATE_PROMISE_UNAVAILABLE',
+  )
+})
+
+test('rejects partially dated carrier evidence', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        transitDays: null,
+      }),
+    ], {
+      requestedDeliveryAt: null,
+    })),
+    'CANONICAL_FULFILLMENT_RATE_TRANSIT_INVALID',
+  )
 })
 
 test('filters services that miss the promise before comparing cost', () => {
@@ -262,6 +312,37 @@ test('fails closed on currency drift, duplicate services, and invalid money', ()
       offer('fedex_rest', 'GROUND', { carrierCostMinor: 10.5 }),
     ])),
     'CANONICAL_FULFILLMENT_RATE_MONEY_INVALID',
+  )
+})
+
+test('keeps same-provider services from distinct carrier accounts independent', () => {
+  const selection = selectCanonicalFulfillmentRate(planningInput([
+    offer('ups_rest', 'GROUND', {
+      carrierAccountGlobalId: 'gac0000002',
+      rateEvidenceGlobalId: 'grq0000002',
+      carrierCostMinor: 1_000,
+    }),
+    offer('ups_rest', 'GROUND', {
+      carrierAccountGlobalId: 'gac0000001',
+      rateEvidenceGlobalId: 'grq0000001',
+      carrierCostMinor: 1_000,
+    }),
+  ]))
+
+  assert.equal(selection.carrierProvider, 'ups_rest')
+  assert.equal(selection.carrierAccountGlobalId, 'gac0000001')
+  assert.equal(selection.serviceCode, 'ground')
+  assert.equal(selection.policy.evaluatedOfferCount, 2)
+})
+
+test('rejects carrier offers without an exact carrier account identity', () => {
+  assertPlanningError(
+    () => selectCanonicalFulfillmentRate(planningInput([
+      offer('ups_rest', 'GROUND', {
+        carrierAccountGlobalId: 'not-an-account',
+      }),
+    ])),
+    'CANONICAL_FULFILLMENT_RATE_ACCOUNT_INVALID',
   )
 })
 

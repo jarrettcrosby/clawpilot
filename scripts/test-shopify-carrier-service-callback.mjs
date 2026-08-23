@@ -37,23 +37,81 @@ const checkoutRate = read(
 const checkoutPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const productionCheckoutRate = read(
+  'app_src/lib/integrations/shopifyCarrierServiceProductionRate.ts',
+)
+const checkoutCarrierSelection = read(
+  'app_src/lib/integrations/shopifyCheckoutCarrierSelection.ts',
+)
+const checkoutParcelEvidenceMigration = read(
+  'db/migrations/0164_shopify_checkout_offer_parcel_evidence.sql',
+)
+
+for (const required of [
+  'carrierWholeShipmentRateDestinationFingerprint({',
+  "purpose: 'shopify_checkout'",
+  'shipment: {',
+  "rateScope: 'multi_package_shipment'",
+  'packageCount: input.packageCount',
+  'parcels: input.parcels.map((parcel) => ({',
+  'packageCount: input.parcels.length',
+]) {
+  assert.ok(
+    productionCheckoutRate.includes(required),
+    `production checkout failure evidence is missing ${required}`,
+  )
+}
+assert.equal(
+  productionCheckoutRate.includes('carrier-production-destination-v1'),
+  false,
+  'production checkout evidence must use the canonical foundation fingerprint',
+)
+for (const required of [
+  'shopify-checkout-carrier-selection-v1|',
+  'input.receiptGlobalId',
+  'input.carrierAccountGlobalId',
+]) {
+  assert.ok(
+    checkoutCarrierSelection.includes(required),
+    `checkout carrier selection key is missing ${required}`,
+  )
+}
+for (const required of [
+  'shopifyCheckoutCarrierSelectionKey({',
+  'receiptGlobalId: claim.receiptGlobalId',
+  'carrierSelectionKey,',
+]) {
+  assert.ok(
+    callback.includes(required),
+    `callback evidence selection is missing ${required}`,
+  )
+}
+assert.ok(
+  productionCheckoutRate.includes('carrierSelectionKey,')
+    && productionCheckoutRate.includes(
+      'receiptGlobalId: input.receiptGlobalId',
+    ),
+  'LIVE evidence must persist the exact receipt/account selection key',
+)
 
 for (const required of [
   'readShopifyCarrierServiceRateRequest(input.request, {',
   'allowShadowSimulation: false',
-  'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-  'readActiveShopifyCustomerRatePolicyFromPostgres({',
+  'variantAllowlistRequired: false',
+  'configuredVariantIds: null',
+  'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
   'evaluateShopifyShadowCheckoutPrePolicy({',
   'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
   "'[shopify checkout rating] shadow guard denied'",
   'buildShopifyStoreEntityRateResponse({',
   'storeEntityName: account.storeEntityName',
-  "protocolVersion: 'shopify-carrier-service-response-v4'",
+  "protocolVersion: 'shopify-carrier-service-response-v5'",
   "responseProtocolVersion !== 'shopify-carrier-service-response-v2'",
   "responseProtocolVersion\n        !== 'shopify-carrier-service-response-v3'",
   "responseProtocolVersion\n        !== 'shopify-carrier-service-response-v4'",
+  "responseProtocolVersion\n        !== 'shopify-carrier-service-response-v5'",
   'packages: checkoutRatePackageSummary(packages)',
-  "responseProtocolVersion === 'shopify-carrier-service-response-v4'",
+  "responseProtocolVersion === 'shopify-carrier-service-response-v5'",
   'checkoutRatePackageSummary(receipt.packages)',
   'shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash',
   'shopifyCheckoutRatingHash(resultSnapshot.response)',
@@ -96,7 +154,9 @@ for (const required of [
   'createShopifyCheckoutReceiptKeys({',
   'stableCacheKey,',
   'shopifyCheckoutDestinationFingerprint(',
+  "account.checkoutRateControl.rateSource\n      === 'production'",
   'carrierSandboxRateDestinationFingerprint(destination)',
+  'carrierWholeShipmentRateDestinationFingerprint({',
   'carrierDestinationFingerprint: carrierDestinationHash',
   'readShopifyCheckoutContextFromPostgres({',
   'inventorySnapshotHash: context.inventorySnapshotHash',
@@ -106,12 +166,11 @@ for (const required of [
   'SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION',
   'snapshotVersion:',
   'packEvidenceHash: line.packEvidenceHash',
-  "version: 'shopify-checkout-execution-fence-v5'",
+  "version: 'shopify-checkout-execution-fence-v6'",
   'packLines: [...context.lines]',
   'receiptGlobalId: claim.receiptGlobalId',
   'expectedConfigRowVersion: account.configRowVersion',
-  'expectedActivationState: account.activationState',
-  'expectedActivationRevision: account.activationRevision',
+  'rateSource: account.checkoutRateControl.rateSource',
   'planShopifyCheckoutPackageCandidates(',
   'rateOptimizedCheckoutPlans({',
   'readShopifyCheckoutPlanRatePolicy(',
@@ -121,10 +180,12 @@ for (const required of [
   'feasibleRateCandidate(',
   'candidatePlanEvidence(',
   'testCarrierSandboxShipmentRate({',
+  'rateShopifyProductionCheckoutShipment({',
   'requireFailureEvidence: true',
   'completeShopifyCheckoutRateReceiptInPostgres({',
   'failShopifyCheckoutRateReceiptInPostgres({',
-  'const chargedOffers = applyShopifyShadowTestCharge({',
+  'const chargedOffers = publicCheckoutOffers(rated.offers)',
+  'collapseShopifyCheckoutRateSourceOffers(',
   'policy: shadowGuard.customerPolicy',
   'offers: chargedOffers.map((offer) => ({',
   'carrierCostMinor: offer.amountMinor',
@@ -135,8 +196,8 @@ for (const required of [
   'carrierAccountGlobalId: offer.carrierAccountGlobalId',
   'rateEvidenceGlobalId: offer.evidenceGlobalId',
   'providerAttempts: rated.providerAttempts.map((attempt) => ({',
-  'configuredProviders: [...rated.configuredProviders].sort()',
-  'successfulProviders: [...rated.successfulProviders].sort()',
+  'configuredAccounts: runtimeCarriers.map((carrier) => ({',
+  'successfulAccounts: rated.successfulAccounts.map((selection) => ({',
   'candidateAttempts: candidateDecisionEvidence',
   'planResultHash: candidate.plan.resultHash',
   'preferenceMaterialGlobalIdsByPool:',
@@ -162,6 +223,11 @@ for (const required of [
     `callback is missing required contract: ${required}`,
   )
 }
+assert.equal(
+  callback.includes('SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS'),
+  false,
+  'Restricted checkout must not retain a hidden environment variant gate',
+)
 
 for (const required of [
   "normalizedStatus === 'active'",
@@ -277,12 +343,12 @@ for (const forbidden of [
 }
 assert.ok(
   callback.includes('name: null')
-    && callback.includes('line1: null')
-    && callback.includes('line2: null')
-    && callback.includes('city: null')
-    && callback.includes('region: null')
+    && callback.includes('line1: request.destination.address1')
+    && callback.includes('line2: request.destination.address2')
+    && callback.includes('city: request.destination.city')
+    && callback.includes('region: request.destination.provinceCode')
     && callback.includes('!request.destination.postalCode'),
-  'Shopify progressive callbacks must share one ZIP-only carrier destination fence',
+  'Shopify callback rating must retain every available rate-material destination field',
 )
 assert.equal(
   callback.includes('!request.destination.provinceCode'),
@@ -350,7 +416,7 @@ const shadowGuard = authenticatedExecution.indexOf(
 assert.ok(
   shadowGuard >= 0
     && authenticatedExecution.indexOf(
-      'shadowCheckoutRequestGuard(account, request),',
+      'checkoutRateAudienceGuard(account, request),',
       shadowGuard,
     ) > shadowGuard
     && shadowGuard < authenticatedExecution.indexOf(
@@ -368,7 +434,7 @@ assert.ok(
     && shadowGuard < authenticatedExecution.indexOf(
       'rateOptimizedCheckoutPlans({',
     ),
-  'Shadow customer and variant allowlist must run before fingerprints, persistence, cartonization, or carrier calls',
+  'Checkout audience and exact customer policy must run before fingerprints, persistence, cartonization, or carrier calls',
 )
 assert.ok(
   authenticatedExecution.includes(
@@ -379,34 +445,40 @@ assert.ok(
       + '      })\n'
       + '      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)',
   ),
-  'a denied Shadow test request must log safe telemetry and return authenticated HTTP 200 empty rates',
+  'a denied checkout-audience request must log safe telemetry and return authenticated HTTP 200 empty rates',
 )
 const shadowGuardFunction = callback.slice(
-  callback.indexOf('async function shadowCheckoutRequestGuard('),
+  callback.indexOf('async function checkoutRateAudienceGuard('),
   callback.indexOf('function checkoutExecutionFenceHash('),
 )
 for (const required of [
-  "account.activationState !== 'shadow'",
+  'const { audience } = account.checkoutRateControl',
+  "audience === 'off'",
+  "account.environment === 'production'",
+  "account.checkoutRateControl.rateSource !== 'production'",
+  "audience === 'restricted_customers'",
   'evaluateShopifyShadowCheckoutPrePolicy({',
   'customerId: request.customer?.id',
-  'configuredVariantIds: configuredShopifyNumericIdentifierSet(',
+  'variantAllowlistRequired: false',
+  'configuredVariantIds: null',
   'items: request.items',
   'if (!prePolicy.ready)',
   'reasonCode: prePolicy.reasonCode',
+  "audience === 'all_eligible'",
   'shopifyCustomerGid: prePolicy.customerId',
   'evaluateShopifyShadowCheckoutPolicy(customerPolicy)',
 ]) {
   assert.ok(
     shadowGuardFunction.includes(required),
-    `Shadow callback targeting is missing fail-closed contract: ${required}`,
+    `checkout-audience targeting is missing fail-closed contract: ${required}`,
   )
 }
 assert.ok(
   shadowGuardFunction.indexOf('if (!prePolicy.ready)')
     < shadowGuardFunction.indexOf(
-      'readActiveShopifyCustomerRatePolicyFromPostgres({',
+      'readShopifyCheckoutCustomerRatePolicyFromPostgres({',
     ),
-  'guest or customer-omitted Shadow callbacks must fail closed before policy lookup',
+  'guest or customer-omitted Restricted callbacks must fail closed before policy lookup',
 )
 for (const required of [
   "MissingCustomer: 'SHOPIFY_SHADOW_GUARD_MISSING_CUSTOMER'",
@@ -417,7 +489,8 @@ for (const required of [
   "HideAll: 'SHOPIFY_SHADOW_GUARD_HIDE_ALL'",
   'shopifyShadowCheckoutGuardDenialTelemetry',
   "stage: 'shadow_guard' as const",
-  "checkpoint: 'request_parsed' as const",
+  "checkpoint?: 'account_authenticated' | 'request_parsed'",
+  "checkpoint: input.checkpoint || 'request_parsed'",
 ]) {
   assert.ok(
     shadowGuardModule.includes(required),
@@ -434,7 +507,7 @@ assert.ok(
 assert.ok(
   callback.indexOf(
     'return resultFromTypedReceipt(\n        account,\n        context,\n        cached,',
-  ) < callback.indexOf('const chargedOffers = applyShopifyShadowTestCharge({'),
+  ) < callback.indexOf('const chargedOffers = publicCheckoutOffers('),
   'a cached typed receipt must remain authoritative and bypass live subsidy recalculation',
 )
 const typedReceiptReplay = callback.slice(
@@ -486,7 +559,7 @@ for (const required of [
   'mapping.external_variant_id = requested.variant_gid',
   "mapping.mapping_purpose = 'shopify_checkout'",
   'state.provider_status_raw AS state_provider_status_raw',
-  'isShopifySandboxCheckoutChannelEligible({',
+  'isShopifyRatingCheckoutChannelEligible({',
   'accountEnvironment: account.environment',
   'row.pack_mapping_provider_lifecycle_state\n        !== row.state_normalized_status',
   "level.projection_state = 'projected'",
@@ -546,6 +619,17 @@ assert.ok(
 assert.ok(
   sandboxRate.includes('signal: options.signal'),
   'carrier rate calls must propagate the checkout abort signal',
+)
+assert.ok(
+  sandboxRate.includes(
+    '...(packageCode === null ? {} : { packageCode })',
+  ),
+  'provider-neutral checkout evidence must omit a null package code',
+)
+assert.equal(
+  checkoutParcelEvidenceMigration.includes("'packageCode'"),
+  false,
+  'provider-neutral checkout evidence must retain the historical parcel shape expected by PostgreSQL',
 )
 assert.ok(
   checkoutRate.includes("const ACCOUNT_GLOBAL_ID = /^gac(?:[0-9]{7}|[0-9a-v]{12})$/"),

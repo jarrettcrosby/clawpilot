@@ -59,6 +59,8 @@ type PolicyRow = {
   webhook_verification_status: string | null
   activation_state: string | null
   activation_revision: string | number | null
+  store_sync_running: boolean
+  store_sync_effective_reason: string | null
   order_policy_revision: string | number | null
   historical_observation_enabled: boolean | null
   continuous_observation_enabled: boolean | null
@@ -165,6 +167,8 @@ export type CommerceAuthorityActualReadiness = {
     webhookVerificationStatus: string | null
     activationState: string | null
     activationRevision: number | null
+    storeSyncRunning: boolean
+    storeSyncEffectiveReason: string | null
     orderPolicyRevision: number | null
     historicalObservationEnabled: boolean | null
     continuousObservationEnabled: boolean | null
@@ -424,12 +428,14 @@ function readiness(row: PolicyRow): CommerceAuthorityActualReadiness {
   const accountAvailable = accountStatus === 'active'
     && credentialStatus === 'verified'
     && row.credential_current
-  const activationAvailable = row.activation_state === 'shadow'
-    || row.activation_state === 'active'
-  if (!activationAvailable) {
-    blockers.push('COMMERCE_AUTHORITY_ACTIVATION_INELIGIBLE')
+  const storeSyncAvailable = row.store_sync_running === true
+  if (!storeSyncAvailable) {
+    blockers.push('COMMERCE_AUTHORITY_STORE_SYNC_PAUSED')
+    if (row.store_sync_effective_reason) {
+      blockers.push(row.store_sync_effective_reason)
+    }
   }
-  const baseAvailable = accountAvailable && activationAvailable
+  const baseAvailable = accountAvailable && storeSyncAvailable
   const realtimeTransportAvailable = provider === 'shopify'
     && row.continuous_transport === 'webhook_signal_plus_poll'
     && row.provider_event_processor_state === 'available'
@@ -553,6 +559,8 @@ function readiness(row: PolicyRow): CommerceAuthorityActualReadiness {
       activationState: row.activation_state,
       activationRevision: row.activation_revision === null
         ? null : numberValue(row.activation_revision),
+      storeSyncRunning: row.store_sync_running,
+      storeSyncEffectiveReason: row.store_sync_effective_reason,
       orderPolicyRevision: row.order_policy_revision === null
         ? null : numberValue(row.order_policy_revision),
       historicalObservationEnabled: row.historical_observation_enabled,
@@ -734,6 +742,14 @@ const POLICY_SELECT = `SELECT
   credential.webhook_verification_status,
   activation.state AS activation_state,
   activation.revision AS activation_revision,
+  operations_commerce_store_sync_is_running(
+    account.organization_id,
+    account.id
+  ) AS store_sync_running,
+  operations_commerce_store_sync_effective_reason(
+    account.organization_id,
+    account.id
+  ) AS store_sync_effective_reason,
   order_policy.revision AS order_policy_revision,
   order_policy.historical_observation_enabled,
   order_policy.continuous_observation_enabled,

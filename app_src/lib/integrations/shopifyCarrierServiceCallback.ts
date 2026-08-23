@@ -8,14 +8,22 @@ import {
   type ShopifyCarrierServiceRateRequest,
 } from '@/lib/integrations/shopifyCarrierServiceProtocol'
 import {
+  CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS,
   rateOptimizedCheckoutPlans,
   type CheckoutRateDestination,
+  type CheckoutRateOffer,
   type CheckoutRateProviderResult,
 } from '@/lib/integrations/carrierCheckoutRate'
 import { testCarrierSandboxShipmentRate } from '@/lib/integrations/carrierIntegrations'
 import {
   carrierSandboxRateDestinationFingerprint,
 } from '@/lib/integrations/carrierSandboxRate'
+import {
+  carrierWholeShipmentRateDestinationFingerprint,
+} from '@/lib/integrations/carrierWholeShipmentRateFoundation'
+import {
+  carrierAccountAddressFingerprint,
+} from '@/lib/integrations/carrierCredentialCrypto'
 import {
   planShopifyCheckoutPackageCandidates,
   shopifyProductGid,
@@ -26,17 +34,24 @@ import {
   readShopifyCheckoutPlanRatePolicy,
   type ShopifyCheckoutPlanRatePolicy,
 } from '@/lib/operations/shopifyCheckoutPlanRatePolicy'
+import {
+  shopifyCheckoutRateControlCanServe,
+  shopifyCheckoutRateControlEmptyReason,
+} from '@/lib/operations/shopifyCheckoutRateControl'
 import { shopifyCheckoutDestinationFingerprint } from '@/lib/integrations/commerceCredentialCrypto'
 import {
-  configuredShopifyNumericIdentifierSet,
-} from '@/lib/integrations/shopifyShadowCheckoutAllowlist'
-import {
-  readActiveShopifyCustomerRatePolicyFromPostgres,
+  readShopifyCheckoutCustomerRatePolicyFromPostgres,
+  type ShopifyCustomerRatePolicy,
 } from '@/lib/persistence/shopifyCustomerRatePolicies'
+import {
+  shopifyCustomerRatePolicyAllowsService,
+} from '@/lib/integrations/shopifyCustomerRatePolicy'
 import {
   claimShopifyCheckoutRateReceiptInPostgres,
   completeShopifyCheckoutRateReceiptInPostgres,
   failShopifyCheckoutRateReceiptInPostgres,
+  assertShopifyCheckoutRatingRuntimeReadyInPostgres,
+  lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres,
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
   SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
@@ -65,15 +80,23 @@ import {
 import {
   evaluateShopifyShadowCheckoutPolicy,
   evaluateShopifyShadowCheckoutPrePolicy,
+  ShopifyShadowCheckoutGuardDenialReason,
   shopifyShadowCheckoutGuardDenialTelemetry,
   type ShopifyShadowCheckoutGuardDecision,
-  type ShopifyShadowCheckoutGuardDenialReason,
 } from '@/lib/integrations/shopifyShadowCheckoutGuard'
 import {
   applyShopifyShadowTestCharge,
   shopifyShadowTestChargePolicyFence,
-  type ShopifyShadowTestChargePolicy,
 } from '@/lib/integrations/shopifyShadowTestCharge'
+import {
+  collapseShopifyCheckoutRateSourceOffers,
+} from '@/lib/integrations/shopifyCheckoutRateSourceOffers'
+import {
+  rateShopifyProductionCheckoutShipment,
+} from '@/lib/integrations/shopifyCarrierServiceProductionRate'
+import {
+  shopifyCheckoutCarrierSelectionKey,
+} from '@/lib/integrations/shopifyCheckoutCarrierSelection'
 
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CALLBACK_TOKEN = /^[A-Za-z0-9_-]{43}$/
@@ -85,6 +108,8 @@ const CALLBACK_RESPONSE_TIMEOUT_MS = 9_250
 const CALLBACK_LEASE_SECONDS = 20
 const MAX_PERSISTED_LINE_QUANTITY = 100_000
 const MAX_PERSISTED_UNIT_WEIGHT_GRAMS = 1_000_000
+const MAX_CONFIGURED_CHECKOUT_CARRIER_ACCOUNTS =
+  CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS * 2
 const EMPTY_RATE_RESPONSE: ShopifyCarrierServiceRateResponse = { rates: [] }
 
 export const SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR =
@@ -185,8 +210,7 @@ function persistedRequestFingerprint(protocolDigest: string) {
 function fencedCacheKey(input: {
   requestFingerprint: string
   configRowVersion: number
-  activationState: 'shadow' | 'active'
-  activationRevision: number
+  rateSource: 'sandbox' | 'production'
   inventorySnapshotHash: string
   executionFenceHash: string
 }) {
@@ -198,13 +222,13 @@ function fencedCacheKey(input: {
     .digest('hex')}`
 }
 
-function sandboxCheckoutAccountIsReady(
+function checkoutAccountIsReady(
   account: ShopifyCheckoutRatingAccount | null,
 ): account is ShopifyCheckoutRatingAccount {
   if (
     !account
-    || account.environment !== 'sandbox'
-    || account.carriers.length !== 2
+    || account.carriers.length < 1
+    || account.carriers.length > MAX_CONFIGURED_CHECKOUT_CARRIER_ACCOUNTS
   ) {
     return false
   }
@@ -213,13 +237,36 @@ function sandboxCheckoutAccountIsReady(
   } catch {
     return false
   }
-  const providers = new Set(account.carriers.map((carrier) => carrier.provider))
+  const carrierAccountGlobalIds = new Set(
+    account.carriers.map((carrier) => carrier.carrierAccountGlobalId),
+  )
+  const sandboxCarrierCount = account.carriers.filter(
+    (carrier) => carrier.environment === 'sandbox',
+  ).length
+  const productionCarrierCount = account.carriers.filter(
+    (carrier) => carrier.environment === 'production',
+  ).length
+  const runtimeEnvironment = checkoutRuntimeCarrierEnvironment(account)
+  const runtimeCarriers = checkoutRuntimeCarrierBindings(account)
+  const runtimeCarrierCount = runtimeCarriers.length
   return (
-    providers.size === 2
-    && providers.has('ups_rest')
-    && providers.has('fedex_rest')
+    carrierAccountGlobalIds.size === account.carriers.length
+    && sandboxCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+    && productionCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+    && runtimeCarrierCount >= 1
+    && runtimeCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
     && account.carriers.every((carrier) => (
-      carrier.environment === 'sandbox'
+      (carrier.provider === 'ups_rest' || carrier.provider === 'fedex_rest')
+      && /^gac(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+        carrier.carrierAccountGlobalId,
+      )
+      && (
+        carrier.environment === 'sandbox'
+        || carrier.environment === 'production'
+      )
+    ))
+    && runtimeCarriers.every((carrier) => (
+      carrier.environment === runtimeEnvironment
       && carrier.accountStatus === 'active'
       && carrier.integrationStatus === 'active'
       && Number.isSafeInteger(carrier.credentialVersion)
@@ -228,20 +275,86 @@ function sandboxCheckoutAccountIsReady(
   )
 }
 
-async function shadowCheckoutRequestGuard(
+function checkoutRuntimeCarrierEnvironment(
+  account: ShopifyCheckoutRatingAccount,
+): 'sandbox' | 'production' {
+  return account.checkoutRateControl.rateSource
+}
+
+function checkoutRuntimeCarrierBindings(
+  account: ShopifyCheckoutRatingAccount,
+) {
+  const environment = checkoutRuntimeCarrierEnvironment(account)
+  return account.carriers.filter(
+    (carrier) => carrier.environment === environment,
+  )
+}
+
+function checkoutTestChargeLane(
+  account: ShopifyCheckoutRatingAccount,
+): 'shadow' | 'active' {
+  return account.checkoutRateControl.rateSource === 'sandbox'
+    && account.checkoutRateControl.audience === 'restricted_customers'
+    ? 'shadow'
+    : 'active'
+}
+
+function customerPolicyAllowsService(
+  policy: ShopifyCustomerRatePolicy | null,
+  carrierCode: 'ups' | 'fedex',
+  serviceLevelCode: string,
+) {
+  if (!policy) return true
+  return shopifyCustomerRatePolicyAllowsService(
+    policy,
+    stableShopifyCarrierServiceCode(carrierCode, serviceLevelCode),
+  )
+}
+
+function filterCheckoutProviderResultForCustomerPolicy(
+  result: CheckoutRateProviderResult,
+  policy: ShopifyCustomerRatePolicy | null,
+): CheckoutRateProviderResult {
+  const carrierCode = result.provider === 'ups_rest' ? 'ups' : 'fedex'
+  return {
+    ...result,
+    rates: result.rates.filter((rate) => customerPolicyAllowsService(
+      policy,
+      carrierCode,
+      rate.serviceCode,
+    )),
+  }
+}
+
+async function checkoutRateAudienceGuard(
   account: ShopifyCheckoutRatingAccount,
   request: ShopifyCarrierServiceRateRequest,
 ): Promise<ShopifyShadowCheckoutGuardDecision & {
-  customerPolicy: ShopifyShadowTestChargePolicy | null
+  customerPolicy: ShopifyCustomerRatePolicy | null
 }> {
-  if (account.activationState !== 'shadow') {
-    return { allowed: true, customerPolicy: null }
+  const { audience } = account.checkoutRateControl
+  if (audience === 'off') {
+    return {
+      allowed: false,
+      reasonCode: ShopifyShadowCheckoutGuardDenialReason.AudienceOff,
+      customerPolicy: null,
+    }
   }
+  if (
+    account.environment === 'production'
+    && account.checkoutRateControl.rateSource !== 'production'
+  ) {
+    throw checkoutFailureError(
+      'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED',
+      'A production Shopify store can serve only production carrier rates',
+    )
+  }
+  const customerRequired = audience === 'restricted_customers'
   const prePolicy = evaluateShopifyShadowCheckoutPrePolicy({
     customerId: request.customer?.id,
-    configuredVariantIds: configuredShopifyNumericIdentifierSet(
-      'SHOPIFY_CHECKOUT_SHADOW_ALLOWED_VARIANT_IDS',
-    ),
+    customerRequired,
+    variantAllowlistRequired: false,
+    configuredVariantIds: null,
     items: request.items,
   })
   if (!prePolicy.ready) {
@@ -251,8 +364,18 @@ async function shadowCheckoutRequestGuard(
       customerPolicy: null,
     }
   }
+  if (audience === 'all_eligible') {
+    return { allowed: true, customerPolicy: null }
+  }
+  if (!prePolicy.customerId) {
+    return {
+      allowed: false,
+      reasonCode: ShopifyShadowCheckoutGuardDenialReason.MissingCustomer,
+      customerPolicy: null,
+    }
+  }
   const customerPolicy =
-    await readActiveShopifyCustomerRatePolicyFromPostgres({
+    await readShopifyCheckoutCustomerRatePolicyFromPostgres({
       organizationId: account.organizationId,
       accountGlobalId: account.accountGlobalId,
       shopifyCustomerGid: prePolicy.customerId,
@@ -266,22 +389,30 @@ async function shadowCheckoutRequestGuard(
 function checkoutExecutionFenceHash(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
-  customerPolicy: ShopifyShadowTestChargePolicy | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ) {
   const planRatePolicy = readShopifyCheckoutPlanRatePolicy(
     account.policySnapshot,
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v5',
+      version: 'shopify-checkout-execution-fence-v6',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
       ),
       policyRevision: account.policyRevision,
       policyHash: account.policyHash,
+      checkoutRateControl: account.checkoutRateControl,
+      restrictedCustomerPolicy:
+        account.checkoutRateControl.audience === 'restricted_customers'
+          ? shopifyShadowTestChargePolicyFence({
+              activationState: 'shadow',
+              policy: customerPolicy,
+            })
+          : null,
       shadowTestChargePolicy: shopifyShadowTestChargePolicyFence({
-        activationState: account.activationState,
+        activationState: checkoutTestChargeLane(account),
         policy: customerPolicy,
       }),
       planRatePolicy,
@@ -314,7 +445,12 @@ function checkoutExecutionFenceHash(
           currency: material.currency,
         })),
       carriers: [...account.carriers]
-        .sort((left, right) => left.provider.localeCompare(right.provider))
+        .sort((left, right) => (
+          left.carrierAccountGlobalId.localeCompare(
+            right.carrierAccountGlobalId,
+          )
+          || left.provider.localeCompare(right.provider)
+        ))
         .map((carrier) => ({
           provider: carrier.provider,
           carrierAccountGlobalId: carrier.carrierAccountGlobalId,
@@ -623,6 +759,44 @@ function configuredWarehouseOriginMatches(
   })
 }
 
+function configuredCarrierOriginsMatch(
+  account: ShopifyCheckoutRatingAccount,
+  carriers = checkoutRuntimeCarrierBindings(account),
+) {
+  const warehouseAddress = account.warehouseAddress
+  let warehouseFingerprint: string
+  try {
+    warehouseFingerprint = carrierAccountAddressFingerprint({
+      line1: warehouseAddress.line1 ?? warehouseAddress.address1,
+      line2: warehouseAddress.line2 ?? warehouseAddress.address2,
+      city: warehouseAddress.city,
+      region:
+        warehouseAddress.regionCode
+        ?? warehouseAddress.region
+        ?? warehouseAddress.state,
+      postalCode: warehouseAddress.postalCode ?? warehouseAddress.zip,
+      countryCode:
+        warehouseAddress.countryCode
+        ?? warehouseAddress.country,
+    })
+  } catch {
+    return false
+  }
+  return carriers.every((carrier) => {
+    try {
+      const retainedFingerprint = carrierAccountAddressFingerprint(
+        carrier.registeredAddress,
+      )
+      return (
+        retainedFingerprint === carrier.registeredAddressFingerprint
+        && retainedFingerprint === warehouseFingerprint
+      )
+    } catch {
+      return false
+    }
+  })
+}
+
 function checkoutDestination(
   request: ShopifyCarrierServiceRateRequest,
 ): CheckoutRateDestination {
@@ -640,10 +814,10 @@ function checkoutDestination(
   }
   return {
     name: null,
-    line1: null,
-    line2: null,
-    city: null,
-    region: null,
+    line1: request.destination.address1,
+    line2: request.destination.address2,
+    city: request.destination.city,
+    region: request.destination.provinceCode,
     postalCode: request.destination.postalCode,
     countryCode: 'US',
   }
@@ -730,6 +904,7 @@ function responseFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ): TypedReceiptResponse | null {
   if (!receipt) return null
   if (receipt.status === 'failed') return null
@@ -754,6 +929,8 @@ function responseFromTypedReceipt(
         !== 'shopify-carrier-service-response-v3'
       && responseProtocolVersion
         !== 'shopify-carrier-service-response-v4'
+      && responseProtocolVersion
+        !== 'shopify-carrier-service-response-v5'
     )
     || shopifyCheckoutRatingHash(resultSnapshot) !== receipt.resultHash
     || resultSnapshot.packagePlanHash !== receipt.packagePlanHash
@@ -830,13 +1007,94 @@ function responseFromTypedReceipt(
   )) {
     return null
   }
+  const runtimeCarriers = checkoutRuntimeCarrierBindings(account)
   const carrierByProvider = new Map(
-    account.carriers.map((carrier) => [carrier.provider, carrier]),
+    runtimeCarriers.map((carrier) => [carrier.provider, carrier]),
+  )
+  const carrierByAccount = new Map(
+    runtimeCarriers.map((carrier) => [
+      carrier.carrierAccountGlobalId,
+      carrier,
+    ]),
   )
   if (responseProtocolVersion === 'shopify-carrier-service-response-v2') {
     if (receipt.providerAttempts.length !== 0) {
       throw new Error(
         'Legacy Shopify checkout receipt retained unexpected provider-attempt evidence',
+      )
+    }
+  } else if (responseProtocolVersion === 'shopify-carrier-service-response-v5') {
+    const attemptAccountGlobalIds = new Set<string>()
+    const providerAttempts = receipt.providerAttempts.map((attempt) => {
+      const carrier = carrierByAccount.get(
+        attempt.carrierAccountGlobalId,
+      )
+      if (
+        !carrier
+        || attemptAccountGlobalIds.has(attempt.carrierAccountGlobalId)
+        || carrier.provider !== attempt.provider
+        || carrier.credentialVersion !== attempt.credentialVersion
+        || shopifyCheckoutRatingHash({
+          provider: attempt.provider,
+          carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+          rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+          status: attempt.status,
+          failureCode: attempt.failureCode,
+          attemptSnapshot: attempt.attemptSnapshot,
+        }) !== attempt.attemptHash
+      ) {
+        throw new Error(
+          'Typed Shopify checkout account-attempt evidence failed replay validation',
+        )
+      }
+      attemptAccountGlobalIds.add(attempt.carrierAccountGlobalId)
+      return {
+        provider: attempt.provider,
+        carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+        environment: carrier.environment,
+        rateEvidenceGlobalId: attempt.rateEvidenceGlobalId,
+        status: attempt.status,
+        failureCode: attempt.failureCode,
+      }
+    }).sort((left, right) => (
+      left.provider.localeCompare(right.provider)
+      || left.carrierAccountGlobalId.localeCompare(
+        right.carrierAccountGlobalId,
+      )
+    ))
+    const configuredAccounts = runtimeCarriers.map((carrier) => ({
+      provider: carrier.provider,
+      carrierAccountGlobalId: carrier.carrierAccountGlobalId,
+      environment: carrier.environment,
+    })).sort((left, right) => (
+      left.provider.localeCompare(right.provider)
+      || left.carrierAccountGlobalId.localeCompare(
+        right.carrierAccountGlobalId,
+      )
+    ))
+    const successfulAccounts = providerAttempts.flatMap((attempt) => (
+      attempt.status === 'succeeded'
+          ? [{
+            provider: attempt.provider,
+            carrierAccountGlobalId: attempt.carrierAccountGlobalId,
+            environment: attempt.environment,
+          }]
+        : []
+    ))
+    if (
+      providerAttempts.length !== carrierByAccount.size
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.configuredAccounts,
+      ) !== shopifyCheckoutRatingHash(configuredAccounts)
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.successfulAccounts,
+      ) !== shopifyCheckoutRatingHash(successfulAccounts)
+      || shopifyCheckoutRatingHash(
+        resultSnapshot.providerAttempts,
+      ) !== shopifyCheckoutRatingHash(providerAttempts)
+    ) {
+      throw new Error(
+        'Shopify checkout account-attempt snapshot failed immutable replay validation',
       )
     }
   } else {
@@ -892,7 +1150,10 @@ function responseFromTypedReceipt(
   const serviceCodes = new Set<string>()
   const typedOffers: ShopifyStoreEntityRateOffer[] =
     receipt.offers.map((offer) => {
-      const carrier = carrierByProvider.get(offer.provider)
+      const carrier = responseProtocolVersion
+        === 'shopify-carrier-service-response-v5'
+        ? carrierByAccount.get(offer.carrierAccountGlobalId)
+        : carrierByProvider.get(offer.provider)
       const carrierCode = offer.provider === 'ups_rest' ? 'ups' : 'fedex'
       const stableCode = stableShopifyCarrierServiceCode(
         carrierCode,
@@ -900,13 +1161,19 @@ function responseFromTypedReceipt(
       )
       if (
         !carrier
-        || carrier.environment !== 'sandbox'
+        || carrier.provider !== offer.provider
+        || carrier.environment !== checkoutRuntimeCarrierEnvironment(account)
         || carrier.carrierAccountGlobalId !== offer.carrierAccountGlobalId
         || carrier.credentialVersion !== offer.credentialVersion
         || offer.packageCount !== receipt.packages.length
         || offer.packagePlanHash !== receipt.packagePlanHash
         || offer.currency !== receipt.currency
         || offer.shopifyServiceCode !== stableCode
+        || !customerPolicyAllowsService(
+          customerPolicy,
+          carrierCode,
+          offer.serviceCode,
+        )
         || serviceCodes.has(stableCode)
       ) {
         throw new Error(
@@ -927,7 +1194,9 @@ function responseFromTypedReceipt(
   const rebuilt = buildShopifyStoreEntityRateResponse({
     storeEntityName,
     packageCount: receipt.packages.length,
-    ...(responseProtocolVersion === 'shopify-carrier-service-response-v4'
+    ...(
+      responseProtocolVersion === 'shopify-carrier-service-response-v4'
+      || responseProtocolVersion === 'shopify-carrier-service-response-v5'
       ? { packages: checkoutRatePackageSummary(receipt.packages) }
       : {}),
     offers: typedOffers,
@@ -950,8 +1219,14 @@ function resultFromTypedReceipt(
   account: ShopifyCheckoutRatingAccount,
   context: ShopifyCheckoutContextResult,
   receipt: ShopifyCheckoutRateReceipt | null,
+  customerPolicy: ShopifyCustomerRatePolicy | null,
 ): CallbackResult {
-  const replay = responseFromTypedReceipt(account, context, receipt)
+  const replay = responseFromTypedReceipt(
+    account,
+    context,
+    receipt,
+    customerPolicy,
+  )
   return receipt?.status === 'succeeded' && replay
     ? authenticatedResult(replay.response, 200)
     : authenticatedResult(EMPTY_RATE_RESPONSE, 503)
@@ -1013,6 +1288,7 @@ function recordCheckoutFailure(input: {
 function recordShadowCheckoutGuardDenial(input: {
   accountGlobalId: string
   reasonCode: ShopifyShadowCheckoutGuardDenialReason
+  checkpoint?: 'account_authenticated' | 'request_parsed'
 }) {
   console.warn(
     '[shopify checkout rating] shadow guard denied',
@@ -1134,14 +1410,69 @@ export async function executeShopifyCarrierServiceCallback(input: {
     cleanup()
     return authenticatedResult(EMPTY_RATE_RESPONSE, 504)
   }
+  const callbackTokenHash = createHash('sha256')
+    .update(input.callbackToken, 'ascii')
+    .digest('hex')
+  let callbackPolicyAccount
+  try {
+    callbackPolicyAccount = await awaitCallbackWork(
+      lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres({
+        accountGlobalId: input.accountGlobalId,
+        callbackTokenHash,
+      }),
+      workController.signal,
+    )
+  } catch (error) {
+    const deadlineExceeded = workController.signal.aborted
+    cleanup()
+    return deadlineExceeded
+      ? authenticatedResult(EMPTY_RATE_RESPONSE, 504)
+      : authenticatedResult(
+          EMPTY_RATE_RESPONSE,
+          failedHttpStatus(error),
+        )
+  }
+  if (!callbackPolicyAccount) {
+    cleanup()
+    return { authenticated: false, response: EMPTY_RATE_RESPONSE }
+  }
+  try {
+    const authenticatedEmptyReason = shopifyCheckoutRateControlEmptyReason({
+      control: callbackPolicyAccount.checkoutRateControl,
+      accountEnvironment: callbackPolicyAccount.environment,
+      activationState: callbackPolicyAccount.activationState,
+    })
+    if (authenticatedEmptyReason) {
+      recordShadowCheckoutGuardDenial({
+        accountGlobalId: callbackPolicyAccount.accountGlobalId,
+        reasonCode: authenticatedEmptyReason as
+          ShopifyShadowCheckoutGuardDenialReason,
+        checkpoint: 'account_authenticated',
+      })
+      cleanup()
+      return authenticatedResult(EMPTY_RATE_RESPONSE, 200)
+    }
+    if (!shopifyCheckoutRateControlCanServe({
+      control: callbackPolicyAccount.checkoutRateControl,
+      accountEnvironment: callbackPolicyAccount.environment,
+      activationState: callbackPolicyAccount.activationState,
+    })) {
+      cleanup()
+      return authenticatedResult(EMPTY_RATE_RESPONSE, 503)
+    }
+  } catch (error) {
+    cleanup()
+    return authenticatedResult(
+      EMPTY_RATE_RESPONSE,
+      failedHttpStatus(error),
+    )
+  }
   let account
   try {
     account = await awaitCallbackWork(
       lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres({
         accountGlobalId: input.accountGlobalId,
-        callbackTokenHash: createHash('sha256')
-          .update(input.callbackToken, 'ascii')
-          .digest('hex'),
+        callbackTokenHash,
         allowShadowSimulation: false,
       }),
       workController.signal,
@@ -1158,9 +1489,9 @@ export async function executeShopifyCarrierServiceCallback(input: {
   }
   if (!account) {
     cleanup()
-    return { authenticated: false, response: EMPTY_RATE_RESPONSE }
+    return authenticatedResult(EMPTY_RATE_RESPONSE, 503)
   }
-  if (!sandboxCheckoutAccountIsReady(account)) {
+  if (!checkoutAccountIsReady(account)) {
     cleanup()
     return authenticatedResult(EMPTY_RATE_RESPONSE, 503)
   }
@@ -1183,7 +1514,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     checkpoint = 'request_parsed'
     attemptedStage = 'shadow_guard'
     const shadowGuard = await awaitCallbackWork(
-      shadowCheckoutRequestGuard(account, request),
+      checkoutRateAudienceGuard(account, request),
       workController.signal,
     )
     if (!shadowGuard.allowed) {
@@ -1206,6 +1537,12 @@ export async function executeShopifyCarrierServiceCallback(input: {
         'Shopify callback origin does not match the warehouse',
       )
     }
+    if (!configuredCarrierOriginsMatch(account)) {
+      throw checkoutFailureError(
+        'SHOPIFY_CHECKOUT_CARRIER_ORIGIN_MISMATCH',
+        'A checkout carrier account origin does not match the warehouse',
+      )
+    }
     checkpoint = 'origin_valid'
     attemptedStage = 'checkout_lines'
     const lines = stableShippableLines(request)
@@ -1222,8 +1559,13 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const destination = checkoutDestination(request)
     checkpoint = 'destination_valid'
     attemptedStage = 'carrier_destination_fingerprint'
-    const carrierDestinationHash =
-      carrierSandboxRateDestinationFingerprint(destination)
+    const carrierDestinationHash = account.checkoutRateControl.rateSource
+      === 'production'
+      ? carrierWholeShipmentRateDestinationFingerprint({
+          ...destination,
+          residential: null,
+        })
+      : carrierSandboxRateDestinationFingerprint(destination)
     checkpoint = 'carrier_destination_fingerprinted'
     attemptedStage = 'checkout_context'
     const context = await awaitCallbackWork(
@@ -1243,8 +1585,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const stableCacheKey = fencedCacheKey({
       requestFingerprint,
       configRowVersion: account.configRowVersion,
-      activationState: account.activationState,
-      activationRevision: account.activationRevision,
+      rateSource: account.checkoutRateControl.rateSource,
       inventorySnapshotHash: context.inventorySnapshotHash,
       executionFenceHash,
     })
@@ -1273,6 +1614,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         cached,
+        shadowGuard.customerPolicy,
       )
     }
     requireCallbackTime(
@@ -1286,8 +1628,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         organizationId: account.organizationId,
         accountGlobalId: account.accountGlobalId,
         expectedConfigRowVersion: account.configRowVersion,
-        expectedActivationState: account.activationState,
-        expectedActivationRevision: account.activationRevision,
+        rateSource: account.checkoutRateControl.rateSource,
         requestFingerprint,
         destinationFingerprint: destinationHash,
         carrierDestinationFingerprint: carrierDestinationHash,
@@ -1357,6 +1698,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         completed,
+        shadowGuard.customerPolicy,
       )
     }
     if (claim.kind !== 'claimed') {
@@ -1364,6 +1706,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
         account,
         context,
         claim.receipt,
+        shadowGuard.customerPolicy,
       )
     }
     claimed = {
@@ -1425,15 +1768,22 @@ export async function executeShopifyCarrierServiceCallback(input: {
         'No carton plan satisfies material weight, stock, and currency fences',
       )
     }
-    const carriers = account.carriers.map((carrier) => ({
+    const runtimeCarriers = checkoutRuntimeCarrierBindings(account)
+    const carriers = runtimeCarriers.map((carrier) => ({
       provider: carrier.provider,
       carrierAccountGlobalId: carrier.carrierAccountGlobalId,
     }))
+    const configuredCarrierAccountGlobalIds = new Set(
+      carriers.map((carrier) => carrier.carrierAccountGlobalId),
+    )
     if (
-      carriers.length !== 2
-      || !carriers.some((carrier) => carrier.provider === 'ups_rest')
-      || !carriers.some((carrier) => carrier.provider === 'fedex_rest')
-      || account.carriers.some((carrier) => carrier.environment !== 'sandbox')
+      carriers.length < 1
+      || carriers.length > CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS
+      || configuredCarrierAccountGlobalIds.size !== carriers.length
+      || carriers.some((carrier) => (
+        carrier.provider !== 'ups_rest'
+        && carrier.provider !== 'fedex_rest'
+      ))
     ) {
       throw new Error('Checkout carrier configuration is not rate-ready')
     }
@@ -1447,34 +1797,92 @@ export async function executeShopifyCarrierServiceCallback(input: {
         policy: planRatePolicy,
         signal: workController.signal,
         invoke: async (selection, carrierRequest) => {
-          const remaining = Math.max(1, carrierDeadlineAt - Date.now())
-          const result = await testCarrierSandboxShipmentRate({
+          await assertShopifyCheckoutRatingRuntimeReadyInPostgres({
             organizationId: account.organizationId,
-            provider: selection.provider,
-            environment: 'sandbox',
-            carrierAccountGlobalId: selection.carrierAccountGlobalId,
-            destination: carrierRequest.destination,
-            parcels: carrierRequest.parcels,
-            actorEmail: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
-            timeoutMs: remaining,
-            signal: carrierRequest.signal,
-            requireFailureEvidence: true,
+            accountGlobalId: account.accountGlobalId,
+            expectedConfigRowVersion: account.configRowVersion,
+            rateSource: account.checkoutRateControl.rateSource,
           })
-          return {
-            provider: selection.provider,
+          const remaining = Math.max(1, carrierDeadlineAt - Date.now())
+          const binding = runtimeCarriers.find((carrier) => (
+            carrier.provider === selection.provider
+            && carrier.carrierAccountGlobalId
+              === selection.carrierAccountGlobalId
+          ))
+          if (!binding) {
+            throw checkoutFailureError(
+              'SHOPIFY_CHECKOUT_CARRIER_BINDING_STALE',
+              'Checkout carrier binding changed before rating',
+            )
+          }
+          const carrierSelectionKey = shopifyCheckoutCarrierSelectionKey({
+            receiptGlobalId: claim.receiptGlobalId,
             carrierAccountGlobalId: selection.carrierAccountGlobalId,
-            packageCount: carrierRequest.parcels.length,
-            rateScope: 'multi_package_shipment',
-            rates: result.rates.map((rate) => ({
-              ...rate,
-              evidenceGlobalId: result.evidenceGlobalId,
-            })),
-          } satisfies CheckoutRateProviderResult
+          })
+          if (binding.environment === 'production') {
+            const result = await rateShopifyProductionCheckoutShipment({
+              organizationId: account.organizationId,
+              receiptGlobalId: claim.receiptGlobalId,
+              binding: {
+                provider: binding.provider,
+                carrierIntegrationAccountGlobalId:
+                  binding.carrierIntegrationAccountGlobalId,
+                carrierAccountId: binding.carrierAccountId,
+                carrierAccountGlobalId:
+                  binding.carrierAccountGlobalId,
+                credentialVersion: binding.credentialVersion,
+                registeredAddressFingerprint:
+                  binding.registeredAddressFingerprint,
+              },
+              destination: carrierRequest.destination,
+              parcels: carrierRequest.parcels,
+              currency: request.currency,
+              actorEmail: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
+              timeoutMs: remaining,
+              signal: carrierRequest.signal,
+            })
+            return filterCheckoutProviderResultForCustomerPolicy(
+              result,
+              shadowGuard.customerPolicy,
+            )
+          }
+          const result = await testCarrierSandboxShipmentRate({
+              organizationId: account.organizationId,
+              provider: selection.provider,
+              environment: 'sandbox',
+              carrierAccountGlobalId: selection.carrierAccountGlobalId,
+              destination: carrierRequest.destination,
+              parcels: carrierRequest.parcels,
+              actorEmail: SHOPIFY_CARRIER_SERVICE_CALLBACK_ACTOR,
+              timeoutMs: remaining,
+              signal: carrierRequest.signal,
+              requireFailureEvidence: true,
+              carrierSelectionKey,
+            })
+          return filterCheckoutProviderResultForCustomerPolicy({
+              provider: selection.provider,
+              carrierAccountGlobalId: selection.carrierAccountGlobalId,
+              packageCount: carrierRequest.parcels.length,
+              rateScope: 'multi_package_shipment',
+              rates: result.rates.map((rate) => ({
+                ...rate,
+                evidenceGlobalId: result.evidenceGlobalId,
+              })),
+            } satisfies CheckoutRateProviderResult, shadowGuard.customerPolicy)
         },
       }),
       workController.signal,
     )
     const rated = optimized.selectedRateResult
+    const publicCheckoutOffers = (offers: CheckoutRateOffer[]) => (
+      collapseShopifyCheckoutRateSourceOffers(
+        applyShopifyShadowTestCharge({
+          activationState: checkoutTestChargeLane(account),
+          policy: shadowGuard.customerPolicy,
+          offers,
+        }),
+      )
+    )
     const selectedPlannedCandidate = plannedCandidateByKey.get(
       optimized.selectedCandidate.candidateKey,
     )
@@ -1518,22 +1926,29 @@ export async function executeShopifyCarrierServiceCallback(input: {
               landedPriceMinor: attempt.evaluation.landedPriceMinor,
               unusedCubeMm3: attempt.evaluation.unusedCubeMm3,
               selectedProvider: attempt.evaluation.offer.provider,
+              selectedCarrierAccountGlobalId:
+                attempt.evaluation.offer.carrierAccountGlobalId,
               selectedServiceCode:
                 attempt.evaluation.offer.serviceLevelCode,
             }
           : null,
-        offers: attempt?.result?.offers.map((offer) => ({
-          provider: offer.provider,
-          carrierAccountGlobalId: offer.carrierAccountGlobalId,
-          carrierCode: offer.carrierCode,
-          serviceLevelCode: offer.serviceLevelCode,
-          serviceName: offer.serviceName,
-          amountMinor: offer.amountMinor,
-          currency: offer.currency,
-          transitDays: offer.transitDays,
-          deliveryDate: offer.deliveryDate,
-          evidenceGlobalId: offer.evidenceGlobalId,
-        })) ?? [],
+        offers: attempt?.result
+          ? publicCheckoutOffers(attempt.result.offers).map((offer) => ({
+              provider: offer.provider,
+              carrierAccountGlobalId: offer.carrierAccountGlobalId,
+              carrierCode: offer.carrierCode,
+              serviceLevelCode: offer.serviceLevelCode,
+              serviceName: offer.serviceName,
+              amountMinor: offer.amountMinor,
+              carrierCostMinor: offer.amountMinor,
+              customerChargeMinor: offer.customerChargeMinor,
+              subsidyReason: offer.subsidyReason,
+              currency: offer.currency,
+              transitDays: offer.transitDays,
+              deliveryDate: offer.deliveryDate,
+              evidenceGlobalId: offer.evidenceGlobalId,
+            }))
+          : [],
         providerAttempts: attempt?.result?.providerAttempts.map(
           (providerAttempt) => ({
             provider: providerAttempt.provider,
@@ -1551,11 +1966,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
       successPersistenceDeadlineAt,
       workController.signal,
     )
-    const chargedOffers = applyShopifyShadowTestCharge({
-      activationState: account.activationState,
-      policy: shadowGuard.customerPolicy,
-      offers: rated.offers,
-    })
+    const chargedOffers = publicCheckoutOffers(rated.offers)
     const recipePackages: ShopifyCheckoutPackageInput[] =
       plan.recipePackages.map((recipePackage) => {
         const ratedOuterDimensionsMm =
@@ -1726,7 +2137,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         })),
         resultSnapshot: {
-          protocolVersion: 'shopify-carrier-service-response-v4',
+          protocolVersion: 'shopify-carrier-service-response-v5',
           storeEntityName: normalizeShopifyStoreEntityName(
             account.storeEntityName,
           ),
@@ -1736,16 +2147,47 @@ export async function executeShopifyCarrierServiceCallback(input: {
           rateScope: rated.rateScope,
           packageCount: rated.packageCount,
           completedAt: rated.completedAt,
-          configuredProviders: [...rated.configuredProviders].sort(),
-          successfulProviders: [...rated.successfulProviders].sort(),
+          configuredAccounts: runtimeCarriers.map((carrier) => ({
+            provider: carrier.provider,
+            carrierAccountGlobalId: carrier.carrierAccountGlobalId,
+            environment: carrier.environment,
+          }))
+            .sort((left, right) => (
+              left.provider.localeCompare(right.provider)
+              || left.carrierAccountGlobalId.localeCompare(
+                right.carrierAccountGlobalId,
+              )
+            )),
+          successfulAccounts: rated.successfulAccounts.map((selection) => ({
+            ...selection,
+            environment: runtimeCarriers.find((carrier) => (
+              carrier.carrierAccountGlobalId
+                === selection.carrierAccountGlobalId
+              && carrier.provider === selection.provider
+            ))?.environment,
+          }))
+            .sort((left, right) => (
+              left.provider.localeCompare(right.provider)
+              || left.carrierAccountGlobalId.localeCompare(
+                right.carrierAccountGlobalId,
+              )
+            )),
           providerAttempts: [...rated.providerAttempts]
             .sort((left, right) => (
               left.provider.localeCompare(right.provider)
+              || left.carrierAccountGlobalId.localeCompare(
+                right.carrierAccountGlobalId,
+              )
             ))
             .map((attempt) => ({
               provider: attempt.provider,
               carrierAccountGlobalId:
                 attempt.carrierAccountGlobalId,
+              environment: runtimeCarriers.find((carrier) => (
+                carrier.carrierAccountGlobalId
+                  === attempt.carrierAccountGlobalId
+                && carrier.provider === attempt.provider
+              ))?.environment,
               rateEvidenceGlobalId:
                 attempt.rateEvidenceGlobalId,
               status: attempt.status,
@@ -1762,6 +2204,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
             selectedCandidateKey:
               optimized.selectedCandidate.candidateKey,
             selectedProvider: optimized.selectedOffer.provider,
+            selectedCarrierAccountGlobalId:
+              optimized.selectedOffer.carrierAccountGlobalId,
             selectedServiceCode:
               optimized.selectedOffer.serviceLevelCode,
             selectedCarrierCostMinor:
@@ -1783,6 +2227,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
                 landedPriceMinor: evaluation.landedPriceMinor,
                 unusedCubeMm3: evaluation.unusedCubeMm3,
                 carrierCode: evaluation.offer.carrierCode,
+                carrierAccountGlobalId:
+                  evaluation.offer.carrierAccountGlobalId,
                 serviceCode: evaluation.offer.serviceLevelCode,
               }),
             ),
@@ -1796,6 +2242,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
       account,
       context,
       completed,
+      shadowGuard.customerPolicy,
     )
     } catch (error) {
       const classifiedError = classifyCheckoutFailure(

@@ -1378,8 +1378,8 @@ async function verify(databaseUrl, ids) {
         JSON.stringify(staleDiscovery),
       ],
     )
-    await rejection(
-      persistence.recordShopifyOrderWebhookSignalInPostgres({
+    const staleDiscoveryAccepted = await persistence
+      .recordShopifyOrderWebhookSignalInPostgres({
         ...input,
         runtime: runtime(ids),
         providerEventId: 'webhook-order-event-93019997',
@@ -1387,9 +1387,8 @@ async function verify(databaseUrl, ids) {
           providerUpdatedAt: '2026-08-13T17:19:00.000Z',
           payloadHash: '7'.repeat(64),
         }),
-      }),
-      /subscription evidence is not current/u,
-    )
+      })
+    assert.equal(staleDiscoveryAccepted.providerWrites, 0)
     const staleDiscoveryIngress = await pool.query(
       `SELECT count(*)::integer AS count
        FROM operations_shopify_order_webhook_signals
@@ -1398,7 +1397,36 @@ async function verify(databaseUrl, ids) {
          AND provider_event_id = 'webhook-order-event-93019997'`,
       [ids.organization, ids.integration],
     )
-    assert.equal(staleDiscoveryIngress.rows[0].count, 0)
+    assert.equal(
+      staleDiscoveryIngress.rows[0].count,
+      1,
+      'older-than-24h exact evidence must accept an already HMAC-verified signal',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET configuration = jsonb_set(
+             configuration, '{orderWebhookSubscriptions,desiredUri}',
+             to_jsonb($3::text), true
+           ), updated_at = now()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [
+        ids.organization,
+        ids.integration,
+        `https://drift.example.test/api/integrations/commerce/shopify/webhooks/${runtime(ids).globalId}`,
+      ],
+    )
+    await rejection(
+      persistence.recordShopifyOrderWebhookSignalInPostgres({
+        ...input,
+        runtime: runtime(ids),
+        providerEventId: 'webhook-order-event-93019996',
+        evidence: evidence({
+          providerUpdatedAt: '2026-08-13T17:20:00.000Z',
+          payloadHash: '8'.repeat(64),
+        }),
+      }),
+      /subscription evidence is not current/u,
+    )
     await pool.query(
       `UPDATE operations_commerce_order_sync_policies
        SET continuous_transport = 'webhook_signal_plus_poll',
@@ -1585,7 +1613,7 @@ async function verify(databaseUrl, ids) {
       ),
       /check constraint/u,
     )
-    assert.equal(audits.length, 26)
+    assert.equal(audits.length, 27)
     assert.equal(audits[0].payload.providerWrites, 0)
     assert.equal(audits[0].payload.scheduledPollBackstop, true)
   } finally {

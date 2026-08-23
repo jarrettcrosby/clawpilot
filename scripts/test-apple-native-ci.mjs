@@ -14,6 +14,7 @@ test('runs paid macOS validation only for native Apple changes', () => {
   assert.match(workflow, /- 'clients\/apple\/\*\*'/)
   assert.match(workflow, /- 'scripts\/test-apple-environment-split\.mjs'/)
   assert.match(workflow, /- 'scripts\/test-apple-native-ci\.mjs'/)
+  assert.match(workflow, /- 'scripts\/test-apple-shopify-checkout-rate-control\.mjs'/)
 
   for (const expensiveFalsePositive of [
     "- 'package.json'",
@@ -37,6 +38,7 @@ test('keeps one bounded macOS job focused on native contracts and builds', () =>
     'native validation should allocate exactly one macOS job',
   )
   assert.match(workflow, /node scripts\/test-apple-native-ci\.mjs/)
+  assert.match(workflow, /node scripts\/test-apple-shopify-checkout-rate-control\.mjs/)
   assert.match(workflow, /node scripts\/test-apple-environment-split\.mjs/)
   assert.match(workflow, /swift test \\\n+            --package-path clients\/apple/)
   assert.match(workflow, /swift clients\/apple\/Tools\/verify-meta-mock-fixtures\.swift/)

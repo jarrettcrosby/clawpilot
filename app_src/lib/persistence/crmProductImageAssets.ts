@@ -129,23 +129,15 @@ const ASSET_PROJECTION = `
         binding.organization_id,
         binding.latest_observation_id
       )
-      AND operations_commerce_product_image_account_is_current(
+      AND operations_commerce_product_image_account_lineage_is_current(
         binding.organization_id,
         binding.integration_account_id,
         binding.provider,
         binding.credential_generation
       )
-      AND operations_commerce_product_image_job_fences_are_current(
+      AND operations_commerce_product_image_projection_fences_are_current(
         binding.organization_id,
         binding.latest_import_job_id
-      )
-      AND EXISTS (
-        SELECT 1
-        FROM operations_activation_scopes activation
-        WHERE activation.organization_id = binding.organization_id
-          AND activation.data_pipeline_id = binding.pipeline_id
-          AND activation.state IN ('shadow', 'active')
-          AND activation.revision = binding.activation_revision
       )
     ORDER BY
       binding.provider_sequence,
@@ -395,23 +387,15 @@ export async function readCrmProductImageAssetBytesInPostgres(input: {
              binding.organization_id,
              binding.latest_observation_id
            )
-           AND operations_commerce_product_image_account_is_current(
+           AND operations_commerce_product_image_account_lineage_is_current(
              binding.organization_id,
              binding.integration_account_id,
              binding.provider,
              binding.credential_generation
            )
-           AND operations_commerce_product_image_job_fences_are_current(
+           AND operations_commerce_product_image_projection_fences_are_current(
              binding.organization_id,
              binding.latest_import_job_id
-           )
-           AND EXISTS (
-             SELECT 1
-             FROM operations_activation_scopes activation
-             WHERE activation.organization_id = binding.organization_id
-               AND activation.data_pipeline_id = binding.pipeline_id
-               AND activation.state IN ('shadow', 'active')
-               AND activation.revision = binding.activation_revision
            )
          ORDER BY
            binding.provider_sequence,
@@ -604,23 +588,15 @@ export async function uploadCrmProductImageAssetInPostgres(input: {
                    binding.organization_id,
                    binding.latest_observation_id
                  )
-                 AND operations_commerce_product_image_account_is_current(
+                 AND operations_commerce_product_image_account_lineage_is_current(
                    binding.organization_id,
                    binding.integration_account_id,
                    binding.provider,
                    binding.credential_generation
                  )
-                 AND operations_commerce_product_image_job_fences_are_current(
+                 AND operations_commerce_product_image_projection_fences_are_current(
                    binding.organization_id,
                    binding.latest_import_job_id
-                 )
-                 AND EXISTS (
-                   SELECT 1
-                   FROM operations_activation_scopes activation
-                   WHERE activation.organization_id = binding.organization_id
-                     AND activation.data_pipeline_id = binding.pipeline_id
-                     AND activation.state IN ('shadow', 'active')
-                     AND activation.revision = binding.activation_revision
                  )
              )
            )
@@ -803,23 +779,15 @@ export async function setPrimaryCrmProductImageAssetInPostgres(input: {
                  binding.organization_id,
                  binding.latest_observation_id
                )
-               AND operations_commerce_product_image_account_is_current(
+               AND operations_commerce_product_image_account_lineage_is_current(
                  binding.organization_id,
                  binding.integration_account_id,
                  binding.provider,
                  binding.credential_generation
                )
-               AND operations_commerce_product_image_job_fences_are_current(
+               AND operations_commerce_product_image_projection_fences_are_current(
                  binding.organization_id,
                  binding.latest_import_job_id
-               )
-               AND EXISTS (
-                 SELECT 1
-                 FROM operations_activation_scopes activation
-                 WHERE activation.organization_id = binding.organization_id
-                   AND activation.data_pipeline_id = binding.pipeline_id
-                   AND activation.state IN ('shadow', 'active')
-                   AND activation.revision = binding.activation_revision
                )
            )
          )

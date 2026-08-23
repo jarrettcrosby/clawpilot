@@ -17,6 +17,10 @@ const application = readFileSync(
   ),
   'utf8',
 )
+const domain = readFileSync(
+  resolve(root, 'app_src/lib/operations/activeFulfillmentExecution.ts'),
+  'utf8',
+)
 const route = readFileSync(
   resolve(root, 'app_src/app/api/operations/route.ts'),
   'utf8',
@@ -80,8 +84,6 @@ assert.ok(
 )
 
 assertIncludes(application, [
-  "context.current_activation_state !== 'active'",
-  'current_activation_revision) !== expectedRevision',
   "context.shadow_authority_mode !== 'shadow'",
   "context.shadow_state !== 'shadow_prepared'",
   'context.provider_write_count',
@@ -100,7 +102,17 @@ assertIncludes(application, [
   'OPERATIONS_ACTIVE_PREPARATION_ORDER_BLOCKED',
   "exception.status = 'open'",
   "exception.severity IN ('high', 'critical')",
-], 'Current Active revision and immutable Shopify Shadow source guards')
+], 'Immutable Shopify Shadow source guards')
+assert.doesNotMatch(
+  application,
+  /operations_activation_scopes|current_activation_state|current_activation_revision/u,
+  'Production carrier preparation must be independent of the legacy Operations profile',
+)
+assert.doesNotMatch(
+  domain,
+  /input\.activationState !== 'active'|OPERATIONS_ACTIVE_AUTHORITY_REQUIRED/u,
+  'Pure carrier-lineage preparation must accept every legacy profile',
+)
 
 assertIncludes(application, [
   'packageResult.rows.length < 1',

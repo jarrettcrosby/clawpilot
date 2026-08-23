@@ -40,6 +40,7 @@ function loadPrinting() {
 
 const {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  hasConnectedLocalPrintAgent,
   LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   isDocumentMediaCompatible,
   isPrinterCapabilitySetValid,
@@ -103,8 +104,21 @@ const labelRequest = {
 }
 
 const primary = printer()
+assert.equal(hasConnectedLocalPrintAgent(primary), true)
 assert.equal(selectPrinterRoute([primary], labelRequest)?.printer.globalId, primary.globalId)
 assert.equal(selectPrinterRoute([primary], labelRequest)?.usedFallback, false)
+const configuredNeverConnected = printer({ localPrintAgentLastSeenAt: null })
+assert.equal(hasConnectedLocalPrintAgent(configuredNeverConnected), false)
+assert.equal(
+  selectPrinterRoute([configuredNeverConnected], { ...labelRequest, durable: true }),
+  null,
+  'A configured printer must not accept durable work before its agent first connects',
+)
+assert.equal(
+  selectPrinterRoute([configuredNeverConnected], { ...labelRequest, durable: false })?.printer.globalId,
+  configuredNeverConnected.globalId,
+  'A never-connected agent must not prevent non-durable profile preconfiguration',
+)
 
 const fallback = printer({
   id: 'fallback-id',
@@ -309,10 +323,14 @@ for (const fragment of [
   'LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES',
   'operations:print-attempt:',
   'OPERATIONS_PRINT_REPRINT_LABEL_INACTIVE',
+  'OPERATIONS_PRINT_RETRY_OUTCOME_UNCERTAIN',
+  'isUncertainLocalAgentOutcome',
   'scheduleRetry',
   'reprint_of_job_id',
   "'operations.print_job.reprinted'",
   'physicalOutputVerified: false',
+  'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
+  'A compatible printer is configured, but its local print agent has never connected',
 ]) assert.ok(delivery.includes(fragment), `Print delivery persistence missing ${fragment}`)
 
 const route = read('app_src/app/api/operations/printers/route.ts')
@@ -355,8 +373,13 @@ assert.ok(
   'Printing must count only active local agents in the primary Agents tab badge',
 )
 assert.ok(
-  panel.includes('retained below as audit history and cannot claim print jobs'),
-  'Printing must distinguish revoked enrollment history from usable agents',
+  panel.includes("agents?.agents.filter((agent) => agent.status === 'active') || []")
+    && panel.includes('activeAgents.map((agent) => ('),
+  'Printing must keep revoked enrollment audit rows out of the operational agent list',
+)
+assert.ok(
+  !panel.includes('retained below as audit history and cannot claim print jobs'),
+  'Printing must not keep showing retired-agent warnings after cutover',
 )
 for (const fragment of [
   "thermal: 'Thermal'",
@@ -364,16 +387,27 @@ for (const fragment of [
   '4 x 6 label',
   'Packing slip',
   'Approved fallback',
-  'Local print agent',
-  'Browser download',
+  'Background LAN print agent',
+  'Web app download / manual print',
   'Create a new profile to move a physical printer to another warehouse.',
-  'One-time agent credential',
+  'One-time pairing code',
   'Authorize reprint',
+  'Authorize new print',
+  'Required duplicate-risk authorization reason',
+  '/api/operations/print-agent/releases',
+  'Download for macOS',
+  'Download for Windows',
+  'The computer must stay on, signed in',
+  'private network IPv4 address and raw port 9100',
   'Cancel print job',
   'Retry print job',
   'does not prove physical output',
   'Print job details',
   'Agent heartbeat',
+  'Agent never connected',
+  'Agent connected',
+  'Configured',
+  'No device delivery yet',
   'Last device delivery',
   'Package dimensions',
   'Document integrity',
@@ -383,6 +417,7 @@ for (const fragment of [
   'const BUNDLED_AGENT_DOCUMENT_TYPES = DEFAULT_PRINT_AGENT_CAPABILITIES.supportedDocumentTypes',
   'const BUNDLED_PRINTER_DEFAULT_MEDIA = LEGACY_BUNDLED_AGENT_MEDIA',
   'function agentSupportsPrinter(',
+  'hasConnectedLocalPrintAgent(printer)',
   'containsAll(agent.supportedFormats, printer.supportedFormats)',
   'containsAll(agent.supportedMedia, printer.supportedMedia)',
   'containsAll(agent.supportedDocumentTypes, printer.supportedDocumentTypes)',
@@ -398,7 +433,13 @@ for (const fragment of [
   'Enable bundled barcode printing',
   'Legacy bundled shipping only',
   'All five Zebra barcode-label sizes are included in the bundled runtime.',
-  'New Zebra profiles retain the 4 x 6 carrier-label preset.',
+  'retain the 4 x 6 carrier-label preset; select only the label sizes physically',
+  'loaded and calibrated.',
+  'Zebra private network IP and raw port 9100',
+  'This form defines routing',
+  'Print delivery method',
+  'Choose one: web app download/manual print or a durable background LAN agent.',
+  'System service printing is not implemented.',
 ]) assert.ok(panel.includes(fragment), `Printer UI missing ${fragment}`)
 assert.ok(
   !panel.includes("supportedFormats: ['ZPL', 'PDF']"),

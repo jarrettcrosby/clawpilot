@@ -282,6 +282,54 @@ async function verify(databaseUrl, ids) {
         '@/lib/persistence/postgres': adapter,
       },
     )
+    await pool.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'paused', explicit_choice = true,
+           revision = revision + 1,
+           reason = 'Pause order backfill no-churn acceptance',
+           updated_by = $3, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = ANY($2::uuid[])`,
+      [ids.organization, [ids.integration, accountTwo], actorEmail],
+    )
+    const pausedSessionState = async () => (
+      await pool.query(
+        `SELECT id::text, status, attempt_count, page_count,
+                provider_records_seen::text, cursor_ciphertext,
+                cursor_iv, cursor_tag, cursor_hash,
+                lock_token::text, locked_by, locked_at::text,
+                lease_expires_at::text, last_error_code, updated_at::text
+         FROM operations_commerce_order_backfill_sessions
+         WHERE id = ANY($1::uuid[])
+         ORDER BY id::text`,
+        [[sessionOne.id, sessionTwo.id]],
+      )
+    ).rows
+    const beforePausedClaims = await pausedSessionState()
+    for (let cycle = 0; cycle < 2; cycle += 1) {
+      assert.deepEqual(
+        Array.from(await persistence.claimCommerceOrderBackfillsInPostgres({
+          workerId: `paused-order-history-${cycle}`,
+          limit: 5,
+        })),
+        [],
+      )
+    }
+    assert.deepEqual(
+      await pausedSessionState(),
+      beforePausedClaims,
+      'Repeated Paused order-history claims must retain exact session and cursor evidence',
+    )
+    await pool.query(
+      `UPDATE operations_commerce_store_sync_controls
+       SET desired_state = 'running', explicit_choice = true,
+           revision = revision + 1,
+           reason = 'Resume retained order backfill acceptance',
+           updated_by = $3, updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = ANY($2::uuid[])`,
+      [ids.organization, [ids.integration, accountTwo], actorEmail],
+    )
     const initialClaims = await persistence.claimCommerceOrderBackfillsInPostgres({
       workerId: 'initial-history-claims',
       limit: 5,

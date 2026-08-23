@@ -186,6 +186,9 @@ const persistenceRuntime = loadTypeScript(
       COMMERCE_ORDER_SYNC_CURSOR_AAD_VERSION:
         'commerce-order-sync-cursor-aad-v1',
     },
+    '@/lib/operations/commerceStoreSync': {
+      commerceStoreSyncRunningSql: () => 'TRUE',
+    },
   },
 )
 const keyConfiguration = await import(
@@ -220,6 +223,9 @@ const historyRuntime = loadTypeScript(
           this.status = status
         }
       },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
     },
   },
 )
@@ -524,9 +530,11 @@ assert.equal(
   ).orderCursor,
   'opaque-provider-cursor',
 )
+const tamperedCursorCiphertext = Buffer.from(cursorOne.ciphertext)
+tamperedCursorCiphertext[0] ^= 1
 assert.throws(
   () => cryptoRuntime.decryptCommerceOrderSyncCursor(
-    { ...cursorOne, ciphertext: Buffer.from(cursorOne.ciphertext).fill(1, 0, 1) },
+    { ...cursorOne, ciphertext: tamperedCursorCiphertext },
     cursorContext.organizationId,
     cursorContext.accountGlobalId,
     cursorContext.provider,
@@ -1089,6 +1097,9 @@ const adapterHistoryRuntime = loadTypeScript(
           : { requestedScopes: ['READ_ORDERS'] },
         encrypted: {},
       }),
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
     },
   },
 )
@@ -1686,6 +1697,9 @@ const workerRuntime = loadTypeScript(
       async readCommerceOrderSyncCursorKeyReadinessFromPostgres() {
         return { ready: true, referencedKeyIds: [] }
       },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      withCommerceStoreSyncProviderReadFenceInPostgres: (input) => input.read(),
     },
   },
 )

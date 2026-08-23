@@ -3,17 +3,31 @@
   "releases": {
     "default": {
       "oncePerEnvironment": true,
-      "title": "Real Shopify test-order management",
-      "summary": "ClawPilot now has a tightly controlled development lane for real, auditable Shopify order changes while production provider writes remain disabled.",
+      "title": "Shadow training, store shipping, and printer setup",
+      "summary": "ClawPilot now adds order-level Shadow training, Shopify location routing, multi-account cart-rate callbacks, exact UPS and FedEx shipping-account proofs, and downloadable local printer pairing.",
       "features": [
-        "Authorized operators can add one exact Shopify order tag on an allowlisted development sandbox account, including fulfilled test-workflow orders such as order 6600",
-        "Fresh, wholly unfulfilled Shopify test orders can be cancelled or have an existing line quantity decreased or removed after exact provider eligibility checks",
-        "Every provider action uses a five-minute typed confirmation, immutable attempt evidence, exact readback, and read-only reconciliation for uncertain outcomes"
+        "Deleted starter packaging assortments can be intentionally recreated with fresh material identities and audit evidence",
+        "Shopify fulfillment and tracking activation remain independently selectable when checkout-rate callbacks still need a registered CarrierService",
+        "One Shopify CarrierService can retain up to eight TEST and eight LIVE direct UPS/FedEx billing accounts; Shadow rates only TEST sources and Active rates only LIVE sources through a callback separate from event webhooks",
+        "Carrier setup keeps USPS and LTL modes visible without presenting them as checkout-ready; LTL readiness follows account classification policy, exact palletization, density-derived class, and then rating",
+        "Shipping Settings can rate an exact sandbox or production UPS/FedEx sender account, create and print the exact selected label, and void it; LIVE label purchase is isolated behind Active Operations, production-label authority, warehouse permission, explicit REAL POSTAGE confirmation, and trusted Railway runtime identity",
+        "Shadow orders from a connected Shopify or Faire sandbox or production store can enable an order-specific local training run that simulates plan, release, pick, pack, and completion while the provider order continues to mirror normally",
+        "Shopify location setup can read merchant and app-managed fulfillment locations, map an eligible merchant location to an existing warehouse, or atomically create a ClawPilot warehouse and inventory route from its verified address without writing to Shopify",
+        "An independently gated development-only location administration control can create, edit, or activate eligible merchant-managed Shopify locations after explicit review; app-managed fulfillment-service locations stay read-only",
+        "Sales Channels separates connected accounts, setup in progress, and an add-channel catalog so an unconfigured Shopify or Faire provider is not presented as already integrated",
+        "Printer settings distinguish a configured local printer from an agent that has actually connected",
+        "Mac pairing keeps each workspace credential and printer endpoint local while allowing one physical printer to serve separately enrolled workspaces",
+        "Operations > Printing can download a credential-free macOS raw-ZPL preview, issue a ten-minute pairing code, and show truthful connected, offline, or previously-seen agent state"
       ],
       "fixes": [
-        "Destructive changes require the accepted Shopify revision, matching store currency, coherent staged totals, and no downstream warehouse work",
-        "Planning, reservation, billing, and sandbox execution records cannot race an in-flight Shopify order write",
-        "Unknown or abandoned provider outcomes block further writes and appear in operational health instead of being retried or silently cleared"
+        "A stale starter-assortment receipt no longer reports deleted packages as available",
+        "Multiple UPS or FedEx billing accounts no longer overwrite one another in Shopify checkout rating evidence, and identical public services resolve to one deterministic best account offer",
+        "Concurrent identical Shopify callbacks cannot attach another receipt's carrier evidence, and TEST/LIVE account drift is reported per account without silently deleting the opposite saved group",
+        "Shadow training can use factual warehouse, package, and product definitions without requiring real inventory, packaging stock, or a mappable Shopify fulfillment assignment, while database guards keep canonical warehouse and commerce records unchanged",
+        "UPS live-postage readiness returns a precise blocked response instead of an opaque server error, while TEST and LIVE selections continue to route only to their fixed sandbox and production APIs",
+        "Durable print jobs fail closed until the assigned local print agent records its first heartbeat",
+        "Local print acknowledgements use opaque device references instead of persisting or displaying raw printer hostnames and IP addresses",
+        "A lost print acknowledgement response no longer downgrades a locally delivered artifact or permits an automatic resend"
       ]
     }
   }

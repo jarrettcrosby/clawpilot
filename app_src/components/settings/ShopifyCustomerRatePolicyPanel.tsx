@@ -132,7 +132,9 @@ type CustomerRatePolicyPayload = {
 
 type Props = {
   accountGlobalId: string
+  accountEnvironment: 'mock' | 'sandbox' | 'production'
   activationState: ActivationState
+  rateSource: 'sandbox' | 'production'
   canManage: boolean
 }
 
@@ -221,7 +223,9 @@ async function responsePayload(response: Response) {
 
 export default function ShopifyCustomerRatePolicyPanel({
   accountGlobalId,
+  accountEnvironment,
   activationState,
+  rateSource,
   canManage,
 }: Props) {
   const [policies, setPolicies] = useState<CustomerRatePolicy[]>([])
@@ -258,9 +262,7 @@ export default function ShopifyCustomerRatePolicyPanel({
   const [customerGid, setCustomerGid] = useState('')
   const [selectedCustomer, setSelectedCustomer] =
     useState<ShopifyCustomer | null>(null)
-  const [mode, setMode] = useState<CustomerRatePolicyMode>(
-    activationState === 'active' ? 'hide_all' : 'show_all',
-  )
+  const [mode, setMode] = useState<CustomerRatePolicyMode>('show_all')
   const [serviceCodeInput, setServiceCodeInput] = useState('')
   const [shadowLifetimeMode, setShadowLifetimeMode] =
     useState<ShadowLifetimeMode>('timed')
@@ -291,11 +293,13 @@ export default function ShopifyCustomerRatePolicyPanel({
   const mutationRequest = useRef<AbortController | null>(null)
 
   const effectiveActivation = enforcement?.activationState || activationState
-  const defaultPolicy = enforcement?.defaultPolicy
-    || (effectiveActivation === 'active' ? 'show_all' : 'hide_all')
-  const policyActionsAllowed = effectiveActivation === 'shadow'
-    || effectiveActivation === 'active'
+  const defaultPolicy = 'hide_all' as const
+  const policyActionsAllowed = effectiveActivation !== 'missing'
   const canChangePolicies = canManage && policyActionsAllowed
+  const productionTestDesiredOnly = accountEnvironment === 'production'
+    && rateSource === 'sandbox'
+  const testLane = rateSource === 'sandbox'
+    && accountEnvironment !== 'production'
   const filteredMode = mode === 'include_only' || mode === 'exclude'
   const parsedServiceCodes = useMemo(
     () => parseServiceCodes(serviceCodeInput),
@@ -305,13 +309,13 @@ export default function ShopifyCustomerRatePolicyPanel({
   const customerGidError = exactCustomerGid.length > 0
     && !CUSTOMER_GID.test(exactCustomerGid)
   const shadowDurationMinutes = Number(shadowDurationInput)
-  const shadowDurationError = effectiveActivation === 'shadow'
+  const shadowDurationError = testLane
     && shadowLifetimeMode === 'timed' && (
     !Number.isSafeInteger(shadowDurationMinutes)
     || shadowDurationMinutes < shadowPolicyLimits.minimumDurationMinutes
     || shadowDurationMinutes > shadowPolicyLimits.maximumDurationMinutes
   )
-  const zeroChargeTestEnabled = effectiveActivation === 'shadow'
+  const zeroChargeTestEnabled = testLane
     && shadowTestChargeMode === 'zero_single_service'
   const normalizedShadowTestServiceCode = shadowTestServiceCode.trim()
   const normalizedShadowTestSubsidyReason = shadowTestSubsidyReason.trim()
@@ -441,7 +445,7 @@ export default function ShopifyCustomerRatePolicyPanel({
     setBusy('')
     setError('')
     setNotice('')
-    resetEditor(activationState === 'active' ? 'show_all' : 'hide_all')
+    resetEditor('hide_all')
     void loadPolicies(1)
     return () => {
       policyListRequest.current?.abort()
@@ -449,7 +453,7 @@ export default function ShopifyCustomerRatePolicyPanel({
       exactPolicyRequest.current?.abort()
       mutationRequest.current?.abort()
     }
-  }, [accountGlobalId, activationState, loadPolicies, resetEditor])
+  }, [accountGlobalId, activationState, loadPolicies, rateSource, resetEditor])
 
   const runCustomerSearch = async (append = false) => {
     const search = customerQuery.trim()
@@ -658,7 +662,7 @@ export default function ShopifyCustomerRatePolicyPanel({
           customerGid: exactCustomerGid,
           mode,
           serviceCodes: filteredMode ? parsedServiceCodes.values : [],
-          shadowTestChargeMode: effectiveActivation === 'shadow'
+          shadowTestChargeMode: testLane
             ? shadowTestChargeMode
             : 'carrier_rate',
           shadowTestServiceCode: zeroChargeTestEnabled
@@ -667,7 +671,7 @@ export default function ShopifyCustomerRatePolicyPanel({
           shadowTestSubsidyReason: zeroChargeTestEnabled
             ? normalizedShadowTestSubsidyReason
             : null,
-          ...(effectiveActivation === 'shadow'
+          ...(testLane
             ? {
                 shadowLifetimeMode,
                 ...(shadowLifetimeMode === 'timed'
@@ -691,20 +695,22 @@ export default function ShopifyCustomerRatePolicyPanel({
       if (payload.enforcement) setEnforcement(payload.enforcement)
       const shadowTestSubsidyNotice =
         payload.policy.shadowTestChargeMode === 'zero_single_service'
-          ? ' One selected service is configured at $0 for the gated Shadow checkout test. Shopify may reuse that response for about 15 minutes, so keep the Test Product isolated and turn this subsidy off immediately after submitting the test order.'
+          ? ' One selected service is configured at $0 for the gated TEST checkout proof. Shopify may reuse that response for about 15 minutes, so keep the Test Product isolated and turn this subsidy off immediately after submitting the test order.'
           : ''
       setNotice(
-        payload.enforcement?.state === 'active_blocked'
-          ? 'The customer policy was saved in ClawPilot. Shopify provider enforcement remains blocked and no live checkout option was changed.'
+        productionTestDesiredOnly
+          ? 'The desired customer policy was saved locally with zero Shopify writes. TEST remains effectively blocked for this production Shopify store, so this policy does not create a proof window or a checkout subsidy.'
+          : !testLane
+          ? 'The desired customer policy was saved locally with zero Shopify writes. LIVE restricted serving remains blocked until customer-specific provider enforcement is verified.'
           : payload.policy.shadowLifetimeMode === 'until_turned_off'
-            ? `The customer policy was saved as a Shadow simulation with zero Shopify writes. It remains active until an administrator turns it off.${shadowTestSubsidyNotice}`
-            : `The customer policy was saved as a timed Shadow simulation with zero Shopify writes. It expires ${
+            ? `The customer policy was saved as a TEST proof with zero Shopify writes. It remains active until an administrator turns it off.${shadowTestSubsidyNotice}`
+            : `The customer policy was saved as a timed TEST proof with zero Shopify writes. It expires ${
               payload.policy.shadowExpiresAt
                 ? new Date(payload.policy.shadowExpiresAt).toLocaleString()
                 : 'at the configured fail-closed boundary'
             }.${shadowTestSubsidyNotice}`,
       )
-      resetEditor(payload.enforcement?.defaultPolicy || defaultPolicy)
+      resetEditor(defaultPolicy)
       await loadPolicies(pagination.page)
     } catch (caught) {
       if (requestWasAborted(caught)) return
@@ -753,7 +759,7 @@ export default function ShopifyCustomerRatePolicyPanel({
         : pagination.page
       setPendingRemoval(null)
       if (editingPolicy?.customerGid === payload.customerGid) {
-        resetEditor(payload.enforcement?.defaultPolicy || defaultPolicy)
+        resetEditor(defaultPolicy)
       }
       setNotice(
         'The per-customer override was removed. This customer now receives the checkout default when authenticated.',
@@ -788,73 +794,47 @@ export default function ShopifyCustomerRatePolicyPanel({
             Checkout audience
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Set the default ClawPilot-rate audience and authenticated-customer
-            overrides without building a capped central customer cohort.
+            Configure exact authenticated-customer eligibility for the saved
+            Restricted checkout audience without a capped central cohort.
           </Typography>
         </Box>
 
-        <Alert severity={effectiveActivation === 'active'
-          ? 'success'
-          : effectiveActivation === 'shadow'
-            ? 'info'
-            : 'warning'}>
-          {effectiveActivation === 'shadow' ? (
-            <>
-              <strong>Shadow default · hide ClawPilot rates.</strong>{' '}
-              Guests and authenticated customers without an explicit policy
-              receive this default. A selected, signed-in Shopify customer is
-              explicit local proof intent only: Shopify does not guarantee that
-              a CarrierService callback contains Customer GID, so a callback
-              without that identity fails closed with no ClawPilot rates.
-            </>
-          ) : effectiveActivation === 'active' ? (
-            <>
-              <strong>Active default · show all eligible ClawPilot rates.</strong>{' '}
-              This default includes guest checkouts and authenticated customers
-              without an override. A customer policy can hide all, include
-              only, or exclude specific ClawPilot services.
-            </>
-          ) : (
-            <>
-              <strong>Checkout default unavailable.</strong>{' '}
-              Operations mode is {providerStateLabel(effectiveActivation)}.
-              Existing customer policies are review-only until the exact
-              organization returns to Shadow or Active.
-            </>
-          )}
+        <Alert severity={effectiveActivation === 'disabled'
+          || effectiveActivation === 'frozen' ? 'warning' : 'info'}>
+          <strong>Restricted default · no matching policy means no ClawPilot rates.</strong>{' '}
+          Desired customer policies remain editable in every Advanced safety
+          mode. {effectiveActivation === 'disabled'
+            || effectiveActivation === 'frozen'
+            ? `${providerStateLabel(effectiveActivation)} currently pauses the effective callback with an empty response; saved policy intent remains intact.`
+            : 'The effective callback still fails closed whenever Shopify omits the exact authenticated Customer GID.'}
         </Alert>
 
         <Alert severity="warning">
           <Stack spacing={0.75}>
             <Typography variant="body2" fontWeight={700}>
-              {!policyActionsAllowed
-                ? 'Provider enforcement unavailable'
-                : enforcement?.state === 'active_blocked'
-                ? 'Provider enforcement blocked'
-                : 'Provider enforcement simulated only'}
+              {productionTestDesiredOnly
+                ? 'TEST desired only · production Shopify store remains empty'
+                : testLane
+                ? 'TEST carrier source · bounded proof only'
+                : 'LIVE restricted serving requires verified provider enforcement'}
             </Typography>
             <Typography variant="body2">
-              In Shadow, an administrator chooses either a 15–240 minute local
-              test window or Until turned off. Both perform zero Shopify writes.
-              Shopify can omit
-              Customer GID from CarrierService callbacks, and its successful
-              rate cache is customer-neutral. Saved-address warming is only a
-              bounded, isolated allowlisted test-variant proof—not
-              deterministic customer
-              enforcement. An eligible, deployed, and provider-verified
-              Delivery Customization is required before customer-specific
-              visibility or per-service filtering can be called live.
+              {productionTestDesiredOnly
+                ? 'The desired customer policy remains editable with zero Shopify writes, but TEST cannot create an effective proof lane on a production Shopify store. New authenticated callbacks remain empty, no timed proof is started, and the $0 proof subsidy is unavailable.'
+                : testLane
+                ? 'The saved TEST source uses a 15–240 minute proof window or Until turned off and performs zero Shopify writes. Keep the proof cart isolated because Shopify can omit Customer GID and caches successful rates without customer identity for about 15 minutes.'
+                : 'Desired LIVE policies are saved locally with zero Shopify writes, but a production store returns authenticated empty rates until an eligible Delivery Customization is durably provider-verified. Callback-only customer filtering is not safe for live serving because Shopify caches successful rates without customer identity.'}
             </Typography>
             <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
               <Chip
                 size="small"
                 color="warning"
                 variant="outlined"
-                label={!policyActionsAllowed
-                  ? `${providerStateLabel(effectiveActivation)} · changes disabled`
-                  : enforcement?.state === 'active_blocked'
-                  ? 'Active · Shopify write blocked'
-                  : 'Shadow · simulated'}
+                label={productionTestDesiredOnly
+                  ? 'Restricted · TEST blocked'
+                  : testLane
+                  ? 'Restricted · TEST proof'
+                  : 'Restricted · LIVE blocked'}
               />
               <Chip
                 size="small"
@@ -876,14 +856,6 @@ export default function ShopifyCustomerRatePolicyPanel({
           <Alert severity="info">
             Owner or authorized administrator permission is required to save
             or remove customer checkout-rate policies.
-          </Alert>
-        ) : null}
-        {!policyActionsAllowed ? (
-          <Alert severity="warning">
-            Customer policy changes are unavailable while Operations mode is{' '}
-            <strong>{providerStateLabel(effectiveActivation)}</strong>. Add,
-            edit, and remove actions require the exact organization to be in
-            Shadow or Active. Existing policies remain visible for review.
           </Alert>
         ) : null}
         {error ? (
@@ -1039,21 +1011,22 @@ export default function ShopifyCustomerRatePolicyPanel({
             <Alert severity="info">
               This local rule can match only when Shopify supplies the exact
               authenticated Customer GID. Shopify does not guarantee that fact
-              in a CarrierService callback. A missing identity or an expired
-              Shadow window fails closed. Guests receive the default; do not
-              treat device-to-device behavior as deterministic customer
-              enforcement until Delivery Customization is provider-verified.
+              in a CarrierService callback. A missing identity, expired TEST
+              window, or desired-only effective block fails closed. Guests and customers without an exact policy
+              receive no ClawPilot rates under Restricted; do not call this
+              deterministic live enforcement until Delivery Customization is
+              provider-verified.
             </Alert>
-            {effectiveActivation === 'shadow' ? (
+            {testLane ? (
               <FormControl size="small" fullWidth>
                 <InputLabel
                   id={`shopify-customer-policy-lifetime-${accountGlobalId}`}
                 >
-                  Shadow lifetime
+                  TEST proof lifetime
                 </InputLabel>
                 <Select
                   labelId={`shopify-customer-policy-lifetime-${accountGlobalId}`}
-                  label="Shadow lifetime"
+                  label="TEST proof lifetime"
                   value={shadowLifetimeMode}
                   disabled={!canChangePolicies || Boolean(busy)}
                   onChange={(event) => {
@@ -1077,13 +1050,13 @@ export default function ShopifyCustomerRatePolicyPanel({
                 </Select>
               </FormControl>
             ) : null}
-            {effectiveActivation === 'shadow'
+            {testLane
               && shadowLifetimeMode === 'timed' ? (
               <TextField
                 size="small"
                 fullWidth
                 type="number"
-                label="Shadow proof duration (minutes)"
+                label="TEST proof duration (minutes)"
                 value={shadowDurationInput}
                 disabled={!canChangePolicies || Boolean(busy)}
                 error={shadowDurationError}
@@ -1104,7 +1077,7 @@ export default function ShopifyCustomerRatePolicyPanel({
                   setShadowDurationInput(event.target.value)
                 }}
               />
-            ) : effectiveActivation === 'shadow' ? (
+            ) : testLane ? (
               <Alert severity="warning">
                 Until turned off has no automatic expiry. The exact Customer
                 GID and test-variant gates still apply, every Shopify write
@@ -1115,7 +1088,7 @@ export default function ShopifyCustomerRatePolicyPanel({
                 purge.
               </Alert>
             ) : null}
-            {effectiveActivation === 'shadow' ? (
+            {testLane ? (
               <Box
                 sx={{
                   border: 1,
@@ -1142,11 +1115,11 @@ export default function ShopifyCustomerRatePolicyPanel({
                     label="Return one selected service at $0 for this test"
                   />
                   <Alert severity="warning">
-                    <strong>Shadow test-only subsidy.</strong> This changes the
+                    <strong>TEST proof-only subsidy.</strong> This changes the
                     checkout charge for exactly one stable service after the
-                    selected Shopify Customer GID and the allowlisted{' '}
-                    <strong>Test Product</strong> pass ClawPilot&apos;s Shadow
-                    gates. Shopify&apos;s successful-rate cache is not partitioned
+                    selected Shopify Customer GID and mapped{' '}
+                    <strong>Test Product</strong> pass ClawPilot&apos;s TEST
+                    proof gates. Shopify&apos;s successful-rate cache is not partitioned
                     by customer, so an identical cart and destination using
                     that Test Product could receive the cached $0 rate for
                     about 15 minutes. Keep the product test-only, use a short
@@ -1501,14 +1474,14 @@ export default function ShopifyCustomerRatePolicyPanel({
                           size="small"
                           color="error"
                           variant="outlined"
-                          label="Shadow expired · fails closed"
+                          label="TEST proof expired · fails closed"
                         />
                       ) : policy.shadowExpiresAt ? (
                         <Chip
                           size="small"
                           color="info"
                           variant="outlined"
-                          label={`Shadow expires ${
+                          label={`TEST proof expires ${
                             new Date(policy.shadowExpiresAt).toLocaleString()
                           }`}
                         />
@@ -1517,7 +1490,7 @@ export default function ShopifyCustomerRatePolicyPanel({
                           size="small"
                           color="info"
                           variant="outlined"
-                          label="Shadow · Until turned off"
+                          label="TEST proof · Until turned off"
                         />
                       ) : null}
                       {policy.lastErrorCode ? (
@@ -1537,12 +1510,12 @@ export default function ShopifyCustomerRatePolicyPanel({
                         variant="outlined"
                         label={policy.shadowTestChargeMode
                           === 'zero_single_service'
-                          ? `Shadow test subsidy · $0 · ${
+                          ? `TEST proof subsidy · $0 · ${
                             shadowTestService?.serviceName
                               || policy.shadowTestServiceCode
                               || 'service unavailable'
                           }`
-                          : 'Shadow test subsidy · Off'}
+                          : 'TEST proof subsidy · Off'}
                       />
                     </Stack>
                     {policy.shadowTestChargeMode === 'zero_single_service' ? (
@@ -1564,10 +1537,9 @@ export default function ShopifyCustomerRatePolicyPanel({
                       <Alert severity="warning">
                         <Stack spacing={1}>
                           <Typography variant="body2">
-                            Remove this override? The authenticated customer
-                            will receive the {defaultPolicy === 'hide_all'
-                              ? 'Shadow hide-all'
-                              : 'Active show-all'} default.
+                            Remove this exact policy? Under Restricted, this
+                            customer will receive no ClawPilot rates unless a
+                            new exact policy is saved.
                           </Typography>
                           <Stack direction="row" spacing={1}>
                             <Button

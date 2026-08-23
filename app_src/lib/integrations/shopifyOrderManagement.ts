@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import {
   SHOPIFY_ADMIN_API_VERSION,
   hasEffectiveShopifyScope,
@@ -32,12 +33,22 @@ const MAX_GID_LENGTH = 255
 const MAX_TAGS = 250
 const MAX_TAG_LENGTH = 255
 const MAX_NOTE_LENGTH = 5_000
+const MAX_EMAIL_LENGTH = 254
+const MAX_PHONE_LENGTH = 64
+const MAX_PO_NUMBER_LENGTH = 255
 const MAX_STAFF_NOTE_LENGTH = 255
+const MAX_ADDRESS_NAME_LENGTH = 255
+const MAX_ADDRESS_COMPANY_LENGTH = 255
+const MAX_ADDRESS_LINE_LENGTH = 255
+const MAX_ADDRESS_CITY_LENGTH = 255
+const MAX_ADDRESS_PROVINCE_CODE_LENGTH = 64
+const MAX_ADDRESS_POSTAL_CODE_LENGTH = 64
 const MAX_USER_ERRORS = 50
+const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/
 
 export const SHOPIFY_ORDER_MANAGEMENT_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 export const SHOPIFY_ORDER_MANAGEMENT_ADAPTER_VERSION =
-  'shopify-graphql-2026-07-order-management-v1'
+  'shopify-graphql-2026-07-order-management-v2'
 
 if (SHOPIFY_ORDER_MANAGEMENT_API_VERSION !== '2026-07') {
   throw new Error('Shopify order management requires Admin API 2026-07')
@@ -59,6 +70,20 @@ export type ShopifyOrderManagementAction =
       quantity: number
       staffNote?: string | null
     }
+  | {
+      type: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      shippingAddress: ShopifyOrderShippingAddress | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemGid: string
+        quantity: number
+      }>
+    }
 
 export type ShopifyOrderManagementExpectedIdentity = {
   shopId: string
@@ -76,6 +101,19 @@ export type ShopifyOrderManagementLine = {
   unfulfilledQuantity: number
   nonFulfillableQuantity: number
   merchantEditable: boolean
+}
+
+export type ShopifyOrderShippingAddress = {
+  firstName: string | null
+  lastName: string | null
+  company: string | null
+  address1: string | null
+  address2: string | null
+  city: string | null
+  provinceCode: string | null
+  countryCode: string | null
+  zip: string | null
+  phone: string | null
 }
 
 export type ShopifyOrderManagementPreview = {
@@ -98,7 +136,11 @@ export type ShopifyOrderManagementPreview = {
   orderCurrencyCode: string
   currentTotalPrice: ShopifyOrderManagementMoney
   totalOutstanding: ShopifyOrderManagementMoney
+  email: string | null
+  phone: string | null
+  poNumber: string | null
   note: string | null
+  shippingAddress: ShopifyOrderShippingAddress | null
   tags: string[]
   lines: ShopifyOrderManagementLine[]
 }
@@ -112,8 +154,20 @@ export type ShopifyOrderTagMutationResult = {
 
 export type ShopifyOrderMetadataMutationResult =
   ShopifyOrderTagMutationResult & {
+    email: string | null
+    phone: string | null
+    poNumber: string | null
     note: string | null
+    shippingAddress: ShopifyOrderShippingAddress | null
   }
+
+export type ShopifyOrderSaveResult = {
+  orderGid: string
+  orderName: string
+  updatedAt: string
+  metadataChanged: boolean
+  changedLineCount: number
+}
 
 export type ShopifyOrderCancelMutationResult = {
   jobGid: string
@@ -200,6 +254,7 @@ export type ShopifyOrderManagementExecutionResult = {
     | ShopifyOrderCancelMutationResult
     | ShopifyOrderEditCommitResult
     | ShopifyOrderTagMutationResult
+    | ShopifyOrderSaveResult
     | null
   providerReference: string | null
   errorCode: string | null
@@ -592,6 +647,224 @@ function normalizeOneTag(value: unknown): string {
   return tag
 }
 
+function nullableInputText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null {
+  if (value === null) return null
+  return inputText(value, label, maximum, { allowEmpty: false })
+}
+
+function nullableResponseText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null {
+  if (value === null) return null
+  return strictText(value, label, maximum, { allowEmpty: false })
+}
+
+function nullableAddressInputText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null {
+  if (value === null) return null
+  return inputText(value, label, maximum, { allowEmpty: false })
+}
+
+function nullableAddressResponseText(
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null {
+  if (value === null || value === '') return null
+  return strictText(value, label, maximum, { allowEmpty: false })
+}
+
+function countryCodeInput(value: unknown): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || !COUNTRY_CODE_PATTERN.test(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify shipping-address country code is invalid',
+    )
+  }
+  return value
+}
+
+function countryCodeResponse(value: unknown): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string' || !COUNTRY_CODE_PATTERN.test(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned an invalid shipping-address country code',
+      502,
+      { stage: 'provider_response' },
+    )
+  }
+  return value
+}
+
+const SHIPPING_ADDRESS_FIELDS = [
+  'firstName',
+  'lastName',
+  'company',
+  'address1',
+  'address2',
+  'city',
+  'provinceCode',
+  'countryCode',
+  'zip',
+  'phone',
+] as const
+
+function normalizeShippingAddressInput(
+  value: unknown,
+): ShopifyOrderShippingAddress | null {
+  if (value === null) return null
+  const address = safeRecord(value)
+  if (
+    !address
+    || Object.keys(address).some((key) => (
+      !(SHIPPING_ADDRESS_FIELDS as readonly string[]).includes(key)
+    ))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify shipping address is invalid',
+    )
+  }
+  return {
+    firstName: nullableAddressInputText(
+      address.firstName,
+      'Shopify shipping-address first name',
+      MAX_ADDRESS_NAME_LENGTH,
+    ),
+    lastName: nullableAddressInputText(
+      address.lastName,
+      'Shopify shipping-address last name',
+      MAX_ADDRESS_NAME_LENGTH,
+    ),
+    company: nullableAddressInputText(
+      address.company,
+      'Shopify shipping-address company',
+      MAX_ADDRESS_COMPANY_LENGTH,
+    ),
+    address1: nullableAddressInputText(
+      address.address1,
+      'Shopify shipping-address line 1',
+      MAX_ADDRESS_LINE_LENGTH,
+    ),
+    address2: nullableAddressInputText(
+      address.address2,
+      'Shopify shipping-address line 2',
+      MAX_ADDRESS_LINE_LENGTH,
+    ),
+    city: nullableAddressInputText(
+      address.city,
+      'Shopify shipping-address city',
+      MAX_ADDRESS_CITY_LENGTH,
+    ),
+    provinceCode: nullableAddressInputText(
+      address.provinceCode,
+      'Shopify shipping-address province or state code',
+      MAX_ADDRESS_PROVINCE_CODE_LENGTH,
+    ),
+    countryCode: countryCodeInput(address.countryCode),
+    zip: nullableAddressInputText(
+      address.zip,
+      'Shopify shipping-address postal code',
+      MAX_ADDRESS_POSTAL_CODE_LENGTH,
+    ),
+    phone: nullableAddressInputText(
+      address.phone,
+      'Shopify shipping-address phone',
+      MAX_PHONE_LENGTH,
+    ),
+  }
+}
+
+function parseShippingAddress(value: unknown): ShopifyOrderShippingAddress | null {
+  if (value === null) return null
+  const address = safeRecord(value)
+  if (!address) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned an invalid shipping address',
+      502,
+      { stage: 'provider_response' },
+    )
+  }
+  return {
+    firstName: nullableAddressResponseText(
+      address.firstName,
+      'shipping-address first name',
+      MAX_ADDRESS_NAME_LENGTH,
+    ),
+    lastName: nullableAddressResponseText(
+      address.lastName,
+      'shipping-address last name',
+      MAX_ADDRESS_NAME_LENGTH,
+    ),
+    company: nullableAddressResponseText(
+      address.company,
+      'shipping-address company',
+      MAX_ADDRESS_COMPANY_LENGTH,
+    ),
+    address1: nullableAddressResponseText(
+      address.address1,
+      'shipping-address line 1',
+      MAX_ADDRESS_LINE_LENGTH,
+    ),
+    address2: nullableAddressResponseText(
+      address.address2,
+      'shipping-address line 2',
+      MAX_ADDRESS_LINE_LENGTH,
+    ),
+    city: nullableAddressResponseText(
+      address.city,
+      'shipping-address city',
+      MAX_ADDRESS_CITY_LENGTH,
+    ),
+    provinceCode: nullableAddressResponseText(
+      address.provinceCode,
+      'shipping-address province or state code',
+      MAX_ADDRESS_PROVINCE_CODE_LENGTH,
+    ),
+    countryCode: countryCodeResponse(address.countryCodeV2),
+    zip: nullableAddressResponseText(
+      address.zip,
+      'shipping-address postal code',
+      MAX_ADDRESS_POSTAL_CODE_LENGTH,
+    ),
+    phone: nullableAddressResponseText(
+      address.phone,
+      'shipping-address phone',
+      MAX_PHONE_LENGTH,
+    ),
+  }
+}
+
+function sameShippingAddress(
+  left: ShopifyOrderShippingAddress | null,
+  right: ShopifyOrderShippingAddress | null,
+) {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function normalizedTags(value: readonly string[]) {
+  return [...value].sort((left, right) => (
+    left < right ? -1 : left > right ? 1 : 0
+  ))
+}
+
+function sameStringList(left: readonly string[], right: readonly string[]) {
+  return left.length === right.length
+    && left.every((value, index) => value === right[index])
+}
+
 function normalizeStaffNote(value: unknown, required: boolean): string | null {
   if ((value === undefined || value === null) && !required) return null
   return inputText(value, 'Shopify staff note', MAX_STAFF_NOTE_LENGTH)
@@ -809,7 +1082,23 @@ function parsePreview(
       shopCurrencyCode,
       { allowNegative: true },
     ),
+    email: nullableResponseText(
+      order.email,
+      'order email',
+      MAX_EMAIL_LENGTH,
+    ),
+    phone: nullableResponseText(
+      order.phone,
+      'order phone',
+      MAX_PHONE_LENGTH,
+    ),
+    poNumber: nullableResponseText(
+      order.poNumber,
+      'order PO number',
+      MAX_PO_NUMBER_LENGTH,
+    ),
     note,
+    shippingAddress: parseShippingAddress(order.shippingAddress),
     tags: strictTags(order.tags),
     lines,
   }
@@ -841,7 +1130,22 @@ const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
       totalOutstandingSet {
         shopMoney { amount currencyCode }
       }
+      email
+      phone
+      poNumber
       note
+      shippingAddress {
+        firstName
+        lastName
+        company
+        address1
+        address2
+        city
+        provinceCode
+        countryCodeV2
+        zip
+        phone
+      }
       tags
       lineItems(first: 250) {
         nodes {
@@ -1047,7 +1351,28 @@ export async function addShopifyOrderTag(
 const SHOPIFY_ORDER_METADATA_UPDATE_MUTATION =
   `mutation ClawPilotShopifyOrderMetadataUpdate($input: OrderInput!) {
     orderUpdate(input: $input) {
-      order { id name updatedAt note tags }
+      order {
+        id
+        name
+        updatedAt
+        email
+        phone
+        poNumber
+        note
+        tags
+        shippingAddress {
+          firstName
+          lastName
+          company
+          address1
+          address2
+          city
+          provinceCode
+          countryCodeV2
+          zip
+          phone
+        }
+      }
       userErrors { field message }
     }
   }`
@@ -1061,19 +1386,43 @@ export async function updateShopifyOrderMetadata(
   credential: ShopifyCommerceRuntimeCredential,
   input: {
     orderGid: unknown
+    email?: unknown
+    phone?: unknown
+    poNumber?: unknown
     note?: unknown
+    shippingAddress?: unknown
     tags?: unknown
   },
   options: ShopifyCommerceClientOptions = {},
   overrides: Partial<ShopifyOrderManagementDependencies> = {},
 ): Promise<ShopifyOrderMetadataMutationResult> {
   const orderGid = inputGid(input.orderGid, 'Shopify order ID', ORDER_GID_PATTERN)
-  if (input.note === undefined && input.tags === undefined) {
+  if (
+    input.email === undefined
+    && input.phone === undefined
+    && input.poNumber === undefined
+    && input.note === undefined
+    && input.shippingAddress === undefined
+    && input.tags === undefined
+  ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
-      'An exact note or tag replacement is required',
+      'At least one exact order field replacement is required',
     )
   }
+  const email = input.email === undefined
+    ? undefined
+    : nullableInputText(input.email, 'Shopify order email', MAX_EMAIL_LENGTH)
+  const phone = input.phone === undefined
+    ? undefined
+    : nullableInputText(input.phone, 'Shopify order phone', MAX_PHONE_LENGTH)
+  const poNumber = input.poNumber === undefined
+    ? undefined
+    : nullableInputText(
+        input.poNumber,
+        'Shopify order PO number',
+        MAX_PO_NUMBER_LENGTH,
+      )
   const note = input.note === undefined
     ? undefined
     : input.note === null
@@ -1081,6 +1430,9 @@ export async function updateShopifyOrderMetadata(
       : inputText(input.note, 'Shopify order note', MAX_NOTE_LENGTH, {
           allowEmpty: true,
         })
+  const shippingAddress = input.shippingAddress === undefined
+    ? undefined
+    : normalizeShippingAddressInput(input.shippingAddress)
   let tags: string[] | undefined
   if (input.tags !== undefined) {
     if (!Array.isArray(input.tags) || input.tags.length > MAX_TAGS) {
@@ -1093,7 +1445,11 @@ export async function updateShopifyOrderMetadata(
   }
   const providerInput = {
     id: orderGid,
+    ...(email !== undefined ? { email } : {}),
+    ...(phone !== undefined ? { phone } : {}),
+    ...(poNumber !== undefined ? { poNumber } : {}),
     ...(note !== undefined ? { note } : {}),
+    ...(shippingAddress !== undefined ? { shippingAddress } : {}),
     ...(tags !== undefined ? { tags } : {}),
   }
   const dependencies = { ...DEFAULT_DEPENDENCIES, ...overrides }
@@ -1135,19 +1491,41 @@ export async function updateShopifyOrderMetadata(
     orderGid: strictGid(order.id, 'updated order identity', ORDER_GID_PATTERN),
     orderName: strictText(order.name, 'updated order name', 255),
     updatedAt: isoDate(order.updatedAt, 'updated order timestamp'),
+    email: nullableResponseText(
+      order.email,
+      'updated order email',
+      MAX_EMAIL_LENGTH,
+    ),
+    phone: nullableResponseText(
+      order.phone,
+      'updated order phone',
+      MAX_PHONE_LENGTH,
+    ),
+    poNumber: nullableResponseText(
+      order.poNumber,
+      'updated order PO number',
+      MAX_PO_NUMBER_LENGTH,
+    ),
     note: order.note === null
       ? null
       : strictText(order.note, 'updated order note', MAX_NOTE_LENGTH, {
           allowEmpty: true,
         }),
+    shippingAddress: parseShippingAddress(order.shippingAddress),
     tags: strictTags(order.tags, 'updated order tags'),
   }
   if (
     result.orderGid !== orderGid
+    || (email !== undefined && result.email !== email)
+    || (phone !== undefined && result.phone !== phone)
+    || (poNumber !== undefined && result.poNumber !== poNumber)
     || (note !== undefined && result.note !== note)
+    || (shippingAddress !== undefined && !sameShippingAddress(
+      result.shippingAddress,
+      shippingAddress,
+    ))
     || (tags !== undefined && (
-      result.tags.length !== tags.length
-      || result.tags.some((tag, index) => tag !== tags?.[index])
+      !sameStringList(normalizedTags(result.tags), normalizedTags(tags))
     ))
   ) {
     fail(
@@ -1601,12 +1979,202 @@ function normalizeAction(action: ShopifyOrderManagementAction): ShopifyOrderMana
       staffNote: normalizeStaffNote(action.staffNote, false),
     }
   }
+  if (action.type === 'save_order') {
+    if (
+      !Array.isArray(action.tagAdds)
+      || !Array.isArray(action.tagRemoves)
+      || action.tagAdds.length > MAX_TAGS
+      || action.tagRemoves.length > MAX_TAGS
+      || !Array.isArray(action.lineQuantities)
+      || action.lineQuantities.length > MAX_ORDER_LINES
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify order save changes are invalid',
+      )
+    }
+    const tagAdds = action.tagAdds.map(normalizeOneTag)
+    const tagRemoves = action.tagRemoves.map(normalizeOneTag)
+    if (
+      new Set(tagAdds).size !== tagAdds.length
+      || new Set(tagRemoves).size !== tagRemoves.length
+      || tagAdds.some((tag) => tagRemoves.includes(tag))
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify tag changes are duplicated or contradictory',
+      )
+    }
+    const lineQuantities = action.lineQuantities.map((line) => {
+      if (!line || typeof line !== 'object') {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+          'Shopify order line changes are invalid',
+        )
+      }
+      if (!Number.isSafeInteger(line.quantity) || line.quantity < 0) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+          'Shopify order line quantity is invalid',
+        )
+      }
+      return {
+        lineItemGid: inputGid(
+          line.lineItemGid,
+          'Shopify order line ID',
+          LINE_ITEM_GID_PATTERN,
+        ),
+        quantity: line.quantity,
+      }
+    })
+    if (new Set(lineQuantities.map((line) => line.lineItemGid)).size
+      !== lineQuantities.length) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify order line changes contain duplicates',
+      )
+    }
+    return {
+      type: 'save_order',
+      email: nullableInputText(
+        action.email,
+        'Shopify order email',
+        MAX_EMAIL_LENGTH,
+      ),
+      phone: nullableInputText(
+        action.phone,
+        'Shopify order phone',
+        MAX_PHONE_LENGTH,
+      ),
+      poNumber: nullableInputText(
+        action.poNumber,
+        'Shopify order PO number',
+        MAX_PO_NUMBER_LENGTH,
+      ),
+      note: action.note === null
+        ? null
+        : inputText(action.note, 'Shopify order note', MAX_NOTE_LENGTH, {
+            allowEmpty: true,
+          }),
+      shippingAddress: normalizeShippingAddressInput(action.shippingAddress),
+      tagAdds: normalizedTags(tagAdds),
+      tagRemoves: normalizedTags(tagRemoves),
+      lineQuantities: [...lineQuantities].sort((left, right) => (
+        left.lineItemGid < right.lineItemGid
+          ? -1
+          : left.lineItemGid > right.lineItemGid ? 1 : 0
+      )),
+    }
+  }
   fail('SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID', 'Shopify order action is invalid')
+}
+
+type ShopifyOrderSaveProjection = Readonly<{
+  email: string | null
+  phone: string | null
+  poNumber: string | null
+  note: string | null
+  shippingAddress: ShopifyOrderShippingAddress | null
+  tags: readonly string[]
+  lineQuantities: readonly Readonly<{
+    lineItemGid: string
+    quantity: number
+  }>[]
+}>
+
+function previewProjection(
+  preview: ShopifyOrderManagementPreview,
+): ShopifyOrderSaveProjection {
+  return {
+    email: preview.email,
+    phone: preview.phone,
+    poNumber: preview.poNumber,
+    note: preview.note,
+    shippingAddress: preview.shippingAddress,
+    tags: normalizedTags(preview.tags),
+    lineQuantities: preview.lines
+      .map((line) => ({
+        lineItemGid: line.id,
+        quantity: line.currentQuantity,
+      }))
+      .sort((left, right) => (
+        left.lineItemGid < right.lineItemGid
+          ? -1
+          : left.lineItemGid > right.lineItemGid ? 1 : 0
+      )),
+  }
+}
+
+function desiredSaveProjection(
+  before: ShopifyOrderManagementPreview,
+  action: Extract<ShopifyOrderManagementAction, { type: 'save_order' }>,
+): ShopifyOrderSaveProjection {
+  const quantities = new Map(
+    before.lines.map((line) => [line.id, line.currentQuantity]),
+  )
+  for (const change of action.lineQuantities) {
+    if (!quantities.has(change.lineItemGid)) {
+      fail(
+        'SHOPIFY_ORDER_EDIT_LINE_NOT_FOUND',
+        'A changed Shopify order line was not found',
+        404,
+        { stage: 'eligibility' },
+      )
+    }
+    quantities.set(change.lineItemGid, change.quantity)
+  }
+  const tags = new Set(before.tags)
+  for (const tag of action.tagRemoves) tags.delete(tag)
+  for (const tag of action.tagAdds) tags.add(tag)
+  return {
+    email: action.email,
+    phone: action.phone,
+    poNumber: action.poNumber,
+    note: action.note,
+    shippingAddress: action.shippingAddress,
+    tags: normalizedTags([...tags]),
+    lineQuantities: [...quantities.entries()]
+      .map(([lineItemGid, quantity]) => ({ lineItemGid, quantity }))
+      .sort((left, right) => (
+        left.lineItemGid < right.lineItemGid
+          ? -1
+          : left.lineItemGid > right.lineItemGid ? 1 : 0
+      )),
+  }
+}
+
+function projectionHash(projection: ShopifyOrderSaveProjection): string {
+  return createHash('sha256').update(JSON.stringify({
+    schema: 'shopify-order-save-projection-v2',
+    ...projection,
+  })).digest('hex')
+}
+
+export function shopifyOrderManagementProjectionHash(
+  preview: ShopifyOrderManagementPreview,
+): string {
+  return projectionHash(previewProjection(preview))
+}
+
+export function requestedShopifyOrderSaveProjectionHash(
+  preview: ShopifyOrderManagementPreview,
+  actionInput: Extract<ShopifyOrderManagementAction, { type: 'save_order' }>,
+): string {
+  const action = normalizeAction(actionInput)
+  if (action.type !== 'save_order') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify order save changes are invalid',
+    )
+  }
+  return projectionHash(desiredSaveProjection(preview, action))
 }
 
 function requiredScopes(action: ShopifyOrderManagementAction): ShopifyAccessScope[] {
   return action.type === 'set_line_quantity'
     ? ['read_orders', 'write_order_edits']
+    : action.type === 'save_order' && action.lineQuantities.length > 0
+      ? ['read_orders', 'write_orders', 'write_order_edits']
     : ['read_orders', 'write_orders']
 }
 
@@ -1772,6 +2340,41 @@ function assertLineEditEligible(
   }
 }
 
+function assertSaveOrderEligible(
+  preview: ShopifyOrderManagementPreview,
+  action: Extract<ShopifyOrderManagementAction, { type: 'save_order' }>,
+) {
+  if (
+    action.tagAdds.some((tag) => preview.tags.includes(tag))
+    || action.tagRemoves.some((tag) => !preview.tags.includes(tag))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_TAG_STALE',
+      'Shopify tags changed before this order save',
+      409,
+      { stage: 'eligibility' },
+    )
+  }
+  const finalTagCount = preview.tags.length
+    - action.tagRemoves.length
+    + action.tagAdds.length
+  if (finalTagCount > MAX_TAGS) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify order has too many tags',
+      400,
+      { stage: 'eligibility' },
+    )
+  }
+  for (const line of action.lineQuantities) {
+    assertLineEditEligible(preview, {
+      type: 'set_line_quantity',
+      lineItemGid: line.lineItemGid,
+      quantity: line.quantity,
+    })
+  }
+}
+
 function assertStagedLineEditFinancials(
   before: ShopifyOrderManagementPreview,
   staged: ShopifyOrderEditQuantityResult,
@@ -1897,7 +2500,7 @@ function inspectionActions(
   value: InspectShopifyOrderManagementTargetInput['requiredActions'],
 ): ShopifyOrderManagementAction['type'][] {
   if (value === undefined) return []
-  if (!Array.isArray(value) || value.length > 3) {
+  if (!Array.isArray(value) || value.length > 4) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
       'Required Shopify order actions are invalid',
@@ -1908,6 +2511,7 @@ function inspectionActions(
     'add_tag',
     'cancel',
     'set_line_quantity',
+    'save_order',
   ].includes(action))) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
@@ -2136,6 +2740,160 @@ export async function executeShopifyOrderManagementAction(
         providerReads: 3,
         providerWritesKnown: true,
         providerWrites: 1,
+        error,
+      })
+    }
+  }
+
+  if (action.type === 'save_order') {
+    assertSaveOrderEligible(before, action)
+    const desired = desiredSaveProjection(before, action)
+    const beforeProjection = previewProjection(before)
+    const shippingAddressChanged = !sameShippingAddress(
+      beforeProjection.shippingAddress,
+      desired.shippingAddress,
+    )
+    const metadataChanged = beforeProjection.email !== desired.email
+      || beforeProjection.phone !== desired.phone
+      || beforeProjection.poNumber !== desired.poNumber
+      || beforeProjection.note !== desired.note
+      || shippingAddressChanged
+      || !sameStringList(beforeProjection.tags, desired.tags)
+    if (!metadataChanged && action.lineQuantities.length === 0) {
+      return {
+        ...resultBase({ action: action.type, probe, before }),
+        outcome: 'succeeded',
+        providerMutationAttempted: false,
+        providerWritesKnown: true,
+        providerWrites: 0,
+        after: before,
+        result: {
+          orderGid: before.id,
+          orderName: before.name,
+          updatedAt: before.updatedAt,
+          metadataChanged: false,
+          changedLineCount: 0,
+        },
+        providerReference: before.id,
+        errorCode: null,
+        safeMessage: null,
+      }
+    }
+
+    let acceptedWrites = 0
+    let providerReads: 2 | 3 = 2
+    const expectedWrites = (metadataChanged ? 1 : 0)
+      + (action.lineQuantities.length > 0
+        ? action.lineQuantities.length + 2
+        : 0)
+    try {
+      if (metadataChanged) {
+        await updateShopifyOrderMetadata(
+          runtimeCredential,
+          {
+            orderGid: before.id,
+            email: desired.email,
+            phone: desired.phone,
+            poNumber: desired.poNumber,
+            note: desired.note,
+            ...(shippingAddressChanged
+              ? { shippingAddress: desired.shippingAddress }
+              : {}),
+            tags: desired.tags,
+          },
+          options,
+          dependencies,
+        )
+        acceptedWrites += 1
+      }
+
+      if (action.lineQuantities.length > 0) {
+        const edit = await beginShopifyOrderEdit(
+          runtimeCredential,
+          before.id,
+          options,
+          dependencies,
+        )
+        acceptedWrites += 1
+        let finalStaged: ShopifyOrderEditQuantityResult | null = null
+        for (const line of action.lineQuantities) {
+          finalStaged = await setShopifyOrderEditLineQuantity(
+            runtimeCredential,
+            {
+              calculatedOrderGid: edit.calculatedOrderGid,
+              lineItemGid: line.lineItemGid,
+              quantity: line.quantity,
+              expectedCurrencyCode: before.shopCurrencyCode,
+            },
+            options,
+            dependencies,
+          )
+          acceptedWrites += 1
+          assertStagedLineEditFinancials(before, finalStaged)
+        }
+        await commitShopifyOrderEdit(
+          runtimeCredential,
+          {
+            calculatedOrderGid: edit.calculatedOrderGid,
+            orderGid: before.id,
+            staffNote: 'Saved Shopify order changes in ClawPilot',
+          },
+          options,
+          dependencies,
+        )
+        acceptedWrites += 1
+      }
+
+      providerReads = 3
+      const after = await readShopifyOrderManagementPreview(
+        runtimeCredential,
+        before.id,
+        options,
+        dependencies,
+      )
+      if (
+        after.id !== before.id
+        || after.name !== before.name
+        || projectionHash(previewProjection(after)) !== projectionHash(desired)
+      ) {
+        fail(
+          'SHOPIFY_ORDER_SAVE_READBACK_MISMATCH',
+          'Shopify order readback did not match the saved fields',
+          502,
+          { stage: 'order_save_readback' },
+        )
+      }
+      return {
+        ...resultBase({ action: action.type, probe, before, providerReads }),
+        outcome: 'succeeded',
+        providerMutationAttempted: acceptedWrites > 0,
+        providerWritesKnown: true,
+        providerWrites: acceptedWrites,
+        after,
+        result: {
+          orderGid: after.id,
+          orderName: after.name,
+          updatedAt: after.updatedAt,
+          metadataChanged,
+          changedLineCount: action.lineQuantities.length,
+        },
+        providerReference: after.id,
+        errorCode: null,
+        safeMessage: null,
+      }
+    } catch (error) {
+      if (acceptedWrites === 0 && explicitFirstMutationRejection(error)) {
+        return rejectedResult({ action: action.type, probe, before, error })
+      }
+      const providerWritesKnown = acceptedWrites === expectedWrites
+        || (acceptedWrites > 0 && explicitFirstMutationRejection(error))
+      return unknownResult({
+        action: action.type,
+        probe,
+        before,
+        providerReads,
+        providerWritesKnown,
+        providerWrites: providerWritesKnown ? acceptedWrites : null,
         error,
       })
     }

@@ -25,6 +25,9 @@ const setupPersistence = read(
 const checkoutRatingPersistence = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
+const callbackExecution = read(
+  'app_src/lib/integrations/shopifyCarrierServiceCallback.ts',
+)
 const operationsPersistence = read(
   'app_src/lib/persistence/operations.ts',
 )
@@ -49,6 +52,23 @@ const receiptAuthorityMigration = read(
 const nameAlignmentMigration = read(
   'db/migrations/0166_shopify_carrier_service_name_alignment.sql',
 )
+const configuredCarriersMigration = read(
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+)
+const checkoutRateControlMigration = read(
+  'db/migrations/0299_operations_shopify_checkout_rate_control.sql',
+)
+const simulationRuntimeReadinessMigration = read(
+  'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+)
+const checkoutRateControlDomain = read(
+  'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+)
+const mutationAuthorizationPersistence = read(
+  'app_src/lib/persistence/shopifyCarrierServiceMutationAuthorization.ts',
+)
+const healthRoute = read('app_src/app/api/health/route.ts')
+const predeployVerification = read('scripts/verify-predeploy.mjs')
 const externalEffectsPersistence = read(
   'app_src/lib/persistence/commerceExternalEffects.ts',
 )
@@ -59,6 +79,23 @@ const userIntegrationsContract = read(
   'docs/modules/user-integrations.md',
 )
 const proxy = read('app_src/proxy.ts')
+
+requireAll(setupPersistence, [
+  'carrier.allow_sender_billing',
+  'carrier.registered_address_fingerprint',
+  'integration.configuration',
+  'matchingWarehouseGlobalIds',
+  'readinessIssues: carrierReadinessIssues(row)',
+  "'sender_billing_not_allowed'",
+  "'production_rate_not_authorized'",
+], 'checkout account readiness projection')
+requireAll(setupPanel, [
+  'const directRateCarriers = useMemo(',
+  'const carrierIssues = (',
+  "'origin_does_not_match_warehouse'",
+  '(!checked && (atLimit || issues.length > 0))',
+  'selectedRuntimeBindings.every((binding) => (',
+], 'checkout account selection truth')
 
 function requireAll(source, contracts, surface) {
   for (const contract of contracts) {
@@ -105,9 +142,11 @@ assert.equal(
 )
 
 const actions = [
-  ['repair-activation-revision-binding', 'save-config'],
-  ['save-config', 'save-plan-rate-policy'],
-  ['save-plan-rate-policy', 'save-name-preference'],
+  ['save-config', 'save-checkout-rate-control'],
+  ['save-checkout-rate-control', 'save-plan-rate-policy'],
+  ['save-plan-rate-policy', 'save-checkout-audience'],
+  ['save-checkout-audience', 'save-rate-warm-policy'],
+  ['save-rate-warm-policy', 'save-name-preference'],
   ['save-name-preference', 'simulate-registration'],
   ['simulate-registration', 'simulate-name-alignment'],
   ['simulate-name-alignment', 'align-registration-name'],
@@ -133,8 +172,8 @@ const providerMutation = setupRoute.slice(
   providerMutationEnd,
 )
 for (const action of [
-  'repair-activation-revision-binding',
   'save-config',
+  'save-checkout-rate-control',
   'save-plan-rate-policy',
   'save-rate-warm-policy',
   'save-name-preference',
@@ -149,133 +188,42 @@ for (const action of [
   )
 }
 
-const repairActivationRevision = actionBranch(
-  'repair-activation-revision-binding',
-  'save-config',
-)
-requireAll(repairActivationRevision, [
-  'requireActivator(context.capabilities.canActivate)',
-  "current.config.registrationState !== 'registered'",
-  "current.reference.activation.state !== 'active'",
-  'repairShopifyCarrierServiceActiveRevisionBindingInPostgres({',
-  'expectedRowVersion: current.config.rowVersion',
-  'current.reference.activation.revision',
-  'actorEmail: context.actor.email',
-], 'authenticated local Active callback repair')
-for (const forbiddenRepairEffect of [
-  'refreshShopifyIdentity()',
-  'testCommerceConnection({',
-  'shopifyCarrierServiceCallbackToken({',
-  'executeResourceScopedCarrierServiceMutation({',
-  'executeShopifyCarrierServiceRegistration({',
-  'upsertShopifyCarrierServiceConfigInPostgres({',
-]) {
-  assert.equal(
-    repairActivationRevision.includes(forbiddenRepairEffect),
-    false,
-    `Active callback repair must not use ${forbiddenRepairEffect}`,
-  )
-}
-
-const repairPersistenceStart = checkoutRatingPersistence.indexOf(
-  'export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(',
-)
-const repairPersistenceEnd = checkoutRatingPersistence.indexOf(
-  'export async function upsertShopifyCarrierServiceConfigInPostgres(',
-  repairPersistenceStart,
-)
-assert.ok(
-  repairPersistenceStart >= 0 && repairPersistenceEnd > repairPersistenceStart,
-  'Active callback repair persistence boundary is invalid',
-)
-const repairPersistence = checkoutRatingPersistence.slice(
-  repairPersistenceStart,
-  repairPersistenceEnd,
-)
-requireAll(repairPersistence, [
-  'app_user_organization_memberships',
-  'FOR SHARE',
-  "!['owner', 'admin'].includes(membership.rows[0]?.role)",
-  'operations_commerce_active_capability_claim_is_current(',
-  "? 'shipping_rate_callbacks'",
-  'operations_shopify_carrier_service_config_is_ready(',
-  'activation_revision = $3',
-  'row_version = row_version + 1',
-  "'operations.shopify_carrier_service.activation_revision_rebound'",
-  'callbackTokenVersionRetained:',
-  'providerWrites: 0',
-  'callbackTokenRotations: 0',
-], 'transition-proven local Active callback repair persistence')
-const shadowRebindStart = checkoutRatingPersistence.indexOf(
-  'export async function rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
-)
-const shadowRebindEnd = checkoutRatingPersistence.indexOf(
-  'export async function repairShopifyCarrierServiceActiveRevisionBindingInPostgres(',
-  shadowRebindStart,
-)
-const shadowRebind = checkoutRatingPersistence.slice(
-  shadowRebindStart,
-  shadowRebindEnd,
-)
-assert.equal(
-  shadowRebind.includes('JOIN operations_commerce_credentials'),
-  false,
-  'Shadow rebind must enumerate every registered CarrierService even when its credential row is missing',
-)
-for (const forbiddenRepairMutation of [
-  'SET service_gid =',
-  'SET callback_token_version =',
-  'SET callback_token_hash =',
-  'SET registered_service_name =',
-  'SET policy_snapshot =',
-  'SET warehouse_id =',
-  'fetch(',
-]) {
-  assert.equal(
-    repairPersistence.includes(forbiddenRepairMutation),
-    false,
-    `Active callback repair must not mutate or call ${forbiddenRepairMutation}`,
-  )
-}
 requireAll(setupPanel, [
-  'const activeRevisionBindingRequired = Boolean(',
-  "setup?.reference.activation.state === 'active'",
-  'setup.config?.activationRevision',
-  "'repair-activation-revision-binding'",
-  'Refresh Active checkout authority',
-  'it performs no Shopify write',
-], 'fail-closed Active callback repair UI')
+  'ShopifyCheckoutRateControlHttpError',
+  'shopifyCheckoutRateControlPendingResolution',
+  "resolution === 'applied'",
+  "resolution === 'definitive_rejection'",
+  'clearPendingRateControlCommand()',
+  'The exact command remains saved for retry.',
+], 'checkout-rate control lost-response recovery')
 
-requireAll(checkoutRatingPersistence, [
+for (const obsoleteActivationLatch of [
+  'repair-activation-revision-binding',
+  'activeRevisionBindingRequired',
+  'repairShopifyCarrierServiceActiveRevisionBindingInPostgres({',
+]) {
+  assert.equal(
+    setupRoute.includes(obsoleteActivationLatch)
+      || setupPanel.includes(obsoleteActivationLatch),
+    false,
+    `checkout setup must not expose the obsolete global activation latch ${obsoleteActivationLatch}`,
+  )
+}
+for (const obsoleteShadowTransitionMutation of [
   'lockShopifyCarrierServiceConfigWritersForActivationWithClient(',
   'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
-  "activation.state = 'shadow'",
-  'operations_shopify_carrier_service_config_is_ready(',
-  'const readiness = await client.query<{ callback_ready: boolean }>(',
-  'readiness.rows[0]?.callback_ready !== true',
-  "'SHOPIFY_CARRIER_SERVICE_SHADOW_REBIND_MUTATION_UNRESOLVED'",
-  "activationState: 'shadow'",
-  'callbackTokenRotations: 0',
-], 'registered CarrierService Shadow revision rebind')
-const shadowRebindUpdate = shadowRebind.slice(
-  shadowRebind.indexOf('const updated = await client.query'),
-  shadowRebind.indexOf('const readiness = await client.query'),
-)
-assert.equal(
-  shadowRebindUpdate.includes(
-    'operations_shopify_carrier_service_config_is_ready(',
-  ),
-  false,
-  'Shadow rebind readiness must be checked in a command after UPDATE RETURNING so the STABLE function sees the new activation revision',
-)
+  'carrierServiceRebindings: shadowCarrierServiceRebindings.map(',
+]) {
+  assert.equal(
+    operationsPersistence.includes(obsoleteShadowTransitionMutation),
+    false,
+    `Operations mode changes must not mutate checkout configuration via ${obsoleteShadowTransitionMutation}`,
+  )
+}
 requireAll(operationsPersistence, [
   "if (input.state === 'shadow')",
   '`commerce-active-transition:${organizationId}`',
-  'lockShopifyCarrierServiceConfigWritersForActivationWithClient(',
-  'rebindRegisteredShopifyCarrierServicesForShadowActivationWithClient(',
-  'targetActivationRevision: updated.revision',
-  'carrierServiceRebindings: shadowCarrierServiceRebindings.map(',
-], 'atomic Operations Shadow callback rebind')
+], 'global transition serialization without checkout config mutation')
 const shadowActivationStart = operationsPersistence.indexOf(
   'export async function updateOperationsActivationInPostgres(',
 )
@@ -293,9 +241,14 @@ assert.ok(
   'Shadow activation must acquire commerce/config serialization before locking activation',
 )
 
-const saveConfig = actionBranch('save-config', 'save-plan-rate-policy')
+const saveConfig = actionBranch('save-config', 'save-checkout-rate-control')
 requireAll(saveConfig, [
   'requireActivator(context.capabilities.canActivate)',
+  'updateRegisteredShopifyCarrierServiceRateSourcesInPostgres({',
+  "current.config?.registrationState === 'registered'",
+  'expectedRowVersion: current.config.rowVersion',
+  "warehouseGlobalId: String(body.warehouseGlobalId || ''),",
+  'materials,',
   'normalizeShopifyCheckoutPlanRatePolicy(',
   'body.planRateOptimization',
   "Object.prototype.hasOwnProperty.call(\n        body,\n        'planRateOptimization',",
@@ -305,6 +258,31 @@ requireAll(saveConfig, [
   'callbackTokenHash: tokenHash(token)',
   'actorEmail: context.actor.email',
 ], 'save-config action')
+assert.doesNotMatch(
+  saveConfig,
+  /body\.checkoutRateControl/u,
+  'save-config must not bypass the dedicated receipt-backed rate-control command',
+)
+
+const saveCheckoutRateControl = actionBranch(
+  'save-checkout-rate-control',
+  'save-plan-rate-policy',
+)
+requireAll(saveCheckoutRateControl, [
+  'requireActivator(context.capabilities.canActivate)',
+  'requireExactBodyFields(body, [',
+  "'expectedConfigGlobalId'",
+  "'expectedRowVersion'",
+  "'expectedPolicyRevision'",
+  "'checkoutRateControl'",
+  "'reason'",
+  'updateShopifyCarrierServiceRateControlInPostgres({',
+  'expectedConfigGlobalId: configGlobalId(',
+  'expectedPolicyRevision: integer(',
+  'normalizeShopifyCheckoutRateControl(',
+  'rateControlIdempotencyKey(req)',
+  'return json({ ok: true, result })',
+], 'idempotent desired checkout-rate control action')
 
 const savePlanRatePolicy = actionBranch(
   'save-plan-rate-policy',
@@ -312,13 +290,17 @@ const savePlanRatePolicy = actionBranch(
 )
 requireAll(savePlanRatePolicy, [
   'requireActivator(context.capabilities.canActivate)',
-  "current.reference.activation.state !== 'shadow'",
   "Object.prototype.hasOwnProperty.call(\n          body,\n          'planRateOptimization',",
   'normalizeShopifyCheckoutPlanRatePolicy(',
   'updateShopifyCarrierServicePlanRatePolicyInPostgres({',
   'expectedRowVersion: current.config.rowVersion',
   'actorEmail: context.actor.email',
 ], 'registered-safe plan-rate policy action')
+assert.doesNotMatch(
+  savePlanRatePolicy,
+  /reference\.activation\.state\s*!==\s*'shadow'/u,
+  'local plan-rate configuration must not require Shadow',
+)
 
 const saveRateWarmPolicy = actionBranch(
   'save-rate-warm-policy',
@@ -326,13 +308,17 @@ const saveRateWarmPolicy = actionBranch(
 )
 requireAll(saveRateWarmPolicy, [
   'requireActivator(context.capabilities.canActivate)',
-  "current.reference.activation.state !== 'shadow'",
   "Object.prototype.hasOwnProperty.call(\n          body,\n          'checkoutRateWarm',",
   'normalizeShopifyCheckoutRateWarmPolicy(',
   'updateShopifyCarrierServiceRateWarmPolicyInPostgres({',
   'expectedRowVersion: current.config.rowVersion',
   'actorEmail: context.actor.email',
 ], 'registered-safe rate-warm policy action')
+assert.doesNotMatch(
+  saveRateWarmPolicy,
+  /reference\.activation\.state\s*!==\s*'shadow'/u,
+  'desired cache-preparation configuration must not require Shadow',
+)
 
 requireAll(checkoutRatingPersistence, [
   'updateShopifyCarrierServicePlanRatePolicyInPostgres(',
@@ -375,15 +361,15 @@ for (const forbiddenMutation of [
 
 requireAll(checkoutRatingPersistence, [
   'updateShopifyCarrierServiceRateWarmPolicyInPostgres(',
-  "'SHOPIFY_CHECKOUT_RATE_WARM_POLICY_SHADOW_REQUIRED'",
-  "current.activation_state !== 'shadow'",
-  "current.account_environment !== 'sandbox'",
+  "current.account_status !== 'active'",
+  "current.verification_status !== 'verified'",
+  'readShopifyCheckoutRateControl(current.policy_snapshot, {',
   'checkoutRateWarm: input.checkoutRateWarm',
   'policy_revision = policy_revision + 1',
   'policy_hash = $3',
   'row_version = row_version + 1',
   'providerRegistrationRetained: true',
-], 'disabled rate-warm policy optimistic persistence')
+], 'profile-independent desired rate-warm policy persistence')
 
 requireAll(setupPanel, [
   'planRateOptimization: PlanRateOptimization',
@@ -403,26 +389,35 @@ requireAll(setupRoute, [
   'checkoutRateWarm: readShopifyCheckoutRateWarmPolicy(',
   'rateWarmReadiness: {',
   'deliveryCustomizationDurable: false',
-  'activationAllowed: shadowSandboxRateWarmReady',
+  'activationAllowed: checkoutRateWarmEffective',
   'readShopifyCustomerRatePolicySummaryFromPostgres({',
-  'customerPolicySummary.shadowAllowedCount < 1',
-  'at least one unexpired allow policy in Checkout audience',
+  'customerPolicySummary.checkoutEligibleCount < 1',
+  'at least one eligible local customer policy in Checkout audience',
   'customerPolicySummary.earliestShadowExpiresAt',
-  'Bounded Shadow cache preparation is available only for the isolated allowlisted test-variant proof',
+  'Bounded saved-address cache preparation is available without a customer allow policy.',
+  'Bounded cache preparation is available only for an allowed customer',
   'Shopify does not guarantee Customer GID in CarrierService callbacks',
   'successful-rate cache is customer-neutral',
   'not deterministic customer enforcement',
-  'hasValidShopifyShadowVariantAllowlist()',
-  'shadowCheckoutIsolationBlockers.join',
+  "shadowCheckoutAudienceMode === 'restricted_customers'",
+  'checkoutRateWarmBlockers.join',
 ], 'public rate-warm policy and truthful readiness')
+assert.equal(
+  setupRoute.includes('hasValidShopifyShadowVariantAllowlist()'),
+  false,
+  'checkout setup must not claim an unimplemented variant allowlist',
+)
 
 requireAll(setupRoute, [
   'checkoutAudience: {',
-  "'shadow_binary_ready'",
+  "'shadow_off'",
+  "'shadow_all_eligible_ready'",
+  "'shadow_restricted_ready'",
   "'shadow_customer_required'",
-  "'active_default_ready_provider_overrides_blocked'",
+  'mode: shadowCheckoutAudienceMode',
   'shadowAllowedCustomerCount: customerPolicySummary.shadowAllowedCount',
-  "shadowBinaryTestReady: reference.activation.state === 'shadow'",
+  'eligibleCustomerCount: customerPolicySummary.checkoutEligibleCount',
+  'shadowBinaryTestReady: checkoutAccountReady',
   'providerEnforcementAvailable:',
   'limited-visibility public app or a custom app on Shopify Plus',
 ], 'checkout-audience readiness projection')
@@ -434,12 +429,9 @@ requireAll(setupPanel, [
   'Processes every distinct complete U.S. saved destination in the',
   'background to prime Shopify&apos;s checkout-rate cache.',
   'browser emits aggregate counts only.',
-  'This is only a bounded, isolated allowlisted test-variant proof.',
-  'Shopify does not',
-  'guarantee Customer GID in a CarrierService callback',
-  'successful-rate cache is customer-neutral.',
-  'deterministic customer enforcement. An unidentified or expired',
-  'Shadow callback fails closed.',
+  'All-eligible cache preparation skips the customer allow-policy lookup.',
+  'Checkout rates are Off. Cache preparation is disabled and does not request a Shopify Admin token',
+  'Restricted cache preparation requires a signed-in customer with an unexpired allow policy',
   'Enable saved-address rate cache preparation',
   'Storefront mode (v1)',
   'Shopify hosted AJAX',
@@ -455,16 +447,44 @@ requireAll(setupPanel, [
 ], 'checkout rate-warm policy UI round trip')
 requireAll(setupPanel, [
   "key: 'audience'",
-  'Select the Shadow checkout audience',
-  'Unexpired Shadow allow customers',
-  'Only binary allow or hide is testable in Shadow.',
-  'Include-only and exclude selections remain saved intent',
+  'Choose checkout audience and rate source',
+  'Set the account-level desired audience and explicit TEST or LIVE carrier lane.',
+  'Desired audience',
+  'Desired source',
+  'Off — return no ClawPilot rates',
+  'Restricted customers — require an exact local policy',
+  'All eligible checkouts',
+  'Save desired checkout controls',
+  'Eligible restricted customers',
+  'Reason for this change',
+  'Required and retained with the immutable control revision.',
+  'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED',
   'limited-visibility public app or a custom app on Shopify Plus',
   'Refresh checkout-audience status',
   "key: 'rate-warm'",
   "key: 'evidence'",
   'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
 ], 'ordered checkout-audience prerequisite')
+requireAll(setupPanel, [
+  'Current operating profile',
+  'const callbackServingReady = Boolean(',
+  'Off · authenticated empty-rate response',
+  'Store sync is independently controlled here. Pausing stops',
+  'new provider catalog, order,',
+  'existing mirrored data',
+  'Desired Restricted · LIVE blocked pending verified provider enforcement',
+  'Desired TEST source · production store effective empty',
+  'Disabled or Frozen makes new authenticated callbacks empty',
+  'response for up to 15 minutes',
+  'Advanced safety · ${operatingActivation}',
+  'Store sync',
+  'Checkout rates',
+  'Order execution',
+  'sandbox store',
+  'production store',
+  'Rating only; checkout rating never buys postage or creates a',
+  'Training and live store writeback are separate order paths.',
+], 'derived operating-profile summary')
 requireOrder(
   setupPanel,
   "key: 'audience'",
@@ -524,22 +544,27 @@ const simulation = actionBranch(
 )
 requireAll(simulation, [
   'await refreshShopifyIdentity()',
-  "current.reference.activation.state !== 'shadow'",
+  "current.reference.activation.state === 'missing'",
   'current.reference.activation.revision === null',
   "current.config.registrationState === 'registered'",
   "? 'delete'",
   ": 'create'",
   "operation === 'create'",
-  "current.account.environment !== 'sandbox'",
-  "'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED'",
   "mode: 'shadow'",
   'executeShopifyCarrierServiceRegistration({',
   'activationRevision: current.reference.activation.revision',
   'idempotencyKey: shadowSimulationIdempotencyKey({',
   'finalizeShopifyCarrierServiceRegistrationInPostgres({',
   "registrationState: 'shadow_simulated'",
-  'const exactConfig = publicCarrierServiceConfig(finalized)',
+  'const exactConfig = publicCarrierServiceConfig(',
+  'finalized,',
+  'current.reference.activation.state,',
 ], 'simulate-registration action')
+assert.doesNotMatch(
+  simulation,
+  /SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED/u,
+  'zero-write production registration simulation must remain available',
+)
 requireOrder(
   simulation,
   'await refreshShopifyIdentity()',
@@ -572,7 +597,7 @@ requireAll(nameSimulation, [
   'await refreshShopifyIdentity()',
   '!current.nameAlignment',
   "current.config.registrationState !== 'registered'",
-  "current.reference.activation.state !== 'shadow'",
+  'current.reference.activation.revision === null',
   "'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_STALE'",
   "operation: 'update'",
   'storeEntityName: current.namePreference.effectiveName',
@@ -607,8 +632,8 @@ requireAll(alignName, [
   "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED'",
   '!current.nameAlignment?.simulation',
   "current.config.registrationState !== 'registered'",
-  "current.reference.activation.state !== 'shadow'",
-  "'SHOPIFY_CARRIER_SERVICE_NAME_SHADOW_EVIDENCE_REQUIRED'",
+  'checkoutCarrierServiceProviderWriteAuthority(',
+  "'SHOPIFY_CARRIER_SERVICE_NAME_SIMULATION_EVIDENCE_REQUIRED'",
   'body.confirmProductionProviderWrite !== true',
   "'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CONFIRMATION_REQUIRED'",
   'executeResourceScopedCarrierServiceMutation({',
@@ -630,16 +655,19 @@ requireAll(providerMutation, [
   'body.confirmProviderWrite !== true',
   "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_CONFIRMATION_REQUIRED'",
   "action === 'register' ? 'create' : 'delete'",
-  "current.reference.activation.state !== 'shadow'",
-  'current.reference.activation.revision === null',
-  "'SHOPIFY_CARRIER_SERVICE_RESOURCE_AUTHORIZATION_REQUIRES_SHADOW'",
+  'checkoutCarrierServiceProviderWriteAuthority(',
   '!current.shadowSimulation',
   'current.shadowSimulation.configRowVersion',
-  "'SHOPIFY_CARRIER_SERVICE_SHADOW_EVIDENCE_REQUIRED'",
+  "'SHOPIFY_CARRIER_SERVICE_SIMULATION_EVIDENCE_REQUIRED'",
   'body.confirmProductionProviderWrite !== true',
   'executeResourceScopedCarrierServiceMutation({',
   'confirmationRequestId(',
 ], 'revision-fenced register and unregister actions')
+requireAll(setupRoute, [
+  "!['shadow', 'read_only', 'active'].includes(input.state)",
+  "'SHOPIFY_CARRIER_SERVICE_PROVIDER_WRITE_SAFETY_BLOCKED'",
+  'CarrierService provider changes are blocked while Operations is Disabled or Frozen',
+], 'resource-scoped provider-write safety helper')
 requireOrder(
   providerMutation,
   'await refreshShopifyIdentity()',
@@ -758,9 +786,6 @@ const activeExecutor = setupRoute.slice(
   activeExecutorEnd,
 )
 requireAll(activeExecutor, [
-  "input.operation === 'create'",
-  "input.accountEnvironment !== 'sandbox'",
-  "'SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED'",
   'shopifyCarrierServiceRegistrationRequestHash(mutation)',
   'currentRequestHash !== input.simulation.requestHash',
   "'SHOPIFY_CARRIER_SERVICE_ACTIVE_REQUEST_STALE'",
@@ -776,6 +801,11 @@ requireAll(activeExecutor, [
   'evidenceGlobalId: outcomeGlobalId',
   'finalizeShopifyCarrierServiceConfigMutationInPostgres({',
 ], 'exact resource-scoped mutation executor')
+assert.doesNotMatch(
+  activeExecutor,
+  /SHOPIFY_CARRIER_SERVICE_PRODUCTION_CREATE_BLOCKED/u,
+  'confirmed production CarrierService creation must not retain the old hard block',
+)
 const updateFinalization = activeExecutor.slice(
   activeExecutor.indexOf("if (input.operation === 'update')"),
   activeExecutor.indexOf(
@@ -822,12 +852,16 @@ for (const [before, after] of [
   )
 }
 requireAll(setupPanel, [
-  'Simulate registration in Shadow',
-  'Simulate exact removal in Shadow',
-  'zero credential decryption, zero Shopify network calls, and zero provider writes',
+  'Simulate registration',
+  'Simulate exact removal',
+  'read-only provider check',
+  'may decrypt the saved Shopify credential and make a Shopify read request',
+  'zero Shopify mutations and zero provider writes',
+  'available in every Advanced safety mode',
   'Authorize exact resource registration',
   'Authorize exact resource removal',
-  'single-use Shopify provider mutation',
+  'one short-lived, single-use Shopify mutation',
+  'Read only, Shadow, and Active may apply it; Disabled and Frozen block the provider write.',
   'confirmWrite',
   'confirmRemove',
   "run(\n                  'register'",
@@ -835,7 +869,7 @@ requireAll(setupPanel, [
   'confirmProviderWrite: true',
   'confirmProductionProviderWrite:',
   'globalThis.crypto.randomUUID()',
-], 'Shadow plus resource-scoped provider mutation workflow')
+], 'all-mode simulation plus resource-scoped provider mutation workflow')
 requireAll(setupPanel, [
   'registeredServiceName: string | null',
   'appliedName: string | null',
@@ -870,7 +904,7 @@ requireOrder(
 requireOrder(
   setupPanel,
   "key: 'carrier-service-name'",
-  "key: 'shadow'",
+  "key: 'simulation'",
   'naming preference before provider simulation',
 )
 const nameAlignmentCompletionStart = setupPanel.indexOf(
@@ -1104,12 +1138,115 @@ requireAll(setupPanel, [
   'Run zero-write simulation',
   'Authorize and register once',
   'Authorize and remove once',
-  'Shadow records immutable terminal evidence',
-  'zero Shopify network calls',
+  'read-only provider check',
+  'zero Shopify mutations and zero provider writes',
+  'available in every Advanced safety mode',
+  'Read only, Shadow, and Active may apply it; Disabled and Frozen block the provider write.',
   'Do not retry.',
   'Open Packaging Materials',
   'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy',
 ], 'customer-facing setup panel')
+requireAll(setupPanel, [
+  "key: 'cart-rate-callback'",
+  "label: 'Shopify cart-rate callback'",
+  "label: 'Exact POST callback URL'",
+  'copyable: true',
+  "label: 'Shopify registration'",
+  "value: 'write_shipping'",
+  'This is not an event webhook',
+  'no manual webhook topic subscriptions belong on this URL',
+  'Do not add it as an orders, products, inventory, or app event webhook.',
+  'Checkout rate sources',
+  "(['sandbox', 'production'] as const).map((environment) => {",
+  'TEST accounts',
+  'LIVE accounts',
+  'Save checkout rate sources',
+  'carriers: selectedCarrierBindings',
+], 'paired TEST and LIVE multi-account callback setup UI')
+requireAll(commercePanel, [
+  'Shopify event webhook setup',
+  'It is separate from the',
+  'CarrierService POST callback used for live cart and',
+  'Signed Shopify event webhook URL',
+  'Do not use this URL for Shopify CarrierService cart rates.',
+], 'event webhook and cart-rate callback distinction')
+
+requireAll(checkoutRatingPersistence, [
+  'MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  'carrierEnvironmentCounts.sandbox',
+  'carrierEnvironmentCounts.production',
+  'Checkout carrier accounts must be unique',
+  'current.carriers.length < 1',
+  '> MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS',
+  ').size !== current.carriers.length',
+], 'paired TEST and LIVE multi-account application persistence fence')
+requireAll(callbackExecution, [
+  'account.carriers.length < 1',
+  'MAX_CONFIGURED_CHECKOUT_CARRIER_ACCOUNTS',
+  'checkoutRuntimeCarrierBindings(account)',
+  'carrierAccountGlobalIds.size === account.carriers.length',
+  'runtimeCarrierCount <= CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
+  'Checkout carrier configuration is not rate-ready',
+], 'paired TEST and LIVE multi-account callback execution fence')
+requireAll(operationsPersistence, [
+  'carrierRows.rows.length < 1',
+  'carrierRows.rows.length > CHECKOUT_RATE_MAX_CARRIER_ACCOUNTS',
+  "row.carrier_provider !== 'ups_rest'",
+  "row.carrier_provider !== 'fedex_rest'",
+  ').size !== carrierRows.rows.length',
+  'unique configured UPS or FedEx sandbox accounts',
+], 'bounded multi-account downstream Shadow execution fence')
+requireAll(configuredCarriersMigration, [
+  'CREATE OR REPLACE FUNCTION',
+  'operations_shopify_carrier_service_config_environment_is_ready(',
+  'operations_shopify_carrier_service_config_is_ready(',
+  "carrier_integration.provider IN ('ups_rest', 'fedex_rest')",
+  ') BETWEEN 1 AND 8',
+  'one through eight selected unique verified direct UPS/FedEx accounts',
+], 'paired TEST and LIVE multi-account canonical database readiness')
+requireAll(simulationRuntimeReadinessMigration, [
+  'public.validate_operations_shopify_carrier_service_config_ready()',
+  "NEW.registration_state = 'shadow_simulated'",
+  'public.operations_shopify_carrier_service_rating_environment_is_ready(',
+  "NEW.policy_snapshot #>> '{checkoutRateControl,rateSource}'",
+  "NEW.registration_state = 'registered'",
+  'public.operations_shopify_carrier_service_config_is_ready(',
+  'AND NOT exact_finalization_link_exists',
+  'AND NOT exact_name_finalization_exists',
+], 'simulation-specific saved rating environment readiness')
+const simulationReadinessStart = simulationRuntimeReadinessMigration.indexOf(
+  "NEW.registration_state = 'shadow_simulated'",
+)
+const registeredReadinessStart = simulationRuntimeReadinessMigration.indexOf(
+  "NEW.registration_state = 'registered'",
+  simulationReadinessStart + 1,
+)
+assert.ok(
+  simulationReadinessStart >= 0
+    && registeredReadinessStart > simulationReadinessStart,
+  'simulation readiness must remain separate from registered provider readiness',
+)
+assert.doesNotMatch(
+  simulationRuntimeReadinessMigration,
+  /NEW\.registration_state IN \('shadow_simulated', 'registered'\)/u,
+  'simulation and registered state must not share the legacy activation-coupled predicate',
+)
+assert.doesNotMatch(
+  configuredCarriersMigration,
+  /selected\.carrier_provider = '(?:ups_rest|fedex_rest)'/u,
+  'canonical readiness must not require both provider names',
+)
+requireAll(healthRoute, [
+  'shopify_carrier_configured_carriers_applied',
+  '0285_shopify_carrier_service_configured_carriers.sql',
+  "'operations_shopify_carrier_service_config_is_ready(uuid,uuid)'",
+  '0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+  '8b6de19ad2fa428edd087100e1cb73c851ba59a7fdff248ce71eedd9d3b3e3bb',
+], 'configured-carrier migration health gate')
+requireAll(predeployVerification, [
+  'db/migrations/0285_shopify_carrier_service_configured_carriers.sql',
+  'db/migrations/0317_operations_shopify_carrier_service_simulation_runtime_readiness.sql',
+], 'configured-carrier predeploy path gate')
 assert.equal(
   /[A-Z0-9._%+-]+@(?:episcs\.com|gmail\.com)/iu.test(setupPanel),
   false,
@@ -1145,8 +1282,9 @@ assert.ok(
   'callback URL must be authorization-gated before it enters setup state',
 )
 requireAll(setupPanel, [
-  'facts: setup?.callbackUrl ? [{',
-  "label: 'Callback URL'",
+  "key: 'cart-rate-callback'",
+  "label: 'Exact POST callback URL'",
+  'value: setup.callbackUrl',
   'setup && !setup.canActivate',
   'Owner or authorized administrator permission is required to view the',
   'callback URL or change registration state.',

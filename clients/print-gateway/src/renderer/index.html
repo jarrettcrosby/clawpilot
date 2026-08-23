@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ClawPilot Print Agent</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">ClawPilot Operations</p>
+        <h1>Print Agent</h1>
+        <p class="lede">Web-managed delivery to Zebra printers on this local network.</p>
+      </div>
+      <div id="gateway-health" class="health" aria-live="polite">Starting…</div>
+    </header>
+
+    <main>
+      <section id="pairing-context" class="context hidden" aria-live="polite"></section>
+      <section id="install-location-warning" class="context warning hidden" aria-live="polite"></section>
+      <section id="legacy-agent-warning" class="context warning hidden" aria-live="polite"></section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="step">Add a workspace instance</p>
+            <h2>Pair this computer to ClawPilot</h2>
+          </div>
+          <p class="privacy">The Zebra IP and port stay on this computer.</p>
+        </div>
+
+        <form id="pair-form" autocomplete="off">
+          <div class="form-grid">
+            <label class="wide">
+              <span>Trusted ClawPilot deployment</span>
+              <select id="base-url" name="baseUrl" required>
+                <option value="">Select Production or Development</option>
+                <option value="https://aiapp.eigenracing.com">Production — aiapp.eigenracing.com</option>
+                <option value="https://dev.aiapp.eigenracing.com">Development — dev.aiapp.eigenracing.com</option>
+              </select>
+            </label>
+            <label>
+              <span>Local nickname (optional)</span>
+              <input id="instance-name" name="instanceName" maxlength="80" placeholder="Packing station Mac">
+            </label>
+            <label>
+              <span>Short-lived pairing code</span>
+              <input id="pairing-code" name="pairingCode" type="password" required placeholder="cppair.v1.…" spellcheck="false" autocomplete="new-password">
+            </label>
+            <label>
+              <span>Zebra private LAN IPv4 address</span>
+              <input id="printer-host" name="printerHost" required placeholder="192.168.1.42" spellcheck="false" inputmode="decimal">
+            </label>
+            <label>
+              <span>Raw TCP port</span>
+              <input id="printer-port" name="printerPort" type="number" min="1" max="65535" value="9100" required>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="probe-button" class="secondary" type="button">Test connection — no print</button>
+            <button id="pair-button" class="primary" type="submit">Pair and start gateway</button>
+          </div>
+          <p class="fine-print">The connection test opens and closes TCP 9100 without sending label bytes or claiming a job. Pairing redeems the code only after that test passes. The pairing code is sent only to the trusted deployment selected above.</p>
+          <p class="fine-print">One physical Zebra may serve multiple organizations. Add and pair one workspace instance per organization using the same printer IP and port; raw delivery is serialized while each credential, claim ledger, and acknowledgement stays isolated.</p>
+          <p id="form-result" class="result" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="step">Background delivery</p>
+            <h2>Paired instances</h2>
+          </div>
+          <label class="toggle">
+            <input id="auto-start" type="checkbox">
+            <span>Start gateway when I sign in</span>
+          </label>
+        </div>
+        <p id="auto-start-status" class="fine-print" aria-live="polite"></p>
+        <div id="instances" class="instances">
+          <p class="empty">No workspaces are paired on this computer.</p>
+        </div>
+        <p class="fine-print">This computer must stay powered on and the user must remain signed in for background printing. Closing this window leaves the tray agent running.</p>
+      </section>
+
+      <section class="panel diagnostics-panel">
+        <div>
+          <p class="step">Support</p>
+          <h2>Status and diagnostics</h2>
+          <p>Exports contain local worker status only. Pairing codes, runtime credentials, printer IPs, and endpoint fingerprints are excluded.</p>
+        </div>
+        <button id="export-diagnostics" class="secondary" type="button">Export redacted diagnostics</button>
+      </section>
+    </main>
+
+    <dialog id="edit-endpoint-dialog">
+      <form id="edit-endpoint-form" autocomplete="off">
+        <p class="step">Local connection</p>
+        <h2>Edit printer connection</h2>
+        <p id="edit-instance-name" class="dialog-copy"></p>
+        <label>
+          <span>Zebra private LAN IPv4 address</span>
+          <input id="edit-printer-host" name="printerHost" required spellcheck="false" inputmode="decimal">
+        </label>
+        <label>
+          <span>Raw TCP port</span>
+          <input id="edit-printer-port" name="printerPort" type="number" min="1" max="65535" required>
+        </label>
+        <p class="fine-print">Save first performs a no-print TCP reachability test. The existing workspace credential and delivery ledger are retained.</p>
+        <p id="edit-result" class="result" aria-live="polite"></p>
+        <div class="actions">
+          <button id="cancel-edit-endpoint" class="secondary" type="button">Cancel</button>
+          <button id="save-edit-endpoint" class="primary" type="submit">Test and save</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

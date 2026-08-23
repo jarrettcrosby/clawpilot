@@ -12,10 +12,9 @@ import {
   type PrintAgentCapabilities,
 } from '@/lib/operations/printing'
 import {
-  enrollOperationsPrintAgentInPostgres,
+  createOperationsPrintAgentPairingGrantInPostgres,
   readOperationsPrintAgentWorkspaceFromPostgres,
   revokeOperationsPrintAgentInPostgres,
-  rotateOperationsPrintAgentCredentialInPostgres,
   upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres,
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
@@ -29,7 +28,7 @@ const MAX_REQUEST_BYTES = 8 * 1024
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const AGENT_GLOBAL_ID = /^gpt(?:[0-9]{7}|[0-9a-v]{12})$/
 const ACTION_FIELDS: Record<string, Set<string>> = {
-  'enroll-agent': new Set([
+  'create-pairing-grant': new Set([
     'action',
     'warehouseId',
     'name',
@@ -38,7 +37,6 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
     'supportedDocumentTypes',
   ]),
   'upgrade-bundled-capabilities': new Set(['action', 'printAgentGlobalId']),
-  'rotate-credential': new Set(['action', 'printAgentGlobalId']),
   'revoke-agent': new Set(['action', 'printAgentGlobalId']),
 }
 
@@ -243,28 +241,19 @@ export async function POST(req: NextRequest) {
     }
     const command = await body(req)
     const organizationId = activeOperationsOrganizationId(actor)
-    if (command.action === 'enroll-agent') {
+    if (command.action === 'create-pairing-grant') {
       const warehouseId = text(command.value.warehouseId, 'Warehouse', 40)
       if (!UUID.test(warehouseId)) {
         fail('OPERATIONS_PRINT_AGENT_REQUEST_INVALID', 'Warehouse is invalid')
       }
       const capabilities = enrollmentCapabilities(command.value)
-      const result = await enrollOperationsPrintAgentInPostgres({
+      const result = await createOperationsPrintAgentPairingGrantInPostgres({
         organizationId,
         warehouseId,
         name: text(command.value.name, 'Print agent name', 120),
         actorEmail: actor.email,
         idempotencyKey: idempotencyKey(req),
         ...capabilities,
-      })
-      return json({ ok: true, ...result })
-    }
-    if (command.action === 'rotate-credential') {
-      const result = await rotateOperationsPrintAgentCredentialInPostgres({
-        organizationId,
-        printAgentGlobalId: agentGlobalId(command.value.printAgentGlobalId),
-        actorEmail: actor.email,
-        idempotencyKey: idempotencyKey(req),
       })
       return json({ ok: true, ...result })
     }

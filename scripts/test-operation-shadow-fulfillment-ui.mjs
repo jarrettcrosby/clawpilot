@@ -99,11 +99,13 @@ for (const fragment of [
   'No shipment, tracking number, carrier',
   'label, postage purchase, commerce write, or final packing slip exists.',
   "activationState === 'shadow' || order.fulfillmentPreparation",
-  "activationState !== 'active'",
-  'Carrier label create and void actions require Operations Active mode.',
-  'data-testid="carrier-label-active-mode-required"',
+  'Connect and verify a sandbox ${selectedRate.carrier} account first.',
   "!activeLabel && (",
-  "!activeExecutionRequiredReason ? (",
+  'const createBlockedReason = !canExecute',
+  'const authorizedPackageCreateBlockedReason = !canExecute',
+  'const voidBlockedReason = !canExecute',
+  'You do not have permission to purchase carrier labels.',
+  'You do not have permission to void carrier labels.',
   'sandboxCommerceE2eAuthorization',
   "action: 'authorize-sandbox-commerce-e2e'",
   'confirmationStatement: SANDBOX_COMMERCE_E2E_CONFIRMATION',
@@ -116,17 +118,16 @@ for (const fragment of [
   "gridTemplateColumns: { xs: 'minmax(0, 1fr)'",
   "overflowWrap: 'anywhere'",
   "overflowX: 'hidden'",
-  "description: 'Stops Operations; only health and migration checks remain.'",
-  "description: 'Validates workflows and stores read evidence with no provider writes.'",
-  "description: 'Allows viewing, health checks, reconciliation, and evidence export only.'",
-  "description: 'Allows approved commands and provider actions. Select Shadow first.'",
-  "description: 'Keeps evidence viewable while stopping new consequential work.'",
+  "description: 'Emergency override for automatic commerce mirroring and activation-gated connected-order execution. Existing evidence remains viewable.'",
+  "description: 'Legacy execution-safety profile. Explicit Store sync choices remain independent.'",
+  "description: 'Allows viewing, health checks, reconciliation, evidence export, and explicitly confirmed zero-provider-write corrections; Store sync remains independently controlled.'",
+  "description: 'Allows approved legacy execution commands. Store sync is controlled separately after an explicit choice.'",
   "anchorOrigin: { vertical: 'bottom', horizontal: 'right' }",
   "transformOrigin: { vertical: 'top', horizontal: 'right' }",
   "variant: 'menu'",
   "maxHeight: 'min(360px, calc(100dvh - 24px))'",
   "overscrollBehavior: 'contain'",
-  "'aria-label': 'Operations activation statuses'",
+  "'aria-label': 'Advanced Operations safety statuses'",
   'renderValue: (selected) => ACTIVATION_OPTIONS.find(',
 ]) {
   assert.ok(uiSource.includes(fragment), `Shadow evidence UI missing ${fragment}`)
@@ -138,30 +139,36 @@ assert.equal(
   'the compact activation control must not repeat a universal tooltip explanation',
 )
 
-const activeModeReason = uiSource.indexOf(
-  "const activeExecutionRequiredReason = activationState !== 'active'",
+assert.equal(
+  uiSource.includes('activeExecutionRequiredReason'),
+  false,
+  'sandbox label actions must not depend on hidden global activation state',
+)
+assert.equal(
+  uiSource.includes('carrier-label-active-mode-required'),
+  false,
+  'the UI must not present global Active mode as a sandbox label prerequisite',
 )
 const createGate = uiSource.indexOf(
-  'const createBlockedReason = activeExecutionRequiredReason',
-  activeModeReason,
+  'const createBlockedReason = !canExecute',
+)
+const authorizedCreateGate = uiSource.indexOf(
+  'const authorizedPackageCreateBlockedReason = !canExecute',
+  createGate,
 )
 const voidGate = uiSource.indexOf(
-  'const voidBlockedReason = activeExecutionRequiredReason',
-  activeModeReason,
+  'const voidBlockedReason = !canExecute',
+  authorizedCreateGate,
 )
 assert.ok(
-  activeModeReason >= 0
-    && createGate > activeModeReason
-    && voidGate > createGate,
-  'create and void label gates must both prioritize exact Active mode',
+  createGate >= 0
+    && authorizedCreateGate > createGate
+    && voidGate > authorizedCreateGate,
+  'create and void label gates must prioritize exact execution permission and evidence',
 )
 
 const shippingExecution = uiSource.indexOf(
   '<DetailSection title="Shipping execution">',
-)
-const activeModeAlert = uiSource.indexOf(
-  'data-testid="carrier-label-active-mode-required"',
-  shippingExecution,
 )
 const voidButton = uiSource.indexOf('onClick={onVoidSandboxLabel}', shippingExecution)
 const authorizedCreateButton = uiSource.indexOf(
@@ -174,11 +181,10 @@ const createButton = uiSource.indexOf(
 )
 assert.ok(
   shippingExecution >= 0
-    && activeModeAlert > shippingExecution
-    && authorizedCreateButton > activeModeAlert
+    && authorizedCreateButton > shippingExecution
     && voidButton > authorizedCreateButton
     && createButton > voidButton,
-  'the visible Active-mode explanation must precede authorized and legacy label actions',
+  'authorized and legacy sandbox label actions must remain in Shipping execution',
 )
 
 const shadowEvidenceCondition =

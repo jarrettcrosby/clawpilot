@@ -1,0 +1,274 @@
+name: Promote Verified macOS Print Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact package version already signed and notarized
+        required: true
+        type: string
+      source_commit:
+        description: Exact commit from which the staged DMG was built
+        required: true
+        type: string
+      staging_tag:
+        description: Draft GitHub release tag containing only the staged DMG
+        required: true
+        type: string
+      expected_sha256:
+        description: Independently recorded SHA-256 of the staged DMG
+        required: true
+        type: string
+      confirmation:
+        description: Type VERIFY_AND_PUBLISH after approving this exact artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: print-gateway-customer-release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: inputs.confirmation == 'VERIFY_AND_PUBLISH'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      staging_tag: ${{ steps.release.outputs.staging_tag }}
+      expected_sha256: ${{ steps.release.outputs.expected_sha256 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          REQUESTED_STAGING_TAG: ${{ inputs.staging_tag }}
+          REQUESTED_SHA256: ${{ inputs.expected_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Verified artifact promotion may run only from refs/heads/main" >&2
+            exit 1
+          fi
+          package_version="$(node -p "require('./clients/print-gateway/package.json').version")"
+          if [ "$package_version" != "$REQUESTED_VERSION" ] \
+            || ! [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Requested version does not match the exact release package version" >&2
+            exit 1
+          fi
+          if ! [[ "$REQUESTED_SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] \
+            || ! [[ "$REQUESTED_SHA256" =~ ^[a-f0-9]{64}$ ]] \
+            || ! [[ "$REQUESTED_STAGING_TAG" =~ ^print-gateway-staging-v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{8}$ ]]; then
+            echo "Staged artifact provenance inputs are malformed" >&2
+            exit 1
+          fi
+          git cat-file -e "${REQUESTED_SOURCE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$REQUESTED_SOURCE_COMMIT" "$GITHUB_SHA"
+          release_matches="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -s --arg tag "$REQUESTED_STAGING_TAG" \
+                '[.[][] | select(.tag_name == $tag)]'
+          )"
+          if [ "$(jq 'length' <<<"$release_matches")" -ne 1 ]; then
+            echo "Expected exactly one draft staging release with the requested tag" >&2
+            exit 1
+          fi
+          release_json="$(jq -c '.[0]' <<<"$release_matches")"
+          if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ]; then
+            echo "The staging release must remain draft-only" >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.assets | length' <<<"$release_json")" -ne 1 ] \
+            || [ "$(jq -r '.assets[0].name' <<<"$release_json")" != "ClawPilot-Print-Agent-${package_version}-mac-universal.dmg" ]; then
+            echo "The draft staging release must contain exactly the expected DMG" >&2
+            exit 1
+          fi
+          staging_target="$(jq -r '.target_commitish' <<<"$release_json")"
+          if [ "$staging_target" != "$REQUESTED_SOURCE_COMMIT" ]; then
+            echo "The draft staging release does not target the declared source commit" >&2
+            exit 1
+          fi
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$REQUESTED_SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=$REQUESTED_STAGING_TAG" >> "$GITHUB_OUTPUT"
+          echo "expected_sha256=$REQUESTED_SHA256" >> "$GITHUB_OUTPUT"
+
+  verify_macos:
+    needs: preflight
+    runs-on: macos-14
+    timeout-minutes: 30
+    environment: print-gateway-customer-release
+    env:
+      MACOS_DEVELOPER_ID_APPLICATION: 'Developer ID Application: Jarrett Crosby (CN2T77JHQQ)'
+      APPLE_TEAM_ID: CN2T77JHQQ
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: clients/print-gateway/package-lock.json
+      - run: npm --prefix clients/print-gateway ci
+      - name: Download the exact draft-staged DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          STAGING_TAG: ${{ needs.preflight.outputs.staging_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf clients/print-gateway/dist
+          mkdir -p clients/print-gateway/dist
+          filename="ClawPilot-Print-Agent-${RELEASE_VERSION}-mac-universal.dmg"
+          gh release download "$STAGING_TAG" \
+            --pattern "$filename" \
+            --dir clients/print-gateway/dist
+          test -f "clients/print-gateway/dist/$filename"
+          test "$(find clients/print-gateway/dist -type f | wc -l | tr -d ' ')" = "1"
+      - name: Verify digest, source ancestry, signature, notarization, stapling, and payload
+        env:
+          CLAWPILOT_RELEASE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+          EXPECTED_SHA256: ${{ needs.preflight.outputs.expected_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${CLAWPILOT_RELEASE_SOURCE_COMMIT}^{commit}"
+          git merge-base --is-ancestor "$CLAWPILOT_RELEASE_SOURCE_COMMIT" "$GITHUB_SHA"
+          dmg="$(find clients/print-gateway/dist -maxdepth 1 -type f -name '*.dmg')"
+          test "$(shasum -a 256 "$dmg" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          (
+            cd clients/print-gateway
+            node scripts/verify-release-artifacts.mjs --platform macos --directory dist
+          )
+          test "$(awk '{print $1}' "${dmg}.sha256")" = "$EXPECTED_SHA256"
+      - name: Execute the exact mounted, signed, stapled DMG payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(find clients/print-gateway/dist -maxdepth 1 -type f -name '*.dmg')"
+          mount_point="$(mktemp -d "$RUNNER_TEMP/clawpilot-dmg-smoke.XXXXXX")"
+          cleanup_mount() {
+            hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+            rmdir "$mount_point" 2>/dev/null || true
+          }
+          trap cleanup_mount EXIT
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg"
+          CLAWPILOT_PACKAGED_PAYLOAD_DIRECTORY="$mount_point" \
+            npm --prefix clients/print-gateway run smoke:packaged
+      - name: Stage re-verified macOS release files
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/macos-release"
+          cp clients/print-gateway/dist/*.dmg "$RUNNER_TEMP/macos-release/"
+          cp clients/print-gateway/dist/*.artifact.json "$RUNNER_TEMP/macos-release/"
+          cp clients/print-gateway/dist/*.sha256 "$RUNNER_TEMP/macos-release/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: promoted-verified-macos-print-gateway
+          path: ${{ runner.temp }}/macos-release
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - preflight
+      - verify_macos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: print-gateway-customer-release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: promoted-verified-macos-print-gateway
+          path: ${{ runner.temp }}/verified/macos
+      - name: Build the atomic macOS release index
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          find "$RUNNER_TEMP/verified" -type f -exec cp '{}' "$RUNNER_TEMP/release/" \;
+          node clients/print-gateway/scripts/create-release-index.mjs \
+            --input "$RUNNER_TEMP/verified" \
+            --output "$RUNNER_TEMP/release"
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - name: Sign and verify manifests and checksums with GitHub OIDC
+        shell: bash
+        run: |
+          identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          for file in "$RUNNER_TEMP"/release/*.artifact.json "$RUNNER_TEMP"/release/*.sha256 "$RUNNER_TEMP"/release/*-release.json "$RUNNER_TEMP"/release/SHA256SUMS.txt; do
+            cosign sign-blob --yes --bundle "${file}.sigstore.json" "$file"
+            cosign verify-blob \
+              --bundle "${file}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$file"
+          done
+      - name: Require the exact immutable macOS customer asset contract
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: node clients/print-gateway/scripts/assert-release-asset-set.mjs --directory "$RUNNER_TEMP/release" --version "$RELEASE_VERSION"
+      - name: Publish only the complete re-verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="print-gateway-v${RELEASE_VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to replace immutable artifacts" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; refusing to attach customer assets to pre-existing provenance" >&2
+            exit 1
+          fi
+          gh release create "$tag" \
+            --draft \
+            --target "$SOURCE_COMMIT" \
+            --title "ClawPilot Print Agent $RELEASE_VERSION" \
+            --notes "Signed, notarized, and stapled macOS universal DMG built from commit $SOURCE_COMMIT, then re-verified from protected main. Verify SHA256SUMS.txt and its Sigstore bundle before installation."
+          draft_target="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -ser --arg tag "$tag" '
+                [.[][] | select(.tag_name == $tag and .draft == true)]
+                | if length == 1 then .[0].target_commitish
+                  else error("expected exactly one draft release") end
+              '
+          )"
+          if [ "$draft_target" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release resolved to unexpected target $draft_target" >&2
+            exit 1
+          fi
+          gh release upload "$tag" "$RUNNER_TEMP"/release/*
+          prepublish_target="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -ser --arg tag "$tag" '
+                [.[][] | select(.tag_name == $tag and .draft == true)]
+                | if length == 1 then .[0].target_commitish
+                  else error("expected exactly one draft release") end
+              '
+          )"
+          if [ "$prepublish_target" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release target drifted during asset upload to $prepublish_target; leaving release unpublished" >&2
+            exit 1
+          fi
+          gh release edit "$tag" --draft=false
+          published_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
+          if [ "$published_commit" != "$SOURCE_COMMIT" ]; then
+            echo "Published release tag drifted to $published_commit" >&2
+            exit 1
+          fi

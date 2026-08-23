@@ -36,14 +36,15 @@ import EditRounded from '@mui/icons-material/EditRounded'
 import FileUploadRounded from '@mui/icons-material/FileUploadRounded'
 import Inventory2Rounded from '@mui/icons-material/Inventory2Rounded'
 import SearchRounded from '@mui/icons-material/SearchRounded'
-import type {
-  PackagingMaterial,
-  PackagingMaterialStock,
-  PackagingMaterialsWorkspace,
-  PackagingDimensionBasis,
-  PackagingDimensionEvidenceType,
-  PackagingMaterialSource,
-  PackagingMaterialType,
+import {
+  packagingDimensionEvidenceReferenceRequired,
+  type PackagingMaterial,
+  type PackagingMaterialStock,
+  type PackagingMaterialsWorkspace,
+  type PackagingDimensionBasis,
+  type PackagingDimensionEvidenceType,
+  type PackagingMaterialSource,
+  type PackagingMaterialType,
 } from '@/lib/operations/packagingMaterials'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import {
@@ -222,6 +223,26 @@ const controlSx = {
 
 function display(value: string) {
   return value.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+const readinessGapLabels: Record<
+  PackagingMaterial['readiness']['missing'][number],
+  string
+> = {
+  dimensions: 'usable inner dimensions',
+  dimension_basis: 'inner-dimension confirmation',
+  dimension_evidence: 'dimension evidence',
+  tare_weight: 'tare weight',
+  max_weight: 'maximum weight',
+  unit_cost: 'unit cost',
+  warehouse_stock: 'warehouse stock',
+  available_stock: 'available stock',
+}
+
+function readinessGapSummary(material: PackagingMaterial) {
+  return material.readiness.missing
+    .map((gap) => readinessGapLabels[gap])
+    .join(', ')
 }
 
 function money(minor: number | null, currency = 'USD') {
@@ -528,6 +549,7 @@ export default function PackagingMaterialsPanel() {
   const [importCsv, setImportCsv] = useState('')
   const [importAccountGlobalId, setImportAccountGlobalId] = useState('')
   const [importPreview, setImportPreview] = useState<Payload['preview']>(undefined)
+  const starterCommandKey = useRef<string | null>(null)
   const importCommandKey = useRef<string | null>(null)
   const previousMeasurementSystem = useRef(measurementSystem)
 
@@ -649,15 +671,18 @@ export default function PackagingMaterialsPanel() {
 
   const materialMeasurementErrors = useMemo(() => {
     const activationRequired = editingMaterial?.status === 'active'
+    const innerMeasurementsRequired = activationRequired
+      || materialDraft.dimensionEvidenceType === 'measured'
     const validate = (
       displayValue: string,
       canonicalValue: string,
       label: string,
+      required = activationRequired,
     ) => {
       const numeric = Number(displayValue)
       const canonical = Number(canonicalValue)
       if (!displayValue.trim()) {
-        return activationRequired ? `${label} is required for activation` : ''
+        return required ? `${label} is required` : ''
       }
       if (!Number.isFinite(numeric) || numeric <= 0) {
         return `${label} must be greater than zero`
@@ -688,16 +713,19 @@ export default function PackagingMaterialsPanel() {
         materialMeasurementDraft.innerLength,
         materialDraft.innerLengthMm,
         'Inner length',
+        innerMeasurementsRequired,
       ),
       innerWidth: validate(
         materialMeasurementDraft.innerWidth,
         materialDraft.innerWidthMm,
         'Inner width',
+        innerMeasurementsRequired,
       ),
       innerHeight: validate(
         materialMeasurementDraft.innerHeight,
         materialDraft.innerHeightMm,
         'Inner height',
+        innerMeasurementsRequired,
       ),
       ratedOuterLength: validateOptional(
         materialMeasurementDraft.ratedOuterLength,
@@ -765,11 +793,16 @@ export default function PackagingMaterialsPanel() {
       hasAllOuter
       && (
         !materialDraft.ratedOuterDimensionEvidenceType
-        || !materialDraft.ratedOuterDimensionEvidenceReference.trim()
+        || (
+          packagingDimensionEvidenceReferenceRequired(
+            materialDraft.ratedOuterDimensionEvidenceType,
+          )
+          && !materialDraft.ratedOuterDimensionEvidenceReference.trim()
+        )
       )
     ) {
       errors.ratedOuterLength =
-        'Select evidence and describe the rated outer measurements'
+        'Select evidence and retain its required reference'
     }
     return errors
   }, [editingMaterial?.status, materialDraft, materialMeasurementDraft])
@@ -783,12 +816,20 @@ export default function PackagingMaterialsPanel() {
     setMaterialSubmitted(true)
     if (!materialMeasurementsValid) return
     if (
-      ['customer_confirmed', 'measured'].includes(
-        materialDraft.dimensionEvidenceType,
+      (
+        ['customer_confirmed', 'provider'].includes(
+          materialDraft.dimensionEvidenceType,
+        )
+        || (
+          editingMaterial?.status === 'active'
+          && packagingDimensionEvidenceReferenceRequired(
+            materialDraft.dimensionEvidenceType,
+          )
+        )
       )
       && !materialDraft.dimensionEvidenceReference.trim()
     ) {
-      setError('Describe the customer confirmation or measurement evidence')
+      setError('Provide the retained evidence reference for these dimensions')
       return
     }
     setBusy(true)
@@ -877,6 +918,17 @@ export default function PackagingMaterialsPanel() {
       material.stock.find((stock) => stock.warehouseId === warehouseId),
     ))
     setStockOpen(true)
+  }
+
+  const openActivationSetup = (material: PackagingMaterial) => {
+    const stockOnly = material.readiness.missing.every(
+      (gap) => gap === 'warehouse_stock' || gap === 'available_stock',
+    )
+    if (stockOnly) {
+      openStock(material)
+      return
+    }
+    openEdit(material)
   }
 
   const changeStockWarehouse = (warehouseId: string) => {
@@ -990,15 +1042,20 @@ export default function PackagingMaterialsPanel() {
     setBusy(true)
     setError('')
     setNotice('')
+    const commandKey = starterCommandKey.current
+      ?? `packaging-materials:starter-assortment:${globalThis.crypto.randomUUID()}`
+    starterCommandKey.current = commandKey
+    let terminalResponse = false
     try {
       const response = await fetch('/api/operations/packaging-materials', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': 'packaging-materials:starter-assortment:v1',
+          'Idempotency-Key': commandKey,
         },
         body: JSON.stringify({ action: 'create-starter-assortment' }),
       })
+      terminalResponse = true
       const payload = await response.json() as Payload
       if (!response.ok || payload.result?.totalCount === undefined) {
         throw new Error(payload.error || 'Starter assortment could not be created')
@@ -1011,6 +1068,7 @@ export default function PackagingMaterialsPanel() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Starter assortment could not be created')
     } finally {
+      if (terminalResponse) starterCommandKey.current = null
       setBusy(false)
     }
   }
@@ -1482,21 +1540,24 @@ export default function PackagingMaterialsPanel() {
                   )
                 })}
 
-                {material.readiness.missing.length > 0 && (
-                  <Alert severity="warning" sx={{ mt: 1.5 }}>
-                    Fix before use:{' '}
-                    {material.readiness.missing.map((gap) => display(gap)).join(', ')}.
-                  </Alert>
-                )}
-
                 <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} sx={{ mt: 1.5 }}>
                   {material.status === 'draft' ? (
                     <Button
-                      variant="contained"
+                      variant={material.readiness.missing.length > 0
+                        ? 'outlined'
+                        : 'contained'}
                       disabled={!canManage || busy}
-                      onClick={() => void changeStatus(material, 'active')}
+                      onClick={() => {
+                        if (material.readiness.missing.length > 0) {
+                          openActivationSetup(material)
+                          return
+                        }
+                        void changeStatus(material, 'active')
+                      }}
                     >
-                      Activate material
+                      {material.readiness.missing.length > 0
+                        ? 'Finish setup'
+                        : 'Activate material'}
                     </Button>
                   ) : (
                     <Button
@@ -1518,11 +1579,13 @@ export default function PackagingMaterialsPanel() {
                     Remove
                   </Button>
                   <Typography variant="caption" color="text.secondary" sx={{ alignSelf: 'center' }}>
-                    {material.source === 'starter_assortment'
-                      ? 'Starter specification — verify against the selected supplier.'
-                      : material.source === 'customer_supplied'
-                        ? 'Customer-supplied draft — verify basis, capacity, cost, and stock.'
-                        : `${display(material.source)} specification.`}
+                    {material.status === 'draft' && material.readiness.missing.length > 0
+                      ? `Needed before activation: ${readinessGapSummary(material)}.`
+                      : material.source === 'starter_assortment'
+                        ? 'Starter specification — verify against the selected supplier.'
+                        : material.source === 'customer_supplied'
+                          ? 'Customer-supplied draft — verify basis, capacity, cost, and stock.'
+                          : `${display(material.source)} specification.`}
                   </Typography>
                 </Stack>
               </Box>
@@ -1682,10 +1745,19 @@ export default function PackagingMaterialsPanel() {
                     ...materialDraft,
                     dimensionEvidenceReference: event.target.value,
                   })}
-                  helperText="Required for customer-confirmed or measured facts"
-                  required={['customer_confirmed', 'measured'].includes(
-                    materialDraft.dimensionEvidenceType,
-                  )}
+                  helperText={materialDraft.dimensionEvidenceType === 'measured'
+                    ? 'Optional note; exact measurements retain the confirming actor and time automatically'
+                    : 'Required for provider and customer-confirmed evidence, and before activation for legacy evidence'}
+                  required={[
+                    'customer_confirmed',
+                    'provider',
+                  ].includes(materialDraft.dimensionEvidenceType)
+                    || (
+                      editingMaterial?.status === 'active'
+                      && packagingDimensionEvidenceReferenceRequired(
+                        materialDraft.dimensionEvidenceType,
+                      )
+                    )}
                 />
               </Box>
               <Box
@@ -1930,7 +2002,17 @@ export default function PackagingMaterialsPanel() {
                     ratedOuterDimensionEvidenceReference:
                       event.target.value,
                   })}
-                  helperText="For example: customer box specification dated 2026-07-29"
+                  helperText={
+                    materialDraft.ratedOuterDimensionEvidenceType === 'measured'
+                      ? 'Optional note; exact outer measurements retain the confirming actor and time automatically'
+                      : 'Required for provider, customer-confirmed, and legacy evidence'
+                  }
+                  required={Boolean(
+                    materialDraft.ratedOuterDimensionEvidenceType
+                    && packagingDimensionEvidenceReferenceRequired(
+                      materialDraft.ratedOuterDimensionEvidenceType,
+                    )
+                  )}
                 />
               </Box>
               {materialMeasurementsValid && (

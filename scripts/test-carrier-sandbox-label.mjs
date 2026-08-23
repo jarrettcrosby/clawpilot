@@ -105,9 +105,26 @@ function loadLabelModule() {
       if (specifier === '@/lib/integrations/carrierSandboxRate') {
         return {
           CARRIER_SANDBOX_RATE_FIXTURE: fixture,
-          carrierSandboxPartyFingerprint: (value) => (
-            createHash('sha256').update(JSON.stringify(value)).digest('hex')
-          ),
+          carrierSandboxPartyFingerprint: (value) => {
+            const allowed = new Set([
+              'name',
+              'line1',
+              'line2',
+              'city',
+              'region',
+              'postalCode',
+              'countryCode',
+            ])
+            const unsupported = Object.keys(value).find(
+              (field) => !allowed.has(field),
+            )
+            if (unsupported) {
+              throw new Error(
+                `Carrier sandbox destination field is not supported: ${unsupported}`,
+              )
+            }
+            return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+          },
           normalizeCarrierSandboxParty: (value) => ({
             name: String(value.name).trim(),
             line1: String(value.line1).trim(),
@@ -261,6 +278,41 @@ assert.ok(
   'Redacted label evidence must omit the destination street',
 )
 
+const commercialShipmentEvidence = carrierSandboxLabelRequestEvidence(
+  'ups_rest',
+  '03',
+  'sender',
+  undefined,
+  normalizedShipmentFixture,
+)
+const residentialShipmentEvidence = carrierSandboxLabelRequestEvidence(
+  'ups_rest',
+  '03',
+  'sender',
+  undefined,
+  {
+    ...normalizedShipmentFixture,
+    destination: {
+      ...normalizedShipmentFixture.destination,
+      residential: true,
+    },
+  },
+)
+assert.match(
+  commercialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  /^[a-f0-9]{64}$/,
+)
+assert.equal(
+  residentialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  commercialShipmentEvidence.redactedRequest.shipment.destinationFingerprint,
+  'Residential classification must not enter the address-only fingerprint',
+)
+assert.notEqual(
+  residentialShipmentEvidence.requestHash,
+  commercialShipmentEvidence.requestHash,
+  'Residential classification must remain sealed into full request evidence',
+)
+
 const upsZpl = '^XA^FO50,50^FDSANDBOX^FS^XZ'
 const upsCreateCalls = []
 const upsCreateResult = await createCarrierSandboxLabel(runtime('ups_rest', '03', {
@@ -341,6 +393,45 @@ assert.equal(
 )
 assert.equal(upsCreateResult.evidence.providerReference, 'ups-create-transaction')
 assertEvidenceRedacted(upsCreateResult)
+
+// Exact hermetic regression for the Test Pro incident: UPS service 02 uses the
+// same Ship v2409 request and response parser as the already-proven service 03
+// path. No provider I/O is allowed in this test.
+const upsSecondDayCalls = []
+const upsSecondDayResult = await createCarrierSandboxLabel(
+  runtime('ups_rest', '02', { shipmentFixture: normalizedShipmentFixture }),
+  {
+    fetchImpl: async (url, init) => {
+      upsSecondDayCalls.push({ url: String(url), init })
+      return jsonResponse({
+        ShipmentResponse: {
+          ShipmentResults: {
+            ShipmentIdentificationNumber: '1ZSECONDSHIPMENT',
+            PackageResults: [{
+              TrackingNumber: '1ZSECONDTRACKING',
+              ShippingLabel: {
+                ImageFormat: { Code: 'ZPL' },
+                GraphicImage: Buffer.from(upsZpl, 'utf8').toString('base64'),
+              },
+            }],
+          },
+        },
+      }, { headers: { 'transaction-id': 'ups-second-day-transaction' } })
+    },
+  },
+)
+assert.equal(upsSecondDayCalls.length, 1)
+assert.equal(
+  JSON.parse(upsSecondDayCalls[0].init.body)
+    .ShipmentRequest.Shipment.Service.Code,
+  '02',
+)
+assert.equal(upsSecondDayResult.trackingNumber, '1ZSECONDTRACKING')
+assert.equal(
+  upsSecondDayResult.evidence.providerReference,
+  'ups-second-day-transaction',
+)
+assertEvidenceRedacted(upsSecondDayResult)
 
 await assert.rejects(
   createCarrierSandboxLabel(runtime('ups_rest', '03', {
@@ -862,6 +953,82 @@ await assert.rejects(
     status: 504,
     uncertain: true,
   }),
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('ups_rest', '02'), {
+    fetchImpl: async () => {
+      const error = new TypeError(
+        `Socket closed after sending ${secrets.accountNumber}`,
+      )
+      error.cause = { code: 'UND_ERR_SOCKET' }
+      throw error
+    },
+  }),
+  (error) => {
+    assertError(error, {
+      code: 'CARRIER_PROVIDER_RESULT_UNKNOWN',
+      status: 503,
+      uncertain: true,
+    })
+    assert.deepEqual(plain({
+      operationStage: error.redactedResponse.operationStage,
+      providerRequestDispatchAttempted:
+        error.redactedResponse.providerRequestDispatchAttempted,
+      providerResponseReceived: error.redactedResponse.providerResponseReceived,
+      exceptionName: error.redactedResponse.exceptionName,
+      exceptionCode: error.redactedResponse.exceptionCode,
+    }), {
+      operationStage: 'shipment_request_dispatch',
+      providerRequestDispatchAttempted: true,
+      providerResponseReceived: false,
+      exceptionName: 'TypeError',
+      exceptionCode: 'UND_ERR_SOCKET',
+    })
+    return true
+  },
+  'A Ship dispatch transport failure must retain only bounded safe evidence',
+)
+
+await assert.rejects(
+  createCarrierSandboxLabel(runtime('ups_rest', '02'), {
+    fetchImpl: async () => {
+      const response = jsonResponse({ ignored: true })
+      response.text = async () => {
+        const error = new TypeError(
+          `Body stream failed after ${secrets.clientSecret}`,
+        )
+        error.cause = { code: 'UND_ERR_SOCKET' }
+        throw error
+      }
+      return response
+    },
+  }),
+  (error) => {
+    assertError(error, {
+      code: 'CARRIER_PROVIDER_RESULT_UNKNOWN',
+      status: 503,
+      uncertain: true,
+    })
+    assert.deepEqual(plain({
+      operationStage: error.redactedResponse.operationStage,
+      providerRequestDispatchAttempted:
+        error.redactedResponse.providerRequestDispatchAttempted,
+      providerResponseReceived: error.redactedResponse.providerResponseReceived,
+      httpStatus: error.redactedResponse.httpStatus,
+      exceptionName: error.redactedResponse.exceptionName,
+      exceptionCode: error.redactedResponse.exceptionCode,
+    }), {
+      operationStage: 'provider_response_read',
+      providerRequestDispatchAttempted: true,
+      providerResponseReceived: true,
+      httpStatus: 200,
+      exceptionName: 'TypeError',
+      exceptionCode: 'UND_ERR_SOCKET',
+    })
+    return true
+  },
+  'A response-body stream failure must distinguish receipt from parsing',
 )
 
 await assert.rejects(

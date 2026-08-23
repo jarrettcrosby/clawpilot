@@ -1,5 +1,9 @@
 import crypto from 'crypto'
-import type { RepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
+import type {
+  GitHubRepositoryInstallationConfiguration,
+  RepositoryRunnerConfiguration,
+} from '@/lib/agents/repositoryRunnerConfig'
+import { validateGitHubContentsReadTokenResponse } from '@/lib/operations/printAgentRelease.mjs'
 
 const GITHUB_API = 'https://api.github.com'
 const API_VERSION = '2022-11-28'
@@ -7,13 +11,15 @@ const API_VERSION = '2022-11-28'
 type GitHubTokenResponse = {
   token?: unknown
   expires_at?: unknown
+  permissions?: unknown
+  repositories?: unknown
 }
 
 function encode(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString('base64url')
 }
 
-function appJwt(configuration: RepositoryRunnerConfiguration): string {
+function appJwt(configuration: Pick<GitHubRepositoryInstallationConfiguration, 'appId' | 'privateKey'>): string {
   const now = Math.floor(Date.now() / 1000)
   const unsigned = `${encode({ alg: 'RS256', typ: 'JWT' })}.${encode({
     iat: now - 60,
@@ -30,6 +36,8 @@ async function githubRequest(input: {
   method?: 'GET' | 'POST'
   body?: Record<string, unknown>
   timeoutMs?: number
+  accept?: string
+  redirect?: RequestRedirect
 }): Promise<Response> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), input.timeoutMs || 20_000)
@@ -38,13 +46,14 @@ async function githubRequest(input: {
       method: input.method || 'GET',
       headers: {
         Authorization: `Bearer ${input.token}`,
-        Accept: 'application/vnd.github+json',
+        Accept: input.accept || 'application/vnd.github+json',
         'X-GitHub-Api-Version': API_VERSION,
         'User-Agent': 'clawpilot-repository-runner',
         ...(input.body ? { 'Content-Type': 'application/json' } : {}),
       },
       body: input.body ? JSON.stringify(input.body) : undefined,
       signal: controller.signal,
+      redirect: input.redirect || 'manual',
     })
   } catch (error) {
     if (controller.signal.aborted) throw new Error('GitHub request timed out')
@@ -52,6 +61,40 @@ async function githubRequest(input: {
   } finally {
     clearTimeout(timeout)
   }
+}
+
+export async function createGitHubContentsReadInstallationToken(
+  configuration: GitHubRepositoryInstallationConfiguration,
+): Promise<{ token: string; expiresAt: string }> {
+  if (!configuration.ready) throw new Error(configuration.reason)
+  const response = await githubRequest({
+    path: `/app/installations/${configuration.installationId}/access_tokens`,
+    token: appJwt(configuration),
+    method: 'POST',
+    body: {
+      repository_ids: [Number(configuration.repositoryId)],
+      permissions: { contents: 'read', metadata: 'read' },
+    },
+  })
+  if (!response.ok) throw await publicError(response, 'Unable to authorize print-agent release downloads')
+  const payload = await response.json() as GitHubTokenResponse
+  return validateGitHubContentsReadTokenResponse(payload, configuration)
+}
+
+export async function githubContentsReadRequest(input: {
+  path: string
+  token: string
+  accept?: string
+  redirect?: RequestRedirect
+  timeoutMs?: number
+}): Promise<Response> {
+  return githubRequest({
+    path: input.path,
+    token: input.token,
+    accept: input.accept,
+    redirect: input.redirect,
+    timeoutMs: input.timeoutMs,
+  })
 }
 
 async function publicError(response: Response, fallback: string): Promise<Error> {

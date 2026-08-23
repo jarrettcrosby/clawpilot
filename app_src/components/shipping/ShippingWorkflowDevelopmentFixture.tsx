@@ -6,10 +6,152 @@ import Button from '@mui/material/Button'
 import OneOffShipmentDialog, {
   type OneOffShipmentDevelopmentFixture,
 } from '@/components/operations/OneOffShipmentDialog'
+import type {
+  OneOffCarrierProvider,
+  OneOffShipmentCreateResult,
+  OneOffShipmentQuote,
+  OneOffShipmentQuoteInput,
+} from '@/lib/operations/oneOffShipments'
 
 const warehouseGlobalId = 'gwh9004001'
 const inventoryPoolGlobalId = 'gip9004001'
 const fixtureUpdatedAt = '2026-08-12T16:00:00.000Z'
+const fixtureQuoteGlobalId = 'goq9004001'
+
+const fixtureCarrierFacts: Record<OneOffCarrierProvider, {
+  providerLabel: 'UPS' | 'FedEx' | 'Worldwide Express'
+  serviceCode: string
+  serviceName: string
+  providerPackageCode: string
+  amountMinor: number
+  transitDays: number
+}> = {
+  ups_rest: {
+    providerLabel: 'UPS',
+    serviceCode: '03',
+    serviceName: 'UPS Ground',
+    providerPackageCode: '02',
+    amountMinor: 1295,
+    transitDays: 3,
+  },
+  fedex_rest: {
+    providerLabel: 'FedEx',
+    serviceCode: 'FEDEX_GROUND',
+    serviceName: 'FedEx Ground',
+    providerPackageCode: 'YOUR_PACKAGING',
+    amountMinor: 1385,
+    transitDays: 4,
+  },
+  wwex_speedship: {
+    providerLabel: 'Worldwide Express',
+    serviceCode: 'GROUND',
+    serviceName: 'Worldwide Express Ground',
+    providerPackageCode: 'CUSTOM',
+    amountMinor: 1495,
+    transitDays: 5,
+  },
+}
+
+function localFixtureQuote(input: OneOffShipmentQuoteInput): OneOffShipmentQuote {
+  const environment = input.executionMode === 'live' ? 'production' : 'sandbox'
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString()
+  const requiredCarrierSelections = input.selectedCarriers.map((selection, index) => ({
+    ...selection,
+    selectionKey: `local-fixture-selection-${index + 1}`,
+    credentialVersion: 1,
+    packageCodes: input.packages.map((shipmentPackage) => ({
+      packageKey: shipmentPackage.packageKey,
+      catalogEntryId: shipmentPackage.packageProfile.catalogEntryId,
+      catalogVersion: shipmentPackage.packageProfile.contractVersion,
+      providerPackageCode: fixtureCarrierFacts[selection.provider].providerPackageCode,
+    })),
+  }))
+  return {
+    globalId: fixtureQuoteGlobalId,
+    referenceNumber: input.referenceNumber,
+    status: 'succeeded',
+    environment,
+    executionMode: input.executionMode,
+    requiredCarrierProviders: [...new Set(input.selectedCarriers.map(({ provider }) => provider))],
+    requiredCarrierSelections,
+    carrierSelectionResults: Object.fromEntries(requiredCarrierSelections.map((selection) => [
+      selection.selectionKey,
+      { status: 'succeeded', eligibleOfferCount: 1, errorCode: null },
+    ])),
+    expiresAt,
+    offers: requiredCarrierSelections.map((selection, index) => {
+      const facts = fixtureCarrierFacts[selection.provider]
+      return {
+        globalId: `gof900400${index + 1}`,
+        provider: selection.provider,
+        providerLabel: facts.providerLabel,
+        executionCapability: selection.provider === 'wwex_speedship'
+          ? 'rate_only'
+          : 'direct_purchase_later',
+        environment,
+        serviceCode: facts.serviceCode,
+        serviceName: facts.serviceName,
+        amountMinor: facts.amountMinor,
+        currency: input.currency,
+        transitDays: facts.transitDays,
+        estimatedDeliveryAt: null,
+        rateEvidenceGlobalId: `gre900400${index + 1}`,
+        integrationAccountGlobalId: selection.integrationAccountGlobalId,
+        carrierAccountGlobalId: selection.carrierAccountGlobalId,
+        credentialVersion: selection.credentialVersion,
+      }
+    }),
+    effects: {
+      carrierRateReads: 0,
+      inventoryWrites: 0,
+      shipmentWrites: 0,
+      labelCalls: 0,
+      postagePurchases: 0,
+    },
+  }
+}
+
+function localFixtureCreateResult(selectedOfferGlobalId: string): OneOffShipmentCreateResult {
+  return {
+    orderGlobalId: 'gor9004001',
+    orderStatus: 'planned',
+    rowVersion: 1,
+    fulfillmentPlanGlobalId: 'gfp9004001',
+    quoteGlobalId: fixtureQuoteGlobalId,
+    selectedOfferGlobalId,
+    createdProductGlobalIds: [],
+    adHocItemGlobalIds: ['gai9004001'],
+    receiptGlobalId: null,
+    packageCount: 1,
+    replayed: false,
+  }
+}
+
+function localFixtureJson(payload: object, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+function localFixtureRequestUrl(input: RequestInfo | URL) {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.toString()
+  return input.url
+}
+
+function localFixtureRequestMethod(input: RequestInfo | URL, init?: RequestInit) {
+  return (init?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase()
+}
+
+function localFixtureRequestBody(init?: RequestInit) {
+  if (typeof init?.body !== 'string') return null
+  try {
+    return JSON.parse(init.body) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
 
 const developmentFixture: OneOffShipmentDevelopmentFixture = {
   initialStep: 1,
@@ -187,6 +329,37 @@ export default function ShippingWorkflowDevelopmentFixture() {
   useEffect(() => {
     const originalFetch = window.fetch
     window.fetch = async (...argumentsList) => {
+      const [input, init] = argumentsList
+      const url = new URL(localFixtureRequestUrl(input), window.location.origin)
+      const body = localFixtureRequestBody(init)
+      if (
+        url.origin === window.location.origin
+        && url.pathname === '/api/operations/one-off-shipments'
+        && !url.search
+        && localFixtureRequestMethod(input, init) === 'POST'
+        && body?.action === 'quote'
+        && body.quote
+        && typeof body.quote === 'object'
+      ) {
+        return localFixtureJson({
+          ok: true,
+          quote: localFixtureQuote(body.quote as OneOffShipmentQuoteInput),
+        })
+      }
+      if (
+        url.origin === window.location.origin
+        && url.pathname === '/api/operations/one-off-shipments'
+        && !url.search
+        && localFixtureRequestMethod(input, init) === 'POST'
+        && body?.action === 'create-and-plan'
+        && body.quoteGlobalId === fixtureQuoteGlobalId
+        && typeof body.selectedOfferGlobalId === 'string'
+      ) {
+        return localFixtureJson({
+          ok: true,
+          result: localFixtureCreateResult(body.selectedOfferGlobalId),
+        })
+      }
       setUnexpectedFetchCount((count) => count + 1)
       throw new Error(`Local Shipping fixture blocked an unexpected request to ${String(argumentsList[0])}`)
     }
@@ -222,7 +395,6 @@ export default function ShippingWorkflowDevelopmentFixture() {
         open={open}
         onClose={() => setOpen(false)}
         onCreated={() => undefined}
-        canActivate={false}
         developmentFixture={developmentFixture}
       />
     </>

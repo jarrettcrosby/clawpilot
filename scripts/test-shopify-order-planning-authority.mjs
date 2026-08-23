@@ -109,7 +109,14 @@ const openOrder = () => ({
     status: 'OPEN',
     requestStatus: 'UNSUBMITTED',
     updatedAt: '2026-08-10T17:59:00.000Z',
-    assignedLocation: { location: { id: locationId } },
+    assignedLocation: {
+      location: {
+        id: locationId,
+        name: 'Shop location',
+        isFulfillmentService: false,
+        fulfillmentService: null,
+      },
+    },
     lineItems: page([{
       id: fulfillmentOrderLineItemId,
       lineItem: { id: lineId },
@@ -119,6 +126,7 @@ const openOrder = () => ({
 })
 
 let providerOrder = openOrder()
+let providerAssignmentOrder = null
 const providerCalls = []
 const module = loadTypeScriptModule(
   'app_src/lib/integrations/shopifyOrderPlanningAuthority.ts',
@@ -140,14 +148,20 @@ const module = loadTypeScriptModule(
         accessToken: 'token',
         grantedScopes: [
           'read_orders',
+          'read_locations',
           'read_merchant_managed_fulfillment_orders',
+          'read_third_party_fulfillment_orders',
+          'read_assigned_fulfillment_orders',
         ],
       }),
       probeShopifyConnection: async () => ({
         shopId: 'gid://shopify/Shop/505',
         grantedScopes: [
           'read_orders',
+          'read_locations',
           'read_merchant_managed_fulfillment_orders',
+          'read_third_party_fulfillment_orders',
+          'read_assigned_fulfillment_orders',
         ],
       }),
       shopifyAdminGraphql: async (_credential, request) => {
@@ -158,6 +172,12 @@ const module = loadTypeScriptModule(
         ) {
           return { order: structuredClone(providerOrder) }
         }
+        if (
+          request.operationName
+            === 'ClawPilotShopifyOrderPlanningAssignment'
+        ) {
+          return { order: structuredClone(providerAssignmentOrder) }
+        }
         assert.fail(`Unexpected operation ${request.operationName}`)
       },
     },
@@ -166,6 +186,7 @@ const module = loadTypeScriptModule(
     },
     '@/lib/persistence/shopifyOrderPlanningAuthority': {
       ShopifyOrderPlanningAuthorityPersistenceError: class extends Error {},
+      readShopifyOrderPlanningAssignmentTargetFromPostgres: async () => null,
       readShopifyOrderPlanningAuthorityTargetFromPostgres: async () => target,
     },
   },
@@ -194,14 +215,20 @@ const dependencies = (overrides = {}) => ({
     accessToken: 'token',
     grantedScopes: [
       'read_orders',
+      'read_locations',
       'read_merchant_managed_fulfillment_orders',
+      'read_third_party_fulfillment_orders',
+      'read_assigned_fulfillment_orders',
     ],
   }),
   probeConnection: async () => ({
     shopId: 'gid://shopify/Shop/505',
     grantedScopes: [
       'read_orders',
+      'read_locations',
       'read_merchant_managed_fulfillment_orders',
+      'read_third_party_fulfillment_orders',
+      'read_assigned_fulfillment_orders',
     ],
   }),
   readOrder: module.readShopifyOrderPlanningAuthority,
@@ -232,7 +259,10 @@ assert.equal(
 assert.equal(providerCalls[0].operationName, 'ClawPilotShopifyOrderPlanningAuthority')
 assert.match(providerCalls[0].query, /confirmed/)
 assert.match(providerCalls[0].query, /fulfillmentOrders\(first: 25\)/)
-assert.match(providerCalls[0].query, /assignedLocation \{ location \{ id \} \}/)
+assert.match(
+  providerCalls[0].query,
+  /assignedLocation[\s\S]+isFulfillmentService[\s\S]+fulfillmentService/,
+)
 assert.match(providerCalls[0].query, /updatedAt/)
 assert.match(
   providerCalls[0].query,
@@ -296,6 +326,24 @@ await assert.rejects(
 )
 
 providerOrder = openOrder()
+providerOrder.fulfillmentOrders.nodes[0].assignedLocation.location = {
+  id: locationId,
+  name: 'Snow City Warehouse',
+  isFulfillmentService: true,
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+}
+await assert.rejects(
+  () => module.inspectShopifyOrderPlanningAuthority(request, dependencies()),
+  (error) => (
+    error?.code === 'SHOPIFY_ORDER_PLANNING_PROVIDER_MANAGED'
+  ),
+)
+
+providerOrder = openOrder()
 providerOrder.fulfillmentOrders.nodes[0].requestStatus = 'SUBMITTED'
 await assert.rejects(
   () => module.inspectShopifyOrderPlanningAuthority(request, dependencies()),
@@ -353,6 +401,303 @@ await assert.rejects(
   (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_SCOPE_REQUIRED',
 )
 assert.equal(scopedReadCalled, false)
+
+const assignmentScopes = [
+  'read_orders',
+  'read_locations',
+  'read_merchant_managed_fulfillment_orders',
+  'read_third_party_fulfillment_orders',
+  'read_assigned_fulfillment_orders',
+]
+const assignmentTarget = {
+  organizationId,
+  accountGlobalId,
+  candidateGlobalId,
+  candidateRowVersion: 9,
+  externalOrderId: orderId,
+  mappings: [{
+    globalId: 'gilm1234567',
+    rowVersion: 2,
+    externalLocationId: locationId,
+    externalLocationName: 'Shop location',
+    warehouseGlobalId,
+    warehouseName: 'AG Alchemy HQ',
+    locationGlobalId: 'gwl1234567',
+    locationCode: 'RESERVE-01',
+  }],
+}
+const assignmentOrder = ({
+  assignedLocationId = locationId,
+  assignedLocationName = 'Shop location',
+  isFulfillmentService = false,
+  fulfillmentService = null,
+  secondLocation = null,
+} = {}) => ({
+  id: orderId,
+  fulfillmentOrders: page([
+    {
+      id: fulfillmentOrderId,
+      status: 'OPEN',
+      requestStatus: 'UNSUBMITTED',
+      assignedLocation: {
+        location: {
+          id: assignedLocationId,
+          name: assignedLocationName,
+          isFulfillmentService,
+          fulfillmentService,
+        },
+      },
+      lineItems: page([{ remainingQuantity: 1 }]),
+    },
+    ...(secondLocation ? [{
+      id: 'gid://shopify/FulfillmentOrder/304',
+      status: 'OPEN',
+      requestStatus: 'UNSUBMITTED',
+      assignedLocation: {
+        location: {
+          id: secondLocation.id,
+          name: secondLocation.name,
+          isFulfillmentService: false,
+          fulfillmentService: null,
+        },
+      },
+      lineItems: page([{ remainingQuantity: 1 }]),
+    }] : []),
+  ]),
+})
+const assignmentDependencies = (overrides = {}) => ({
+  readTarget: async () => structuredClone(assignmentTarget),
+  readRuntimeCredential: dependencies().readRuntimeCredential,
+  decryptCredential: dependencies().decryptCredential,
+  requestAccessToken: async () => ({
+    accessToken: 'token',
+    grantedScopes: assignmentScopes,
+  }),
+  probeConnection: async () => ({
+    shopId: 'gid://shopify/Shop/505',
+    grantedScopes: assignmentScopes,
+  }),
+  readAssignment: module.readShopifyOrderPlanningAssignment,
+  ...overrides,
+})
+providerAssignmentOrder = assignmentOrder()
+const assignment = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(assignment.status, 'ready')
+assert.equal(assignment.selectedWarehouse.globalId, warehouseGlobalId)
+assert.equal(assignment.selectedWarehouse.shopifyLocationName, 'Shop location')
+assert.equal(assignment.providerReads, 1)
+assert.equal(assignment.providerWrites, 0)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/999',
+  assignedLocationName: 'Snow City Warehouse',
+  isFulfillmentService: true,
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888?id=true',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+})
+const providerManaged = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(providerManaged.status, 'provider_managed')
+assert.equal(providerManaged.selectedWarehouse, null)
+assert.equal(
+  providerManaged.assignments[0].fulfillmentService.serviceName,
+  'Snow City App',
+)
+assert.equal(
+  providerManaged.assignments[0].fulfillmentService.id,
+  'gid://shopify/FulfillmentService/888?id=true',
+)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/999',
+  assignedLocationName: 'Snow City Warehouse',
+  isFulfillmentService: true,
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+})
+const providerManagedBaseId = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(providerManagedBaseId.status, 'provider_managed')
+assert.equal(
+  providerManagedBaseId.assignments[0].fulfillmentService.id,
+  'gid://shopify/FulfillmentService/888',
+)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/999',
+  assignedLocationName: 'Unreadable fulfillment-service location',
+  isFulfillmentService: true,
+  fulfillmentService: null,
+})
+const providerManagedWithoutDetails =
+  await module.inspectShopifyOrderPlanningAssignment(
+    {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      expectedCandidateRowVersion: 9,
+    },
+    assignmentDependencies(),
+  )
+assert.equal(providerManagedWithoutDetails.status, 'provider_managed')
+assert.equal(
+  providerManagedWithoutDetails.assignments[0].ownerType,
+  'fulfillment_service',
+)
+assert.equal(
+  providerManagedWithoutDetails.assignments[0].fulfillmentService,
+  null,
+)
+
+for (const invalidId of [
+  null,
+  'gid://shopify/FulfillmentService/888?id=false',
+  'gid://shopify/FulfillmentService/888?id=true&extra=1',
+]) {
+  providerAssignmentOrder = assignmentOrder({
+    assignedLocationId: 'gid://shopify/Location/999',
+    assignedLocationName: 'Snow City Warehouse',
+    isFulfillmentService: true,
+    fulfillmentService: {
+      id: invalidId,
+      serviceName: 'Snow City App',
+      type: 'THIRD_PARTY',
+    },
+  })
+  await assert.rejects(
+    () => module.inspectShopifyOrderPlanningAssignment(
+      {
+        organizationId,
+        accountGlobalId,
+        candidateGlobalId,
+        expectedCandidateRowVersion: 9,
+      },
+      assignmentDependencies(),
+    ),
+    (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+  )
+}
+
+providerAssignmentOrder = assignmentOrder({
+  fulfillmentService: {
+    id: 'gid://shopify/FulfillmentService/888?id=true',
+    serviceName: 'Snow City App',
+    type: 'THIRD_PARTY',
+  },
+})
+await assert.rejects(
+  () => module.inspectShopifyOrderPlanningAssignment(
+    {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      expectedCandidateRowVersion: 9,
+    },
+    assignmentDependencies(),
+  ),
+  (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+)
+
+providerAssignmentOrder = assignmentOrder({
+  secondLocation: {
+    id: 'gid://shopify/Location/203',
+    name: 'Second shop location',
+  },
+})
+const split = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(split.status, 'split')
+assert.equal(split.assignments.length, 2)
+
+providerAssignmentOrder = assignmentOrder({
+  assignedLocationId: 'gid://shopify/Location/204',
+  assignedLocationName: 'Unmapped merchant location',
+})
+const unmapped = await module.inspectShopifyOrderPlanningAssignment(
+  {
+    organizationId,
+    accountGlobalId,
+    candidateGlobalId,
+    expectedCandidateRowVersion: 9,
+  },
+  assignmentDependencies(),
+)
+assert.equal(unmapped.status, 'unmapped')
+assert.equal(unmapped.assignments[0].mapping, null)
+
+let assignmentProviderReadCalled = false
+await assert.rejects(
+  () => module.inspectShopifyOrderPlanningAssignment(
+    {
+      organizationId,
+      accountGlobalId,
+      candidateGlobalId,
+      expectedCandidateRowVersion: 9,
+    },
+    assignmentDependencies({
+      requestAccessToken: async () => ({
+        accessToken: 'token',
+        grantedScopes: ['read_orders', 'read_locations'],
+      }),
+      probeConnection: async () => ({
+        shopId: 'gid://shopify/Shop/505',
+        grantedScopes: ['read_orders', 'read_locations'],
+      }),
+      readAssignment: async () => {
+        assignmentProviderReadCalled = true
+        return { assignments: [], providerReads: 1 }
+      },
+    }),
+  ),
+  (error) => error?.code === 'SHOPIFY_ORDER_PLANNING_SCOPE_REQUIRED',
+)
+assert.equal(assignmentProviderReadCalled, false)
+
+const assignmentRoute = read(
+  'app_src/app/api/integrations/commerce/intake/planning-assignment/route.ts',
+)
+assert.match(assignmentRoute, /operationsCapabilities\(actor\)\.canManage/)
+assert.match(assignmentRoute, /inspectShopifyOrderPlanningAssignment/)
+assert.match(assignmentRoute, /Cache-Control': 'private, no-store'/)
+assert.match(
+  read('app_src/components/operations/OperationsSection.tsx'),
+  /Locked to Shopify’s current exact fulfillment assignment/,
+)
 
 const persistence = read(
   'app_src/lib/persistence/shopifyOrderPlanningAuthority.ts',

@@ -1,0 +1,137 @@
+{
+  "name": "@clawpilot/site-print-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Signed cross-platform local delivery plane for ClawPilot web-managed LAN printing.",
+  "author": "ClawPilot",
+  "main": "src/main.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "smoke:packaged": "node scripts/smoke-packaged-runtime.mjs",
+    "build:dir": "node scripts/build-platform-native.mjs && cross-env CLAWPILOT_ALLOW_UNSIGNED_LOCAL_BUILD=1 electron-builder --dir --publish never",
+    "build:mac": "node scripts/assert-release-environment.mjs macos && node scripts/build-macos-lock-helper.mjs && electron-builder --mac dmg --universal --publish never && node scripts/finalize-macos-release.mjs && node scripts/verify-release-artifacts.mjs --platform macos --directory dist",
+    "build:win": "node scripts/assert-release-environment.mjs windows && node scripts/build-windows-lock-helper.mjs && electron-builder --win nsis --x64 --publish never && node scripts/verify-release-artifacts.mjs --platform windows --directory dist",
+    "release:index": "node scripts/create-release-index.mjs",
+    "release:test-fixture": "node scripts/create-release-index-test-fixture.mjs"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.clawpilot.site-print-gateway",
+    "productName": "ClawPilot Print Agent",
+    "copyright": "Copyright ClawPilot",
+    "artifactName": "ClawPilot-Print-Agent-${version}-${os}-${arch}.${ext}",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "package.json",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "extraResources": [
+      {
+        "from": "../../scripts/run-local-print-agent.mjs",
+        "to": "runtime/run-local-print-agent.mjs"
+      },
+      {
+        "from": "../../scripts/lib/local-print-device.mjs",
+        "to": "runtime/lib/local-print-device.mjs"
+      },
+      {
+        "from": "../../scripts/lib/submit-raw-print.mjs",
+        "to": "runtime/lib/submit-raw-print.mjs"
+      },
+      {
+        "from": "../../scripts/lib/print-agent-pairing-credential.mjs",
+        "to": "runtime/lib/print-agent-pairing-credential.mjs"
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "protocols": [
+      {
+        "name": "ClawPilot Print Agent",
+        "schemes": [
+          "clawpilot-print-gateway"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "icon": "../apple/Assets/ClawPilotAssets.xcassets/AppIcon.appiconset/ClawPilot-AppIcon-1024.png",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "identity": "Developer ID Application",
+      "extendInfo": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        }
+      },
+      "extraResources": [
+        {
+          "from": "build/macos/clawpilot-print-lock",
+          "to": "runtime/lib/clawpilot-print-lock"
+        }
+      ],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ]
+    },
+    "afterSign": "scripts/after-sign-macos.cjs",
+    "afterPack": "scripts/after-pack.cjs",
+    "dmg": {
+      "sign": true,
+      "writeUpdateInfo": false
+    },
+    "win": {
+      "icon": "../apple/Assets/ClawPilotAssets.xcassets/AppIcon.appiconset/ClawPilot-AppIcon-1024.png",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "signAndEditExecutable": true,
+      "verifyUpdateCodeSignature": true,
+      "signExts": [
+        ".exe",
+        ".dll",
+        ".node"
+      ],
+      "extraResources": [
+        {
+          "from": "build/windows/clawpilot-print-lock.exe",
+          "to": "runtime/lib/clawpilot-print-lock.exe"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

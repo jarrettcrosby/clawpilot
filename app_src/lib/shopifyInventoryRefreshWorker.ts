@@ -3,6 +3,7 @@ import {
   claimShopifyInventoryRefreshJobsInPostgres,
   completeShopifyInventoryRefreshJobInPostgres,
   failShopifyInventoryRefreshJobInPostgres,
+  parkShopifyInventoryRefreshForStoreSyncPauseInPostgres,
   queueAutomaticShopifyInventoryRefreshesInPostgres,
   recordShopifyInventoryRefreshWorkerHeartbeatInPostgres,
   renewShopifyInventoryRefreshJobLeaseInPostgres,
@@ -10,6 +11,14 @@ import {
 
 function inventoryRefreshIdempotencyKey(jobId: string) {
   return `shopify-inventory-refresh:${jobId}`
+}
+
+function isStoreSyncReadPause(error: unknown) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code || '')
+    : ''
+  return code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED'
+    || code === 'COMMERCE_STORE_SYNC_PROVIDER_READ_LEASE_LOST'
 }
 
 export async function processShopifyInventoryRefreshOutbox(input: {
@@ -27,6 +36,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
   let retried = 0
   let dead = 0
   let cancelled = 0
+  let parked = 0
   for (let index = 0; index < requestedLimit; index += 1) {
     const [job] = await claimShopifyInventoryRefreshJobsInPostgres({
       limit: 1,
@@ -39,6 +49,11 @@ export async function processShopifyInventoryRefreshOutbox(input: {
       jobId: job.id,
       carrierServiceConfigId: job.carrierServiceConfigId,
       warehouseId: job.warehouseId,
+      locationMappingId: job.locationMappingId,
+      locationMappingRowVersion: job.locationMappingRowVersion,
+      providerLocationId: job.providerLocationId,
+      inventoryLocationId: job.inventoryLocationId,
+      inventoryPoolId: job.inventoryPoolId,
       credentialGeneration: job.credentialGeneration,
       activationRevision: job.activationRevision,
       configRowVersion: job.configRowVersion,
@@ -97,6 +112,13 @@ export async function processShopifyInventoryRefreshOutbox(input: {
         }
       } else cancelled += 1
     } catch (error) {
+      if (isStoreSyncReadPause(error)) {
+        const disposition =
+          await parkShopifyInventoryRefreshForStoreSyncPauseInPostgres({ job })
+        if (disposition.parked) parked += 1
+        else cancelled += 1
+        continue
+      }
       const failure = await failShopifyInventoryRefreshJobInPostgres({
         job,
         error,
@@ -114,6 +136,7 @@ export async function processShopifyInventoryRefreshOutbox(input: {
     retried,
     dead,
     cancelled,
+    parked,
     resource: 'inventory',
     readOnly: true,
     providerWrites: 0,

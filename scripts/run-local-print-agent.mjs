@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import {
+  opaqueLocalDeviceReference,
+  readOrCreateLocalDeviceKey,
+  runWithLocalPrinterKernelLock,
+  normalizedLocalPrinterEndpoint,
+} from './lib/local-print-device.mjs'
+import {
+  rawPrintFailureDisposition,
+  submitRaw as submitRawToPrinter,
+} from './lib/submit-raw-print.mjs'
 
 const args = new Set(process.argv.slice(2))
 const once = args.has('--once')
@@ -31,22 +41,39 @@ const legacyWorkerCapabilities = Object.freeze({
   documentTypes: ['shipping_label'],
 })
 let activeWorkerCapabilities = workerCapabilities
+let stopping = false
 const ledgerPath = expandHome(
   process.env.CLAWPILOT_PRINT_AGENT_LEDGER
     || '~/.clawpilot/print-agent-ledger.json',
 )
+const deviceKeyPath = expandHome(
+  process.env.CLAWPILOT_PRINT_AGENT_DEVICE_KEY
+    || path.join(path.dirname(ledgerPath), 'device-reference.key'),
+)
+const deviceLockDirectory = expandHome(
+  process.env.CLAWPILOT_PRINT_AGENT_DEVICE_LOCK_DIRECTORY
+    || '~/Library/Application Support/ClawPilot/print-agent/device-locks',
+)
+const MINIMUM_RAW_DELIVERY_LEASE_MS = 25_000
+const CLAIM_MONOTONIC_DEADLINE = Symbol('claimMonotonicDeadline')
+const REQUEST_ROUND_TRIP_MS = Symbol('requestRoundTripMs')
+let testMonotonicOffsetNs = 0n
 
 if (help) {
   process.stdout.write(`ClawPilot local print agent
 
 Required environment:
   CLAWPILOT_PRINT_AGENT_URL          ClawPilot deployment base URL
-  CLAWPILOT_PRINT_AGENT_CREDENTIAL   One-time enrolled cpprint credential
+  CLAWPILOT_PRINT_AGENT_CREDENTIAL   Runtime cpprint credential (valid until revoked)
   CLAWPILOT_PRINTER_HOST             Printer hostname or IP address
 
 Optional environment:
+  CLAWPILOT_PRINT_AGENT_CREDENTIAL_FD
+                                      Inherited descriptor containing the runtime credential
   CLAWPILOT_PRINTER_PORT             Raw printer port (default 9100)
   CLAWPILOT_PRINT_AGENT_LEDGER       Local duplicate fence ledger
+  CLAWPILOT_PRINT_AGENT_DEVICE_KEY   Local opaque device-reference key
+  CLAWPILOT_PRINT_AGENT_DEVICE_LOCK_DIRECTORY
   CLAWPILOT_PRINT_AGENT_POLL_MS      Poll interval (default 2000)
   CLAWPILOT_PRINT_AGENT_KEYCHAIN_SERVICE
   CLAWPILOT_PRINT_AGENT_KEYCHAIN_ACCOUNT
@@ -87,6 +114,16 @@ function endpointUrl() {
 function credential() {
   const direct = String(process.env.CLAWPILOT_PRINT_AGENT_CREDENTIAL || '').trim()
   if (direct) return direct
+  const descriptorValue = String(process.env.CLAWPILOT_PRINT_AGENT_CREDENTIAL_FD || '').trim()
+  const descriptor = Number(descriptorValue)
+  if (
+    descriptorValue
+    && Number.isSafeInteger(descriptor)
+    && (descriptor === 0 || (descriptor >= 3 && descriptor <= 255))
+  ) {
+    const piped = readFileSync(descriptor, { encoding: 'utf8' }).trim()
+    if (piped) return piped
+  }
   const service = String(
     process.env.CLAWPILOT_PRINT_AGENT_KEYCHAIN_SERVICE || '',
   ).trim()
@@ -105,6 +142,7 @@ function credential() {
 
 function assertConfiguration() {
   if (!printerHost) throw new Error('CLAWPILOT_PRINTER_HOST is required')
+  normalizedLocalPrinterEndpoint(printerHost, printerPort)
   const token = credential()
   if (!/^cpprint\.v1\.[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/i.test(token)) {
     throw new Error('The local print-agent credential has an invalid shape')
@@ -126,9 +164,17 @@ async function readLedger() {
     if (parsed?.version !== 1 || !parsed.claims || typeof parsed.claims !== 'object') {
       throw new Error('Local print ledger has an unsupported shape')
     }
+    if (!parsed.deliveries || typeof parsed.deliveries !== 'object') {
+      parsed.deliveries = {}
+    }
+    if (!parsed.pendingResults || typeof parsed.pendingResults !== 'object') {
+      parsed.pendingResults = {}
+    }
     return parsed
   } catch (error) {
-    if (error?.code === 'ENOENT') return { version: 1, claims: {} }
+    if (error?.code === 'ENOENT') {
+      return { version: 1, claims: {}, deliveries: {}, pendingResults: {} }
+    }
     throw error
   }
 }
@@ -136,15 +182,41 @@ async function readLedger() {
 async function writeLedger(ledger) {
   await fs.mkdir(path.dirname(ledgerPath), { recursive: true, mode: 0o700 })
   const temporary = `${ledgerPath}.${process.pid}.tmp`
-  await fs.writeFile(temporary, `${JSON.stringify(ledger, null, 2)}\n`, {
-    mode: 0o600,
-  })
-  await fs.rename(temporary, ledgerPath)
+  let handle
+  try {
+    handle = await fs.open(temporary, 'w', 0o600)
+    await handle.writeFile(`${JSON.stringify(ledger, null, 2)}\n`, { encoding: 'utf8' })
+    await handle.sync()
+    await handle.close()
+    handle = null
+    await fs.rename(temporary, ledgerPath)
+
+    // FlushFileBuffers on the renamed destination is the Windows durability
+    // barrier. POSIX additionally requires the parent-directory metadata sync.
+    handle = await fs.open(ledgerPath, 'r+')
+    await handle.sync()
+    await handle.close()
+    handle = null
+    if (process.platform !== 'win32') {
+      handle = await fs.open(path.dirname(ledgerPath), 'r')
+      await handle.sync()
+      await handle.close()
+      handle = null
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    await fs.unlink(temporary).catch((unlinkError) => {
+      if (unlinkError?.code !== 'ENOENT') throw unlinkError
+    })
+    throw error
+  }
 }
 
 async function agentRequest(config, action, payload, key) {
+  const requestStarted = process.hrtime.bigint()
   const response = await fetch(config.endpoint, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       authorization: `Bearer ${config.token}`,
       'content-type': 'application/json',
@@ -160,6 +232,10 @@ async function agentRequest(config, action, payload, key) {
     error.code = code
     throw error
   }
+  Object.defineProperty(result, REQUEST_ROUND_TRIP_MS, {
+    value: Number(process.hrtime.bigint() - requestStarted) / 1_000_000,
+    enumerable: false,
+  })
   return result
 }
 
@@ -178,6 +254,7 @@ function decodeAndVerify(job) {
   if (
     !job?.globalId
     || !job?.claimToken
+    || !document?.globalId
     || document?.format !== 'ZPL'
     || document?.encoding !== 'utf8'
     || typeof document?.inlinePayload !== 'string'
@@ -214,42 +291,197 @@ async function probePrinter(timeoutMs = 3_000) {
   })
 }
 
-async function submitRaw(payload, timeoutMs = 10_000) {
-  return new Promise((resolvePromise, reject) => {
-    const socket = net.createConnection({ host: printerHost, port: printerPort })
-    let acceptedBytes = 0
-    let settled = false
-    const finish = (error) => {
-      if (settled) return
-      settled = true
-      socket.destroy()
-      if (error) {
-        error.acceptedBytes = acceptedBytes
-        reject(error)
-      } else {
-        resolvePromise({ acceptedBytes })
-      }
-    }
-    socket.setTimeout(timeoutMs)
-    socket.once('connect', () => {
-      socket.write(payload, (error) => {
-        if (error) return finish(error)
-        acceptedBytes = payload.byteLength
-        socket.end()
-      })
-    })
-    socket.once('finish', () => finish())
-    socket.once('timeout', () => finish(new Error('Printer delivery timed out')))
-    socket.once('error', finish)
+async function submitRaw(payload, job, timeoutMs = 10_000) {
+  const execution = await runWithLocalPrinterKernelLock({
+    directory: deviceLockDirectory,
+    host: printerHost,
+    port: printerPort,
+    timeoutMs,
+    executeWhileLocked: () => submitRawToPrinter(
+      payload,
+      printerHost,
+      printerPort,
+      timeoutMs,
+      {
+        claimExpiresAt: claimExpiry(job),
+        claimMonotonicDeadlineNs: String(claimMonotonicDeadline(job)),
+        shouldStop: () => stopping,
+      },
+    ),
   })
+  if (execution.lockTimedOut) {
+    const error = new Error('The configured local printer is busy')
+    error.code = 'LOCAL_PRINTER_BUSY'
+    error.acceptedBytes = 0
+    error.deliveryStarted = false
+    throw error
+  }
+  const result = execution.value
+  if (Number(result?.acceptedBytes) === payload.byteLength) {
+    return { acceptedBytes: payload.byteLength }
+  }
+  const error = new Error('The configured local printer did not complete delivery')
+  const disposition = rawPrintFailureDisposition({
+    acceptedBytes: Number.isSafeInteger(Number(result?.acceptedBytes))
+      ? Number(result.acceptedBytes)
+      : payload.byteLength,
+    deliveryStarted: result?.deliveryStarted,
+  })
+  error.code = String(result?.code || disposition.code)
+  error.acceptedBytes = disposition.acceptedBytes
+  error.deliveryStarted = disposition.deliveryStarted
+  if (process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1') {
+    error.helperDiagnostic = {
+      exitCode: execution.code,
+      signal: execution.signal,
+      stdout: execution.stdout,
+      stderr: execution.stderr,
+    }
+  }
+  throw error
 }
 
 function claimKey(job) {
   return `${job.globalId}:${job.claimToken}`
 }
 
-async function failClaim(config, job, input) {
-  return agentRequest(config, 'fail', {
+function deliveryKey(job) {
+  if (
+    !job?.globalId
+    || !job?.claimToken
+    || !job?.document?.globalId
+    || !/^[a-f0-9]{64}$/i.test(String(job.document.contentSha256 || ''))
+  ) {
+    throw new Error('The print job is missing its immutable artifact identity')
+  }
+  const identity = [
+    'clawpilot:local-print-delivery:v1',
+    job.globalId,
+    job.document.globalId,
+    String(job.document.contentSha256 || '').toLowerCase(),
+  ].join('\n')
+  return `delivery.v1.${createHash('sha256').update(identity).digest('hex')}`
+}
+
+function priorDelivery(ledger, job, key) {
+  const candidates = [
+    ledger.deliveries[key],
+    ...Object.values(ledger.claims).filter((claim) => (
+      claim?.jobGlobalId === job.globalId
+      && claim?.documentGlobalId === job.document.globalId
+      && (
+        !claim?.contentSha256
+        || claim.contentSha256 === String(job.document.contentSha256).toLowerCase()
+      )
+    )),
+  ].filter(Boolean)
+  const priority = (candidate) => {
+    if (candidate.state === 'acknowledged' || candidate.state === 'delivered') return 3
+    if (
+      candidate.state === 'sending'
+      || candidate.state === 'outcome_uncertain'
+      || candidate.state === 'server_recovery_required'
+    ) return 2
+    if (candidate.state === 'delivery_failed') return 1
+    return 0
+  }
+  const highest = Math.max(0, ...candidates.map(priority))
+  if (!highest) return null
+  const strongest = candidates.filter((candidate) => priority(candidate) === highest)
+  const state = highest === 3
+    ? strongest.some((candidate) => candidate.state === 'acknowledged')
+      ? 'acknowledged'
+      : 'delivered'
+    : highest === 2
+      ? 'outcome_uncertain'
+      : 'delivery_failed'
+  return {
+    ...strongest[0],
+    state,
+    startedAt: strongest.find((candidate) => candidate.startedAt)?.startedAt,
+    deliveredAt: strongest.find((candidate) => candidate.deliveredAt)?.deliveredAt,
+    acknowledgedAt: strongest.find((candidate) => candidate.acknowledgedAt)?.acknowledgedAt,
+    acceptedBytes: strongest.find((candidate) => (
+      candidate.acceptedBytes !== null
+      && candidate.acceptedBytes !== undefined
+      && Number.isSafeInteger(Number(candidate.acceptedBytes))
+    ))?.acceptedBytes,
+  }
+}
+
+function deliveryRecord(job, state, detail = {}) {
+  return {
+    jobGlobalId: job.globalId,
+    documentGlobalId: job.document.globalId,
+    contentSha256: String(job.document.contentSha256).toLowerCase(),
+    state,
+    ...detail,
+  }
+}
+
+function claimExpiry(job) {
+  const expiresAt = String(job?.claimExpiresAt || '')
+  if (!Number.isFinite(Date.parse(expiresAt))) {
+    throw new Error('The print job is missing its authoritative claim expiration')
+  }
+  return expiresAt
+}
+
+function monotonicNowNs() {
+  return process.hrtime.bigint() + testMonotonicOffsetNs
+}
+
+function registerClaimLease(job, requestRoundTripMs, requestedLeaseSeconds = 120) {
+  const serverNow = Date.parse(String(job?.serverNow || ''))
+  const expiresAt = Date.parse(claimExpiry(job))
+  if (
+    !Number.isFinite(serverNow)
+    || expiresAt <= serverNow
+    || !Number.isFinite(requestRoundTripMs)
+    || requestRoundTripMs < 0
+    || requestRoundTripMs > 20_500
+  ) throw new Error('The print claim is missing trustworthy server lease timing')
+  const transitAndClockSafetyMs = requestRoundTripMs + 2_000
+  const serverBudgetMs = expiresAt - serverNow - transitAndClockSafetyMs
+  const requestedBudgetMs = requestedLeaseSeconds * 1_000 - transitAndClockSafetyMs
+  const remainingMs = Math.max(0, Math.min(serverBudgetMs, requestedBudgetMs))
+  Object.defineProperty(job, CLAIM_MONOTONIC_DEADLINE, {
+    value: process.hrtime.bigint() + BigInt(Math.floor(remainingMs * 1_000_000)),
+    enumerable: false,
+  })
+}
+
+function claimMonotonicDeadline(job) {
+  const deadline = job?.[CLAIM_MONOTONIC_DEADLINE]
+  if (typeof deadline !== 'bigint' || deadline <= 0n) {
+    throw new Error('The print claim is missing its monotonic delivery deadline')
+  }
+  return deadline
+}
+
+function assertClaimLease(job, minimumRemainingMs = MINIMUM_RAW_DELIVERY_LEASE_MS) {
+  const remainingNs = claimMonotonicDeadline(job) - monotonicNowNs()
+  if (remainingNs < BigInt(minimumRemainingMs) * 1_000_000n) {
+    const error = new Error('The print claim lease is too close to expiration for safe raw delivery')
+    error.code = 'PRINT_CLAIM_LEASE_TOO_SHORT'
+    throw error
+  }
+  return claimExpiry(job)
+}
+
+function applyTestClockAdvanceBeforeRaw() {
+  if (
+    process.env.CLAWPILOT_GATEWAY_TEST_MODE !== '1'
+    || process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK !== '1'
+  ) return
+  const offset = Number(process.env.CLAWPILOT_PRINT_AGENT_TEST_PRE_RAW_CLOCK_ADVANCE_MS || 0)
+  if (Number.isSafeInteger(offset) && offset > 0 && offset <= 24 * 60 * 60 * 1_000) {
+    testMonotonicOffsetNs = BigInt(offset) * 1_000_000n
+  }
+}
+
+function failurePayload(job, input) {
+  return {
     jobGlobalId: job.globalId,
     claimToken: job.claimToken,
     errorCode: input.errorCode,
@@ -257,43 +489,351 @@ async function failClaim(config, job, input) {
     retryable: input.retryable,
     printerUnavailable: input.printerUnavailable,
     retryAfterSeconds: input.retryAfterSeconds || 0,
-  }, `fail:${job.globalId}:${job.claimToken}`)
+  }
 }
 
-async function acknowledgeClaim(config, job) {
-  return agentRequest(config, 'acknowledge', {
+function acknowledgementPayload(job, deviceReference) {
+  return {
     jobGlobalId: job.globalId,
     claimToken: job.claimToken,
-    deviceJobReference: `${printerHost}:${printerPort}`,
-  }, `ack:${job.globalId}:${job.claimToken}`)
+    deviceJobReference: deviceReference,
+  }
 }
 
-async function handleJob(config, ledger, job) {
-  const key = claimKey(job)
-  const previous = ledger.claims[key]
-  if (previous?.state === 'acknowledged') {
-    log('claim_already_acknowledged', { jobGlobalId: job.globalId })
-    return
+function pendingResultIdentifier(action, job) {
+  return `${action}:${job.globalId}:${job.claimToken}`
+}
+
+function queuePendingResult(ledger, job, action, payload, {
+  claimLedgerKey = null,
+  deliveryLedgerKey = null,
+} = {}) {
+  if (!['acknowledge', 'fail'].includes(action)) {
+    throw new Error('The pending print result action is invalid')
   }
-  if (previous?.state === 'delivered') {
-    await acknowledgeClaim(config, job)
-    previous.state = 'acknowledged'
-    previous.acknowledgedAt = new Date().toISOString()
+  const idempotencyKey = `${action === 'acknowledge' ? 'ack' : 'fail'}:${job.globalId}:${job.claimToken}`
+  const identifier = pendingResultIdentifier(action, job)
+  ledger.pendingResults[identifier] = {
+    version: 1,
+    action,
+    jobGlobalId: job.globalId,
+    claimToken: job.claimToken,
+    claimExpiresAt: claimExpiry(job),
+    idempotencyKey,
+    payload,
+    claimLedgerKey,
+    deliveryLedgerKey,
+    queuedAt: new Date().toISOString(),
+  }
+  return identifier
+}
+
+function assertPendingResult(identifier, pending) {
+  if (
+    !pending
+    || pending.version !== 1
+    || !['acknowledge', 'fail'].includes(pending.action)
+    || pending.jobGlobalId !== pending.payload?.jobGlobalId
+    || pending.claimToken !== pending.payload?.claimToken
+    || identifier !== `${pending.action}:${pending.jobGlobalId}:${pending.claimToken}`
+    || pending.idempotencyKey !== `${pending.action === 'acknowledge' ? 'ack' : 'fail'}:${pending.jobGlobalId}:${pending.claimToken}`
+    || !Number.isFinite(Date.parse(pending.claimExpiresAt))
+    || !Number.isFinite(Date.parse(pending.queuedAt))
+  ) throw new Error('The durable pending print result is invalid')
+  if (pending.action === 'acknowledge') {
+    if (
+      Object.keys(pending.payload).sort().join(',') !== [
+        'claimToken',
+        'deviceJobReference',
+        'jobGlobalId',
+      ].sort().join(',')
+      || !/^local-device\.v1\.[A-Za-z0-9_-]{43}$/.test(
+        String(pending.payload.deviceJobReference || ''),
+      )
+    ) throw new Error('The durable pending acknowledgement is invalid')
+  } else if (
+    Object.keys(pending.payload).sort().join(',') !== [
+      'claimToken',
+      'errorCode',
+      'errorMessage',
+      'jobGlobalId',
+      'printerUnavailable',
+      'retryAfterSeconds',
+      'retryable',
+    ].sort().join(',')
+    || !/^[A-Z][A-Z0-9_]{1,63}$/.test(String(pending.payload.errorCode || ''))
+    || typeof pending.payload.errorMessage !== 'string'
+    || !pending.payload.errorMessage
+    || pending.payload.errorMessage.length > 1_000
+    || typeof pending.payload.retryable !== 'boolean'
+    || typeof pending.payload.printerUnavailable !== 'boolean'
+    || !Number.isSafeInteger(pending.payload.retryAfterSeconds)
+    || pending.payload.retryAfterSeconds < 0
+    || pending.payload.retryAfterSeconds > 300
+  ) throw new Error('The durable pending failure result is invalid')
+  return pending
+}
+
+async function submitPendingResult(config, ledger, identifier, { replayed = false } = {}) {
+  const pending = assertPendingResult(identifier, ledger.pendingResults[identifier])
+  try {
+    await agentRequest(
+      config,
+      pending.action,
+      pending.payload,
+      pending.idempotencyKey,
+    )
+  } catch (error) {
+    if (error?.code !== 'OPERATIONS_PRINT_CLAIM_EXPIRED') throw error
+    const resolutionRequiredAt = new Date().toISOString()
+    if (pending.claimLedgerKey && ledger.claims[pending.claimLedgerKey]) {
+      ledger.claims[pending.claimLedgerKey] = {
+        ...ledger.claims[pending.claimLedgerKey],
+        state: 'server_recovery_required',
+        resolutionRequiredAt,
+        serverResultConfirmed: false,
+      }
+    }
+    if (pending.deliveryLedgerKey && ledger.deliveries[pending.deliveryLedgerKey]) {
+      ledger.deliveries[pending.deliveryLedgerKey] = {
+        ...ledger.deliveries[pending.deliveryLedgerKey],
+        state: 'server_recovery_required',
+        resolutionRequiredAt,
+        serverResultConfirmed: false,
+      }
+    }
+    delete ledger.pendingResults[identifier]
     await writeLedger(ledger)
-    log('job_acknowledged', { jobGlobalId: job.globalId, recovered: true })
-    return
+    log('result_replay_expired', {
+      action: pending.action,
+      jobGlobalId: pending.jobGlobalId,
+      serverRejectedUncommittedResult: true,
+      resent: false,
+    })
+    return false
   }
-  if (previous?.state === 'sending') {
-    await failClaim(config, job, {
-      errorCode: 'PRINT_OUTCOME_UNCERTAIN',
-      errorMessage: 'The local agent restarted after delivery began; automatic resend was fenced',
+  const completedAt = new Date().toISOString()
+  if (pending.action === 'acknowledge') {
+    if (pending.claimLedgerKey && ledger.claims[pending.claimLedgerKey]) {
+      ledger.claims[pending.claimLedgerKey] = {
+        ...ledger.claims[pending.claimLedgerKey],
+        state: 'acknowledged',
+        acknowledgedAt: completedAt,
+      }
+    }
+    if (pending.deliveryLedgerKey && ledger.deliveries[pending.deliveryLedgerKey]) {
+      ledger.deliveries[pending.deliveryLedgerKey] = {
+        ...ledger.deliveries[pending.deliveryLedgerKey],
+        state: 'acknowledged',
+        acknowledgedAt: completedAt,
+      }
+    }
+  } else {
+    if (pending.claimLedgerKey && ledger.claims[pending.claimLedgerKey]) {
+      ledger.claims[pending.claimLedgerKey] = {
+        ...ledger.claims[pending.claimLedgerKey],
+        serverResultConfirmed: true,
+        serverResultConfirmedAt: completedAt,
+      }
+    }
+    if (pending.deliveryLedgerKey && ledger.deliveries[pending.deliveryLedgerKey]) {
+      ledger.deliveries[pending.deliveryLedgerKey] = {
+        ...ledger.deliveries[pending.deliveryLedgerKey],
+        serverResultConfirmed: true,
+        serverResultConfirmedAt: completedAt,
+      }
+    }
+  }
+  delete ledger.pendingResults[identifier]
+  await writeLedger(ledger)
+  log('job_result_submitted', {
+    action: pending.action,
+    jobGlobalId: pending.jobGlobalId,
+    replayed,
+    resent: false,
+  })
+  return true
+}
+
+async function replayPendingResults(config, ledger) {
+  for (const identifier of Object.keys(ledger.pendingResults).sort()) {
+    await submitPendingResult(config, ledger, identifier, { replayed: true })
+  }
+}
+
+async function recordSafePreDeliveryFailure(
+  config,
+  ledger,
+  job,
+  key,
+  immutableKey,
+  {
+    errorCode = 'PRINT_CLAIM_LEASE_TOO_SHORT',
+    errorMessage = 'The authoritative claim lease was too close to expiration for safe raw delivery; zero bytes were sent',
+    retryAfterSeconds = 0,
+    event = 'job_lease_too_short',
+  } = {},
+) {
+  const failedAt = new Date().toISOString()
+  ledger.claims[key] = {
+    ...(ledger.claims[key] || deliveryRecord(job, 'delivery_failed', {
+      claimToken: job.claimToken,
+      claimExpiresAt: claimExpiry(job),
+    })),
+    state: 'delivery_failed',
+    failedAt,
+    acceptedBytes: 0,
+    deliveryStarted: false,
+  }
+  ledger.deliveries[immutableKey] = {
+    ...(ledger.deliveries[immutableKey] || deliveryRecord(job, 'delivery_failed')),
+    state: 'delivery_failed',
+    failedAt,
+    acceptedBytes: 0,
+    deliveryStarted: false,
+  }
+  const failure = failurePayload(job, {
+    errorCode,
+    errorMessage,
+    retryable: true,
+    printerUnavailable: false,
+    retryAfterSeconds,
+  })
+  const pending = queuePendingResult(
+    ledger,
+    job,
+    'fail',
+    failure,
+    { claimLedgerKey: key, deliveryLedgerKey: immutableKey },
+  )
+  await writeLedger(ledger)
+  await submitPendingResult(config, ledger, pending)
+  log(event, {
+    jobGlobalId: job.globalId,
+    acceptedBytes: 0,
+    deliveryStarted: false,
+  })
+}
+
+async function recordStoppedBeforeDelivery(
+  config,
+  ledger,
+  job,
+  key,
+  immutableKey,
+) {
+  await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey, {
+    errorCode: 'PRINT_DELIVERY_STOPPED',
+    errorMessage: 'The local print worker stopped before raw delivery began; zero bytes were sent',
+    retryAfterSeconds: 0,
+    event: 'job_stopped_before_delivery',
+  })
+}
+
+async function handleJob(config, ledger, job, deviceReference) {
+  claimExpiry(job)
+  let key
+  let immutableKey
+  try {
+    key = claimKey(job)
+    immutableKey = deliveryKey(job)
+  } catch (error) {
+    if (!job?.globalId || !job?.claimToken) throw error
+    ledger.claims[key] = {
+      jobGlobalId: job.globalId,
+      claimToken: job.claimToken,
+      state: 'delivery_failed',
+      failedAt: new Date().toISOString(),
+      acceptedBytes: 0,
+      deliveryStarted: false,
+      serverResultConfirmed: false,
+    }
+    const payload = failurePayload(job, {
+      errorCode: 'PRINT_ARTIFACT_INVALID',
+      errorMessage: error.message,
       retryable: false,
       printerUnavailable: false,
     })
-    previous.state = 'outcome_uncertain'
-    previous.failedAt = new Date().toISOString()
+    const pending = queuePendingResult(ledger, job, 'fail', payload, {
+      claimLedgerKey: key,
+    })
     await writeLedger(ledger)
-    log('job_outcome_uncertain', { jobGlobalId: job.globalId })
+    await submitPendingResult(config, ledger, pending)
+    log('job_rejected', { jobGlobalId: job.globalId, reason: error.message })
+    return
+  }
+  const currentClaim = ledger.claims[key]
+  const previous = priorDelivery(ledger, job, immutableKey)
+  if (currentClaim?.state === 'acknowledged') {
+    log('claim_already_acknowledged', { jobGlobalId: job.globalId })
+    return
+  }
+  if (previous?.state === 'delivered' || previous?.state === 'acknowledged') {
+    ledger.claims[key] = {
+      ...deliveryRecord(job, 'delivered', {
+        claimToken: job.claimToken,
+        claimExpiresAt: claimExpiry(job),
+        recoveredWithoutResend: true,
+      }),
+    }
+    ledger.deliveries[immutableKey] = {
+      ...deliveryRecord(job, 'delivered', {
+        deliveredAt: previous.deliveredAt,
+        acceptedBytes: previous.acceptedBytes,
+      }),
+    }
+    const pending = queuePendingResult(
+      ledger,
+      job,
+      'acknowledge',
+      acknowledgementPayload(job, deviceReference),
+      { claimLedgerKey: key, deliveryLedgerKey: immutableKey },
+    )
+    await writeLedger(ledger)
+    await submitPendingResult(config, ledger, pending)
+    log('job_acknowledged', {
+      jobGlobalId: job.globalId,
+      recovered: true,
+      resent: false,
+    })
+    return
+  }
+  if (previous?.state === 'sending' || previous?.state === 'outcome_uncertain') {
+    const failedAt = new Date().toISOString()
+    ledger.claims[key] = {
+      ...deliveryRecord(job, 'outcome_uncertain', {
+        claimToken: job.claimToken,
+        failedAt,
+        acceptedBytes: previous.acceptedBytes,
+      }),
+    }
+    ledger.deliveries[immutableKey] = {
+      ...deliveryRecord(job, 'outcome_uncertain', {
+        startedAt: previous.startedAt,
+        failedAt,
+        acceptedBytes: previous.acceptedBytes,
+      }),
+    }
+    const payload = failurePayload(job, {
+      errorCode: 'PRINT_OUTCOME_UNCERTAIN',
+      errorMessage: 'Delivery previously began for this immutable artifact; automatic resend was fenced',
+      retryable: false,
+      printerUnavailable: false,
+    })
+    const pending = queuePendingResult(
+      ledger,
+      job,
+      'fail',
+      payload,
+      { claimLedgerKey: key, deliveryLedgerKey: immutableKey },
+    )
+    await writeLedger(ledger)
+    await submitPendingResult(config, ledger, pending)
+    log('job_outcome_uncertain', {
+      jobGlobalId: job.globalId,
+      recovered: true,
+      resent: false,
+    })
     return
   }
 
@@ -301,66 +841,215 @@ async function handleJob(config, ledger, job) {
   try {
     payload = decodeAndVerify(job)
   } catch (error) {
-    await failClaim(config, job, {
+    const failedAt = new Date().toISOString()
+    ledger.claims[key] = {
+      ...deliveryRecord(job, 'delivery_failed', {
+        claimToken: job.claimToken,
+        claimExpiresAt: claimExpiry(job),
+        failedAt,
+        acceptedBytes: 0,
+        deliveryStarted: false,
+        serverResultConfirmed: false,
+      }),
+    }
+    ledger.deliveries[immutableKey] = deliveryRecord(job, 'delivery_failed', {
+      failedAt,
+      acceptedBytes: 0,
+      deliveryStarted: false,
+      serverResultConfirmed: false,
+    })
+    const failure = failurePayload(job, {
       errorCode: 'PRINT_ARTIFACT_INVALID',
       errorMessage: error.message,
       retryable: false,
       printerUnavailable: false,
     })
+    const pending = queuePendingResult(ledger, job, 'fail', failure, {
+      claimLedgerKey: key,
+      deliveryLedgerKey: immutableKey,
+    })
+    await writeLedger(ledger)
+    await submitPendingResult(config, ledger, pending)
     log('job_rejected', { jobGlobalId: job.globalId, reason: error.message })
     return
   }
 
-  ledger.claims[key] = {
-    jobGlobalId: job.globalId,
-    claimToken: job.claimToken,
-    documentGlobalId: job.document.globalId,
-    state: 'sending',
-    startedAt: new Date().toISOString(),
+  try {
+    assertClaimLease(job)
+  } catch (error) {
+    if (error?.code !== 'PRINT_CLAIM_LEASE_TOO_SHORT') throw error
+    await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey)
+    return
   }
+
+  if (stopping) {
+    await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+    return
+  }
+
+  ledger.claims[key] = {
+    ...deliveryRecord(job, 'sending', {
+      claimToken: job.claimToken,
+      claimExpiresAt: claimExpiry(job),
+      startedAt: new Date().toISOString(),
+    }),
+  }
+  ledger.deliveries[immutableKey] = deliveryRecord(job, 'sending', {
+    startedAt: ledger.claims[key].startedAt,
+  })
   await writeLedger(ledger)
 
+  if (stopping) {
+    await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+    return
+  }
+
+  applyTestClockAdvanceBeforeRaw()
   try {
-    const result = await submitRaw(payload)
-    ledger.claims[key].state = 'delivered'
-    ledger.claims[key].deliveredAt = new Date().toISOString()
-    ledger.claims[key].acceptedBytes = result.acceptedBytes
-    await writeLedger(ledger)
-    await acknowledgeClaim(config, job)
-    ledger.claims[key].state = 'acknowledged'
-    ledger.claims[key].acknowledgedAt = new Date().toISOString()
-    await writeLedger(ledger)
-    log('job_acknowledged', {
-      jobGlobalId: job.globalId,
-      printerGlobalId: job.printer?.globalId,
-      bytes: result.acceptedBytes,
-    })
+    assertClaimLease(job)
   } catch (error) {
-    const acceptedBytes = Number(error?.acceptedBytes || 0)
-    const retryable = acceptedBytes === 0
-    ledger.claims[key].state = retryable ? 'delivery_failed' : 'outcome_uncertain'
-    ledger.claims[key].failedAt = new Date().toISOString()
-    ledger.claims[key].acceptedBytes = acceptedBytes
-    await writeLedger(ledger)
-    await failClaim(config, job, {
+    if (error?.code !== 'PRINT_CLAIM_LEASE_TOO_SHORT') throw error
+    await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey)
+    return
+  }
+
+  let result
+  try {
+    result = await submitRaw(payload, job)
+  } catch (error) {
+    const disposition = rawPrintFailureDisposition(error)
+    if (
+      error?.code === 'PRINT_DELIVERY_STOPPED'
+      && disposition.acceptedBytes === 0
+      && disposition.deliveryStarted === false
+    ) {
+      await recordStoppedBeforeDelivery(config, ledger, job, key, immutableKey)
+      return
+    }
+    if (
+      error?.code === 'PRINT_CLAIM_LEASE_TOO_SHORT'
+      && disposition.acceptedBytes === 0
+      && disposition.deliveryStarted === false
+    ) {
+      await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey)
+      return
+    }
+    if (
+      error?.code === 'LOCAL_PRINTER_BUSY'
+      && disposition.acceptedBytes === 0
+      && disposition.deliveryStarted === false
+    ) {
+      await recordSafePreDeliveryFailure(config, ledger, job, key, immutableKey, {
+        errorCode: 'LOCAL_PRINTER_BUSY',
+        errorMessage: 'Another paired workspace is using this shared Zebra endpoint; zero bytes were sent',
+        retryAfterSeconds: 2,
+        event: 'job_printer_busy',
+      })
+      return
+    }
+    const { acceptedBytes, deliveryStarted, retryable } = disposition
+    const state = retryable ? 'delivery_failed' : 'outcome_uncertain'
+    const failedAt = new Date().toISOString()
+    ledger.claims[key] = {
+      ...ledger.claims[key],
+      state,
+      failedAt,
+      acceptedBytes,
+      deliveryStarted,
+    }
+    ledger.deliveries[immutableKey] = {
+      ...ledger.deliveries[immutableKey],
+      state,
+      failedAt,
+      acceptedBytes,
+      deliveryStarted,
+    }
+    const failure = failurePayload(job, {
       errorCode: retryable ? 'PRINTER_UNAVAILABLE' : 'PRINT_OUTCOME_UNCERTAIN',
       errorMessage: retryable
-        ? `Printer ${printerHost}:${printerPort} did not accept the artifact`
+        ? 'The configured local printer did not accept the artifact'
         : 'Printer delivery began but completion could not be proven; automatic resend was fenced',
       retryable,
       printerUnavailable: retryable,
       retryAfterSeconds: retryable ? 10 : 0,
     })
+    const pending = queuePendingResult(
+      ledger,
+      job,
+      'fail',
+      failure,
+      { claimLedgerKey: key, deliveryLedgerKey: immutableKey },
+    )
+    await writeLedger(ledger)
+    await submitPendingResult(config, ledger, pending)
     log('job_failed', {
       jobGlobalId: job.globalId,
       retryable,
       acceptedBytes,
+      deliveryStarted,
+      ...(process.env.CLAWPILOT_GATEWAY_TEST_MODE === '1'
+        ? {
+          failureDetail: error?.message || null,
+          helperDiagnostic: error?.helperDiagnostic || null,
+        }
+        : {}),
     })
+    return
   }
+
+  const deliveredAt = new Date().toISOString()
+  ledger.claims[key] = {
+    ...ledger.claims[key],
+    state: 'delivered',
+    deliveredAt,
+    acceptedBytes: result.acceptedBytes,
+  }
+  ledger.deliveries[immutableKey] = {
+    ...ledger.deliveries[immutableKey],
+    state: 'delivered',
+    deliveredAt,
+    acceptedBytes: result.acceptedBytes,
+  }
+  const pending = queuePendingResult(
+    ledger,
+    job,
+    'acknowledge',
+    acknowledgementPayload(job, deviceReference),
+    { claimLedgerKey: key, deliveryLedgerKey: immutableKey },
+  )
+  await writeLedger(ledger)
+  try {
+    const confirmed = await submitPendingResult(config, ledger, pending)
+    if (!confirmed) {
+      log('job_server_recovery_required', {
+        jobGlobalId: job.globalId,
+        delivered: true,
+        resent: false,
+      })
+      return
+    }
+  } catch (error) {
+    log('job_acknowledgement_pending', {
+      jobGlobalId: job.globalId,
+      delivered: true,
+      resent: false,
+    })
+    throw error
+  }
+  log('job_acknowledged', {
+    jobGlobalId: job.globalId,
+    printerGlobalId: job.printer?.globalId,
+    bytes: result.acceptedBytes,
+  })
 }
 
-async function cycle(config, ledger) {
-  const claimId = `claim:${os.hostname()}:${randomUUID()}`
+async function cycle(config, ledger, deviceReference) {
+  await replayPendingResults(config, ledger)
+  if (stopping) {
+    log('worker_stop_before_claim')
+    return 0
+  }
+  const claimId = `claim:${randomUUID()}`
   let response
   try {
     response = await agentRequest(config, 'claim', {
@@ -375,6 +1064,10 @@ async function cycle(config, ledger) {
       activeWorkerCapabilities !== workerCapabilities
       || error?.code !== 'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH'
     ) throw error
+    if (stopping) {
+      log('worker_stop_before_claim')
+      return 0
+    }
     activeWorkerCapabilities = legacyWorkerCapabilities
     response = await agentRequest(config, 'claim', {
       limit: 1,
@@ -386,26 +1079,57 @@ async function cycle(config, ledger) {
     })
   }
   const jobs = Array.isArray(response.jobs) ? response.jobs : []
-  if (jobs[0]) await handleJob(config, ledger, jobs[0])
+  const stoppedAfterClaim = stopping
+  if (stoppedAfterClaim && !jobs[0]) {
+    log('worker_stop_after_claim', {
+      returnedJobCount: jobs.length,
+      localOwnershipCreated: false,
+    })
+    return 0
+  }
+  if (jobs[0]) {
+    registerClaimLease(jobs[0], response[REQUEST_ROUND_TRIP_MS], 120)
+    await handleJob(config, ledger, jobs[0], deviceReference)
+    if (stoppedAfterClaim) {
+      log('worker_stop_after_claim', {
+        returnedJobCount: jobs.length,
+        localOwnershipCreated: true,
+        safeZeroByteDispositionRecorded: true,
+      })
+      return 0
+    }
+  }
   return jobs.length
 }
 
 async function main() {
+  log('worker_started', { pid: process.pid })
   if (probeOnly) {
     if (!printerHost) throw new Error('CLAWPILOT_PRINTER_HOST is required')
+    normalizedLocalPrinterEndpoint(printerHost, printerPort)
     await probePrinter()
-    log('printer_reachable', { printerHost, printerPort })
+    log('printer_reachable')
     return
   }
   const config = assertConfiguration()
   const ledger = await readLedger()
-  let stopping = false
-  process.once('SIGINT', () => { stopping = true })
-  process.once('SIGTERM', () => { stopping = true })
+  const deviceKey = await readOrCreateLocalDeviceKey(deviceKeyPath)
+  const deviceReference = opaqueLocalDeviceReference({
+    key: deviceKey,
+    host: printerHost,
+    port: printerPort,
+  })
+  const requestStop = (signal) => {
+    if (stopping) return
+    stopping = true
+    log('worker_stop_requested', { signal })
+  }
+  process.once('SIGINT', () => requestStop('SIGINT'))
+  process.once('SIGTERM', () => requestStop('SIGTERM'))
   do {
     try {
-      const count = await cycle(config, ledger)
-      if (once) return
+      const count = await cycle(config, ledger, deviceReference)
+      if (once || stopping) return
       await new Promise((resolvePromise) => setTimeout(
         resolvePromise,
         count ? 50 : pollIntervalMs,
@@ -413,6 +1137,7 @@ async function main() {
     } catch (error) {
       log('poll_failed', { message: error.message })
       if (once) throw error
+      if (stopping) return
       await new Promise((resolvePromise) => setTimeout(resolvePromise, pollIntervalMs))
     }
   } while (!stopping)

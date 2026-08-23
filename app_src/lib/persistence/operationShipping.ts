@@ -17,7 +17,11 @@ import {
 } from '@/lib/integrations/carrierSandboxLabel'
 import { CARRIER_SANDBOX_RATE_FIXTURE } from '@/lib/integrations/carrierSandboxRate'
 import type { OperationsSandboxLabelCommandResult } from '@/lib/operations/types'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
 import { enqueueOperationsPrintJobInPostgres } from '@/lib/persistence/operationPrintDelivery'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import {
   assertCommerceOrderRevisionExecutionCurrent,
@@ -26,6 +30,9 @@ import {
 import {
   requireActiveSandboxCommerceE2eAuthorization,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
+  requireActiveShopifyTestStoreCanonicalE2eAuthorization,
+} from '@/lib/persistence/shopifyTestStoreCanonicalE2e'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -41,7 +48,8 @@ type OrderRow = QueryResultRow & {
   status: string
   row_version: string
   ship_to: Record<string, unknown>
-  activation_state: string
+  shipment_ship_to_ready: boolean
+  shipment_rerate_required: boolean
   plan_id: string | null
   warehouse_id: string | null
   warehouse_address: Record<string, unknown> | null
@@ -310,12 +318,9 @@ async function readShippingContext(
     client,
     `SELECT orders.id::text, orders.global_id, orders.status,
             orders.row_version::text, orders.ship_to,
-            activation.state AS activation_state,
             plan.id::text AS plan_id, plan.warehouse_id::text,
             warehouse.address AS warehouse_address
      FROM operations_orders orders
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = orders.organization_id
      LEFT JOIN LATERAL (
        SELECT candidate.*
        FROM operations_fulfillment_plans candidate
@@ -342,6 +347,16 @@ async function readShippingContext(
       404,
     )
   }
+  const shipmentShipTo =
+    await readOperationsOrderShipmentAddressInPostgres({
+      organizationId,
+      orderGlobalId: order.global_id,
+      client,
+    })
+  order.ship_to = orderShipToStorageValue(shipmentShipTo.value)
+  order.shipment_ship_to_ready =
+    shipmentShipTo.readiness === 'carrier_ready'
+  order.shipment_rerate_required = shipmentShipTo.rerateRequired
   if (!order.plan_id || !order.warehouse_id) {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_PLAN_REQUIRED',
@@ -478,13 +493,6 @@ function assertCreateContext(
   expectedRowVersion: number,
   authorizedSandboxE2e = false,
 ) {
-  if (context.order.activation_state !== 'active') {
-    throw new OperationsRequestError(
-      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
-      'Operations must be active before creating a sandbox carrier label; Shadow mode never calls carrier label APIs',
-      409,
-    )
-  }
   if (context.order.status !== 'packed') {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ORDER_NOT_PACKED',
@@ -496,6 +504,20 @@ function assertCreateContext(
     throw new OperationsRequestError(
       'OPERATIONS_ORDER_VERSION_CONFLICT',
       'The order changed. Refresh it before creating a label.',
+      409,
+    )
+  }
+  if (!context.order.shipment_ship_to_ready) {
+    throw new OperationsRequestError(
+      'OPERATIONS_LABEL_SHIP_TO_INCOMPLETE',
+      'Add the missing ship-to details before creating a label.',
+      409,
+    )
+  }
+  if (context.order.shipment_rerate_required) {
+    throw new OperationsRequestError(
+      'OPERATIONS_LABEL_RERATE_REQUIRED',
+      'The ship-to changed after rating. Compare rates again before creating a label.',
       409,
     )
   }
@@ -555,13 +577,6 @@ function assertCreateContext(
 }
 
 function assertVoidContext(context: ShippingContext, expectedRowVersion: number) {
-  if (context.order.activation_state !== 'active') {
-    throw new OperationsRequestError(
-      'OPERATIONS_LABEL_ACTIVE_MODE_REQUIRED',
-      'Operations must be active before voiding a sandbox carrier label; Shadow mode never calls carrier void APIs',
-      409,
-    )
-  }
   if (context.order.status !== 'packed') {
     throw new OperationsRequestError(
       'OPERATIONS_LABEL_ORDER_NOT_PACKED',
@@ -902,13 +917,26 @@ async function prepareAttempt(input: {
         context.order.id,
       )
       if (input.sandboxE2eAuthorizationGlobalId) {
-        await requireActiveSandboxCommerceE2eAuthorization(client, {
+        const authority = await requireActiveSandboxCommerceE2eAuthorization(client, {
           organizationId: input.organizationId,
           authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
           orderGlobalId: input.orderGlobalId,
           actorEmail: input.actorEmail,
           packageGlobalId: input.packageGlobalId,
         })
+        if (
+          authority.confirmation_statement_version
+            === 'shopify-test-store-canonical-e2e-v1'
+        ) {
+          await requireActiveShopifyTestStoreCanonicalE2eAuthorization(client, {
+            organizationId: input.organizationId,
+            authorizationGlobalId: input.sandboxE2eAuthorizationGlobalId,
+            orderGlobalId: input.orderGlobalId,
+            actorEmail: input.actorEmail,
+            expectedOrderRowVersion: input.expectedRowVersion,
+            expectedOrderStatus: 'packed',
+          })
+        }
       }
       assertCreateContext(
         context,

@@ -33,7 +33,7 @@
     "sharp": "0.35.3"
   },
   "overrides": {
-    "postcss": "8.5.22",
+    "postcss": "8.5.26",
     "sharp": "0.35.3"
   },
   "devDependencies": {

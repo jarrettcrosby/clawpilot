@@ -9,7 +9,7 @@ import {
   type ProductPackVariantMappingInput,
 } from '@/lib/operations/productPackManagement'
 import {
-  isShopifySandboxCheckoutChannelEligible,
+  isShopifyRatingCheckoutChannelEligible,
 } from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import {
   acquireTransactionAdvisoryLock,
@@ -1231,7 +1231,7 @@ async function requireShopifyCheckoutPackReady(
   },
 ) {
   if (
-    !isShopifySandboxCheckoutChannelEligible({
+    !isShopifyRatingCheckoutChannelEligible({
       provider: input.state.provider,
       accountEnvironment: input.state.account_environment,
       providerStatusRaw: input.state.provider_status_raw,
@@ -1243,7 +1243,7 @@ async function requireShopifyCheckoutPackReady(
   ) {
     fail(
       'PRODUCT_PACK_SHOPIFY_CHECKOUT_CHANNEL_NOT_READY',
-      'Shopify checkout mapping requires an eligible sandbox shipping variant with positive provider weight',
+      'Shopify checkout mapping requires an eligible exact Shopify shipping variant with positive provider weight',
       409,
     )
   }
@@ -1271,9 +1271,10 @@ async function requireShopifyCheckoutPackReady(
      WHERE config.organization_id = $1::uuid
        AND config.integration_account_id = $2::uuid
        AND config.registration_state = 'registered'
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_carrier_service_rating_environment_is_ready(
          config.organization_id,
-         config.id
+         config.id,
+         config.policy_snapshot #>> '{checkoutRateControl,rateSource}'
        )
      ORDER BY config.global_id
      LIMIT 1`,
@@ -1634,7 +1635,10 @@ function assertActiveRecipeMaterial(material: MaterialRow) {
     material.status !== 'active'
     || material.dimension_basis !== 'inner'
     || material.dimension_evidence_type === 'unknown'
-    || !material.dimension_evidence_reference
+    || (
+      material.dimension_evidence_type !== 'measured'
+      && !material.dimension_evidence_reference?.trim()
+    )
     || material.dimension_confirmed_at === null
     || !Number.isSafeInteger(material.inner_length_mm)
     || Number(material.inner_length_mm) < 1
@@ -1648,8 +1652,13 @@ function assertActiveRecipeMaterial(material: MaterialRow) {
     || Number(material.rated_outer_width_mm) < 1
     || !Number.isSafeInteger(material.rated_outer_height_mm)
     || Number(material.rated_outer_height_mm) < 1
-    || !material.rated_outer_dimension_evidence_type
-    || !material.rated_outer_dimension_evidence_reference
+    || !['customer_confirmed', 'measured', 'provider'].includes(
+      material.rated_outer_dimension_evidence_type || '',
+    )
+    || (
+      material.rated_outer_dimension_evidence_type !== 'measured'
+      && !material.rated_outer_dimension_evidence_reference?.trim()
+    )
     || material.rated_outer_dimension_confirmed_at === null
     || !Number.isSafeInteger(material.tare_weight_grams)
     || Number(material.tare_weight_grams) < 1

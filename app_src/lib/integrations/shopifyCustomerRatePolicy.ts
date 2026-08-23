@@ -54,6 +54,16 @@ export type NormalizedShopifyCustomerRatePolicy = {
   shadowTestSubsidyReason: string | null
 }
 
+export function shopifyCustomerRatePolicyAllowsService(
+  policy: Pick<NormalizedShopifyCustomerRatePolicy, 'mode' | 'serviceCodes'>,
+  stableServiceCode: string,
+): boolean {
+  if (policy.mode === 'show_all') return true
+  if (policy.mode === 'hide_all') return false
+  const selected = policy.serviceCodes.includes(stableServiceCode)
+  return policy.mode === 'include_only' ? selected : !selected
+}
+
 export type ShopifyCustomerSearchResult = {
   customers: Array<{
     customerGid: string

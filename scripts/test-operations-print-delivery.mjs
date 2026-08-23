@@ -164,6 +164,117 @@ function verifySourceContracts() {
       `Missing print-delivery SQL contract: ${fragment}`,
     )
   }
+
+  const privacyMigrationSource = read(
+    'db/migrations/0284_operations_print_device_reference_privacy.sql',
+  )
+  const privacyMigration = compactSql(privacyMigrationSource)
+  for (const fragment of [
+    'normalize_operations_print_delivery_device_reference()',
+    'normalize_operations_print_delivery_device_reference_write',
+    "NEW.device_job_reference := 'local-device.legacy.v1.redacted'",
+    "'^local-device[.]v1[.][A-Za-z0-9_-]{43}$'",
+    'DISABLE TRIGGER protect_operations_print_delivery_attempt_write',
+    "SET device_job_reference = 'local-device.legacy.v1.redacted'",
+    'WHERE device_job_reference IS NOT NULL AND NOT',
+    'ENABLE TRIGGER protect_operations_print_delivery_attempt_write',
+    "to_regprocedure('protect_operations_append_only()')",
+    "trigger_row.tgenabled = 'O'",
+    'trigger_row.tgtype = 27',
+    'trigger_row.tgtype = 7',
+    'legacy raw local printer references remain after privacy remediation',
+  ]) {
+    assert.ok(
+      privacyMigration.includes(fragment),
+      `Missing print-device privacy migration contract: ${fragment}`,
+    )
+  }
+  assert.doesNotMatch(
+    privacyMigrationSource,
+    /(?:DROP\s+TRIGGER\s+protect_operations_print_delivery_attempt_write|DISABLE\s+TRIGGER\s+(?:ALL|USER))/i,
+    'Privacy migration must disable only the exact append-only guard',
+  )
+  const privacyUpdate = privacyMigration.match(
+    /UPDATE operations_print_delivery_attempts SET (.*?) WHERE device_job_reference/,
+  )
+  assert.equal(
+    privacyUpdate?.[1],
+    "device_job_reference = 'local-device.legacy.v1.redacted'",
+    'Privacy migration must update only device_job_reference',
+  )
+
+  const healthRoute = read('app_src/app/api/health/route.ts')
+  for (const fragment of [
+    '0284_operations_print_device_reference_privacy.sql',
+    'operations_print_device_reference_privacy_applied',
+    'protect_operations_print_delivery_attempt_write',
+    "to_regprocedure('protect_operations_append_only()')",
+    "print_delivery_guard.tgenabled = 'O'",
+    'print_delivery_guard.tgtype = 27',
+    "'normalize_operations_print_delivery_device_reference()'",
+    'normalize_operations_print_delivery_device_reference_write',
+    "print_device_reference_guard.tgenabled = 'O'",
+    'print_device_reference_guard.tgtype = 7',
+    '&& row?.operations_print_device_reference_privacy_applied',
+    '|| !row?.operations_print_device_reference_privacy_applied',
+  ]) {
+    assert.ok(
+      healthRoute.includes(fragment),
+      `Missing print-device privacy health contract: ${fragment}`,
+    )
+  }
+  assert.ok(
+    (healthRoute.match(/operations_print_device_reference_privacy_applied/g) || [])
+      .length >= 4,
+    'Privacy migration must gate query typing, SQL, migrationsCurrent, and health errors',
+  )
+  assert.ok(
+    read('scripts/verify-predeploy.mjs').includes(
+      'db/migrations/0284_operations_print_device_reference_privacy.sql',
+    ),
+    'Predeploy must require the print-device privacy migration',
+  )
+  const uncertainFence = compactSql(
+    read('db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql'),
+  )
+  for (const fragment of [
+    'prevent_operations_uncertain_print_retry()',
+    'FOR UPDATE',
+    "previous_error_code = 'PRINT_OUTCOME_UNCERTAIN'",
+    'prevent_operations_uncertain_print_retry_write',
+    "agent.status <> 'active'",
+    'printer.local_print_agent_id IS DISTINCT FROM agent.id',
+    "'PRINT_OUTCOME_UNCERTAIN'",
+    "'operations.print_job.outcome_uncertain'",
+    "'automaticRetryBlocked', true",
+  ]) assert.ok(
+    uncertainFence.includes(fragment),
+    `Missing uncertain-outcome database fence contract: ${fragment}`,
+  )
+  for (const fragment of [
+    '0296_operations_print_outcome_uncertain_retry_fence.sql',
+    'operations_print_outcome_uncertain_fence_applied',
+    "'prevent_operations_uncertain_print_retry()'",
+    'prevent_operations_uncertain_print_retry_write',
+    "uncertain_retry_guard.tgenabled = 'O'",
+    'uncertain_retry_guard.tgtype = 7',
+    'stranded_printer.local_print_agent_id',
+    '&& row?.operations_print_outcome_uncertain_fence_applied',
+    '|| !row?.operations_print_outcome_uncertain_fence_applied',
+  ]) assert.ok(
+    healthRoute.includes(fragment),
+    `Missing uncertain-outcome health attestation: ${fragment}`,
+  )
+  assert.ok(
+    (healthRoute.match(/operations_print_outcome_uncertain_fence_applied/g) || []).length >= 5,
+    'Uncertain-outcome fence must gate query typing, SQL, migrationsCurrent, status, and health errors',
+  )
+  assert.ok(
+    read('scripts/verify-predeploy.mjs').includes(
+      'db/migrations/0296_operations_print_outcome_uncertain_retry_fence.sql',
+    ),
+    'Predeploy must require the uncertain-outcome database fence',
+  )
   assert.ok(
     !/CREATE TABLE(?: IF NOT EXISTS)? operations_printer_profiles/i.test(migrationSource),
     'Migration must extend operations_printers rather than duplicate printer profiles',
@@ -219,7 +330,8 @@ function verifySourceContracts() {
     'OPERATIONS_PRINT_REPRINT_LABEL_INACTIVE',
     'request_fingerprint',
     'FOR UPDATE OF job SKIP LOCKED',
-    'LEASE_EXPIRED',
+    'lease_expired_outcome_uncertain',
+    'automatic retry is blocked',
     'physicalOutputVerified: false',
     'artifact.content_sha256 AS artifact_content_sha256',
     'COALESCE(source_label.environment, rate_test_label.environment)',
@@ -243,6 +355,7 @@ function verifySourceContracts() {
     'original.rate_test_label_id',
     'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
     'OPERATIONS_PRINT_AGENT_CAPABILITIES_MISMATCH',
+    'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
     'artifact.format = ANY($5::text[])',
     'runtimeSupportedFormats',
     "type: 'packing_slip_artifact'",
@@ -274,6 +387,7 @@ function verifySourceContracts() {
     'Idempotency-Key',
     'Cache-Control',
     'runtimeCapabilities',
+    'OPERATIONS_PRINT_OUTCOME_UNCERTAIN_RETRY_FORBIDDEN',
   ]) {
     assert.ok(agentRoute.includes(fragment), `Missing print-agent route contract: ${fragment}`)
   }
@@ -300,13 +414,14 @@ function verifySourceContracts() {
     'Document integrity',
     'Lifecycle and lineage',
     'Delivery history',
+    'Authorize new print',
+    'Required duplicate-risk authorization reason',
   ]) {
     assert.ok(panel.includes(fragment), `Missing print-job detail contract: ${fragment}`)
   }
   const managementRoute = read('app_src/app/api/operations/print-agents/route.ts')
   for (const fragment of [
-    "command.action === 'enroll-agent'",
-    "command.action === 'rotate-credential'",
+    "command.action === 'create-pairing-grant'",
     "command.action === 'revoke-agent'",
     'requireRequestUser',
     'supportedFormats',
@@ -315,6 +430,17 @@ function verifySourceContracts() {
     'DEFAULT_PRINT_AGENT_CAPABILITIES',
   ]) {
     assert.ok(managementRoute.includes(fragment), `Missing print-agent management contract: ${fragment}`)
+  }
+  for (const forbidden of [
+    "command.action === 'enroll-agent'",
+    "command.action === 'rotate-credential'",
+    'enrollOperationsPrintAgentInPostgres',
+    'rotateOperationsPrintAgentCredentialInPostgres',
+  ]) {
+    assert.ok(
+      !managementRoute.includes(forbidden),
+      `Browser print-agent management must not expose cpprint issuance: ${forbidden}`,
+    )
   }
 
   const helpers = loadPersistenceHelpers()
@@ -335,6 +461,33 @@ function verifySourceContracts() {
     helpers.operationsPrintDeliveryFingerprint({ b: 2, a: 1 }),
     helpers.operationsPrintDeliveryFingerprint({ a: 1, b: 2 }),
     'Request fingerprints must be independent of object key order',
+  )
+  const opaqueDeviceReference = `local-device.v1.${'A'.repeat(43)}`
+  assert.equal(
+    helpers.normalizeOperationsLocalDeviceReference(
+      opaqueDeviceReference,
+    ),
+    opaqueDeviceReference,
+    'Current opaque local-device references must remain stable',
+  )
+  const legacyDeviceReference = helpers.normalizeOperationsLocalDeviceReference(
+    '192.168.4.146:9100',
+  )
+  assert.equal(legacyDeviceReference, 'local-device.legacy.v1.redacted')
+  assert.doesNotMatch(legacyDeviceReference, /192\.168\.4\.146|9100/)
+  assert.equal(
+    legacyDeviceReference,
+    helpers.normalizeOperationsLocalDeviceReference(
+      '192.168.4.146:9100',
+    ),
+    'Legacy endpoint redaction must never retain a correlatable endpoint fingerprint',
+  )
+  assert.equal(
+    legacyDeviceReference,
+    helpers.normalizeOperationsLocalDeviceReference(
+      '192.168.4.146:9100',
+    ),
+    'Legacy endpoint redaction must be constant across agents',
   )
 
   const rawZpl = '^XA\n^FO20,20^FDClawPilot^FS\n^XZ'

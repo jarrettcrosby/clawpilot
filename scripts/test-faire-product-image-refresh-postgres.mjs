@@ -158,6 +158,10 @@ const suiteCrmProjectionMock = {
   },
 }
 
+const commerceStoreSyncMock = {
+  async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+}
+
 const productImageAssets = loadTypeScriptModule(
   'app_src/lib/crm/productImageAssets.ts',
 )
@@ -167,6 +171,7 @@ const imageImports = loadTypeScriptModule(
     '@/lib/auditWriter': auditWriterMock,
     '@/lib/crm/productImageAssets': productImageAssets,
     '@/lib/persistence/postgres': persistenceMock,
+    '@/lib/persistence/commerceStoreSync': commerceStoreSyncMock,
     '@/lib/persistence/suiteCrmProductImageProjection':
       suiteCrmProjectionMock,
   },
@@ -179,6 +184,7 @@ const refreshPersistence = loadTypeScriptModule(
   {
     '@/lib/integrations/faireProductImageRefreshTypes': refreshTypes,
     '@/lib/persistence/commerceProductImageImports': imageImports,
+    '@/lib/persistence/commerceStoreSync': commerceStoreSyncMock,
     '@/lib/persistence/postgres': persistenceMock,
   },
 )
@@ -343,6 +349,16 @@ async function verifyRefresh(pool) {
       observedAt: '2026-08-02T15:00:00.000Z',
       productSourceHash: sha('faire-targeted-image-set'),
       actorEmail: tenant.actorEmail,
+      providerReadLease: {
+        id: randomUUID(),
+        organizationId: tenant.organizationId,
+        integrationAccountId: tenant.accountId,
+        authorityKind: 'manual_read_only',
+        readKind: 'product_image_import',
+        controlRevision: 1,
+        activationRevision: 1,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
       images: [{
         providerImageId: 'i_6xtuafkgqp',
         locatorSha256: sha('faire-front-locator'),
@@ -423,6 +439,16 @@ async function verifyRefresh(pool) {
       observedAt: '2026-08-02T15:01:00.000Z',
       productSourceHash: sha('stale-faire-targeted-image-set'),
       actorEmail: tenant.actorEmail,
+      providerReadLease: {
+        id: randomUUID(),
+        organizationId: tenant.organizationId,
+        integrationAccountId: tenant.accountId,
+        authorityKind: 'manual_read_only',
+        readKind: 'product_image_import',
+        controlRevision: 1,
+        activationRevision: 1,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
       images: [],
     }),
     (error) => {

@@ -140,6 +140,7 @@ function command(overrides = {}) {
     expectedExternalVariantId: target.externalVariantId,
     expectedProviderSku: target.providerSku,
     confirmReadOnlyProviderRequest: true,
+    idempotencyKey: 'faire-product-image-refresh:test-command-0001',
     actorEmail: 'faire-image-operator@episcs.com',
     ...overrides,
   }
@@ -166,12 +167,17 @@ test('queues only the exact reviewed Faire Product images with zero provider wri
       targetReads += 1
       return target
     },
-    async readSources(input) {
+    async withSources(input) {
       sourceReadOperations += 1
       assert.equal(input.provider, 'faire')
       assert.equal(input.accountGlobalId, 'gia5156705')
       assert.equal(input.externalProductId, 'p_26rmrj53zw')
-      return Object.freeze([{
+      assert.equal(input.authorityKind, 'manual_read_only')
+      assert.equal(
+        input.intentKey,
+        'faire-product-image-refresh:faire-product-image-refresh:test-command-0001',
+      )
+      const sources = Object.freeze([{
         providerImageId: 'i_6xtuafkgqp',
         locatorSha256: sha('faire-chicken-apple-front'),
         sequence: 0,
@@ -182,6 +188,10 @@ test('queues only the exact reviewed Faire Product images with zero provider wri
         sequence: 1,
         url: 'https://cdn.faire.com/back.webp?token=secret-back',
       }])
+      return input.consume(sources, Object.freeze({
+        globalId: 'gcprl1234567',
+        controlRevision: 7,
+      }))
     },
     async reconcile(input) {
       reconciliationInput = input
@@ -257,7 +267,7 @@ test('rejects stale variant or SKU evidence before Faire I/O', async () => {
       async readTarget() {
         return target
       },
-      async readSources() {
+      async withSources() {
         sourceReadOperations += 1
         return []
       },
@@ -273,7 +283,7 @@ test('preserves sanitized provider errors without exposing raw locators', async 
       async readTarget() {
         return target
       },
-      async readSources() {
+      async withSources() {
         throw new CommerceProviderImageSourceError(
           'COMMERCE_PROVIDER_IMAGE_SOURCE_STALE',
           'Provider image source changed',
@@ -304,6 +314,8 @@ test('route and UI pin authenticated same-origin exact-target zero-write behavio
   assert.match(route, /expectedExternalProductId/u)
   assert.match(route, /expectedExternalVariantId/u)
   assert.match(route, /expectedProviderSku/u)
+  assert.match(route, /'idempotencyKey'/u)
+  assert.match(route, /idempotencyKey: body\.idempotencyKey/u)
   assert.match(route, /commerceReadRuntimeAvailable\(\)/u)
   assert.match(route, /FAIRE_PRODUCT_IMAGE_REFRESH_DISABLED/u)
   assert.ok(
@@ -332,6 +344,15 @@ test('route and UI pin authenticated same-origin exact-target zero-write behavio
   assert.match(panel, /makes two[\s\S]*read-only Faire requests/u)
   assert.match(panel, /expectedChannelStateRowVersion: channel\.rowVersion/u)
   assert.match(panel, /expectedChannelSourceRevision: channel\.sourceRevision/u)
+  assert.match(panel, /const pendingFaireRefresh = useRef/u)
+  assert.match(panel, /const fingerprint = JSON\.stringify\(command\)/u)
+  assert.match(panel, /body: JSON\.stringify\(\{ \.\.\.command, idempotencyKey \}\)/u)
+  assert.match(panel, /selectedFaireStoreSyncNormallyPaused/u)
+  assert.match(panel, /this explicit[\s\S]*refresh remains available/u)
+  assert.doesNotMatch(
+    panel,
+    /set Store sync[\s\S]*to Running before making a new Faire provider read/u,
+  )
 
   const persistence = read(
     'app_src/lib/persistence/faireProductImageRefresh.ts',

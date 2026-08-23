@@ -12,6 +12,19 @@ export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_SECONDS = 300 as const
 export const SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED_CODE =
   'SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED' as const
 
+export type ShopifyOrderManagementShippingAddress = {
+  firstName: string | null
+  lastName: string | null
+  company: string | null
+  address1: string | null
+  address2: string | null
+  city: string | null
+  provinceCode: string | null
+  countryCode: string | null
+  zip: string | null
+  phone: string | null
+}
+
 export type ShopifyOrderManagementAction =
   | { type: 'add_tag'; tag: string }
   | {
@@ -24,6 +37,20 @@ export type ShopifyOrderManagementAction =
       lineItemGid: string
       quantity: number
       staffNote?: string
+    }
+  | {
+      type: 'save_order'
+      email: string | null
+      phone: string | null
+      poNumber: string | null
+      note: string | null
+      shippingAddress: ShopifyOrderManagementShippingAddress | null
+      tagAdds: string[]
+      tagRemoves: string[]
+      lineQuantities: Array<{
+        lineItemGid: string
+        quantity: number
+      }>
     }
 
 export type ShopifyOrderManagementStatus =
@@ -44,8 +71,10 @@ export type ShopifyOrderManagementAuthorization = {
   externalAccountId: string
   shopDomain: string
   credentialGeneration: number
-  activationState: 'shadow' | 'active'
-  activationRevision: number
+  legacyActivationState: 'shadow' | 'active' | null
+  legacyActivationRevision: number | null
+  providerWriteControlRowVersion: number | null
+  providerWriteScopeDigest: string | null
   orderGlobalId: string
   externalOrderId: string
   orderNumber: string
@@ -64,6 +93,8 @@ export type ShopifyOrderManagementAuthorization = {
   tagHash: string | null
   cancelReason: 'STAFF' | 'OTHER' | null
   staffNoteHash: string | null
+  requestedProjectionHash: string | null
+  requiresOrderEdits: boolean
   authorizationReason: string
   intentHash: string
   idempotencyKey: string
@@ -71,7 +102,7 @@ export type ShopifyOrderManagementAuthorization = {
   status: ShopifyOrderManagementStatus
   storedStatus: ShopifyOrderManagementStatus
   authorizedBy: string
-  authorizedRole: 'owner' | 'admin'
+  authorizedRole: 'owner' | 'admin' | 'member'
   providerAttemptGlobalId: string | null
   processingLeaseExpiresAt: string | null
   latestOutcomeGlobalId: string | null
@@ -112,8 +143,10 @@ export type ShopifyOrderManagementTarget = {
   shopDomain: string | null
   credentialGeneration: number
   credentialCurrent: boolean
-  activationState: string
-  activationRevision: number
+  providerWriteControlRowVersion: number
+  providerWriteRequestedMode: 'off' | 'on'
+  providerWriteBindingCurrent: boolean
+  providerWriteScopeDigest: string | null
   orderGlobalId: string
   externalOrderId: string
   orderNumber: string
@@ -143,6 +176,7 @@ export type PrepareShopifyOrderManagementInput = {
   providerOrderTest: unknown
   action: unknown
   expectedLineQuantity?: unknown
+  requestedProjectionHash?: unknown
   reason: unknown
   idempotencyKey: unknown
 }
@@ -215,8 +249,10 @@ type AuthorizationRow = {
   external_account_id: string
   shop_domain: string
   credential_generation: number
-  activation_state: 'shadow' | 'active'
-  activation_revision: number
+  activation_state: 'shadow' | 'active' | null
+  activation_revision: number | null
+  provider_write_control_row_version: number | string | null
+  provider_write_scope_digest: string | null
   order_id: string
   order_global_id: string
   external_order_id: string
@@ -236,6 +272,8 @@ type AuthorizationRow = {
   tag_hash: string | null
   cancel_reason: 'STAFF' | 'OTHER' | null
   staff_note_hash: string | null
+  requested_projection_hash: string | null
+  requires_order_edits: boolean
   authorization_reason: string
   intent_hash: string
   idempotency_key: string
@@ -243,7 +281,7 @@ type AuthorizationRow = {
   status: ShopifyOrderManagementStatus
   effective_status?: ShopifyOrderManagementStatus
   authorized_by: string
-  authorized_role: 'owner' | 'admin'
+  authorized_role: 'owner' | 'admin' | 'member'
   provider_attempt_id: string | null
   provider_attempt_global_id?: string | null
   provider_attempt_hash?: string | null
@@ -278,8 +316,12 @@ type BindingRow = {
   credential_version: number
   auth_mode: string
   verification_status: string
-  activation_state: 'shadow' | 'active'
-  activation_revision: number
+  credential_last_error_code: string | null
+  provider_write_control_row_version: number | string
+  provider_write_requested_mode: 'off' | 'on'
+  provider_write_binding_current: boolean
+  provider_write_scope_digest: string | null
+  provider_write_bound_scopes: string[] | null
   order_id: string
   order_global_id: string
   external_order_id: string
@@ -318,6 +360,19 @@ const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/
+const COUNTRY_CODE = /^[A-Z]{2}$/
+const SHIPPING_ADDRESS_FIELDS = [
+  'firstName',
+  'lastName',
+  'company',
+  'address1',
+  'address2',
+  'city',
+  'provinceCode',
+  'countryCode',
+  'zip',
+  'phone',
+] as const
 
 function fail(code: string, message: string, status = 409): never {
   throw new ShopifyOrderManagementPersistenceError(code, message, status)
@@ -510,6 +565,148 @@ function optionalText(
   return normalized
 }
 
+function nullableActionText(
+  value: unknown,
+  label: string,
+  maximum: number,
+  allowEmpty = false,
+): string | null {
+  if (value === null) return null
+  if (typeof value !== 'string') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  const normalized = value.trim()
+  if (
+    normalized !== value
+    || normalized.length > maximum
+    || (!allowEmpty && normalized.length < 1)
+    || (normalized.length > 0 && !SAFE_TEXT.test(normalized))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+  return normalized
+}
+
+function normalizedTags(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.length > 250) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} are invalid`,
+      400,
+    )
+  }
+  const tags = value.map((entry) => {
+    const tag = nullableActionText(entry, label, 255)
+    if (!tag || tag.includes(',')) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        `${label} are invalid`,
+        400,
+      )
+    }
+    return tag
+  }).sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+  if (new Set(tags).size !== tags.length) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      `${label} contain duplicates`,
+      400,
+    )
+  }
+  return tags
+}
+
+function normalizedShippingAddress(
+  value: unknown,
+): ShopifyOrderManagementShippingAddress | null {
+  if (value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping address is invalid',
+      400,
+    )
+  }
+  const address = value as Record<string, unknown>
+  if (Object.keys(address).some((key) => (
+    !(SHIPPING_ADDRESS_FIELDS as readonly string[]).includes(key)
+  ))) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping address is invalid',
+      400,
+    )
+  }
+  const countryCode = nullableActionText(
+    address.countryCode,
+    'Shopify shipping-address country code',
+    2,
+  )
+  if (countryCode !== null && !COUNTRY_CODE.test(countryCode)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Shopify shipping-address country code is invalid',
+      400,
+    )
+  }
+  return {
+    firstName: nullableActionText(
+      address.firstName,
+      'Shopify shipping-address first name',
+      255,
+    ),
+    lastName: nullableActionText(
+      address.lastName,
+      'Shopify shipping-address last name',
+      255,
+    ),
+    company: nullableActionText(
+      address.company,
+      'Shopify shipping-address company',
+      255,
+    ),
+    address1: nullableActionText(
+      address.address1,
+      'Shopify shipping-address line 1',
+      255,
+    ),
+    address2: nullableActionText(
+      address.address2,
+      'Shopify shipping-address line 2',
+      255,
+    ),
+    city: nullableActionText(
+      address.city,
+      'Shopify shipping-address city',
+      255,
+    ),
+    provinceCode: nullableActionText(
+      address.provinceCode,
+      'Shopify shipping-address province or state code',
+      64,
+    ),
+    countryCode,
+    zip: nullableActionText(
+      address.zip,
+      'Shopify shipping-address postal code',
+      64,
+    ),
+    phone: nullableActionText(
+      address.phone,
+      'Shopify shipping-address phone',
+      64,
+    ),
+  }
+}
+
 export function normalizeShopifyOrderManagementAction(
   value: unknown,
 ): ShopifyOrderManagementAction {
@@ -573,9 +770,84 @@ export function normalizeShopifyOrderManagementAction(
       ...(staffNote ? { staffNote } : {}),
     }
   }
+  if (input.type === 'save_order') {
+    const tagAdds = normalizedTags(input.tagAdds, 'Shopify tags to add')
+    const tagRemoves = normalizedTags(
+      input.tagRemoves,
+      'Shopify tags to remove',
+    )
+    if (tagAdds.some((tag) => tagRemoves.includes(tag))) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify tag changes are contradictory',
+        400,
+      )
+    }
+    if (!Array.isArray(input.lineQuantities) || input.lineQuantities.length > 250) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify order line changes are invalid',
+        400,
+      )
+    }
+    const lineQuantities = input.lineQuantities.map((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+          'Shopify order line changes are invalid',
+          400,
+        )
+      }
+      const line = value as Record<string, unknown>
+      const lineItemGid = String(line.lineItemGid || '').trim()
+      if (!SHOPIFY_LINE_ITEM_GID.test(lineItemGid)) {
+        fail(
+          'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+          'A valid Shopify LineItem GID is required',
+          400,
+        )
+      }
+      return {
+        lineItemGid,
+        quantity: integer(line.quantity, 'Shopify line quantity'),
+      }
+    }).sort((left, right) => (
+      left.lineItemGid < right.lineItemGid
+        ? -1
+        : left.lineItemGid > right.lineItemGid ? 1 : 0
+    ))
+    if (new Set(lineQuantities.map((line) => line.lineItemGid)).size
+      !== lineQuantities.length) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Shopify order line changes contain duplicates',
+        400,
+      )
+    }
+    return {
+      type: 'save_order',
+      email: nullableActionText(input.email, 'Shopify order email', 254),
+      phone: nullableActionText(input.phone, 'Shopify order phone', 64),
+      poNumber: nullableActionText(
+        input.poNumber,
+        'Shopify order PO number',
+        255,
+      ),
+      note: nullableActionText(
+        input.note,
+        'Shopify order note',
+        5_000,
+        true,
+      ),
+      shippingAddress: normalizedShippingAddress(input.shippingAddress),
+      tagAdds,
+      tagRemoves,
+      lineQuantities,
+    }
+  }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
-    'Supported actions are add_tag, cancel, and set_line_quantity',
+    'Supported actions are add_tag, cancel, set_line_quantity, and save_order',
     400,
   )
 }
@@ -609,6 +881,16 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
         : null,
     }
   }
+  if (action.type === 'save_order') {
+    return {
+      action: action.type,
+      lineItemGid: null,
+      requestedQuantity: null,
+      tagHash: null,
+      cancelReason: null,
+      staffNoteHash: null,
+    }
+  }
   return {
     action: action.type,
     lineItemGid: action.lineItemGid,
@@ -622,6 +904,21 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
         })
       : null,
   }
+}
+
+function projectionHash(value: unknown, required: boolean) {
+  if (!required && (value === undefined || value === null || value === '')) {
+    return null
+  }
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!SHA256.test(normalized)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'A valid requested Shopify order projection hash is required',
+      400,
+    )
+  }
+  return normalized
 }
 
 function expectedLineQuantity(
@@ -682,6 +979,26 @@ function authorization(
     || row.provider_write_count === undefined
     ? null
     : Number(row.provider_write_count)
+  const providerWriteControlRowVersion =
+    row.provider_write_control_row_version === null
+      ? null
+      : Number(row.provider_write_control_row_version)
+  if ((
+    providerWriteControlRowVersion !== null
+    && (!Number.isSafeInteger(providerWriteControlRowVersion)
+      || providerWriteControlRowVersion < 1
+      || !row.provider_write_scope_digest
+      || !SHA256.test(row.provider_write_scope_digest))
+  ) || (
+    providerWriteControlRowVersion === null
+    && row.provider_write_scope_digest !== null
+  )) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_EVIDENCE_INVALID',
+      'Stored Provider writes binding is invalid',
+      500,
+    )
+  }
   return {
     authorizationGlobalId: row.global_id,
     organizationId: row.organization_id,
@@ -691,8 +1008,12 @@ function authorization(
     externalAccountId: row.external_account_id,
     shopDomain: row.shop_domain,
     credentialGeneration: Number(row.credential_generation),
-    activationState: row.activation_state,
-    activationRevision: Number(row.activation_revision),
+    legacyActivationState: row.activation_state,
+    legacyActivationRevision: row.activation_revision === null
+      ? null
+      : Number(row.activation_revision),
+    providerWriteControlRowVersion,
+    providerWriteScopeDigest: row.provider_write_scope_digest,
     orderGlobalId: row.order_global_id,
     externalOrderId: row.external_order_id,
     orderNumber: row.order_number,
@@ -714,6 +1035,8 @@ function authorization(
     tagHash: row.tag_hash,
     cancelReason: row.cancel_reason,
     staffNoteHash: row.staff_note_hash,
+    requestedProjectionHash: row.requested_projection_hash || null,
+    requiresOrderEdits: row.requires_order_edits === true,
     authorizationReason: row.authorization_reason,
     intentHash: row.intent_hash,
     idempotencyKey: row.idempotency_key,
@@ -771,7 +1094,7 @@ async function requireActorRole(
   client: PoolClient,
   input: { organizationId: string; actorEmail: string },
 ) {
-  const result = await client.query<{ role: 'owner' | 'admin' }>(
+  const result = await client.query<{ role: 'owner' | 'admin' | 'member' }>(
     `SELECT membership.role
      FROM app_user_organization_memberships membership
      WHERE membership.organization_id = $1::uuid
@@ -779,26 +1102,19 @@ async function requireActorRole(
        AND membership.status = 'active'
        AND (
          membership.role = 'owner'
-         OR (
-           membership.role = 'admin'
-           AND COALESCE(
-             (membership.permissions->>'manageOperations')::boolean,
-             false
-           )
-           AND COALESCE(
-             (membership.permissions->>'executeWarehouse')::boolean,
-             false
-           )
+         OR COALESCE(
+           (membership.permissions->>'manageOperations')::boolean,
+           false
          )
        )
      FOR SHARE`,
     [input.organizationId, input.actorEmail],
   )
   const role = result.rows[0]?.role
-  if (role !== 'owner' && role !== 'admin') {
+  if (role !== 'owner' && role !== 'admin' && role !== 'member') {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
-      'Shopify order management requires an owner or a fully authorized operations administrator',
+      'Shopify order management requires Operations-management permission',
       403,
     )
   }
@@ -825,8 +1141,30 @@ async function readBinding(
        credential.credential_version,
        credential.auth_mode,
        credential.verification_status,
-       activation.state AS activation_state,
-       activation.revision AS activation_revision,
+       credential.last_error_code AS credential_last_error_code,
+       provider_control.row_version AS provider_write_control_row_version,
+       provider_control.requested_mode AS provider_write_requested_mode,
+       provider_control.bound_granted_scope_digest
+         AS provider_write_scope_digest,
+       provider_control.bound_granted_scopes
+         AS provider_write_bound_scopes,
+       (
+         provider_control.requested_mode = 'on'
+         AND provider_control.row_version > 0
+         AND provider_control.bound_credential_generation =
+               account.commerce_credential_generation
+         AND provider_control.bound_granted_scopes =
+               operations_commerce_granted_scope_snapshot(
+                 account.configuration
+               )
+         AND 'write_orders' = ANY(provider_control.bound_granted_scopes)
+         AND provider_control.bound_granted_scope_digest =
+               operations_commerce_granted_scope_digest(
+                 operations_commerce_granted_scope_snapshot(
+                   account.configuration
+                 )
+               )
+       ) AS provider_write_binding_current,
        order_row.id::text AS order_id,
        order_row.global_id AS order_global_id,
        order_row.external_order_id,
@@ -852,8 +1190,9 @@ async function readBinding(
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_provider_write_control_current provider_control
+       ON provider_control.organization_id = account.organization_id
+      AND provider_control.integration_account_id = account.id
      JOIN operations_commerce_order_revision_targets target
        ON target.organization_id = order_row.organization_id
       AND target.order_id = order_row.id
@@ -870,7 +1209,7 @@ async function readBinding(
      WHERE order_row.organization_id = $1::uuid
        AND account.global_id = $2
        AND order_row.global_id = $3
-     FOR UPDATE OF order_row, account, credential, activation, target`,
+     FOR UPDATE OF order_row, account, credential, target`,
     [input.organizationId, input.accountGlobalId, input.orderGlobalId],
   )
   const row = result.rows[0]
@@ -891,6 +1230,7 @@ function assertCurrentBinding(
     expectedSourceHash: string
     action: ShopifyOrderManagementAction['type']
     providerOrderUpdatedAt: string
+    requiresOrderEdits?: boolean
   },
 ) {
   if (
@@ -902,11 +1242,25 @@ function assertCurrentBinding(
     || row.credential_version !== row.credential_generation
     || row.auth_mode !== 'shopify_client_credentials'
     || row.verification_status !== 'verified'
-    || !['shadow', 'active'].includes(row.activation_state)
+    || row.credential_last_error_code !== null
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_CURRENT',
-      'The Shopify sandbox account, credential, or activation is not current',
+      'The Shopify sandbox account or credential is not current',
+    )
+  }
+  if (
+    row.provider_write_requested_mode !== 'on'
+    || row.provider_write_binding_current !== true
+    || Number(row.provider_write_control_row_version) < 1
+    || !row.provider_write_scope_digest
+    || !SHA256.test(row.provider_write_scope_digest)
+    || (input.requiresOrderEdits
+      && !row.provider_write_bound_scopes?.includes('write_order_edits'))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
+      'Turn Provider writes On for this Shopify connection before saving changes',
     )
   }
   if (
@@ -965,6 +1319,19 @@ export async function prepareShopifyOrderManagementInPostgres(
   )
   const expectedSourceHash = sourceHash(input.expectedSourceHash)
   const action = normalizeShopifyOrderManagementAction(input.action)
+  const requestedProjectionHash = projectionHash(
+    input.requestedProjectionHash,
+    action.type === 'save_order',
+  )
+  if (action.type !== 'save_order' && requestedProjectionHash !== null) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'Requested order projection applies only to a combined order save',
+      400,
+    )
+  }
+  const requiresOrderEdits = action.type === 'save_order'
+    && action.lineQuantities.length > 0
   const expectedLineQuantityValue = expectedLineQuantity(
     input.expectedLineQuantity,
     action,
@@ -984,8 +1351,9 @@ export async function prepareShopifyOrderManagementInPostgres(
     accountGlobalId,
     orderGlobalId,
     expectedOrderRowVersion,
-    expectedSourceHash,
-    intentHash: exactIntentHash,
+      expectedSourceHash,
+      intentHash: exactIntentHash,
+      requestedProjectionHash,
   })
 
   return withTransaction(async (client) => {
@@ -1031,10 +1399,17 @@ export async function prepareShopifyOrderManagementInPostgres(
       )
     }
     const providerOrderTest = input.providerOrderTest
-    if (action.type !== 'add_tag' && !providerOrderTest) {
+    if (
+      (
+        action.type === 'cancel'
+        || action.type === 'set_line_quantity'
+        || requiresOrderEdits
+      )
+      && !providerOrderTest
+    ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
-        'Cancellation and quantity changes require a Shopify test order',
+        'Cancellation and line quantity changes require a Shopify test order',
         409,
       )
     }
@@ -1046,6 +1421,8 @@ export async function prepareShopifyOrderManagementInPostgres(
       providerOrderObservedAt,
       providerOrderTest,
       expectedLineQuantity: expectedLineQuantityValue,
+      requestedProjectionHash,
+      requiresOrderEdits,
     })
 
     await acquireTransactionAdvisoryLock(
@@ -1078,6 +1455,7 @@ export async function prepareShopifyOrderManagementInPostgres(
       expectedSourceHash,
       action: action.type,
       providerOrderUpdatedAt,
+      requiresOrderEdits,
     })
     const acceptedObservationId = action.type === 'add_tag'
       ? null : binding.accepted_observation_id
@@ -1092,13 +1470,16 @@ export async function prepareShopifyOrderManagementInPostgres(
          organization_id, integration_account_id,
          integration_account_global_id, provider, account_environment,
          external_account_id, shop_domain, credential_generation,
-         activation_state, activation_revision, order_id, order_global_id,
+         provider_write_control_row_version, provider_write_scope_digest,
+         order_id, order_global_id,
          external_order_id, order_number, expected_order_row_version,
          expected_source_hash, provider_order_updated_at,
          provider_order_observed_at, provider_order_test,
          provider_snapshot_hash, action, line_item_id,
          expected_line_quantity, requested_quantity,
-         tag_hash, cancel_reason, staff_note_hash, authorization_reason,
+         tag_hash, cancel_reason, staff_note_hash,
+         requested_projection_hash, requires_order_edits,
+         authorization_reason,
          intent_hash,
          idempotency_key, request_hash, status, authorized_by,
          authorized_role, accepted_observation_id,
@@ -1108,8 +1489,8 @@ export async function prepareShopifyOrderManagementInPostgres(
          $1::uuid, $2::uuid, $3, 'shopify', $4, $5, $6, $7,
          $8, $9, $10::uuid, $11, $12, $13, $14::bigint, $15,
          $16::timestamptz, $17::timestamptz, $18, $19, $20, $21,
-         $22, $23, $24, $25, $26, $27, $28, $29, $30, 'prepared',
-         $31, $32, $33::uuid, $34::timestamptz,
+         $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
+         $32, 'prepared', $33, $34, $35::uuid, $36::timestamptz,
          prepared_clock.prepared_at,
          prepared_clock.prepared_at + interval '5 minutes'
        FROM prepared_clock
@@ -1122,8 +1503,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         binding.external_account_id,
         binding.shop_domain,
         binding.credential_generation,
-        binding.activation_state,
-        binding.activation_revision,
+        Number(binding.provider_write_control_row_version),
+        binding.provider_write_scope_digest,
         binding.order_id,
         binding.order_global_id,
         binding.external_order_id,
@@ -1141,6 +1522,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         actionFacts.tagHash,
         actionFacts.cancelReason,
         actionFacts.staffNoteHash,
+        requestedProjectionHash,
+        requiresOrderEdits,
         reason,
         exactIntentHash,
         key,
@@ -1166,7 +1549,9 @@ export async function prepareShopifyOrderManagementInPostgres(
         externalOrderId: row.external_order_id,
         action: row.action,
         credentialGeneration: row.credential_generation,
-        activationRevision: row.activation_revision,
+        providerWriteControlRowVersion:
+          row.provider_write_control_row_version,
+        providerWriteScopeDigest: row.provider_write_scope_digest,
         expectedOrderRowVersion,
         expectedSourceHash,
         acceptedObservationId,
@@ -1175,6 +1560,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         intentHash: exactIntentHash,
         authorizationReason: reason,
         expectedLineQuantity: expectedLineQuantityValue,
+        requestedProjectionHash,
+        requiresOrderEdits,
         expiresAt: iso(row.expires_at),
         providerWrites: 0,
       },
@@ -1230,11 +1617,21 @@ export async function claimShopifyOrderManagementInPostgres(
         404,
       )
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-provider-writes:${scopedOrganizationId}:${row.integration_account_global_id}`,
+    )
     if (
       row.authorized_by !== claimedBy
       || row.authorized_role !== role
       || row.authorization_reason !== reason
       || row.expected_line_quantity !== expectedLineQuantityValue
+      || row.requires_order_edits !== (
+        action.type === 'save_order' && action.lineQuantities.length > 0
+      )
+      || (action.type === 'save_order') !== Boolean(
+        row.requested_projection_hash,
+      )
       || row.intent_hash !== exactIntentHash
     ) {
       fail(
@@ -1282,7 +1679,7 @@ export async function claimShopifyOrderManagementInPostgres(
     if (current.rows[0]?.current !== true) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
-        'The account, credential, activation, order, source, or warehouse state changed',
+        'The account, credential, Provider writes control, order, source, or warehouse state changed',
       )
     }
     await acquireTransactionAdvisoryLock(
@@ -1295,7 +1692,9 @@ export async function claimShopifyOrderManagementInPostgres(
       organizationId: row.organization_id,
       accountGlobalId: row.integration_account_global_id,
       credentialGeneration: row.credential_generation,
-      activationRevision: row.activation_revision,
+      providerWriteControlRowVersion:
+        row.provider_write_control_row_version,
+      providerWriteScopeDigest: row.provider_write_scope_digest,
       orderGlobalId: row.order_global_id,
       externalOrderId: row.external_order_id,
       expectedOrderRowVersion: Number(row.expected_order_row_version),
@@ -1305,6 +1704,8 @@ export async function claimShopifyOrderManagementInPostgres(
         iso(row.accepted_provider_order_updated_at),
       providerSnapshotHash: row.provider_snapshot_hash,
       expectedLineQuantity: row.expected_line_quantity,
+      requestedProjectionHash: row.requested_projection_hash,
+      requiresOrderEdits: row.requires_order_edits,
       intentHash: row.intent_hash,
     })
     const attempted = await client.query<{
@@ -1319,16 +1720,18 @@ export async function claimShopifyOrderManagementInPostgres(
        INSERT INTO operations_shopify_order_management_attempts (
          organization_id, authorization_id, integration_account_id,
          integration_account_global_id, provider, external_account_id,
-         credential_generation, activation_revision, order_id,
+         credential_generation, provider_write_control_row_version,
+         provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
          expected_source_hash, provider_snapshot_hash, action, intent_hash,
-         expected_line_quantity, attempt_hash, dispatch_state, claimed_by,
+         expected_line_quantity, requested_projection_hash,
+         requires_order_edits, attempt_hash, dispatch_state, claimed_by,
          accepted_observation_id, accepted_provider_order_updated_at,
          claimed_at, processing_lease_expires_at
        ) SELECT
          $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
-         $8::uuid, $9, $10, $11::bigint, $12, $13, $14, $15, $16,
-         $17, 'authorized', $18, $19::uuid, $20::timestamptz,
+         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15, $16,
+         $17, $18, $19, $20, 'authorized', $21, $22::uuid, $23::timestamptz,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -1341,7 +1744,8 @@ export async function claimShopifyOrderManagementInPostgres(
         row.integration_account_global_id,
         row.external_account_id,
         row.credential_generation,
-        row.activation_revision,
+        row.provider_write_control_row_version,
+        row.provider_write_scope_digest,
         row.order_id,
         row.order_global_id,
         row.external_order_id,
@@ -1351,6 +1755,8 @@ export async function claimShopifyOrderManagementInPostgres(
         row.action,
         row.intent_hash,
         row.expected_line_quantity,
+        row.requested_projection_hash,
+        row.requires_order_edits,
         attemptHash,
         claimedBy,
         row.accepted_observation_id,
@@ -1389,7 +1795,9 @@ export async function claimShopifyOrderManagementInPostgres(
         externalOrderId: row.external_order_id,
         action: row.action,
         credentialGeneration: row.credential_generation,
-        activationRevision: row.activation_revision,
+        providerWriteControlRowVersion:
+          row.provider_write_control_row_version,
+        providerWriteScopeDigest: row.provider_write_scope_digest,
         expectedOrderRowVersion: Number(row.expected_order_row_version),
         expectedSourceHash: row.expected_source_hash,
         acceptedObservationId: row.accepted_observation_id,
@@ -1397,6 +1805,8 @@ export async function claimShopifyOrderManagementInPostgres(
           iso(row.accepted_provider_order_updated_at),
         providerSnapshotHash: row.provider_snapshot_hash,
         expectedLineQuantity: row.expected_line_quantity,
+        requestedProjectionHash: row.requested_projection_hash,
+        requiresOrderEdits: row.requires_order_edits,
         intentHash: row.intent_hash,
         authorizationReason: row.authorization_reason,
         attemptHash,
@@ -1488,10 +1898,10 @@ function providerWriteCount(
     )
   }
   const normalized = Number(value)
-  if (!Number.isSafeInteger(normalized) || normalized < 0 || normalized > 3) {
+  if (!Number.isSafeInteger(normalized) || normalized < 0 || normalized > 253) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_OUTCOME_INVALID',
-      'Provider write count must be an integer from zero through three',
+      'Provider write count must be an integer from zero through 253',
       400,
     )
   }
@@ -2106,8 +2516,10 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     shop_domain: string | null
     commerce_credential_generation: number
     credential_current: boolean
-    activation_state: string
-    activation_revision: number
+    provider_write_control_row_version: string | number
+    provider_write_requested_mode: 'off' | 'on'
+    provider_write_scope_digest: string | null
+    provider_write_binding_current: boolean
     order_global_id: string
     external_order_id: string
     order_number: string
@@ -2140,9 +2552,29 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
                account.commerce_credential_generation
          AND credential.auth_mode = 'shopify_client_credentials'
          AND credential.verification_status = 'verified'
+         AND credential.last_error_code IS NULL
        ) AS credential_current,
-       activation.state AS activation_state,
-       activation.revision AS activation_revision,
+       provider_control.row_version AS provider_write_control_row_version,
+       provider_control.requested_mode AS provider_write_requested_mode,
+       provider_control.bound_granted_scope_digest
+         AS provider_write_scope_digest,
+       (
+         provider_control.requested_mode = 'on'
+         AND provider_control.row_version > 0
+         AND provider_control.bound_credential_generation =
+               account.commerce_credential_generation
+         AND provider_control.bound_granted_scopes =
+               operations_commerce_granted_scope_snapshot(
+                 account.configuration
+               )
+         AND 'write_orders' = ANY(provider_control.bound_granted_scopes)
+         AND provider_control.bound_granted_scope_digest =
+               operations_commerce_granted_scope_digest(
+                 operations_commerce_granted_scope_snapshot(
+                   account.configuration
+                 )
+               )
+       ) AS provider_write_binding_current,
        order_row.global_id AS order_global_id,
        order_row.external_order_id,
        order_row.order_number,
@@ -2171,8 +2603,9 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
      LEFT JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = order_row.organization_id
+     JOIN operations_commerce_provider_write_control_current provider_control
+       ON provider_control.organization_id = account.organization_id
+      AND provider_control.integration_account_id = account.id
      JOIN operations_commerce_order_revision_targets target
        ON target.organization_id = order_row.organization_id
       AND target.order_id = order_row.id
@@ -2238,8 +2671,13 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     shopDomain: row.shop_domain,
     credentialGeneration: Number(row.commerce_credential_generation),
     credentialCurrent: row.credential_current === true,
-    activationState: row.activation_state,
-    activationRevision: Number(row.activation_revision),
+    providerWriteControlRowVersion: Number(
+      row.provider_write_control_row_version,
+    ),
+    providerWriteRequestedMode: row.provider_write_requested_mode,
+    providerWriteBindingCurrent:
+      row.provider_write_binding_current === true,
+    providerWriteScopeDigest: row.provider_write_scope_digest,
     orderGlobalId: row.order_global_id,
     externalOrderId: row.external_order_id,
     orderNumber: row.order_number,

@@ -59,11 +59,83 @@ const oneOffConstants = runModule(
   (specifier) => requireFromApp(specifier),
 )
 
+const productionLabelRuntime = runModule(
+  'app_src/lib/integrations/carrierProductionLabelRuntime.ts',
+  (specifier) => requireFromApp(specifier),
+)
+
 const operationsContract = runModule(
   'app_src/lib/operations/oneOffShipments.ts',
-  (specifier) => specifier === '@/lib/operations/oneOffShipmentConstants'
-    ? oneOffConstants
-    : requireFromApp(specifier),
+  (specifier) => {
+    if (specifier === '@/lib/operations/oneOffShipmentConstants') return oneOffConstants
+    if (specifier === '@/lib/integrations/carrierProductionLabelRuntime') {
+      return productionLabelRuntime
+    }
+    return requireFromApp(specifier)
+  },
+)
+
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+    RAILWAY_ENVIRONMENT_NAME: 'development',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntime
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+  }),
+  'production',
+  'Trusted Railway development must expose the production one-off carrier environment',
+)
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+  }),
+  'sandbox',
+  'A generic local development runtime must not expose production postage',
+)
+assert.equal(
+  operationsContract.oneOffRateEnvironment({
+    CLAWPILOT_ENV: 'development',
+    RAILWAY_ENVIRONMENT_NAME: 'development',
+    RAILWAY_PROJECT_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_PROJECT_ID,
+    RAILWAY_SERVICE_ID:
+      productionLabelRuntime.CARRIER_PRODUCTION_LABEL_RAILWAY_SERVICE_ID,
+    RAILWAY_ENVIRONMENT_ID:
+      productionLabelRuntime
+        .CARRIER_PRODUCTION_LABEL_RAILWAY_DEVELOPMENT_ENVIRONMENT_ID,
+    VERCEL: '1',
+    VERCEL_ENV: 'preview',
+  }),
+  'sandbox',
+  'A Vercel preview must remain unable to select production postage',
+)
+
+for (const operationsState of [
+  'absent', 'disabled', 'shadow', 'read_only', 'active', 'frozen',
+]) {
+  const readiness = operationsContract.oneOffShippingExecutionModes({
+    runtimeEnvironment: 'production',
+    canPurchaseLivePostage: true,
+    sandboxCarrierCount: 1,
+    productionCarrierCount: 1,
+  })
+  assert.equal(readiness[0].enabled, true, `${operationsState} must not affect TEST`)
+  assert.equal(readiness[1].enabled, true, `${operationsState} must not affect LIVE`)
+}
+assert.equal(
+  operationsContract.oneOffShippingExecutionModes({
+    runtimeEnvironment: 'production',
+    canPurchaseLivePostage: false,
+    sandboxCarrierCount: 1,
+    productionCarrierCount: 1,
+  })[1].enabled,
+  false,
+  'LIVE must remain denied without explicit live-postage permission',
 )
 
 const clientAttempts = runModule(
@@ -268,6 +340,66 @@ assert.equal(normalized.shipTo.postalCode, '02108')
 assert.equal(normalized.packages[0].allocations[0].quantity, 2)
 assert.equal(normalized.packages[0].packageProfile.catalogEntryId, 'custom')
 assert.equal(normalized.selectedCarriers[0].provider, 'ups_rest')
+
+const directRecipientAdHoc = validQuote()
+directRecipientAdHoc.customerGlobalId = null
+directRecipientAdHoc.inventoryPoolGlobalId = null
+directRecipientAdHoc.receivingLocationGlobalId = null
+directRecipientAdHoc.lines = [{
+  kind: 'ad_hoc',
+  lineKey: 'line-adhoc-1',
+  name: 'Documents / paperwork',
+  sku: null,
+  quantity: 1,
+  unitPriceMinor: 0,
+  unitWeightGrams: null,
+  unitDimensionsMm: null,
+}]
+directRecipientAdHoc.packages[0].allocations = [{
+  lineKey: 'line-adhoc-1',
+  quantity: 1,
+}]
+const normalizedAdHoc = validateOneOffShipmentQuoteInput(directRecipientAdHoc)
+assert.equal(normalizedAdHoc.customerGlobalId, null)
+assert.equal(normalizedAdHoc.inventoryPoolGlobalId, null)
+assert.equal(normalizedAdHoc.receivingLocationGlobalId, null)
+assert.equal(normalizedAdHoc.lines[0].kind, 'ad_hoc')
+assert.equal(normalizedAdHoc.lines[0].unitWeightGrams, null)
+assert.equal(normalizedAdHoc.lines[0].unitDimensionsMm, null)
+
+const measuredAdHoc = structuredClone(directRecipientAdHoc)
+measuredAdHoc.lines[0].unitWeightGrams = 450
+measuredAdHoc.lines[0].unitDimensionsMm = { length: 220, width: 140, height: 80 }
+assert.equal(
+  validateOneOffShipmentQuoteInput(measuredAdHoc).lines[0].unitWeightGrams,
+  450,
+  'Existing factual ad-hoc unit measurements remain supported',
+)
+
+const partialAdHocMeasurements = structuredClone(directRecipientAdHoc)
+partialAdHocMeasurements.lines[0].unitWeightGrams = 450
+assert.throws(
+  () => validateOneOffShipmentQuoteInput(partialAdHocMeasurements),
+  (error) => error instanceof OneOffShipmentPersistenceError
+    && error.code === 'OPERATIONS_ONE_OFF_REQUEST_INVALID',
+  'Ad-hoc unit facts must be wholly present or wholly omitted',
+)
+
+const mixedMissingMeasurements = validQuote()
+mixedMissingMeasurements.lines.push({
+  ...structuredClone(directRecipientAdHoc.lines[0]),
+  lineKey: 'line-adhoc-mixed',
+})
+mixedMissingMeasurements.packages[0].allocations.push({
+  lineKey: 'line-adhoc-mixed',
+  quantity: 1,
+})
+assert.throws(
+  () => validateOneOffShipmentQuoteInput(mixedMissingMeasurements),
+  (error) => error instanceof OneOffShipmentPersistenceError
+    && error.code === 'OPERATIONS_ONE_OFF_AD_HOC_PHYSICAL_FACTS_REQUIRED',
+  'Only pure productless shipments may rely solely on parcel physical facts',
+)
 
 assert.equal(
   nextOneOffWwexShipmentDateTime(new Date('2026-08-14T23:59:59.000Z')),
@@ -485,6 +617,9 @@ assertRequestError((input) => {
 }, 'OPERATIONS_ONE_OFF_PACKAGE_SELECTION_UNSUPPORTED')
 
 const persistenceSource = read('app_src/lib/persistence/oneOffShipments.ts')
+const groupPersistenceSource = read(
+  'app_src/lib/persistence/operationOneOffShipping.ts',
+)
 const routeSource = read('app_src/app/api/operations/one-off-shipments/route.ts')
 const migrationSource = read('db/migrations/0258_operations_one_off_shipments.sql')
 const uiSource = read('app_src/components/operations/OneOffShipmentDialog.tsx')
@@ -495,11 +630,28 @@ assert.ok(
   commandPosition >= 0 && mutableScopePosition > commandPosition,
   'An idempotent quote replay must be resolved before mutable scope and carrier checks',
 )
+assert.match(
+  persistenceSource,
+  /enabledOneOffRateSources\(organizationId, undefined, 'sandbox'\)[\s\S]*enabledOneOffRateSources\(organizationId, undefined, 'production'\)/,
+  'The workspace must retain both sandbox TEST and production LIVE carrier choices',
+)
+assert.ok(
+  persistenceSource.includes('oneOffShippingExecutionModes({'),
+  'Workspace readiness must use the activation-independent TEST/LIVE helper',
+)
+assert.match(
+  groupPersistenceSource,
+  /input\.executionMode === 'live'[\s\S]*resolveCarrierProductionShippingRuntime\([\s\S]*resolveCarrierSandboxShippingRuntime\(/,
+  'The selected execution mode must resolve the matching production or sandbox provider runtime',
+)
 
 for (const fragment of [
   'OPERATIONS_ONE_OFF_LIVE_RUNTIME_REQUIRED',
   "quote.executionMode === 'live' ? 'production' : 'sandbox'",
-  "active.state !== 'shadow'",
+  'shippingScope(client, organizationId',
+  'operations_one_off_ad_hoc_order_lines',
+  'operations_one_off_ad_hoc_package_contents',
+  "shipmentLine.kind === 'ad_hoc'",
   'OPERATIONS_ONE_OFF_QUOTE_STALE',
   'inventorySnapshotHash',
   "source_authority = 'clawpilot'",
@@ -614,8 +766,18 @@ assert.ok(
 )
 
 assert.ok(
-  (routeSource.match(/!capabilities\.canManage \|\| !capabilities\.canExecute/g) || []).length >= 2,
-  'Workspace reads and mutations must both require management and execution permission',
+  (routeSource.match(/!capabilities\.canCreate/g) || []).length >= 2,
+  'Workspace reads and mutations must both require Shipping creation permission',
+)
+assert.doesNotMatch(
+  routeSource,
+  /operationsCapabilities|canManage|canExecute/,
+  'One-off routes must not depend on Operations capabilities',
+)
+assert.match(
+  routeSource,
+  /executionMode === 'live' && !capabilities\.canPurchaseLivePostage/,
+  'LIVE actions must require the independent live-postage capability',
 )
 
 for (const fragment of [

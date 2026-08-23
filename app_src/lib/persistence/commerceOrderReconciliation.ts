@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { CommerceIntegrationRequestError } from '@/lib/integrations/commerceIntegrations'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   AUTOMATIC_FAIRE_EXACT_REFRESH_ATTENTION_MARKER,
   AUTOMATIC_FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_MARKER,
@@ -21,6 +22,7 @@ const ORDER_RECONCILIATION_INTERVAL = '30 minutes'
 const ORDER_RECONCILIATION_LEASE = '10 minutes'
 const WORKER_HEARTBEAT_KEY = 'commerce_order_reconciliation_worker_heartbeat'
 const ORDER_READ_ACCOUNT_SQL = commerceReadAccountSql('account')
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 export const FAIRE_AUTO_PROMOTION_ATTENTION_CODE =
   AUTOMATIC_FAIRE_ORDER_PROMOTION_ATTENTION_MARKER
 export const FAIRE_LEGACY_UNATTRIBUTED_ATTENTION_CODE =
@@ -226,7 +228,7 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
          AND credential.credential_version =
              account.commerce_credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.state IN ('shadow', 'active')
+         AND ${STORE_SYNC_RUNNING_SQL}
          AND ${ORDER_READABLE_CONNECTION_SQL}
      ),
      state AS (
@@ -452,7 +454,7 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
            AND credential.credential_version
              = account.commerce_credential_generation
            AND credential.verification_status = 'verified'
-           AND activation.state IN ('shadow', 'active')
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND ${ORDER_READABLE_CONNECTION_SQL}
            AND NOT COALESCE((
              cursor.reconciliation_status = 'failed'

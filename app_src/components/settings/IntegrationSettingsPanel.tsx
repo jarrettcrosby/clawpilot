@@ -11,8 +11,7 @@ import LocalShippingRounded from '@mui/icons-material/LocalShippingRounded'
 import ManageSearchRounded from '@mui/icons-material/ManageSearchRounded'
 import RestaurantRounded from '@mui/icons-material/RestaurantRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
-import CarrierIntegrationPanel from './CarrierIntegrationPanel'
-import BrokeredTransportIntegrationPanel from './BrokeredTransportIntegrationPanel'
+import CarrierConnectionsPanel from './CarrierConnectionsPanel'
 import CommerceIntegrationPanel from './CommerceIntegrationPanel'
 import EmbeddingSettingsPanel from './EmbeddingSettingsPanel'
 import GoogleWorkspaceIntegrationPanel from './GoogleWorkspaceIntegrationPanel'
@@ -34,11 +33,13 @@ export default function IntegrationSettingsPanel({
   isOwner,
   canManageOrganizationIntegrations,
   canManageOperationsIntegrations,
+  onNavigate,
 }: {
   initialIntegration?: 'commerce'
   isOwner: boolean
   canManageOrganizationIntegrations: boolean
   canManageOperationsIntegrations: boolean
+  onNavigate?: (hash: string) => void
 }) {
   const [activeIntegration, setActiveIntegration] = useState<IntegrationKey>(
     initialIntegration === 'commerce' && canManageOperationsIntegrations
@@ -47,10 +48,6 @@ export default function IntegrationSettingsPanel({
         ? (isOwner ? 'google' : 'maton')
         : 'shipping',
   )
-  const [shippingCapability, setShippingCapability] = useState<
-    'small_parcel' | 'ltl'
-  >('small_parcel')
-
   if (!canManageOrganizationIntegrations && !canManageOperationsIntegrations) {
     return (
       <Box role="tabpanel" id="settings-panel-3" aria-labelledby="settings-tab-3">
@@ -135,42 +132,12 @@ export default function IntegrationSettingsPanel({
       ) : null}
       {activeIntegration === 'shipping' ? (
         <Box role="tabpanel" id="integration-panel-shipping" aria-labelledby="integration-tab-shipping">
-          <Tabs
-            data-testid="shipping-integration-capability-tabs"
-            value={shippingCapability}
-            onChange={(_, value: 'small_parcel' | 'ltl') => (
-              setShippingCapability(value)
-            )}
-            variant="fullWidth"
-            aria-label="Shipping integration capability"
-            sx={{
-              maxWidth: 840,
-              mx: 'auto',
-              mb: 3,
-              minHeight: 44,
-              borderBottom: '1px solid rgba(255,255,255,0.08)',
-              '& .MuiTab-root': { minHeight: 44 },
-            }}
-          >
-            <Tab
-              value="small_parcel"
-              label="Small Parcel · UPS / FedEx / Worldwide Express"
-            />
-            <Tab
-              value="ltl"
-              label="LTL · R+L / Worldwide Express"
-            />
-          </Tabs>
-          {shippingCapability === 'small_parcel' ? (
-            <CarrierIntegrationPanel brokeredFocus="small_parcel" />
-          ) : (
-            <BrokeredTransportIntegrationPanel focus="ltl" />
-          )}
+          <CarrierConnectionsPanel onNavigate={onNavigate} />
         </Box>
       ) : null}
       {activeIntegration === 'commerce' ? (
         <Box role="tabpanel" id="integration-panel-commerce" aria-labelledby="integration-tab-commerce">
-          <CommerceIntegrationPanel />
+          <CommerceIntegrationPanel onNavigate={onNavigate} />
         </Box>
       ) : null}
       {activeIntegration === 'knowledge' && isOwner ? (

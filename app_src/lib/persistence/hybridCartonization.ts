@@ -6,7 +6,7 @@ import type {
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
 import {
-  isShopifySandboxCheckoutChannelEligible,
+  isShopifyRatingCheckoutChannelEligible,
 } from '@/lib/integrations/shopifyCheckoutChannelEligibility'
 import { getPostgresPool } from '@/lib/persistence/postgres'
 import {
@@ -48,6 +48,7 @@ export type HybridCartonizationInventoryProductEvidence = {
   availabilityAuthority:
     | 'operational_available'
     | 'shopify_provider_commitment'
+    | 'shadow_training_simulated'
   operationalAvailableQuantity: number
   providerCommittedQuantity: number
   activeReservedQuantity: number
@@ -89,6 +90,7 @@ export type HybridCartonizationReadResult = {
   warehouse: {
     globalId: string
     name: string
+    address: Record<string, unknown>
   }
   inventory: {
     syncRunGlobalId: string | null
@@ -250,7 +252,7 @@ export function assertHybridCartonizationCandidateEligible(input: {
     input.workflowState,
   )
   const promotedOperationalState = (
-    input.mode === 'production'
+    ['production', 'shadow_training_simulated'].includes(input.mode)
     && input.workflowState === 'promoted'
   )
   if (!prePromotionState && !promotedOperationalState) {
@@ -284,6 +286,7 @@ type WarehouseRow = {
   id: string
   global_id: string
   name: string
+  address: Record<string, unknown>
 }
 
 type InventoryRunRow = {
@@ -1180,7 +1183,11 @@ export function normalizeHybridCartonizationReadRequest(
     input.expectedCandidateRowVersion,
     'Expected candidate row version',
   )
-  if (!['production', 'sandbox_demo'].includes(input.mode)) {
+  if (![
+    'production',
+    'sandbox_demo',
+    'shadow_training_simulated',
+  ].includes(input.mode)) {
     fail(
       'Cartonization mode is invalid',
       400,
@@ -1273,11 +1280,11 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
   assumedCommittedQuantities: HybridCartonizationCommittedAssumption[]
 }) {
   if (
-    input.mode === 'production'
+    ['production', 'shadow_training_simulated'].includes(input.mode || '')
     && input.assumedCommittedQuantities.length > 0
   ) {
     fail(
-      'Production cartonization cannot accept operator-entered committed inventory assumptions',
+      'Operational and training cartonization cannot accept operator-entered committed inventory assumptions',
       400,
       'HYBRID_CARTONIZATION_PRODUCTION_ASSUMPTIONS_FORBIDDEN',
     )
@@ -1296,7 +1303,7 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
     ]),
   )
   if (
-    input.mode !== 'production'
+    input.mode === 'sandbox_demo'
     && assumptionsByLine.size !== input.lines.length
   ) {
     fail(
@@ -1337,7 +1344,9 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
   for (const line of input.lines) {
     const assumed = input.mode === 'production'
       ? 0
-      : assumptionsByLine.get(line.lineGlobalId)
+      : input.mode === 'shadow_training_simulated'
+        ? line.requiredQuantity
+        : assumptionsByLine.get(line.lineGlobalId)
     if (assumed === undefined) {
       fail(
         `Committed quantity for ${line.lineGlobalId} is missing`,
@@ -1376,28 +1385,35 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
       position?.providerCommittedQuantity ?? 0
     const activeReservedQuantity =
       position?.activeReservedQuantity ?? 0
-    if (activeReservedQuantity > providerCommittedQuantity) {
+    if (
+      input.mode !== 'shadow_training_simulated'
+      && activeReservedQuantity > providerCommittedQuantity
+    ) {
       fail(
         `Active provider inventory claims exceed committed evidence for ${productGlobalId}`,
         409,
         'HYBRID_CARTONIZATION_PROVIDER_COMMITMENT_EXHAUSTED',
       )
     }
-    if (total.assumed > providerCommittedQuantity) {
+    if (
+      input.mode !== 'shadow_training_simulated'
+      && total.assumed > providerCommittedQuantity
+    ) {
       fail(
         `Assumed committed inventory for ${productGlobalId} exceeds the latest provider evidence`,
         422,
         'HYBRID_CARTONIZATION_COMMITTED_ASSUMPTION_UNSUPPORTED',
       )
     }
-    const availabilityAuthority = (
-      input.mode === 'production'
-      && input.provider === 'shopify'
-    )
-      ? 'shopify_provider_commitment'
-      : 'operational_available'
+    const availabilityAuthority = input.mode === 'shadow_training_simulated'
+      ? 'shadow_training_simulated'
+      : input.mode === 'production' && input.provider === 'shopify'
+        ? 'shopify_provider_commitment'
+        : 'operational_available'
     const effectiveAvailableQuantity =
-      availabilityAuthority === 'shopify_provider_commitment'
+      availabilityAuthority === 'shadow_training_simulated'
+        ? total.required
+        : availabilityAuthority === 'shopify_provider_commitment'
         ? providerCommittedQuantity - activeReservedQuantity
         : operationalAvailableQuantity + total.assumed
     if (total.required > effectiveAvailableQuantity) {
@@ -1439,9 +1455,9 @@ export function evaluateHybridCartonizationInventoryAvailability(input: {
 export function hybridCartonizationInventoryProjectionStates(
   mode: HybridCartonizationReadRequest['mode'],
 ): HybridCartonizationInventoryProjectionState[] {
-  return mode === 'sandbox_demo'
-    ? ['projected', 'negative_available']
-    : ['projected']
+  return mode === 'production'
+    ? ['projected']
+    : ['projected', 'negative_available']
 }
 
 export function isHybridCartonizationFulfillmentChannelEligible(input: {
@@ -1464,7 +1480,7 @@ export function isHybridCartonizationFulfillmentChannelEligible(input: {
   )
   return activeChannel || (
     input.mappingPurpose === 'shopify_checkout'
-    && isShopifySandboxCheckoutChannelEligible({
+    && isShopifyRatingCheckoutChannelEligible({
       provider: input.provider,
       accountEnvironment: input.accountEnvironment,
       providerStatusRaw: input.providerStatusRaw,
@@ -1598,7 +1614,8 @@ async function readWarehouse(
   input: HybridCartonizationReadRequest,
 ) {
   const result = await client.query<WarehouseRow>(
-    `SELECT warehouse.id::text, warehouse.global_id, warehouse.name
+    `SELECT warehouse.id::text, warehouse.global_id, warehouse.name,
+            warehouse.address
      FROM operations_warehouses warehouse
      WHERE warehouse.organization_id = $1::uuid
        AND warehouse.global_id = $2
@@ -1643,6 +1660,7 @@ async function readLatestInventoryRun(
   )
   const row = result.rows[0]
   if (!row) {
+    if (input.mode === 'shadow_training_simulated') return null
     fail(
       'No successful inventory sync exists for this account and warehouse',
       422,
@@ -2464,11 +2482,11 @@ export function mapCandidateLines(
         'HYBRID_CARTONIZATION_CHANNEL_PACK_REVISION_CONFLICT',
       )
     }
-    const eligibleLifecycle = input.mode === 'production'
-      ? row.pack_profile_lifecycle_state === 'active'
-      : ['customer_confirmed', 'active'].includes(
+    const eligibleLifecycle = input.mode === 'sandbox_demo'
+      ? ['customer_confirmed', 'active'].includes(
           row.pack_profile_lifecycle_state || '',
         )
+      : row.pack_profile_lifecycle_state === 'active'
     if (!eligibleLifecycle) {
       fail(
         `${row.product_title_snapshot} pack profile is not eligible in ${input.mode}`,
@@ -2704,15 +2722,15 @@ function mapSelectedMaterials(
         'HYBRID_CARTONIZATION_MATERIAL_REVISION_CONFLICT',
       )
     }
-    const eligible = input.mode === 'production'
-      ? row.status === 'active'
-      : (
+    const eligible = input.mode === 'sandbox_demo'
+      ? (
           row.status === 'active'
           || (
             row.status === 'draft'
             && row.source === 'customer_supplied'
           )
         )
+      : row.status === 'active'
     if (!eligible) {
       fail(
         `${row.name} is not eligible in ${input.mode}`,
@@ -2743,7 +2761,10 @@ function mapSelectedMaterials(
     )
     if (
       row.dimension_evidence_type === 'unknown'
-      || !row.dimension_evidence_reference
+      || (
+        row.dimension_evidence_type !== 'measured'
+        && !row.dimension_evidence_reference?.trim()
+      )
       || !confirmedAt
     ) {
       fail(
@@ -2780,13 +2801,16 @@ function mapSelectedMaterials(
       `${row.global_id} rated exterior confirmation`,
     )
     if (
-      input.mode === 'production'
+      input.mode !== 'sandbox_demo'
       && (
         !ratedOuterDimensionsMm
         || !['customer_confirmed', 'measured', 'provider'].includes(
           row.rated_outer_dimension_evidence_type || '',
         )
-        || !row.rated_outer_dimension_evidence_reference
+        || (
+          row.rated_outer_dimension_evidence_type !== 'measured'
+          && !row.rated_outer_dimension_evidence_reference?.trim()
+        )
         || !ratedOuterConfirmedAt
       )
     ) {
@@ -2853,7 +2877,9 @@ function mapSelectedMaterials(
         stockOnHandQuantity: row.stock_on_hand_quantity,
         activeClaimedQuantity,
         maximumGrossWeightGrams: row.max_weight_grams,
-        availableQuantity,
+        availableQuantity: input.mode === 'shadow_training_simulated'
+          ? null
+          : availableQuantity,
         ratedOuterDimensionsMm,
       },
       evidence: {
@@ -2946,7 +2972,8 @@ async function readRecipes(
        AND recipe.packaging_material_id = ANY($3::uuid[])
        AND recipe.is_current = true
        AND (
-         ($4 = 'production' AND recipe.lifecycle_state = 'active')
+         ($4 IN ('production', 'shadow_training_simulated')
+          AND recipe.lifecycle_state = 'active')
          OR (
            $4 = 'sandbox_demo'
            AND recipe.lifecycle_state IN ('customer_confirmed', 'active')
@@ -3276,6 +3303,7 @@ export async function readHybridCartonizationInputFromPostgres(
       warehouse: {
         globalId: warehouse.global_id,
         name: warehouse.name,
+        address: warehouse.address,
       },
       inventory: {
         syncRunGlobalId: inventoryRun?.global_id || null,

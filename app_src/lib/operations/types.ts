@@ -1,3 +1,9 @@
+import type {
+  OrderShipToDraft,
+  OrderShipToIssue,
+  OrderShipToReadiness,
+} from '@/lib/operations/orderShipTo'
+
 export type OperationsProvider = 'shopify' | 'bigcommerce' | 'etsy' | 'mock-commerce'
 
 export type OperationsOrderStatus =
@@ -43,6 +49,7 @@ export type OperationsOrderAction =
   | 'release_to_warehouse'
   | 'confirm_picks'
   | 'reconcile_external_fulfillment'
+  | 'reopen_for_replanning'
   | 'verify_pack'
   | 'prepare_fulfillment'
   | 'confirm_shipment'
@@ -52,6 +59,26 @@ export type OperationsOrderActionAvailability = {
   label: string
   enabled: boolean
   blockedReason: string | null
+  blockedCode?: string | null
+  consequenceSummary?: string | null
+  expectedPlanGlobalId?: string | null
+  expectedPlanVersion?: number | null
+  expectedCorrectionFingerprint?: string | null
+}
+
+export type OperationsOrderReplanningCorrectionResult = {
+  orderGlobalId: string
+  orderStatus: 'imported'
+  previousRowVersion: number
+  rowVersion: number
+  correctionGlobalId: string
+  cancelledPlanGlobalId: string
+  releasedLocalReservationCount: number
+  releasedProviderCommitmentCount: number
+  releasedPackagingClaimCount: number
+  providerReads: 0
+  providerWrites: 0
+  replayed: boolean
 }
 
 export type OperationsExternalFulfillmentReconciliationResult = {
@@ -676,6 +703,7 @@ export type OperationsShadowFulfillmentPreparationStage = {
   packageCount: number
   packages: OperationsShadowFulfillmentPreparationPackage[]
   selectedRate: {
+    carrierAccountGlobalId: string
     provider: 'ups_rest' | 'fedex_rest'
     serviceCode: string
     serviceName: string
@@ -741,6 +769,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     authorizationGlobalId: string
     authorizedAt: string
     expiresAt: string
+    authorityKind: 'legacy_packed' | 'shopify_test_store_canonical'
+    fulfillmentConfirmedAt: string | null
   } | null
   fulfillmentPreparation: OperationsShadowFulfillmentPreparation | null
   planningPreparation: {
@@ -765,6 +795,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
       revision: 0
     }
   shipTo: Address
+  shipmentShipTo: OperationsOrderShipmentAddress
   lines: Array<{
     globalId: string
     productGlobalId: string
@@ -808,7 +839,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     serviceName: string
     internalCostMinor: string
     customerChargeMinor: string | null
-    estimatedDeliveryAt: string
+    estimatedDeliveryAt: string | null
     meetsPromise: boolean
     selected: boolean
   }>
@@ -890,6 +921,44 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   }>
 }
 
+export type OperationsOrderShipmentAddress = {
+  orderGlobalId: string
+  orderRowVersion: number
+  rowVersion: number
+  value: OrderShipToDraft
+  sourceValue: OrderShipToDraft
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  provenance: 'source' | 'local'
+  sourceVersionChanged: boolean
+  rerateRequired: boolean
+  editable: boolean
+  editBlockedReason: string | null
+  providerWrites: 0
+}
+
+export type OperationsOrderShipmentAddressUpdateResult = {
+  orderGlobalId: string
+  orderRowVersion: number
+  rowVersion: number
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  changedFields: Array<
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  >
+  sourceVersionChanged: false
+  rerateRequired: boolean
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
+}
+
 export type OperationsWorkspace = {
   organizationId: string
   configured: boolean
@@ -898,6 +967,7 @@ export type OperationsWorkspace = {
     canManage: boolean
     canExecute: boolean
     canActivate: boolean
+    canPurchaseLivePostage?: boolean
   }
   dataPipeline: { id: string; name: string }
   activation: {
@@ -906,7 +976,9 @@ export type OperationsWorkspace = {
     reason: string | null
     updatedAt: string
   }
+  storeSync: import('@/lib/operations/commerceStoreSync').CommerceStoreSyncControl[]
   summary: OperationsSummary
+  importedOrders: OperationsImportedOrderWorkingCopy[]
   orders: OperationsOrderListItem[]
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
@@ -1039,6 +1111,177 @@ export type OperationsWorkspace = {
   generatedAt: string
 }
 
+export type OperationsImportedOrderWorkingCopy = {
+  kind: 'imported_working_copy'
+  globalId: string
+  candidateGlobalId: string
+  canonicalOrderGlobalId: string | null
+  integrationAccountGlobalId: string
+  integrationAccountName: string
+  provider: 'shopify' | 'faire'
+  externalOrderId: string
+  orderNumber: string
+  status: 'imported'
+  needsInfo: boolean
+  blockerCodes: string[]
+  customerName: string | null
+  lineCount: number
+  sourceUpdatedAt: string
+  candidateRowVersion: number
+  rowVersion: number
+  providerVersionChanged: boolean
+  resolutionDetailsLoaded: boolean
+  customer: {
+    status: 'unresolved' | 'suggested' | 'resolved' | 'unsupported'
+    resolvedCustomerGlobalId: string | null
+    selectedCustomerGlobalId: string | null
+    options: Array<{
+      globalId: string
+      name: string
+      email: string | null
+    }>
+  }
+  delivery: {
+    status:
+      | 'unresolved'
+      | 'provider'
+      | 'manual'
+      | 'policy'
+      | 'not_required'
+      | 'not_supplied'
+    providerRequestedDeliveryAt: string | null
+    selectedDeliveryAt: string | null
+    draftDeliveryAt: string | null
+  }
+  lines: Array<{
+    globalId: string
+    title: string
+    sku: string | null
+    quantity: number
+    requiresShipping: boolean
+    mappingStatus:
+      | 'unresolved'
+      | 'suggested'
+      | 'resolved'
+      | 'not_required'
+      | 'unsupported'
+    priceStatus: 'unresolved' | 'provider' | 'manual' | 'unsupported'
+    packageStatus: 'unresolved' | 'resolved' | 'not_required' | 'unsupported'
+    productGlobalId: string | null
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+    blockerCodes: string[]
+  }>
+  productOptions: Array<{
+    globalId: string
+    name: string
+    sku: string | null
+    packageProfiles: Array<{
+      globalId: string
+      name: string
+    }>
+  }>
+  shipTo: {
+    value: OrderShipToDraft
+    readiness: OrderShipToReadiness
+    provenance: 'provider' | 'local'
+    syncStatus:
+      | 'provider_snapshot'
+      | 'local_only'
+      | 'provider_sync_pending'
+      | 'provider_synced'
+      | 'provider_sync_failed'
+    issues: OrderShipToIssue[]
+  }
+  providerWrites: 0
+}
+
+export type OperationsImportedOrderResolutionDraft = {
+  customerGlobalId: string | null
+  requestedDeliveryAt: string | null
+  lines: Array<{
+    lineGlobalId: string
+    productGlobalId: string
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+  }>
+}
+
+export type OperationsImportedOrderWorkingCopyDraft = {
+  shipTo: OrderShipToDraft
+  resolution: OperationsImportedOrderResolutionDraft
+}
+
+export type OperationsImportedOrderShipToUpdateResult = {
+  candidateGlobalId: string
+  canonicalOrderGlobalId: string | null
+  rowVersion: number
+  readiness: OrderShipToReadiness
+  issues: OrderShipToIssue[]
+  changedFields: Array<
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  >
+  syncStatus: 'local_only'
+  promotionStatus: 'not_ready' | 'needs_info' | 'promoted'
+  remainingBlockerCodes: string[]
+  providerVersionChanged: boolean
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
+}
+
+export type OperationsImportedOrderRefreshConflict = {
+  field:
+    | 'name'
+    | 'line1'
+    | 'line2'
+    | 'city'
+    | 'region'
+    | 'postalCode'
+    | 'country'
+  localValue: string | null
+  providerValue: string | null
+}
+
+export type OperationsImportedOrderLineRefreshConflict = {
+  lineGlobalId: string
+  externalLineId: string
+  title: string
+  sku: string | null
+  reason: 'provider_line_missing' | 'provider_line_ambiguous'
+  localDraft: {
+    productGlobalId: string
+    unitPriceMinor: number | null
+    currency: string
+    packageProfileGlobalId: string | null
+  }
+}
+
+export type OperationsImportedOrderRefreshResult = {
+  previousCandidateGlobalId: string
+  candidateGlobalId: string
+  rowVersion: number
+  status: 'unchanged' | 'rebased'
+  providerChangedFields: OperationsImportedOrderRefreshConflict['field'][]
+  preservedLocalFields: OperationsImportedOrderRefreshConflict['field'][]
+  preservedLineDrafts: Array<{
+    previousLineGlobalId: string
+    lineGlobalId: string
+    externalLineId: string
+  }>
+  providerWrites: 0
+  providerWriteIntentCreated: false
+  replayed: boolean
+}
+
 export type OperationsInventoryPoolInput = {
   name: string
   poolType: 'customer_dedicated' | 'shared'
@@ -1166,6 +1409,7 @@ export type OperationsPlanCommandResult = OperationsOrderCommandResult & {
   fulfillmentPlanGlobalId: string
   cartonizationEvidenceGlobalId: string
   packageCount: number
+  carrierAccountGlobalId: string
   carrier: string
   serviceCode: string
   serviceName: string
@@ -1187,6 +1431,7 @@ export type OperationsShadowFulfillmentExecutionResult = {
   varianceGlobalId: string
   packageCount: number
   carrier: 'UPS' | 'FedEx'
+  carrierAccountGlobalId: string
   provider: 'ups_rest' | 'fedex_rest'
   serviceCode: string
   serviceName: string

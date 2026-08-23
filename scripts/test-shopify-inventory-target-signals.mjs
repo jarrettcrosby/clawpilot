@@ -498,6 +498,9 @@ const integrationService = loadTypeScriptModule(
         },
         ShopifyOrderWebhookSignalPersistenceError: StubProviderError,
       },
+      '@/lib/persistence/shopifyOrderWebhookReconciliation': {
+        ShopifyOrderWebhookReconciliationPersistenceError: StubProviderError,
+      },
       '@/lib/persistence/shopifyFulfillmentNotifications': {
         ShopifyFulfillmentNotificationPolicyError: StubProviderError,
       },

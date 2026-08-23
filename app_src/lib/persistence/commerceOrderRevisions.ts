@@ -19,11 +19,16 @@ import {
   commerceReadAccountSql,
   commerceReadRuntimeAvailable,
 } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 import { isHostedRuntime } from '@/lib/persistence/config'
 
 const REVISION_INTERVAL = '30 minutes'
@@ -47,8 +52,13 @@ const GLOBAL_APPLICATION_ID = /^gcoa(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{2,127}$/u
 const READABLE_ACCOUNT_SQL = commerceReadAccountSql('account')
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 
 export type CommerceOrderRevisionProvider = 'shopify' | 'faire'
+
+export class CommerceOrderRevisionStoreSyncPausedError extends Error {
+  readonly code = 'COMMERCE_ORDER_REVISION_STORE_SYNC_PAUSED'
+}
 export type CommerceOrderRevisionMaterialState =
   | 'current'
   | 'review_required'
@@ -74,6 +84,7 @@ export type CommerceOrderRevisionClaim = Readonly<{
 
 export type CommerceOrderRevisionObservationInput = Readonly<{
   claim: CommerceOrderRevisionClaim
+  providerReadLease: CommerceStoreSyncProviderReadLease
   sourceRevision: string
   sourceHash: string
   revisionHash: string
@@ -478,6 +489,7 @@ export async function claimCommerceOrderRevisionTargetsInPostgres(input: {
            AND account.integration_type = 'commerce'
            AND account.external_account_id IS NOT NULL
            AND ${READABLE_ACCOUNT_SQL}
+           AND ${STORE_SYNC_RUNNING_SQL}
            AND credential.verification_status = 'verified'
            AND credential.credential_version = account.commerce_credential_generation
            AND credential.external_account_id = account.external_account_id
@@ -525,6 +537,53 @@ export async function claimCommerceOrderRevisionTargetsInPostgres(input: {
     )
     return claimed.rows.map(normalizedClaim)
   })
+}
+
+/**
+ * Revalidates the exact lease and account-scoped Store sync fence immediately
+ * before a revision adapter is allowed to issue its first provider read.
+ */
+export async function assertCommerceOrderRevisionStoreSyncRunningInPostgres(
+  claim: CommerceOrderRevisionClaim,
+) {
+  validateClaim(claim)
+  const current = await query<{ permitted: boolean }>(
+    `SELECT COALESCE(
+       target.claim_state = 'processing'
+       AND target.locked_by = $3
+       AND target.lock_token = $4::uuid
+       AND target.locked_until > now()
+       AND account.global_id = $5
+       AND account.provider = $6
+       AND account.integration_type = 'commerce'
+       AND account.commerce_credential_generation = $7
+       AND ${STORE_SYNC_RUNNING_SQL},
+       false
+     ) AS permitted
+     FROM operations_commerce_order_revision_targets target
+     JOIN operations_integration_accounts account
+       ON account.organization_id = target.organization_id
+      AND account.id = target.integration_account_id
+     WHERE target.id = $1::uuid
+       AND target.organization_id = $2::uuid
+       AND target.integration_account_id = $8::uuid
+     LIMIT 1`,
+    [
+      claim.targetId,
+      claim.organizationId,
+      claim.workerId,
+      claim.leaseToken,
+      claim.accountGlobalId,
+      claim.provider,
+      claim.credentialVersion,
+      claim.integrationAccountId,
+    ],
+  )
+  if (current.rows[0]?.permitted !== true) {
+    throw new CommerceOrderRevisionStoreSyncPausedError(
+      'Store sync paused or the exact revision-read lease changed before provider I/O',
+    )
+  }
 }
 
 export async function prepareManagerCommerceOrderRevisionRefreshInPostgres(
@@ -1041,6 +1100,37 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
 ): Promise<CommerceOrderRevisionCaptureResult> {
   const observation = validatedObservation(input)
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.claim.organizationId,
+      integrationAccountId: input.claim.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: observation.trigger.kind === 'manager'
+        ? 'manual_read_only'
+        : 'automatic',
+      readKind: 'order_revision',
+    })
+    if (observation.trigger.kind === 'manager') {
+      const command = await client.query<{ id: string }>(
+        `SELECT id::text
+         FROM operations_command_receipts
+         WHERE id = $1::uuid
+           AND organization_id = $2::uuid
+           AND command_type = 'operations.commerce_order_revision.refresh'
+           AND actor_email = $3
+           AND target_global_id = $4
+           AND status = 'processing'
+         FOR UPDATE`,
+        [
+          observation.trigger.commandReceiptId,
+          input.claim.organizationId,
+          observation.trigger.actorEmail,
+          input.claim.canonicalOrderGlobalId,
+        ],
+      )
+      if (!command.rows[0]) {
+        throw new Error('Manager order revision command authority is stale')
+      }
+    }
     // Match the Operations command lock order: canonical order first, then
     // revision target. This prevents order->target versus target->order
     // deadlocks while making capture row-version checks atomic.
@@ -1086,6 +1176,9 @@ export async function captureCommerceOrderRevisionObservationInPostgres(
          AND target.locked_until > now()
          AND credential.verification_status = 'verified'
          AND credential.credential_version = account.commerce_credential_generation
+         AND ${observation.trigger.kind === 'manager'
+           ? 'TRUE'
+           : STORE_SYNC_RUNNING_SQL}
        FOR UPDATE OF target, account, credential`,
       [
         input.claim.targetId,
@@ -1367,6 +1460,48 @@ export async function failCommerceOrderRevisionTargetInPostgres(input: {
     ],
   )
   return result.rows[0]?.claim_state || null
+}
+
+export async function parkCommerceOrderRevisionTargetForStoreSyncPauseInPostgres(
+  input: {
+    claim: CommerceOrderRevisionClaim
+    workerId: string
+  },
+) {
+  validateClaim(input.claim)
+  const workerId = boundedText(
+    input.workerId,
+    'Commerce order revision worker ID',
+    200,
+  )
+  if (workerId !== input.claim.workerId) {
+    throw new Error('Commerce order revision pause disposition is invalid')
+  }
+  const result = await query(
+    `UPDATE operations_commerce_order_revision_targets
+     SET claim_state = 'ready',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         next_check_at = now(),
+         locked_by = NULL,
+         lock_token = NULL,
+         locked_until = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         row_version = row_version + 1,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND organization_id = $2::uuid
+       AND claim_state = 'processing'
+       AND locked_by = $3
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.claim.targetId,
+      input.claim.organizationId,
+      workerId,
+      input.claim.leaseToken,
+    ],
+  )
+  return result.rowCount === 1
 }
 
 export class CommerceOrderRevisionGateError extends Error {
@@ -3637,8 +3772,13 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
     count: string
     overdue_count: string
     stale_count: string
+    store_sync_running: boolean
   }>(
-    `SELECT provider, claim_state, material_state,
+    `SELECT target.provider, target.claim_state, target.material_state,
+            operations_commerce_store_sync_is_running(
+              target.organization_id,
+              target.integration_account_id
+            ) AS store_sync_running,
             count(*)::text AS count,
             count(*) FILTER (
               WHERE target.next_check_at < now() - interval '${REVISION_OVERDUE_GRACE}'
@@ -3653,8 +3793,9 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
        ON order_row.organization_id = target.organization_id
       AND order_row.id = target.order_id
      WHERE order_row.status NOT IN ('shipped', 'cancelled')
-     GROUP BY provider, claim_state, material_state
-     ORDER BY provider, claim_state, material_state`,
+     GROUP BY target.provider, target.claim_state, target.material_state,
+              target.organization_id, target.integration_account_id
+     ORDER BY target.provider, target.claim_state, target.material_state`,
   ), query<{
     referenced_key_ids: string[]
     unpurged_protected_read_count: number
@@ -3698,19 +3839,27 @@ export async function readCommerceOrderRevisionHealthFromPostgres() {
     count: Number(row.count),
     overdue: Number(row.overdue_count),
     stale: Number(row.stale_count),
+    storeSyncRunning: row.store_sync_running,
   }))
   const summary = targets.reduce((current, row) => ({
-    active: current.active + row.count,
-    failed: current.failed + (row.claimState === 'failed' ? row.count : 0),
+    active: current.active + (row.storeSyncRunning ? row.count : 0),
+    retainedPaused:
+      current.retainedPaused + (row.storeSyncRunning ? 0 : row.count),
+    failed: current.failed + (
+      row.storeSyncRunning && row.claimState === 'failed' ? row.count : 0
+    ),
     deadLetter:
-      current.deadLetter + (row.claimState === 'dead_letter' ? row.count : 0),
+      current.deadLetter + (
+        row.storeSyncRunning && row.claimState === 'dead_letter' ? row.count : 0
+      ),
     materialReviewRequired:
       current.materialReviewRequired
-      + (row.materialState !== 'current' ? row.count : 0),
-    overdue: current.overdue + row.overdue,
-    stale: current.stale + row.stale,
+      + (row.storeSyncRunning && row.materialState !== 'current' ? row.count : 0),
+    overdue: current.overdue + (row.storeSyncRunning ? row.overdue : 0),
+    stale: current.stale + (row.storeSyncRunning ? row.stale : 0),
   }), {
     active: 0,
+    retainedPaused: 0,
     failed: 0,
     deadLetter: 0,
     materialReviewRequired: 0,

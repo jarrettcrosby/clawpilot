@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import {
   assertCarrierRateTestArtifactCapability,
   carrierSandboxRateSelectionRequestHash,
+  resolveCarrierOneOffVoidRuntime,
+  resolveCarrierProductionShippingRuntime,
   resolveCarrierSandboxShippingRuntime,
   sanitizedCarrierIntegrationError,
 } from '@/lib/integrations/carrierIntegrations'
@@ -13,6 +15,21 @@ import {
   voidCarrierSandboxLabel,
   type CarrierLabelOutputFormat,
 } from '@/lib/integrations/carrierSandboxLabel'
+import {
+  CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+  CarrierOneOffGroupError,
+  executeCarrierOneOffGroupShipment,
+  executeCarrierOneOffGroupVoid,
+  prepareCarrierOneOffGroupRequest,
+  prepareCarrierOneOffGroupVoidRequest,
+  type CarrierOneOffGroupRuntime,
+  type CarrierOneOffGroupShipmentFixture,
+} from '@/lib/integrations/carrierOneOffGroupShipment'
+import {
+  carrierWholeShipmentRateAddressFingerprints,
+  prepareCarrierWholeShipmentRateRequest,
+} from '@/lib/integrations/carrierWholeShipmentRateFoundation'
+import type { CarrierShippingDiagnosticParcel } from '@/lib/integrations/carrierShippingDiagnosticRate'
 import {
   buildCarrierSandboxRateFixture,
   carrierSandboxPartyFingerprint,
@@ -36,6 +53,7 @@ import {
   reconcileCarrierRateTestLabelAttemptInPostgres,
   replayCarrierRateTestLabelVoidInPostgres,
   type CarrierRateTestCreateContext,
+  type CarrierRateTestLabelProviderContext,
   type CarrierRateTestSelectedRate,
 } from '@/lib/persistence/carrierRateTestLabels'
 import { OperationsRequestError } from '@/lib/persistence/operations'
@@ -72,6 +90,9 @@ function carrierActionError(error: unknown) {
   if (error instanceof CarrierSandboxLabelError) {
     return new OperationsRequestError(error.code, error.message, error.status)
   }
+  if (error instanceof CarrierOneOffGroupError) {
+    return new OperationsRequestError(error.code, error.message, error.status)
+  }
   const sanitized = sanitizedCarrierIntegrationError(error)
   return new OperationsRequestError(
     sanitized.code,
@@ -95,6 +116,14 @@ function failureDetail(error: unknown) {
       code: error.code,
       providerReference: null,
       response: error.redactedResponse || {},
+    }
+  }
+  if (error instanceof CarrierOneOffGroupError) {
+    return {
+      state: error.uncertain ? 'unknown' as const : 'failed' as const,
+      code: error.code,
+      providerReference: null,
+      response: error.redactedResponse,
     }
   }
   const sanitized = sanitizedCarrierIntegrationError(error)
@@ -135,7 +164,7 @@ async function finalizePreparedFailure(input: {
 function selectionMismatch(): never {
   throw new OperationsRequestError(
     'CARRIER_RATE_TEST_SELECTION_MISMATCH',
-    'Select one exact rate returned by the current sandbox rating result',
+    'Select one exact rate returned by the current account rating result',
     409,
   )
 }
@@ -171,6 +200,71 @@ function exactSelectedRate(
     }
   }
   return selectionMismatch()
+}
+
+export function carrierProductionDiagnosticConfirmation(input: {
+  provider: 'ups_rest' | 'fedex_rest'
+  carrierAccountGlobalId: string
+  selectedRate: CarrierRateTestSelectedRate
+}) {
+  const provider = input.provider === 'ups_rest' ? 'UPS' : 'FEDEX'
+  return [
+    'BUY REAL POSTAGE',
+    provider,
+    input.carrierAccountGlobalId,
+    input.selectedRate.serviceCode,
+    `${input.selectedRate.currency} ${input.selectedRate.amount}`,
+  ].join(' | ')
+}
+
+function assertFreshProductionRate(context: CarrierRateTestCreateContext) {
+  const ageMs = Date.now() - Date.parse(context.completedAt)
+  if (!Number.isFinite(ageMs) || ageMs < -60_000 || ageMs > 10 * 60 * 1000) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_RATE_EXPIRED',
+      'Run a new LIVE rate before buying real postage; production diagnostic rates expire after ten minutes',
+      409,
+    )
+  }
+}
+
+function stableAttemptCorrelationKey(input: {
+  organizationId: string
+  idempotencyKey: string
+  action: 'create' | 'void'
+}) {
+  return createHash('sha256')
+    .update([
+      'carrier-shipping-diagnostic-v1',
+      input.organizationId,
+      input.action,
+      input.idempotencyKey,
+    ].join(':'))
+    .digest('hex')
+}
+
+function productionBillingSnapshot(runtime: {
+  integrationGlobalId: string
+  carrierAccountGlobalId: string
+  carrierAccountDisplayName?: string
+  accountNumberLastFour?: string
+  accountNumberFingerprint?: string
+  credentialFingerprint?: string
+  registeredAddressFingerprint?: string
+  senderName?: string
+}) {
+  return {
+    mode: 'explicit_shipping_account_diagnostic',
+    integrationAccountGlobalId: runtime.integrationGlobalId,
+    carrierAccountGlobalId: runtime.carrierAccountGlobalId,
+    carrierAccountDisplayName: runtime.carrierAccountDisplayName || null,
+    accountNumberLastFour: runtime.accountNumberLastFour || null,
+    accountNumberFingerprint: runtime.accountNumberFingerprint || null,
+    credentialFingerprint: runtime.credentialFingerprint || null,
+    registeredAddressFingerprint: runtime.registeredAddressFingerprint || null,
+    senderName: runtime.senderName || null,
+    billingRelationship: 'sender',
+  }
 }
 
 function persistedShipmentEvidence(context: CarrierRateTestCreateContext) {
@@ -240,6 +334,7 @@ function assertRuntimeMatches(input: {
 function createFixtureAndVerifyContext(input: {
   context: CarrierRateTestCreateContext
   destination: CarrierSandboxParty
+  parcel?: CarrierShippingDiagnosticParcel
   runtime: Awaited<ReturnType<typeof resolveCarrierSandboxShippingRuntime>>
 }) {
   const { context, runtime } = input
@@ -277,6 +372,7 @@ function createFixtureAndVerifyContext(input: {
       countryCode: String(registeredAddress.countryCode || ''),
     },
     destination: input.destination,
+    ...(input.parcel ? { parcel: input.parcel } : {}),
   })
   const safeRateRequest = carrierSandboxRateRequestEvidence(
     context.provider,
@@ -315,6 +411,7 @@ async function resolveVerifiedLabelRuntime(input: {
   organizationId: string
   context: CarrierRateTestCreateContext
   destination: CarrierSandboxParty
+  parcel?: CarrierShippingDiagnosticParcel
 }) {
   const runtime = await resolveCarrierSandboxShippingRuntime({
     organizationId: input.organizationId,
@@ -328,8 +425,411 @@ async function resolveVerifiedLabelRuntime(input: {
     shipmentFixture: createFixtureAndVerifyContext({
       context: input.context,
       destination: input.destination,
+      parcel: input.parcel,
       runtime,
     }),
+  }
+}
+
+function assertProductionRuntimeMatches(input: {
+  runtime: Awaited<ReturnType<typeof resolveCarrierProductionShippingRuntime>>
+  context: CarrierRateTestCreateContext
+}) {
+  const { runtime, context } = input
+  const snapshot = record(context.billingSelectionSnapshot)
+  if (
+    context.environment !== 'production'
+    || context.purpose !== 'shipping_account_diagnostic'
+    || context.billingRelationship !== 'sender'
+    || runtime.provider !== context.provider
+    || runtime.integrationAccountId !== context.integrationAccountId
+    || runtime.integrationGlobalId !== context.integrationGlobalId
+    || runtime.carrierAccountId !== context.carrierAccountId
+    || runtime.carrierAccountGlobalId !== context.carrierAccountGlobalId
+    || runtime.credentialVersion !== context.credentialVersion
+    || snapshot.integrationAccountGlobalId !== runtime.integrationGlobalId
+    || snapshot.carrierAccountGlobalId !== runtime.carrierAccountGlobalId
+    || snapshot.accountNumberFingerprint
+      !== runtime.accountNumberFingerprint
+    || snapshot.credentialFingerprint !== runtime.credentialFingerprint
+    || snapshot.registeredAddressFingerprint
+      !== runtime.registeredAddressFingerprint
+    || snapshot.senderName !== runtime.senderName
+  ) {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_CONTEXT_CHANGED',
+      'The LIVE credential, sender account, or registered address changed; run a new production rate',
+      409,
+    )
+  }
+}
+
+function productionDiagnosticPrepared(input: {
+  organizationId: string
+  idempotencyKey: string
+  context: CarrierRateTestCreateContext
+  selectedRate: CarrierRateTestSelectedRate
+  destination: CarrierSandboxParty
+  destinationResidential: boolean
+  parcel: CarrierShippingDiagnosticParcel
+  shipFromPhone: string
+  shipToPhone: string
+  outputFormat: CarrierLabelOutputFormat
+  runtime: Awaited<ReturnType<typeof resolveCarrierProductionShippingRuntime>>
+  shipDate: string
+}) {
+  assertProductionRuntimeMatches({ runtime: input.runtime, context: input.context })
+  const destination = {
+    ...input.destination,
+    residential: input.destinationResidential,
+  }
+  const ratePrepared = prepareCarrierWholeShipmentRateRequest({
+    binding: {
+      organizationId: input.runtime.organizationId,
+      integrationAccountId: input.runtime.integrationAccountId,
+      carrierAccountId: input.runtime.carrierAccountId,
+      credentialRevision: input.runtime.credentialVersion,
+      credentialFingerprint: input.runtime.credentialFingerprint,
+      accountNumber: input.runtime.credential.accountNumber,
+      accountNumberFingerprint: input.runtime.accountNumberFingerprint,
+      provider: input.runtime.provider,
+      environment: 'production',
+    },
+    origin: {
+      name: input.runtime.senderName,
+      phone: null,
+      ...input.runtime.registeredAddress,
+      countryCode: 'US',
+      residential: null,
+    },
+    destination: {
+      ...destination,
+      residential: input.destinationResidential,
+    },
+    parcels: [{
+      ...input.parcel,
+      packageCode: input.runtime.provider === 'ups_rest'
+        ? '02'
+        : 'YOUR_PACKAGING',
+    }],
+    billing: {
+      relationship: 'sender',
+      payerAccountNumber: input.runtime.credential.accountNumber,
+      payerAccountNumberFingerprint: input.runtime.accountNumberFingerprint,
+      payerPostalCode: input.runtime.registeredAddress.postalCode,
+      payerCountryCode: 'US',
+    },
+    expectedCurrency: 'USD',
+    fedexPickupType: input.runtime.provider === 'fedex_rest'
+      ? 'DROPOFF_AT_FEDEX_LOCATION'
+      : null,
+  })
+  const fingerprints = carrierWholeShipmentRateAddressFingerprints({
+    origin: {
+      name: input.runtime.senderName,
+      phone: null,
+      ...input.runtime.registeredAddress,
+      countryCode: 'US',
+      residential: null,
+    },
+    destination: {
+      ...destination,
+      residential: input.destinationResidential,
+    },
+  })
+  if (
+    ratePrepared.requestHash !== input.context.requestHash
+    || fingerprints.destinationFingerprint
+      !== persistedShipmentEvidence(input.context).destinationFingerprint
+  ) {
+    selectionMismatch()
+  }
+  const shipmentFixture: CarrierOneOffGroupShipmentFixture = {
+    origin: {
+      name: input.runtime.senderName,
+      line1: input.runtime.registeredAddress.line1,
+      line2: input.runtime.registeredAddress.line2,
+      city: input.runtime.registeredAddress.city,
+      region: input.runtime.registeredAddress.region,
+      postalCode: input.runtime.registeredAddress.postalCode,
+      countryCode: 'US',
+    },
+    destination,
+    parcels: [{
+      ...input.parcel,
+      packageKey: 'shipping-settings-diagnostic-package-1',
+      packageNumber: 1,
+    }],
+  }
+  const runtime: CarrierOneOffGroupRuntime = {
+    provider: input.runtime.provider,
+    environment: 'production',
+    credential: input.runtime.credential,
+    integrationAccountGlobalId: input.runtime.integrationGlobalId,
+    carrierAccountGlobalId: input.runtime.carrierAccountGlobalId,
+    credentialVersion: input.runtime.credentialVersion,
+    credentialFingerprint: input.runtime.credentialFingerprint,
+    accountNumberFingerprint: input.runtime.accountNumberFingerprint,
+    billingRelationship: 'sender',
+    billingSelectionSnapshot: productionBillingSnapshot(input.runtime),
+  }
+  const providerPrepared = prepareCarrierOneOffGroupRequest({
+    runtime,
+    serviceCode: input.selectedRate.serviceCode,
+    shipmentFixture,
+    outputFormat: input.outputFormat,
+    shipFromPhone: input.shipFromPhone,
+    shipToPhone: input.shipToPhone,
+    shipDate: input.shipDate,
+    attemptCorrelationKey: stableAttemptCorrelationKey({
+      organizationId: input.organizationId,
+      action: 'create',
+      idempotencyKey: input.idempotencyKey,
+    }),
+  })
+  return { runtime, providerPrepared }
+}
+
+async function createCarrierProductionDiagnosticLabel(input: {
+  organizationId: string
+  actorEmail: string
+  rateEvidenceGlobalId: string
+  selectedRate: CarrierRateTestSelectedRate
+  destination: CarrierSandboxParty
+  destinationResidential: boolean
+  parcel?: CarrierShippingDiagnosticParcel
+  shipFromPhone: string
+  shipToPhone: string
+  outputFormat: CarrierLabelOutputFormat
+  reason: string
+  idempotencyKey: string
+  operatorConfirmation: string
+  productionAuthorizedByOwnerAdmin: boolean
+  productionLivePostageAuthorized: boolean
+  context: CarrierRateTestCreateContext
+}) {
+  if (!input.parcel) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_DIAGNOSTIC_PARCEL_REQUIRED',
+      'Enter the exact LIVE diagnostic parcel before buying postage',
+      400,
+    )
+  }
+  if (!input.productionAuthorizedByOwnerAdmin) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
+      'Organization owner or administrator access is required to buy REAL POSTAGE',
+      403,
+    )
+  }
+  if (!input.productionLivePostageAuthorized) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_LABEL_AUTHORIZATION_FORBIDDEN',
+      'Live-postage permission is required to buy REAL POSTAGE',
+      403,
+    )
+  }
+  assertFreshProductionRate(input.context)
+  const expectedConfirmation = carrierProductionDiagnosticConfirmation({
+    provider: input.context.provider,
+    carrierAccountGlobalId: input.context.carrierAccountGlobalId,
+    selectedRate: input.selectedRate,
+  })
+  if (input.operatorConfirmation !== expectedConfirmation) {
+    throw new OperationsRequestError(
+      'CARRIER_PRODUCTION_LABEL_CONFIRMATION_REQUIRED',
+      `Type exactly: ${expectedConfirmation}`,
+      400,
+    )
+  }
+  const shipDate = new Date().toISOString().slice(0, 10)
+  let runtime: Awaited<ReturnType<typeof resolveCarrierProductionShippingRuntime>>
+  let preparedProvider: ReturnType<typeof productionDiagnosticPrepared>
+  try {
+    runtime = await resolveCarrierProductionShippingRuntime({
+      organizationId: input.organizationId,
+      provider: input.context.provider,
+      integrationAccountGlobalId: input.context.integrationGlobalId,
+      carrierAccountGlobalId: input.context.carrierAccountGlobalId,
+    })
+    preparedProvider = productionDiagnosticPrepared({
+      ...input,
+      parcel: input.parcel,
+      runtime,
+      shipDate,
+    })
+  } catch (error) {
+    throw carrierActionError(error)
+  }
+  const destinationFingerprint = String(
+    persistedShipmentEvidence(input.context).destinationFingerprint || '',
+  )
+  const attemptRequestHash = carrierRateTestLabelFingerprint({
+    action: 'create',
+    environment: 'production',
+    rateEvidenceGlobalId: input.context.rateEvidenceGlobalId,
+    rateRequestHash: input.context.requestHash,
+    carrierAccountGlobalId: input.context.carrierAccountGlobalId,
+    credentialVersion: input.context.credentialVersion,
+    selectedRate: input.selectedRate,
+    destinationFingerprint,
+    outputFormat: input.outputFormat,
+    providerPreparedRequestHash: preparedProvider.providerPrepared.requestHash,
+    operatorConfirmation: input.operatorConfirmation,
+    adapterVersion: CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+    reason: input.reason,
+  })
+  const prepared = await prepareCarrierRateTestLabelCreateInPostgres({
+    ...input.context,
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    reason: input.reason,
+    idempotencyKey: input.idempotencyKey,
+    attemptRequestHash,
+    destinationFingerprint,
+    selectedRate: input.selectedRate,
+    outputFormat: input.outputFormat,
+    adapterVersion: CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+    preparedProviderEvidence: preparedProvider.providerPrepared.redactedRequest,
+    operatorConfirmation: input.operatorConfirmation,
+  })
+  if (prepared.disposition === 'replayed') return prepared.label
+
+  try {
+    runtime = await resolveCarrierProductionShippingRuntime({
+      organizationId: input.organizationId,
+      provider: input.context.provider,
+      integrationAccountGlobalId: input.context.integrationGlobalId,
+      carrierAccountGlobalId: input.context.carrierAccountGlobalId,
+    })
+    const verified = productionDiagnosticPrepared({
+      ...input,
+      parcel: input.parcel,
+      runtime,
+      shipDate,
+    })
+    if (
+      verified.providerPrepared.requestHash
+        !== preparedProvider.providerPrepared.requestHash
+    ) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_CONTEXT_CHANGED',
+        'The LIVE provider request changed after authorization; run a new rate',
+        409,
+      )
+    }
+    preparedProvider = verified
+  } catch (error) {
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+
+  let result: Awaited<ReturnType<typeof executeCarrierOneOffGroupShipment>>
+  try {
+    result = await executeCarrierOneOffGroupShipment({
+      runtime: preparedProvider.runtime,
+      prepared: preparedProvider.providerPrepared,
+    })
+  } catch (error) {
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+  const label = result.labels[0]
+  if (
+    result.environment !== 'production'
+    || result.lifecycleMode !== 'carrier_void'
+    || result.labels.length !== 1
+    || !label
+  ) {
+    const error = new CarrierOneOffGroupError(
+      'The production carrier returned an invalid diagnostic label result',
+      502,
+      'CARRIER_PROVIDER_RESPONSE_INVALID',
+      true,
+      result.evidence.redactedResponse,
+    )
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+  const bytes = label.payloadEncoding === 'utf8'
+    ? Buffer.from(label.labelPayload, 'utf8')
+    : strictBase64Bytes(label.labelPayload)
+  if (
+    !bytes
+    || bytes.byteLength !== label.labelByteLength
+    || contentHash(bytes) !== label.labelContentSha256
+  ) {
+    const error = new CarrierOneOffGroupError(
+      'The production carrier label failed decoded-byte integrity validation',
+      502,
+      'CARRIER_PROVIDER_RESPONSE_INVALID',
+      true,
+      result.evidence.redactedResponse,
+    )
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+  try {
+    return await finalizeCarrierRateTestLabelCreateInPostgres({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      accountNumberFingerprint: runtime.accountNumberFingerprint,
+      providerLabelId: result.providerShipmentId,
+      trackingNumber: label.trackingNumber,
+      format: label.format,
+      mediaSize: 'label_4x6',
+      sourceKind: 'provider_native',
+      providerImageType: label.providerImageType as 'ZPL' | 'ZPLII' | 'PDF' | 'PNG',
+      providerStockType: label.providerStockType as
+        | 'HEIGHT_6_WIDTH_4' | 'STOCK_4X6' | 'PAPER_4X6',
+      labelPayload: bytes,
+      contentSha256: label.labelContentSha256,
+      providerReference: result.evidence.providerReference,
+      redactedProviderEvidence: {
+        adapterVersion: CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+        provider: result.provider,
+        environment: result.environment,
+        quotedCharge: result.quotedCharge,
+        request: result.evidence.redactedRequest,
+        response: result.evidence.redactedResponse,
+      },
+    })
+  } catch {
+    await finalizeCarrierRateTestLabelAttemptFailureInPostgres({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      state: 'unknown',
+      errorCode: 'CARRIER_RATE_TEST_FINALIZATION_UNKNOWN',
+      providerReference: result.evidence.providerReference,
+      redactedResponse: result.evidence.redactedResponse,
+    }).catch(() => undefined)
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_RECONCILIATION_REQUIRED',
+      'The carrier bought real postage, but ClawPilot could not finalize it; reconcile before any retry',
+      503,
+    )
   }
 }
 
@@ -339,6 +839,13 @@ export async function createCarrierRateTestLabel(input: {
   rateEvidenceGlobalId: string
   selectedRate: CarrierRateTestSelectedRate
   destination: CarrierSandboxParty
+  destinationResidential?: boolean
+  parcel?: CarrierShippingDiagnosticParcel
+  shipFromPhone?: string
+  shipToPhone?: string
+  operatorConfirmation?: string
+  productionAuthorizedByOwnerAdmin?: boolean
+  productionLivePostageAuthorized?: boolean
   outputFormat: CarrierLabelOutputFormat
   reason: string
   idempotencyKey: string
@@ -349,6 +856,23 @@ export async function createCarrierRateTestLabel(input: {
   })
   const selectedRate = exactSelectedRate(context, input.selectedRate)
   const destination = normalizeCarrierSandboxParty(input.destination)
+  if (context.environment === 'production') {
+    return createCarrierProductionDiagnosticLabel({
+      ...input,
+      context,
+      selectedRate,
+      destination,
+      destinationResidential: input.destinationResidential === true,
+      parcel: input.parcel,
+      shipFromPhone: input.shipFromPhone || '',
+      shipToPhone: input.shipToPhone || '',
+      operatorConfirmation: input.operatorConfirmation || '',
+      productionAuthorizedByOwnerAdmin:
+        input.productionAuthorizedByOwnerAdmin === true,
+      productionLivePostageAuthorized:
+        input.productionLivePostageAuthorized === true,
+    })
+  }
   const destinationFingerprint = carrierSandboxPartyFingerprint(destination)
   assertDestinationMatchesRate(context, destinationFingerprint)
   try {
@@ -356,6 +880,7 @@ export async function createCarrierRateTestLabel(input: {
       organizationId: input.organizationId,
       context,
       destination,
+      parcel: input.parcel,
     })
   } catch (error) {
     throw carrierActionError(error)
@@ -370,6 +895,7 @@ export async function createCarrierRateTestLabel(input: {
     destinationFingerprint,
     outputFormat: input.outputFormat,
     adapterVersion: CARRIER_SANDBOX_LABEL_ADAPTER_VERSION,
+    operatorConfirmation: null,
     reason: input.reason,
   })
   const prepared = await prepareCarrierRateTestLabelCreateInPostgres({
@@ -393,6 +919,7 @@ export async function createCarrierRateTestLabel(input: {
       organizationId: input.organizationId,
       context,
       destination,
+      parcel: input.parcel,
     })
     runtime = verified.runtime
     shipmentFixture = verified.shipmentFixture
@@ -499,6 +1026,9 @@ export async function voidCarrierRateTestLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
+  if (label.environment === 'production') {
+    return voidCarrierProductionDiagnosticLabel({ ...input, label })
+  }
   try {
     await assertCarrierRateTestArtifactCapability({
       organizationId: input.organizationId,
@@ -615,6 +1145,162 @@ export async function voidCarrierRateTestLabel(input: {
   }
 }
 
+async function voidCarrierProductionDiagnosticLabel(input: {
+  organizationId: string
+  actorEmail: string
+  labelGlobalId: string
+  reason: string
+  idempotencyKey: string
+  label: CarrierRateTestLabelProviderContext
+}) {
+  const buildPrepared = async () => {
+    const resolved = await resolveCarrierOneOffVoidRuntime({
+      organizationId: input.organizationId,
+      provider: input.label.provider,
+      environment: 'production',
+      integrationAccountGlobalId: input.label.integrationGlobalId,
+      carrierAccountGlobalId: input.label.carrierAccountGlobalId,
+    })
+    if (
+      resolved.environment !== 'production'
+      || resolved.integrationAccountId !== input.label.integrationAccountId
+      || resolved.integrationGlobalId !== input.label.integrationGlobalId
+      || resolved.carrierAccountId !== input.label.carrierAccountId
+      || resolved.carrierAccountGlobalId !== input.label.carrierAccountGlobalId
+      || resolved.accountNumberFingerprint
+        !== input.label.accountNumberFingerprint
+    ) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_CONTEXT_CHANGED',
+        'The original production sender account is unavailable; reconcile before retrying the void',
+        409,
+      )
+    }
+    const runtime: CarrierOneOffGroupRuntime = {
+      provider: resolved.provider,
+      environment: 'production',
+      credential: resolved.credential,
+      integrationAccountGlobalId: resolved.integrationGlobalId,
+      carrierAccountGlobalId: resolved.carrierAccountGlobalId,
+      credentialVersion: resolved.credentialVersion,
+      credentialFingerprint: resolved.credentialFingerprint,
+      accountNumberFingerprint: resolved.accountNumberFingerprint,
+      billingRelationship: 'sender',
+      billingSelectionSnapshot: resolved.billingSelectionSnapshot,
+    }
+    const providerPrepared = prepareCarrierOneOffGroupVoidRequest({
+      runtime,
+      masterTrackingNumber: input.label.trackingNumber,
+      providerShipmentId: input.label.providerLabelId,
+      packageTrackingNumbers: [input.label.trackingNumber],
+      attemptCorrelationKey: stableAttemptCorrelationKey({
+        organizationId: input.organizationId,
+        action: 'void',
+        idempotencyKey: input.idempotencyKey,
+      }),
+    })
+    return { runtime, providerPrepared }
+  }
+  let provider: Awaited<ReturnType<typeof buildPrepared>>
+  try {
+    provider = await buildPrepared()
+  } catch (error) {
+    throw carrierActionError(error)
+  }
+  const attemptRequestHash = carrierRateTestLabelFingerprint({
+    action: 'void',
+    environment: 'production',
+    labelGlobalId: input.label.labelGlobalId,
+    rateEvidenceGlobalId: input.label.rateEvidenceGlobalId,
+    carrierAccountGlobalId: input.label.carrierAccountGlobalId,
+    providerLabelId: input.label.providerLabelId,
+    trackingNumber: input.label.trackingNumber,
+    providerPreparedRequestHash: provider.providerPrepared.requestHash,
+    adapterVersion: CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+    reason: input.reason,
+  })
+  const replay = await replayCarrierRateTestLabelVoidInPostgres({
+    organizationId: input.organizationId,
+    labelGlobalId: input.label.labelGlobalId,
+    idempotencyKey: input.idempotencyKey,
+    attemptRequestHash,
+  })
+  if (replay) return replay
+  const prepared = await prepareCarrierRateTestLabelVoidInPostgres({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    label: input.label,
+    credentialVersion: provider.runtime.credentialVersion,
+    reason: input.reason,
+    idempotencyKey: input.idempotencyKey,
+    attemptRequestHash,
+    adapterVersion: CARRIER_ONE_OFF_GROUP_ADAPTER_VERSION,
+    preparedProviderEvidence: provider.providerPrepared.redactedRequest,
+  })
+  if (prepared.disposition === 'replayed') return prepared.label
+  try {
+    const verified = await buildPrepared()
+    if (
+      verified.providerPrepared.requestHash
+        !== provider.providerPrepared.requestHash
+    ) {
+      throw new OperationsRequestError(
+        'CARRIER_RATE_TEST_CONTEXT_CHANGED',
+        'The production void request changed after it was prepared',
+        409,
+      )
+    }
+    provider = verified
+  } catch (error) {
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+  let result: Awaited<ReturnType<typeof executeCarrierOneOffGroupVoid>>
+  try {
+    result = await executeCarrierOneOffGroupVoid({
+      runtime: provider.runtime,
+      prepared: provider.providerPrepared,
+    })
+  } catch (error) {
+    await finalizePreparedFailure({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      error,
+    })
+    throw carrierActionError(error)
+  }
+  try {
+    return await finalizeCarrierRateTestLabelVoidInPostgres({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      providerReference: result.evidence.providerReference,
+      redactedResponse: result.evidence.redactedResponse,
+    })
+  } catch {
+    await finalizeCarrierRateTestLabelAttemptFailureInPostgres({
+      organizationId: input.organizationId,
+      actorEmail: input.actorEmail,
+      attemptGlobalId: prepared.attemptGlobalId,
+      state: 'unknown',
+      errorCode: 'CARRIER_RATE_TEST_VOID_FINALIZATION_UNKNOWN',
+      providerReference: result.evidence.providerReference,
+      redactedResponse: result.evidence.redactedResponse,
+    }).catch(() => undefined)
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_RECONCILIATION_REQUIRED',
+      'The carrier voided the real postage, but ClawPilot could not finalize it; reconcile before retrying',
+      503,
+    )
+  }
+}
+
 export async function closeCarrierRateTestSampleLabel(input: {
   organizationId: string
   actorEmail: string
@@ -626,6 +1312,13 @@ export async function closeCarrierRateTestSampleLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
+  if (label.environment !== 'sandbox') {
+    throw new OperationsRequestError(
+      'CARRIER_RATE_TEST_SAMPLE_CLOSE_UNAVAILABLE',
+      'LIVE production postage can only be retired by a true provider void',
+      409,
+    )
+  }
   try {
     await assertCarrierRateTestArtifactCapability({
       organizationId: input.organizationId,
@@ -680,14 +1373,16 @@ export async function printCarrierRateTestLabel(input: {
     organizationId: input.organizationId,
     labelGlobalId: input.labelGlobalId,
   })
-  try {
-    await assertCarrierRateTestArtifactCapability({
-      organizationId: input.organizationId,
-      integrationAccountId: label.integrationAccountId,
-      provider: label.provider,
-    })
-  } catch (error) {
-    throw carrierActionError(error)
+  if (label.environment === 'sandbox') {
+    try {
+      await assertCarrierRateTestArtifactCapability({
+        organizationId: input.organizationId,
+        integrationAccountId: label.integrationAccountId,
+        provider: label.provider,
+      })
+    } catch (error) {
+      throw carrierActionError(error)
+    }
   }
   return queueCarrierRateTestLabelPrintInPostgres(input)
 }

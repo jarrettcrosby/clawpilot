@@ -10,6 +10,8 @@ import {
   managedCarrierDelegationAllows,
   managedCarrierDelegationProfile,
 } from '@/lib/integrations/carrierManagedDelegation'
+import { carrierProductionLabelAuthorizationAllowed } from '@/lib/integrations/carrierProductionLabelRuntime'
+export { carrierProductionLabelAuthorizationAllowed } from '@/lib/integrations/carrierProductionLabelRuntime'
 import {
   CARRIER_SANDBOX_RATE_FIXTURE,
   buildCarrierSandboxRateFixture,
@@ -133,6 +135,23 @@ function sanitize(error: unknown): CarrierIntegrationRequestError {
   }
   if (error instanceof CarrierCredentialClientError) {
     return new CarrierIntegrationRequestError(error.message, error.status, error.code)
+  }
+  if (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && error.code === 'CARRIER_PRODUCTION_LABEL_NOT_READY'
+    && 'status' in error
+    && error.status === 409
+  ) {
+    const safeMessage = 'message' in error && typeof error.message === 'string'
+      ? error.message
+      : 'Live postage setup is not ready'
+    return new CarrierIntegrationRequestError(
+      safeMessage,
+      409,
+      'CARRIER_PRODUCTION_LABEL_NOT_READY',
+    )
   }
   const message = error instanceof Error ? error.message : ''
   if (message === 'Carrier credential encryption is not configured') {
@@ -762,6 +781,13 @@ export async function resolveCarrierProductionShippingRuntime(input: {
   carrierAccountGlobalId: unknown
 }): Promise<CarrierProductionRatingRuntime> {
   try {
+    if (!carrierProductionLabelAuthorizationAllowed()) {
+      throw new CarrierIntegrationRequestError(
+        'Production label purchase is available only in production or the trusted Railway development service',
+        403,
+        'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
+      )
+    }
     const organizationId = normalizeCarrierOrganizationId(input.organizationId)
     const provider = normalizeDirectCarrierProvider(input.provider)
     const runtime = await storedRuntimeCredential({
@@ -903,6 +929,13 @@ export async function setCarrierProductionLabelEnabled(input: {
         'Live postage is available only for UPS and FedEx production connections',
         409,
         'CARRIER_PRODUCTION_LABEL_UNSUPPORTED',
+      )
+    }
+    if (input.enabled === true && !carrierProductionLabelAuthorizationAllowed()) {
+      throw new CarrierIntegrationRequestError(
+        'Production label purchase can be authorized only in production or the trusted Railway development service',
+        403,
+        'CARRIER_PRODUCTION_LABEL_ENVIRONMENT_FORBIDDEN',
       )
     }
     const reason = String(input.reason || '').trim()

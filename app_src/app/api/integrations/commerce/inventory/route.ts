@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
+  createShopifyInventoryWarehouseAndMap,
   getShopifyInventoryState,
+  mapShopifyInventoryLocation,
   syncShopifyInventory,
 } from '@/lib/integrations/commerceInventory'
 import {
@@ -112,6 +114,9 @@ export async function GET(req: NextRequest) {
     const inventory = await getShopifyInventoryState({
       organizationId: organizationId(user),
       accountGlobalId: req.nextUrl.searchParams.get('accountGlobalId'),
+      mappingGlobalId: req.nextUrl.searchParams.get('mappingGlobalId'),
+      idempotencyKey: req.headers.get('Idempotency-Key'),
+      actorEmail: user.email,
     })
     return json({ ok: true, inventory })
   } catch (error) {
@@ -123,6 +128,31 @@ export async function POST(req: NextRequest) {
   try {
     const user = await actor(req)
     const body = await requestBody(req)
+    if (body.action === 'create-warehouse-and-map') {
+      const result = await createShopifyInventoryWarehouseAndMap({
+        organizationId: organizationId(user),
+        accountGlobalId: body.accountGlobalId,
+        externalLocationId: body.externalLocationId,
+        warehouse: body.warehouse,
+        idempotencyKey: body.idempotencyKey,
+        actorEmail: user.email,
+      })
+      return json({ ok: true, ...result }, 201)
+    }
+    if (body.action === 'map-location') {
+      const result = await mapShopifyInventoryLocation({
+        organizationId: organizationId(user),
+        accountGlobalId: body.accountGlobalId,
+        externalLocationId: body.externalLocationId,
+        warehouseGlobalId: body.warehouseGlobalId,
+        locationGlobalId: body.locationGlobalId,
+        mappingGlobalId: body.mappingGlobalId,
+        expectedRowVersion: body.expectedRowVersion,
+        idempotencyKey: body.idempotencyKey,
+        actorEmail: user.email,
+      })
+      return json({ ok: true, ...result })
+    }
     if (body.action !== 'sync') {
       throw new CommerceIntegrationRequestError(
         'Shopify inventory action is invalid',
@@ -130,10 +160,22 @@ export async function POST(req: NextRequest) {
         'SHOPIFY_INVENTORY_ACTION_INVALID',
       )
     }
+    if (
+      typeof body.mappingGlobalId !== 'string'
+      || !body.mappingGlobalId.trim()
+    ) {
+      throw new CommerceIntegrationRequestError(
+        'Choose a mapped Shopify inventory location to synchronize',
+        400,
+        'SHOPIFY_INVENTORY_LOCATION_MAPPING_REQUIRED',
+      )
+    }
     const result = await syncShopifyInventory({
       organizationId: organizationId(user),
       accountGlobalId: body.accountGlobalId,
       idempotencyKey: body.idempotencyKey,
+      mappingGlobalId: body.mappingGlobalId,
+      expectedMappingRowVersion: body.expectedMappingRowVersion,
       actorEmail: user.email,
     })
     return json({ ok: true, ...result })

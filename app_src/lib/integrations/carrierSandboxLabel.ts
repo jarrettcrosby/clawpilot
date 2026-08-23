@@ -109,6 +109,22 @@ export class CarrierSandboxLabelError extends Error {
   }
 }
 
+type CarrierSandboxOperationStage =
+  | 'oauth'
+  | 'shipment_request_build'
+  | 'shipment_request_dispatch'
+  | 'provider_response_read'
+  | 'provider_response_parse'
+  | 'provider_response_status'
+  | 'provider_response_validate'
+
+type CarrierSandboxOperationContext = {
+  operationStage: CarrierSandboxOperationStage
+  providerRequestDispatchAttempted: boolean
+  providerResponseReceived: boolean
+  providerHttpStatus?: number
+}
+
 const PROVIDER_LABEL_OUTPUTS: Record<
   SandboxLabelProvider,
   readonly CarrierSandboxLabelOutputOption[]
@@ -313,20 +329,82 @@ function providerHttpError(
   )
 }
 
+const SAFE_TRANSPORT_ERROR_CODES = new Set([
+  'ABORT_ERR',
+  'EAI_AGAIN',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ERR_INVALID_STATE',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'UND_ERR_ABORTED',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_SOCKET',
+])
+
+function safeExceptionEvidence(error: unknown) {
+  const errorRecord = record(error)
+  const causeRecord = record(errorRecord.cause)
+  const candidateCode = text(errorRecord.code || causeRecord.code).toUpperCase()
+  const safeCode = SAFE_TRANSPORT_ERROR_CODES.has(candidateCode)
+    ? candidateCode
+    : null
+  const candidateName = error instanceof Error ? error.name : ''
+  const safeName = ['AbortError', 'Error', 'TypeError'].includes(candidateName)
+    ? candidateName
+    : 'Error'
+  return {
+    exceptionName: safeName,
+    ...(safeCode ? { exceptionCode: safeCode } : {}),
+  }
+}
+
 function credentialError(error: unknown) {
   if (error instanceof CarrierSandboxLabelError) return error
+  const redactedResponse = {
+    operationStage: 'oauth',
+    providerRequestDispatchAttempted: false,
+    providerResponseReceived: false,
+    ...safeExceptionEvidence(error),
+  }
   if (error instanceof CarrierCredentialClientError) {
-    return new CarrierSandboxLabelError(error.message, error.status, error.code, false)
+    return new CarrierSandboxLabelError(
+      error.message,
+      error.status,
+      error.code,
+      false,
+      redactedResponse,
+    )
   }
   return new CarrierSandboxLabelError(
     'The carrier sandbox credential request failed',
     503,
     'CARRIER_PROVIDER_UNAVAILABLE',
     false,
+    redactedResponse,
   )
 }
 
-function operationError(error: unknown, clientTransactionId: string) {
+function operationError(
+  error: unknown,
+  clientTransactionId: string,
+  context: CarrierSandboxOperationContext,
+) {
+  const operationEvidence = {
+    clientTransactionId,
+    operationStage: context.operationStage,
+    providerRequestDispatchAttempted: context.providerRequestDispatchAttempted,
+    providerResponseReceived: context.providerResponseReceived,
+    ...(context.providerHttpStatus
+      ? { httpStatus: context.providerHttpStatus }
+      : {}),
+  }
   if (error instanceof CarrierSandboxLabelError) {
     return new CarrierSandboxLabelError(
       error.message,
@@ -335,7 +413,7 @@ function operationError(error: unknown, clientTransactionId: string) {
       error.uncertain,
       {
         ...error.redactedResponse,
-        clientTransactionId,
+        ...operationEvidence,
       },
     )
   }
@@ -345,7 +423,7 @@ function operationError(error: unknown, clientTransactionId: string) {
       504,
       'CARRIER_PROVIDER_RESULT_UNKNOWN',
       true,
-      { clientTransactionId },
+      { ...operationEvidence, ...safeExceptionEvidence(error) },
     )
   }
   return new CarrierSandboxLabelError(
@@ -353,7 +431,7 @@ function operationError(error: unknown, clientTransactionId: string) {
     503,
     'CARRIER_PROVIDER_RESULT_UNKNOWN',
     true,
-    { clientTransactionId },
+    { ...operationEvidence, ...safeExceptionEvidence(error) },
   )
 }
 
@@ -672,6 +750,15 @@ export function carrierSandboxLabelRequestEvidence(
       ? fixture.origin.name
       : String(senderName || '').trim() || fixture.origin.name,
   }
+  const destinationParty: CarrierSandboxRateFixture['destination'] = {
+    name: fixture.destination.name,
+    line1: fixture.destination.line1,
+    line2: fixture.destination.line2,
+    city: fixture.destination.city,
+    region: fixture.destination.region,
+    postalCode: fixture.destination.postalCode,
+    countryCode: fixture.destination.countryCode,
+  }
   const value = {
     provider,
     environment: 'sandbox',
@@ -700,7 +787,7 @@ export function carrierSandboxLabelRequestEvidence(
       label: value.label,
       shipment: {
         originFingerprint: carrierSandboxPartyFingerprint(origin),
-        destinationFingerprint: carrierSandboxPartyFingerprint(fixture.destination),
+        destinationFingerprint: carrierSandboxPartyFingerprint(destinationParty),
         origin: {
           region: origin.region,
           countryCode: origin.countryCode,
@@ -918,6 +1005,7 @@ function parseFedexCreate(
 async function readProviderPayload(
   response: Response,
   maximumBytes = 2 * 1024 * 1024,
+  onStage?: (stage: 'provider_response_read' | 'provider_response_parse') => void,
 ) {
   const limit = Math.max(
     64 * 1024,
@@ -932,6 +1020,7 @@ async function readProviderPayload(
       true,
     )
   }
+  onStage?.('provider_response_read')
   const raw = await response.text()
   if (Buffer.byteLength(raw, 'utf8') > limit) {
     throw new CarrierSandboxLabelError(
@@ -941,6 +1030,7 @@ async function readProviderPayload(
       true,
     )
   }
+  onStage?.('provider_response_parse')
   try {
     return record(JSON.parse(raw))
   } catch {
@@ -978,11 +1068,19 @@ export async function createCarrierSandboxLabel(
   const controller = new AbortController()
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 15_000, 20_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  const operationContext: CarrierSandboxOperationContext = {
+    operationStage: 'shipment_request_build',
+    providerRequestDispatchAttempted: false,
+    providerResponseReceived: false,
+  }
   try {
     const fixture = runtimeFixture(input)
     const body = input.provider === 'ups_rest'
       ? upsCreateRequest(input, selectedServiceCode, fixture, output)
       : fedexCreateRequest(input, selectedServiceCode, fixture, output)
+    const serializedBody = JSON.stringify(body)
+    operationContext.operationStage = 'shipment_request_dispatch'
+    operationContext.providerRequestDispatchAttempted = true
     const response = await fetchImpl(LABEL_ENDPOINTS[input.provider], {
       method: 'POST',
       headers: {
@@ -996,17 +1094,23 @@ export async function createCarrierSandboxLabel(
               'x-locale': 'en_US',
             }),
       },
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: controller.signal,
     })
-    const payload = await readProviderPayload(response)
+    operationContext.providerResponseReceived = true
+    operationContext.providerHttpStatus = response.status
+    const payload = await readProviderPayload(response, undefined, (stage) => {
+      operationContext.operationStage = stage
+    })
     if (!response.ok) {
+      operationContext.operationStage = 'provider_response_status'
       throw providerHttpError(response.status, 'create', payload, {
         clientTransactionId: transactionId,
         providerTransactionId: response.headers.get('transaction-id')
           || response.headers.get('x-customer-transaction-id'),
       })
     }
+    operationContext.operationStage = 'provider_response_validate'
     const parsed = input.provider === 'ups_rest'
       ? parseUpsCreate(payload, output)
       : parseFedexCreate(payload, output)
@@ -1047,7 +1151,7 @@ export async function createCarrierSandboxLabel(
       },
     }
   } catch (error) {
-    throw operationError(error, transactionId)
+    throw operationError(error, transactionId, operationContext)
   } finally {
     clearTimeout(timeout)
   }
@@ -1086,8 +1190,22 @@ export async function voidCarrierSandboxLabel(
   const controller = new AbortController()
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs || 15_000, 20_000))
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  const operationContext: CarrierSandboxOperationContext = {
+    operationStage: 'shipment_request_build',
+    providerRequestDispatchAttempted: false,
+    providerResponseReceived: false,
+  }
   try {
     const isUps = input.provider === 'ups_rest'
+    const serializedBody = isUps
+      ? undefined
+      : JSON.stringify({
+          accountNumber: { value: input.credential.accountNumber },
+          trackingNumber,
+          deletionControl: 'DELETE_ALL_PACKAGES',
+        })
+    operationContext.operationStage = 'shipment_request_dispatch'
+    operationContext.providerRequestDispatchAttempted = true
     const response = await fetchImpl(
       isUps
         ? `${VOID_ENDPOINTS.ups_rest}/${encodeURIComponent(providerReference)}`
@@ -1106,23 +1224,25 @@ export async function voidCarrierSandboxLabel(
               }),
         },
         ...(isUps ? {} : {
-          body: JSON.stringify({
-            accountNumber: { value: input.credential.accountNumber },
-            trackingNumber,
-            deletionControl: 'DELETE_ALL_PACKAGES',
-          }),
+          body: serializedBody,
         }),
         signal: controller.signal,
       },
     )
-    const payload = await readProviderPayload(response)
+    operationContext.providerResponseReceived = true
+    operationContext.providerHttpStatus = response.status
+    const payload = await readProviderPayload(response, undefined, (stage) => {
+      operationContext.operationStage = stage
+    })
     if (!response.ok) {
+      operationContext.operationStage = 'provider_response_status'
       throw providerHttpError(response.status, 'void', payload, {
         clientTransactionId: transactionId,
         providerTransactionId: response.headers.get('transaction-id')
           || response.headers.get('x-customer-transaction-id'),
       })
     }
+    operationContext.operationStage = 'provider_response_validate'
     if (isUps) {
       const voidResponse = record(payload.VoidShipmentResponse)
       const summary = record(record(voidResponse.SummaryResult).Status)
@@ -1172,7 +1292,7 @@ export async function voidCarrierSandboxLabel(
       },
     }
   } catch (error) {
-    throw operationError(error, transactionId)
+    throw operationError(error, transactionId, operationContext)
   } finally {
     clearTimeout(timeout)
   }

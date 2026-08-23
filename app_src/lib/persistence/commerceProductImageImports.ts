@@ -9,14 +9,22 @@ import {
 } from '@/lib/crm/productImageAssets'
 import {
   acquireTransactionAdvisoryLock,
+  query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 import {
   enqueueSuiteCrmProductImageProjectionWithClient,
 } from '@/lib/persistence/suiteCrmProductImageProjection'
 
 export type CommerceProductImageProvider = 'shopify' | 'faire'
 export type CommerceProductImageLifecycle = 'active' | 'removed'
+export type CommerceProductImageProviderReadAuthority =
+  | 'automatic'
+  | 'manual_read_only'
 export type CommerceProductImageImportJobState =
   | 'waiting_mapping'
   | 'queued'
@@ -68,6 +76,7 @@ export type RecordCommerceProductImageObservationInput = {
   providerUpdatedAt?: Date | string | null
   observedAt: Date | string
   actorEmail: string
+  providerReadAuthority: CommerceProductImageProviderReadAuthority
   maxAttempts?: number
 }
 
@@ -100,6 +109,7 @@ export type CommerceProductImageImportClaim = {
   leaseToken: string
   leaseExpiresAt: string
   actorEmail: string
+  providerReadAuthority: CommerceProductImageProviderReadAuthority
 }
 
 export type CommerceProductImageImportCompletion = {
@@ -128,6 +138,7 @@ export type CommerceProductImageImportQueueHealth = {
   claimedCount: number
   deadCount: number
   historicalDeadCount: number
+  pausedRetainedCount: number
   staleLeaseCount: number
   overdueCount: number
   lastTerminalProgressAt: string | null
@@ -191,6 +202,7 @@ type JobRow = QueryResultRow & {
   result_asset_id: string | null
   result_content_sha256: string | null
   created_by: string
+  provider_read_authority: CommerceProductImageProviderReadAuthority
 }
 
 type MappingResolutionRow = QueryResultRow & {
@@ -419,6 +431,12 @@ function normalizeObservationInput(
   if (!['active', 'removed'].includes(input.lifecycle)) {
     fail('COMMERCE_PRODUCT_IMAGE_INPUT_INVALID', 'Image lifecycle is invalid')
   }
+  if (!['automatic', 'manual_read_only'].includes(input.providerReadAuthority)) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_INPUT_INVALID',
+      'Product image provider-read authority is invalid',
+    )
+  }
   const credentialGeneration = Number(input.credentialGeneration)
   if (!Number.isSafeInteger(credentialGeneration) || credentialGeneration < 1) {
     fail('COMMERCE_PRODUCT_IMAGE_INPUT_INVALID', 'Credential generation is invalid')
@@ -474,6 +492,7 @@ function normalizeObservationInput(
       : sourceTimestamp(input.providerUpdatedAt, 'Provider update timestamp'),
     observedAt: sourceTimestamp(input.observedAt, 'Observation timestamp'),
     actorEmail: requiredTrimmed(input.actorEmail, 'Actor email', 255),
+    providerReadAuthority: input.providerReadAuthority,
     maxAttempts,
   }
 }
@@ -732,6 +751,7 @@ async function selectJob(
        mapping_fingerprint_sha256,
        activation_revision,
        asset_alt_text,
+       provider_read_authority,
        state,
        wait_reason,
        last_error_code,
@@ -834,6 +854,38 @@ async function jobFencesAreCurrent(
        $1::uuid, $2::uuid
      ) AS current`,
     [organizationId, jobId],
+  )
+  return result.rows[0]?.current === true
+}
+
+async function lockCommerceProductImageProviderReadAuthority(
+  client: PoolClient,
+  job: Pick<
+    JobRow,
+    'organization_id' | 'integration_account_id' | 'provider_read_authority'
+  >,
+) {
+  const result = await client.query<{ current: boolean }>(
+    `SELECT operations_commerce_provider_read_authority_is_current(
+       account.organization_id,
+       account.id,
+       $3
+     ) AS current
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_store_sync_controls control
+       ON control.organization_id = account.organization_id
+      AND control.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider IN ('shopify', 'faire')
+     LIMIT 1
+     FOR UPDATE OF account, control`,
+    [
+      job.organization_id,
+      job.integration_account_id,
+      job.provider_read_authority,
+    ],
   )
   return result.rows[0]?.current === true
 }
@@ -979,8 +1031,9 @@ async function createCommerceProductImageSuccessorJob(
     priorJob: JobRow
     actorEmail: string
     auditActor?: string
-    auditReason: 'mapping_changed' | 'operator_retry'
+    auditReason: 'mapping_changed' | 'operator_retry' | 'manual_refresh'
     operatorReason?: string | null
+    providerReadAuthority?: CommerceProductImageProviderReadAuthority
   },
 ): Promise<JobRow> {
   const priorJob = input.priorJob
@@ -988,8 +1041,16 @@ async function createCommerceProductImageSuccessorJob(
     ['succeeded', 'dead'].includes(priorJob.state)
     || (
       priorJob.state === 'cancelled'
-      && input.auditReason === 'mapping_changed'
-      && priorJob.last_error_code === 'MAPPING_CHANGED'
+      && (
+        (
+          input.auditReason === 'mapping_changed'
+          && priorJob.last_error_code === 'MAPPING_CHANGED'
+        )
+        || (
+          input.auditReason === 'manual_refresh'
+          && priorJob.last_error_code !== null
+        )
+      )
     )
   )) {
     fail(
@@ -1075,6 +1136,7 @@ async function createCommerceProductImageSuccessorJob(
        mapping_fingerprint_sha256,
        activation_revision,
        asset_alt_text,
+       provider_read_authority,
        state,
        wait_reason,
        max_attempts,
@@ -1083,7 +1145,7 @@ async function createCommerceProductImageSuccessorJob(
      ) VALUES (
        $1, $2::uuid, $3::uuid, $4, $5, $6::uuid, $7, $8, $9, $10,
        $11, $12::uuid, $13::uuid, $14::uuid, $15, $16, $17, $18,
-       $19, $20, $21, $22, $22
+       $19, $20, $21, $22, $23, $23
      )
      RETURNING *`,
     [
@@ -1105,6 +1167,7 @@ async function createCommerceProductImageSuccessorJob(
       mapping?.mappingFingerprintSha256 || null,
       mapping?.activationRevision || null,
       mapping?.assetAltText || null,
+      input.providerReadAuthority || priorJob.provider_read_authority,
       state,
       waitReason,
       priorJob.max_attempts,
@@ -1334,6 +1397,7 @@ async function recordCommerceProductImageObservationWithClient(
            mapping_fingerprint_sha256,
            activation_revision,
            asset_alt_text,
+           provider_read_authority,
            state,
            wait_reason,
            max_attempts,
@@ -1344,9 +1408,9 @@ async function recordCommerceProductImageObservationWithClient(
          ) VALUES (
            $1::uuid, $2::uuid, $3, $4, $5::uuid, $6::bigint,
            $7, $8, $9, $10, $11::uuid, $12::uuid, $13::uuid,
-           $14, $15, $16, $17, $18, $19, $20, $21,
-           CASE WHEN $18 = 'cancelled' THEN clock_timestamp() ELSE NULL END,
-           $22, $22
+           $14, $15, $16, $17, $18, $19, $20, $21, $22,
+           CASE WHEN $19 = 'cancelled' THEN clock_timestamp() ELSE NULL END,
+           $23, $23
          )
          RETURNING *`,
         [
@@ -1367,6 +1431,7 @@ async function recordCommerceProductImageObservationWithClient(
           mapping?.mappingFingerprintSha256 || null,
           mapping?.activationRevision || null,
           mapping?.assetAltText || null,
+          normalized.providerReadAuthority,
           state,
           waitReason,
           normalized.maxAttempts,
@@ -1374,6 +1439,42 @@ async function recordCommerceProductImageObservationWithClient(
           normalized.actorEmail,
         ],
       )
+    } else if (
+      normalized.lifecycle === 'active'
+      && normalized.providerReadAuthority === 'manual_read_only'
+      && jobResult.rows[0].provider_read_authority === 'automatic'
+      && jobResult.rows[0].state !== 'succeeded'
+    ) {
+      if (!['dead', 'cancelled'].includes(jobResult.rows[0].state)) {
+        await client.query(
+          `UPDATE operations_commerce_product_image_import_jobs
+           SET state = 'cancelled',
+               wait_reason = NULL,
+               lease_token = NULL,
+               claimed_by = NULL,
+               claimed_at = NULL,
+               lease_expires_at = NULL,
+               last_error_code = 'MANUAL_READ_SUPERSEDED',
+               completed_at = clock_timestamp(),
+               updated_by = $3
+           WHERE organization_id = $1::uuid
+             AND id = $2::uuid
+             AND state NOT IN ('succeeded', 'dead', 'cancelled')`,
+          [normalized.organizationId, jobResult.rows[0].id, normalized.actorEmail],
+        )
+        jobResult.rows[0] = await selectJob(
+          client,
+          normalized.organizationId,
+          jobResult.rows[0].id,
+          true,
+        )
+      }
+      jobResult.rows[0] = await createCommerceProductImageSuccessorJob(client, {
+        priorJob: jobResult.rows[0],
+        actorEmail: normalized.actorEmail,
+        auditReason: 'manual_refresh',
+        providerReadAuthority: 'manual_read_only',
+      })
     } else if (
       normalized.lifecycle === 'active'
       && jobResult.rows[0].state === 'succeeded'
@@ -1435,6 +1536,7 @@ export type ReconcileCommerceProductImageSetInput = {
   observedAt: Date | string
   providerUpdatedAt?: Date | string | null
   actorEmail: string
+  providerReadAuthority: CommerceProductImageProviderReadAuthority
   maxAttempts?: number
   images: Array<{
     providerImageId?: string | null
@@ -1657,7 +1759,6 @@ async function electCurrentProviderImagePrimary(
            FROM operations_activation_scopes activation
            WHERE activation.organization_id = binding.organization_id
              AND activation.data_pipeline_id = binding.pipeline_id
-             AND activation.state IN ('shadow', 'active')
              AND activation.revision = binding.activation_revision
          )
        ORDER BY
@@ -2127,6 +2228,12 @@ export async function reconcileCommerceProductImageSetWithClient(
     512,
   )
   const actorEmail = requiredTrimmed(input.actorEmail, 'Actor email', 255)
+  if (!['automatic', 'manual_read_only'].includes(input.providerReadAuthority)) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_INPUT_INVALID',
+      'Product image provider-read authority is invalid',
+    )
+  }
   const productSourceHash = requiredHash(
     input.productSourceHash,
     'Product image-set source hash',
@@ -2179,6 +2286,7 @@ export async function reconcileCommerceProductImageSetWithClient(
       providerUpdatedAt,
       observedAt,
       actorEmail,
+      providerReadAuthority: input.providerReadAuthority,
       maxAttempts: input.maxAttempts,
     })
     const identity = normalized.imageIdentitySha256
@@ -2229,18 +2337,39 @@ export async function reconcileCommerceProductImageSetWithClient(
     actor_exists: boolean
   }>(
     `SELECT
-       operations_commerce_product_image_account_is_current(
-         $1::uuid, $2::uuid, $3, $4
-       ) AS account_is_current,
+       true AS account_is_current,
        EXISTS (
          SELECT 1 FROM app_users WHERE email = $5
-       ) AS actor_exists`,
+       ) AS actor_exists
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+      AND credential.external_account_id = account.external_account_id
+     JOIN operations_commerce_store_sync_controls control
+       ON control.organization_id = account.organization_id
+      AND control.integration_account_id = account.id
+     JOIN operations_activation_scopes activation
+       ON activation.organization_id = account.organization_id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.provider = $3
+       AND account.commerce_credential_generation = $4
+       AND credential.credential_version = $4
+       AND credential.verification_status = 'verified'
+       AND operations_commerce_product_image_read_authority_is_current(
+         account.organization_id, account.id, account.provider,
+         credential.credential_version, $6
+       )
+     LIMIT 1
+     FOR SHARE OF account, credential, control, activation`,
     [
       organizationId,
       integrationAccountId,
       input.provider,
       input.credentialGeneration,
       actorEmail,
+      input.providerReadAuthority,
     ],
   )
   if (!authority.rows[0]?.account_is_current) {
@@ -2353,7 +2482,11 @@ export async function reconcileCommerceProductImageSetWithClient(
       ],
     )
   }
-    const insertedSet = await client.query<{ id: string; global_id: string }>(
+    const insertedSet = await client.query<{
+      id: string
+      global_id: string
+      provider_read_authority: CommerceProductImageProviderReadAuthority
+    }>(
       `INSERT INTO operations_commerce_product_image_observation_sets (
          organization_id,
          integration_account_id,
@@ -2367,10 +2500,11 @@ export async function reconcileCommerceProductImageSetWithClient(
          snapshot_sha256,
          provider_updated_at,
          observed_at,
+         provider_read_authority,
          created_by
        ) VALUES (
          $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9,
-         $10, $11::timestamptz, $12::timestamptz, $13
+         $10, $11::timestamptz, $12::timestamptz, $13, $14
        )
        ON CONFLICT (
          organization_id,
@@ -2384,7 +2518,7 @@ export async function reconcileCommerceProductImageSetWithClient(
          image_identity_set_sha256,
          snapshot_sha256
        ) DO NOTHING
-       RETURNING id::text, global_id`,
+       RETURNING id::text, global_id, provider_read_authority`,
       [
         organizationId,
         integrationAccountId,
@@ -2398,13 +2532,18 @@ export async function reconcileCommerceProductImageSetWithClient(
         snapshotSha256,
         providerUpdatedAt,
         observedAt,
+        input.providerReadAuthority,
         actorEmail,
       ],
     )
     let observationSet = insertedSet.rows[0]
     if (!observationSet) {
-      const replayedSet = await client.query<{ id: string; global_id: string }>(
-        `SELECT id::text, global_id
+      const replayedSet = await client.query<{
+        id: string
+        global_id: string
+        provider_read_authority: CommerceProductImageProviderReadAuthority
+      }>(
+        `SELECT id::text, global_id, provider_read_authority
          FROM operations_commerce_product_image_observation_sets
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
@@ -2432,6 +2571,16 @@ export async function reconcileCommerceProductImageSetWithClient(
         ],
       )
       observationSet = replayedSet.rows[0]
+      if (
+        observationSet
+        && observationSet.provider_read_authority !== input.providerReadAuthority
+      ) {
+        fail(
+          'COMMERCE_PRODUCT_IMAGE_SNAPSHOT_AUTHORITY_CONFLICT',
+          'Product image snapshot replay does not match its original read authority',
+          409,
+        )
+      }
     }
     if (!observationSet) {
       fail(
@@ -2468,6 +2617,7 @@ export async function reconcileCommerceProductImageSetWithClient(
         providerUpdatedAt,
         observedAt,
         actorEmail,
+        providerReadAuthority: input.providerReadAuthority,
         maxAttempts: input.maxAttempts,
       }, client, observationSet.id)
       active.push(receipt)
@@ -2562,6 +2712,7 @@ export async function reconcileCommerceProductImageSetWithClient(
           providerUpdatedAt,
           observedAt,
           actorEmail,
+          providerReadAuthority: input.providerReadAuthority,
           maxAttempts: input.maxAttempts,
         }, client, observationSet.id)
         removed.push(removal)
@@ -2614,6 +2765,11 @@ export async function resolveWaitingCommerceProductImageImportJobsInPostgres(inp
        FROM operations_commerce_product_image_import_jobs
        WHERE ($1::uuid IS NULL OR organization_id = $1::uuid)
          AND state = 'waiting_mapping'
+         AND operations_commerce_provider_read_authority_is_current(
+           organization_id,
+           integration_account_id,
+           provider_read_authority
+         )
        ORDER BY created_at, id
        LIMIT $2
        FOR UPDATE SKIP LOCKED`,
@@ -2621,6 +2777,9 @@ export async function resolveWaitingCommerceProductImageImportJobsInPostgres(inp
     )
     const resolved = []
     for (const job of candidates.rows) {
+      if (!await lockCommerceProductImageProviderReadAuthority(client, job)) {
+        continue
+      }
       const observation = await selectObservation(client, job.observation_id)
       const current = await bindWaitingJob(client, job, observation, updatedBy)
       resolved.push({
@@ -2764,6 +2923,7 @@ function claimFromRows(rows: Array<JobRow & {
       leaseToken: row.lease_token,
       leaseExpiresAt: iso(row.lease_expires_at, 'lease expiry'),
       actorEmail: row.requested_actor_email,
+      providerReadAuthority: row.provider_read_authority,
     }
   })
 }
@@ -2917,6 +3077,76 @@ export async function claimCommerceProductImageImportJobsInPostgres(input: {
   })
 }
 
+/**
+ * Revalidates the exact image-import lease and its Store sync/data fences at
+ * the last local boundary before any provider source or image fetch.
+ */
+export async function assertCommerceProductImageImportClaimCurrentInPostgres(
+  input: {
+    organizationId: string
+    jobId: string
+    leaseToken: string
+    workerId: string
+  },
+) {
+  const organizationId = requiredTrimmed(
+    input.organizationId,
+    'Organization ID',
+    64,
+  )
+  const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
+  const leaseToken = requiredTrimmed(input.leaseToken, 'Lease token', 64)
+  const workerId = requiredTrimmed(input.workerId, 'Worker ID', 100)
+  const current = await query<{
+    lease_current: boolean
+    provider_read_authority_current: boolean
+    fences_current: boolean
+  }>(
+    `SELECT
+       job.state = 'claimed'
+         AND job.lease_token = $3::uuid
+         AND job.claimed_by = $4
+         AND job.lease_expires_at > statement_timestamp()
+           AS lease_current,
+       operations_commerce_provider_read_authority_is_current(
+         job.organization_id,
+         job.integration_account_id,
+         job.provider_read_authority
+       ) AS provider_read_authority_current,
+       operations_commerce_product_image_job_fences_are_current(
+         job.organization_id,
+         job.id
+       ) AS fences_current
+     FROM operations_commerce_product_image_import_jobs job
+     WHERE job.organization_id = $1::uuid
+       AND job.id = $2::uuid
+     LIMIT 1`,
+    [organizationId, jobId, leaseToken, workerId],
+  )
+  const row = current.rows[0]
+  if (!row?.lease_current) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_LEASE_LOST',
+      'Commerce product image import lease is no longer current',
+      409,
+    )
+  }
+  if (!row.provider_read_authority_current) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+      'Store sync paused before the commerce product image provider read',
+      409,
+    )
+  }
+  if (!row.fences_current) {
+    fail(
+      'COMMERCE_PRODUCT_IMAGE_FENCE_STALE',
+      'Commerce product image import fences changed before provider I/O',
+      409,
+    )
+  }
+}
+
 export async function failCommerceProductImageImportJobInPostgres(input: {
   organizationId: string
   jobId: string
@@ -2998,6 +3228,46 @@ export async function failCommerceProductImageImportJobInPostgres(input: {
     )
     return { state, attemptCount: job.attempt_count }
   })
+}
+
+export async function parkCommerceProductImageImportForStoreSyncPauseInPostgres(
+  input: {
+    organizationId: string
+    jobId: string
+    leaseToken: string
+    workerId: string
+  },
+) {
+  const organizationId = requiredTrimmed(
+    input.organizationId,
+    'Organization ID',
+    64,
+  )
+  const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
+  const leaseToken = requiredTrimmed(input.leaseToken, 'Lease token', 64)
+  const workerId = requiredTrimmed(input.workerId, 'Worker ID', 100)
+  const parked = await query(
+    `UPDATE operations_commerce_product_image_import_jobs
+     SET state = 'queued',
+         attempt_count = GREATEST(0, attempt_count - 1),
+         lease_token = NULL,
+         claimed_by = NULL,
+         claimed_at = NULL,
+         lease_expires_at = NULL,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         available_at = statement_timestamp(),
+         completed_at = NULL,
+         updated_by = $5,
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid
+       AND id = $2::uuid
+       AND state = 'claimed'
+       AND lease_token = $3::uuid
+       AND claimed_by = $4
+     RETURNING id`,
+    [organizationId, jobId, leaseToken, workerId, workerId],
+  )
+  return { parked: parked.rowCount === 1 }
 }
 
 type PersistedCommerceProductImageFanoutTarget = {
@@ -3221,6 +3491,7 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
   sourceByteLength: unknown
   sourceContentSha256: unknown
   normalizationVersion: unknown
+  providerReadLease: CommerceStoreSyncProviderReadLease
 }): Promise<CommerceProductImageImportCompletion> {
   const organizationId = requiredTrimmed(input.organizationId, 'Organization ID', 64)
   const jobId = requiredTrimmed(input.jobId, 'Import job ID', 64)
@@ -3228,6 +3499,13 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
   const actorEmail = requiredTrimmed(input.actorEmail, 'Actor email', 255)
   return withTransaction(async (client) => {
     const job = await selectJob(client, organizationId, jobId, true)
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId,
+      integrationAccountId: job.integration_account_id,
+      lease: input.providerReadLease,
+      authorityKind: job.provider_read_authority,
+      readKind: 'product_image_import',
+    })
     if (job.created_by !== actorEmail) {
       fail(
         'COMMERCE_PRODUCT_IMAGE_ACTOR_FENCE_MISMATCH',
@@ -3339,6 +3617,35 @@ export async function completeCommerceProductImageImportJobInPostgres(input: {
       fail(
         'COMMERCE_PRODUCT_IMAGE_LEASE_LOST',
         'Commerce product image import lease is no longer current',
+        409,
+      )
+    }
+    const storeSync = await client.query(
+      `SELECT control.integration_account_id
+       FROM operations_commerce_store_sync_controls control
+       JOIN operations_integration_accounts account
+         ON account.organization_id = control.organization_id
+        AND account.id = control.integration_account_id
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = account.organization_id
+       WHERE control.organization_id = $1::uuid
+         AND control.integration_account_id = $2::uuid
+         AND operations_commerce_provider_read_authority_is_current(
+           control.organization_id,
+           control.integration_account_id,
+           $3
+         )
+       FOR SHARE OF control, account, activation`,
+      [
+        organizationId,
+        job.integration_account_id,
+        job.provider_read_authority,
+      ],
+    )
+    if (!storeSync.rows[0]) {
+      fail(
+        'COMMERCE_PRODUCT_IMAGE_STORE_SYNC_PAUSED',
+        'Store sync paused before image evidence persistence',
         409,
       )
     }
@@ -3619,18 +3926,47 @@ Promise<CommerceProductImageImportQueueHealth> {
       claimed_count: string
       dead_count: string
       historical_dead_count: string
+      paused_retained_count: string
       stale_lease_count: string
       overdue_count: string
       last_terminal_progress_at: Date | string | null
     }>(
       `SELECT
-         count(*) FILTER (WHERE state = 'waiting_mapping')::text
+         count(*) FILTER (
+           WHERE state = 'waiting_mapping'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
+         )::text
            AS waiting_mapping_count,
-         count(*) FILTER (WHERE state = 'queued')::text AS queued_count,
-         count(*) FILTER (WHERE state = 'retry')::text AS retry_count,
-         count(*) FILTER (WHERE state = 'claimed')::text AS claimed_count,
+         count(*) FILTER (
+           WHERE state = 'queued'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
+         )::text AS queued_count,
+         count(*) FILTER (
+           WHERE state = 'retry'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
+         )::text AS retry_count,
+         count(*) FILTER (
+           WHERE state = 'claimed'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
+         )::text AS claimed_count,
          count(*) FILTER (
            WHERE job.state = 'dead'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
              AND NOT EXISTS (
                SELECT 1
                FROM operations_commerce_product_image_import_jobs newer
@@ -3650,11 +3986,26 @@ Promise<CommerceProductImageImportQueueHealth> {
              )
          )::text AS historical_dead_count,
          count(*) FILTER (
+           WHERE NOT operations_commerce_provider_read_authority_is_current(
+             job.organization_id, job.integration_account_id,
+             job.provider_read_authority
+           )
+             AND state IN ('waiting_mapping', 'queued', 'retry', 'claimed')
+         )::text AS paused_retained_count,
+         count(*) FILTER (
            WHERE state = 'claimed'
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
              AND lease_expires_at <= statement_timestamp()
          )::text AS stale_lease_count,
          count(*) FILTER (
            WHERE state IN ('queued', 'retry')
+             AND operations_commerce_provider_read_authority_is_current(
+               job.organization_id, job.integration_account_id,
+               job.provider_read_authority
+             )
              AND available_at <=
                    statement_timestamp() - interval '5 minutes'
          )::text AS overdue_count,
@@ -3692,6 +4043,10 @@ Promise<CommerceProductImageImportQueueHealth> {
       historicalDeadCount: nonnegativeInteger(
         row.historical_dead_count,
         'historical dead count',
+      ),
+      pausedRetainedCount: nonnegativeInteger(
+        row.paused_retained_count,
+        'paused retained count',
       ),
       staleLeaseCount: nonnegativeInteger(
         row.stale_lease_count,

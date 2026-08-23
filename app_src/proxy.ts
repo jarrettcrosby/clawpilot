@@ -72,6 +72,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/docs/embeddings/process'
     || normalizedPath === '/api/ai-radar/process'
     || normalizedPath === '/api/operations/print-agent/jobs'
+    || normalizedPath === '/api/operations/print-agent/pair'
     || normalizedPath === '/api/shortlinks'
     || normalizedPath.startsWith('/api/public/crm-product-images/')
     || normalizedPath.startsWith('/api/auth/')
@@ -82,6 +83,18 @@ function isPublicAppleAppLink(pathname: string) {
   return pathname === '/.well-known/apple-app-site-association'
     || pathname === '/apple-app-site-association'
     || pathname === '/ios'
+}
+
+const DEVELOPER_PRINT_AGENT_PREVIEW_ARTIFACTS = new Set([
+  '/downloads/ClawPilot-Print-Agent-macOS.zip',
+  '/downloads/ClawPilot-Print-Agent-macOS.zip.sha256',
+  '/downloads/ClawPilot-Print-Agent-macOS.json',
+])
+const DEVELOPER_PRINT_AGENT_PREVIEW_ENABLED =
+  process.env.NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW === 'true'
+
+function isDeveloperPrintAgentPreviewArtifact(pathname: string) {
+  return DEVELOPER_PRINT_AGENT_PREVIEW_ARTIFACTS.has(pathname)
 }
 
 function sensitiveMutationDuringImpersonation(req: NextRequest, session: BrowserSession): boolean {
@@ -135,6 +148,14 @@ export async function proxy(req: NextRequest) {
       return NextResponse.json({ ok: false, error: message }, { status: 500 })
     }
     return new NextResponse(message, { status: 500, headers: { 'content-type': 'text/plain; charset=utf-8' } })
+  }
+
+  if (isDeveloperPrintAgentPreviewArtifact(pathname)
+    && !DEVELOPER_PRINT_AGENT_PREVIEW_ENABLED) {
+    return new NextResponse('Not found', {
+      status: 404,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    })
   }
 
   if (!AUTH_REQUIRED) return NextResponse.next()

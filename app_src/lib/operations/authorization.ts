@@ -7,6 +7,12 @@ export type OperationsCapabilities = {
   canActivate: boolean
 }
 
+export type ShippingCapabilities = {
+  canView: boolean
+  canCreate: boolean
+  canPurchaseLivePostage: boolean
+}
+
 export type CarrierRateNetworkCapabilities = {
   canManageNetworks: boolean
   canGrantRateAccess: boolean
@@ -23,6 +29,26 @@ export function operationsCapabilities(user: AppUser): OperationsCapabilities {
     canManage: role === 'owner' || ((role === 'admin' || role === 'member') && permissions.manageOperations === true),
     canExecute: role === 'owner' || permissions.executeWarehouse === true,
     canActivate: role === 'owner' || (role === 'admin' && permissions.manageOperations === true),
+  }
+}
+
+export function shippingCapabilities(user: AppUser): ShippingCapabilities {
+  const role = effectiveAuthorizationRole(user)
+  const permissions = effectiveUserPermissions(user)
+  const canView = role === 'owner' || permissions.viewShipping === true
+  const canCreate = role === 'owner' || (
+    (role === 'admin' || role === 'member')
+    && canView
+    && permissions.createShipments === true
+  )
+  return {
+    canView,
+    canCreate,
+    canPurchaseLivePostage: role === 'owner' || (
+      (role === 'admin' || role === 'member')
+      && canCreate
+      && permissions.purchaseLivePostage === true
+    ),
   }
 }
 
@@ -48,6 +74,12 @@ export function carrierRateNetworkCapabilities(user: AppUser): CarrierRateNetwor
 export function requireOperationsCapability(user: AppUser, capability: keyof OperationsCapabilities) {
   if (!operationsCapabilities(user)[capability]) {
     throw new Error('OPERATIONS_FORBIDDEN')
+  }
+}
+
+export function requireShippingCapability(user: AppUser, capability: keyof ShippingCapabilities) {
+  if (!shippingCapabilities(user)[capability]) {
+    throw new Error('SHIPPING_FORBIDDEN')
   }
 }
 

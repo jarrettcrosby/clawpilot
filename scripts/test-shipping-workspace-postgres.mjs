@@ -94,13 +94,13 @@ async function verifyShippingProjection(databaseUrl) {
       organizationId,
       canView: true,
       canCreate: false,
-      canActivate: false,
+      canPurchaseLivePostage: false,
     })
     assert.equal(workspace.organizationId, organizationId)
     assert.deepEqual(Array.from(workspace.records), [])
     assert.deepEqual(
       JSON.parse(JSON.stringify(workspace.capabilities)),
-      { canView: true, canCreate: false, canActivate: false },
+      { canView: true, canCreate: false, canPurchaseLivePostage: false },
     )
     assert.equal(workspace.pickupAvailability.parcel.available, false)
     assert.equal(workspace.pickupAvailability.ltl.available, false)

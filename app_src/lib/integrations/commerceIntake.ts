@@ -97,6 +97,9 @@ import {
   type CommerceIntakeReadIntentTarget,
 } from '@/lib/persistence/commerceIntake'
 import { resolveCommerceCustomerInPostgres } from '@/lib/persistence/operations'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 
 const INTAKE_POLICY_VERSION = 'commerce-intake-resolution-v2'
 const INTAKE_RETENTION_DAYS = 30
@@ -2031,6 +2034,11 @@ async function withAutomaticCustomerResolution(
         organizationId: input.runtime.organizationId,
         integrationAccountGlobalId: input.runtime.globalId,
         actorEmail: input.actorEmail,
+        automaticStoreSync: {
+          source: 'commerce_intake_customer_resolution',
+          runGlobalId,
+          candidateGlobalId: target.candidateGlobalId,
+        },
         identity: {
           provider: target.provider,
           externalCustomerId: target.externalCustomerId,
@@ -2064,6 +2072,10 @@ async function withAutomaticCustomerResolution(
         ]),
         candidateGlobalId: target.candidateGlobalId,
         candidateRowVersion: target.candidateRowVersion,
+        automatic: {
+          source: 'commerce_intake_customer_resolution',
+          runGlobalId,
+        },
         customer: {
           mode: 'existing',
           customerGlobalId: resolution.customer.globalId,
@@ -2750,6 +2762,7 @@ type ExecuteCommerceIntakeInput = {
 type CommerceIntakeExecutionOptions = {
   includeIntakeState: boolean
   hydrateProductInventory: boolean
+  runAutomaticOrderHooks?: boolean
   runtimeAuthority?: 'development_interactive' | 'read_reconciliation'
   providerAttemptActorEmail?: string | null
   expectedCredentialVersion?: number
@@ -3122,7 +3135,7 @@ async function executeCommerceIntakeCommandInternal(
           action: commandAction,
         },
       )
-      const automaticOrderHooksEnabled = !(
+      const automaticOrderHooksEnabled = options.runAutomaticOrderHooks !== false && !(
         reconciliationRead
         && commerceReadRuntimeMode() === 'production'
       )
@@ -3237,6 +3250,9 @@ async function executeCommerceIntakeCommandInternal(
                 ? SHOPIFY_ORDER_PAGE_SIZE
                 : FAIRE_ORDER_PAGE_SIZE
         ),
+        providerReadAuthority: reconciliationRead
+          ? 'automatic'
+          : 'manual_read_only',
       })
       readIntentId = prepared.id
       page = prepared
@@ -3299,6 +3315,9 @@ async function executeCommerceIntakeCommandInternal(
       productsFetched: page.resource === 'products',
       oneRootPage: !targetExternalOrderId && !exactExternalProductId,
       readOnly: true,
+      providerReadAuthority: reconciliationRead
+        ? 'automatic'
+        : 'manual_read_only',
       providerWrites: 0,
       syncCursorAdvanced: false,
     }
@@ -3325,37 +3344,53 @@ async function executeCommerceIntakeCommandInternal(
       }
     } else {
       try {
-        const result = await fetchEnvelope(
-          runtime,
-          page,
-          targetExternalOrderId,
-          {
-            hydrateProductInventory: options.hydrateProductInventory,
-            targetExternalProductId: exactExternalProductId,
-          },
-        )
-        const normalizedVariants = result.envelope.products.reduce(
-          (count, product) => count + product.variants.length,
-          0,
-        )
-        const durable = await captureCommerceIntakeProviderReadInPostgres({
-          ...shared,
-          readIntentId,
-          providerAttemptId: reservation.providerAttemptId,
-          leaseToken: reservation.leaseToken,
-          requestHash: reservation.requestHash,
-          result,
-          redactedResponse: {
-            providerRowsSeen: result.page.providerRowsSeen,
-            ordersNormalized: result.envelope.orders.length,
-            productsNormalized: result.envelope.products.length,
-            variantsNormalized: normalizedVariants,
-            recordsRejected: result.envelope.rejections.length,
-            hasNextBatch: Boolean(result.page.nextOrderCursor),
-            providerWrites: 0,
-            syncCursorAdvanced: false,
-          },
-        })
+        const durable =
+          await withCommerceStoreSyncProviderReadFenceInPostgres({
+            organizationId: runtime.organizationId,
+            integrationAccountId: runtime.integrationAccountId,
+            authorityKind: reconciliationRead
+              ? 'automatic'
+              : 'manual_read_only',
+            readKind: 'catalog_intake',
+            intentKey: `${readIntentId}:${reservation.providerAttemptId}`,
+            acquiredBy: options.providerAttemptActorEmail
+              || input.actorEmail
+              || 'system:commerce-intake',
+            read: async (providerReadLease) => {
+              const result = await fetchEnvelope(
+                runtime,
+                page,
+                targetExternalOrderId,
+                {
+                  hydrateProductInventory: options.hydrateProductInventory,
+                  targetExternalProductId: exactExternalProductId,
+                },
+              )
+              const normalizedVariants = result.envelope.products.reduce(
+                (count, product) => count + product.variants.length,
+                0,
+              )
+              return captureCommerceIntakeProviderReadInPostgres({
+                ...shared,
+                readIntentId,
+                providerAttemptId: reservation.providerAttemptId,
+                leaseToken: reservation.leaseToken,
+                requestHash: reservation.requestHash,
+                result,
+                providerReadLease,
+                redactedResponse: {
+                  providerRowsSeen: result.page.providerRowsSeen,
+                  ordersNormalized: result.envelope.orders.length,
+                  productsNormalized: result.envelope.products.length,
+                  variantsNormalized: normalizedVariants,
+                  recordsRejected: result.envelope.rejections.length,
+                  hasNextBatch: Boolean(result.page.nextOrderCursor),
+                  providerWrites: 0,
+                  syncCursorAdvanced: false,
+                },
+              })
+            },
+          })
         captured = {
           result: durable.result as OperationalPageResult,
           responseHash: durable.responseHash,
@@ -3409,7 +3444,7 @@ async function executeCommerceIntakeCommandInternal(
         action: commandAction,
       },
     )
-    const automaticOrderHooksEnabled = !(
+    const automaticOrderHooksEnabled = options.runAutomaticOrderHooks !== false && !(
       reconciliationRead
       && commerceReadRuntimeMode() === 'production'
     )
@@ -3822,6 +3857,36 @@ export async function executeCommerceIntakeCommand(
   return executeCommerceIntakeCommandInternal(input, {
     includeIntakeState: true,
     hydrateProductInventory: true,
+  })
+}
+
+/**
+ * Exact manual provider refresh for the ordinary Operations order editor.
+ * The existing intake read-intent/capture/stage pipeline retains the provider
+ * evidence, while automatic customer resolution and candidate promotion stay
+ * paused until the workbench performs its explicit three-way local rebase.
+ */
+export async function refreshCommerceOrderWorkbenchCandidate(input: {
+  organizationId: string
+  accountGlobalId: string
+  actorEmail: string
+  idempotencyKey: string
+  candidateGlobalId: string
+}) {
+  return executeCommerceIntakeCommandInternal({
+    organizationId: input.organizationId,
+    actorEmail: input.actorEmail,
+    body: {
+      action: 'refresh',
+      accountGlobalId: input.accountGlobalId,
+      idempotencyKey: input.idempotencyKey,
+      candidateGlobalId: input.candidateGlobalId,
+      confirmReadOnly: true,
+    },
+  }, {
+    includeIntakeState: false,
+    hydrateProductInventory: false,
+    runAutomaticOrderHooks: false,
   })
 }
 

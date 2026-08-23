@@ -658,15 +658,10 @@ function verifySourceContracts() {
     /providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:[\s\S]*?operations\.order\.released[\s\S]*?providerCommitmentsRevalidated:[\s\S]*?providerCommitmentInventorySyncRunGlobalIds:/,
     'Warehouse release domain and audit evidence must record the latest current Shopify inventory sync runs',
   )
-  assert.match(
-    persistence,
-    /LEFT JOIN operations_cartonization_rate_evidence evidence[\s\S]*?plan\.cartonization_evidence_id IS NULL[\s\S]*?carrierReadEnvironment'[\s\S]*?IS DISTINCT FROM 'production'/,
-    'Active activation must fail closed for both missing and non-production plan evidence',
-  )
-  assert.match(
-    persistence,
-    /activation\.state === 'active'[\s\S]*?!plan\.cartonization_evidence_id[\s\S]*?plan\.carrier_read_environment !== 'production'[\s\S]*?OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
-    'Warehouse release must fail closed when active planning evidence is missing or non-production',
+  assert.doesNotMatch(
+    warehouseReleaseRegion,
+    /OPERATIONS_ACTIVE_RATE_EVIDENCE_REQUIRES_PRODUCTION/,
+    'Local warehouse release must not reinterpret activation as carrier-read authority',
   )
   assert.match(
     persistence,
@@ -1267,6 +1262,13 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  class CommerceStoreSyncPersistenceError extends Error {
+    constructor(code, message, status = 400) {
+      super(message)
+      this.code = code
+      this.status = status
+    }
+  }
   class CarrierIntegrationRequestError extends Error {
     constructor(message, status = 409, code = 'CARRIER_REQUEST_INVALID') {
       super(message)
@@ -1296,6 +1298,9 @@ async function verifyRouteBehavior() {
       this.status = status
     }
   }
+  const shadowTraining = loadTypeScriptModule(
+    'app_src/lib/operations/shadowTraining.ts',
+  )
   const calls = {
     reads: [],
     proofs: [],
@@ -1311,6 +1316,7 @@ async function verifyRouteBehavior() {
     activeTransitions: [],
     productionRerates: [],
   }
+  let proofWriteError = null
   let productionRerateError = null
   const route = loadTypeScriptModule('app_src/app/api/operations/route.ts', {
     mocks: {
@@ -1326,6 +1332,9 @@ async function verifyRouteBehavior() {
       },
       '@/lib/operations/authorization': {
         operationsCapabilities: (actor) => actor.capabilities,
+        shippingCapabilities: (actor) => ({
+          canPurchaseLivePostage: Boolean(actor.capabilities.canActivate),
+        }),
         activeOperationsOrganizationId: (actor) => {
           if (!actor.organizationId) throw new Error('ACTIVE_ORGANIZATION_REQUIRED')
           return actor.organizationId
@@ -1337,6 +1346,30 @@ async function verifyRouteBehavior() {
         ),
       },
       '@/lib/persistence/config': { isPostgresStorageEnabled: () => true },
+      '@/lib/persistence/commerceStoreSync': {
+        CommerceStoreSyncPersistenceError,
+        updateCommerceStoreSyncControlInPostgres: async () => {
+          throw new Error('Store sync updates are covered by their focused route contract')
+        },
+      },
+      '@/lib/persistence/commerceOrderWorkbench': {
+        CommerceOrderWorkbenchError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
+      '@/lib/persistence/operationsOrderShipmentAddress': {
+        OperationsOrderShipmentAddressError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
       '@/lib/integrations/carrierIntegrations': {
         CarrierIntegrationRequestError,
       },
@@ -1361,6 +1394,7 @@ async function verifyRouteBehavior() {
           throw new Error('Active preparation is covered by its focused route contract')
         },
       },
+      '@/lib/operations/shadowTraining': shadowTraining,
       '@/lib/persistence/commerceActiveTransitionAuthorization': {
         CommerceActiveTransitionPersistenceError,
         prepareCommerceActiveTransitionInPostgres: async (input) => {
@@ -1442,6 +1476,22 @@ async function verifyRouteBehavior() {
           state: 'active',
         }),
       },
+      '@/lib/integrations/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2eError: class extends Error {},
+        authorizeShopifyTestStoreCanonicalE2e: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not authorize Shopify test-store E2E',
+          )
+        },
+      },
+      '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+        ShopifyTestStoreCanonicalE2ePersistenceError: class extends Error {},
+        confirmShopifyTestStoreCanonicalE2eFulfillmentInPostgres: async () => {
+          throw new Error(
+            'Distributed Operations route contract does not confirm Shopify test fulfillment',
+          )
+        },
+      },
       '@/lib/persistence/commerceOrderRevisions': {
         CommerceOrderRevisionDispositionError: class extends Error {},
         cancelUnstartedCommerceOrderFromProviderRevisionInPostgres:
@@ -1451,6 +1501,10 @@ async function verifyRouteBehavior() {
             )
           },
       },
+      '@/lib/persistence/operationShadowTraining': {
+        assertCanonicalShadowCommerceOrderIsMirrorOnlyInPostgres:
+          async () => {},
+      },
       '@/lib/persistence/operations': {
         OperationsRequestError,
         readOperationsWorkspaceFromPostgres: async (input) => {
@@ -1458,6 +1512,7 @@ async function verifyRouteBehavior() {
           return { organizationId: input.organizationId, orders: [], capabilities: input.capabilities }
         },
         runMockOperationsProofFromPostgres: async (input) => {
+          if (proofWriteError) throw proofWriteError
           calls.proofs.push(input)
           return {
             orderGlobalId: 'gor1234567',
@@ -1594,6 +1649,7 @@ async function verifyRouteBehavior() {
     organizationId: actor.organizationId,
     actorEmail: actor.email,
     capabilities: actor.capabilities,
+    canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
     exceptionStatus: 'open',
@@ -1650,6 +1706,35 @@ async function verifyRouteBehavior() {
     quantity: 2,
     openingQuantity: 12,
   }])
+
+  proofWriteError = Object.assign(
+    new Error('OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY'),
+    {
+      code: 'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+      status: 409,
+    },
+  )
+  const packEvidenceConflict = await route.POST(request(
+    'http://localhost/api/operations',
+    {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'run-proof-order',
+        proof: {
+          ...proof,
+          externalOrderId: 'route-proof-pack-evidence-conflict',
+          orderNumber: 'ROUTE-PACK-CONFLICT',
+        },
+      }),
+    },
+  ))
+  assert.equal(packEvidenceConflict.status, 409)
+  assert.equal(
+    (await payload(packEvidenceConflict)).code,
+    'OPERATIONS_SHIPPING_ONE_OFF_PACK_EVIDENCE_BUSY',
+  )
+  assert.equal(calls.proofs.length, 1, 'Conflicted writer must have zero transition')
+  proofWriteError = null
 
   const { productGlobalId: _productGlobalId, quantity: _quantity, openingQuantity: _openingQuantity, ...proofBase } = proof
   const multiLineWrite = await route.POST(request('http://localhost/api/operations', {
@@ -1717,6 +1802,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 4,
     reason: 'Reviewed plan',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'release-route-proof-1',
   })
 
@@ -1762,6 +1848,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 5,
     reason: 'Picker verified every ready task',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-route-proof-1',
   })
 
@@ -1833,6 +1920,7 @@ async function verifyRouteBehavior() {
     reason: 'Picker verified the multi-unit count',
     countEvidenceIdempotencyKey: 'wearable-count-route-proof-1',
     countEvidence,
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'picks-count-route-proof-1',
   })
 
@@ -1878,6 +1966,7 @@ async function verifyRouteBehavior() {
     orderGlobalId: 'gor1234567',
     expectedRowVersion: 6,
     reason: 'Packer verified the carton',
+    sandboxE2eAuthorizationGlobalId: null,
     idempotencyKey: 'pack-route-proof-1',
   })
 
@@ -1942,7 +2031,7 @@ async function verifyRouteBehavior() {
   assert.equal(deniedProductionRerate.status, 403)
   assert.equal(
     (await payload(deniedProductionRerate)).code,
-    'OPERATIONS_EXECUTE_REQUIRED',
+    'OPERATIONS_LIVE_POSTAGE_REQUIRED',
   )
   assert.equal(calls.productionRerates.length, 0)
 
@@ -3779,6 +3868,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const commerceOrderRevisionEvidence = loadTypeScriptModule(
       'app_src/lib/integrations/commerceOrderRevisionEvidence.ts',
     )
+    const commerceStoreSyncPolicy = loadTypeScriptModule(
+      'app_src/lib/operations/commerceStoreSync.ts',
+    )
     const commerceOrderRevisions = loadTypeScriptModule(
       'app_src/lib/persistence/commerceOrderRevisions.ts',
       {
@@ -3786,6 +3878,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
           '@/lib/auditWriter': auditWriter,
           '@/lib/integrations/commerceOrderRevisionEvidence':
             commerceOrderRevisionEvidence,
+          '@/lib/operations/commerceStoreSync': commerceStoreSyncPolicy,
+          '@/lib/persistence/commerceStoreSync': {
+            assertCommerceStoreSyncProviderReadLeaseCurrentWithClient:
+              async () => {},
+          },
           '@/lib/integrations/commerceCredentialCrypto': {
             commerceOrderRevisionEvidenceKeyAvailable: () => false,
             commerceOrderRevisionProtectedContentFingerprint: () => {
@@ -3858,6 +3955,38 @@ async function verifyPostgresAcceptance(databaseUrl) {
       'app_src/lib/operations/barcodeLabels.ts',
       { mocks: { '@/lib/globalIds.mjs': globalIds } },
     )
+    const orderShipTo = loadTypeScriptModule(
+      'app_src/lib/operations/orderShipTo.ts',
+    )
+    const operationsOrderShipmentAddress = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
+      {
+        mocks: {
+          '@/lib/auditWriter': auditWriter,
+          '@/lib/integrations/carrierSandboxRate': {
+            carrierSandboxPartyFingerprint: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not fingerprint shipment parties',
+              )
+            },
+          },
+          '@/lib/integrations/commerceCredentialCrypto': {
+            decryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not decrypt shipment-address overrides',
+              )
+            },
+            encryptCommerceCandidateSnapshot: () => {
+              throw new Error(
+                'Distributed Operations acceptance does not encrypt shipment-address overrides',
+              )
+            },
+          },
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/postgres': postgres,
+        },
+      },
+    )
     const cartonizationRateEvidence = loadTypeScriptModule(
       'app_src/lib/persistence/cartonizationRateEvidence.ts',
       {
@@ -3880,6 +4009,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
           },
           '@/lib/operations/fulfillmentOptimizerContract':
             fulfillmentOptimizerContract,
+          '@/lib/operations/orderShipTo': orderShipTo,
+          '@/lib/persistence/operationsOrderShipmentAddress':
+            operationsOrderShipmentAddress,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3891,6 +4023,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const shopifyCheckoutRateWarmPolicy = loadTypeScriptModule(
       'app_src/lib/operations/shopifyCheckoutRateWarmPolicy.ts',
     )
+    const shopifyCheckoutAudiencePolicy = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutAudiencePolicy.ts',
+    )
+    const shopifyCheckoutRateControl = loadTypeScriptModule(
+      'app_src/lib/operations/shopifyCheckoutRateControl.ts',
+    )
     const shopifyCheckoutRating = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyCheckoutRating.ts',
       {
@@ -3900,6 +4038,10 @@ async function verifyPostgresAcceptance(databaseUrl) {
             shopifyCheckoutPlanRatePolicy,
           '@/lib/operations/shopifyCheckoutRateWarmPolicy':
             shopifyCheckoutRateWarmPolicy,
+          '@/lib/operations/shopifyCheckoutAudiencePolicy':
+            shopifyCheckoutAudiencePolicy,
+          '@/lib/operations/shopifyCheckoutRateControl':
+            shopifyCheckoutRateControl,
           '@/lib/persistence/postgres': postgres,
         },
       },
@@ -3926,6 +4068,11 @@ async function verifyPostgresAcceptance(databaseUrl) {
           executeShopifyFulfillmentWriteback: async () => {
             throw new Error(
               'Distributed Operations acceptance does not write Shopify fulfillment',
+            )
+          },
+          shopifyFulfillmentAttemptSignatureHashCandidates: () => {
+            throw new Error(
+              'Distributed Operations acceptance does not hash Shopify fulfillment attempts',
             )
           },
         },
@@ -3973,8 +4120,23 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
+        '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
+        '@/lib/persistence/commerceOrderWorkbench': {
+          readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
+        '@/lib/persistence/commerceProviderWrites': {
+          CommerceProviderWriteControlError: class extends Error {},
+          readCommerceProviderWriteControlsFromPostgres: async () => ({
+            accounts: [],
+          }),
+          requireCurrentCommerceProviderWritesInPostgres: async () => {
+            throw new Error(
+              'Distributed Operations acceptance does not authorize commerce provider writes',
+            )
+          },
+        },
         '@/lib/persistence/crm': {
           stageCrmRecordWithClient: stageCommerceCustomerForAcceptance,
         },
@@ -3988,6 +4150,12 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/persistence/operationShadowFulfillmentPreparation': {
           readShadowFulfillmentPreparation: async () => null,
         },
+        '@/lib/persistence/operationShadowTraining': {
+          assertNoOpenOperationsShadowTrainingRunsForActivation:
+            async () => {},
+        },
+        '@/lib/persistence/operationsOrderShipmentAddress':
+          operationsOrderShipmentAddress,
         '@/lib/persistence/sandboxCommerceE2eAuthorization': {
           requireActiveSandboxCommerceE2eAuthorization: async () => {
             throw new Error(
@@ -4000,7 +4168,22 @@ async function verifyPostgresAcceptance(databaseUrl) {
             )
           },
         },
+        '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
+          requireActiveShopifyTestStoreCanonicalE2eAuthorization: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no Shopify test-store authorization',
+            )
+          },
+          requireExactShopifyTestStoreConfirmedLabelSnapshot: async () => {
+            throw new Error(
+              'Distributed Operations acceptance has no confirmed Shopify test labels',
+            )
+          },
+        },
         '@/lib/persistence/commerceOrderRevisions': commerceOrderRevisions,
+        '@/lib/persistence/commerceStoreSync': {
+          readCommerceStoreSyncControlsFromPostgres: async () => [],
+        },
         '@/lib/persistence/postgres': postgres,
         '@/lib/persistence/productPackaging': productPackaging,
         '@/lib/persistence/shopifyCheckoutRating': shopifyCheckoutRating,

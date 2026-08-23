@@ -88,23 +88,27 @@ includes(persistence, [
   'credentialVersion: number',
   'credential.credential_version',
   'rate_evidence.credential_version',
-  "account.account_environment !== 'sandbox'",
-  "integration.environment = 'sandbox'",
-  "AND account.environment = 'sandbox'",
-  "'SHOPIFY_CHECKOUT_SANDBOX_REQUIRED'",
+  "AND integration.environment IN ('sandbox', 'production')",
+  'normalizeShopifyCheckoutRateControl',
+  'checkoutRateControl.rateSource !== input.rateSource',
+  'operations_shopify_carrier_service_rating_runtime_is_ready',
   'cacheKey: string',
   'idempotencyKey: string',
   'receipt.idempotency_key = $5',
   'left(receipt.idempotency_key, length($5) + 9)',
-  'receipt.idempotency_key = $11',
-  'left(receipt.idempotency_key, length($11) + 9)',
-], 'Persistence sandbox, credential, and retry-safe cache fences')
+  'receipt.rate_source = $9',
+  'receipt.idempotency_key = $10',
+  'left(receipt.idempotency_key, length($10) + 9)',
+], 'Persistence explicit rate source, credential, and retry-safe cache fences')
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v5'",
-  "account.environment !== 'sandbox'",
-  "carrier.environment === 'sandbox'",
+  "version: 'shopify-checkout-execution-fence-v6'",
+  'return account.checkoutRateControl.rateSource',
+  'checkoutRateControl: account.checkoutRateControl',
+  'checkoutRuntimeCarrierBindings(account)',
+  "if (binding.environment === 'production')",
+  "environment: 'sandbox'",
   'policyRevision: account.policyRevision',
   'policyHash: account.policyHash',
   'planRatePolicy,',
@@ -126,10 +130,10 @@ includes(callback, [
   'stableCacheKey,',
   'cacheKey: stableCacheKey',
   'idempotencyKey,',
-  'cached,\n      )',
-  'claim.receipt,\n      )',
-  'completed,\n      )',
-], 'Callback sandbox and execution cache fences')
+  'cached,\n        shadowGuard.customerPolicy,',
+  'claim.receipt,\n        shadowGuard.customerPolicy,',
+  'completed,\n        shadowGuard.customerPolicy,',
+], 'Callback activation-environment and execution cache fences')
 assert.equal(
   callback.includes('shadowGuard.customerLabel'),
   false,
@@ -170,7 +174,7 @@ assert.equal(
 )
 
 includes(contract, [
-  'sandbox-only checkout execution boundary',
+  'paired checkout execution boundary',
   'packaging-material and packaging-stock revisions',
   'carrier-credential generations',
   'immutable typed package and offer rows',

@@ -17,8 +17,10 @@ import {
   readCommerceRuntimeCredentialFromPostgres,
 } from '@/lib/persistence/commerceIntegrations'
 import {
+  readShopifyOrderPlanningAssignmentTargetFromPostgres,
   readShopifyOrderPlanningAuthorityTargetFromPostgres,
   ShopifyOrderPlanningAuthorityPersistenceError,
+  type ShopifyOrderPlanningAssignmentTarget,
   type ShopifyOrderPlanningAuthorityTarget,
 } from '@/lib/persistence/shopifyOrderPlanningAuthority'
 
@@ -30,6 +32,8 @@ const SHOPIFY_FULFILLMENT_ORDER_GID =
 const SHOPIFY_FULFILLMENT_ORDER_LINE_ITEM_GID =
   /^gid:\/\/shopify\/FulfillmentOrderLineItem\/[1-9][0-9]*$/
 const SHOPIFY_LOCATION_GID = /^gid:\/\/shopify\/Location\/[1-9][0-9]*$/
+const SHOPIFY_FULFILLMENT_SERVICE_GID =
+  /^gid:\/\/shopify\/FulfillmentService\/[1-9][0-9]*(?:\?id=true)?$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ACCOUNT_GLOBAL_ID = /^gia(?:[0-9]{7}|[0-9a-v]{12})$/
 const CANDIDATE_GLOBAL_ID = /^gcoc(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -39,11 +43,40 @@ const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
 const LOCATION_MAPPING_GLOBAL_ID = /^gilm(?:[0-9]{7}|[0-9a-v]{12})$/
 const REQUIRED_SCOPES = [
   'read_orders',
+  'read_locations',
   'read_merchant_managed_fulfillment_orders',
+  'read_third_party_fulfillment_orders',
+  'read_assigned_fulfillment_orders',
 ] as const
 const MAX_SHOPIFY_ORDER_LINES = 250
 const MAX_SHOPIFY_FULFILLMENT_ORDERS = 25
 const MAX_SHOPIFY_FULFILLMENT_ORDER_LINES = 250
+
+const SHOPIFY_ORDER_PLANNING_ASSIGNMENT_QUERY = `query ClawPilotShopifyOrderPlanningAssignment($id: ID!) {
+  order(id: $id) {
+    id
+    fulfillmentOrders(first: ${MAX_SHOPIFY_FULFILLMENT_ORDERS}) {
+      nodes {
+        id
+        status
+        requestStatus
+        assignedLocation {
+          location {
+            id
+            name
+            isFulfillmentService
+            fulfillmentService { id serviceName type }
+          }
+        }
+        lineItems(first: ${MAX_SHOPIFY_FULFILLMENT_ORDER_LINES}) {
+          nodes { remainingQuantity }
+          pageInfo { hasNextPage }
+        }
+      }
+      pageInfo { hasNextPage }
+    }
+  }
+}`
 
 const SHOPIFY_ORDER_PLANNING_QUERY = `query ClawPilotShopifyOrderPlanningAuthority($id: ID!) {
   order(id: $id) {
@@ -70,7 +103,14 @@ const SHOPIFY_ORDER_PLANNING_QUERY = `query ClawPilotShopifyOrderPlanningAuthori
         status
         requestStatus
         updatedAt
-        assignedLocation { location { id } }
+        assignedLocation {
+          location {
+            id
+            name
+            isFulfillmentService
+            fulfillmentService { id serviceName type }
+          }
+        }
         lineItems(first: ${MAX_SHOPIFY_FULFILLMENT_ORDER_LINES}) {
           nodes {
             id
@@ -143,6 +183,43 @@ export type ShopifyOrderPlanningAuthorityProviderRead = {
   providerReads: number
 }
 
+export type ShopifyOrderPlanningAssignment = {
+  version: 'shopify-order-planning-assignment-v1'
+  status: 'ready' | 'unmapped' | 'provider_managed' | 'split' | 'not_open'
+  accountGlobalId: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  assignments: Array<{
+    shopifyLocationId: string
+    shopifyLocationName: string
+    ownerType: 'merchant_managed' | 'fulfillment_service'
+    fulfillmentService: null | {
+      id: string
+      serviceName: string
+      type: string | null
+    }
+    fulfillmentOrderIds: string[]
+    mapping: null | {
+      globalId: string
+      rowVersion: number
+      warehouseGlobalId: string
+      warehouseName: string
+      locationGlobalId: string
+      locationCode: string
+    }
+  }>
+  selectedWarehouse: null | {
+    globalId: string
+    name: string
+    mappingGlobalId: string
+    mappingRowVersion: number
+    shopifyLocationId: string
+    shopifyLocationName: string
+  }
+  providerReads: 1
+  providerWrites: 0
+}
+
 export class ShopifyOrderPlanningAuthorityError extends Error {
   constructor(
     message: string,
@@ -164,6 +241,15 @@ type Dependencies = {
   readOrder: typeof readShopifyOrderPlanningAuthority
 }
 
+type AssignmentDependencies = {
+  readTarget: typeof readShopifyOrderPlanningAssignmentTargetFromPostgres
+  readRuntimeCredential: typeof readCommerceRuntimeCredentialFromPostgres
+  decryptCredential: typeof decryptCommerceCredential
+  requestAccessToken: typeof requestShopifyAccessToken
+  probeConnection: typeof probeShopifyConnection
+  readAssignment: typeof readShopifyOrderPlanningAssignment
+}
+
 const DEFAULT_DEPENDENCIES: Dependencies = {
   readTarget: readShopifyOrderPlanningAuthorityTargetFromPostgres,
   readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
@@ -171,6 +257,15 @@ const DEFAULT_DEPENDENCIES: Dependencies = {
   requestAccessToken: requestShopifyAccessToken,
   probeConnection: probeShopifyConnection,
   readOrder: readShopifyOrderPlanningAuthority,
+}
+
+const DEFAULT_ASSIGNMENT_DEPENDENCIES: AssignmentDependencies = {
+  readTarget: readShopifyOrderPlanningAssignmentTargetFromPostgres,
+  readRuntimeCredential: readCommerceRuntimeCredentialFromPostgres,
+  decryptCredential: decryptCommerceCredential,
+  requestAccessToken: requestShopifyAccessToken,
+  probeConnection: probeShopifyConnection,
+  readAssignment: readShopifyOrderPlanningAssignment,
 }
 
 function fail(
@@ -766,17 +861,55 @@ function normalizeProviderOrder(
       fulfillmentOrder.assignedLocation,
       'fulfillmentOrder.assignedLocation',
     )
+    const assignedLocationRecord = record(
+      assignedLocation.location,
+      'fulfillmentOrder.assignedLocation.location',
+    )
     const assignedLocationId = gid(
-      record(
-        assignedLocation.location,
-        'fulfillmentOrder.assignedLocation.location',
-      ).id,
+      assignedLocationRecord.id,
       SHOPIFY_LOCATION_GID,
       'fulfillmentOrder.assignedLocation.location.id',
     )
-    if (assignedLocationId !== target.warehouse.shopifyLocationId) {
+    const assignedLocationIsFulfillmentService = boolean(
+      assignedLocationRecord.isFulfillmentService,
+      'fulfillmentOrder.assignedLocation.location.isFulfillmentService',
+    )
+    if (assignedLocationIsFulfillmentService) {
+      const service = assignedLocationRecord.fulfillmentService === null
+        ? null
+        : record(
+            assignedLocationRecord.fulfillmentService,
+            'fulfillmentOrder.assignedLocation.location.fulfillmentService',
+          )
+      const serviceName = service && typeof service.serviceName === 'string'
+        ? text(
+            service.serviceName,
+            'fulfillmentOrder.assignedLocation.location.fulfillmentService.serviceName',
+          )
+        : 'another fulfillment app'
       fail(
-        'Shopify assigned the order to a different location than the selected ClawPilot warehouse',
+        `Shopify assigned this order to ${serviceName}; ClawPilot cannot plan it as a merchant-managed warehouse order`,
+        409,
+        'SHOPIFY_ORDER_PLANNING_PROVIDER_MANAGED',
+      )
+    }
+    if (assignedLocationRecord.fulfillmentService !== null) {
+      fail(
+        'Shopify returned inconsistent fulfillment-location ownership',
+        502,
+        'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+        true,
+      )
+    }
+    if (assignedLocationId !== target.warehouse.shopifyLocationId) {
+      const assignedLocationName = typeof assignedLocationRecord.name === 'string'
+        ? text(
+            assignedLocationRecord.name,
+            'fulfillmentOrder.assignedLocation.location.name',
+          )
+        : 'a different Shopify location'
+      fail(
+        `Shopify assigned the order to ${assignedLocationName}, not the selected ClawPilot warehouse`,
         409,
         'SHOPIFY_ORDER_PLANNING_LOCATION_MISMATCH',
       )
@@ -887,6 +1020,339 @@ export async function readShopifyOrderPlanningAuthority(
       )
     }
     throw error
+  }
+}
+
+type ProviderPlanningAssignment = {
+  shopifyLocationId: string
+  shopifyLocationName: string
+  ownerType: 'merchant_managed' | 'fulfillment_service'
+  fulfillmentService: null | {
+    id: string
+    serviceName: string
+    type: string | null
+  }
+  fulfillmentOrderIds: string[]
+  actionable: boolean
+}
+
+export async function readShopifyOrderPlanningAssignment(
+  credential: ShopifyCommerceRuntimeCredential,
+  target: ShopifyOrderPlanningAssignmentTarget,
+): Promise<{
+  assignments: ProviderPlanningAssignment[]
+  providerReads: 1
+}> {
+  try {
+    const data = await shopifyAdminGraphql<{ order?: unknown }>(
+      credential,
+      {
+        query: SHOPIFY_ORDER_PLANNING_ASSIGNMENT_QUERY,
+        operationName: 'ClawPilotShopifyOrderPlanningAssignment',
+        variables: { id: target.externalOrderId },
+      },
+      { timeoutMs: 12_000 },
+    )
+    const order = record(data.order, 'order planning assignment')
+    const orderId = gid(order.id, SHOPIFY_ORDER_GID, 'order.id')
+    if (orderId !== target.externalOrderId) {
+      fail(
+        'Shopify returned a different order identity',
+        409,
+        'SHOPIFY_ORDER_PLANNING_ORDER_CHANGED',
+      )
+    }
+    const grouped = new Map<string, ProviderPlanningAssignment>()
+    for (const fulfillmentOrder of nodes(
+      order.fulfillmentOrders,
+      'order.fulfillmentOrders',
+      MAX_SHOPIFY_FULFILLMENT_ORDERS,
+    )) {
+      const fulfillmentOrderId = gid(
+        fulfillmentOrder.id,
+        SHOPIFY_FULFILLMENT_ORDER_GID,
+        'fulfillmentOrder.id',
+      )
+      const remainingQuantity = nodes(
+        fulfillmentOrder.lineItems,
+        'fulfillmentOrder.lineItems',
+        MAX_SHOPIFY_FULFILLMENT_ORDER_LINES,
+      ).reduce((sum, line, index) => {
+        const next = sum + integer(
+          line.remainingQuantity,
+          `fulfillmentOrder.lineItems[${index}].remainingQuantity`,
+        )
+        if (!Number.isSafeInteger(next)) {
+          fail(
+            'Shopify returned unsupported fulfillment-order quantities',
+            502,
+            'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+            true,
+          )
+        }
+        return next
+      }, 0)
+      if (remainingQuantity === 0) continue
+      const assignedLocation = record(
+        fulfillmentOrder.assignedLocation,
+        'fulfillmentOrder.assignedLocation',
+      )
+      const location = record(
+        assignedLocation.location,
+        'fulfillmentOrder.assignedLocation.location',
+      )
+      const shopifyLocationId = gid(
+        location.id,
+        SHOPIFY_LOCATION_GID,
+        'fulfillmentOrder.assignedLocation.location.id',
+      )
+      const shopifyLocationName = text(
+        location.name,
+        'fulfillmentOrder.assignedLocation.location.name',
+      )
+      const isFulfillmentService = boolean(
+        location.isFulfillmentService,
+        'fulfillmentOrder.assignedLocation.location.isFulfillmentService',
+      )
+      let fulfillmentService: ProviderPlanningAssignment[
+        'fulfillmentService'
+      ] = null
+      if (isFulfillmentService && location.fulfillmentService !== null) {
+        const service = record(
+          location.fulfillmentService,
+          'fulfillmentOrder.assignedLocation.location.fulfillmentService',
+        )
+        fulfillmentService = {
+          id: gid(
+            service.id,
+            SHOPIFY_FULFILLMENT_SERVICE_GID,
+            'fulfillmentService.id',
+          ),
+          serviceName: text(
+            service.serviceName,
+            'fulfillmentService.serviceName',
+          ),
+          type: service.type === null || service.type === undefined
+            ? null
+            : text(service.type, 'fulfillmentService.type', 64),
+        }
+      } else if (location.fulfillmentService !== null) {
+        fail(
+          'Shopify returned inconsistent fulfillment-service location evidence',
+          502,
+          'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+          true,
+        )
+      }
+      const actionable = (
+        text(fulfillmentOrder.status, 'fulfillmentOrder.status', 64)
+          === 'OPEN'
+        && text(
+          fulfillmentOrder.requestStatus,
+          'fulfillmentOrder.requestStatus',
+          64,
+        ) === 'UNSUBMITTED'
+      )
+      const existing = grouped.get(shopifyLocationId)
+      const ownerType = isFulfillmentService
+        ? 'fulfillment_service' as const
+        : 'merchant_managed' as const
+      if (existing) {
+        if (
+          existing.shopifyLocationName !== shopifyLocationName
+          || existing.ownerType !== ownerType
+          || existing.fulfillmentService?.id !== fulfillmentService?.id
+        ) {
+          fail(
+            'Shopify returned inconsistent assigned-location evidence',
+            502,
+            'SHOPIFY_ORDER_PLANNING_RESPONSE_INVALID',
+            true,
+          )
+        }
+        existing.fulfillmentOrderIds.push(fulfillmentOrderId)
+        existing.actionable = existing.actionable && actionable
+      } else {
+        grouped.set(shopifyLocationId, {
+          shopifyLocationId,
+          shopifyLocationName,
+          ownerType,
+          fulfillmentService,
+          fulfillmentOrderIds: [fulfillmentOrderId],
+          actionable,
+        })
+      }
+    }
+    return {
+      assignments: [...grouped.values()].map((assignment) => ({
+        ...assignment,
+        fulfillmentOrderIds: [...assignment.fulfillmentOrderIds].sort(),
+      })).sort((left, right) => (
+        left.shopifyLocationId.localeCompare(right.shopifyLocationId)
+      )),
+      providerReads: 1,
+    }
+  } catch (error) {
+    if (error instanceof ShopifyOrderPlanningAuthorityError) throw error
+    if (error instanceof ShopifyCommerceClientError) {
+      throw new ShopifyOrderPlanningAuthorityError(
+        'Shopify order location assignment is temporarily unavailable',
+        error.status >= 500 ? error.status : 502,
+        'SHOPIFY_ORDER_PLANNING_PROVIDER_READ_FAILED',
+        error.retryable,
+      )
+    }
+    throw error
+  }
+}
+
+const ASSIGNMENT_REQUIRED_SCOPES = [
+  'read_orders',
+  'read_locations',
+  'read_merchant_managed_fulfillment_orders',
+  'read_third_party_fulfillment_orders',
+  'read_assigned_fulfillment_orders',
+] as const
+
+export async function inspectShopifyOrderPlanningAssignment(
+  input: {
+    organizationId: unknown
+    accountGlobalId: unknown
+    candidateGlobalId: unknown
+    expectedCandidateRowVersion: unknown
+  },
+  dependencies: AssignmentDependencies = DEFAULT_ASSIGNMENT_DEPENDENCIES,
+): Promise<ShopifyOrderPlanningAssignment> {
+  let target: ShopifyOrderPlanningAssignmentTarget
+  try {
+    target = await dependencies.readTarget(input)
+  } catch (error) {
+    if (error instanceof ShopifyOrderPlanningAuthorityPersistenceError) {
+      throw new ShopifyOrderPlanningAuthorityError(
+        error.message,
+        error.status,
+        error.code,
+      )
+    }
+    throw error
+  }
+  const runtime = await dependencies.readRuntimeCredential({
+    organizationId: target.organizationId,
+    accountGlobalId: target.accountGlobalId,
+  })
+  if (
+    !runtime
+    || runtime.provider !== 'shopify'
+    || runtime.status !== 'active'
+    || runtime.verificationStatus !== 'verified'
+  ) {
+    fail(
+      'A verified active Shopify connection is required to inspect order location assignment',
+      409,
+      'SHOPIFY_ORDER_PLANNING_CONNECTION_INVALID',
+    )
+  }
+  const decrypted = dependencies.decryptCredential(
+    runtime.encrypted,
+    runtime.organizationId,
+    runtime.provider,
+    runtime.environment,
+    runtime.externalAccountId,
+  )
+  if (decrypted.provider !== 'shopify') {
+    fail(
+      'Stored Shopify credentials could not be decrypted',
+      500,
+      'SHOPIFY_ORDER_PLANNING_CREDENTIAL_INVALID',
+    )
+  }
+  const shopDomain = normalizeShopifyShopDomain(
+    runtime.configuration.shopDomain,
+  )
+  const grant = await dependencies.requestAccessToken({
+    shopDomain,
+    clientId: decrypted.clientId,
+    clientSecret: decrypted.clientSecret,
+  })
+  const probe = await dependencies.probeConnection({
+    shopDomain,
+    accessToken: grant.accessToken,
+  })
+  if (probe.shopId !== runtime.externalAccountId) {
+    fail(
+      'Shopify returned a different store identity',
+      409,
+      'SHOPIFY_ORDER_PLANNING_STORE_CHANGED',
+    )
+  }
+  const missingScopes = ASSIGNMENT_REQUIRED_SCOPES.filter((scope) => (
+    !hasEffectiveShopifyScope(grant.grantedScopes, scope)
+    || !hasEffectiveShopifyScope(probe.grantedScopes, scope)
+  ))
+  if (missingScopes.length > 0) {
+    fail(
+      `Shopify must grant ${missingScopes.join(', ')} to inspect every fulfillment location`,
+      409,
+      'SHOPIFY_ORDER_PLANNING_SCOPE_REQUIRED',
+    )
+  }
+  const providerRead = await dependencies.readAssignment(
+    { shopDomain, accessToken: grant.accessToken },
+    target,
+  )
+  const mappings = new Map(target.mappings.map((mapping) => [
+    mapping.externalLocationId,
+    mapping,
+  ]))
+  const assignments = providerRead.assignments.map((assignment) => {
+    const mapping = mappings.get(assignment.shopifyLocationId)
+    return {
+      shopifyLocationId: assignment.shopifyLocationId,
+      shopifyLocationName: assignment.shopifyLocationName,
+      ownerType: assignment.ownerType,
+      fulfillmentService: assignment.fulfillmentService,
+      fulfillmentOrderIds: assignment.fulfillmentOrderIds,
+      mapping: mapping ? {
+        globalId: mapping.globalId,
+        rowVersion: mapping.rowVersion,
+        warehouseGlobalId: mapping.warehouseGlobalId,
+        warehouseName: mapping.warehouseName,
+        locationGlobalId: mapping.locationGlobalId,
+        locationCode: mapping.locationCode,
+      } : null,
+    }
+  })
+  const actionable = providerRead.assignments.every(
+    (assignment) => assignment.actionable,
+  )
+  const single = assignments.length === 1 ? assignments[0] : null
+  const status: ShopifyOrderPlanningAssignment['status'] =
+    !actionable || assignments.length === 0
+      ? 'not_open'
+      : assignments.length > 1
+        ? 'split'
+        : single?.ownerType === 'fulfillment_service'
+          ? 'provider_managed'
+          : !single?.mapping
+            ? 'unmapped'
+            : 'ready'
+  return {
+    version: 'shopify-order-planning-assignment-v1',
+    status,
+    accountGlobalId: target.accountGlobalId,
+    candidateGlobalId: target.candidateGlobalId,
+    candidateRowVersion: target.candidateRowVersion,
+    assignments,
+    selectedWarehouse: status === 'ready' && single?.mapping ? {
+      globalId: single.mapping.warehouseGlobalId,
+      name: single.mapping.warehouseName,
+      mappingGlobalId: single.mapping.globalId,
+      mappingRowVersion: single.mapping.rowVersion,
+      shopifyLocationId: single.shopifyLocationId,
+      shopifyLocationName: single.shopifyLocationName,
+    } : null,
+    providerReads: providerRead.providerReads,
+    providerWrites: 0,
   }
 }
 

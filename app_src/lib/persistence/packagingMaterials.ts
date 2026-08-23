@@ -252,6 +252,8 @@ function materialsFromRows(rows: MaterialRow[]): PackagingMaterial[] {
       innerDimensionsMm: material.innerDimensionsMm,
       dimensionBasis: material.dimensionBasis,
       dimensionEvidenceType: material.dimensionEvidenceType,
+      dimensionEvidenceReference: material.dimensionEvidenceReference,
+      dimensionConfirmedAt: material.dimensionConfirmedAt,
       tareWeightGrams: material.tareWeightGrams,
       maxWeightGrams: material.maxWeightGrams,
       unitCostMinor: material.unitCostMinor,
@@ -376,6 +378,15 @@ async function readiness(
            WHERE material.status = 'active'
              AND material.dimension_basis = 'inner'
              AND material.dimension_evidence_type <> 'unknown'
+             AND (
+               material.dimension_evidence_type = 'measured'
+               OR (
+                 material.dimension_evidence_reference IS NOT NULL
+                 AND length(btrim(material.dimension_evidence_reference))
+                   BETWEEN 1 AND 500
+               )
+             )
+             AND material.dimension_confirmed_at IS NOT NULL
              AND material.inner_length_mm IS NOT NULL
              AND material.inner_width_mm IS NOT NULL
              AND material.inner_height_mm IS NOT NULL
@@ -547,9 +558,31 @@ async function assertActivationReady(
   client: PoolClient,
   organizationId: string,
   materialId: string,
+  evidenceType: PackagingMaterial['dimensionEvidenceType'],
 ) {
-  const configured = await client.query<{ ready: boolean }>(
-    `SELECT EXISTS (
+  const configured = await client.query<{
+    evidence_ready: boolean
+    stock_ready: boolean
+  }>(
+    `SELECT
+       EXISTS (
+         SELECT 1
+         FROM operations_packaging_materials material
+         WHERE material.organization_id = $1::uuid
+           AND material.id = $2::uuid
+           AND material.dimension_basis = 'inner'
+           AND material.dimension_evidence_type <> 'unknown'
+           AND (
+             material.dimension_evidence_type = 'measured'
+             OR (
+               material.dimension_evidence_reference IS NOT NULL
+               AND length(btrim(material.dimension_evidence_reference))
+                 BETWEEN 1 AND 500
+             )
+           )
+           AND material.dimension_confirmed_at IS NOT NULL
+       ) AS evidence_ready,
+       EXISTS (
        SELECT 1
        FROM operations_packaging_material_stock stock
        JOIN operations_warehouses warehouse
@@ -559,10 +592,19 @@ async function assertActivationReady(
        WHERE stock.organization_id = $1::uuid
          AND stock.packaging_material_id = $2::uuid
          AND stock.on_hand_quantity IS NOT NULL
-     ) AS ready`,
+     ) AS stock_ready`,
     [organizationId, materialId],
   )
-  if (!configured.rows[0]?.ready) {
+  if (!configured.rows[0]?.evidence_ready) {
+    throw new PackagingMaterialRequestError(
+      'PACKAGING_MATERIAL_EVIDENCE_REQUIRED',
+      evidenceType === 'measured'
+        ? 'Save exact positive measurements so ClawPilot can retain their confirmation before activation'
+        : 'Retain the factual dimension evidence reference and confirmation before activation',
+      409,
+    )
+  }
+  if (!configured.rows[0]?.stock_ready) {
     throw new PackagingMaterialRequestError(
       'PACKAGING_MATERIAL_STOCK_REQUIRED',
       'Record on-hand stock for at least one active warehouse before activation',
@@ -702,7 +744,7 @@ export async function savePackagingMaterialInPostgres(input: {
                dimension_evidence_type = $15,
                dimension_evidence_reference = $16,
                dimension_confirmed_at = CASE
-                 WHEN $15 IN ('customer_confirmed', 'measured')
+                 WHEN $15 <> 'unknown'
                    THEN CASE
                      WHEN inner_length_mm IS DISTINCT FROM $6
                        OR inner_width_mm IS DISTINCT FROM $7
@@ -716,7 +758,7 @@ export async function savePackagingMaterialInPostgres(input: {
                  ELSE NULL
                END,
                dimension_confirmed_by = CASE
-                 WHEN $15 IN ('customer_confirmed', 'measured')
+                 WHEN $15 <> 'unknown'
                    THEN CASE
                      WHEN inner_length_mm IS DISTINCT FROM $6
                        OR inner_width_mm IS DISTINCT FROM $7
@@ -789,9 +831,9 @@ export async function savePackagingMaterialInPostgres(input: {
              CASE WHEN $11::text IS NOT NULL THEN now() ELSE NULL END,
              CASE WHEN $11::text IS NOT NULL THEN $21 ELSE NULL END,
              $13, $14, $15,
-             CASE WHEN $14 IN ('customer_confirmed', 'measured')
+             CASE WHEN $14 <> 'unknown'
                THEN now() ELSE NULL END,
-             CASE WHEN $14 IN ('customer_confirmed', 'measured')
+             CASE WHEN $14 <> 'unknown'
                THEN $21 ELSE NULL END,
              $16, $17, $18, $19, $20, $22, $21, $21
            )
@@ -827,7 +869,12 @@ export async function savePackagingMaterialInPostgres(input: {
       }
 
       if (input.material.status === 'active') {
-        await assertActivationReady(client, input.organizationId, materialId)
+        await assertActivationReady(
+          client,
+          input.organizationId,
+          materialId,
+          input.material.dimensionEvidenceType,
+        )
       }
 
       const eventType = previousStatus === null
@@ -1651,6 +1698,34 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
         )
       }
       if (receipt.status === 'succeeded' && receipt.result_payload) {
+        const materialGlobalIds = Array.isArray(
+          receipt.result_payload.materialGlobalIds,
+        )
+          ? receipt.result_payload.materialGlobalIds.filter(
+            (value): value is string => typeof value === 'string',
+          )
+          : []
+        const currentMaterials = materialGlobalIds.length
+          ? await client.query<{ count: string }>(
+            `SELECT count(*)::text AS count
+             FROM operations_packaging_materials
+             WHERE organization_id = $1::uuid
+               AND global_id = ANY($2::text[])
+               AND status <> 'retired'`,
+            [input.organizationId, materialGlobalIds],
+          )
+          : { rows: [{ count: '0' }] }
+        if (
+          materialGlobalIds.length !== STARTER_PACKAGING_MATERIALS.length
+          || integer(currentMaterials.rows[0]?.count || '0')
+            !== materialGlobalIds.length
+        ) {
+          throw new PackagingMaterialRequestError(
+            'PACKAGING_MATERIAL_STARTER_REPLAY_STALE',
+            'This starter-assortment command already completed, but one or more of its materials were later removed. Start a new creation command.',
+            409,
+          )
+        }
         return {
           ...receipt.result_payload,
           replayed: true,
@@ -1846,7 +1921,7 @@ export async function createStarterPackagingAssortmentInPostgres(input: {
       aggregateType: 'operations.packaging_material',
       aggregateId: starters.rows[0].global_id,
       organizationId: input.organizationId,
-      eventKey: `operations:packaging-material-starter:${input.organizationId}:v${STARTER_ASSORTMENT_VERSION}`,
+      eventKey: `operations:packaging-material-starter:${input.organizationId}:v${STARTER_ASSORTMENT_VERSION}:${createdReceipt.rows[0].id}`,
       payload: {
         assortmentVersion: STARTER_ASSORTMENT_VERSION,
         createdCount,

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   SHOPIFY_INVENTORY_ADAPTER_VERSION,
   type ShopifyInventoryLocation,
@@ -18,10 +19,41 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  type CommerceStoreSyncProviderReadLease,
+} from '@/lib/persistence/commerceStoreSync'
 
 const INVENTORY_POOL_NAME = 'Shopify Available-to-Promise'
 const INVENTORY_LOT_CODE = 'SHOPIFY_ATP'
 const SYNC_ACTION = 'inventory.levels.read'
+const SHOPIFY_LOCATION_ROUTING_LOCK = 'shopify-inventory-location-routing'
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
+const WAREHOUSE_FACILITY_TYPES = new Set([
+  'distribution_center',
+  'store',
+  'dark_store',
+  'micro_fulfillment',
+  'cross_dock',
+  'supplier',
+  'drop_ship',
+  'third_party',
+])
+const SHOPIFY_WAREHOUSE_STARTER_LOCATIONS = Object.freeze([
+  { code: 'INBOUND', zone: 'INBOUND', type: 'receiving', level: 'zone', storage: 'work_area', sequence: 1, parent: null },
+  { code: 'RECEIVE-01', zone: 'INBOUND', type: 'receiving', level: 'dock', storage: 'work_area', sequence: 10, parent: 'INBOUND' },
+  { code: 'STAGE-IN-01', zone: 'INBOUND', type: 'staging', level: 'staging', storage: 'staging', sequence: 20, parent: 'INBOUND' },
+  { code: 'STORAGE', zone: 'STORAGE', type: 'storage', level: 'zone', storage: 'reserve', sequence: 90, parent: null },
+  { code: 'RESERVE-01', zone: 'STORAGE', type: 'storage', level: 'bin', storage: 'reserve', sequence: 100, parent: 'STORAGE' },
+  { code: 'FULFILLMENT', zone: 'FULFILLMENT', type: 'pick', level: 'zone', storage: 'work_area', sequence: 190, parent: null },
+  { code: 'PICKFACE-01', zone: 'FULFILLMENT', type: 'pick', level: 'bin', storage: 'forward_pick', sequence: 200, parent: 'FULFILLMENT' },
+  { code: 'PACK-01', zone: 'FULFILLMENT', type: 'pack', level: 'station', storage: 'work_area', sequence: 300, parent: 'FULFILLMENT' },
+  { code: 'OUTBOUND', zone: 'OUTBOUND', type: 'shipping', level: 'zone', storage: 'work_area', sequence: 390, parent: null },
+  { code: 'STAGE-OUT-01', zone: 'OUTBOUND', type: 'staging', level: 'staging', storage: 'staging', sequence: 400, parent: 'OUTBOUND' },
+  { code: 'SHIP-01', zone: 'OUTBOUND', type: 'shipping', level: 'dock', storage: 'work_area', sequence: 500, parent: 'OUTBOUND' },
+  { code: 'RETURNS', zone: 'RETURNS', type: 'returns', level: 'zone', storage: 'work_area', sequence: 590, parent: null },
+  { code: 'RETURNS-01', zone: 'RETURNS', type: 'returns', level: 'station', storage: 'work_area', sequence: 600, parent: 'RETURNS' },
+])
 const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
@@ -36,6 +68,54 @@ export class CommerceInventoryPersistenceError extends Error {
     super(message)
     this.name = 'CommerceInventoryPersistenceError'
   }
+}
+
+type ShopifyInventoryProviderReadAuthority =
+  | 'automatic'
+  | 'manual_read_only'
+
+async function lockShopifyInventoryProviderReadAuthority(
+  client: PoolClient,
+  runtime: Pick<
+    CommerceRuntimeCredentialRecord,
+    'organizationId' | 'integrationAccountId'
+  >,
+  authority: ShopifyInventoryProviderReadAuthority,
+) {
+  const result = await client.query<{
+    effective_reason: string
+  }>(
+    `SELECT operations_commerce_store_sync_effective_reason(
+       account.organization_id,
+       account.id
+     ) AS effective_reason
+     FROM operations_integration_accounts account
+     JOIN operations_commerce_store_sync_controls control
+       ON control.organization_id = account.organization_id
+      AND control.integration_account_id = account.id
+     WHERE account.organization_id = $1::uuid
+       AND account.id = $2::uuid
+       AND account.integration_type = 'commerce'
+       AND account.provider = 'shopify'
+       AND (
+         $3 = 'manual_read_only'
+         OR operations_commerce_store_sync_is_running(
+           account.organization_id,
+           account.id
+         )
+       )
+     LIMIT 1
+     FOR UPDATE OF account, control`,
+    [runtime.organizationId, runtime.integrationAccountId, authority],
+  )
+  if (!result.rows[0]) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_STORE_SYNC_PAUSED',
+      'Store sync is Paused for this Shopify connection',
+      409,
+    )
+  }
+  return result.rows[0]
 }
 
 type TargetRow = QueryResultRow & {
@@ -58,8 +138,18 @@ type InventoryLocationMappingRow = QueryResultRow & {
   global_id: string
   external_location_id: string
   external_location_name: string
+  external_location_address: Record<string, unknown>
   warehouse_id: string
   location_id: string
+  inventory_pool_id: string
+  mapping_method: 'automatic_single_location' | 'automatic_exact_address' | 'manual'
+  ownership_classification: 'unknown' | 'merchant_managed' | 'fulfillment_service'
+  provider_snapshot_json: Record<string, unknown>
+  provider_snapshot_hash: string | null
+  provider_observed_at: Date | null
+  inventory_import_enabled: boolean
+  active: boolean
+  row_version: string | number
 }
 
 type WarehouseAuthorityRow = QueryResultRow & {
@@ -86,6 +176,9 @@ export type ShopifyInventoryTarget = {
     globalId: string
     externalLocationId: string
     externalLocationName: string
+    rowVersion: number
+    inventoryPoolId: string
+    ownershipClassification: 'unknown' | 'merchant_managed' | 'fulfillment_service'
   } | null
 }
 
@@ -98,6 +191,7 @@ export type ShopifyInventoryAttempt = {
   replayed: boolean
   captured: boolean
   leaseToken: string | null
+  providerReadAuthority: ShopifyInventoryProviderReadAuthority
 }
 
 export type ShopifyInventoryRefreshExpectedFence = {
@@ -112,7 +206,40 @@ export type ShopifyInventoryRefreshExpectedFence = {
   inventoryMaxAgeSeconds: number
   requestedDirtyVersion: number
   lockToken: string
+  locationMappingId?: string | null
+  locationMappingRowVersion?: number | null
+  providerLocationId?: string | null
+  inventoryLocationId?: string | null
+  inventoryPoolId?: string | null
 }
+
+export type ShopifyInventoryMappingCommandResult = {
+  mapping: {
+    globalId: string
+    externalLocationId: string
+    externalLocationName: string
+    ownershipClassification: 'merchant_managed'
+    inventoryImportEnabled: true
+    rowVersion: number
+    warehouseGlobalId: string
+    locationGlobalId: string
+  }
+  providerWrites: 0
+  replayed: boolean
+}
+
+export type ShopifyInventoryWarehouseMappingCommandResult =
+  ShopifyInventoryMappingCommandResult & {
+    warehouse: {
+      globalId: string
+      code: string
+      name: string
+      facilityType: string
+      timezone: string
+      inventoryLocationGlobalId: string
+      inventoryLocationCode: string
+    }
+  }
 
 export type ShopifyInventoryCapture = {
   id: string
@@ -137,7 +264,6 @@ type ExistingPositionRow = QueryResultRow & {
   on_hand_quantity: string
   reserved_quantity: string
   source_authority: string
-  source_inventory_item_ids: string[]
 }
 
 type LatestRunRow = QueryResultRow & {
@@ -205,6 +331,55 @@ type LatestLevelRow = QueryResultRow & {
   operational_reserved_quantity: string | null
 }
 
+type InventoryWarehouseRow = QueryResultRow & {
+  global_id: string
+  code: string
+  name: string
+  address: Record<string, unknown>
+  status: 'active'
+  location_global_id: string
+  location_code: string
+  location_zone: string
+  location_type: string
+  location_active: boolean
+}
+
+type InventoryMappingStateRow = QueryResultRow & {
+  global_id: string
+  external_location_id: string
+  external_location_name: string
+  external_location_address: Record<string, unknown>
+  mapping_method: string
+  ownership_classification: 'unknown' | 'merchant_managed' | 'fulfillment_service'
+  provider_observed_at: Date | null
+  inventory_import_enabled: boolean
+  active: boolean
+  row_version: string
+  warehouse_global_id: string
+  warehouse_code: string
+  warehouse_name: string
+  location_global_id: string
+  location_code: string
+  location_zone: string
+  location_type: string
+  run_global_id: string | null
+  provider_fetched_at: Date | null
+  completed_at: Date | null
+  provider_location_id: string | null
+  provider_location_name: string | null
+  levels_seen: number | null
+  levels_mapped: number | null
+  levels_projected: number | null
+  levels_unmapped: number | null
+  levels_untracked: number | null
+  operational_available_quantity: string | null
+  positions_created: number | null
+  positions_updated: number | null
+  positions_zeroed: number | null
+  provider_writes: number | null
+  order_quantity_adjustment: string | null
+}
+
 function decimal(value: string | number | null | undefined): number {
   const parsed = Number(value || 0)
   return Number.isFinite(parsed) ? parsed : 0
@@ -212,6 +387,21 @@ function decimal(value: string | number | null | undefined): number {
 
 function iso(value: Date | string | null | undefined): string | null {
   return value ? new Date(value).toISOString() : null
+}
+
+function nonNegativeInteger(
+  value: string | number | null | undefined,
+  code = 'SHOPIFY_INVENTORY_MAPPING_VERSION_INVALID',
+): number {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    persistenceError(
+      code,
+      'The Shopify inventory mapping row version is invalid',
+      409,
+    )
+  }
+  return parsed
 }
 
 function persistenceError(
@@ -222,31 +412,89 @@ function persistenceError(
   throw new CommerceInventoryPersistenceError(code, message, status)
 }
 
+function isProjectionTargetUniqueViolation(error: unknown): boolean {
+  const postgresError = error as { code?: unknown; constraint?: unknown }
+  return postgresError?.code === '23505'
+    && postgresError?.constraint
+      === 'idx_operations_commerce_inventory_active_projection_target'
+}
+
 export async function readShopifyInventoryTargetFromPostgres(input: {
   runtime: CommerceRuntimeCredentialRecord
   expectedWarehouseId?: string | null
+  mappingGlobalId?: string | null
+  expectedMappingRowVersion?: number | null
+  expectedLocationMappingId?: string | null
 }): Promise<ShopifyInventoryTarget> {
   const mapping = await query<InventoryLocationMappingRow>(
     `SELECT mapping.id::text, mapping.global_id,
             mapping.external_location_id,
             mapping.external_location_name,
+            mapping.external_location_address,
             mapping.warehouse_id::text,
-            mapping.location_id::text
+            mapping.location_id::text,
+            mapping.inventory_pool_id::text,
+            mapping.mapping_method,
+            mapping.ownership_classification,
+            mapping.provider_snapshot_json,
+            mapping.provider_snapshot_hash,
+            mapping.provider_observed_at,
+            mapping.inventory_import_enabled,
+            mapping.active,
+            mapping.row_version::text
      FROM operations_commerce_inventory_location_mappings mapping
      WHERE mapping.organization_id = $1::uuid
        AND mapping.integration_account_id = $2::uuid
        AND mapping.active = true
+       AND mapping.inventory_import_enabled = true
+       AND ($3::text IS NULL OR mapping.global_id = $3)
+       AND ($4::uuid IS NULL OR mapping.id = $4::uuid)
+       AND ($5::uuid IS NULL OR mapping.warehouse_id = $5::uuid)
      ORDER BY mapping.id
      LIMIT 2`,
-    [input.runtime.organizationId, input.runtime.integrationAccountId],
+    [
+      input.runtime.organizationId,
+      input.runtime.integrationAccountId,
+      input.mappingGlobalId || null,
+      input.expectedLocationMappingId || null,
+      input.expectedWarehouseId || null,
+    ],
   )
   if (mapping.rows.length > 1) {
     persistenceError(
       'SHOPIFY_INVENTORY_LOCATION_MAPPING_AMBIGUOUS',
-      'More than one active Shopify inventory location mapping requires review',
+      'Choose the Shopify inventory location to synchronize',
     )
   }
   const existingMapping = mapping.rows[0] || null
+  const exactMappingRequested = Boolean(
+    input.mappingGlobalId || input.expectedLocationMappingId,
+  )
+  if (exactMappingRequested && !existingMapping) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+      'The selected Shopify inventory location mapping is no longer active',
+    )
+  }
+  if (
+    existingMapping
+    && input.expectedMappingRowVersion !== undefined
+    && input.expectedMappingRowVersion !== null
+    && nonNegativeInteger(existingMapping.row_version ?? 0)
+      !== input.expectedMappingRowVersion
+  ) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+      'The selected Shopify inventory location mapping changed. Reload before synchronizing.',
+    )
+  }
+  if (existingMapping?.ownership_classification === 'fulfillment_service') {
+    persistenceError(
+      'SHOPIFY_INVENTORY_FULFILLMENT_SERVICE_LOCATION_FORBIDDEN',
+      'Inventory owned by another Shopify fulfillment service cannot be mapped as a ClawPilot warehouse',
+      409,
+    )
+  }
   const configuredWarehouses = await query<WarehouseAuthorityRow>(
     `SELECT DISTINCT config.warehouse_id::text AS warehouse_id
      FROM operations_shopify_carrier_service_configs config
@@ -257,7 +505,7 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
      LIMIT 2`,
     [input.runtime.organizationId, input.runtime.integrationAccountId],
   )
-  if (configuredWarehouses.rows.length > 1) {
+  if (configuredWarehouses.rows.length > 1 && !exactMappingRequested) {
     persistenceError(
       'SHOPIFY_INVENTORY_CARRIER_CONFIG_AMBIGUOUS',
       'More than one active Shopify carrier-service warehouse requires review',
@@ -271,6 +519,7 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
       (existingMapping
         && existingMapping.warehouse_id !== expectedWarehouseId)
       || (configuredWarehouseId
+        && !input.expectedLocationMappingId
         && configuredWarehouseId !== expectedWarehouseId)
     ) {
       persistenceError(
@@ -279,6 +528,8 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
       )
     }
   } else if (
+    !exactMappingRequested
+    &&
     existingMapping
     && configuredWarehouseId
     && existingMapping.warehouse_id !== configuredWarehouseId
@@ -419,6 +670,10 @@ export async function readShopifyInventoryTargetFromPostgres(input: {
           globalId: existingMapping.global_id,
           externalLocationId: existingMapping.external_location_id,
           externalLocationName: existingMapping.external_location_name,
+          rowVersion: nonNegativeInteger(existingMapping.row_version ?? 0),
+          inventoryPoolId: existingMapping.inventory_pool_id,
+          ownershipClassification:
+            existingMapping.ownership_classification || 'unknown',
         }
       : null,
   }
@@ -430,6 +685,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
   idempotencyKey: string
   requestHash: string
   actorEmail: string | null
+  providerReadAuthority: ShopifyInventoryProviderReadAuthority
 }): Promise<ShopifyInventoryAttempt> {
   return withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -577,8 +833,14 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
         replayed: true,
         captured: true,
         leaseToken: null,
+        providerReadAuthority: input.providerReadAuthority,
       }
     }
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.providerReadAuthority,
+    )
     if (latest?.state === 'prepared') {
       if (latest.captured) {
         const leaseToken = await capturedAttemptLease(latest)
@@ -591,6 +853,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           replayed: false,
           captured: true,
           leaseToken,
+          providerReadAuthority: input.providerReadAuthority,
         }
       }
       if (latest.lease_is_live) {
@@ -688,6 +951,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           replayed: false,
           captured: true,
           leaseToken,
+          providerReadAuthority: input.providerReadAuthority,
         }
       }
       if (active.lease_is_live) {
@@ -765,6 +1029,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
           providerWrites: 0,
           orderQuantityAdjustment: 0,
           readOnly: true,
+          providerReadAuthority: input.providerReadAuthority,
         }),
         attemptNumber,
         input.actorEmail,
@@ -779,6 +1044,7 @@ export async function prepareShopifyInventoryReadInPostgres(input: {
       replayed: false,
       captured: false,
       leaseToken: inserted.rows[0].lease_token,
+      providerReadAuthority: input.providerReadAuthority,
     }
   })
 }
@@ -891,6 +1157,7 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
   requestHash: string
   snapshot: ShopifyInventorySnapshot
   actorEmail: string | null
+  providerReadLease: CommerceStoreSyncProviderReadLease
 }): Promise<ShopifyInventoryCapture> {
   if (!input.attempt.leaseToken) {
     persistenceError(
@@ -912,6 +1179,13 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
     )
   }
   return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.runtime.organizationId,
+      integrationAccountId: input.runtime.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: input.attempt.providerReadAuthority,
+      readKind: 'shopify_inventory',
+    })
     await acquireTransactionAdvisoryLock(
       client,
       [
@@ -973,8 +1247,15 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
         }),
       }
     }
-    const lease = await client.query(
-      `SELECT id
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.attempt.providerReadAuthority,
+    )
+    const lease = await client.query<{ provider_read_authority: string }>(
+      `SELECT id,
+              redacted_request->>'providerReadAuthority'
+                AS provider_read_authority
        FROM operations_commerce_provider_attempts
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -999,6 +1280,14 @@ export async function captureShopifyInventorySnapshotInPostgres(input: {
       persistenceError(
         'SHOPIFY_INVENTORY_READ_LEASE_LOST',
         'The Shopify inventory response arrived after its durable lease ended',
+        409,
+      )
+    }
+    if (lease.rows[0]?.provider_read_authority
+        !== input.attempt.providerReadAuthority) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_READ_AUTHORITY_INVALID',
+        'The durable Shopify inventory read authority does not match this capture',
         409,
       )
     }
@@ -1178,6 +1467,25 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
        AND state = 'prepared'
        AND lease_token = $5::uuid
        AND lease_expires_at > clock_timestamp()
+       AND redacted_request->>'providerReadAuthority' = $6
+       AND EXISTS (
+         SELECT 1
+         FROM operations_integration_accounts account
+         JOIN operations_commerce_store_sync_controls control
+           ON control.organization_id = account.organization_id
+          AND control.integration_account_id = account.id
+         WHERE account.organization_id =
+                 operations_commerce_provider_attempts.organization_id
+           AND account.id =
+                 operations_commerce_provider_attempts.integration_account_id
+           AND (
+             $6 = 'manual_read_only'
+             OR operations_commerce_store_sync_is_running(
+               account.organization_id,
+               account.id
+             )
+           )
+       )
      RETURNING id`,
     [
       input.runtime.organizationId,
@@ -1185,6 +1493,7 @@ export async function renewShopifyInventoryReadLeaseInPostgres(input: {
       input.attempt.id,
       SYNC_ACTION,
       input.attempt.leaseToken,
+      input.attempt.providerReadAuthority,
     ],
   )
   return renewed.rowCount === 1
@@ -1269,7 +1578,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
   expectedRefreshFence?: ShopifyInventoryRefreshExpectedFence | null
 }) {
   const snapshot = input.capture.snapshot
-  const committed = await withTransaction(async (client) => {
+  const committed = await (async () => {
+    try {
+      return await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
       [
@@ -1283,94 +1594,6 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          'clawpilot.shopify_inventory_sync', 'on', true
        )`,
     )
-    if (input.expectedRefreshFence) {
-      const expected = input.expectedRefreshFence
-      const refreshFence = await client.query(
-        `SELECT job.id
-         FROM operations_shopify_inventory_refresh_jobs job
-         JOIN operations_shopify_carrier_service_configs config
-           ON config.organization_id = job.organization_id
-          AND config.id = job.carrier_service_config_id
-          AND config.integration_account_id =
-              job.integration_account_id
-          AND config.warehouse_id = job.warehouse_id
-          AND config.credential_generation = job.credential_generation
-          AND config.activation_revision = job.activation_revision
-          AND config.row_version = job.config_row_version
-          AND config.policy_revision = job.policy_revision
-          AND config.policy_hash = job.policy_hash
-          AND config.inventory_max_age_seconds =
-              job.inventory_max_age_seconds
-         JOIN operations_integration_accounts account
-           ON account.organization_id = job.organization_id
-          AND account.id = job.integration_account_id
-          AND account.integration_type = 'commerce'
-          AND account.provider = 'shopify'
-          AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
-          AND account.commerce_credential_generation =
-              job.credential_generation
-         JOIN operations_commerce_credentials credential
-           ON credential.organization_id = job.organization_id
-          AND credential.integration_account_id =
-              job.integration_account_id
-          AND credential.credential_version = job.credential_generation
-          AND credential.verification_status = 'verified'
-         JOIN operations_activation_scopes activation
-           ON activation.organization_id = job.organization_id
-          AND activation.revision = job.activation_revision
-         WHERE job.organization_id = $1::uuid
-           AND job.integration_account_id = $2::uuid
-           AND job.id = $3::uuid
-           AND job.carrier_service_config_id = $4::uuid
-           AND job.warehouse_id = $5::uuid
-           AND job.credential_generation = $6::integer
-           AND job.activation_revision = $7::integer
-           AND job.config_row_version = $8::bigint
-           AND job.policy_revision = $9::bigint
-           AND job.policy_hash = $10
-           AND job.inventory_max_age_seconds = $11::integer
-           AND job.status = 'processing'
-           AND job.cancel_requested = false
-           AND job.lock_token = $12::uuid
-           AND job.requested_dirty_version = $13::bigint
-           AND job.lease_expires_at > clock_timestamp()
-           AND (
-             (config.registration_state = 'registered'
-               AND activation.state IN ('shadow', 'active'))
-             OR
-             (config.registration_state = 'shadow_simulated'
-               AND activation.state = 'shadow')
-           )
-           AND operations_shopify_carrier_service_config_is_ready(
-             config.organization_id,
-             config.id
-           )
-         LIMIT 1
-         FOR UPDATE OF job, config, account, credential, activation`,
-        [
-          input.runtime.organizationId,
-          input.runtime.integrationAccountId,
-          expected.jobId,
-          expected.carrierServiceConfigId,
-          expected.warehouseId,
-          expected.credentialGeneration,
-          expected.activationRevision,
-          expected.configRowVersion,
-          expected.policyRevision,
-          expected.policyHash,
-          expected.inventoryMaxAgeSeconds,
-          expected.lockToken,
-          expected.requestedDirtyVersion,
-        ],
-      )
-      if (!refreshFence.rowCount) {
-        persistenceError(
-          'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
-          'The automatic Shopify inventory refresh authority changed before projection',
-          409,
-        )
-      }
-    }
     const replay = await client.query<{ global_id: string }>(
       `SELECT global_id
        FROM operations_commerce_inventory_sync_runs
@@ -1395,6 +1618,127 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         replayed: true,
       }
     }
+    await lockShopifyInventoryProviderReadAuthority(
+      client,
+      input.runtime,
+      input.attempt.providerReadAuthority,
+    )
+    if (input.expectedRefreshFence) {
+      const expected = input.expectedRefreshFence
+      const refreshFence = await client.query(
+        `SELECT job.id
+         FROM operations_shopify_inventory_refresh_jobs job
+         JOIN operations_shopify_carrier_service_configs config
+           ON config.organization_id = job.organization_id
+          AND config.id = job.carrier_service_config_id
+          AND config.integration_account_id =
+              job.integration_account_id
+          AND (
+            job.location_mapping_id IS NOT NULL
+            OR config.warehouse_id = job.warehouse_id
+          )
+          AND config.credential_generation = job.credential_generation
+          AND config.activation_revision = job.activation_revision
+          AND config.row_version = job.config_row_version
+          AND config.policy_revision = job.policy_revision
+          AND config.policy_hash = job.policy_hash
+          AND config.inventory_max_age_seconds =
+              job.inventory_max_age_seconds
+         LEFT JOIN operations_commerce_inventory_location_mappings mapping
+           ON mapping.organization_id = job.organization_id
+          AND mapping.integration_account_id = job.integration_account_id
+          AND mapping.id = job.location_mapping_id
+          AND mapping.warehouse_id = job.warehouse_id
+          AND mapping.location_id = job.inventory_location_id
+          AND mapping.inventory_pool_id = job.inventory_pool_id
+          AND mapping.external_location_id = job.provider_location_id
+          AND mapping.row_version = job.location_mapping_row_version
+         JOIN operations_integration_accounts account
+           ON account.organization_id = job.organization_id
+          AND account.id = job.integration_account_id
+          AND account.integration_type = 'commerce'
+          AND account.provider = 'shopify'
+          AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
+          AND account.commerce_credential_generation =
+              job.credential_generation
+         JOIN operations_commerce_credentials credential
+           ON credential.organization_id = job.organization_id
+          AND credential.integration_account_id =
+              job.integration_account_id
+          AND credential.credential_version = job.credential_generation
+          AND credential.verification_status = 'verified'
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = job.organization_id
+         WHERE job.organization_id = $1::uuid
+           AND job.integration_account_id = $2::uuid
+           AND job.id = $3::uuid
+           AND job.carrier_service_config_id = $4::uuid
+           AND job.warehouse_id = $5::uuid
+           AND job.credential_generation = $6::integer
+           AND job.activation_revision = $7::integer
+           AND job.config_row_version = $8::bigint
+           AND job.policy_revision = $9::bigint
+           AND job.policy_hash = $10
+           AND job.inventory_max_age_seconds = $11::integer
+           AND job.status = CASE
+             WHEN $14::uuid IS NULL THEN 'processing'
+             ELSE 'mapped_processing'
+           END
+           AND job.cancel_requested = false
+           AND job.lock_token = $12::uuid
+           AND job.requested_dirty_version = $13::bigint
+           AND job.lease_expires_at > clock_timestamp()
+           AND (
+             $14::uuid IS NULL
+             OR (
+               job.location_mapping_id = $14::uuid
+               AND job.location_mapping_row_version = $15::bigint
+               AND job.provider_location_id = $16
+               AND job.inventory_location_id = $17::uuid
+               AND job.inventory_pool_id = $18::uuid
+               AND mapping.active = true
+               AND mapping.inventory_import_enabled = true
+             )
+           )
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
+           )
+           AND operations_shopify_inventory_read_config_is_ready(
+             config.organization_id,
+             config.id
+           )
+         LIMIT 1
+         FOR UPDATE OF job, config, account, credential, activation`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          expected.jobId,
+          expected.carrierServiceConfigId,
+          expected.warehouseId,
+          expected.credentialGeneration,
+          expected.activationRevision,
+          expected.configRowVersion,
+          expected.policyRevision,
+          expected.policyHash,
+          expected.inventoryMaxAgeSeconds,
+          expected.lockToken,
+          expected.requestedDirtyVersion,
+          expected.locationMappingId || null,
+          expected.locationMappingRowVersion ?? null,
+          expected.providerLocationId || null,
+          expected.inventoryLocationId || null,
+          expected.inventoryPoolId || null,
+        ],
+      )
+      if (!refreshFence.rowCount) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
+          'The automatic Shopify inventory refresh authority changed before projection',
+          409,
+        )
+      }
+    }
     const captureFence = await client.query<{
       request_hash: string
       snapshot_hash: string
@@ -1408,6 +1752,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       lease_expires_at: Date | null
       lease_is_live: boolean
       state: string
+      provider_read_authority: string | null
     }>(
       `SELECT capture.request_hash, capture.snapshot_hash,
               capture.provider_location_id, capture.level_count,
@@ -1419,7 +1764,9 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
                 AND attempt.lease_expires_at IS NOT NULL
                 AND attempt.lease_expires_at > clock_timestamp()
               ) AS lease_is_live,
-              attempt.state
+              attempt.state,
+              attempt.redacted_request->>'providerReadAuthority'
+                AS provider_read_authority
        FROM operations_commerce_inventory_captures capture
        JOIN operations_commerce_provider_attempts attempt
          ON attempt.organization_id = capture.organization_id
@@ -1452,6 +1799,8 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       || captured.location_id !== input.target.location.id
       || captured.credential_version !== input.runtime.credentialVersion
       || captured.adapter_version !== SHOPIFY_INVENTORY_ADAPTER_VERSION
+      || captured.provider_read_authority
+        !== input.attempt.providerReadAuthority
       || !input.attempt.leaseToken
       || captured.lease_token !== input.attempt.leaseToken
       || !captured.lease_is_live
@@ -1555,6 +1904,57 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         'The Shopify inventory pool is bound to a different product catalog',
       )
     }
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        SHOPIFY_LOCATION_ROUTING_LOCK,
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+      ].join(':'),
+    )
+    const projectionAuthorities = await client.query<{
+      id: string
+      integration_account_id: string
+    }>(
+      `SELECT id::text, integration_account_id::text
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND warehouse_id = $2::uuid
+         AND location_id = $3::uuid
+         AND inventory_pool_id = $4::uuid
+         AND active = true
+         AND inventory_import_enabled = true
+       ORDER BY id
+       FOR UPDATE`,
+      [
+        input.runtime.organizationId,
+        input.target.warehouse.id,
+        input.target.location.id,
+        pool.rows[0].id,
+      ],
+    )
+    const expectedMappingId = input.target.existingMapping?.id || null
+    if (
+      projectionAuthorities.rows.length > 1
+      || projectionAuthorities.rows.some((authority) => (
+        authority.integration_account_id
+          !== input.runtime.integrationAccountId
+        || (expectedMappingId !== null && authority.id !== expectedMappingId)
+        || expectedMappingId === null
+      ))
+      || (
+        expectedMappingId !== null
+        && projectionAuthorities.rows.length !== 1
+      )
+    ) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_PROJECTION_AUTHORITY_CONFLICT',
+        'Another connected store owns this ClawPilot inventory projection target',
+        409,
+      )
+    }
     const existingMapping = await client.query<{
       id: string
       global_id: string
@@ -1562,17 +1962,26 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
       warehouse_id: string
       location_id: string
       inventory_pool_id: string
+      ownership_classification: string
+      inventory_import_enabled: boolean
+      active: boolean
+      row_version: string
     }>(
       `SELECT id::text, global_id, external_location_id,
               warehouse_id::text, location_id::text,
-              inventory_pool_id::text
+              inventory_pool_id::text, ownership_classification,
+              inventory_import_enabled, active, row_version::text
        FROM operations_commerce_inventory_location_mappings
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
-         AND active = true
+         AND external_location_id = $3
        LIMIT 1
        FOR UPDATE`,
-      [input.runtime.organizationId, input.runtime.integrationAccountId],
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.providerLocation.id,
+      ],
     )
     let locationMapping: { id: string; global_id: string }
     if (existingMapping.rows[0]) {
@@ -1582,6 +1991,18 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         || mapping.warehouse_id !== input.target.warehouse.id
         || mapping.location_id !== input.target.location.id
         || mapping.inventory_pool_id !== pool.rows[0].id
+        || !mapping.active
+        || !mapping.inventory_import_enabled
+        || mapping.ownership_classification === 'fulfillment_service'
+        || (
+          input.target.existingMapping
+          && mapping.id !== input.target.existingMapping.id
+        )
+        || (
+          input.target.existingMapping
+          && nonNegativeInteger(mapping.row_version)
+            !== input.target.existingMapping.rowVersion
+        )
       ) {
         persistenceError(
           'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
@@ -1593,8 +2014,11 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
           `UPDATE operations_commerce_inventory_location_mappings
            SET external_location_name = $3,
                external_location_address = $4::jsonb,
-               row_version = row_version + 1,
-               updated_by = $5,
+               ownership_classification = 'merchant_managed',
+               provider_snapshot_json = $5::jsonb,
+               provider_snapshot_hash = $6,
+               provider_observed_at = now(),
+               updated_by = $7,
                updated_at = now()
            WHERE organization_id = $1::uuid AND id = $2::uuid
            RETURNING id::text, global_id`,
@@ -1603,6 +2027,10 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
             mapping.id,
             input.providerLocation.name,
             JSON.stringify(input.providerLocation.address),
+            JSON.stringify(input.providerLocation),
+            createHash('sha256')
+              .update(JSON.stringify(input.providerLocation))
+              .digest('hex'),
             input.actorEmail,
           ],
         )
@@ -1614,11 +2042,14 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
              organization_id, integration_account_id,
              external_location_id, external_location_name,
              external_location_address, warehouse_id, location_id,
-             inventory_pool_id, mapping_method, active,
+             inventory_pool_id, mapping_method, ownership_classification,
+             provider_snapshot_json, provider_snapshot_hash,
+             provider_observed_at, inventory_import_enabled, active,
              created_by, updated_by
            ) VALUES (
              $1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid, $7::uuid,
-             $8::uuid, $9, true, $10, $10
+             $8::uuid, $9, 'merchant_managed', $10::jsonb, $11, now(),
+             true, true, $12, $12
            )
            RETURNING id::text, global_id`,
           [
@@ -1631,6 +2062,10 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
             input.target.location.id,
             pool.rows[0].id,
             input.mappingMethod,
+            JSON.stringify(input.providerLocation),
+            createHash('sha256')
+              .update(JSON.stringify(input.providerLocation))
+              .digest('hex'),
             input.actorEmail,
           ],
         )
@@ -1653,11 +2088,13 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
        FROM operations_commerce_inventory_sync_runs
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
+         AND location_mapping_id = $3::uuid
        ORDER BY completed_at DESC, id DESC
        LIMIT 1`,
       [
         input.runtime.organizationId,
         input.runtime.integrationAccountId,
+        locationMapping.id,
       ],
     )
     const previousRunId = previousRun.rows[0]?.id || null
@@ -1768,16 +2205,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
               position.product_id::text,
               position.on_hand_quantity::text,
               position.reserved_quantity::text,
-              position.source_authority,
-              ARRAY(
-                SELECT DISTINCT evidence.external_inventory_item_id
-                FROM operations_commerce_inventory_levels evidence
-                WHERE evidence.organization_id =
-                    position.organization_id
-                  AND evidence.inventory_position_id = position.id
-                  AND evidence.sync_run_id = $6::uuid
-                ORDER BY evidence.external_inventory_item_id
-              )::text[] AS source_inventory_item_ids
+              position.source_authority
        FROM operations_inventory_positions position
        WHERE position.organization_id = $1::uuid
          AND position.warehouse_id = $2::uuid
@@ -1791,7 +2219,6 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         input.target.location.id,
         pool.rows[0].id,
         INVENTORY_LOT_CODE,
-        previousRunId,
       ],
     )
     const authorityConflict = existing.rows.find(
@@ -1913,10 +2340,6 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
     const currentProductIdSet = new Set(projectedProductIds)
     const positionsToZero = existing.rows.filter((position) => (
       !currentProductIdSet.has(position.product_id)
-      && position.source_inventory_item_ids.length > 0
-      && position.source_inventory_item_ids.every(
-        (inventoryItemId) => !snapshotInventoryItemIds.has(inventoryItemId),
-      )
       && (
         decimal(position.on_hand_quantity) !== 0
         || decimal(position.reserved_quantity) !== 0
@@ -2087,8 +2510,7 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
          WHERE operations_inventory_positions.source_authority = 'shopify'
          RETURNING id::text, global_id, product_id::text,
                    on_hand_quantity::text, reserved_quantity::text,
-                   source_authority, '{}'::text[]
-                     AS source_inventory_item_ids`,
+                   source_authority`,
         [
           input.runtime.organizationId,
           input.target.pipelineId,
@@ -2337,11 +2759,22 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
         `shopify-inventory:${input.idempotencyKey}`,
       ],
     )
-    return {
-      runGlobalId: run.rows[0].global_id,
-      replayed: false,
+        return {
+          runGlobalId: run.rows[0].global_id,
+          replayed: false,
+        }
+      })
+    } catch (error) {
+      if (isProjectionTargetUniqueViolation(error)) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_PROJECTION_AUTHORITY_CONFLICT',
+          'Another connected store owns this ClawPilot inventory projection target',
+          409,
+        )
+      }
+      throw error
     }
-  })
+  })()
   await recordAuditEvent({
     actor: input.actorEmail || 'system',
     eventType: 'commerce.inventory.synced',
@@ -2361,9 +2794,1124 @@ export async function applyShopifyInventorySnapshotInPostgres(input: {
   return committed
 }
 
+export async function readShopifyInventoryConfigurationFromPostgres(input: {
+  organizationId: string
+  integrationAccountId: string
+}) {
+  const warehouseRows = await query<InventoryWarehouseRow>(
+    `SELECT warehouse.global_id, warehouse.code, warehouse.name,
+            warehouse.address, warehouse.status,
+            location.global_id AS location_global_id,
+            location.code AS location_code,
+            location.zone AS location_zone,
+            location.location_type,
+            location.active AS location_active
+     FROM operations_warehouses warehouse
+     JOIN operations_locations location
+       ON location.organization_id = warehouse.organization_id
+      AND location.warehouse_id = warehouse.id
+      AND location.active = true
+     WHERE warehouse.organization_id = $1::uuid
+       AND warehouse.status = 'active'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_inventory_location_mappings foreign_mapping
+         WHERE foreign_mapping.organization_id = warehouse.organization_id
+           AND foreign_mapping.integration_account_id <> $2::uuid
+           AND foreign_mapping.warehouse_id = warehouse.id
+           AND foreign_mapping.location_id = location.id
+           AND foreign_mapping.active = true
+           AND foreign_mapping.inventory_import_enabled = true
+       )
+     ORDER BY lower(warehouse.name), warehouse.global_id,
+              location.pick_sequence, lower(location.code),
+              location.global_id`,
+    [input.organizationId, input.integrationAccountId],
+  )
+  const warehouseByGlobalId = new Map<string, {
+    globalId: string
+    code: string
+    name: string
+    address: Record<string, unknown>
+    status: 'active'
+    locations: Array<{
+      globalId: string
+      code: string
+      zone: string
+      locationType: string
+      active: boolean
+    }>
+  }>()
+  for (const row of warehouseRows.rows) {
+    let warehouse = warehouseByGlobalId.get(row.global_id)
+    if (!warehouse) {
+      warehouse = {
+        globalId: row.global_id,
+        code: row.code,
+        name: row.name,
+        address: row.address || {},
+        status: row.status,
+        locations: [],
+      }
+      warehouseByGlobalId.set(row.global_id, warehouse)
+    }
+    warehouse.locations.push({
+      globalId: row.location_global_id,
+      code: row.location_code,
+      zone: row.location_zone,
+      locationType: row.location_type,
+      active: row.location_active,
+    })
+  }
+
+  const mappingRows = await query<InventoryMappingStateRow>(
+    `SELECT mapping.global_id, mapping.external_location_id,
+            mapping.external_location_name,
+            mapping.external_location_address, mapping.mapping_method,
+            mapping.ownership_classification,
+            mapping.provider_observed_at,
+            mapping.inventory_import_enabled, mapping.active,
+            mapping.row_version::text,
+            warehouse.global_id AS warehouse_global_id,
+            warehouse.code AS warehouse_code,
+            warehouse.name AS warehouse_name,
+            location.global_id AS location_global_id,
+            location.code AS location_code,
+            location.zone AS location_zone,
+            location.location_type,
+            latest.global_id AS run_global_id,
+            latest.provider_fetched_at, latest.completed_at,
+            latest.provider_location_id, latest.provider_location_name,
+            latest.levels_seen, latest.levels_mapped,
+            latest.levels_projected, latest.levels_unmapped,
+            latest.levels_untracked,
+            latest.operational_available_quantity::text,
+            latest.positions_created, latest.positions_updated,
+            latest.positions_zeroed, latest.provider_writes,
+            latest.order_quantity_adjustment::text
+     FROM operations_commerce_inventory_location_mappings mapping
+     JOIN operations_warehouses warehouse
+       ON warehouse.organization_id = mapping.organization_id
+      AND warehouse.id = mapping.warehouse_id
+     JOIN operations_locations location
+       ON location.organization_id = mapping.organization_id
+      AND location.id = mapping.location_id
+     LEFT JOIN LATERAL (
+       SELECT run.global_id, run.provider_fetched_at, run.completed_at,
+              run.provider_location_id, run.provider_location_name,
+              run.levels_seen, run.levels_mapped,
+              run.levels_projected, run.levels_unmapped,
+              run.levels_untracked,
+              run.operational_available_quantity,
+              run.positions_created, run.positions_updated,
+              run.positions_zeroed, run.provider_writes,
+              run.order_quantity_adjustment
+       FROM operations_commerce_inventory_sync_runs run
+       WHERE run.organization_id = mapping.organization_id
+         AND run.integration_account_id = mapping.integration_account_id
+         AND run.location_mapping_id = mapping.id
+         AND run.status = 'succeeded'
+       ORDER BY run.completed_at DESC, run.id DESC
+       LIMIT 1
+     ) latest ON true
+     WHERE mapping.organization_id = $1::uuid
+       AND mapping.integration_account_id = $2::uuid
+     ORDER BY mapping.active DESC, mapping.inventory_import_enabled DESC,
+              lower(mapping.external_location_name), mapping.global_id`,
+    [input.organizationId, input.integrationAccountId],
+  )
+  return {
+    warehouses: [...warehouseByGlobalId.values()],
+    mappings: mappingRows.rows.map((row) => ({
+      globalId: row.global_id,
+      externalLocationId: row.external_location_id,
+      externalLocationName: row.external_location_name,
+      externalLocationAddress: row.external_location_address || {},
+      mappingMethod: row.mapping_method,
+      ownershipClassification: row.ownership_classification,
+      providerObservedAt: iso(row.provider_observed_at),
+      inventoryImportEnabled: row.inventory_import_enabled,
+      active: row.active,
+      rowVersion: nonNegativeInteger(row.row_version),
+      warehouse: {
+        globalId: row.warehouse_global_id,
+        code: row.warehouse_code,
+        name: row.warehouse_name,
+      },
+      location: {
+        globalId: row.location_global_id,
+        code: row.location_code,
+        zone: row.location_zone,
+        locationType: row.location_type,
+      },
+      latestRun: row.run_global_id
+        ? {
+            globalId: row.run_global_id,
+            providerFetchedAt: iso(row.provider_fetched_at),
+            completedAt: iso(row.completed_at),
+            providerLocationId: row.provider_location_id,
+            providerLocationName: row.provider_location_name,
+            levelsSeen: row.levels_seen || 0,
+            levelsMapped: row.levels_mapped || 0,
+            levelsProjected: row.levels_projected || 0,
+            levelsUnmapped: row.levels_unmapped || 0,
+            levelsUntracked: row.levels_untracked || 0,
+            operationalAvailableQuantity: decimal(
+              row.operational_available_quantity,
+            ),
+            positionsCreated: row.positions_created || 0,
+            positionsUpdated: row.positions_updated || 0,
+            positionsZeroed: row.positions_zeroed || 0,
+            providerWrites: row.provider_writes || 0,
+            orderQuantityAdjustment: decimal(
+              row.order_quantity_adjustment,
+            ),
+          }
+        : null,
+    })),
+  }
+}
+
+function mappingCommandResult(
+  value: unknown,
+): ShopifyInventoryMappingCommandResult {
+  const result = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : {}
+  const mapping = result.mapping && typeof result.mapping === 'object'
+    ? result.mapping as Record<string, unknown>
+    : {}
+  const rowVersion = nonNegativeInteger(
+    typeof mapping.rowVersion === 'number' ? mapping.rowVersion : undefined,
+  )
+  return {
+    mapping: {
+      globalId: String(mapping.globalId || ''),
+      externalLocationId: String(mapping.externalLocationId || ''),
+      externalLocationName: String(mapping.externalLocationName || ''),
+      ownershipClassification: 'merchant_managed',
+      inventoryImportEnabled: true,
+      rowVersion,
+      warehouseGlobalId: String(mapping.warehouseGlobalId || ''),
+      locationGlobalId: String(mapping.locationGlobalId || ''),
+    },
+    providerWrites: 0,
+    replayed: result.replayed === true,
+  }
+}
+
+export async function mapShopifyInventoryLocationInPostgres(input: {
+  runtime: CommerceRuntimeCredentialRecord
+  providerLocation: ShopifyInventoryLocation
+  warehouseGlobalId: string
+  locationGlobalId: string
+  expectedMappingGlobalId: string | null
+  expectedRowVersion: number | null
+  idempotencyKey: string
+  actorEmail: string
+}): Promise<ShopifyInventoryMappingCommandResult> {
+  if (
+    input.providerLocation.isFulfillmentService
+    || !input.providerLocation.isActive
+    || !input.providerLocation.shipsInventory
+    || !input.providerLocation.fulfillsOnlineOrders
+  ) {
+    persistenceError(
+      input.providerLocation.isFulfillmentService
+        ? 'SHOPIFY_INVENTORY_FULFILLMENT_SERVICE_LOCATION_FORBIDDEN'
+        : 'SHOPIFY_INVENTORY_LOCATION_INELIGIBLE',
+      input.providerLocation.isFulfillmentService
+        ? 'Inventory owned by another Shopify fulfillment service cannot be mapped as a ClawPilot warehouse'
+        : 'Choose an active Shopify location that ships inventory and fulfills online orders',
+      409,
+    )
+  }
+  const requestHash = createHash('sha256').update(JSON.stringify({
+    version: 1,
+    command: 'shopify_inventory_location_map',
+    accountGlobalId: input.runtime.globalId,
+    credentialVersion: input.runtime.credentialVersion,
+    externalLocationId: input.providerLocation.id,
+    warehouseGlobalId: input.warehouseGlobalId,
+    locationGlobalId: input.locationGlobalId,
+    expectedMappingGlobalId: input.expectedMappingGlobalId,
+    expectedRowVersion: input.expectedRowVersion,
+    providerWrites: 0,
+  })).digest('hex')
+  const providerSnapshot = JSON.stringify(input.providerLocation)
+  const providerSnapshotHash = createHash('sha256')
+    .update(providerSnapshot)
+    .digest('hex')
+  const commandType = 'shopify_inventory_location_map'
+  try {
+    return await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        SHOPIFY_LOCATION_ROUTING_LOCK,
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+      ].join(':'),
+    )
+    const prior = await client.query<{
+      request_hash: string
+      status: string
+      result_payload: unknown
+    }>(
+      `SELECT request_hash, status, result_payload
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = $2
+         AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.runtime.organizationId, commandType, input.idempotencyKey],
+    )
+    if (prior.rows[0]) {
+      if (prior.rows[0].request_hash !== requestHash) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_MAPPING_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for a different Shopify inventory mapping',
+        )
+      }
+      if (
+        prior.rows[0].status === 'succeeded'
+        && prior.rows[0].result_payload
+      ) {
+        const replay = mappingCommandResult(prior.rows[0].result_payload)
+        return { ...replay, replayed: true }
+      }
+      persistenceError(
+        'SHOPIFY_INVENTORY_MAPPING_IN_PROGRESS',
+        'This Shopify inventory mapping change is already in progress',
+      )
+    }
+    const receipt = await client.query<{ id: string }>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', gen_random_uuid())
+       RETURNING id::text`,
+      [
+        input.runtime.organizationId,
+        commandType,
+        input.idempotencyKey,
+        requestHash,
+        input.actorEmail,
+      ],
+    )
+    const authority = await client.query<{
+      credential_version: number
+      verification_status: string
+      account_status: string
+      pipeline_id: string
+      warehouse_id: string
+      warehouse_global_id: string
+      location_id: string
+      location_global_id: string
+    }>(
+      `SELECT credential.credential_version,
+              credential.verification_status,
+              account.status AS account_status,
+              activation.data_pipeline_id::text AS pipeline_id,
+              warehouse.id::text AS warehouse_id,
+              warehouse.global_id AS warehouse_global_id,
+              location.id::text AS location_id,
+              location.global_id AS location_global_id
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version =
+            account.commerce_credential_generation
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = account.organization_id
+       JOIN operations_warehouses warehouse
+         ON warehouse.organization_id = account.organization_id
+        AND warehouse.global_id = $3
+        AND warehouse.status = 'active'
+       JOIN operations_locations location
+         ON location.organization_id = warehouse.organization_id
+        AND location.warehouse_id = warehouse.id
+        AND location.global_id = $4
+        AND location.active = true
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       LIMIT 1
+       FOR UPDATE OF account, credential, warehouse, location`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.warehouseGlobalId,
+        input.locationGlobalId,
+      ],
+    )
+    const currentAuthority = authority.rows[0]
+    if (!currentAuthority) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_MAPPING_TARGET_REQUIRED',
+        'Choose an active ClawPilot warehouse and inventory location',
+        404,
+      )
+    }
+    if (
+      currentAuthority.credential_version !== input.runtime.credentialVersion
+      || currentAuthority.verification_status !== 'verified'
+      || currentAuthority.account_status !== 'active'
+    ) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_CONNECTION_STALE',
+        'Shopify changed while the inventory mapping was being saved',
+      )
+    }
+    const pool = await client.query<{
+      id: string
+      pipeline_id: string
+    }>(
+      `INSERT INTO operations_inventory_pools (
+         organization_id, pipeline_id, owner_customer_id, name,
+         pool_type, allocation_policy, active, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, NULL, $3, 'shared', 'fifo', true, $4
+       )
+       ON CONFLICT (organization_id, name) DO UPDATE
+       SET active = true, updated_at = now()
+       RETURNING id::text, pipeline_id::text`,
+      [
+        input.runtime.organizationId,
+        currentAuthority.pipeline_id,
+        INVENTORY_POOL_NAME,
+        input.actorEmail,
+      ],
+    )
+    if (pool.rows[0].pipeline_id !== currentAuthority.pipeline_id) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_POOL_PIPELINE_CONFLICT',
+        'The Shopify inventory pool is bound to a different product catalog',
+      )
+    }
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        SHOPIFY_LOCATION_ROUTING_LOCK,
+        input.runtime.organizationId,
+        currentAuthority.warehouse_id,
+        currentAuthority.location_id,
+        pool.rows[0].id,
+      ].join(':'),
+    )
+    const conflicts = await client.query<InventoryLocationMappingRow>(
+      `SELECT id::text, global_id, external_location_id,
+              external_location_name, external_location_address,
+              warehouse_id::text, location_id::text,
+              inventory_pool_id::text, mapping_method,
+              ownership_classification, provider_snapshot_json,
+              provider_snapshot_hash, provider_observed_at,
+              inventory_import_enabled, active, row_version::text
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND (
+           (
+             integration_account_id = $2::uuid
+             AND (
+               global_id = $3
+               OR external_location_id = $4
+               OR warehouse_id = $5::uuid
+             )
+           )
+           OR (
+             warehouse_id = $5::uuid
+             AND location_id = $6::uuid
+             AND inventory_pool_id = $7::uuid
+             AND active = true
+             AND inventory_import_enabled = true
+           )
+         )
+       ORDER BY id
+       FOR UPDATE`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.expectedMappingGlobalId || '',
+        input.providerLocation.id,
+        currentAuthority.warehouse_id,
+        currentAuthority.location_id,
+        pool.rows[0].id,
+      ],
+    )
+    let saved: { global_id: string; row_version: string }
+    if (input.expectedMappingGlobalId) {
+      const current = conflicts.rows.find(
+        (row) => row.global_id === input.expectedMappingGlobalId,
+      )
+      if (!current || current.external_location_id !== input.providerLocation.id) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+          'The selected Shopify inventory location mapping changed. Reload before saving.',
+        )
+      }
+      if (
+        input.expectedRowVersion === null
+        || nonNegativeInteger(current.row_version)
+          !== input.expectedRowVersion
+      ) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+          'The selected Shopify inventory location mapping changed. Reload before saving.',
+        )
+      }
+      const collision = conflicts.rows.find(
+        (row) => row.id !== current.id,
+      )
+      if (collision) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_CONFLICT',
+          'That Shopify location or ClawPilot inventory target is already mapped to a connected store',
+        )
+      }
+      if (
+        current.warehouse_id !== currentAuthority.warehouse_id
+        || current.location_id !== currentAuthority.location_id
+        || current.inventory_pool_id !== pool.rows[0].id
+      ) {
+        const projected = await client.query(
+          `SELECT run.id
+           FROM operations_commerce_inventory_sync_runs run
+           WHERE run.organization_id = $1::uuid
+             AND run.integration_account_id = $2::uuid
+             AND run.location_mapping_id = $3::uuid
+             AND run.status = 'succeeded'
+           LIMIT 1`,
+          [
+            input.runtime.organizationId,
+            input.runtime.integrationAccountId,
+            current.id,
+          ],
+        )
+        if (projected.rowCount) {
+          persistenceError(
+            'SHOPIFY_INVENTORY_MAPPING_ROUTE_TRANSITION_REQUIRED',
+            'This Shopify location already projected inventory. Reconcile the prior warehouse balance before changing its route.',
+          )
+        }
+      }
+      const updated = await client.query<{
+        global_id: string
+        row_version: string
+      }>(
+        `UPDATE operations_commerce_inventory_location_mappings
+         SET external_location_name = $4,
+             external_location_address = $5::jsonb,
+             warehouse_id = $6::uuid,
+             location_id = $7::uuid,
+             inventory_pool_id = $8::uuid,
+             mapping_method = 'manual',
+             ownership_classification = 'merchant_managed',
+             provider_snapshot_json = $9::jsonb,
+             provider_snapshot_hash = $10,
+             provider_observed_at = now(),
+             inventory_import_enabled = true,
+             active = true,
+             row_version = row_version + 1,
+             updated_by = $11,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND id = $3::uuid
+           AND row_version = $12::bigint
+         RETURNING global_id, row_version::text`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          current.id,
+          input.providerLocation.name,
+          JSON.stringify(input.providerLocation.address),
+          currentAuthority.warehouse_id,
+          currentAuthority.location_id,
+          pool.rows[0].id,
+          providerSnapshot,
+          providerSnapshotHash,
+          input.actorEmail,
+          input.expectedRowVersion,
+        ],
+      )
+      if (!updated.rows[0]) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+          'The selected Shopify inventory location mapping changed. Reload before saving.',
+        )
+      }
+      saved = updated.rows[0]
+    } else {
+      if (input.expectedRowVersion !== null || conflicts.rows.length) {
+        persistenceError(
+          conflicts.rows.length
+            ? 'SHOPIFY_INVENTORY_LOCATION_MAPPING_CONFLICT'
+            : 'SHOPIFY_INVENTORY_LOCATION_MAPPING_CHANGED',
+          conflicts.rows.length
+            ? 'That Shopify location or ClawPilot inventory target is already mapped to a connected store'
+            : 'Reload Shopify inventory locations before saving this mapping',
+        )
+      }
+      const inserted = await client.query<{
+        global_id: string
+        row_version: string
+      }>(
+        `INSERT INTO operations_commerce_inventory_location_mappings (
+           organization_id, integration_account_id,
+           external_location_id, external_location_name,
+           external_location_address, warehouse_id, location_id,
+           inventory_pool_id, mapping_method, ownership_classification,
+           provider_snapshot_json, provider_snapshot_hash,
+           provider_observed_at, inventory_import_enabled, active,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid, $7::uuid,
+           $8::uuid, 'manual', 'merchant_managed', $9::jsonb, $10, now(),
+           true, true, $11, $11
+         )
+         RETURNING global_id, row_version::text`,
+        [
+          input.runtime.organizationId,
+          input.runtime.integrationAccountId,
+          input.providerLocation.id,
+          input.providerLocation.name,
+          JSON.stringify(input.providerLocation.address),
+          currentAuthority.warehouse_id,
+          currentAuthority.location_id,
+          pool.rows[0].id,
+          providerSnapshot,
+          providerSnapshotHash,
+          input.actorEmail,
+        ],
+      )
+      saved = inserted.rows[0]
+    }
+    const result: ShopifyInventoryMappingCommandResult = {
+      mapping: {
+        globalId: saved.global_id,
+        externalLocationId: input.providerLocation.id,
+        externalLocationName: input.providerLocation.name,
+        ownershipClassification: 'merchant_managed',
+        inventoryImportEnabled: true,
+        rowVersion: nonNegativeInteger(saved.row_version),
+        warehouseGlobalId: currentAuthority.warehouse_global_id,
+        locationGlobalId: currentAuthority.location_global_id,
+      },
+      providerWrites: 0,
+      replayed: false,
+    }
+    await client.query(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_global_id = $2,
+           result_payload = $3::jsonb, completed_at = now(),
+           updated_at = now()
+       WHERE id = $1::uuid`,
+      [receipt.rows[0].id, saved.global_id, JSON.stringify(result)],
+    )
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.inventory.location_mapped',
+      aggregateType: 'operations.commerce_inventory_location_mapping',
+      aggregateId: saved.global_id,
+      organizationId: input.runtime.organizationId,
+      eventKey: `commerce-inventory-location-map:${input.idempotencyKey}`,
+      payload: {
+        integrationAccountGlobalId: input.runtime.globalId,
+        externalLocationIdHash: createHash('sha256')
+          .update(input.providerLocation.id)
+          .digest('hex'),
+        warehouseGlobalId: currentAuthority.warehouse_global_id,
+        locationGlobalId: currentAuthority.location_global_id,
+        rowVersion: result.mapping.rowVersion,
+        ownershipClassification: 'merchant_managed',
+        providerWrites: 0,
+      },
+    }, client)
+      return result
+    })
+  } catch (error) {
+    if (isProjectionTargetUniqueViolation(error)) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_PROJECTION_AUTHORITY_CONFLICT',
+        'Another connected store owns this ClawPilot inventory projection target',
+        409,
+      )
+    }
+    throw error
+  }
+}
+
+function warehouseMappingCommandResult(
+  value: unknown,
+): ShopifyInventoryWarehouseMappingCommandResult {
+  const mappingResult = mappingCommandResult(value)
+  const result = value && typeof value === 'object'
+    ? value as Record<string, unknown>
+    : {}
+  const warehouse = result.warehouse && typeof result.warehouse === 'object'
+    ? result.warehouse as Record<string, unknown>
+    : {}
+  return {
+    ...mappingResult,
+    warehouse: {
+      globalId: String(warehouse.globalId || ''),
+      code: String(warehouse.code || ''),
+      name: String(warehouse.name || ''),
+      facilityType: String(warehouse.facilityType || ''),
+      timezone: String(warehouse.timezone || ''),
+      inventoryLocationGlobalId: String(
+        warehouse.inventoryLocationGlobalId || '',
+      ),
+      inventoryLocationCode: String(
+        warehouse.inventoryLocationCode || '',
+      ),
+    },
+  }
+}
+
+export async function createShopifyInventoryWarehouseAndMappingInPostgres(
+  input: {
+    runtime: CommerceRuntimeCredentialRecord
+    providerLocation: ShopifyInventoryLocation
+    warehouse: {
+      code: string
+      name: string
+      facilityType: string
+      timezone: string
+    }
+    idempotencyKey: string
+    actorEmail: string
+  },
+): Promise<ShopifyInventoryWarehouseMappingCommandResult> {
+  if (
+    input.providerLocation.isFulfillmentService
+    || !input.providerLocation.isActive
+    || !input.providerLocation.shipsInventory
+    || !input.providerLocation.fulfillsOnlineOrders
+  ) {
+    persistenceError(
+      input.providerLocation.isFulfillmentService
+        ? 'SHOPIFY_INVENTORY_FULFILLMENT_SERVICE_LOCATION_FORBIDDEN'
+        : 'SHOPIFY_INVENTORY_LOCATION_INELIGIBLE',
+      input.providerLocation.isFulfillmentService
+        ? 'Inventory owned by another Shopify fulfillment service cannot be mapped as a ClawPilot warehouse'
+        : 'Choose an active Shopify location that ships inventory and fulfills online orders',
+      409,
+    )
+  }
+  const code = input.warehouse.code.trim().toUpperCase()
+  const name = input.warehouse.name.trim()
+  const facilityType = input.warehouse.facilityType.trim()
+  const timezone = input.warehouse.timezone.trim()
+  if (!/^[A-Z0-9][A-Z0-9_-]{0,31}$/.test(code)) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_WAREHOUSE_CODE_INVALID',
+      'Warehouse code may use letters, numbers, hyphens, and underscores',
+      400,
+    )
+  }
+  if (!name || name.length > 160 || /[\u0000-\u001f\u007f]/.test(name)) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_WAREHOUSE_NAME_INVALID',
+      'Warehouse name is invalid',
+      400,
+    )
+  }
+  if (!WAREHOUSE_FACILITY_TYPES.has(facilityType)) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_WAREHOUSE_FACILITY_INVALID',
+      'Warehouse facility type is invalid',
+      400,
+    )
+  }
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format()
+  } catch {
+    persistenceError(
+      'SHOPIFY_INVENTORY_WAREHOUSE_TIMEZONE_INVALID',
+      'Warehouse timezone is invalid',
+      400,
+    )
+  }
+  const providerAddress = input.providerLocation.address
+  const address = {
+    name,
+    line1: providerAddress.line1.trim(),
+    ...(providerAddress.line2.trim()
+      ? { line2: providerAddress.line2.trim() }
+      : {}),
+    city: providerAddress.city.trim(),
+    region: (providerAddress.regionCode || providerAddress.region).trim(),
+    postalCode: providerAddress.postalCode.trim(),
+    country: (
+      providerAddress.countryCode || providerAddress.country
+    ).trim().toUpperCase(),
+  }
+  if (
+    !address.line1
+    || !address.city
+    || !address.region
+    || !address.postalCode
+    || !/^[A-Z]{2}$/.test(address.country)
+  ) {
+    persistenceError(
+      'SHOPIFY_INVENTORY_LOCATION_ADDRESS_INCOMPLETE',
+      'Complete the Shopify location shipping address before creating a ClawPilot warehouse from it',
+      409,
+    )
+  }
+  const commandType = 'shopify_inventory_warehouse_create_and_map'
+  const requestHash = createHash('sha256').update(JSON.stringify({
+    version: 1,
+    command: commandType,
+    accountGlobalId: input.runtime.globalId,
+    credentialVersion: input.runtime.credentialVersion,
+    externalLocationId: input.providerLocation.id,
+    warehouse: { code, name, facilityType, timezone },
+    inventoryLocationCode: 'RESERVE-01',
+    providerWrites: 0,
+  })).digest('hex')
+  const providerSnapshot = JSON.stringify(input.providerLocation)
+  const providerSnapshotHash = createHash('sha256')
+    .update(providerSnapshot)
+    .digest('hex')
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      [
+        SHOPIFY_LOCATION_ROUTING_LOCK,
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+      ].join(':'),
+    )
+    const prior = await client.query<{
+      request_hash: string
+      status: string
+      result_payload: unknown
+    }>(
+      `SELECT request_hash, status, result_payload
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = $2
+         AND idempotency_key = $3
+       FOR UPDATE`,
+      [input.runtime.organizationId, commandType, input.idempotencyKey],
+    )
+    if (prior.rows[0]) {
+      if (prior.rows[0].request_hash !== requestHash) {
+        persistenceError(
+          'SHOPIFY_INVENTORY_WAREHOUSE_IDEMPOTENCY_CONFLICT',
+          'This idempotency key was already used for another Shopify warehouse creation',
+        )
+      }
+      if (
+        prior.rows[0].status === 'succeeded'
+        && prior.rows[0].result_payload
+      ) {
+        const replay = warehouseMappingCommandResult(
+          prior.rows[0].result_payload,
+        )
+        return { ...replay, replayed: true }
+      }
+      persistenceError(
+        'SHOPIFY_INVENTORY_WAREHOUSE_CREATE_IN_PROGRESS',
+        'This Shopify warehouse creation is already in progress',
+      )
+    }
+    const receipt = await client.query<{ id: string }>(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id
+       ) VALUES ($1::uuid, $2, $3, $4, $5, 'processing', gen_random_uuid())
+       RETURNING id::text`,
+      [
+        input.runtime.organizationId,
+        commandType,
+        input.idempotencyKey,
+        requestHash,
+        input.actorEmail,
+      ],
+    )
+    const authority = await client.query<{
+      credential_version: number
+      verification_status: string
+      account_status: string
+      pipeline_id: string
+    }>(
+      `SELECT credential.credential_version,
+              credential.verification_status,
+              account.status AS account_status,
+              activation.data_pipeline_id::text AS pipeline_id
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version =
+            account.commerce_credential_generation
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = account.organization_id
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+       LIMIT 1
+       FOR UPDATE OF account, credential`,
+      [input.runtime.organizationId, input.runtime.integrationAccountId],
+    )
+    const currentAuthority = authority.rows[0]
+    if (
+      !currentAuthority
+      || currentAuthority.credential_version !== input.runtime.credentialVersion
+      || currentAuthority.verification_status !== 'verified'
+      || currentAuthority.account_status !== 'active'
+    ) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_CONNECTION_STALE',
+        'Shopify changed while the warehouse was being created',
+      )
+    }
+    const existingMapping = await client.query(
+      `SELECT id
+       FROM operations_commerce_inventory_location_mappings
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_location_id = $3
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.providerLocation.id,
+      ],
+    )
+    if (existingMapping.rowCount) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_LOCATION_MAPPING_CONFLICT',
+        'This Shopify location is already mapped to a ClawPilot warehouse',
+      )
+    }
+    let warehouse: { id: string; global_id: string }
+    try {
+      const created = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_warehouses (
+           organization_id, code, name, facility_type, timezone, address,
+           status, cutoff_time, carrier_cutoffs, operating_days,
+           opens_at, closes_at, standard_processing_minutes,
+           daily_order_capacity, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2, $3, $4, $5, $6::jsonb, 'active', NULL,
+           '{}'::jsonb, ARRAY[1,2,3,4,5]::smallint[], '08:00'::time,
+           '17:00'::time, 120, NULL, $7, $7
+         )
+         RETURNING id::text, global_id`,
+        [
+          input.runtime.organizationId,
+          code,
+          name,
+          facilityType,
+          timezone,
+          JSON.stringify(address),
+          input.actorEmail,
+        ],
+      )
+      warehouse = created.rows[0]
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        persistenceError(
+          'SHOPIFY_INVENTORY_WAREHOUSE_CODE_EXISTS',
+          'A ClawPilot warehouse already uses this code',
+        )
+      }
+      throw error
+    }
+    const locationIdsByCode = new Map<string, string>()
+    const locationGlobalIdsByCode = new Map<string, string>()
+    for (const starter of SHOPIFY_WAREHOUSE_STARTER_LOCATIONS) {
+      const created = await client.query<{
+        id: string
+        global_id: string
+      }>(
+        `INSERT INTO operations_locations (
+           organization_id, warehouse_id, code, zone, location_type,
+           topology_level, parent_location_id, pick_sequence, active,
+           storage_function, created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8, true,
+           $9, $10, $10
+         )
+         RETURNING id::text, global_id`,
+        [
+          input.runtime.organizationId,
+          warehouse.id,
+          starter.code,
+          starter.zone,
+          starter.type,
+          starter.level,
+          starter.parent
+            ? locationIdsByCode.get(starter.parent) || null
+            : null,
+          starter.sequence,
+          starter.storage,
+          input.actorEmail,
+        ],
+      )
+      locationIdsByCode.set(starter.code, created.rows[0].id)
+      locationGlobalIdsByCode.set(starter.code, created.rows[0].global_id)
+    }
+    const inventoryLocationId = locationIdsByCode.get('RESERVE-01')
+    const inventoryLocationGlobalId = locationGlobalIdsByCode.get(
+      'RESERVE-01',
+    )
+    if (!inventoryLocationId || !inventoryLocationGlobalId) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_WAREHOUSE_TOPOLOGY_INCOMPLETE',
+        'The warehouse starter inventory location was not created',
+        500,
+      )
+    }
+    const pool = await client.query<{
+      id: string
+      pipeline_id: string
+    }>(
+      `INSERT INTO operations_inventory_pools (
+         organization_id, pipeline_id, owner_customer_id, name,
+         pool_type, allocation_policy, active, created_by
+       ) VALUES (
+         $1::uuid, $2::uuid, NULL, $3, 'shared', 'fifo', true, $4
+       )
+       ON CONFLICT (organization_id, name) DO UPDATE
+       SET active = true, updated_at = now()
+       RETURNING id::text, pipeline_id::text`,
+      [
+        input.runtime.organizationId,
+        currentAuthority.pipeline_id,
+        INVENTORY_POOL_NAME,
+        input.actorEmail,
+      ],
+    )
+    if (pool.rows[0].pipeline_id !== currentAuthority.pipeline_id) {
+      persistenceError(
+        'SHOPIFY_INVENTORY_POOL_PIPELINE_CONFLICT',
+        'The Shopify inventory pool is bound to a different product catalog',
+      )
+    }
+    const mapping = await client.query<{
+      global_id: string
+      row_version: string
+    }>(
+      `INSERT INTO operations_commerce_inventory_location_mappings (
+         organization_id, integration_account_id,
+         external_location_id, external_location_name,
+         external_location_address, warehouse_id, location_id,
+         inventory_pool_id, mapping_method, ownership_classification,
+         provider_snapshot_json, provider_snapshot_hash,
+         provider_observed_at, inventory_import_enabled, active,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::uuid, $7::uuid,
+         $8::uuid, 'manual', 'merchant_managed', $9::jsonb, $10, now(),
+         true, true, $11, $11
+       )
+       RETURNING global_id, row_version::text`,
+      [
+        input.runtime.organizationId,
+        input.runtime.integrationAccountId,
+        input.providerLocation.id,
+        input.providerLocation.name,
+        JSON.stringify(input.providerLocation.address),
+        warehouse.id,
+        inventoryLocationId,
+        pool.rows[0].id,
+        providerSnapshot,
+        providerSnapshotHash,
+        input.actorEmail,
+      ],
+    )
+    const result: ShopifyInventoryWarehouseMappingCommandResult = {
+      warehouse: {
+        globalId: warehouse.global_id,
+        code,
+        name,
+        facilityType,
+        timezone,
+        inventoryLocationGlobalId,
+        inventoryLocationCode: 'RESERVE-01',
+      },
+      mapping: {
+        globalId: mapping.rows[0].global_id,
+        externalLocationId: input.providerLocation.id,
+        externalLocationName: input.providerLocation.name,
+        ownershipClassification: 'merchant_managed',
+        inventoryImportEnabled: true,
+        rowVersion: nonNegativeInteger(mapping.rows[0].row_version),
+        warehouseGlobalId: warehouse.global_id,
+        locationGlobalId: inventoryLocationGlobalId,
+      },
+      providerWrites: 0,
+      replayed: false,
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'operations.warehouse.created',
+      aggregateType: 'operations.warehouse',
+      aggregateId: warehouse.global_id,
+      subject: name,
+      organizationId: input.runtime.organizationId,
+      eventKey: `operations:warehouse:${warehouse.global_id}:created`,
+      payload: {
+        code,
+        facilityType,
+        timezone,
+        starterLocationCount: SHOPIFY_WAREHOUSE_STARTER_LOCATIONS.length,
+        source: 'shopify_inventory_location',
+        providerWrites: 0,
+      },
+    }, client)
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      eventType: 'commerce.inventory.location_mapped',
+      aggregateType: 'operations.commerce_inventory_location_mapping',
+      aggregateId: mapping.rows[0].global_id,
+      organizationId: input.runtime.organizationId,
+      eventKey:
+        `commerce-inventory-warehouse-create-map:${input.idempotencyKey}`,
+      payload: {
+        integrationAccountGlobalId: input.runtime.globalId,
+        externalLocationIdHash: createHash('sha256')
+          .update(input.providerLocation.id)
+          .digest('hex'),
+        warehouseGlobalId: warehouse.global_id,
+        locationGlobalId: inventoryLocationGlobalId,
+        rowVersion: result.mapping.rowVersion,
+        ownershipClassification: 'merchant_managed',
+        providerWrites: 0,
+      },
+    }, client)
+    await client.query(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_global_id = $2,
+           result_payload = $3::jsonb, completed_at = now(),
+           updated_at = now()
+       WHERE id = $1::uuid`,
+      [
+        receipt.rows[0].id,
+        mapping.rows[0].global_id,
+        JSON.stringify(result),
+      ],
+    )
+    return result
+  })
+}
+
 export async function readShopifyInventoryStateFromPostgres(input: {
   organizationId: string
   accountGlobalId: string
+  mappingGlobalId?: string | null
 }) {
   const account = await query<{
     id: string
@@ -2411,6 +3959,10 @@ export async function readShopifyInventoryStateFromPostgres(input: {
             run.positions_zeroed, run.provider_writes,
             run.order_quantity_adjustment::text, run.snapshot_hash
      FROM operations_commerce_inventory_sync_runs run
+     JOIN operations_commerce_inventory_location_mappings mapping
+       ON mapping.organization_id = run.organization_id
+      AND mapping.integration_account_id = run.integration_account_id
+      AND mapping.id = run.location_mapping_id
      JOIN operations_warehouses warehouse
        ON warehouse.organization_id = run.organization_id
       AND warehouse.id = run.warehouse_id
@@ -2428,9 +3980,14 @@ export async function readShopifyInventoryStateFromPostgres(input: {
       AND content.id = capture.snapshot_content_id
      WHERE run.organization_id = $1::uuid
        AND run.integration_account_id = $2::uuid
+       AND ($3::text IS NULL OR mapping.global_id = $3)
      ORDER BY run.completed_at DESC, run.id DESC
      LIMIT 1`,
-    [input.organizationId, account.rows[0].id],
+    [
+      input.organizationId,
+      account.rows[0].id,
+      input.mappingGlobalId || null,
+    ],
   )
   const run = latest.rows[0]
   if (!run) {

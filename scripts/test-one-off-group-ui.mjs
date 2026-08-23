@@ -16,8 +16,8 @@ assert.match(constants, /ONE_OFF_MAX_SYNCHRONOUS_PACKAGES = 40/)
 assert.match(dialog, /ONE_OFF_MAX_SYNCHRONOUS_PACKAGES/)
 assert.match(dialog, /oneOffShipmentConstants/)
 assert.doesNotMatch(dialog, /const MAX_PACKAGES\s*=\s*\d+/)
-assert.match(dialog, /mode\.mode === 'live' && !canActivate/)
-assert.match(dialog, /disabled=\{!mode\.enabled \|\| \(mode\.mode === 'live' && !canActivate\)\}/)
+assert.doesNotMatch(dialog, /canActivate|Operations activation permission/)
+assert.match(dialog, /disabled=\{!mode\.enabled\}/)
 assert.match(dialog, /onChange=\{\(event\) => \{\s*setExecutionMode\(event\.target\.value as 'test' \| 'live'\)\s*resetQuote\(\)/)
 
 for (const action of ['refresh-packed-rates', 'purchase-group', 'void-group']) {
@@ -38,6 +38,8 @@ const voidRoute = route.slice(
   route.indexOf("throw new OneOffShipmentPersistenceError(\n      'OPERATIONS_ONE_OFF_ACTION_INVALID'"),
 )
 assert.doesNotMatch(voidRoute, /canActivate|LIVE_VOID_PERMISSION_REQUIRED/)
+assert.match(voidRoute, /executionMode === 'live' && !capabilities\.canPurchaseLivePostage/)
+assert.match(voidRoute, /canPurchaseLivePostage: capabilities\.canPurchaseLivePostage/)
 
 assert.match(panel, /one-off-group-shipping-execution/)
 assert.match(panel, /complete label set/i)
@@ -72,8 +74,16 @@ assert.match(persistence, /create_attempt\.provider_charge_minor::text[\s\S]*AS 
 assert.match(persistence, /providerChargeMinor: input\.attempt\.create_provider_charge_minor/)
 assert.match(persistence, /if \(prepared\.replayed\) \{\s*return replayVoidedGroup/)
 
-assert.match(carrierSettings, /one provider command/)
-assert.match(carrierSettings, /complete group is voided/i)
-assert.match(carrierSettings, /individual package purchase and void controls are intentionally unavailable/i)
+assert.match(panel, /one\s+whole-shipment command/)
+assert.match(panel, /Purchase and cancellation are never offered per package/)
+assert.match(section, /one whole-shipment cancellation/)
+assert.match(section, /package labels must be retired together/)
+assert.match(carrierSettings, /Production capabilities/)
+assert.match(carrierSettings, /Rate-only ready/)
+assert.match(carrierSettings, /a quote cannot create a label or shipment/i)
+assert.doesNotMatch(
+  carrierSettings,
+  /individual package purchase and void controls are intentionally unavailable/i,
+)
 
 console.log('one-off multi-package UI contracts passed')

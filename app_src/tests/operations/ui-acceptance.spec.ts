@@ -1,11 +1,15 @@
 import { expect, test } from '@playwright/test'
 import type { Locator, Page } from '@playwright/test'
-import type { OperationsExceptionStatus } from '@/lib/operations/types'
+import type {
+  OperationsExceptionStatus,
+  OperationsImportedOrderWorkingCopy,
+} from '@/lib/operations/types'
 import type {
   OperationsRegressionPackRateStage,
   OperationsRegressionRun,
   OperationsRegressionWalkthrough,
 } from '@/lib/operations/regressionReplay'
+import { SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 
 test.use({ hasTouch: true })
 
@@ -85,6 +89,37 @@ const selectedOrder = {
     region: 'NY',
     postalCode: '10001',
     country: 'US',
+  },
+  shipmentShipTo: {
+    orderGlobalId: 'gor1234567',
+    orderRowVersion: 0,
+    rowVersion: 0,
+    value: {
+      name: 'Northstar Receiving',
+      line1: '200 Customer Lane',
+      line2: null,
+      city: 'New York',
+      region: 'NY',
+      postalCode: '10001',
+      country: 'US',
+    },
+    sourceValue: {
+      name: 'Northstar Receiving',
+      line1: '200 Customer Lane',
+      line2: null,
+      city: 'New York',
+      region: 'NY',
+      postalCode: '10001',
+      country: 'US',
+    },
+    readiness: 'carrier_ready',
+    issues: [],
+    provenance: 'source',
+    sourceVersionChanged: false,
+    rerateRequired: false,
+    editable: false,
+    editBlockedReason: 'Address is sealed after planning.',
+    providerWrites: 0,
   },
   lines: [{
     globalId: 'gol1234567',
@@ -222,6 +257,21 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
       reason: 'Acceptance validation',
       updatedAt: '2026-07-22T18:00:00.000Z',
     },
+    storeSync: [{
+      accountGlobalId: 'gia9286799',
+      provider: 'shopify',
+      environment: 'sandbox',
+      displayName: 'Pro Bakery Bites',
+      accountStatus: 'active',
+      desiredState: 'running',
+      effectiveState: 'running',
+      effectiveReason: 'STORE_SYNC_EXPLICIT_RUNNING',
+      effectiveReasonLabel: 'Running by an explicit Store sync choice.',
+      explicitChoice: true,
+      revision: 2,
+      reason: 'Acceptance validation',
+      updatedAt: '2026-07-22T18:00:00.000Z',
+    }],
     summary: {
       openOrders: 1,
       exceptions: exceptionStatus === 'open' || exceptionStatus === 'acknowledged' ? 1 : 0,
@@ -232,6 +282,7 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
       unbilledMinor: '1335',
     },
     orders: [currentOrder],
+    importedOrders: [],
     selectedOrder: currentOrder,
     exceptions: [currentException],
     warehouses: [{ id: 'warehouse-id', globalId: 'gwh1234567', name: 'Primary Warehouse' }],
@@ -317,7 +368,499 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+const workbenchCandidateGlobalId = 'gcoc7654321'
+const workbenchLatestCandidateGlobalId = 'gcoc7654322'
+const workbenchCanonicalOrderGlobalId = 'gor8765432'
+const workbenchCustomerGlobalId = 'ga1234567'
+const workbenchProductGlobalId = 'gp1234567'
+const workbenchPackageProfileGlobalId = 'gpp1234567'
+const workbenchLineGlobalId = 'gcol7654321'
+
+const workbenchPartialShipTo = {
+  name: 'Northstar Receiving',
+  line1: '200 Customer Lane',
+  line2: null,
+  city: 'New York',
+  region: null,
+  postalCode: null,
+  country: 'US',
+}
+
+const workbenchCompleteShipTo = {
+  ...workbenchPartialShipTo,
+  region: 'NY',
+  postalCode: '10001',
+}
+
+function importedWorkbenchOrder(
+  details: boolean,
+): OperationsImportedOrderWorkingCopy {
+  return {
+    kind: 'imported_working_copy',
+    globalId: workbenchCandidateGlobalId,
+    candidateGlobalId: workbenchCandidateGlobalId,
+    canonicalOrderGlobalId: null,
+    integrationAccountGlobalId: 'gia9286799',
+    integrationAccountName: 'Pro Bakery Bites',
+    provider: 'shopify',
+    externalOrderId: 'gid://shopify/Order/7710',
+    orderNumber: '#7710',
+    status: 'imported',
+    needsInfo: true,
+    blockerCodes: [
+      'customer_resolution_required',
+      'delivery_decision_required',
+      'product_mapping_required',
+      'line_price_required',
+      'packaging_required',
+      'ship_to_region_required',
+      'ship_to_postal_code_required',
+    ],
+    customerName: 'Northstar Receiving',
+    lineCount: 1,
+    sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
+    candidateRowVersion: 4,
+    rowVersion: 0,
+    providerVersionChanged: false,
+    resolutionDetailsLoaded: details,
+    customer: {
+      status: 'unresolved',
+      resolvedCustomerGlobalId: null,
+      selectedCustomerGlobalId: null,
+      options: details ? [{
+        globalId: workbenchCustomerGlobalId,
+        name: 'Northstar Outfitters',
+        email: 'buyer@northstar.example',
+      }] : [],
+    },
+    delivery: {
+      status: 'not_supplied',
+      providerRequestedDeliveryAt: null,
+      selectedDeliveryAt: null,
+      draftDeliveryAt: null,
+    },
+    lines: details ? [{
+      globalId: workbenchLineGlobalId,
+      title: 'Trail Pack retail unit',
+      sku: 'TRAIL-PROVIDER-001',
+      quantity: 2,
+      requiresShipping: true,
+      mappingStatus: 'unresolved',
+      priceStatus: 'unresolved',
+      packageStatus: 'unresolved',
+      productGlobalId: null,
+      unitPriceMinor: null,
+      currency: 'USD',
+      packageProfileGlobalId: null,
+      blockerCodes: [
+        'product_mapping_required',
+        'line_price_required',
+        'packaging_required',
+      ],
+    }] : [],
+    productOptions: details ? [{
+      globalId: workbenchProductGlobalId,
+      name: 'Trail Pack',
+      sku: 'TRAIL-001',
+      packageProfiles: [{
+        globalId: workbenchPackageProfileGlobalId,
+        name: 'Trail Pack measured single',
+      }],
+    }] : [],
+    shipTo: {
+      value: workbenchPartialShipTo,
+      readiness: 'incomplete',
+      provenance: 'provider',
+      syncStatus: 'provider_snapshot',
+      issues: [
+        { field: 'region', code: 'required' },
+        { field: 'postalCode', code: 'required' },
+      ],
+    },
+    providerWrites: 0,
+  }
+}
+
+function promotedWorkbenchOrder() {
+  return {
+    ...selectedOrder,
+    id: 'canonical-workbench-order-id',
+    globalId: workbenchCanonicalOrderGlobalId,
+    orderNumber: '#7710',
+    externalOrderId: 'gid://shopify/Order/7710',
+    customerName: 'Northstar Outfitters',
+    customerGlobalId: workbenchCustomerGlobalId,
+    sourceProvider: 'shopify',
+    status: 'imported',
+    rowVersion: 0,
+    planStatus: null,
+    waveStatus: null,
+    pickTaskCount: 0,
+    readyPickTaskCount: 0,
+    pickedPickTaskCount: 0,
+    packageCount: 0,
+    plannedPackageCount: 0,
+    packedPackageCount: 0,
+    availableActions: [],
+    warehouseName: null,
+    promisedDeliveryAt: '2026-08-30T15:30:00.000Z',
+    lineCount: 1,
+    expectedCostMinor: '0',
+    expectedRevenueMinor: '2500',
+    expectedMarginMinor: '2500',
+    shipTo: workbenchCompleteShipTo,
+    shipmentShipTo: {
+      ...selectedOrder.shipmentShipTo,
+      orderGlobalId: workbenchCanonicalOrderGlobalId,
+      value: workbenchCompleteShipTo,
+      sourceValue: workbenchCompleteShipTo,
+      readiness: 'carrier_ready',
+      issues: [],
+      editable: true,
+      editBlockedReason: null,
+      providerWrites: 0,
+    },
+    lines: [{
+      globalId: 'gol8765432',
+      productGlobalId: workbenchProductGlobalId,
+      productName: 'Trail Pack',
+      channelSku: 'TRAIL-PROVIDER-001',
+      quantity: 2,
+      reservedQuantity: 0,
+      pickStatus: null,
+    }],
+    packages: [],
+    rates: [],
+    billableEvents: [],
+    events: [],
+    planningPreparation: {
+      accountGlobalId: 'gia9286799',
+      candidateGlobalId: workbenchCandidateGlobalId,
+      candidateRowVersion: 4,
+    },
+    sandboxCommerceE2eAuthorization: null,
+    fulfillmentNotificationPolicy: {
+      mode: 'clawpilot_explicit',
+      notifyCustomerDefault: false,
+      revision: 1,
+    },
+  }
+}
+
+type ImportedWorkbenchRouteRequest = {
+  body: Record<string, unknown>
+  idempotencyKey: string
+}
+
+async function installImportedWorkbenchRoutes(
+  page: Page,
+  options: { refreshConflict?: boolean } = {},
+) {
+  const capture = {
+    patchRequests: [] as ImportedWorkbenchRouteRequest[],
+    patchResults: [] as Array<Record<string, unknown>>,
+    acceptRequests: [] as ImportedWorkbenchRouteRequest[],
+    acceptResults: [] as Array<Record<string, unknown>>,
+    refreshRequests: [] as ImportedWorkbenchRouteRequest[],
+    providerMutationRequests: [] as string[],
+    canonicalWorkspaceReads: 0,
+  }
+  let promoted = false
+  let detailedOrder = importedWorkbenchOrder(true)
+
+  if (options.refreshConflict) {
+    detailedOrder = {
+      ...detailedOrder,
+      providerVersionChanged: true,
+      shipTo: {
+        value: workbenchCompleteShipTo,
+        readiness: 'carrier_ready',
+        provenance: 'local',
+        syncStatus: 'local_only',
+        issues: [],
+      },
+    }
+  }
+
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+    if (
+      url.pathname.startsWith('/api/integrations/commerce/')
+      && !['GET', 'HEAD'].includes(request.method())
+    ) {
+      capture.providerMutationRequests.push(
+        `${request.method()} ${url.pathname}`,
+      )
+    }
+  })
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/training',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        training: {
+          eligible: false,
+          eligibilityCode: 'canonical_order_promoted',
+          run: null,
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-revisions',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: workbenchCanonicalOrderGlobalId,
+          orderRowVersion: 0,
+          orderStatus: 'imported',
+          state: null,
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/shopify-order-management',
+    async (route) => route.fulfill({
+      status: 503,
+      json: {
+        ok: false,
+        code: 'NOT_REQUIRED_FOR_WORKBENCH_ACCEPTANCE',
+        error: 'Provider editor is outside this local handoff test',
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      const request = route.request()
+      if (request.method() === 'GET') {
+        expect(new URL(request.url()).searchParams.get('candidate'))
+          .toBe(detailedOrder.candidateGlobalId)
+        return route.fulfill({ json: { ok: true, orders: [detailedOrder] } })
+      }
+      const captured = {
+        body: request.postDataJSON() as Record<string, unknown>,
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+      }
+      if (request.method() === 'PATCH') {
+        capture.patchRequests.push(captured)
+        const draft = captured.body as {
+          shipTo: typeof workbenchCompleteShipTo
+          resolution: {
+            customerGlobalId: string | null
+            requestedDeliveryAt: string | null
+            lines: Array<{
+              lineGlobalId: string
+              productGlobalId: string
+              unitPriceMinor: number | null
+              currency: string
+              packageProfileGlobalId: string | null
+            }>
+          }
+        }
+        const lineDraft = draft.resolution.lines[0]
+        detailedOrder = {
+          ...detailedOrder,
+          rowVersion: 1,
+          customer: {
+            ...detailedOrder.customer,
+            selectedCustomerGlobalId: draft.resolution.customerGlobalId,
+          },
+          delivery: {
+            ...detailedOrder.delivery,
+            draftDeliveryAt: draft.resolution.requestedDeliveryAt,
+          },
+          lines: detailedOrder.lines.map((line) => (
+            line.globalId === lineDraft?.lineGlobalId
+              ? {
+                  ...line,
+                  productGlobalId: lineDraft.productGlobalId,
+                  unitPriceMinor: lineDraft.unitPriceMinor,
+                  currency: lineDraft.currency,
+                  packageProfileGlobalId: lineDraft.packageProfileGlobalId,
+                }
+              : line
+          )),
+          shipTo: {
+            value: draft.shipTo,
+            readiness: 'carrier_ready',
+            provenance: 'local',
+            syncStatus: 'local_only',
+            issues: [],
+          },
+        }
+        const result = {
+          candidateGlobalId: workbenchCandidateGlobalId,
+          canonicalOrderGlobalId: null,
+          rowVersion: 1,
+          readiness: 'carrier_ready',
+          issues: [],
+          changedFields: ['region', 'postalCode'],
+          syncStatus: 'local_only',
+          promotionStatus: 'needs_info',
+          remainingBlockerCodes: detailedOrder.blockerCodes.filter((code) => (
+            !code.startsWith('ship_to_')
+          )),
+          providerVersionChanged: false,
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          replayed: false,
+        }
+        capture.patchResults.push(result)
+        return route.fulfill({
+          json: {
+            ok: true,
+            result,
+            order: detailedOrder,
+          },
+        })
+      }
+      if (
+        request.method() === 'POST'
+        && captured.body.action === 'accept'
+        && !options.refreshConflict
+      ) {
+        capture.acceptRequests.push(captured)
+        promoted = true
+        const result = {
+          candidateGlobalId: workbenchCandidateGlobalId,
+          canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+          rowVersion: 2,
+          readiness: 'carrier_ready',
+          issues: [],
+          changedFields: [],
+          syncStatus: 'local_only',
+          promotionStatus: 'promoted',
+          remainingBlockerCodes: [],
+          providerVersionChanged: false,
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          replayed: false,
+        }
+        capture.acceptResults.push(result)
+        return route.fulfill({
+          json: {
+            ok: true,
+            result,
+            order: null,
+          },
+        })
+      }
+      if (request.method() !== 'POST' || !options.refreshConflict) {
+        throw new Error(`Unexpected order-workbench request: ${request.method()}`)
+      }
+      capture.refreshRequests.push(captured)
+      if (capture.refreshRequests.length === 1) {
+        return route.fulfill({
+          status: 409,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
+            error: 'Choose which changed address values to retain',
+            latestCandidateGlobalId: workbenchLatestCandidateGlobalId,
+            conflicts: [{
+              field: 'line1',
+              localValue: '200 Customer Lane',
+              providerValue: '303 Provider Avenue',
+            }, {
+              field: 'postalCode',
+              localValue: '10001',
+              providerValue: '11201',
+            }],
+            lineConflicts: [],
+          },
+        })
+      }
+      detailedOrder = {
+        ...detailedOrder,
+        globalId: workbenchLatestCandidateGlobalId,
+        candidateGlobalId: workbenchLatestCandidateGlobalId,
+        candidateRowVersion: 5,
+        rowVersion: 1,
+        providerVersionChanged: false,
+        shipTo: {
+          value: {
+            ...workbenchCompleteShipTo,
+            line1: '200 Customer Lane',
+            postalCode: '11201',
+          },
+          readiness: 'carrier_ready',
+          provenance: 'local',
+          syncStatus: 'local_only',
+          issues: [],
+        },
+      }
+      return route.fulfill({
+        json: {
+          ok: true,
+          refreshResult: {
+            previousCandidateGlobalId: workbenchCandidateGlobalId,
+            candidateGlobalId: workbenchLatestCandidateGlobalId,
+            rowVersion: 1,
+            status: 'rebased',
+            providerChangedFields: ['line1', 'postalCode'],
+            preservedLocalFields: ['line1'],
+            preservedLineDrafts: [],
+            providerWrites: 0,
+            providerWriteIntentCreated: false,
+            replayed: false,
+          },
+          order: detailedOrder,
+        },
+      })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    const requestedOrder = new URL(route.request().url()).searchParams
+      .get('order')
+    if (requestedOrder === workbenchCanonicalOrderGlobalId) {
+      capture.canonicalWorkspaceReads += 1
+    }
+    const canonical = promoted ? promotedWorkbenchOrder() : null
+    return route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...workspace(),
+          activation: { ...workspace().activation, state: 'read_only' },
+          summary: {
+            ...workspace().summary,
+            openOrders: 1,
+            exceptions: 0,
+          },
+          importedOrders: promoted ? [] : [{
+            ...detailedOrder,
+            resolutionDetailsLoaded: false,
+            customer: { ...detailedOrder.customer, options: [] },
+            lines: [],
+            productOptions: [],
+          }],
+          orders: canonical ? [canonical] : [],
+          selectedOrder: canonical,
+          exceptions: [],
+          shipping: { sandboxCarrierAccounts: [] },
+        },
+      },
+    })
+  })
+
+  return capture
+}
+
 async function installImportedOrderPreparationRoutes(page: Page) {
+  const authorizationIssuedAt = Date.now()
+  const canonicalAuthorization = {
+    authorizationGlobalId: 'gsea7654321',
+    authorizedAt: new Date(authorizationIssuedAt).toISOString(),
+    expiresAt: new Date(authorizationIssuedAt + 120 * 60 * 1000).toISOString(),
+    authorityKind: 'shopify_test_store_canonical' as const,
+    fulfillmentConfirmedAt: null,
+  }
   const importedOrder = {
     ...selectedOrder,
     globalId: 'gor7654321',
@@ -342,6 +885,12 @@ async function installImportedOrderPreparationRoutes(page: Page) {
     availableActions: [],
     sandboxCommerceE2eAuthorization: null,
     fulfillmentPreparation: null,
+    shipmentShipTo: {
+      ...selectedOrder.shipmentShipTo,
+      orderGlobalId: 'gor7654321',
+      editable: true,
+      editBlockedReason: null,
+    },
     fulfillmentNotificationPolicy: {
       mode: 'clawpilot_explicit',
       notifyCustomerDefault: false,
@@ -464,6 +1013,69 @@ async function installImportedOrderPreparationRoutes(page: Page) {
     }],
   }
   let planned = false
+  let authorized = false
+
+  await page.route((url) => url.pathname === '/api/operations/training', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        training: {
+          eligible: true,
+          eligibilityCode: null,
+          run: null,
+        },
+      },
+    })
+  })
+  await page.route((url) => url.pathname === '/api/operations/order-revisions', async (route) => {
+    await route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: 'gor7654321',
+          orderRowVersion: planned ? 1 : 0,
+          orderStatus: planned ? 'planned' : 'imported',
+          state: null,
+        },
+      },
+    })
+  })
+  await page.route(
+    (url) => url.pathname === '/api/integrations/commerce/intake/planning-assignment',
+    async (route) => {
+      expect(route.request().postDataJSON()).toMatchObject({
+        action: 'inspect',
+        accountGlobalId: 'gia9286799',
+        candidateGlobalId: 'gcoc35vrs9qjtmee',
+        expectedCandidateRowVersion: 10,
+      })
+      await route.fulfill({
+        json: {
+          ok: true,
+          assignment: {
+            version: 'shopify-order-planning-assignment-v1',
+            status: 'ready',
+            accountGlobalId: 'gia9286799',
+            candidateGlobalId: 'gcoc35vrs9qjtmee',
+            candidateRowVersion: 10,
+            assignments: [],
+            selectedWarehouse: {
+              globalId: 'gwh5366613',
+              name: 'Ag-Alchemy',
+              mappingGlobalId: 'gwlm7654321',
+              mappingRowVersion: 1,
+              shopifyLocationId: 'gid://shopify/Location/123456789',
+              shopifyLocationName: 'Ag-Alchemy',
+            },
+            providerReads: 1,
+            providerWrites: 0,
+          },
+        },
+      })
+    },
+  )
 
   await page.route((url) => url.pathname === '/api/operations/packaging-materials', async (route) => {
     await route.fulfill({
@@ -486,7 +1098,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             innerDimensionsMm: { length: 280, width: 220, height: 190 },
             ratedOuterDimensionsMm: { length: 292, width: 229, height: 203 },
             ratedOuterDimensionEvidenceType: 'measured',
-            ratedOuterDimensionEvidenceReference: 'warehouse measurement',
+            ratedOuterDimensionEvidenceReference: null,
             ratedOuterDimensionConfirmedAt: '2026-08-01T12:00:00.000Z',
             ratedOuterDimensionConfirmedBy: 'manager@example.com',
             dimensionBasis: 'inner',
@@ -557,6 +1169,37 @@ async function installImportedOrderPreparationRoutes(page: Page) {
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
     if (route.request().method() === 'POST') {
       const request = route.request().postDataJSON()
+      if (request.action === 'authorize-shopify-test-store-canonical-e2e') {
+        expect(route.request().headers()['idempotency-key'])
+          .toMatch(/^shopify-test-store-authorize:/)
+        expect(request).toEqual({
+          action: 'authorize-shopify-test-store-canonical-e2e',
+          orderGlobalId: 'gor7654321',
+          expectedRowVersion: 0,
+          confirmationStatement:
+            SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
+          reason:
+            'Authorized end-to-end validation for Shopify test order #6600',
+          lifetimeMinutes: 120,
+        })
+        authorized = true
+        return route.fulfill({
+          status: 201,
+          json: {
+            ok: true,
+            result: {
+              ...canonicalAuthorization,
+              orderGlobalId: 'gor7654321',
+              externalOrderId: 'gid://shopify/Order/6600',
+              state: 'active',
+              reason: request.reason,
+              authorizedBy: 'manager@example.com',
+              consumedAt: null,
+              consumedBy: null,
+            },
+          },
+        })
+      }
       expect(request).toMatchObject({
         action: 'plan-order',
         orderGlobalId: 'gor7654321',
@@ -600,13 +1243,25 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             blockedReason: null,
           }],
           planningPreparation: null,
+          sandboxCommerceE2eAuthorization: authorized
+            ? canonicalAuthorization
+            : null,
         }
-      : importedOrder
+      : {
+          ...importedOrder,
+          sandboxCommerceE2eAuthorization: authorized
+            ? canonicalAuthorization
+            : null,
+        }
     return route.fulfill({
       json: {
         ok: true,
         operations: {
           ...workspace(),
+          activation: {
+            ...workspace().activation,
+            state: 'read_only',
+          },
           summary: { ...workspace().summary, openOrders: 1 },
           orders: [current],
           selectedOrder: current,
@@ -1000,6 +1655,183 @@ async function installReplayRoutes(page: Page) {
   })
 }
 
+test('incomplete imported order saves locally before explicit acceptance into canonical Orders', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  const importedRow = page.getByTestId(
+    `imported-order-${workbenchCandidateGlobalId}`,
+  )
+  await expect(importedRow).toBeVisible()
+  await expect(importedRow).toContainText('#7710')
+  await expect(importedRow).toContainText('Needs info')
+  await importedRow.click()
+
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect(page.getByText('Ship-to incomplete for rates')).toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByText('Quantity 2')).toBeVisible()
+
+  const customer = page.getByRole('combobox', { name: 'Customer' })
+  await expect(customer).toBeEnabled()
+  await customer.click()
+  await page.getByRole('option', { name: /Northstar Outfitters/ }).click()
+
+  const product = page.getByRole('combobox', { name: 'ClawPilot product' })
+  await product.click()
+  await page.getByRole('option', { name: /Trail Pack · TRAIL-001/ }).click()
+  await page.getByLabel('Unit price (USD)').fill('12.50')
+
+  await expect(page.getByRole('combobox', {
+    name: 'Sellable pack override (optional)',
+  })).toHaveText('Use mapped product pack and cartonization')
+
+  const requestedDelivery = page.getByLabel('Requested delivery')
+  await requestedDelivery.fill('2026-08-30T15:30')
+  const requestedDeliveryAt = await requestedDelivery.evaluate((element) => (
+    new Date((element as HTMLInputElement).value).toISOString()
+  ))
+  await page.getByLabel('State / province').fill('NY')
+  await page.getByLabel('Postal code').fill('10001')
+  await expect(page.getByText('Ready for rates')).toBeVisible()
+
+  const save = page.getByRole('button', { name: 'Save', exact: true })
+  await expect(save).toHaveCount(1)
+  await expect(save).toBeEnabled()
+  await save.click()
+
+  await expect(page.getByText('Order #7710 saved locally')).toBeVisible()
+  await expect(page.getByText('Saved locally', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  expect(capture.canonicalWorkspaceReads).toBe(0)
+
+  const accept = page.getByRole('button', {
+    name: 'Accept & import',
+    exact: true,
+  })
+  await expect(accept).toBeEnabled()
+  await expect(save).toBeDisabled()
+  await accept.click()
+
+  await expect(page.getByText('Order #7710 imported')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Order #7710' }))
+    .toBeVisible()
+  await expect.poll(() => capture.canonicalWorkspaceReads)
+    .toBeGreaterThanOrEqual(1)
+
+  expect(capture.patchRequests).toHaveLength(1)
+  expect(capture.patchRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.patchRequests[0].body).toEqual({
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+    shipTo: workbenchCompleteShipTo,
+    resolution: {
+      customerGlobalId: workbenchCustomerGlobalId,
+      requestedDeliveryAt,
+      lines: [{
+        lineGlobalId: workbenchLineGlobalId,
+        productGlobalId: workbenchProductGlobalId,
+        unitPriceMinor: 1250,
+        currency: 'USD',
+        packageProfileGlobalId: null,
+      }],
+    },
+  })
+  expect(capture.patchResults).toEqual([expect.objectContaining({
+    canonicalOrderGlobalId: null,
+    promotionStatus: 'needs_info',
+    providerWrites: 0,
+    providerWriteIntentCreated: false,
+  })])
+  expect(capture.acceptRequests).toHaveLength(1)
+  expect(capture.acceptRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.acceptRequests[0].body).toEqual({
+    action: 'accept',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 1,
+  })
+  expect(capture.acceptResults).toEqual([expect.objectContaining({
+    canonicalOrderGlobalId: workbenchCanonicalOrderGlobalId,
+    promotionStatus: 'promoted',
+    providerWrites: 0,
+    providerWriteIntentCreated: false,
+  })])
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('imported order provider refresh resolves each address conflict explicitly', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    refreshConflict: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+  const refresh = page.getByRole('button', { name: 'Refresh from Shopify' })
+  await expect(refresh).toBeEnabled()
+  await refresh.click()
+
+  const keepLocalAddress = page.getByRole('button', {
+    name: 'Keep mine: 200 Customer Lane',
+  })
+  const useProviderAddress = page.getByRole('button', {
+    name: 'Use Shopify: 303 Provider Avenue',
+  })
+  const keepLocalPostalCode = page.getByRole('button', {
+    name: 'Keep mine: 10001',
+  })
+  const useProviderPostalCode = page.getByRole('button', {
+    name: 'Use Shopify: 11201',
+  })
+  await expect(keepLocalAddress).toBeVisible()
+  await expect(useProviderAddress).toBeVisible()
+  await expect(keepLocalPostalCode).toBeVisible()
+  await expect(useProviderPostalCode).toBeVisible()
+
+  await keepLocalAddress.click()
+  await useProviderPostalCode.click()
+  await page.getByRole('button', { name: 'Apply choices' }).click()
+
+  await expect(page.getByText(
+    'Order #7710 refreshed; review provider item changes',
+  )).toBeVisible()
+  await expect(page.getByLabel('Address')).toHaveValue('200 Customer Lane')
+  await expect(page.getByLabel('Postal code')).toHaveValue('11201')
+
+  expect(capture.refreshRequests).toHaveLength(2)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+  })
+  expect(capture.refreshRequests[1].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+    latestCandidateGlobalId: workbenchLatestCandidateGlobalId,
+    resolutions: {
+      line1: 'local',
+      postalCode: 'provider',
+    },
+    lineResolutions: {},
+  })
+  for (const request of capture.refreshRequests) {
+    expect(request.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  }
+  expect(capture.refreshRequests[0].idempotencyKey)
+    .not.toBe(capture.refreshRequests[1].idempotencyKey)
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 768 })
   await installOperationsRoutes(page)
@@ -1041,13 +1873,115 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
 })
 
+test('measured outer dimensions save without a redundant evidence note', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOperationsRoutes(page)
+  const requests: Array<Record<string, unknown>> = []
+  const packagingMaterials = {
+    capabilities: { canView: true, canManage: true },
+    warehouses: [{
+      id: 'warehouse-id',
+      globalId: 'gwh5366613',
+      name: 'Ag-Alchemy',
+      status: 'active',
+    }],
+    materials: [],
+    shopifyPackageImport: {
+      providerListApiAvailable: false,
+      importMethod: 'csv',
+      accounts: [],
+    },
+    optimizerReadiness: {
+      historyWindowDays: 365,
+      shippedDemandSampleCount: 0,
+      eligibleShippedDemandSampleCount: 0,
+      missingProductDimensionCount: 0,
+      missingMaterialCostCount: 0,
+      missingWarehouseStockCount: 0,
+      outOfStockAvailabilityCount: 0,
+      eligibleMaterialCount: 0,
+      reorderDueCount: 0,
+    },
+  }
+  await page.route(
+    (url) => url.pathname === '/api/operations/packaging-materials',
+    async (route) => {
+      if (route.request().method() === 'POST') {
+        requests.push(route.request().postDataJSON())
+        return route.fulfill({
+          json: {
+            ok: true,
+            result: {
+              globalId: 'gmat0309001',
+              rowVersion: 0,
+              status: 'draft',
+            },
+          },
+        })
+      }
+      return route.fulfill({
+        json: { ok: true, packagingMaterials },
+      })
+    },
+  )
+  await gotoApp(page, '/#operations')
+  await page.getByRole('tab', { name: 'Packaging materials' }).click()
+  await page.getByRole('button', { name: 'Add material' }).click()
+
+  await page.getByLabel('Code').fill('MEASURED-OUTER')
+  await page.getByLabel('Name').fill('Measured outer carton')
+  await page.getByLabel(/^Outer length/).fill('12')
+  await page.getByLabel(/^Outer width/).fill('8')
+  await page.getByLabel(/^Outer height/).fill('6')
+  await page.getByRole('combobox', {
+    name: 'Outer-dimension evidence',
+  }).click()
+  await page.getByRole('option', { name: 'Measured' }).click()
+  const reference = page.getByLabel('Outer-dimension evidence reference')
+  await expect(reference).not.toHaveAttribute('required')
+  await expect(page.getByText(
+    'Optional note; exact outer measurements retain the confirming actor and time automatically',
+  )).toBeVisible()
+  await page.getByRole('button', { name: 'Create draft' }).click()
+
+  await expect.poll(() => requests.length).toBe(1)
+  expect(requests[0]).toMatchObject({
+    action: 'save-material',
+    code: 'MEASURED-OUTER',
+    name: 'Measured outer carton',
+    ratedOuterDimensionEvidenceType: 'measured',
+    ratedOuterDimensionEvidenceReference: null,
+    status: 'draft',
+  })
+  expect(Number(requests[0].ratedOuterLengthMm)).toBeGreaterThan(0)
+  expect(Number(requests[0].ratedOuterWidthMm)).toBeGreaterThan(0)
+  expect(Number(requests[0].ratedOuterHeightMm)).toBeGreaterThan(0)
+  await expect(page.getByText('Measured outer carton was created as a draft.'))
+    .toBeVisible()
+})
+
 test('imported order preparation cartonizes, compares rates, and plans without releasing', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   await installImportedOrderPreparationRoutes(page)
   await gotoApp(page, '/#operations')
 
   await page.getByRole('row', { name: /#6600/ }).click()
-  await page.getByRole('button', { name: 'Prepare order' }).click()
+  const prepareOrder = page.getByRole('button', { name: 'Prepare order' })
+  const authorizeOrder = page.getByTestId(
+    'authorize-shopify-test-store-canonical-e2e',
+  )
+  await expect(authorizeOrder).toBeVisible()
+  await expect(prepareOrder).toHaveCount(0)
+  await authorizeOrder.click()
+  await expect(
+    page.getByRole('heading', { name: 'Authorize verified Shopify test order' }),
+  ).toBeVisible()
+  await page.getByTestId('shopify-test-store-authorization-statement')
+    .fill(SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION)
+  await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
+  await expect(page.getByTestId('sandbox-commerce-e2e-authorization-active'))
+    .toContainText('gsea7654321')
+  await prepareOrder.click()
   await expect(
     page.getByRole('heading', { name: 'Prepare and plan imported order' }),
   ).toBeVisible()
@@ -1089,39 +2023,27 @@ test('operations tabs support touch navigation without portrait or landscape ove
   await expect.poll(async () => scroller.evaluate((element) => getComputedStyle(element).touchAction)).toBe('pan-x')
 
   const initialScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
-  const rightBox = await right.boundingBox()
-  if (!rightBox) throw new Error('Operations tabs right scroll control has no layout box')
-  await page.touchscreen.tap(rightBox.x + rightBox.width / 2, rightBox.y + rightBox.height / 2)
+  await right.tap()
   await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeGreaterThan(initialScrollLeft)
   await expect(left).toBeEnabled()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
 
   const rightwardScrollLeft = await scroller.evaluate((element) => element.scrollLeft)
-  const leftBox = await left.boundingBox()
-  if (!leftBox) throw new Error('Operations tabs left scroll control has no layout box')
-  await page.touchscreen.tap(leftBox.x + leftBox.width / 2, leftBox.y + leftBox.height / 2)
+  await left.tap()
   await expect.poll(async () => scroller.evaluate((element) => element.scrollLeft)).toBeLessThan(rightwardScrollLeft)
 
-  const nextRightBox = await right.boundingBox()
-  if (!nextRightBox) throw new Error('Operations tabs right scroll control has no layout box')
-  await page.touchscreen.tap(
-    nextRightBox.x + nextRightBox.width / 2,
-    nextRightBox.y + nextRightBox.height / 2,
-  )
+  await right.tap()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
 
-  const printingBox = await printing.boundingBox()
-  if (!printingBox) throw new Error('Printing tab has no layout box')
-  await page.touchscreen.tap(
-    printingBox.x + printingBox.width / 2,
-    printingBox.y + printingBox.height / 2,
-  )
+  await printing.tap()
   await expect(printing).toHaveAttribute('aria-selected', 'true')
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
   await page.setViewportSize({ width: 844, height: 390 })
-  await expect(page.getByRole('button', { name: /Scroll operations tabs (left|right)/ })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Scroll operations tabs (left|right)/ })).toHaveCount(2)
+  await expect(left).toBeEnabled()
+  await expect(right).toBeDisabled()
   await expect.poll(async () => isFullyVisibleWithin(printing, scroller)).toBe(true)
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
@@ -1206,7 +2128,9 @@ test('pack and rate replay runs, persists, and reloads two-pass package evidence
   await expect(
     page.getByText('Customer checkout shipping charge').first(),
   ).toBeVisible()
-  await expect(page.getByText('Pre-label carrier estimate')).toBeVisible()
+  await expect(
+    page.getByText('Pre-label carrier estimate', { exact: true }).first(),
+  ).toBeVisible()
   await expect(page.getByText(
     /selected for 2 packages, but recorded label finalization has not proven every package used it/,
   )).toBeVisible()
@@ -1238,7 +2162,7 @@ test('Faire replay shows only the marketplace estimate before post-intake rating
     page.getByRole('heading', { name: 'Marketplace checkout estimate' }),
   ).toBeVisible()
   await expect(
-    page.getByText('Captured marketplace estimate', { exact: true }),
+    page.getByText('Captured checkout shipping charge', { exact: true }),
   ).toBeVisible()
   await expect(page.getByText('$18.95').first()).toBeVisible()
   await expect(page.getByText('ClawPilot checkout packages and rates')).toBeVisible()
@@ -1257,5 +2181,5 @@ test('Faire replay shows only the marketplace estimate before post-intake rating
       name: 'Marketplace estimate vs post-intake fulfillment',
     }),
   ).toBeVisible()
-  await expect(page.getByText(/no checkout carrier-cost or package-plan baseline/)).toBeVisible()
+  await expect(page.getByText(/no checkout carrier-estimate or package-plan baseline/)).toBeVisible()
 })

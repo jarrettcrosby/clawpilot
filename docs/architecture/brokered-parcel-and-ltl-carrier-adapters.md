@@ -127,6 +127,22 @@ replace that optimization.
 
 ## Freight Classification
 
+Freight classification policy belongs to the exact LTL provider account; a
+connection must not impose one static freight class on every shipment. An
+account may authorize the full density scale, require an independently
+verified NMFC item/subitem, or require operator review for commodities that do
+not qualify for density classification. The selected policy and its revision
+are immutable inputs to the rate request.
+
+For an account that authorizes density classification, ClawPilot derives the
+candidate class only after cartonization and palletization are complete. The
+calculation uses the exact as-rated pallet's outside dimensions and gross
+weight, including pallet tare and every assigned carton. Changing the pallet
+configuration, contents, dimensions, weight, account, or account policy
+invalidates the classification and the quote. Mixed-commodity or otherwise
+ineligible pallets remain blocked from the density path instead of inheriting
+an account default.
+
 ClawPilot includes a dependency-free density assessment at
 `app_src/lib/operations/freightClassification.ts`. It implements the public
 NMFTA 13-subprovision full-density scale against an exact as-tendered pallet's

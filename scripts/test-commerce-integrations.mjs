@@ -605,7 +605,7 @@ assert.equal(
       /const integrations = await commerceMutationIntegrations\(/g,
     ) || []
   ).length,
-  9,
+  10,
   'Every commerce mutation that returns integration state must restore computed account fields',
 )
 const mutationResponseHelper = adminRoute.slice(
@@ -1031,10 +1031,10 @@ includes(panel, [
   'Signed receipt setup',
   'Register scope safety webhook',
   'Current Shopify webhook receipts need attention',
-  'Run Test',
-  'connection at least every 24 hours',
-  'readiness',
-  'fails closed when that evidence expires',
+  'Test connection',
+  'refreshes the 24-hour',
+  'older exact discovery',
+  'does not block a valid signed order event',
   'Copy URL',
   'Distributed Operations scope profile',
   "action: 'set-receipt-intake'",
@@ -1168,7 +1168,7 @@ includes(integrationSettings, [
   "initialIntegration === 'commerce' && canManageOperationsIntegrations",
   "key: 'commerce'",
   "label: 'Sales channels'",
-  '<CommerceIntegrationPanel />',
+  '<CommerceIntegrationPanel onNavigate={onNavigate} />',
   'canManageOperationsIntegrations',
 ], 'Integration settings navigation')
 const appHeader = read('app_src/components/AppHeader.tsx')

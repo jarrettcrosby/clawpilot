@@ -1,0 +1,1609 @@
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { EventEmitter, once } from 'node:events'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import http from 'node:http'
+import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
+import { PassThrough } from 'node:stream'
+import test from 'node:test'
+import { WorkerManager } from '../src/lib/worker-manager.mjs'
+import { pairGatewayInstance } from '../src/lib/pair-instance.mjs'
+import { GatewayStateStore } from '../src/lib/state-store.mjs'
+import {
+  assertInstanceLedgerCanBeRemoved,
+  removeInstanceDirectory,
+} from '../src/lib/instance-removal.mjs'
+import {
+  assertLegacyMacMigrationComplete,
+  legacyMacMigrationIsBlocked,
+  legacyMacMigrationMessage,
+  legacyMacPrintAgentDetection,
+} from '../src/lib/legacy-macos-agent.mjs'
+import { LegacyMacMigrationGuard } from '../src/lib/legacy-macos-migration-guard.mjs'
+import { runWithLocalPrinterKernelLock } from '../../../scripts/lib/local-print-device.mjs'
+
+const repositoryRoot = path.resolve(import.meta.dirname, '../../..')
+const runtimeCredential = `cpprint.v1.00000000-0000-4000-8000-000000000001.${'A'.repeat(43)}`
+const tauriExecutable = '/Applications/Print Agent.app/Contents/MacOS/print-agent'
+const lsofTextFixture = (pid, executablePath) => (
+  `p${pid}\nftxt\nn${executablePath}\nftxt\nn/usr/lib/libSystem.B.dylib\n`
+)
+
+function gatewaySafeStorageMock() {
+  return {
+    isEncryptionAvailable: () => true,
+    encryptString: (value) => Buffer.from(`protected:${Buffer.from(value).toString('base64')}`),
+    decryptString: (value) => {
+      const protectedValue = value.toString()
+      if (!protectedValue.startsWith('protected:')) throw new Error('invalid protected value')
+      return Buffer.from(protectedValue.slice('protected:'.length), 'base64').toString('utf8')
+    },
+  }
+}
+
+test('legacy Mac detection covers exact Tauri plist/process and avoids command false positives', () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-legacy-agent-detection-'))
+  const launchAgents = path.join(temporary, 'Library', 'LaunchAgents')
+  mkdirSync(launchAgents, { recursive: true })
+  try {
+    writeFileSync(path.join(launchAgents, 'com.printagent.app.plist'), '<plist/>')
+    const plistOnly = legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => '1 /sbin/launchd\n',
+    })
+    assert.deepEqual(plistOnly, {
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: true,
+      tauriProcessRunning: false,
+    })
+
+    rmSync(path.join(launchAgents, 'com.printagent.app.plist'))
+    for (const [index, executablePath] of [
+      tauriExecutable,
+      '/Users/operator/Applications/Print Agent.app/Contents/MacOS/print-agent',
+      '/Volumes/Print Agent Installer/Print Agent.app/Contents/MacOS/print-agent',
+      '/private/var/folders/ab/cd/T/AppTranslocation/123/d/Print Agent.app/Contents/MacOS/print-agent',
+      '/private/tmp/rollback/Print Agent.app/Contents/MacOS/print-agent',
+    ].entries()) {
+      const pid = 1_500 + index
+      const processOnly = legacyMacPrintAgentDetection({
+        platform: 'darwin',
+        homeDirectory: temporary,
+        listProcesses: () => `${pid} ${executablePath}\n`,
+        listProcessTextFiles: (candidatePids) => {
+          assert.deepEqual(candidatePids, [pid])
+          return lsofTextFixture(pid, executablePath)
+        },
+      })
+      assert.deepEqual(processOnly, {
+        clawPilotInstances: [],
+        tauriLaunchAgentPresent: false,
+        tauriProcessRunning: true,
+      })
+    }
+
+    writeFileSync(path.join(launchAgents, 'com.printagent.app.plist'), '<plist/>')
+    writeFileSync(path.join(launchAgents, 'com.clawpilot.print-agent.zebra-west.plist'), '<plist/>')
+    writeFileSync(path.join(launchAgents, 'com.clawpilot.print-agent.ag-alchemy.plist'), '<plist/>')
+    const bothFamilies = legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => `1556 ${tauriExecutable}\n`,
+      listProcessTextFiles: (pids) => lsofTextFixture(pids[0], tauriExecutable),
+    })
+    assert.deepEqual(bothFamilies, {
+      clawPilotInstances: ['ag-alchemy', 'zebra-west'],
+      tauriLaunchAgentPresent: true,
+      tauriProcessRunning: true,
+    })
+    assert.equal(legacyMacMigrationIsBlocked(bothFamilies), true)
+    const message = legacyMacMigrationMessage(bothFamilies)
+    assert.match(message, /older Tauri.*auto-start LaunchAgent and running tray process/i)
+    assert.match(message, /turn off its auto-start setting, then Quit/i)
+    assert.match(message, /Library\/Application Support\/print-agent.*rollback/i)
+    assert.match(message, /3\. Stop and uninstall an instance/)
+    assert.match(message, /retaining its Keychain credential, device key, and delivery ledger/)
+    assert.match(message, /will not stop, delete, uninstall, or revoke/i)
+
+    const falsePositiveListing = [
+      `2001 /usr/bin/grep ${tauriExecutable}`,
+      `2002 /bin/sh -c ${tauriExecutable}`,
+      `2003 ${tauriExecutable}-helper`,
+      `2004 ${tauriExecutable} --hidden`,
+      '2005 /Applications/Print Agent.app/Contents/MacOS/print-agent-old --hidden',
+      '2006 /usr/bin/grep',
+      '2007 /bin/sh',
+    ].join('\n')
+    const falseExecutableByPid = new Map([
+      [2001, '/usr/bin/grep'],
+      [2002, '/bin/sh'],
+      [2003, '/Applications/Print Agent.app/Contents/MacOS/print-agent-helper'],
+      [2004, '/usr/bin/env'],
+      [2005, '/Applications/Print Agent.app/Contents/MacOS/print-agent-old'],
+    ])
+    rmSync(path.join(launchAgents, 'com.printagent.app.plist'))
+    const falsePositives = legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => falsePositiveListing,
+      listProcessTextFiles: (pids) => pids.map((pid) => lsofTextFixture(
+        pid,
+        falseExecutableByPid.get(pid),
+      )).join(''),
+    })
+    assert.equal(falsePositives.tauriProcessRunning, false)
+
+    let truncatedCommExecutableListings = 0
+    const truncatedComm = legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => '1556 /Applications/Pr\n',
+      listProcessTextFiles: () => {
+        truncatedCommExecutableListings += 1
+        throw new Error('a truncated comm field must not nominate a PID')
+      },
+    })
+    assert.equal(truncatedComm.tauriProcessRunning, false)
+    assert.equal(truncatedCommExecutableListings, 0)
+    assert.throws(() => legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => `1556 ${tauriExecutable}\n`,
+      listProcessTextFiles: () => 'p1556\nftxt\n',
+    }), /executable detection returned invalid state/)
+
+    let processListings = 0
+    let executableListings = 0
+    assert.deepEqual(legacyMacPrintAgentDetection({
+      platform: 'win32',
+      homeDirectory: 'not-an-absolute-path',
+      listProcesses: () => { processListings += 1; throw new Error('must not list') },
+      listProcessTextFiles: () => { executableListings += 1; throw new Error('must not list') },
+    }), {
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: false,
+      tauriProcessRunning: false,
+    })
+    assert.equal(processListings, 0)
+    assert.equal(executableListings, 0)
+    assert.throws(() => legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => null,
+    }), /invalid state/)
+    assert.throws(() => legacyMacMigrationIsBlocked({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: 'yes',
+      tauriProcessRunning: false,
+    }), /invalid state/)
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy appearance gracefully quiesces workers and latches zero further claims or bytes', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-stop-'))
+  let claims = 0
+  let printerBytes = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') claims += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, jobs: [] }))
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000019',
+    slug: 'instance-00000000-0000-4000-8000-000000000019',
+    displayName: 'Late legacy fence',
+    serverAgentGlobalId: 'gpa_late_legacy_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+    intervalMs: 250,
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  try {
+    guard.start()
+    manager.startEnabled()
+    await waitFor(() => claims >= 1, 'Electron worker never reached its first claim')
+    legacyPresent = true
+    await waitFor(
+      () => guard.snapshot().quiesced && manager.statusFor(instance.id).state === 'stopped',
+      'Recurring legacy guard did not stop the Electron worker safely',
+      12_000,
+    )
+    const claimsAfterQuiesce = claims
+    const bytesAfterQuiesce = printerBytes
+    manager.resume(instance.id)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.match(manager.statusFor(instance.id).lastError, /Legacy local printing/)
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 2_250))
+    assert.equal(claims, claimsAfterQuiesce)
+    assert.equal(printerBytes, bytesAfterQuiesce)
+    assert.equal(printerBytes, 0)
+    assert.equal(guard.snapshot().blocked, true)
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    guard.stop()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late malformed legacy detection fails closed and quiesces once', async () => {
+  let stops = 0
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => { throw new Error('malformed ps evidence') },
+    stopWorkers: async () => { stops += 1 },
+  })
+  const snapshot = await guard.checkNow()
+  assert.equal(snapshot.blocked, true)
+  assert.equal(snapshot.quiesced, true)
+  assert.match(snapshot.message, /could not be verified.*stopped safely/i)
+  assert.throws(() => guard.assertReady(), /could not be verified/i)
+  await guard.checkNow()
+  assert.equal(stops, 1)
+})
+
+test('late legacy stop requeues a job returned by an in-flight claim with zero-byte proof', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-claim-'))
+  const zpl = '^XA^FO20,20^FDMust be safely requeued after stop^FS^XZ'
+  const actions = []
+  const commands = []
+  let printerBytes = 0
+  let releaseClaimResponse
+  const claimResponseRelease = new Promise((resolvePromise) => {
+    releaseClaimResponse = resolvePromise
+  })
+  let claimRequestObserved = false
+  let claimResponseSent = false
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      actions.push(body.action)
+      commands.push(body)
+      if (body.action === 'fail') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
+      if (body.action !== 'claim') {
+        response.writeHead(409, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+        return
+      }
+      claimRequestObserved = true
+      await claimResponseRelease
+      const serverNow = new Date()
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        ok: true,
+        jobs: [{
+          globalId: 'gpj0000065',
+          claimToken: '00000000-0000-4000-8000-000000000065',
+          serverNow: serverNow.toISOString(),
+          claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+          printer: { globalId: 'gpr0000065' },
+          document: {
+            globalId: 'gpf0000065',
+            type: 'shipping_label',
+            format: 'ZPL',
+            encoding: 'utf8',
+            media: 'label_4x6',
+            inlinePayload: zpl,
+            byteLength: Buffer.byteLength(zpl),
+            contentSha256: createHash('sha256').update(zpl).digest('hex'),
+          },
+        }],
+      }))
+      claimResponseSent = true
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000065',
+    slug: 'instance-00000000-0000-4000-8000-000000000065',
+    displayName: 'In-flight claim migration fence',
+    serverAgentGlobalId: 'gpa_inflight_claim_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  const instanceDirectory = manager.pathsFor(instance).instanceDirectory
+  const ledgerPath = path.join(instanceDirectory, 'claim-ledger.json')
+  const emptyLedger = {
+    version: 1,
+    claims: {},
+    deliveries: {},
+    pendingResults: {},
+  }
+  mkdirSync(instanceDirectory, { recursive: true })
+  writeFileSync(ledgerPath, `${JSON.stringify(emptyLedger, null, 2)}\n`, { mode: 0o600 })
+  try {
+    manager.startEnabled()
+    await waitFor(
+      () => claimRequestObserved,
+      'The delayed claim request did not arrive',
+    )
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      'The claim-waiting worker did not latch its graceful stop signal',
+    )
+    releaseClaimResponse()
+    await quiesced
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_after_claim',
+      'The stopped worker did not report the post-claim response fence',
+    )
+    assert.equal(claimResponseSent, true)
+    assert.deepEqual(actions, ['claim', 'fail'])
+    assert.equal(commands[1].errorCode, 'PRINT_DELIVERY_STOPPED')
+    assert.equal(commands[1].retryable, true)
+    assert.equal(commands[1].printerUnavailable, false)
+    assert.equal(commands[1].retryAfterSeconds, 0)
+    assert.equal(printerBytes, 0)
+    const stoppedLedger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+    assert.deepEqual(stoppedLedger.pendingResults, {})
+    assert.equal(Object.values(stoppedLedger.claims).length, 1)
+    assert.equal(Object.values(stoppedLedger.deliveries).length, 1)
+    for (const entry of [
+      ...Object.values(stoppedLedger.claims),
+      ...Object.values(stoppedLedger.deliveries),
+    ]) {
+      assert.equal(entry.state, 'delivery_failed')
+      assert.equal(entry.acceptedBytes, 0)
+      assert.equal(entry.deliveryStarted, false)
+      assert.equal(entry.serverResultConfirmed, true)
+    }
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releaseClaimResponse()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy stop while waiting for the shared endpoint lock requeues with zero raw bytes', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-lock-wait-'))
+  const sharedLockDirectory = path.join(temporary, 'shared-locks')
+  const lockReadyPath = path.join(temporary, 'lock-ready')
+  const releaseLockPath = path.join(temporary, 'release-lock')
+  const zpl = '^XA^FO20,20^FDMust stop before shared-lock delivery^FS^XZ'
+  const commands = []
+  let printerBytes = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      commands.push(body)
+      if (body.action === 'claim') {
+        const serverNow = new Date()
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          ok: true,
+          jobs: [{
+            globalId: 'gpj0000066',
+            claimToken: '00000000-0000-4000-8000-000000000066',
+            serverNow: serverNow.toISOString(),
+            claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+            printer: { globalId: 'gpr0000066' },
+            document: {
+              globalId: 'gpf0000066',
+              type: 'shipping_label',
+              format: 'ZPL',
+              encoding: 'utf8',
+              media: 'label_4x6',
+              inlinePayload: zpl,
+              byteLength: Buffer.byteLength(zpl),
+              contentSha256: createHash('sha256').update(zpl).digest('hex'),
+            },
+          }],
+        }))
+        return
+      }
+      if (body.action === 'fail') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
+      response.writeHead(409, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+    })
+  })
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const priorTestMode = process.env.CLAWPILOT_GATEWAY_TEST_MODE
+  const priorLoopback = process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK
+  process.env.CLAWPILOT_GATEWAY_TEST_MODE = '1'
+  process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK = '1'
+  const lockHolder = runWithLocalPrinterKernelLock({
+    directory: sharedLockDirectory,
+    host: '127.0.0.1',
+    port: printer.address().port,
+    timeoutMs: 10_000,
+    command: process.execPath,
+    args: [
+      '--input-type=module',
+      '--eval',
+      `import { existsSync, writeFileSync } from 'node:fs';
+       writeFileSync(process.argv[1], 'ready');
+       const timer = setInterval(() => {
+         if (!existsSync(process.argv[2])) return;
+         clearInterval(timer);
+       }, 10);`,
+      lockReadyPath,
+      releaseLockPath,
+    ],
+  })
+  await waitFor(() => existsSync(lockReadyPath), 'The endpoint-lock fixture did not acquire the lock')
+  if (priorTestMode === undefined) delete process.env.CLAWPILOT_GATEWAY_TEST_MODE
+  else process.env.CLAWPILOT_GATEWAY_TEST_MODE = priorTestMode
+  if (priorLoopback === undefined) delete process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK
+  else process.env.CLAWPILOT_PRINT_AGENT_ALLOW_LOOPBACK = priorLoopback
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000066',
+    slug: 'instance-00000000-0000-4000-8000-000000000066',
+    displayName: 'Shared-lock migration fence',
+    serverAgentGlobalId: 'gpa_shared_lock_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(15_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory,
+    startGuard: () => guard.assertReady(),
+  })
+  const workerEvents = []
+  manager.on('status', ({ id, status }) => {
+    if (id === instance.id && status.lastEvent) workerEvents.push(status.lastEvent)
+  })
+  const ledgerPath = path.join(manager.pathsFor(instance).instanceDirectory, 'claim-ledger.json')
+  try {
+    manager.startEnabled()
+    await waitFor(() => {
+      try {
+        return Object.values(JSON.parse(readFileSync(ledgerPath, 'utf8')).claims)
+          .some((entry) => entry.state === 'sending')
+      } catch {
+        return false
+      }
+    }, 'The claimed job did not reach the durable pre-delivery sending state')
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => workerEvents.includes('worker_stop_requested'),
+      'The shared-lock worker did not latch its graceful stop signal',
+    )
+    writeFileSync(releaseLockPath, 'release')
+    await lockHolder
+    await quiesced
+    assert.deepEqual(commands.map(({ action }) => action), ['claim', 'fail'])
+    assert.equal(commands[1].errorCode, 'PRINT_DELIVERY_STOPPED')
+    assert.equal(commands[1].retryable, true)
+    assert.equal(commands[1].printerUnavailable, false)
+    assert.equal(printerBytes, 0)
+    const stoppedLedger = JSON.parse(readFileSync(ledgerPath, 'utf8'))
+    assert.deepEqual(stoppedLedger.pendingResults, {})
+    for (const entry of [
+      ...Object.values(stoppedLedger.claims),
+      ...Object.values(stoppedLedger.deliveries),
+    ]) {
+      assert.equal(entry.state, 'delivery_failed')
+      assert.equal(entry.acceptedBytes, 0)
+      assert.equal(entry.deliveryStarted, false)
+      assert.equal(entry.serverResultConfirmed, true)
+    }
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    writeFileSync(releaseLockPath, 'release')
+    await lockHolder.catch(() => undefined)
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy stop lets an in-flight raw delivery and ACK finish before worker exit', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-raw-'))
+  const zpl = `^XA${'A'.repeat(2 * 1024 * 1024)}^XZ`
+  let claims = 0
+  let acknowledgements = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') claims += 1
+      if (body.action === 'acknowledge') acknowledgements += 1
+      const jobs = body.action === 'claim' && acknowledgements === 0 ? [{
+        globalId: 'gpj0000061',
+        claimToken: '00000000-0000-4000-8000-000000000061',
+        serverNow: new Date().toISOString(),
+        claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+        printer: { globalId: 'gpr0000061' },
+        document: {
+          globalId: 'gpf0000061',
+          type: 'shipping_label',
+          format: 'ZPL',
+          encoding: 'utf8',
+          media: 'label_4x6',
+          inlinePayload: zpl,
+          byteLength: Buffer.byteLength(zpl),
+          contentSha256: createHash('sha256').update(zpl).digest('hex'),
+        },
+      }] : []
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, jobs }))
+    })
+  })
+  const rawChunks = []
+  let rawByteLength = 0
+  let releasePrinter
+  const printerRelease = new Promise((resolvePromise) => { releasePrinter = resolvePromise })
+  let rawConnectionStarted = false
+  const printer = net.createServer((socket) => {
+    socket.pause()
+    rawConnectionStarted = true
+    void printerRelease.then(() => socket.resume())
+    socket.on('data', (chunk) => {
+      rawChunks.push(chunk)
+      rawByteLength += chunk.byteLength
+    })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000020',
+    slug: 'instance-00000000-0000-4000-8000-000000000020',
+    displayName: 'In-flight migration fence',
+    serverAgentGlobalId: 'gpa_inflight_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(15_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  const workerEvents = []
+  manager.on('status', ({ id, status }) => {
+    if (id === instance.id && status.lastEvent) workerEvents.push(status.lastEvent)
+  })
+  try {
+    manager.startEnabled()
+    await waitFor(() => rawConnectionStarted, 'In-flight raw delivery never reached the printer')
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => workerEvents.includes('worker_stop_requested'),
+      'The in-flight worker did not latch its graceful stop signal',
+    )
+    releasePrinter()
+    await quiesced
+    await waitFor(() => acknowledgements === 1, 'In-flight delivery did not ACK before exit')
+    await waitFor(
+      () => rawByteLength === Buffer.byteLength(zpl),
+      'The printer fixture did not consume the complete in-flight raw payload',
+    )
+    assert.equal(Buffer.concat(rawChunks).equals(Buffer.from(zpl)), true)
+    assert.equal(claims, 1)
+    assert.equal(acknowledgements, 1)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releasePrinter()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('late legacy stop finishes pending ACK replay but starts no new claim or raw delivery', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-late-legacy-ack-replay-'))
+  const oldJobGlobalId = 'gpj0000062'
+  const oldClaimToken = '00000000-0000-4000-8000-000000000062'
+  const zpl = '^XA^FO20,20^FDMust not print after stop^FS^XZ'
+  const actions = []
+  let releasePendingAcknowledgement
+  const pendingAcknowledgementRelease = new Promise((resolvePromise) => {
+    releasePendingAcknowledgement = resolvePromise
+  })
+  let observePendingAcknowledgement
+  const pendingAcknowledgementObserved = new Promise((resolvePromise) => {
+    observePendingAcknowledgement = resolvePromise
+  })
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      actions.push(body.action)
+      if (
+        body.action === 'acknowledge'
+        && body.jobGlobalId === oldJobGlobalId
+      ) {
+        observePendingAcknowledgement()
+        await pendingAcknowledgementRelease
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true }))
+        return
+      }
+      if (body.action === 'claim') {
+        const serverNow = new Date()
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({
+          ok: true,
+          jobs: [{
+            globalId: 'gpj0000063',
+            claimToken: '00000000-0000-4000-8000-000000000063',
+            serverNow: serverNow.toISOString(),
+            claimExpiresAt: new Date(serverNow.getTime() + 120_000).toISOString(),
+            printer: { globalId: 'gpr0000063' },
+            document: {
+              globalId: 'gpf0000063',
+              type: 'shipping_label',
+              format: 'ZPL',
+              encoding: 'utf8',
+              media: 'label_4x6',
+              inlinePayload: zpl,
+              byteLength: Buffer.byteLength(zpl),
+              contentSha256: createHash('sha256').update(zpl).digest('hex'),
+            },
+          }],
+        }))
+        return
+      }
+      response.writeHead(409, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: false, code: 'UNEXPECTED_ACTION' }))
+    })
+  })
+  let printerBytes = 0
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => { printerBytes += chunk.byteLength })
+  })
+  api.listen(0, '127.0.0.1')
+  printer.listen(0, '127.0.0.1')
+  await Promise.all([once(api, 'listening'), once(printer, 'listening')])
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000064',
+    slug: 'instance-00000000-0000-4000-8000-000000000064',
+    displayName: 'Pending ACK migration fence',
+    serverAgentGlobalId: 'gpa_pending_ack_migration_fence',
+    warehouseName: 'Migration safety warehouse',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => id === instance.id ? instance : null,
+    publicState: () => ({ instances: [instance] }),
+    credentialFor: () => runtimeCredential,
+  }
+  let legacyPresent = false
+  let manager
+  const guard = new LegacyMacMigrationGuard({
+    detect: () => ({
+      clawPilotInstances: [],
+      tauriLaunchAgentPresent: legacyPresent,
+      tauriProcessRunning: false,
+    }),
+    stopWorkers: () => manager.stopAllAndWait(10_000),
+  })
+  manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => guard.assertReady(),
+  })
+  const instanceDirectory = manager.pathsFor(instance).instanceDirectory
+  mkdirSync(instanceDirectory, { recursive: true })
+  const pendingIdentifier = `acknowledge:${oldJobGlobalId}:${oldClaimToken}`
+  writeFileSync(path.join(instanceDirectory, 'claim-ledger.json'), `${JSON.stringify({
+    version: 1,
+    claims: {},
+    deliveries: {},
+    pendingResults: {
+      [pendingIdentifier]: {
+        version: 1,
+        action: 'acknowledge',
+        jobGlobalId: oldJobGlobalId,
+        claimToken: oldClaimToken,
+        claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+        idempotencyKey: `ack:${oldJobGlobalId}:${oldClaimToken}`,
+        payload: {
+          jobGlobalId: oldJobGlobalId,
+          claimToken: oldClaimToken,
+          deviceJobReference: `local-device.v1.${'A'.repeat(43)}`,
+        },
+        claimLedgerKey: null,
+        deliveryLedgerKey: null,
+        queuedAt: new Date().toISOString(),
+      },
+    },
+  }, null, 2)}\n`, { mode: 0o600 })
+  try {
+    manager.startEnabled()
+    await Promise.race([
+      pendingAcknowledgementObserved,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('Pending acknowledgement replay did not start')),
+        8_000,
+      )),
+    ])
+    legacyPresent = true
+    const quiesced = guard.checkNow()
+    await waitFor(
+      () => manager.statusFor(instance.id).lastEvent === 'worker_stop_requested',
+      'The ACK-replay worker did not latch its graceful stop signal',
+    )
+    releasePendingAcknowledgement()
+    await quiesced
+    assert.deepEqual(actions, ['acknowledge'])
+    assert.deepEqual(
+      JSON.parse(readFileSync(
+        path.join(instanceDirectory, 'claim-ledger.json'),
+        'utf8',
+      )).pendingResults,
+      {},
+    )
+    assert.equal(printerBytes, 0)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.equal(guard.snapshot().quiesced, true)
+  } finally {
+    releasePendingAcknowledgement()
+    manager.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('legacy mac LaunchAgent blocks pairing/start before any worker or printer bytes', () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-legacy-agent-block-'))
+  const launchAgents = path.join(temporary, 'Library', 'LaunchAgents')
+  const legacyRuntime = path.join(temporary, 'Library', 'Application Support', 'ClawPilot', 'print-agent', 'ag-alchemy')
+  mkdirSync(launchAgents, { recursive: true })
+  mkdirSync(legacyRuntime, { recursive: true })
+  writeFileSync(
+    path.join(launchAgents, 'com.clawpilot.print-agent.ag-alchemy.plist'),
+    '<plist><dict><key>Label</key><string>com.clawpilot.print-agent.ag-alchemy</string></dict></plist>',
+  )
+  writeFileSync(
+    path.join(legacyRuntime, 'run-local-print-agent.mjs'),
+    '// historical fixture intentionally has no kernel endpoint lock or immutable delivery ledger\n',
+  )
+  const legacy = legacyMacPrintAgentDetection({
+    platform: 'darwin',
+    homeDirectory: temporary,
+    listProcesses: () => '',
+  })
+  assert.deepEqual(legacy.clawPilotInstances, ['ag-alchemy'])
+  let migrationError
+  try {
+    assertLegacyMacMigrationComplete(legacy)
+  } catch (error) {
+    migrationError = error
+  }
+  assert.ok(migrationError instanceof Error)
+  assert.match(migrationError.message, /do not share.*duplicate-print fences/i)
+  assert.match(migrationError.message, /3\. Stop and uninstall an instance/)
+  assert.match(migrationError.message, /retaining its Keychain credential, device key, and delivery ledger for rollback/)
+  assert.match(migrationError.message, /same Zebra private LAN IP and port.*no-print connection test.*one controlled UPS sandbox label/i)
+  assert.match(migrationError.message, /Do not revoke an old server enrollment until this app.*acknowledged/i)
+  assert.doesNotMatch(migrationError.message, /stop and disable/i)
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000008',
+    slug: 'instance-00000000-0000-4000-8000-000000000008',
+    enabled: true,
+  }
+  let spawns = 0
+  const manager = new WorkerManager({
+    store: {
+      instanceFor: () => instance,
+      publicState: () => ({ instances: [instance] }),
+      credentialFor: () => runtimeCredential,
+    },
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => assertLegacyMacMigrationComplete(legacy),
+    spawnImplementation: () => { spawns += 1 },
+  })
+  try {
+    manager.startEnabled()
+    assert.equal(spawns, 0)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.match(manager.statusFor(instance.id).lastError, /Legacy local printing/)
+  } finally {
+    manager.shutdown()
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('Tauri migration guard blocks pairing and worker start before local side effects', async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-tauri-agent-block-'))
+  const processDetection = legacyMacPrintAgentDetection({
+    platform: 'darwin',
+    homeDirectory: temporary,
+    listProcesses: () => `1556 ${tauriExecutable}\n`,
+    listProcessTextFiles: (pids) => lsofTextFixture(pids[0], tauriExecutable),
+  })
+  const launchAgents = path.join(temporary, 'Library', 'LaunchAgents')
+  mkdirSync(launchAgents, { recursive: true })
+  writeFileSync(path.join(launchAgents, 'com.printagent.app.plist'), '<plist/>')
+  const plistDetection = legacyMacPrintAgentDetection({
+    platform: 'darwin',
+    homeDirectory: temporary,
+    listProcesses: () => '',
+  })
+  let persistenceWrites = 0
+  let probes = 0
+  let printerBytes = 0
+  let redemptions = 0
+  for (const detection of [plistDetection, processDetection]) {
+    await assert.rejects(pairGatewayInstance({
+      input: {},
+      operationGuard: () => assertLegacyMacMigrationComplete(detection),
+      store: {
+        preflightPairingPersistence() { persistenceWrites += 1 },
+      },
+      async probe() { probes += 1; printerBytes += 1 },
+      async redeem() { redemptions += 1 },
+    }), /older Tauri/i)
+  }
+  await assert.rejects(pairGatewayInstance({
+    input: {},
+    operationGuard: () => legacyMacPrintAgentDetection({
+      platform: 'darwin',
+      homeDirectory: temporary,
+      listProcesses: () => ({ malformed: true }),
+    }),
+    store: {
+      preflightPairingPersistence() { persistenceWrites += 1 },
+    },
+    async probe() { probes += 1; printerBytes += 1 },
+    async redeem() { redemptions += 1 },
+  }), /invalid state/)
+  assert.equal(persistenceWrites, 0)
+  assert.equal(probes, 0)
+  assert.equal(printerBytes, 0)
+  assert.equal(redemptions, 0)
+
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000018',
+    slug: 'instance-00000000-0000-4000-8000-000000000018',
+    enabled: true,
+  }
+  let spawns = 0
+  let credentialsRead = 0
+  const manager = new WorkerManager({
+    store: {
+      instanceFor: () => instance,
+      publicState: () => ({ instances: [instance] }),
+      credentialFor: () => { credentialsRead += 1; return runtimeCredential },
+    },
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    startGuard: () => assertLegacyMacMigrationComplete(processDetection),
+    spawnImplementation: () => { spawns += 1 },
+  })
+  try {
+    manager.startEnabled()
+    assert.equal(spawns, 0)
+    assert.equal(credentialsRead, 0)
+    assert.equal(manager.statusFor(instance.id).state, 'stopped')
+    assert.match(manager.statusFor(instance.id).lastError, /older Tauri/)
+  } finally {
+    manager.shutdown()
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('durable cleanup fence survives restart and starts zero workers or claims', async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-cleanup-start-fence-'))
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000039',
+    slug: 'instance-00000000-0000-4000-8000-000000000039',
+    enabled: true,
+  }
+  const instanceDirectory = path.join(temporary, 'instances', instance.slug)
+  mkdirSync(instanceDirectory, { recursive: true })
+  writeFileSync(path.join(instanceDirectory, 'claim-ledger.json'), `${JSON.stringify({
+    version: 1,
+    claims: {},
+    deliveries: {},
+    pendingResults: {},
+    cleanupResolution: {
+      version: 1,
+      idempotencyKey: 'cleanup:00000000-0000-4000-8000-000000000040',
+      entries: [{
+        jobGlobalId: 'gpj0000001',
+        claimToken: '00000000-0000-4000-8000-000000000041',
+        documentGlobalId: 'gpf0000001',
+        contentSha256: '4'.repeat(64),
+        resolution: 'outcome_uncertain_terminal',
+        removalSafe: true,
+        reasonCode: 'SERVER_OUTCOME_UNCERTAIN_TERMINAL',
+      }],
+      resolvedAt: new Date().toISOString(),
+    },
+  })}\n`)
+  let spawns = 0
+  let enableWrites = 0
+  const manager = new WorkerManager({
+    store: {
+      instanceFor: () => instance,
+      publicState: () => ({ instances: [instance] }),
+      credentialFor: () => runtimeCredential,
+      setEnabled: () => { enableWrites += 1 },
+    },
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    spawnImplementation: () => { spawns += 1 },
+  })
+  try {
+    manager.startEnabled()
+    assert.equal(spawns, 0)
+    assert.match(manager.statusFor(instance.id).lastError, /removal reconciliation is pending/)
+    await assert.rejects(manager.setEnabled(instance.id, true), /removal reconciliation is pending/)
+    assert.equal(enableWrites, 0)
+    assert.equal(spawns, 0)
+  } finally {
+    manager.shutdown()
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('worker credential pipe contains fast EPIPE and reports other errors without secrets', async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-worker-stdin-'))
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000009',
+    displayName: 'Pipe test',
+    localName: null,
+    slug: 'instance-00000000-0000-4000-8000-000000000009',
+    serverAgentGlobalId: 'gpa_pipe_test',
+    baseUrl: 'https://aiapp.eigenracing.com',
+    printerHost: '192.168.4.146',
+    printerPort: 9_100,
+    enabled: true,
+  }
+  const child = new EventEmitter()
+  child.pid = 41_001
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.stdin = new EventEmitter()
+  child.stdin.end = () => {
+    queueMicrotask(() => {
+      const error = new Error(`broken pipe ${runtimeCredential}`)
+      error.code = 'EPIPE'
+      child.stdin.emit('error', error)
+    })
+  }
+  const manager = new WorkerManager({
+    store: {
+      instanceFor: () => instance,
+      credentialFor: () => runtimeCredential,
+      publicState: () => ({ instances: [instance] }),
+    },
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+    spawnImplementation: () => child,
+  })
+  try {
+    manager.start(instance.id)
+    await new Promise((resolvePromise) => setImmediate(resolvePromise))
+    assert.equal(manager.statusFor(instance.id).lastError, null)
+    const other = new Error(`credential pipe failed ${runtimeCredential}`)
+    other.code = 'EIO'
+    child.stdin.emit('error', other)
+    assert.match(manager.statusFor(instance.id).lastError, /credential pipe failed \[secret redacted\]/)
+    assert.doesNotMatch(manager.statusFor(instance.id).lastError, /cpprint\.v1/)
+  } finally {
+    manager.shutdown()
+    child.emit('exit', 0, null)
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+async function waitFor(predicate, message, timeoutMs = 8_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const value = predicate()
+    if (value) return value
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
+  }
+  throw new Error(message)
+}
+
+test('stop signals nested worker while lifetime-lock supervisor remains until worker exit', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-worker-lifetime-'))
+  let claims = 0
+  const api = http.createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      claims += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ ok: true, jobs: [] }))
+    })
+  })
+  api.listen(0, '127.0.0.1')
+  await once(api, 'listening')
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000010',
+    displayName: 'Worker lifetime test',
+    localName: null,
+    slug: 'instance-00000000-0000-4000-8000-000000000010',
+    serverAgentGlobalId: 'gpa_lifetime_test',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: 9_100,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => (id === instance.id ? instance : null),
+    credentialFor: () => runtimeCredential,
+    publicState: () => ({ instances: [instance] }),
+  }
+  const manager = new WorkerManager({
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+  })
+  try {
+    manager.start(instance.id)
+    const state = await waitFor(
+      () => manager.workers.get(instance.id)?.runtimePid
+        ? manager.workers.get(instance.id)
+        : null,
+      'Nested worker never reported its PID',
+    )
+    const runtimePid = state.runtimePid
+    const supervisorPid = state.child.pid
+    assert.equal(processExists(runtimePid), true)
+    assert.equal(processExists(supervisorPid), true)
+    if (process.platform === 'darwin') {
+      assert.notEqual(runtimePid, supervisorPid, 'macOS lockf must be treated as a separate supervisor')
+    }
+    await waitFor(() => claims >= 1, 'Nested worker never completed its first claim request')
+    await manager.stopAndWait(instance.id, 10_000)
+    assert.equal(processExists(runtimePid), false)
+    assert.equal(processExists(supervisorPid), false)
+    assert.ok(claims >= 1)
+  } finally {
+    manager.shutdown()
+    api.close()
+    await once(api, 'close')
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('two app generations sharing one instance allow exactly one raw delivery', {
+  skip: !['darwin', 'linux'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-worker-overlap-'))
+  const zpl = '^XA^FO20,20^FDOne lifetime owner^FS^XZ'
+  const printerBytes = []
+  const printer = net.createServer((socket) => {
+    socket.on('data', (chunk) => printerBytes.push(chunk))
+  })
+  printer.listen(0, '127.0.0.1')
+  await once(printer, 'listening')
+  let claims = 0
+  let acknowledgements = 0
+  let releaseFirstClaim
+  const firstClaimGate = new Promise((resolvePromise) => { releaseFirstClaim = resolvePromise })
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', async () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') {
+        claims += 1
+        if (claims === 1) await firstClaimGate
+      }
+      if (body.action === 'acknowledge') acknowledgements += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify(body.action === 'claim' && acknowledgements === 0 ? {
+        ok: true,
+        jobs: [{
+          globalId: 'gpj-lifetime-one',
+          claimToken: 'claim-lifetime-one',
+          serverNow: new Date().toISOString(),
+          claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+          printer: { globalId: 'gpr-lifetime-one' },
+          document: {
+            globalId: 'gpd-lifetime-one',
+            type: 'shipping_label',
+            format: 'ZPL',
+            encoding: 'utf8',
+            media: 'label_4x6',
+            inlinePayload: zpl,
+            byteLength: Buffer.byteLength(zpl),
+            contentSha256: createHash('sha256').update(zpl).digest('hex'),
+          },
+        }],
+      } : { ok: true, jobs: [] }))
+    })
+  })
+  api.listen(0, '127.0.0.1')
+  await once(api, 'listening')
+  const instance = {
+    id: '00000000-0000-4000-8000-000000000011',
+    displayName: 'Overlap test',
+    localName: null,
+    slug: 'instance-00000000-0000-4000-8000-000000000011',
+    serverAgentGlobalId: 'gpa_overlap_test',
+    baseUrl: `http://127.0.0.1:${api.address().port}`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+    enabled: true,
+  }
+  const store = {
+    instanceFor: (id) => (id === instance.id ? instance : null),
+    credentialFor: () => runtimeCredential,
+    publicState: () => ({ instances: [instance] }),
+  }
+  const managerInput = {
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-locks'),
+  }
+  const first = new WorkerManager(managerInput)
+  const second = new WorkerManager(managerInput)
+  try {
+    first.start(instance.id)
+    await waitFor(() => claims === 1, 'First generation never reached claim')
+    second.start(instance.id)
+    await waitFor(
+      () => /Another ClawPilot process/.test(second.statusFor(instance.id).lastError || ''),
+      'Second generation did not fail closed on the lifetime lock',
+    )
+    assert.equal(claims, 1)
+    releaseFirstClaim()
+    await waitFor(() => acknowledgements === 1, 'First generation never acknowledged delivery')
+    await first.stopAndWait(instance.id, 10_000)
+    await second.stopAndWait(instance.id, 10_000)
+    assert.equal(Buffer.concat(printerBytes).toString('utf8'), zpl)
+    assert.equal(acknowledgements, 1)
+  } finally {
+    releaseFirstClaim()
+    first.shutdown()
+    second.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('two organizations share one printer with isolated credentials, ledgers, ACKs, and cleanup', {
+  skip: !['darwin', 'linux', 'win32'].includes(process.platform),
+}, async () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-multi-org-printer-'))
+  const printerPayloads = []
+  const printer = net.createServer((socket) => {
+    const chunks = []
+    socket.on('data', (chunk) => chunks.push(chunk))
+    socket.on('end', () => printerPayloads.push(Buffer.concat(chunks).toString('utf8')))
+  })
+  printer.listen(0, '127.0.0.1')
+  await once(printer, 'listening')
+
+  const organizations = [
+    {
+      key: 'org-a',
+      agentId: '00000000-0000-4000-8000-000000000021',
+      agentGlobalId: 'gpa_multi_org_a',
+      credential: `cpprint.v1.00000000-0000-4000-8000-000000000021.${'A'.repeat(43)}`,
+      warehouseId: '00000000-0000-4000-8000-000000000031',
+      warehouseGlobalId: 'gwh_multi_org_a',
+      jobGlobalId: 'gpj0000021',
+      claimToken: '00000000-0000-4000-8000-000000000041',
+      documentGlobalId: 'gpf0000021',
+      zpl: '^XA^FO20,20^FDOrganization A only^FS^XZ',
+      claims: 0,
+      acknowledgementRequests: 0,
+      acknowledgementIdempotencyKeys: new Set(),
+      revoked: false,
+    },
+    {
+      key: 'org-b',
+      agentId: '00000000-0000-4000-8000-000000000022',
+      agentGlobalId: 'gpa_multi_org_b',
+      credential: `cpprint.v1.00000000-0000-4000-8000-000000000022.${'B'.repeat(43)}`,
+      warehouseId: '00000000-0000-4000-8000-000000000032',
+      warehouseGlobalId: 'gwh_multi_org_b',
+      jobGlobalId: 'gpj0000022',
+      claimToken: '00000000-0000-4000-8000-000000000042',
+      documentGlobalId: 'gpf0000022',
+      zpl: '^XA^FO20,20^FDOrganization B only^FS^XZ',
+      claims: 0,
+      acknowledgementRequests: 0,
+      acknowledgementIdempotencyKeys: new Set(),
+      revoked: false,
+    },
+  ]
+  const byAuthorization = new Map(organizations.map((organization) => [
+    `Bearer ${organization.credential}`,
+    organization,
+  ]))
+  let crossOrganizationRequests = 0
+  const api = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const organization = byAuthorization.get(String(request.headers.authorization || ''))
+      if (!organization || organization.revoked) {
+        response.writeHead(401, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: false, code: 'UNAUTHORIZED' }))
+        return
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      if (body.action === 'claim') {
+        organization.claims += 1
+        const jobs = organization.acknowledgementIdempotencyKeys.size > 0 ? [] : [{
+          globalId: organization.jobGlobalId,
+          claimToken: organization.claimToken,
+          serverNow: new Date().toISOString(),
+          claimExpiresAt: new Date(Date.now() + 120_000).toISOString(),
+          printer: { globalId: `gpr_${organization.key}` },
+          document: {
+            globalId: organization.documentGlobalId,
+            type: 'shipping_label',
+            format: 'ZPL',
+            encoding: 'utf8',
+            media: 'label_4x6',
+            inlinePayload: organization.zpl,
+            byteLength: Buffer.byteLength(organization.zpl),
+            contentSha256: createHash('sha256').update(organization.zpl).digest('hex'),
+          },
+        }]
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: true, jobs }))
+        return
+      }
+      if (
+        body.action !== 'acknowledge'
+        || body.jobGlobalId !== organization.jobGlobalId
+        || body.claimToken !== organization.claimToken
+      ) {
+        crossOrganizationRequests += 1
+        response.writeHead(409, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ ok: false, code: 'CROSS_ORGANIZATION_REQUEST' }))
+        return
+      }
+      organization.acknowledgementRequests += 1
+      const acknowledgementIdempotencyKey = String(
+        request.headers['idempotency-key'] || '',
+      )
+      assert.equal(
+        acknowledgementIdempotencyKey,
+        `ack:${organization.jobGlobalId}:${organization.claimToken}`,
+      )
+      organization.acknowledgementIdempotencyKeys.add(
+        acknowledgementIdempotencyKey,
+      )
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        ok: true,
+        replayed: organization.acknowledgementRequests > 1,
+      }))
+    })
+  })
+  api.listen(0, '127.0.0.1')
+  await once(api, 'listening')
+
+  const store = new GatewayStateStore({
+    dataDirectory: temporary,
+    safeStorage: gatewaySafeStorageMock(),
+    allowLocalDevelopment: true,
+  })
+  const instances = organizations.map((organization) => store.createInstance({
+    baseUrl: `http://localhost:${api.address().port}`,
+    displayName: `${organization.key} Zebra agent`,
+    localName: `${organization.key} on shared Zebra`,
+    serverAgentId: organization.agentId,
+    serverAgentGlobalId: organization.agentGlobalId,
+    serverAgentName: `${organization.key} Zebra agent`,
+    warehouseId: organization.warehouseId,
+    warehouseGlobalId: organization.warehouseGlobalId,
+    warehouseName: `${organization.key} warehouse`,
+    printerHost: '127.0.0.1',
+    printerPort: printer.address().port,
+  }, organization.credential))
+  assert.equal(instances[0].printerHost, instances[1].printerHost)
+  assert.equal(instances[0].printerPort, instances[1].printerPort)
+  assert.notEqual(instances[0].id, instances[1].id)
+
+  const managerInput = {
+    store,
+    dataDirectory: temporary,
+    runtimePath: path.join(repositoryRoot, 'scripts/run-local-print-agent.mjs'),
+    executablePath: process.execPath,
+    allowLocalDevelopment: true,
+    sharedLockDirectory: path.join(temporary, 'shared-endpoint-locks'),
+    windowsLockHelperPath: process.platform === 'win32'
+      ? path.join(
+        repositoryRoot,
+        'clients',
+        'print-gateway',
+        'build',
+        'windows',
+        'clawpilot-print-lock.exe',
+      )
+      : null,
+  }
+  const firstGeneration = new WorkerManager(managerInput)
+  let restartedGeneration
+  let overlappingSupervisor
+  let survivorGeneration
+  try {
+    firstGeneration.startEnabled()
+    await waitFor(
+      () => organizations.every(
+        (organization) => organization.acknowledgementIdempotencyKeys.size === 1,
+      ),
+      'Both organization-scoped workers did not acknowledge their exact jobs',
+    )
+    await waitFor(() => printerPayloads.length === 2, 'Shared printer did not finish both jobs')
+    assert.deepEqual([...printerPayloads].sort(), organizations.map(({ zpl }) => zpl).sort())
+    assert.equal(crossOrganizationRequests, 0)
+    assert.deepEqual(
+      organizations.map(({ acknowledgementIdempotencyKeys }) => (
+        acknowledgementIdempotencyKeys.size
+      )),
+      [1, 1],
+    )
+    assert.equal(
+      organizations.every(({ acknowledgementRequests }) => acknowledgementRequests >= 1),
+      true,
+    )
+    await Promise.all(instances.map((instance) => firstGeneration.stopAndWait(instance.id, 10_000)))
+
+    const priorClaimCounts = organizations.map(({ claims }) => claims)
+    restartedGeneration = new WorkerManager(managerInput)
+    restartedGeneration.startEnabled()
+    await waitFor(
+      () => organizations.every((organization, index) => organization.claims > priorClaimCounts[index]),
+      'Restarted workers did not poll both organization-scoped queues',
+    )
+    overlappingSupervisor = new WorkerManager(managerInput)
+    overlappingSupervisor.startEnabled()
+    await waitFor(
+      () => instances.every((instance) => /Another ClawPilot process/.test(
+        overlappingSupervisor.statusFor(instance.id).lastError || '',
+      )),
+      'Overlapping supervisor did not fail closed for both organization instances',
+    )
+    assert.deepEqual(
+      organizations.map(({ acknowledgementIdempotencyKeys }) => (
+        acknowledgementIdempotencyKeys.size
+      )),
+      [1, 1],
+    )
+    assert.equal(printerPayloads.length, 2)
+    overlappingSupervisor.shutdown()
+    await Promise.all(instances.map((instance) => restartedGeneration.stopAndWait(instance.id, 10_000)))
+
+    const firstDirectory = firstGeneration.pathsFor(instances[0]).instanceDirectory
+    const secondDirectory = firstGeneration.pathsFor(instances[1]).instanceDirectory
+    assertInstanceLedgerCanBeRemoved(firstDirectory)
+    const secondLedgerBefore = readFileSync(path.join(secondDirectory, 'claim-ledger.json'))
+    const secondStateBefore = store.instanceFor(instances[1].id)
+    const secondCredentialBefore = store.credentialFor(instances[1].id)
+    store.setEnabled(instances[0].id, false)
+    store.removeInstance(instances[0].id)
+    firstGeneration.forget(instances[0].id)
+    removeInstanceDirectory({ dataDirectory: temporary, slug: instances[0].slug })
+    organizations[0].revoked = true
+
+    assert.deepEqual(store.publicState().instances, [secondStateBefore])
+    assert.equal(store.credentialFor(instances[1].id), secondCredentialBefore)
+    assert.equal(readFileSync(path.join(secondDirectory, 'claim-ledger.json')).equals(secondLedgerBefore), true)
+    const survivorClaimsBefore = organizations[1].claims
+    survivorGeneration = new WorkerManager(managerInput)
+    survivorGeneration.startEnabled()
+    await waitFor(
+      () => organizations[1].claims > survivorClaimsBefore,
+      'Removing and revoking the first organization blocked the surviving organization',
+    )
+    await survivorGeneration.stopAndWait(instances[1].id, 10_000)
+    assert.equal(organizations[0].acknowledgementIdempotencyKeys.size, 1)
+    assert.equal(organizations[1].acknowledgementIdempotencyKeys.size, 1)
+    assert.equal(
+      organizations.every(({ acknowledgementRequests }) => acknowledgementRequests >= 1),
+      true,
+    )
+    assert.equal(printerPayloads.length, 2)
+    assert.equal(crossOrganizationRequests, 0)
+    assert.equal(readFileSync(path.join(secondDirectory, 'claim-ledger.json')).equals(secondLedgerBefore), true)
+  } finally {
+    firstGeneration.shutdown()
+    restartedGeneration?.shutdown()
+    overlappingSupervisor?.shutdown()
+    survivorGeneration?.shutdown()
+    api.close()
+    printer.close()
+    await Promise.all([once(api, 'close'), once(printer, 'close')])
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})

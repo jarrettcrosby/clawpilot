@@ -12,6 +12,10 @@ import {
   validateFulfillmentOptimizationInput,
   type FulfillmentOptimizationInputV1,
 } from '@/lib/operations/fulfillmentOptimizerContract'
+import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
+import {
+  readOperationsOrderShipmentAddressInPostgres,
+} from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
   acquireTransactionAdvisoryLock,
   getPostgresPool,
@@ -74,7 +78,7 @@ export type CartonizationRateEvidenceMaterialRateAssumption = {
     maximumGrossWeightGrams: number
     unitCostMinor: number
     currency: string
-    stock: {
+    stock: null | {
       rowVersion: number
       onHandQuantity: number
       activeClaimedQuantity: number
@@ -822,6 +826,36 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
     | 'packages'
   >,
 ) {
+  const rawShadowTraining = input.planSnapshot.shadowTraining
+  const shadowTraining = rawShadowTraining
+    && typeof rawShadowTraining === 'object'
+    && !Array.isArray(rawShadowTraining)
+    ? rawShadowTraining as Record<string, unknown>
+    : null
+  if (
+    rawShadowTraining !== undefined
+    && (
+      input.evidenceMode !== 'operational'
+      || !shadowTraining
+      || shadowTraining.version !== 'shadow-training-evidence-v1'
+      || !/^gtrn(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+        String(shadowTraining.runGlobalId || ''),
+      )
+      || !Number.isSafeInteger(shadowTraining.runRowVersion)
+      || Number(shadowTraining.runRowVersion) < 0
+      || shadowTraining.assignmentPolicy !== 'local_simulation_only'
+      || shadowTraining.commerceProviderWrites !== 0
+      || shadowTraining.inventoryWrites !== 0
+      || shadowTraining.packagingStockWrites !== 0
+      || shadowTraining.productionPostage !== 0
+    )
+  ) {
+    fail(
+      'Shadow training evidence authorization is invalid',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_SHADOW_TRAINING_INVALID',
+    )
+  }
   const sandboxFixedAxisPackageKeys = input.packages
     .filter((item) => item.planningMethod === 'sandbox_fixed_axis')
     .map((item) => item.packageKey)
@@ -961,22 +995,32 @@ export function assertCartonizationRateEvidenceMaterialAssumptions(
           || !/^[A-Z]{3}$/.test(
             assumption.operationalFacts.currency,
           )
-          || !Number.isSafeInteger(
-            assumption.operationalFacts.stock.rowVersion,
+          || (
+            shadowTraining === null
+            && (
+              !assumption.operationalFacts.stock
+              || !Number.isSafeInteger(
+                assumption.operationalFacts.stock.rowVersion,
+              )
+              || assumption.operationalFacts.stock.rowVersion < 0
+              || !Number.isSafeInteger(
+                assumption.operationalFacts.stock.onHandQuantity,
+              )
+              || assumption.operationalFacts.stock.onHandQuantity < 0
+              || !Number.isSafeInteger(
+                assumption.operationalFacts.stock.activeClaimedQuantity,
+              )
+              || assumption.operationalFacts.stock.activeClaimedQuantity < 0
+              || assumption.operationalFacts.stock.availableQuantity
+                !== assumption.operationalFacts.stock.onHandQuantity
+                  - assumption.operationalFacts.stock.activeClaimedQuantity
+              || assumption.operationalFacts.stock.availableQuantity <= 0
+            )
           )
-          || assumption.operationalFacts.stock.rowVersion < 0
-          || !Number.isSafeInteger(
-            assumption.operationalFacts.stock.onHandQuantity,
+          || (
+            shadowTraining !== null
+            && assumption.operationalFacts.stock !== null
           )
-          || assumption.operationalFacts.stock.onHandQuantity < 0
-          || !Number.isSafeInteger(
-            assumption.operationalFacts.stock.activeClaimedQuantity,
-          )
-          || assumption.operationalFacts.stock.activeClaimedQuantity < 0
-          || assumption.operationalFacts.stock.availableQuantity
-            !== assumption.operationalFacts.stock.onHandQuantity
-              - assumption.operationalFacts.stock.activeClaimedQuantity
-          || assumption.operationalFacts.stock.availableQuantity <= 0
         )
       )
       || (
@@ -1178,6 +1222,7 @@ export async function readCartonizationRateCandidateContext(input: {
     ship_to_snapshot_ciphertext: Buffer | null
     ship_to_snapshot_iv: Buffer | null
     ship_to_snapshot_tag: Buffer | null
+    canonical_order_global_id: string | null
   }>(
     `SELECT
        candidate.organization_id::text,
@@ -1188,11 +1233,15 @@ export async function readCartonizationRateCandidateContext(input: {
        candidate.ship_to_snapshot_state,
        candidate.ship_to_snapshot_ciphertext,
        candidate.ship_to_snapshot_iv,
-       candidate.ship_to_snapshot_tag
+       candidate.ship_to_snapshot_tag,
+       canonical_order.global_id AS canonical_order_global_id
      FROM operations_commerce_order_candidates candidate
      JOIN operations_integration_accounts account
        ON account.organization_id = candidate.organization_id
       AND account.id = candidate.integration_account_id
+     LEFT JOIN operations_orders canonical_order
+       ON canonical_order.organization_id = candidate.organization_id
+      AND canonical_order.id = candidate.canonical_order_id
      WHERE candidate.organization_id = $1::uuid
        AND account.global_id = $2
        AND candidate.global_id = $3
@@ -1221,30 +1270,39 @@ export async function readCartonizationRateCandidateContext(input: {
       'CARTONIZATION_RATE_CANDIDATE_REVISION_CONFLICT',
     )
   }
-  if (
-    row.ship_to_snapshot_state !== 'confirmed'
-    || !row.ship_to_snapshot_ciphertext
-    || !row.ship_to_snapshot_iv
-    || !row.ship_to_snapshot_tag
-  ) {
-    fail(
-      'Confirm the provider or manual ship-to address before comparing carrier rates',
-      409,
-      'CARTONIZATION_RATE_DESTINATION_REQUIRED',
-    )
-  }
-  const decrypted = decryptCommerceCandidateSnapshot(
-    {
-      ciphertext: row.ship_to_snapshot_ciphertext,
-      iv: row.ship_to_snapshot_iv,
-      tag: row.ship_to_snapshot_tag,
-    },
-    row.organization_id,
-    row.account_global_id,
-    row.external_order_id,
-    row.source_hash,
-    'ship_to',
-  )
+  const decrypted = row.canonical_order_global_id
+    ? orderShipToStorageValue((
+        await readOperationsOrderShipmentAddressInPostgres({
+          organizationId: row.organization_id,
+          orderGlobalId: row.canonical_order_global_id,
+        })
+      ).value)
+    : (() => {
+        if (
+          row.ship_to_snapshot_state !== 'confirmed'
+          || !row.ship_to_snapshot_ciphertext
+          || !row.ship_to_snapshot_iv
+          || !row.ship_to_snapshot_tag
+        ) {
+          fail(
+            'Add the ship-to details needed to compare carrier rates',
+            409,
+            'CARTONIZATION_RATE_DESTINATION_REQUIRED',
+          )
+        }
+        return decryptCommerceCandidateSnapshot(
+          {
+            ciphertext: row.ship_to_snapshot_ciphertext!,
+            iv: row.ship_to_snapshot_iv!,
+            tag: row.ship_to_snapshot_tag!,
+          },
+          row.organization_id,
+          row.account_global_id,
+          row.external_order_id,
+          row.source_hash,
+          'ship_to',
+        )
+      })()
   const destination = (() => {
     try {
       return normalizeCarrierSandboxParty({
@@ -1819,6 +1877,10 @@ export async function writeCartonizationRateEvidenceInPostgres(
   assertCartonizationRateEvidenceOrToolsProfiles(input)
   assertCartonizationRateEvidenceOperationalGeometryProvenance(input)
   assertCartonizationRateEvidenceMaterialAssumptions(input)
+  const shadowTrainingEvidence = Object.hasOwn(
+    input.planSnapshot,
+    'shadowTraining',
+  )
   const inputPlanResultHash = cartonizationRateEvidenceHash(input.planSnapshot)
   if (inputPlanResultHash !== input.planResultHash) {
     fail('Plan result hash does not match the exact plan snapshot', 400)
@@ -1892,6 +1954,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
       ship_to_snapshot_ciphertext: Buffer | null
       ship_to_snapshot_iv: Buffer | null
       ship_to_snapshot_tag: Buffer | null
+      canonical_order_global_id: string | null
       warehouse_id: string
       inventory_sync_run_id: string | null
     }>(
@@ -1906,6 +1969,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
          candidate.ship_to_snapshot_ciphertext,
          candidate.ship_to_snapshot_iv,
          candidate.ship_to_snapshot_tag,
+         canonical_order.global_id AS canonical_order_global_id,
          warehouse.id::text AS warehouse_id,
          inventory_run.id::text AS inventory_sync_run_id
        FROM operations_integration_accounts account
@@ -1913,6 +1977,9 @@ export async function writeCartonizationRateEvidenceInPostgres(
          ON candidate.organization_id = account.organization_id
         AND candidate.integration_account_id = account.id
         AND candidate.global_id = $3
+       LEFT JOIN operations_orders canonical_order
+         ON canonical_order.organization_id = candidate.organization_id
+        AND canonical_order.id = candidate.canonical_order_id
        JOIN operations_warehouses warehouse
          ON warehouse.organization_id = account.organization_id
         AND warehouse.global_id = $5
@@ -1947,30 +2014,41 @@ export async function writeCartonizationRateEvidenceInPostgres(
         'CARTONIZATION_RATE_EVIDENCE_REVISION_CONFLICT',
       )
     }
-    if (
-      exactContext.ship_to_snapshot_state !== 'confirmed'
-      || !exactContext.ship_to_snapshot_ciphertext
-      || !exactContext.ship_to_snapshot_iv
-      || !exactContext.ship_to_snapshot_tag
-    ) {
-      fail(
-        'The confirmed destination changed before the proof could be saved',
-        409,
-        'CARTONIZATION_RATE_DESTINATION_STALE',
-      )
-    }
-    const exactDestinationSnapshot = decryptCommerceCandidateSnapshot(
-        {
-          ciphertext: exactContext.ship_to_snapshot_ciphertext,
-          iv: exactContext.ship_to_snapshot_iv,
-          tag: exactContext.ship_to_snapshot_tag,
-        },
-        input.organizationId,
-        exactContext.account_global_id,
-        exactContext.external_order_id,
-        exactContext.candidate_source_hash,
-        'ship_to',
-      )
+    const exactDestinationSnapshot = exactContext.canonical_order_global_id
+      ? orderShipToStorageValue((
+          await readOperationsOrderShipmentAddressInPostgres({
+            organizationId: input.organizationId,
+            orderGlobalId: exactContext.canonical_order_global_id,
+            client,
+            lock: true,
+          })
+        ).value)
+      : (() => {
+          if (
+            exactContext.ship_to_snapshot_state !== 'confirmed'
+            || !exactContext.ship_to_snapshot_ciphertext
+            || !exactContext.ship_to_snapshot_iv
+            || !exactContext.ship_to_snapshot_tag
+          ) {
+            fail(
+              'The destination changed before the proof could be saved',
+              409,
+              'CARTONIZATION_RATE_DESTINATION_STALE',
+            )
+          }
+          return decryptCommerceCandidateSnapshot(
+            {
+              ciphertext: exactContext.ship_to_snapshot_ciphertext!,
+              iv: exactContext.ship_to_snapshot_iv!,
+              tag: exactContext.ship_to_snapshot_tag!,
+            },
+            input.organizationId,
+            exactContext.account_global_id,
+            exactContext.external_order_id,
+            exactContext.candidate_source_hash,
+            'ship_to',
+          )
+        })()
     const exactDestination = normalizeCarrierSandboxParty({
       name: destinationText(
         exactDestinationSnapshot.name,
@@ -2155,7 +2233,10 @@ export async function writeCartonizationRateEvidenceInPostgres(
           || !['customer_confirmed', 'measured', 'provider'].includes(
             material.rated_outer_dimension_evidence_type || '',
           )
-          || !material.rated_outer_dimension_evidence_reference?.trim()
+          || (
+            material.rated_outer_dimension_evidence_type !== 'measured'
+            && !material.rated_outer_dimension_evidence_reference?.trim()
+          )
           || material.rated_outer_dimension_confirmed_at === null
           || material.tare_weight_grams !== packageInput.tareWeightGrams
         )
@@ -2202,69 +2283,79 @@ export async function writeCartonizationRateEvidenceInPostgres(
             'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STALE',
           )
         }
-        const stock = await client.query<{
-          is_available: boolean
-          on_hand_quantity: number | null
-          row_version: string
-          active_claimed_quantity: string
-        }>(
-          `SELECT
-             stock.is_available,
-             stock.on_hand_quantity,
-             stock.row_version::text,
-             COALESCE((
-               SELECT sum(claim.quantity)
-               FROM operations_packaging_material_claims claim
-               WHERE claim.organization_id = stock.organization_id
-                 AND claim.packaging_material_id =
-                      stock.packaging_material_id
-                 AND claim.warehouse_id = stock.warehouse_id
-                 AND claim.status = 'active'
-             ), 0)::text AS active_claimed_quantity
-           FROM operations_packaging_material_stock stock
-           WHERE stock.organization_id = $1::uuid
-             AND stock.packaging_material_id = $2::uuid
-             AND stock.warehouse_id = $3::uuid
-           LIMIT 1
-           FOR SHARE OF stock`,
-          [
-            input.organizationId,
-            material.material_id,
-            exactContext.warehouse_id,
-          ],
-        )
-        const currentStock = stock.rows[0]
-        const activeClaimedQuantity = currentStock
-          ? safeInteger(
-              currentStock.active_claimed_quantity,
-              `${packageInput.packagingMaterialGlobalId} active claims`,
+        if (!shadowTrainingEvidence) {
+          const operationalStock = operationalFacts.stock
+          if (!operationalStock) {
+            fail(
+              `${packageInput.packagingMaterialGlobalId} is missing operational stock evidence`,
+              409,
+              'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
             )
-          : 0
-        const requiredQuantity = requiredMaterialQuantities.get(
-          packageInput.packagingMaterialGlobalId,
-        ) || 0
-        if (
-          !currentStock
-          || currentStock.is_available !== true
-          || currentStock.on_hand_quantity === null
-          || safeInteger(
-            currentStock.row_version,
-            `${packageInput.packagingMaterialGlobalId} stock row version`,
-          ) !== operationalFacts.stock.rowVersion
-          || currentStock.on_hand_quantity
-            !== operationalFacts.stock.onHandQuantity
-          || activeClaimedQuantity
-            !== operationalFacts.stock.activeClaimedQuantity
-          || currentStock.on_hand_quantity - activeClaimedQuantity
-            !== operationalFacts.stock.availableQuantity
-          || currentStock.on_hand_quantity - activeClaimedQuantity
-            < requiredQuantity
-        ) {
-          fail(
-            `${packageInput.packagingMaterialGlobalId} has insufficient current stock for ${requiredQuantity} planned package(s)`,
-            409,
-            'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
+          }
+          const stock = await client.query<{
+            is_available: boolean
+            on_hand_quantity: number | null
+            row_version: string
+            active_claimed_quantity: string
+          }>(
+            `SELECT
+               stock.is_available,
+               stock.on_hand_quantity,
+               stock.row_version::text,
+               COALESCE((
+                 SELECT sum(claim.quantity)
+                 FROM operations_packaging_material_claims claim
+                 WHERE claim.organization_id = stock.organization_id
+                   AND claim.packaging_material_id =
+                        stock.packaging_material_id
+                   AND claim.warehouse_id = stock.warehouse_id
+                   AND claim.status = 'active'
+               ), 0)::text AS active_claimed_quantity
+             FROM operations_packaging_material_stock stock
+             WHERE stock.organization_id = $1::uuid
+               AND stock.packaging_material_id = $2::uuid
+               AND stock.warehouse_id = $3::uuid
+             LIMIT 1
+             FOR SHARE OF stock`,
+            [
+              input.organizationId,
+              material.material_id,
+              exactContext.warehouse_id,
+            ],
           )
+          const currentStock = stock.rows[0]
+          const activeClaimedQuantity = currentStock
+            ? safeInteger(
+                currentStock.active_claimed_quantity,
+                `${packageInput.packagingMaterialGlobalId} active claims`,
+              )
+            : 0
+          const requiredQuantity = requiredMaterialQuantities.get(
+            packageInput.packagingMaterialGlobalId,
+          ) || 0
+          if (
+            !currentStock
+            || currentStock.is_available !== true
+            || currentStock.on_hand_quantity === null
+            || safeInteger(
+              currentStock.row_version,
+              `${packageInput.packagingMaterialGlobalId} stock row version`,
+            ) !== operationalStock.rowVersion
+            || currentStock.on_hand_quantity
+              !== operationalStock.onHandQuantity
+            || activeClaimedQuantity
+              !== operationalStock.activeClaimedQuantity
+            || currentStock.on_hand_quantity - activeClaimedQuantity
+              !== operationalStock.availableQuantity
+            || currentStock.on_hand_quantity - activeClaimedQuantity
+              < requiredQuantity
+          ) {
+            fail(
+              `${packageInput.packagingMaterialGlobalId} has insufficient current stock for ${requiredQuantity} planned package(s)`,
+              409,
+              'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_STALE',
+            )
+          }
         }
       }
       if (

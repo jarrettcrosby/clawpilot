@@ -8,6 +8,7 @@ import {
   SHOPIFY_RECEIPT_PROOF_SCOPES,
 } from '@/lib/integrations/commerceCapabilities'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   faireFulfillmentWriteReadiness,
   type FaireFulfillmentWriteReadiness,
@@ -742,6 +743,28 @@ async function auditCommerce(
   }, client)
 }
 
+function commerceProviderWritesAccountLockKey(input: {
+  organizationId: string
+  accountGlobalId: string
+}) {
+  return `commerce-provider-writes:${input.organizationId}:${input.accountGlobalId}`
+}
+
+async function fenceExpiredCommerceFulfillmentLeasesWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    accountGlobalId: string
+  },
+) {
+  await client.query(
+    `SELECT public.fence_operations_commerce_fulfillment_expired_leases(
+       $1::uuid, $2
+     )`,
+    [input.organizationId, input.accountGlobalId],
+  )
+}
+
 export async function createFaireOAuthInstallationInPostgres(input: {
   organizationId: string
   browserSessionId: string
@@ -989,6 +1012,31 @@ export async function writeCommerceCredentialInPostgres(input: {
       client,
       `commerce-credential:${input.organizationId}:${input.provider}:${input.environment}:${input.externalAccountId}`,
     )
+    const existingIdentity = await client.query<{
+      global_id: string
+    }>(
+      `SELECT global_id
+       FROM operations_integration_accounts
+       WHERE organization_id = $1::uuid
+         AND integration_type = 'commerce'
+         AND provider = $2
+         AND environment = $3
+       LIMIT 1`,
+      [input.organizationId, input.provider, input.environment],
+    )
+    if (existingIdentity.rows[0]) {
+      await acquireTransactionAdvisoryLock(
+        client,
+        commerceProviderWritesAccountLockKey({
+          organizationId: input.organizationId,
+          accountGlobalId: existingIdentity.rows[0].global_id,
+        }),
+      )
+      await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+        organizationId: input.organizationId,
+        accountGlobalId: existingIdentity.rows[0].global_id,
+      })
+    }
     const existingAccount = await client.query<{
       id: string
       global_id: string
@@ -1307,6 +1355,17 @@ export async function markCommerceCredentialVerificationInPostgres(input: {
   await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
       client,
+      commerceProviderWritesAccountLockKey({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+      }),
+    )
+    await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
+    await acquireTransactionAdvisoryLock(
+      client,
       commerceOrderSyncAccountLockKey({
         organizationId: input.organizationId,
         accountGlobalId: input.accountGlobalId,
@@ -1559,6 +1618,17 @@ export async function disconnectCommerceCredentialInPostgres(input: {
   actorEmail: string
 }) {
   await withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      commerceProviderWritesAccountLockKey({
+        organizationId: input.organizationId,
+        accountGlobalId: input.accountGlobalId,
+      }),
+    )
+    await fenceExpiredCommerceFulfillmentLeasesWithClient(client, {
+      organizationId: input.organizationId,
+      accountGlobalId: input.accountGlobalId,
+    })
     const account = await client.query<{
       id: string
       global_id: string
@@ -1893,33 +1963,28 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         'Shopify inventory webhook target evidence is incomplete',
       )
     }
-    const activationState = isProductDeletion
+    const productDeletionStoreSyncRunning = isProductDeletion
       ? (
           await client.query<{
-            state:
-              | 'disabled'
-              | 'shadow'
-              | 'read_only'
-              | 'active'
-              | 'frozen'
+            running: boolean
           }>(
-            `SELECT state
-             FROM operations_activation_scopes
-             WHERE organization_id = $1::uuid
-             FOR SHARE`,
-            [input.runtime.organizationId],
+            `SELECT operations_commerce_store_sync_is_running(
+               $1::uuid,
+               $2::uuid
+             ) AS running`,
+            [
+              input.runtime.organizationId,
+              input.runtime.integrationAccountId,
+            ],
           )
-        ).rows[0]?.state || null
-      : null
+        ).rows[0]?.running === true
+      : false
     const productDeletionCanReconcile = Boolean(
       input.productDeletion
       && current.receipt_intake_enabled
       && current.status === 'active'
       && current.actor_email
-      && (
-        activationState === 'shadow'
-        || activationState === 'active'
-      ),
+      && productDeletionStoreSyncRunning,
     )
     const reconcileProductDeletion = async (
       receivedAt: string | Date,
@@ -1946,6 +2011,7 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
         observedAt: receivedAt,
         providerUpdatedAt: input.productDeletion.providerUpdatedAt,
         actorEmail: current.actor_email,
+        providerReadAuthority: 'automatic',
       }, client)
     }
     const existing = await client.query<{
@@ -2448,9 +2514,9 @@ export async function recordShopifyWebhookReceiptInPostgres(input: {
 
 /**
  * Replays signed product deletions that were durably held while receipt intake
- * or Operations activation was paused. The encrypted receipt is the source of
+ * or Store sync was paused. The encrypted receipt is the source of
  * truth; no caller supplies a plaintext product identity or locator.
- * If the catalog worker is disabled while activation alone resumes, the
+ * If the catalog worker is disabled while Store sync alone resumes, the
  * immutable receipt intentionally remains held until this replay entry point,
  * receipt-intake re-enable, or an authenticated duplicate delivery runs.
  */
@@ -2502,8 +2568,6 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
      JOIN operations_commerce_credentials credential
        ON credential.organization_id = account.organization_id
       AND credential.integration_account_id = account.id
-     JOIN operations_activation_scopes activation
-       ON activation.organization_id = account.organization_id
      WHERE receipt.provider = 'shopify'
        AND receipt.topic = 'products/delete'
        AND receipt.state = 'held'
@@ -2522,7 +2586,7 @@ export async function replayHeldShopifyProductDeletionsInPostgres(input: {
        AND credential.auth_mode = 'shopify_client_credentials'
        AND credential.verification_status = 'verified'
        AND credential.webhook_verification_status = 'verified'
-       AND activation.state IN ('shadow', 'active')
+       AND ${commerceStoreSyncRunningSql('account')}
        AND COALESCE(
          account.updated_by,
          account.created_by,

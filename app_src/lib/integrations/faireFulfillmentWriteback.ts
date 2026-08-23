@@ -595,6 +595,7 @@ export async function reconcileFaireFulfillmentWritebackReadOnly(
 export async function executeFaireFulfillmentWriteback(
   input: FaireFulfillmentWritebackInput,
   dependencies: FaireFulfillmentWritebackDependencies = DEFAULT_DEPENDENCIES,
+  beforeProviderMutation?: () => Promise<void>,
 ): Promise<FaireFulfillmentWritebackResult> {
   if (!['execute', 'reconcile_unknown'].includes(String(input?.mode || ''))) {
     throw new FaireFulfillmentWritebackError(
@@ -657,6 +658,7 @@ export async function executeFaireFulfillmentWriteback(
   let order = initialOrder
   let state = providerState(order)
   if (state === 'NEW') {
+    await beforeProviderMutation?.()
     try {
       const expectedShipDate = normalizeExpectedShipDate(input.expectedShipDate)
       await client.moveOrderToProcessing(
@@ -716,6 +718,7 @@ export async function executeFaireFulfillmentWriteback(
     shippingType: 'SHIP_ON_YOUR_OWN',
     ...(item.makerCost ? { makerCost: item.makerCost } : {}),
   }))
+  await beforeProviderMutation?.()
   try {
     await client.addOrderShipments(orderId, shipments)
   } catch (error) {

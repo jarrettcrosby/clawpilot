@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { commerceReadAccountSql } from '@/lib/integrations/commerceReadRuntime'
+import { commerceStoreSyncRunningSql } from '@/lib/operations/commerceStoreSync'
 import {
   acquireTransactionAdvisoryLock,
   query,
@@ -14,6 +15,7 @@ const SHOPIFY_INVENTORY_READ_ACCOUNT_SQL = commerceReadAccountSql(
   'account',
   { developmentRequiresActive: true },
 )
+const STORE_SYNC_RUNNING_SQL = commerceStoreSyncRunningSql('account')
 const INVENTORY_READABLE_CONNECTION_SQL = `(
   COALESCE(account.configuration->'grantedScopes', '[]'::jsonb)
     ?| ARRAY['read_inventory', 'write_inventory']
@@ -30,6 +32,11 @@ export type ShopifyInventoryRefreshJob = {
   accountGlobalId: string
   carrierServiceConfigId: string
   warehouseId: string
+  locationMappingId: string | null
+  locationMappingRowVersion: number | null
+  providerLocationId: string | null
+  inventoryLocationId: string | null
+  inventoryPoolId: string | null
   credentialGeneration: number
   activationRevision: number
   configRowVersion: number
@@ -139,35 +146,62 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
        LIMIT 1
      )
      SELECT
-       COALESCE(job.status, 'idle') AS status,
+       COALESCE(
+         CASE job.status
+           WHEN 'mapped_pending' THEN 'pending'
+           WHEN 'mapped_processing' THEN 'processing'
+           WHEN 'mapped_failed' THEN 'failed'
+           WHEN 'mapped_succeeded' THEN 'succeeded'
+           WHEN 'mapped_cancelled' THEN 'cancelled'
+           WHEN 'mapped_dead' THEN 'dead'
+           ELSE job.status
+         END,
+         'idle'
+       ) AS status,
        job.last_error_code,
        job.attempt_count,
        job.max_attempts,
        job.available_at,
        job.completed_at,
        COALESCE(affected.orders, '[]'::jsonb) AS affected_orders,
-       CASE
-         WHEN job.status <> 'dead' THEN false
-         ELSE EXISTS (
-           SELECT 1
-           FROM operations_commerce_inventory_sync_runs recovered
-           WHERE recovered.organization_id = current.organization_id
-             AND recovered.integration_account_id =
-                 current.integration_account_id
-             AND recovered.warehouse_id = current.warehouse_id
-             AND recovered.status = 'succeeded'
-             AND recovered.completed_at > job.completed_at
-         )
-       END AS recovered_after_dead
+       COALESCE(job.recovered_after_dead, false) AS recovered_after_dead
      FROM current_config current
      LEFT JOIN LATERAL (
-       SELECT job.*
+       SELECT
+         job.*,
+         CASE
+           WHEN job.status NOT IN ('dead', 'mapped_dead') THEN false
+           ELSE EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_sync_runs recovered
+             WHERE recovered.organization_id = current.organization_id
+               AND recovered.integration_account_id =
+                   current.integration_account_id
+               AND recovered.status = 'succeeded'
+               AND recovered.completed_at > job.completed_at
+               AND (
+                 (
+                   job.location_mapping_id IS NOT NULL
+                   AND recovered.location_mapping_id =
+                       job.location_mapping_id
+                   AND recovered.provider_location_id =
+                       job.provider_location_id
+                   AND recovered.warehouse_id = job.warehouse_id
+                   AND recovered.location_id = job.inventory_location_id
+                   AND recovered.inventory_pool_id = job.inventory_pool_id
+                 )
+                 OR (
+                   job.location_mapping_id IS NULL
+                   AND recovered.warehouse_id = job.warehouse_id
+                 )
+               )
+           )
+         END AS recovered_after_dead
        FROM operations_shopify_inventory_refresh_jobs job
        WHERE job.organization_id = current.organization_id
          AND job.integration_account_id = current.integration_account_id
          AND job.carrier_service_config_id =
              current.carrier_service_config_id
-         AND job.warehouse_id = current.warehouse_id
          AND job.credential_generation = current.credential_generation
          AND job.activation_revision = current.activation_revision
          AND job.config_row_version = current.row_version
@@ -175,7 +209,67 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
          AND job.policy_hash = current.policy_hash
          AND job.inventory_max_age_seconds =
              current.inventory_max_age_seconds
-       ORDER BY job.created_at DESC, job.id DESC
+         AND (
+           (
+             job.location_mapping_id IS NULL
+             AND job.warehouse_id = current.warehouse_id
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_inventory_location_mappings
+                 existing_mapping
+               WHERE existing_mapping.organization_id =
+                     job.organization_id
+                 AND existing_mapping.integration_account_id =
+                     job.integration_account_id
+             )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_location_mappings mapping
+             WHERE mapping.organization_id = job.organization_id
+               AND mapping.integration_account_id =
+                   job.integration_account_id
+               AND mapping.id = job.location_mapping_id
+               AND mapping.active = true
+               AND mapping.inventory_import_enabled = true
+               AND mapping.row_version = job.location_mapping_row_version
+               AND mapping.external_location_id = job.provider_location_id
+               AND mapping.warehouse_id = job.warehouse_id
+               AND mapping.location_id = job.inventory_location_id
+               AND mapping.inventory_pool_id = job.inventory_pool_id
+           )
+         )
+       ORDER BY
+         (
+           job.status IN ('dead', 'mapped_dead')
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_sync_runs recovered
+             WHERE recovered.organization_id = current.organization_id
+               AND recovered.integration_account_id =
+                   current.integration_account_id
+               AND recovered.status = 'succeeded'
+               AND recovered.completed_at > job.completed_at
+               AND (
+                 (
+                   job.location_mapping_id IS NOT NULL
+                   AND recovered.location_mapping_id =
+                       job.location_mapping_id
+                   AND recovered.provider_location_id =
+                       job.provider_location_id
+                   AND recovered.warehouse_id = job.warehouse_id
+                   AND recovered.location_id = job.inventory_location_id
+                   AND recovered.inventory_pool_id = job.inventory_pool_id
+                 )
+                 OR (
+                   job.location_mapping_id IS NULL
+                   AND recovered.warehouse_id = job.warehouse_id
+                 )
+               )
+           )
+         ) DESC,
+         job.created_at DESC,
+         job.id DESC
        LIMIT 1
      ) job ON true
      LEFT JOIN LATERAL (
@@ -212,10 +306,17 @@ export async function readShopifyInventoryRefreshRecoveryStateFromPostgres(
            AND source_order.archived_at IS NULL
            AND source_order.status = 'released'
            AND latest_plan.status = 'released'
-           AND position.warehouse_id = current.warehouse_id
+           AND position.warehouse_id = job.warehouse_id
+           AND (
+             job.location_mapping_id IS NULL
+             OR (
+               position.location_id = job.inventory_location_id
+               AND position.pool_id = job.inventory_pool_id
+             )
+           )
            AND source_level.integration_account_id =
                current.integration_account_id
-           AND job.status = 'dead'
+           AND job.status IN ('dead', 'mapped_dead')
            AND job.last_error_code =
                'SHOPIFY_INVENTORY_PROVIDER_COMMITMENT_CONFLICT'
            AND operations_shopify_external_fulfillment_reconciliation_required(
@@ -426,7 +527,10 @@ function currentFenceSql(jobAlias = 'job') {
       ON config.organization_id = ${jobAlias}.organization_id
      AND config.id = ${jobAlias}.carrier_service_config_id
      AND config.integration_account_id = ${jobAlias}.integration_account_id
-     AND config.warehouse_id = ${jobAlias}.warehouse_id
+     AND (
+       ${jobAlias}.location_mapping_id IS NOT NULL
+       OR config.warehouse_id = ${jobAlias}.warehouse_id
+     )
      AND config.credential_generation = ${jobAlias}.credential_generation
      AND config.activation_revision = ${jobAlias}.activation_revision
      AND config.row_version = ${jobAlias}.config_row_version
@@ -448,16 +552,38 @@ function currentFenceSql(jobAlias = 'job') {
          ${jobAlias}.integration_account_id
      AND credential.credential_version = ${jobAlias}.credential_generation
      AND credential.verification_status = 'verified'
+    LEFT JOIN operations_commerce_inventory_location_mappings mapping
+      ON mapping.organization_id = ${jobAlias}.organization_id
+     AND mapping.integration_account_id =
+         ${jobAlias}.integration_account_id
+     AND mapping.id = ${jobAlias}.location_mapping_id
+     AND mapping.active = true
+     AND mapping.inventory_import_enabled = true
+     AND mapping.row_version = ${jobAlias}.location_mapping_row_version
+     AND mapping.external_location_id = ${jobAlias}.provider_location_id
+     AND mapping.warehouse_id = ${jobAlias}.warehouse_id
+     AND mapping.location_id = ${jobAlias}.inventory_location_id
+     AND mapping.inventory_pool_id = ${jobAlias}.inventory_pool_id
     JOIN operations_activation_scopes activation
       ON activation.organization_id = ${jobAlias}.organization_id
-     AND activation.revision = ${jobAlias}.activation_revision
      AND (
-       (config.registration_state = 'registered'
-         AND activation.state IN ('shadow', 'active'))
-       OR
-       (config.registration_state = 'shadow_simulated'
-         AND activation.state = 'shadow')
+       ${jobAlias}.location_mapping_id IS NULL
+       OR mapping.id IS NOT NULL
      )
+     AND (
+       ${jobAlias}.location_mapping_id IS NOT NULL
+       OR NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_inventory_location_mappings
+           existing_mapping
+         WHERE existing_mapping.organization_id =
+               ${jobAlias}.organization_id
+           AND existing_mapping.integration_account_id =
+               ${jobAlias}.integration_account_id
+       )
+     )
+     AND ${STORE_SYNC_RUNNING_SQL}
+     AND config.registration_state IN ('registered', 'shadow_simulated')
   `
 }
 
@@ -466,17 +592,23 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
     const stale = await client.query(
       `UPDATE operations_shopify_inventory_refresh_jobs job
        SET status = CASE
-             WHEN job.status = 'processing' THEN job.status
-             ELSE 'cancelled'
+             WHEN job.status IN ('processing', 'mapped_processing')
+               THEN job.status
+             WHEN job.location_mapping_id IS NULL THEN 'cancelled'
+             ELSE 'mapped_cancelled'
            END,
            cancel_requested = true,
            completed_at = CASE
-             WHEN job.status = 'processing' THEN job.completed_at
+             WHEN job.status IN ('processing', 'mapped_processing')
+               THEN job.completed_at
              ELSE now()
            END,
            last_error_code = 'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
            updated_at = now()
-       WHERE job.status IN ('pending', 'processing', 'failed')
+       WHERE job.status IN (
+           'pending', 'processing', 'failed',
+           'mapped_pending', 'mapped_processing', 'mapped_failed'
+         )
          AND NOT EXISTS (
            SELECT 1
            FROM operations_shopify_carrier_service_configs config
@@ -488,11 +620,25 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
             AND credential.integration_account_id = account.id
            JOIN operations_activation_scopes activation
              ON activation.organization_id = config.organization_id
+           LEFT JOIN operations_commerce_inventory_location_mappings mapping
+             ON mapping.organization_id = job.organization_id
+            AND mapping.integration_account_id = job.integration_account_id
+            AND mapping.id = job.location_mapping_id
+            AND mapping.active = true
+            AND mapping.inventory_import_enabled = true
+            AND mapping.row_version = job.location_mapping_row_version
+            AND mapping.external_location_id = job.provider_location_id
+            AND mapping.warehouse_id = job.warehouse_id
+            AND mapping.location_id = job.inventory_location_id
+            AND mapping.inventory_pool_id = job.inventory_pool_id
            WHERE config.organization_id = job.organization_id
              AND config.id = job.carrier_service_config_id
              AND config.integration_account_id =
                  job.integration_account_id
-             AND config.warehouse_id = job.warehouse_id
+             AND (
+               job.location_mapping_id IS NOT NULL
+               OR config.warehouse_id = job.warehouse_id
+             )
              AND config.credential_generation =
                  job.credential_generation
              AND config.activation_revision = job.activation_revision
@@ -509,22 +655,267 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
              AND credential.credential_version =
                  job.credential_generation
              AND credential.verification_status = 'verified'
-             AND activation.revision = job.activation_revision
-             AND (
-               (config.registration_state = 'registered'
-                 AND activation.state IN ('shadow', 'active'))
-               OR
-               (config.registration_state = 'shadow_simulated'
-                 AND activation.state = 'shadow')
+             AND config.registration_state IN (
+               'registered', 'shadow_simulated'
              )
              AND ${INVENTORY_READABLE_CONNECTION_SQL}
-             AND operations_shopify_carrier_service_config_is_ready(
-               config.organization_id, config.id
+             AND (
+               job.location_mapping_id IS NULL
+               OR mapping.id IS NOT NULL
+             )
+             AND (
+               job.location_mapping_id IS NOT NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_inventory_location_mappings
+                   existing_mapping
+                 WHERE existing_mapping.organization_id =
+                       job.organization_id
+                   AND existing_mapping.integration_account_id =
+                       job.integration_account_id
+               )
              )
          )`,
     )
-    const queued = await client.query(
-       `INSERT INTO operations_shopify_inventory_refresh_jobs (
+    const mapped = await client.query(
+      `WITH eligible AS (
+         SELECT
+           config.organization_id,
+           config.integration_account_id,
+           config.id AS carrier_service_config_id,
+           config.credential_generation,
+           config.activation_revision,
+           config.row_version AS config_row_version,
+           config.policy_revision,
+           config.policy_hash,
+           config.inventory_max_age_seconds,
+           COALESCE(watermark.dirty_version, 0) AS dirty_version,
+           COALESCE(watermark.reconciled_version, 0) AS reconciled_version
+         FROM operations_shopify_carrier_service_configs config
+         JOIN operations_integration_accounts account
+           ON account.organization_id = config.organization_id
+          AND account.id = config.integration_account_id
+         JOIN operations_commerce_credentials credential
+           ON credential.organization_id = account.organization_id
+          AND credential.integration_account_id = account.id
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = config.organization_id
+         LEFT JOIN operations_shopify_inventory_refresh_watermarks watermark
+           ON watermark.organization_id = config.organization_id
+          AND watermark.integration_account_id =
+              config.integration_account_id
+         WHERE config.registration_state IN (
+             'shadow_simulated', 'registered'
+           )
+           AND account.integration_type = 'commerce'
+           AND account.provider = 'shopify'
+           AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
+           AND account.commerce_credential_generation =
+               config.credential_generation
+           AND credential.credential_version = config.credential_generation
+           AND credential.verification_status = 'verified'
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
+           )
+           AND ${INVENTORY_READABLE_CONNECTION_SQL}
+           AND operations_shopify_inventory_read_config_is_ready(
+             config.organization_id, config.id
+           )
+       )
+       INSERT INTO operations_shopify_inventory_refresh_jobs (
+         organization_id, integration_account_id,
+         carrier_service_config_id, warehouse_id,
+         location_mapping_id, location_mapping_row_version,
+         provider_location_id, inventory_location_id, inventory_pool_id,
+         credential_generation, activation_revision,
+         config_row_version, policy_revision, policy_hash,
+         inventory_max_age_seconds, requested_dirty_version, status
+       )
+       SELECT
+         eligible.organization_id,
+         eligible.integration_account_id,
+         eligible.carrier_service_config_id,
+         mapping.warehouse_id,
+         mapping.id,
+         mapping.row_version,
+         mapping.external_location_id,
+         mapping.location_id,
+         mapping.inventory_pool_id,
+         eligible.credential_generation,
+         eligible.activation_revision,
+         eligible.config_row_version,
+         eligible.policy_revision,
+         eligible.policy_hash,
+         eligible.inventory_max_age_seconds,
+         eligible.dirty_version,
+         'mapped_pending'
+       FROM eligible
+       JOIN operations_commerce_inventory_location_mappings mapping
+         ON mapping.organization_id = eligible.organization_id
+        AND mapping.integration_account_id =
+            eligible.integration_account_id
+        AND mapping.active = true
+        AND mapping.inventory_import_enabled = true
+       WHERE NOT EXISTS (
+           SELECT 1
+           FROM operations_shopify_inventory_refresh_jobs dead
+           WHERE dead.organization_id = eligible.organization_id
+             AND dead.integration_account_id =
+                 eligible.integration_account_id
+             AND dead.carrier_service_config_id =
+                 eligible.carrier_service_config_id
+             AND dead.location_mapping_id = mapping.id
+             AND dead.location_mapping_row_version = mapping.row_version
+             AND dead.provider_location_id = mapping.external_location_id
+             AND dead.warehouse_id = mapping.warehouse_id
+             AND dead.inventory_location_id = mapping.location_id
+             AND dead.inventory_pool_id = mapping.inventory_pool_id
+             AND dead.credential_generation =
+                 eligible.credential_generation
+             AND dead.activation_revision = eligible.activation_revision
+             AND dead.config_row_version = eligible.config_row_version
+             AND dead.policy_revision = eligible.policy_revision
+             AND dead.policy_hash = eligible.policy_hash
+             AND dead.status = 'mapped_dead'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_commerce_inventory_sync_runs recovered
+               WHERE recovered.organization_id = eligible.organization_id
+                 AND recovered.integration_account_id =
+                     eligible.integration_account_id
+                 AND recovered.location_mapping_id = mapping.id
+                 AND recovered.provider_location_id =
+                     mapping.external_location_id
+                 AND recovered.warehouse_id = mapping.warehouse_id
+                 AND recovered.location_id = mapping.location_id
+                 AND recovered.inventory_pool_id =
+                     mapping.inventory_pool_id
+                 AND recovered.status = 'succeeded'
+                 AND recovered.completed_at > dead.completed_at
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_shopify_inventory_refresh_jobs succeeded
+           WHERE succeeded.organization_id = eligible.organization_id
+             AND succeeded.integration_account_id =
+                 eligible.integration_account_id
+             AND succeeded.carrier_service_config_id =
+                 eligible.carrier_service_config_id
+             AND succeeded.location_mapping_id = mapping.id
+             AND succeeded.location_mapping_row_version = mapping.row_version
+             AND succeeded.provider_location_id = mapping.external_location_id
+             AND succeeded.warehouse_id = mapping.warehouse_id
+             AND succeeded.inventory_location_id = mapping.location_id
+             AND succeeded.inventory_pool_id = mapping.inventory_pool_id
+             AND succeeded.credential_generation =
+                 eligible.credential_generation
+             AND succeeded.activation_revision =
+                 eligible.activation_revision
+             AND succeeded.config_row_version =
+                 eligible.config_row_version
+             AND succeeded.policy_revision = eligible.policy_revision
+             AND succeeded.policy_hash = eligible.policy_hash
+             AND succeeded.inventory_max_age_seconds =
+                 eligible.inventory_max_age_seconds
+             AND succeeded.requested_dirty_version = eligible.dirty_version
+             AND succeeded.status = 'mapped_succeeded'
+         )
+         AND (
+           eligible.dirty_version > eligible.reconciled_version
+           OR NOT EXISTS (
+             SELECT 1
+             FROM operations_commerce_inventory_sync_runs recent
+             WHERE recent.organization_id = eligible.organization_id
+               AND recent.integration_account_id =
+                   eligible.integration_account_id
+               AND recent.location_mapping_id = mapping.id
+               AND recent.provider_location_id =
+                   mapping.external_location_id
+               AND recent.warehouse_id = mapping.warehouse_id
+               AND recent.location_id = mapping.location_id
+               AND recent.inventory_pool_id = mapping.inventory_pool_id
+               AND recent.status = 'succeeded'
+               AND recent.provider_fetched_at > now() - make_interval(
+                 secs => GREATEST(
+                   15,
+                   floor(
+                     eligible.inventory_max_age_seconds / 2.0
+                   )::integer
+                 )
+               )
+           )
+         )
+       ON CONFLICT (
+         organization_id, integration_account_id, location_mapping_id
+       ) WHERE location_mapping_id IS NOT NULL
+         AND status IN (
+           'mapped_pending', 'mapped_processing', 'mapped_failed'
+         )
+       DO UPDATE SET
+         requested_dirty_version = EXCLUDED.requested_dirty_version,
+         status = 'mapped_pending',
+         available_at = now(),
+         last_error_code = NULL,
+         updated_at = now()
+       WHERE operations_shopify_inventory_refresh_jobs.status IN (
+         'mapped_pending', 'mapped_failed'
+       )
+         -- Only a genuinely newer webhook signal may supersede a failed
+         -- job's exponential retry delay.
+         AND EXCLUDED.requested_dirty_version >
+           operations_shopify_inventory_refresh_jobs
+             .requested_dirty_version`,
+    )
+    const legacy = await client.query(
+      `WITH eligible AS (
+         SELECT
+           config.organization_id,
+           config.integration_account_id,
+           config.id AS carrier_service_config_id,
+           config.warehouse_id,
+           config.credential_generation,
+           config.activation_revision,
+           config.row_version AS config_row_version,
+           config.policy_revision,
+           config.policy_hash,
+           config.inventory_max_age_seconds,
+           COALESCE(watermark.dirty_version, 0) AS dirty_version,
+           COALESCE(watermark.reconciled_version, 0) AS reconciled_version
+         FROM operations_shopify_carrier_service_configs config
+         JOIN operations_integration_accounts account
+           ON account.organization_id = config.organization_id
+          AND account.id = config.integration_account_id
+         JOIN operations_commerce_credentials credential
+           ON credential.organization_id = account.organization_id
+          AND credential.integration_account_id = account.id
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = config.organization_id
+         LEFT JOIN operations_shopify_inventory_refresh_watermarks watermark
+           ON watermark.organization_id = config.organization_id
+          AND watermark.integration_account_id =
+              config.integration_account_id
+         WHERE config.registration_state IN (
+             'shadow_simulated', 'registered'
+           )
+           AND account.integration_type = 'commerce'
+           AND account.provider = 'shopify'
+           AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
+           AND account.commerce_credential_generation =
+               config.credential_generation
+           AND credential.credential_version = config.credential_generation
+           AND credential.verification_status = 'verified'
+           AND ${STORE_SYNC_RUNNING_SQL}
+           AND config.registration_state IN (
+             'registered', 'shadow_simulated'
+           )
+           AND ${INVENTORY_READABLE_CONNECTION_SQL}
+           AND operations_shopify_inventory_read_config_is_ready(
+             config.organization_id, config.id
+           )
+       )
+       INSERT INTO operations_shopify_inventory_refresh_jobs (
          organization_id, integration_account_id,
          carrier_service_config_id, warehouse_id,
          credential_generation, activation_revision,
@@ -532,100 +923,76 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
          inventory_max_age_seconds, requested_dirty_version
        )
        SELECT
-         config.organization_id,
-         config.integration_account_id,
-         config.id,
-         config.warehouse_id,
-         config.credential_generation,
-         config.activation_revision,
-         config.row_version,
-         config.policy_revision,
-         config.policy_hash,
-         config.inventory_max_age_seconds,
-         COALESCE(watermark.dirty_version, 0)
-       FROM operations_shopify_carrier_service_configs config
-       JOIN operations_integration_accounts account
-         ON account.organization_id = config.organization_id
-        AND account.id = config.integration_account_id
-       JOIN operations_commerce_credentials credential
-         ON credential.organization_id = account.organization_id
-        AND credential.integration_account_id = account.id
-       JOIN operations_activation_scopes activation
-         ON activation.organization_id = config.organization_id
-       LEFT JOIN operations_shopify_inventory_refresh_watermarks watermark
-         ON watermark.organization_id = config.organization_id
-        AND watermark.integration_account_id =
-            config.integration_account_id
-       WHERE config.registration_state IN (
-           'shadow_simulated', 'registered'
-         )
-         AND account.integration_type = 'commerce'
-         AND account.provider = 'shopify'
-         AND ${SHOPIFY_INVENTORY_READ_ACCOUNT_SQL}
-         AND account.commerce_credential_generation =
-             config.credential_generation
-         AND credential.credential_version =
-             config.credential_generation
-         AND credential.verification_status = 'verified'
-         AND activation.revision = config.activation_revision
-         AND (
-           (config.registration_state = 'registered'
-             AND activation.state IN ('shadow', 'active'))
-           OR
-           (config.registration_state = 'shadow_simulated'
-             AND activation.state = 'shadow')
-         )
-         AND ${INVENTORY_READABLE_CONNECTION_SQL}
-         AND operations_shopify_carrier_service_config_is_ready(
-           config.organization_id, config.id
-         )
+         eligible.organization_id,
+         eligible.integration_account_id,
+         eligible.carrier_service_config_id,
+         eligible.warehouse_id,
+         eligible.credential_generation,
+         eligible.activation_revision,
+         eligible.config_row_version,
+         eligible.policy_revision,
+         eligible.policy_hash,
+         eligible.inventory_max_age_seconds,
+         eligible.dirty_version
+       FROM eligible
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_inventory_location_mappings mapping
+         WHERE mapping.organization_id = eligible.organization_id
+           AND mapping.integration_account_id =
+               eligible.integration_account_id
+       )
          AND NOT EXISTS (
            SELECT 1
            FROM operations_shopify_inventory_refresh_jobs dead
-           WHERE dead.organization_id = config.organization_id
+           WHERE dead.organization_id = eligible.organization_id
              AND dead.integration_account_id =
-                 config.integration_account_id
-             AND dead.carrier_service_config_id = config.id
+                 eligible.integration_account_id
+             AND dead.carrier_service_config_id =
+                 eligible.carrier_service_config_id
+             AND dead.location_mapping_id IS NULL
              AND dead.credential_generation =
-                 config.credential_generation
-             AND dead.activation_revision = config.activation_revision
-             AND dead.config_row_version = config.row_version
-             AND dead.policy_revision = config.policy_revision
-             AND dead.policy_hash = config.policy_hash
+                 eligible.credential_generation
+             AND dead.activation_revision = eligible.activation_revision
+             AND dead.config_row_version = eligible.config_row_version
+             AND dead.policy_revision = eligible.policy_revision
+             AND dead.policy_hash = eligible.policy_hash
              AND dead.status = 'dead'
              AND NOT EXISTS (
                SELECT 1
                FROM operations_commerce_inventory_sync_runs recovered
-               WHERE recovered.organization_id = config.organization_id
+               WHERE recovered.organization_id = eligible.organization_id
                  AND recovered.integration_account_id =
-                     config.integration_account_id
-                 AND recovered.warehouse_id = config.warehouse_id
+                     eligible.integration_account_id
+                 AND recovered.warehouse_id = eligible.warehouse_id
                  AND recovered.status = 'succeeded'
                  AND recovered.completed_at > dead.completed_at
              )
          )
          AND (
-           COALESCE(watermark.dirty_version, 0)
-             > COALESCE(watermark.reconciled_version, 0)
+           eligible.dirty_version > eligible.reconciled_version
            OR NOT EXISTS (
              SELECT 1
              FROM operations_commerce_inventory_sync_runs recent
-             WHERE recent.organization_id = config.organization_id
+             WHERE recent.organization_id = eligible.organization_id
                AND recent.integration_account_id =
-                   config.integration_account_id
-               AND recent.warehouse_id = config.warehouse_id
+                   eligible.integration_account_id
+               AND recent.warehouse_id = eligible.warehouse_id
                AND recent.status = 'succeeded'
                AND recent.provider_fetched_at > now() - make_interval(
                  secs => GREATEST(
                    15,
-                   floor(config.inventory_max_age_seconds / 2.0)::integer
+                   floor(
+                     eligible.inventory_max_age_seconds / 2.0
+                   )::integer
                  )
                )
            )
          )
        ON CONFLICT (
          organization_id, integration_account_id
-       ) WHERE status IN ('pending', 'processing', 'failed')
+       ) WHERE location_mapping_id IS NULL
+         AND status IN ('pending', 'processing', 'failed')
        DO UPDATE SET
          requested_dirty_version = EXCLUDED.requested_dirty_version,
          status = 'pending',
@@ -635,14 +1002,12 @@ export async function queueAutomaticShopifyInventoryRefreshesInPostgres() {
        WHERE operations_shopify_inventory_refresh_jobs.status IN (
          'pending', 'failed'
        )
-         -- Only a genuinely newer webhook signal may supersede a failed
-         -- job's exponential retry delay.
          AND EXCLUDED.requested_dirty_version >
            operations_shopify_inventory_refresh_jobs
              .requested_dirty_version`,
     )
     return {
-      queued: queued.rowCount || 0,
+      queued: (mapped.rowCount || 0) + (legacy.rowCount || 0),
       cancelled: stale.rowCount || 0,
     }
   })
@@ -656,9 +1021,14 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
     await client.query(
       `UPDATE operations_shopify_inventory_refresh_jobs
        SET status = CASE
-             WHEN cancel_requested THEN 'cancelled'
-             WHEN attempt_count >= max_attempts THEN 'dead'
-             ELSE 'failed'
+             WHEN cancel_requested AND location_mapping_id IS NULL
+               THEN 'cancelled'
+             WHEN cancel_requested THEN 'mapped_cancelled'
+             WHEN attempt_count >= max_attempts
+                  AND location_mapping_id IS NULL THEN 'dead'
+             WHEN attempt_count >= max_attempts THEN 'mapped_dead'
+             WHEN location_mapping_id IS NULL THEN 'failed'
+             ELSE 'mapped_failed'
            END,
            completed_at = CASE
              WHEN cancel_requested OR attempt_count >= max_attempts
@@ -676,7 +1046,7 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
            lock_token = NULL,
            lease_expires_at = NULL,
            updated_at = now()
-       WHERE status = 'processing'
+       WHERE status IN ('processing', 'mapped_processing')
          AND lease_expires_at <= now()`,
     )
     const claimed = await client.query<{
@@ -686,6 +1056,11 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
       account_global_id: string
       carrier_service_config_id: string
       warehouse_id: string
+      location_mapping_id: string | null
+      location_mapping_row_version: string | null
+      provider_location_id: string | null
+      inventory_location_id: string | null
+      inventory_pool_id: string | null
       credential_generation: number
       activation_revision: number
       config_row_version: string
@@ -698,23 +1073,71 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
       lock_token: string
       started_at: Date | string
     }>(
-      `WITH candidates AS (
-         SELECT job.id
-         FROM operations_shopify_inventory_refresh_jobs job
-         ${currentFenceSql()}
-         WHERE job.status IN ('pending', 'failed')
-           AND job.available_at <= now()
-           AND job.cancel_requested = false
-           AND ${INVENTORY_READABLE_CONNECTION_SQL}
-           AND operations_shopify_carrier_service_config_is_ready(
-             config.organization_id, config.id
+      `WITH candidate_accounts AS (
+         SELECT account.organization_id, account.id
+         FROM operations_integration_accounts account
+         WHERE account.integration_type = 'commerce'
+           AND account.provider = 'shopify'
+           AND EXISTS (
+             SELECT 1
+             FROM operations_shopify_inventory_refresh_jobs waiting
+             WHERE waiting.organization_id = account.organization_id
+               AND waiting.integration_account_id = account.id
+               AND waiting.status IN (
+                 'pending', 'failed', 'mapped_pending', 'mapped_failed'
+               )
+               AND waiting.available_at <= now()
+               AND waiting.cancel_requested = false
            )
-         ORDER BY job.available_at, job.created_at, job.id
-         FOR UPDATE OF job SKIP LOCKED
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_shopify_inventory_refresh_jobs processing
+             WHERE processing.organization_id = account.organization_id
+               AND processing.integration_account_id = account.id
+               AND processing.status IN ('processing', 'mapped_processing')
+           )
+         ORDER BY account.organization_id, account.id
+         FOR UPDATE OF account SKIP LOCKED
          LIMIT $1
+       ),
+       candidates AS (
+         SELECT selected.id
+         FROM candidate_accounts candidate_account
+         CROSS JOIN LATERAL (
+           SELECT job.id
+           FROM operations_shopify_inventory_refresh_jobs job
+           ${currentFenceSql()}
+           WHERE job.organization_id = candidate_account.organization_id
+             AND job.integration_account_id = candidate_account.id
+             AND job.status IN (
+               'pending', 'failed', 'mapped_pending', 'mapped_failed'
+             )
+             AND job.available_at <= now()
+             AND job.cancel_requested = false
+             AND ${INVENTORY_READABLE_CONNECTION_SQL}
+             AND operations_shopify_inventory_read_config_is_ready(
+               config.organization_id, config.id
+             )
+             AND NOT EXISTS (
+               SELECT 1
+               FROM operations_shopify_inventory_refresh_jobs processing
+               WHERE processing.organization_id = job.organization_id
+                 AND processing.integration_account_id =
+                     job.integration_account_id
+                 AND processing.status IN (
+                   'processing', 'mapped_processing'
+                 )
+             )
+           ORDER BY job.available_at, job.created_at, job.id
+           FOR UPDATE OF job SKIP LOCKED
+           LIMIT 1
+         ) selected
        )
        UPDATE operations_shopify_inventory_refresh_jobs job
-       SET status = 'processing',
+       SET status = CASE
+             WHEN job.location_mapping_id IS NULL THEN 'processing'
+             ELSE 'mapped_processing'
+           END,
            attempt_count = job.attempt_count + 1,
            locked_at = now(),
            locked_by = $2,
@@ -734,6 +1157,11 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
          account.global_id AS account_global_id,
          job.carrier_service_config_id::text,
          job.warehouse_id::text,
+         job.location_mapping_id::text,
+         job.location_mapping_row_version::text,
+         job.provider_location_id,
+         job.inventory_location_id::text,
+         job.inventory_pool_id::text,
          job.credential_generation,
          job.activation_revision,
          job.config_row_version::text,
@@ -757,6 +1185,13 @@ export async function claimShopifyInventoryRefreshJobsInPostgres(input: {
       accountGlobalId: row.account_global_id,
       carrierServiceConfigId: row.carrier_service_config_id,
       warehouseId: row.warehouse_id,
+      locationMappingId: row.location_mapping_id,
+      locationMappingRowVersion: row.location_mapping_row_version === null
+        ? null
+        : Number(row.location_mapping_row_version),
+      providerLocationId: row.provider_location_id,
+      inventoryLocationId: row.inventory_location_id,
+      inventoryPoolId: row.inventory_pool_id,
       credentialGeneration: row.credential_generation,
       activationRevision: row.activation_revision,
       configRowVersion: Number(row.config_row_version),
@@ -783,13 +1218,25 @@ async function currentJobFence(
      WHERE job.id = $1::uuid
        AND job.organization_id = $2::uuid
        AND job.integration_account_id = $3::uuid
-       AND job.status = 'processing'
+       AND (
+         (job.location_mapping_id IS NULL AND job.status = 'processing')
+         OR (
+           job.location_mapping_id IS NOT NULL
+           AND job.status = 'mapped_processing'
+         )
+       )
        AND job.lock_token = $4::uuid
        AND job.requested_dirty_version = $5::bigint
+       AND job.location_mapping_id IS NOT DISTINCT FROM $6::uuid
+       AND job.location_mapping_row_version
+             IS NOT DISTINCT FROM $7::bigint
+       AND job.provider_location_id IS NOT DISTINCT FROM $8::text
+       AND job.inventory_location_id IS NOT DISTINCT FROM $9::uuid
+       AND job.inventory_pool_id IS NOT DISTINCT FROM $10::uuid
        AND job.lease_expires_at > now()
        AND job.cancel_requested = false
        AND ${INVENTORY_READABLE_CONNECTION_SQL}
-       AND operations_shopify_carrier_service_config_is_ready(
+       AND operations_shopify_inventory_read_config_is_ready(
          config.organization_id, config.id
        )
      FOR UPDATE OF job`,
@@ -799,6 +1246,11 @@ async function currentJobFence(
       job.integrationAccountId,
       job.lockToken,
       job.requestedDirtyVersion,
+      job.locationMappingId,
+      job.locationMappingRowVersion,
+      job.providerLocationId,
+      job.inventoryLocationId,
+      job.inventoryPoolId,
     ],
   )
   return current.rowCount === 1
@@ -810,7 +1262,10 @@ async function cancelProcessingJob(
 ) {
   await client.query(
     `UPDATE operations_shopify_inventory_refresh_jobs
-     SET status = 'cancelled',
+     SET status = CASE
+           WHEN location_mapping_id IS NULL THEN 'cancelled'
+           ELSE 'mapped_cancelled'
+         END,
          cancel_requested = true,
          completed_at = now(),
          locked_at = NULL,
@@ -820,7 +1275,7 @@ async function cancelProcessingJob(
          last_error_code = 'SHOPIFY_INVENTORY_REFRESH_FENCE_CHANGED',
          updated_at = now()
      WHERE id = $1::uuid
-       AND status = 'processing'
+       AND status IN ('processing', 'mapped_processing')
        AND lock_token = $2::uuid
        AND lease_expires_at > now()`,
     [job.id, job.lockToken],
@@ -842,7 +1297,7 @@ export async function renewShopifyInventoryRefreshJobLeaseInPostgres(
        WHERE id = $1::uuid
          AND organization_id = $2::uuid
          AND integration_account_id = $3::uuid
-         AND status = 'processing'
+         AND status IN ('processing', 'mapped_processing')
          AND lock_token = $4::uuid
          AND cancel_requested = false
          AND lease_expires_at > now()`,
@@ -901,6 +1356,15 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
          AND run.global_id = $4
          AND run.idempotency_key = $5
          AND run.status = 'succeeded'
+         AND (
+           $6::uuid IS NULL
+           OR (
+             run.location_mapping_id = $6::uuid
+             AND run.location_id = $7::uuid
+             AND run.inventory_pool_id = $8::uuid
+             AND run.provider_location_id = $9::text
+           )
+         )
        LIMIT 1`,
       [
         input.job.organizationId,
@@ -908,6 +1372,10 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
         input.job.warehouseId,
         input.inventoryRunGlobalId,
         input.effectiveIdempotencyKey,
+        input.job.locationMappingId,
+        input.job.inventoryLocationId,
+        input.job.inventoryPoolId,
+        input.job.providerLocationId,
       ],
     )
     const run = evidence.rows[0]
@@ -920,7 +1388,10 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
     }
     const completed = await client.query(
       `UPDATE operations_shopify_inventory_refresh_jobs
-       SET status = 'succeeded',
+       SET status = CASE
+             WHEN location_mapping_id IS NULL THEN 'succeeded'
+             ELSE 'mapped_succeeded'
+           END,
            result_summary = jsonb_build_object(
              'resource', 'inventory',
              'readOnly', true,
@@ -940,7 +1411,7 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
            last_error_code = NULL,
            updated_at = now()
        WHERE id = $1::uuid
-         AND status = 'processing'
+         AND status IN ('processing', 'mapped_processing')
          AND lock_token = $2::uuid
          AND lease_expires_at > now()`,
       [
@@ -992,6 +1463,46 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
              AND dirty_version = $4::bigint
              AND last_signaled_at IS NOT NULL
              AND $6::timestamptz >= last_signaled_at
+             AND (
+               $7::uuid IS NULL
+               OR NOT EXISTS (
+                 SELECT 1
+                 FROM operations_commerce_inventory_location_mappings
+                   current_mapping
+                 WHERE current_mapping.organization_id = $1::uuid
+                   AND current_mapping.integration_account_id = $2::uuid
+                   AND current_mapping.active = true
+                   AND current_mapping.inventory_import_enabled = true
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM operations_shopify_inventory_refresh_jobs
+                       succeeded
+                     WHERE succeeded.organization_id = $1::uuid
+                       AND succeeded.integration_account_id = $2::uuid
+                       AND succeeded.location_mapping_id =
+                           current_mapping.id
+                       AND succeeded.location_mapping_row_version =
+                           current_mapping.row_version
+                       AND succeeded.provider_location_id =
+                           current_mapping.external_location_id
+                       AND succeeded.warehouse_id =
+                           current_mapping.warehouse_id
+                       AND succeeded.inventory_location_id =
+                           current_mapping.location_id
+                       AND succeeded.inventory_pool_id =
+                           current_mapping.inventory_pool_id
+                       AND succeeded.carrier_service_config_id = $8::uuid
+                       AND succeeded.credential_generation = $3::integer
+                       AND succeeded.activation_revision = $9::integer
+                       AND succeeded.config_row_version = $10::bigint
+                       AND succeeded.policy_revision = $11::bigint
+                       AND succeeded.policy_hash = $12::text
+                       AND succeeded.inventory_max_age_seconds = $13::integer
+                       AND succeeded.requested_dirty_version = $4::bigint
+                       AND succeeded.status = 'mapped_succeeded'
+                   )
+               )
+             )
            RETURNING dirty_version::text, reconciled_version::text`
         : `SELECT dirty_version::text, reconciled_version::text
            FROM operations_shopify_inventory_refresh_watermarks
@@ -1006,6 +1517,13 @@ export async function completeShopifyInventoryRefreshJobInPostgres(input: {
             input.job.requestedDirtyVersion,
             run.global_id,
             new Date(run.provider_fetched_at).toISOString(),
+            input.job.locationMappingId,
+            input.job.carrierServiceConfigId,
+            input.job.activationRevision,
+            input.job.configRowVersion,
+            input.job.policyRevision,
+            input.job.policyHash,
+            input.job.inventoryMaxAgeSeconds,
           ]
         : [
             input.job.organizationId,
@@ -1077,7 +1595,12 @@ export async function failShopifyInventoryRefreshJobInPostgres(input: {
     )
     const failed = await client.query<{ available_at: Date | string }>(
       `UPDATE operations_shopify_inventory_refresh_jobs
-       SET status = CASE WHEN $3::boolean THEN 'dead' ELSE 'failed' END,
+       SET status = CASE
+             WHEN location_mapping_id IS NULL AND $3::boolean THEN 'dead'
+             WHEN location_mapping_id IS NULL THEN 'failed'
+             WHEN $3::boolean THEN 'mapped_dead'
+             ELSE 'mapped_failed'
+           END,
            available_at = CASE
              WHEN $3::boolean THEN available_at
              ELSE now() + make_interval(secs => $4::integer)
@@ -1096,7 +1619,7 @@ export async function failShopifyInventoryRefreshJobInPostgres(input: {
            ),
            updated_at = now()
        WHERE id = $1::uuid
-         AND status = 'processing'
+         AND status IN ('processing', 'mapped_processing')
          AND lock_token = $2::uuid
          AND lease_expires_at > now()
        RETURNING available_at`,
@@ -1144,6 +1667,41 @@ export async function failShopifyInventoryRefreshJobInPostgres(input: {
     })
   }
   return outcome
+}
+
+export async function parkShopifyInventoryRefreshForStoreSyncPauseInPostgres(
+  input: { job: ShopifyInventoryRefreshJob },
+) {
+  const parked = await query(
+    `UPDATE operations_shopify_inventory_refresh_jobs
+     SET status = CASE
+           WHEN location_mapping_id IS NULL THEN 'pending'
+           ELSE 'mapped_pending'
+         END,
+         attempt_count = GREATEST(0, attempt_count - 1),
+         available_at = now(),
+         locked_at = NULL,
+         locked_by = NULL,
+         lock_token = NULL,
+         lease_expires_at = NULL,
+         cancel_requested = false,
+         last_error_code = 'COMMERCE_STORE_SYNC_PROVIDER_READ_PAUSED',
+         completed_at = NULL,
+         updated_at = now()
+     WHERE id = $1::uuid
+       AND organization_id = $2::uuid
+       AND integration_account_id = $3::uuid
+       AND status IN ('processing', 'mapped_processing')
+       AND lock_token = $4::uuid
+     RETURNING id`,
+    [
+      input.job.id,
+      input.job.organizationId,
+      input.job.integrationAccountId,
+      input.job.lockToken,
+    ],
+  )
+  return { parked: parked.rowCount === 1 }
 }
 
 export async function recordShopifyInventoryRefreshWorkerHeartbeatInPostgres(
@@ -1210,7 +1768,7 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
         AND credential.integration_account_id = account.id
        JOIN operations_activation_scopes activation
          ON activation.organization_id = config.organization_id
-       WHERE operations_shopify_carrier_service_config_is_ready(
+       WHERE operations_shopify_inventory_read_config_is_ready(
            config.organization_id, config.id
          )
          AND config.registration_state IN (
@@ -1224,66 +1782,122 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
          AND credential.credential_version =
              config.credential_generation
          AND credential.verification_status = 'verified'
-         AND activation.revision = config.activation_revision
-         AND (
-           (config.registration_state = 'registered'
-             AND activation.state IN ('shadow', 'active'))
-           OR
-           (config.registration_state = 'shadow_simulated'
-             AND activation.state = 'shadow')
+         AND ${STORE_SYNC_RUNNING_SQL}
+         AND config.registration_state IN (
+           'registered', 'shadow_simulated'
          )
          AND ${INVENTORY_READABLE_CONNECTION_SQL}
      ),
+     eligible_routes AS (
+       SELECT
+         ready.organization_id,
+         ready.integration_account_id,
+         ready.config_id,
+         mapping.warehouse_id,
+         mapping.id AS location_mapping_id,
+         mapping.row_version AS location_mapping_row_version,
+         mapping.external_location_id AS provider_location_id,
+         mapping.location_id AS inventory_location_id,
+         mapping.inventory_pool_id,
+         ready.credential_generation,
+         ready.activation_revision,
+         ready.row_version,
+         ready.policy_revision,
+         ready.policy_hash,
+         ready.inventory_max_age_seconds
+       FROM eligible ready
+       JOIN operations_commerce_inventory_location_mappings mapping
+         ON mapping.organization_id = ready.organization_id
+        AND mapping.integration_account_id = ready.integration_account_id
+        AND mapping.active = true
+        AND mapping.inventory_import_enabled = true
+       UNION ALL
+       SELECT
+         ready.organization_id,
+         ready.integration_account_id,
+         ready.config_id,
+         ready.warehouse_id,
+         NULL::uuid AS location_mapping_id,
+         NULL::bigint AS location_mapping_row_version,
+         NULL::text AS provider_location_id,
+         NULL::uuid AS inventory_location_id,
+         NULL::uuid AS inventory_pool_id,
+         ready.credential_generation,
+         ready.activation_revision,
+         ready.row_version,
+         ready.policy_revision,
+         ready.policy_hash,
+         ready.inventory_max_age_seconds
+       FROM eligible ready
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM operations_commerce_inventory_location_mappings mapping
+         WHERE mapping.organization_id = ready.organization_id
+           AND mapping.integration_account_id =
+               ready.integration_account_id
+       )
+     ),
      latest_inventory AS (
        SELECT DISTINCT ON (
-         run.organization_id, run.integration_account_id, run.warehouse_id
+         run.organization_id,
+         run.integration_account_id,
+         run.location_mapping_id
        )
          run.organization_id,
          run.integration_account_id,
+         run.location_mapping_id,
          run.warehouse_id,
+         run.location_id,
+         run.inventory_pool_id,
+         run.provider_location_id,
          run.provider_fetched_at
        FROM operations_commerce_inventory_sync_runs run
        WHERE run.status = 'succeeded'
        ORDER BY run.organization_id, run.integration_account_id,
-                run.warehouse_id, run.provider_fetched_at DESC,
+                run.location_mapping_id, run.provider_fetched_at DESC,
                 run.completed_at DESC, run.id DESC
-     ),
-     latest_job AS (
-       SELECT DISTINCT ON (
-         job.organization_id, job.integration_account_id
-       )
-         job.organization_id,
-         job.integration_account_id,
-         job.carrier_service_config_id,
-         job.warehouse_id,
-         job.credential_generation,
-         job.activation_revision,
-         job.config_row_version,
-         job.policy_revision,
-         job.policy_hash,
-         job.status,
-         job.completed_at
-       FROM operations_shopify_inventory_refresh_jobs job
-       ORDER BY job.organization_id, job.integration_account_id,
-                job.created_at DESC, job.id DESC
      )
      SELECT
-       (SELECT count(*) FROM eligible)::text AS eligible_accounts,
        (
-         SELECT count(*)
-         FROM eligible ready
+         SELECT count(DISTINCT (
+           ready.organization_id, ready.integration_account_id
+         ))
+         FROM eligible_routes ready
+       )::text AS eligible_accounts,
+       (
+         SELECT count(DISTINCT (
+           ready.organization_id, ready.integration_account_id
+         ))
+         FROM eligible_routes ready
          LEFT JOIN latest_inventory inventory
            ON inventory.organization_id = ready.organization_id
           AND inventory.integration_account_id =
               ready.integration_account_id
-          AND inventory.warehouse_id = ready.warehouse_id
+          AND (
+            (
+              ready.location_mapping_id IS NOT NULL
+              AND inventory.location_mapping_id =
+                  ready.location_mapping_id
+              AND inventory.provider_location_id =
+                  ready.provider_location_id
+              AND inventory.warehouse_id = ready.warehouse_id
+              AND inventory.location_id = ready.inventory_location_id
+              AND inventory.inventory_pool_id = ready.inventory_pool_id
+            )
+            OR (
+              ready.location_mapping_id IS NULL
+              AND inventory.warehouse_id = ready.warehouse_id
+            )
+          )
          WHERE inventory.provider_fetched_at IS NULL
             OR inventory.provider_fetched_at <= now() - make_interval(
               secs => ready.inventory_max_age_seconds
             )
        )::text AS stale_accounts,
        (
-         SELECT count(*)
+         SELECT count(DISTINCT (
+           ready.organization_id, ready.integration_account_id
+         ))
          FROM eligible ready
          JOIN operations_shopify_inventory_refresh_watermarks watermark
            ON watermark.organization_id = ready.organization_id
@@ -1291,25 +1905,58 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
               ready.integration_account_id
          WHERE watermark.dirty_version > watermark.reconciled_version
        )::text AS dirty_accounts,
-       count(*) FILTER (WHERE job.status = 'pending')::text AS queued,
-       count(*) FILTER (WHERE job.status = 'processing')::text AS processing,
-       count(*) FILTER (WHERE job.status = 'failed')::text AS retrying,
+       count(*) FILTER (
+         WHERE job.status IN ('pending', 'mapped_pending')
+       )::text AS queued,
+       count(*) FILTER (
+         WHERE job.status IN ('processing', 'mapped_processing')
+       )::text AS processing,
+       count(*) FILTER (
+         WHERE job.status IN ('failed', 'mapped_failed')
+       )::text AS retrying,
        (
-         SELECT count(*)
-         FROM latest_job latest
-         JOIN eligible ready
-           ON ready.organization_id = latest.organization_id
-          AND ready.integration_account_id =
-              latest.integration_account_id
-         WHERE latest.status = 'dead'
-           AND latest.carrier_service_config_id = ready.config_id
-           AND latest.warehouse_id = ready.warehouse_id
-           AND latest.credential_generation =
-               ready.credential_generation
-           AND latest.activation_revision = ready.activation_revision
-           AND latest.config_row_version = ready.row_version
-           AND latest.policy_revision = ready.policy_revision
-           AND latest.policy_hash = ready.policy_hash
+         SELECT count(DISTINCT (
+           ready.organization_id, ready.integration_account_id
+         ))
+         FROM eligible_routes ready
+         JOIN LATERAL (
+           SELECT job.*
+           FROM operations_shopify_inventory_refresh_jobs job
+           WHERE job.organization_id = ready.organization_id
+             AND job.integration_account_id =
+                 ready.integration_account_id
+             AND job.carrier_service_config_id = ready.config_id
+             AND job.credential_generation =
+                 ready.credential_generation
+             AND job.activation_revision = ready.activation_revision
+             AND job.config_row_version = ready.row_version
+             AND job.policy_revision = ready.policy_revision
+             AND job.policy_hash = ready.policy_hash
+             AND job.inventory_max_age_seconds =
+                 ready.inventory_max_age_seconds
+             AND (
+               (
+                 ready.location_mapping_id IS NULL
+                 AND job.location_mapping_id IS NULL
+                 AND job.warehouse_id = ready.warehouse_id
+               )
+               OR (
+                 ready.location_mapping_id IS NOT NULL
+                 AND job.location_mapping_id = ready.location_mapping_id
+                 AND job.location_mapping_row_version =
+                     ready.location_mapping_row_version
+                 AND job.provider_location_id =
+                     ready.provider_location_id
+                 AND job.warehouse_id = ready.warehouse_id
+                 AND job.inventory_location_id =
+                     ready.inventory_location_id
+                 AND job.inventory_pool_id = ready.inventory_pool_id
+               )
+             )
+           ORDER BY job.created_at DESC, job.id DESC
+           LIMIT 1
+         ) latest ON true
+         WHERE latest.status IN ('dead', 'mapped_dead')
            AND NOT EXISTS (
              SELECT 1
              FROM operations_commerce_inventory_sync_runs recovered
@@ -1318,18 +1965,38 @@ export async function readShopifyInventoryRefreshHealthFromPostgres() {
                    latest.integration_account_id
                AND recovered.status = 'succeeded'
                AND recovered.completed_at > latest.completed_at
+               AND (
+                 (
+                   latest.location_mapping_id IS NOT NULL
+                   AND recovered.location_mapping_id =
+                       latest.location_mapping_id
+                   AND recovered.provider_location_id =
+                       latest.provider_location_id
+                   AND recovered.warehouse_id = latest.warehouse_id
+                   AND recovered.location_id =
+                       latest.inventory_location_id
+                   AND recovered.inventory_pool_id =
+                       latest.inventory_pool_id
+                 )
+                 OR (
+                   latest.location_mapping_id IS NULL
+                   AND recovered.warehouse_id = latest.warehouse_id
+                 )
+               )
            )
        )::text AS current_dead,
        count(*) FILTER (
-         WHERE job.status = 'processing'
+         WHERE job.status IN ('processing', 'mapped_processing')
            AND job.lease_expires_at <= now()
        )::text AS stale_processing,
        count(*) FILTER (
-         WHERE job.status IN ('pending', 'failed')
+         WHERE job.status IN (
+           'pending', 'failed', 'mapped_pending', 'mapped_failed'
+         )
            AND job.available_at <= now() - interval '2 minutes'
        )::text AS overdue,
        max(job.completed_at) FILTER (
-         WHERE job.status = 'succeeded'
+         WHERE job.status IN ('succeeded', 'mapped_succeeded')
        ) AS last_success_at
      FROM operations_shopify_inventory_refresh_jobs job`,
   )

@@ -34,37 +34,37 @@ function shipmentAction(overrides: Record<string, unknown> = {}) {
   return actions.find((action) => action.action === 'confirm_shipment')!
 }
 
-test('native TEST one-off permits complete multi-package confirmation only in Shadow', () => {
-  assert.deepEqual(shipmentAction(), {
-    action: 'confirm_shipment',
-    label: 'Confirm shipment',
-    enabled: true,
-    blockedReason: null,
-  })
-  assert.match(
-    shipmentAction({ activationState: 'active' }).blockedReason || '',
-    /TEST one-off shipments.*Operations Shadow/,
-  )
+test('native TEST one-off permits exact multi-package confirmation in every activation profile', () => {
+  for (const activationState of [
+    'disabled', 'shadow', 'read_only', 'active', 'frozen',
+  ] as const) {
+    assert.deepEqual(shipmentAction({ activationState }), {
+      action: 'confirm_shipment',
+      label: 'Confirm shipment',
+      enabled: true,
+      blockedReason: null,
+    })
+  }
 })
 
 test('native LIVE one-off permits complete multi-package confirmation only in Active', () => {
   assert.equal(shipmentAction({
     oneOffShippingMode: 'live',
     activationState: 'active',
-    canActivate: true,
+    canPurchaseLivePostage: true,
     sandboxLabelCount: 0,
     shippableLabelCount: 2,
   }).enabled, true)
   assert.match(shipmentAction({
     oneOffShippingMode: 'live',
     activationState: 'shadow',
-    canActivate: true,
+    canPurchaseLivePostage: true,
   }).blockedReason || '', /LIVE one-off shipments.*Operations Active/)
   assert.match(shipmentAction({
     oneOffShippingMode: 'live',
     activationState: 'active',
-    canActivate: false,
-  }).blockedReason || '', /activation permission.*LIVE postage/i)
+    canPurchaseLivePostage: false,
+  }).blockedReason || '', /live-postage permission.*LIVE postage/i)
 })
 
 test('native one-off blocks partial, unresolved, and closed group evidence', () => {
