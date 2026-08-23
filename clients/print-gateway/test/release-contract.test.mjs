@@ -172,7 +172,7 @@ test('release verifier proves signatures, hardened runtime, and payload architec
   assert.match(verifier, /signature\.subject !== subject/)
   assert.match(verifier, /WIN_SIGNING_THUMBPRINT/)
   const exactAssetGate = read('clients/print-gateway/scripts/assert-release-asset-set.mjs')
-  assert.match(exactAssetGate, /exact 14-file customer contract/)
+  assert.match(exactAssetGate, /exact selected-platform customer contract/)
 })
 
 test('recursive release scan rejects hidden credentials and a single-arch nested Mach-O', () => {

@@ -80,3 +80,48 @@ test('deterministic fixture drives release index into the exact 14-asset contrac
     rmSync(temporary, { recursive: true, force: true })
   }
 })
+
+test('macOS-only fixture drives release index into the exact 9-asset contract', () => {
+  const temporary = mkdtempSync(path.join(os.tmpdir(), 'clawpilot-release-index-macos-fixture-'))
+  const input = path.join(temporary, 'input')
+  const release = path.join(temporary, 'release')
+  const version = '7.8.10'
+  const sourceCommit = '1123456789abcdef0123456789abcdef01234567'
+  mkdirSync(release)
+  try {
+    const fixture = run('create-release-index-test-fixture.mjs', [
+      '--output', input,
+      '--version', version,
+      '--source-commit', sourceCommit,
+      '--platforms', 'macos',
+    ])
+    for (const name of readdirSync(input)) {
+      copyFileSync(path.join(input, name), path.join(release, name))
+    }
+    run('create-release-index.mjs', ['--input', input, '--output', release])
+    const indexName = `ClawPilot-Print-Agent-${version}-release.json`
+    const index = JSON.parse(readFileSync(path.join(release, indexName), 'utf8'))
+    assert.deepEqual(index.artifacts.map((artifact) => artifact.platform), ['macos'])
+    const signedMetadata = [
+      ...fixture.artifacts.flatMap((artifact) => [
+        `${artifact.filename}.artifact.json`,
+        `${artifact.filename}.sha256`,
+      ]),
+      indexName,
+      'SHA256SUMS.txt',
+    ]
+    for (const filename of signedMetadata) {
+      writeFileSync(
+        path.join(release, `${filename}.sigstore.json`),
+        `${JSON.stringify({ fixtureOnly: true, filename })}\n`,
+      )
+    }
+    const exact = run('assert-release-asset-set.mjs', [
+      '--directory', release,
+      '--version', version,
+    ])
+    assert.equal(exact.assets.length, 9)
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})

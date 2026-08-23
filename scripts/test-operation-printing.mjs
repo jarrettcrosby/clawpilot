@@ -373,8 +373,13 @@ assert.ok(
   'Printing must count only active local agents in the primary Agents tab badge',
 )
 assert.ok(
-  panel.includes('retained below as audit history and cannot claim print jobs'),
-  'Printing must distinguish revoked enrollment history from usable agents',
+  panel.includes("agents?.agents.filter((agent) => agent.status === 'active') || []")
+    && panel.includes('activeAgents.map((agent) => ('),
+  'Printing must keep revoked enrollment audit rows out of the operational agent list',
+)
+assert.ok(
+  !panel.includes('retained below as audit history and cannot claim print jobs'),
+  'Printing must not keep showing retired-agent warnings after cutover',
 )
 for (const fragment of [
   "thermal: 'Thermal'",

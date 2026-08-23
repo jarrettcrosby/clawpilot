@@ -8,9 +8,17 @@ on:
         required: true
         type: string
       confirmation:
-        description: Type SIGN_AND_PUBLISH after approving both platform releases
+        description: Type SIGN_AND_PUBLISH after approving the selected platform release
         required: true
         type: string
+      platforms:
+        description: Customer installers to build and publish
+        required: true
+        default: macos
+        type: choice
+        options:
+          - macos
+          - macos-and-windows
 
 permissions:
   contents: read
@@ -26,6 +34,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       source_commit: ${{ steps.version.outputs.source_commit }}
+      platforms: ${{ steps.version.outputs.platforms }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
@@ -45,6 +54,7 @@ jobs:
         shell: bash
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "Customer signing may run only from refs/heads/main" >&2
@@ -65,6 +75,7 @@ jobs:
           fi
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
           echo "source_commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "platforms=$REQUESTED_PLATFORMS" >> "$GITHUB_OUTPUT"
 
   macos:
     needs: preflight
@@ -180,6 +191,7 @@ jobs:
 
   windows:
     needs: preflight
+    if: needs.preflight.outputs.platforms == 'macos-and-windows'
     runs-on: windows-latest
     timeout-minutes: 35
     environment: print-gateway-customer-release
@@ -284,6 +296,11 @@ jobs:
       - windows
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    if: >-
+      always()
+      && needs.preflight.result == 'success'
+      && needs.macos.result == 'success'
+      && (needs.windows.result == 'success' || needs.windows.result == 'skipped')
     environment: print-gateway-customer-release
     permissions:
       contents: write

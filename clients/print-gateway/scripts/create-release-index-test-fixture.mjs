@@ -14,12 +14,17 @@ for (let index = 2; index < process.argv.length; index += 2) {
 const output = path.resolve(args.get('--output') || '')
 const version = String(args.get('--version') || '')
 const sourceCommit = String(args.get('--source-commit') || '').toLowerCase()
+const platforms = String(args.get('--platforms') || 'macos,windows').split(',')
 if (
   !args.has('--output')
   || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)
   || !/^[a-f0-9]{40}$/.test(sourceCommit)
+  || platforms.length < 1
+  || platforms.length > 2
+  || new Set(platforms).size !== platforms.length
+  || platforms.some((platform) => !['macos', 'windows'].includes(platform))
 ) {
-  throw new Error('--output, exact --version, and exact 40-character --source-commit are required')
+  throw new Error('--output, exact --version, exact 40-character --source-commit, and supported unique platforms are required')
 }
 mkdirSync(output, { recursive: true, mode: 0o700 })
 if (readdirSync(output).length !== 0) {
@@ -41,7 +46,7 @@ const definitions = [
     notarized: false,
     stapled: false,
   },
-]
+].filter((definition) => platforms.includes(definition.platform))
 const artifacts = definitions.map((definition) => {
   const artifactPath = path.join(output, definition.filename)
   const bytes = Buffer.from([
