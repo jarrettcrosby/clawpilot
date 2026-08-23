@@ -18,6 +18,7 @@ const tag = `print-gateway-v${version}`
 const repositoryId = '123456789'
 const nowMs = Date.parse('2026-08-15T16:00:00.000Z')
 const signedLocation = `https://release-assets.githubusercontent.com/github-production-release-asset/test/index?se=${encodeURIComponent('2026-08-15T16:05:00.000Z')}&sig=test`
+const currentGitHubSignedLocation = `https://release-assets.githubusercontent.com/github-production-release-asset/test/index?se=${encodeURIComponent('2026-08-15T16:40:00.000Z')}&sig=test&jwt=short-lived-download-credential`
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex')
@@ -105,7 +106,7 @@ function fixture(mutateIndex) {
       indexSha256: indexDigest,
       prerelease: false,
     },
-    repository: { id: Number(repositoryId), full_name: 'jarrettcrosby/clawpilot', private: true },
+    repository: { id: Number(repositoryId), full_name: 'jarrettcrosby/clawpilot', private: false },
     release: {
       tag_name: tag,
       target_commitish: sourceCommit,
@@ -202,6 +203,10 @@ try {
   repoDrift.repository.id += 1
   await expectCode('PRINT_AGENT_RELEASE_REPOSITORY_INVALID', () => verify(repoDrift))
 
+  const visibilityDrift = fixture()
+  visibilityDrift.repository.private = true
+  await expectCode('PRINT_AGENT_RELEASE_REPOSITORY_INVALID', () => verify(visibilityDrift))
+
   for (const [field, value] of [['draft', true], ['prerelease', true], ['target_commitish', 'b'.repeat(40)]]) {
     const drift = fixture()
     drift.release[field] = value
@@ -243,6 +248,10 @@ try {
   )))
 
   assert.equal(validateGitHubAssetRedirect(signedLocation, nowMs), signedLocation)
+  assert.equal(
+    validateGitHubAssetRedirect(currentGitHubSignedLocation, nowMs),
+    currentGitHubSignedLocation,
+  )
   for (const evil of [
     `http://release-assets.githubusercontent.com/file?se=${encodeURIComponent('2026-08-15T16:05:00.000Z')}`,
     `https://release-assets.githubusercontent.com:444/file?se=${encodeURIComponent('2026-08-15T16:05:00.000Z')}`,
@@ -250,7 +259,7 @@ try {
     `https://release-assets.githubusercontent.com/file?token=leak&se=${encodeURIComponent('2026-08-15T16:05:00.000Z')}`,
     `https://release-assets.githubusercontent.com/file?se=${encodeURIComponent('2026-08-15T16:05:00.000Z')}`,
     `https://release-assets.githubusercontent.com/file?se=${encodeURIComponent('2026-08-15T15:59:00.000Z')}&sig=test`,
-    `https://release-assets.githubusercontent.com/file?se=${encodeURIComponent('2026-08-15T17:00:00.000Z')}&sig=test`,
+    `https://release-assets.githubusercontent.com/file?se=${encodeURIComponent('2026-08-15T17:00:01.000Z')}&sig=test`,
   ]) {
     assert.throws(() => validateGitHubAssetRedirect(evil, nowMs), (error) => (
       error instanceof PrintAgentReleaseError && error.code === 'PRINT_AGENT_RELEASE_REDIRECT_INVALID'
