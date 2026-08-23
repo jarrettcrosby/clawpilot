@@ -136,19 +136,25 @@ test('pre-signed macOS promotion re-verifies exact bytes from protected main', (
     'run smoke:packaged',
     'cosign verify-blob',
     'assert-release-asset-set.mjs',
+    'release_id=',
+    'upload_url=',
     'draft_target=',
+    'prepublish_json=',
     'prepublish_target=',
+    'actual_asset_names=',
+    '--data-binary "@$release_file"',
+    '$upload_url?name=$asset_name',
     'published_commit=',
-    '--draft',
-    '--draft=false',
+    '--method PATCH',
+    '-F draft=false',
   ]) assert.ok(workflow.includes(gate), `Promotion workflow is missing ${gate}`)
   assert.doesNotMatch(workflow, /build:mac|APPLE_API_KEY|CERTIFICATE_BASE64|CSC_KEY_PASSWORD/)
   assert.doesNotMatch(workflow, /^\s*push:/m)
-  assert.equal((workflow.match(/gh release create "\$tag"/g) || []).length, 1)
-  assert.equal((workflow.match(/gh release edit "\$tag" --draft=false/g) || []).length, 1)
+  assert.equal((workflow.match(/gh api --method POST "repos\/\$GITHUB_REPOSITORY\/releases"/g) || []).length, 1)
+  assert.equal((workflow.match(/gh api --silent --method PATCH/g) || []).length, 1)
   assert.match(
     workflow,
-    /gh release upload[\s\S]*prepublish_target=.*[\s\S]*if \[ "\$prepublish_target" != "\$SOURCE_COMMIT" \][\s\S]*gh release edit "\$tag" --draft=false/,
+    /upload_url=.*[\s\S]*--data-binary "@\$release_file"[\s\S]*prepublish_target=.*[\s\S]*diff -u[\s\S]*--method PATCH/,
   )
   for (const runBlock of shellRunBlocks(workflow)) {
     assert.doesNotMatch(runBlock, /\$\{\{\s*inputs\./)

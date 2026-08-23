@@ -242,37 +242,67 @@ jobs:
             echo "Tag $tag already exists; refusing to attach customer assets to pre-existing provenance" >&2
             exit 1
           fi
-          gh release create "$tag" \
-            --draft \
-            --target "$SOURCE_COMMIT" \
-            --title "ClawPilot Print Agent $RELEASE_VERSION" \
-            --notes "Signed, notarized, and stapled macOS universal DMG built from commit $SOURCE_COMMIT, then re-verified from protected main. Verify SHA256SUMS.txt and its Sigstore bundle before installation."
-          draft_target="$(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -ser --arg tag "$tag" '
-                [.[][] | select(.tag_name == $tag and .draft == true)]
-                | if length == 1 then .[0].target_commitish
-                  else error("expected exactly one draft release") end
-              '
+          release_notes="Signed, notarized, and stapled macOS universal DMG built from commit $SOURCE_COMMIT, then re-verified from protected main. Verify SHA256SUMS.txt and its Sigstore bundle before installation."
+          release_json="$(
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$tag" \
+              -f target_commitish="$SOURCE_COMMIT" \
+              -f name="ClawPilot Print Agent $RELEASE_VERSION" \
+              -f body="$release_notes" \
+              -F draft=true \
+              -F prerelease=false
           )"
-          if [ "$draft_target" != "$SOURCE_COMMIT" ]; then
+          release_id="$(jq -er '.id' <<<"$release_json")"
+          upload_url="$(jq -er '.upload_url | sub("\\{\\?name,label\\}$"; "")' <<<"$release_json")"
+          draft_target="$(jq -er '.target_commitish' <<<"$release_json")"
+          if [ "$(jq -r '.draft' <<<"$release_json")" != "true" ] \
+            || [ "$(jq -r '.tag_name' <<<"$release_json")" != "$tag" ] \
+            || [ "$draft_target" != "$SOURCE_COMMIT" ]; then
             echo "Draft release resolved to unexpected target $draft_target" >&2
             exit 1
           fi
-          gh release upload "$tag" "$RUNNER_TEMP"/release/*
-          prepublish_target="$(
-            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              | jq -ser --arg tag "$tag" '
-                [.[][] | select(.tag_name == $tag and .draft == true)]
-                | if length == 1 then .[0].target_commitish
-                  else error("expected exactly one draft release") end
-              '
+          expected_asset_names="$(
+            find "$RUNNER_TEMP/release" -maxdepth 1 -type f -exec basename '{}' \; \
+              | LC_ALL=C sort
           )"
-          if [ "$prepublish_target" != "$SOURCE_COMMIT" ]; then
+          while IFS= read -r release_file; do
+            asset_name="$(basename "$release_file")"
+            if ! [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Release asset name is not URL-safe: $asset_name" >&2
+              exit 1
+            fi
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --header 'Content-Type: application/octet-stream' \
+              --data-binary "@$release_file" \
+              "$upload_url?name=$asset_name" \
+              >/dev/null
+          done < <(find "$RUNNER_TEMP/release" -maxdepth 1 -type f | LC_ALL=C sort)
+          prepublish_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          prepublish_target="$(jq -er '.target_commitish' <<<"$prepublish_json")"
+          actual_asset_names="$(jq -r '.assets[].name' <<<"$prepublish_json" | LC_ALL=C sort)"
+          if [ "$(jq -r '.draft' <<<"$prepublish_json")" != "true" ] \
+            || [ "$(jq -r '.tag_name' <<<"$prepublish_json")" != "$tag" ] \
+            || [ "$prepublish_target" != "$SOURCE_COMMIT" ] \
+            || ! diff -u \
+              <(printf '%s\n' "$expected_asset_names") \
+              <(printf '%s\n' "$actual_asset_names"); then
             echo "Draft release target drifted during asset upload to $prepublish_target; leaving release unpublished" >&2
             exit 1
           fi
-          gh release edit "$tag" --draft=false
+          gh api --silent --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false
+          published_release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          if [ "$(jq -r '.draft' <<<"$published_release")" != "false" ] \
+            || [ "$(jq -r '.tag_name' <<<"$published_release")" != "$tag" ] \
+            || [ "$(jq -r '.target_commitish' <<<"$published_release")" != "$SOURCE_COMMIT" ]; then
+            echo "Published release metadata does not match the verified draft" >&2
+            exit 1
+          fi
           published_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
           if [ "$published_commit" != "$SOURCE_COMMIT" ]; then
             echo "Published release tag drifted to $published_commit" >&2
