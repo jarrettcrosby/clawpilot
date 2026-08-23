@@ -102,7 +102,8 @@ npm --prefix clients/print-gateway run build:dir
 `.github/workflows/print-gateway-release.yml` is manual-only and requires the
 exact `SIGN_AND_PUBLISH` confirmation plus approval of the protected
 `print-gateway-customer-release` GitHub environment. It publishes nothing unless
-both platform jobs finish and the publish job proves all of the following:
+every selected platform job finishes and the publish job proves all of the
+following:
 
 - macOS app and DMG use a `Developer ID Application` identity for the expected
   Apple team;
@@ -110,11 +111,11 @@ both platform jobs finish and the publish job proves all of the following:
 - Apple notary service returns `Accepted` for the app and DMG;
 - notarization tickets are stapled and validated;
 - Gatekeeper accepts the mounted app and DMG;
-- Windows app executable and NSIS installer have a `Valid` Authenticode chain
+- when Windows is selected, its app executable and NSIS installer have a `Valid` Authenticode chain
   for the expected subject and a trusted timestamp;
-- both artifacts match their SHA-256/byte-length manifests and contain no
+- every selected artifact matches its SHA-256/byte-length manifest and contains no
   concrete `cppair.v1` or `cpprint.v1` value;
-- the cross-platform release index contains both release-ready platforms;
+- the release index contains exactly the selected release-ready platforms;
 - per-artifact manifests, per-artifact checksums, the aggregate release index,
   and `SHA256SUMS.txt` receive verified GitHub OIDC Sigstore bundles.
 
@@ -139,7 +140,7 @@ macOS:
 - `PRINT_GATEWAY_APPLE_API_KEY_ID`
 - `PRINT_GATEWAY_APPLE_API_ISSUER`
 
-Windows:
+Windows (required only when `macos-and-windows` is selected):
 
 - `PRINT_GATEWAY_WINDOWS_CERTIFICATE_PFX_BASE64`
 - `PRINT_GATEWAY_WINDOWS_CERTIFICATE_PASSWORD`
@@ -151,6 +152,6 @@ by electron-builder/sign-tool. The resulting installer must carry a valid RFC
 3161 timestamp. No signing key, certificate, App Store Connect credential, or
 notarization upload is created or performed by local source validation.
 
-Until those secrets and the protected environment are configured, there is no
-customer-release artifact. This package does not publish or relabel an unsigned
+Until the selected platform secrets and the protected environment are configured,
+there is no customer-release artifact. This package does not publish or relabel an unsigned
 `.command`/Node ZIP as a customer download.

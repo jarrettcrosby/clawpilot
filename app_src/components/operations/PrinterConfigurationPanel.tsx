@@ -327,8 +327,10 @@ function customerReleaseIsValid(release: CustomerPrintAgentRelease): boolean {
     && release.product === 'ClawPilot Print Agent'
     && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(release.version)
     && release.customerReleaseReady === true
-    && release.artifacts.length === 2
-    && new Set(release.artifacts.map((artifact) => artifact.platform)).size === 2
+    && release.artifacts.length >= 1
+    && release.artifacts.length <= 2
+    && new Set(release.artifacts.map((artifact) => artifact.platform)).size
+      === release.artifacts.length
     && release.artifacts.every(customerReleaseArtifactIsValid)
 }
 
@@ -754,8 +756,8 @@ export default function PrinterConfigurationPanel() {
     () => agents?.agents.filter((agent) => agent.status === 'active').length || 0,
     [agents?.agents],
   )
-  const retiredAgentCount = useMemo(
-    () => agents?.agents.filter((agent) => agent.status === 'revoked').length || 0,
+  const activeAgents = useMemo(
+    () => agents?.agents.filter((agent) => agent.status === 'active') || [],
     [agents?.agents],
   )
 
@@ -1475,8 +1477,8 @@ export default function PrinterConfigurationPanel() {
                     <Typography fontWeight={700}>Verified Print Agent release unavailable</Typography>
                     <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
                       {customerPrintAgentReleaseLoading
-                        ? 'ClawPilot is checking the verified signed macOS and Windows release.'
-                        : 'New operator pairing stays disabled until the exact signed macOS and Windows release passes verification. Existing paired background agents remain visible below, and web app download/manual print remains available.'}
+                        ? 'ClawPilot is checking the verified signed installer release.'
+                        : 'New operator pairing stays disabled until a signed installer passes release verification. Existing paired background agents remain available, and web app download/manual print remains a separate option.'}
                     </Typography>
                   </>
                 )}
@@ -1516,7 +1518,7 @@ export default function PrinterConfigurationPanel() {
               Create an active warehouse before creating a workspace pairing code.
             </Alert>
           )}
-          {!agents?.agents.length ? (
+          {!agents || !activeAgents.length ? (
             <Box sx={{ py: 5, textAlign: 'center' }}>
               <TokenRounded sx={{ fontSize: 40, color: 'text.disabled' }} />
               <Typography fontWeight={700} sx={{ mt: 1 }}>No local print agents</Typography>
@@ -1525,7 +1527,7 @@ export default function PrinterConfigurationPanel() {
                   ? 'Download and open the signed Print Agent, then create a one-time code for this workspace. The app prompts locally for the private Zebra IP and port 9100.'
                   : ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW
                   ? 'Open the developer helper first, then create a one-time code for this workspace. The helper prompts locally for the Zebra IP and port 9100.'
-                  : 'A verified signed macOS or Windows Print Agent is required before a new operator can pair this workspace.'}
+                  : 'A verified signed Print Agent installer is required before a new operator can pair this workspace.'}
               </Typography>
             </Box>
           ) : (
@@ -1545,14 +1547,8 @@ export default function PrinterConfigurationPanel() {
                   </Button>
                 )}
               </Stack>
-              {retiredAgentCount > 0 && (
-                <Alert severity="info" sx={{ mb: 1.5 }}>
-                  {activeAgentCount} active local print {activeAgentCount === 1 ? 'agent' : 'agents'}.
-                  {' '}{retiredAgentCount} revoked enrollment {retiredAgentCount === 1 ? 'is' : 'are'} retained below as audit history and cannot claim print jobs.
-                </Alert>
-              )}
               <Stack divider={<Divider flexItem />}>
-              {agents.agents.map((agent) => (
+              {activeAgents.map((agent) => (
                 <Stack
                   key={agent.globalId}
                   direction={{ xs: 'column', md: 'row' }}

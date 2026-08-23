@@ -73,21 +73,19 @@ printing or claiming a job, stores the endpoint locally, and redeems the
 pairing grant into Keychain. The LAN endpoint must not be sent to hosted state,
 put in a URL, or retained in browser history.
 
-That customer-distributable native application is not released yet. The only
-current macOS artifact is a credential-free, unsigned, unnotarized, Node.js
-developer preview ZIP. It is not a `.app` or `.pkg`, can be blocked by managed
-browser policy and Gatekeeper, and must not be offered as operator setup. The
-normal web UI therefore hides its download and pairing actions. Its exact ZIP,
-checksum, and manifest paths return `404` unless
+The customer-distributable native application is available to the web UI only
+after the manual customer-release workflow publishes an exact verified release
+and that release is enabled in runtime configuration. Until then the normal web
+UI hides new pairing actions. A separate credential-free, unsigned,
+unnotarized Node.js developer preview ZIP remains available only when
 `NEXT_PUBLIC_ENABLE_DEVELOPER_PRINT_AGENT_PREVIEW=true`; even when enabled,
 hosted access remains behind browser authentication. The preview manifest and
 README declare `developers-only` distribution and no customer-release
 readiness.
 
-Do not conflate the future visible setup application with the existing print
-runtime. Current connected `local_agent` records run as headless macOS
-LaunchAgents: no application window or Dock icon is expected. The signed native
-application will configure/install that background runtime. The separate
+Do not conflate the native setup application with a browser printing path. Its
+managed workers run in the signed-in user's background tray after the setup
+window closes. The separate
 `browser` connection mode remains web app download/manual print only; it cannot
 open raw TCP to a LAN printer and creates no durable delivery acknowledgement.
 `system_service` is a reserved schema/UI placeholder with no certified backend
@@ -110,9 +108,9 @@ and printer model before it may advertise compatibility.
 
 Open **Operations > Printing**.
 
-New operator pairing is release-gated until the signed and notarized native
-macOS application is available. Existing paired agents remain visible and may
-continue operating. On an explicitly enabled developer environment only:
+New operator pairing is release-gated until a verified signed native installer
+is configured. Existing active agents may continue operating. In a configured
+customer release or an explicitly enabled developer environment:
 
 1. In **Agents**, create a short-lived pairing code for the warehouse and declare only the formats, media, and document types its installed runtime can actually deliver.
 2. Redeem the one-time `cppair.v1` code on the Mac. The helper stores the resulting `cpprint.v1` runtime credential in Keychain; that credential remains valid until the agent is revoked.

@@ -139,7 +139,8 @@ function validateIndex(configuration, value) {
     || index.customerReleaseReady !== true
     || index.signature !== 'sigstore-bundle-required-before-publish'
     || !Array.isArray(index.artifacts)
-    || index.artifacts.length !== 2) {
+    || index.artifacts.length < 1
+    || index.artifacts.length > 2) {
     fail('PRINT_AGENT_RELEASE_INDEX_INVALID', 'Release index does not match the configured customer release')
   }
 
@@ -189,7 +190,6 @@ function validateIndex(configuration, value) {
       customerReleaseReady: true,
     }
   })
-  if (expectedPairs.size) fail('PRINT_AGENT_RELEASE_INDEX_INVALID', 'Release index is missing a required artifact')
   return { index, artifacts }
 }
 

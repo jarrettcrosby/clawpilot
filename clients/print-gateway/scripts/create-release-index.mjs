@@ -18,10 +18,13 @@ function filesRecursively(directory) {
 const manifests = filesRecursively(inputDirectory)
   .filter((filePath) => filePath.endsWith('.artifact.json'))
   .map((filePath) => ({ filePath, value: JSON.parse(readFileSync(filePath, 'utf8')) }))
-if (manifests.length !== 2) throw new Error(`Expected two verified platform manifests, found ${manifests.length}`)
+if (manifests.length < 1 || manifests.length > 2) {
+  throw new Error(`Expected one or two verified platform manifests, found ${manifests.length}`)
+}
 const platforms = new Set(manifests.map(({ value }) => value.platform))
-if (!platforms.has('macos') || !platforms.has('windows')) {
-  throw new Error('A customer release requires both macOS and Windows artifacts')
+if (platforms.size !== manifests.length
+  || [...platforms].some((platform) => !['macos', 'windows'].includes(platform))) {
+  throw new Error('A customer release contains a duplicate or unsupported platform artifact')
 }
 const versions = new Set(manifests.map(({ value }) => value.version))
 if (versions.size !== 1) throw new Error('Platform artifact versions do not match')

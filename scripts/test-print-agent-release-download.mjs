@@ -175,9 +175,17 @@ try {
     'macos:universal',
     'windows:x64',
   ])
+  const macosOnly = fixture((index) => {
+    index.artifacts = [artifact('macos')]
+  })
+  assert.deepEqual(
+    (await verify(macosOnly)).artifacts.map(({ platform, architecture }) => `${platform}:${architecture}`),
+    ['macos:universal'],
+  )
   assert.ok(requestLog.some((entry) => entry.url === '/repos/jarrettcrosby/clawpilot/releases/assets/10' && entry.accept === 'application/octet-stream'))
 
   const streamedIndex = fixture()
+  state.current = streamedIndex
   const streamedVerified = await verifyPrintAgentRelease({
     configuration: streamedIndex.configuration,
     nowMs,
@@ -217,6 +225,8 @@ try {
   await expectCode('PRINT_AGENT_RELEASE_INDEX_INVALID', () => verify(digestDrift))
 
   await expectCode('PRINT_AGENT_RELEASE_INDEX_INVALID', () => verify(fixture((index) => { index.endpoint = 'https://example.test' })))
+  await expectCode('PRINT_AGENT_RELEASE_INDEX_INVALID', () => verify(fixture((index) => { index.artifacts = [] })))
+  await expectCode('PRINT_AGENT_RELEASE_ASSET_INVALID', () => verify(fixture((index) => { index.artifacts = [artifact('macos'), artifact('macos')] })))
   await expectCode('PRINT_AGENT_RELEASE_INDEX_INVALID', () => verify(fixture((index) => { index.artifacts[0].notarized = false })))
   await expectCode('PRINT_AGENT_RELEASE_INDEX_INVALID', () => verify(fixture((index) => { index.artifacts[1].signed = false })))
 
