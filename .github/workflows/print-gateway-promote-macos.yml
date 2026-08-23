@@ -35,6 +35,9 @@ jobs:
   preflight:
     if: inputs.confirmation == 'VERIFY_AND_PUBLISH'
     runs-on: ubuntu-latest
+    permissions:
+      # GitHub hides draft releases from tokens without push-equivalent contents access.
+      contents: write
     outputs:
       version: ${{ steps.release.outputs.version }}
       source_commit: ${{ steps.release.outputs.source_commit }}
@@ -106,6 +109,9 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     environment: print-gateway-customer-release
+    permissions:
+      # The verifier must download the still-private draft asset.
+      contents: write
     env:
       MACOS_DEVELOPER_ID_APPLICATION: 'Developer ID Application: Jarrett Crosby (CN2T77JHQQ)'
       APPLE_TEAM_ID: CN2T77JHQQ
