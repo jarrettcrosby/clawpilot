@@ -484,6 +484,140 @@ async function seedNeedsInfoFacts(client, fixture) {
   )
 }
 
+async function seedCurrentMappedProductPack(client, fixture) {
+  const externalProductId =
+    `gid://shopify/Product/${fixture.productGlobalId.slice(-7)}`
+  const externalVariantId =
+    `gid://shopify/ProductVariant/${fixture.productGlobalId.slice(-7)}`
+  const channelRevision =
+    `workbench-mapped-pack-${fixture.candidateGlobalId}`
+  const channelSourceHash = '7'.repeat(64)
+  const packEvidenceHash = '8'.repeat(64)
+  const productMapping = (await client.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id,
+       product_id, channel_sku, external_product_id,
+       external_variant_id, external_inventory_item_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'PB-BOX-12', $5, $6,
+       $7, 'exact_variant', $8, true, $9
+     ) RETURNING id::text, global_id`,
+    [
+      fixture.organization,
+      fixture.integration,
+      fixture.pipeline,
+      fixture.product,
+      externalProductId,
+      externalVariantId,
+      `gid://shopify/InventoryItem/${fixture.productGlobalId.slice(-7)}`,
+      channelRevision,
+      actorEmail,
+    ],
+  )).rows[0]
+  await client.query(
+    `INSERT INTO operations_product_channel_states (
+       organization_id, integration_account_id, pipeline_id, provider,
+       external_product_id, external_variant_id,
+       external_inventory_item_id, product_id, product_mapping_id,
+       provider_product_title, provider_variant_title, provider_sku,
+       provider_status_raw, normalized_status, provider_active,
+       requires_shipping, weight_grams, observed_at, source_revision,
+       source_hash, pack_evidence_hash, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'shopify', $4, $5, $6,
+       $7::uuid, $8::uuid, 'Bakery Bites Provider Box', 'Default',
+       'PB-BOX-12', 'ACTIVE', 'active', true, true, 907, now(),
+       $9, $10, $11, $12, $12
+     )`,
+    [
+      fixture.organization,
+      fixture.integration,
+      fixture.pipeline,
+      externalProductId,
+      externalVariantId,
+      `gid://shopify/InventoryItem/${fixture.productGlobalId.slice(-7)}`,
+      fixture.product,
+      productMapping.id,
+      channelRevision,
+      channelSourceHash,
+      packEvidenceHash,
+      actorEmail,
+    ],
+  )
+  const packProfile = (await client.query(
+    `INSERT INTO operations_product_pack_profiles (
+       organization_id, pipeline_id, product_id, profile_key,
+       profile_name, package_level, is_default, status,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'mapped-each',
+       'Mapped sellable each', 'each', true, 'active', $4, $4
+     ) RETURNING id::text, global_id`,
+    [
+      fixture.organization,
+      fixture.pipeline,
+      fixture.product,
+      actorEmail,
+    ],
+  )).rows[0]
+  const packVersion = (await client.query(
+    `INSERT INTO operations_product_pack_profile_versions (
+       organization_id, pipeline_id, product_id, profile_id,
+       version_number, lifecycle_state, base_each_quantity,
+       unit_of_measure, length_mm, width_mm, height_mm, dimension_basis,
+       gross_weight_grams, weight_basis, fit_model, ships_as_own_package,
+       assembly_policy, evidence_type, source, is_current,
+       evidence_reference, confirmed_at, confirmed_by, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       1, 'active', 1, 'each', 254, 203, 152, 'outer',
+       907, 'customer_stated', 'rigid_3d', false, 'never',
+       'customer_confirmed', 'manual', true,
+       'Workbench mapped Product pack evidence', now(), $5, $5
+     ) RETURNING id::text, global_id, row_version::text`,
+    [
+      fixture.organization,
+      fixture.pipeline,
+      fixture.product,
+      packProfile.id,
+      actorEmail,
+    ],
+  )).rows[0]
+  const packMapping = (await client.query(
+    `INSERT INTO operations_commerce_variant_pack_mappings (
+       organization_id, integration_account_id, pipeline_id, product_id,
+       provider, external_product_id, external_variant_id,
+       default_pack_profile_version_id, provider_lifecycle_state,
+       projection_state, mapping_purpose, source_revision, source_hash,
+       pack_evidence_hash, observed_at, is_current, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'shopify', $5, $6, $7::uuid, 'active',
+       'current', 'catalog', $8, $9, $10, now(), true, $11, $11
+     ) RETURNING id::text, global_id, row_version::text`,
+    [
+      fixture.organization,
+      fixture.integration,
+      fixture.pipeline,
+      fixture.product,
+      externalProductId,
+      externalVariantId,
+      packVersion.id,
+      channelRevision,
+      channelSourceHash,
+      packEvidenceHash,
+      actorEmail,
+    ],
+  )).rows[0]
+  Object.assign(fixture, {
+    productMappingGlobalId: productMapping.global_id,
+    modernPackProfileGlobalId: packProfile.global_id,
+    packVersionGlobalId: packVersion.global_id,
+    packMappingGlobalId: packMapping.global_id,
+  })
+}
+
 async function seedFixtures(
   pool,
   primary,
@@ -511,6 +645,7 @@ async function seedFixtures(
     await seedTenant(client, nonShipping, 'Non shipping workbench')
     await seedReadyFacts(client, ready)
     await seedNeedsInfoFacts(client, needsInfo)
+    await seedCurrentMappedProductPack(client, needsInfo)
     await seedReadyFacts(client, accept)
     await seedNeedsInfoFacts(client, refresh)
     await seedNonShippingReadyFacts(client, nonShipping)
@@ -1285,8 +1420,7 @@ async function verifyAcceptance(
             productGlobalId: needsInfoFixture.productGlobalId,
             unitPriceMinor: null,
             currency: 'USD',
-            packageProfileGlobalId:
-              needsInfoFixture.packageProfileGlobalId,
+            packageProfileGlobalId: null,
           }],
         },
       }))
@@ -1316,10 +1450,7 @@ async function verifyAcceptance(
       needsInfoFixture.productGlobalId,
     )
     assert.equal(savedNeedsInfo.lines[0].unitPriceMinor, null)
-    assert.equal(
-      savedNeedsInfo.lines[0].packageProfileGlobalId,
-      needsInfoFixture.packageProfileGlobalId,
-    )
+    assert.equal(savedNeedsInfo.lines[0].packageProfileGlobalId, null)
     await expectDatabaseError(
       () => pool.query(
         `UPDATE operations_commerce_order_workbench
@@ -1370,8 +1501,7 @@ async function verifyAcceptance(
             productGlobalId: needsInfoFixture.productGlobalId,
             unitPriceMinor: 1250,
             currency: 'USD',
-            packageProfileGlobalId:
-              needsInfoFixture.packageProfileGlobalId,
+            packageProfileGlobalId: null,
           }],
         },
       }))
@@ -1410,8 +1540,18 @@ async function verifyAcceptance(
               customer.reference_code AS customer_global_id,
               line.mapping_state, line.price_resolution_state,
               line.packaging_state,
+              line.packaging_source,
+              line.packaging_weight_source,
+              line.weight_grams,
+              line.length_mm,
+              line.width_mm,
+              line.height_mm,
+              line.pack_profile_package_level,
+              line.pack_profile_base_each_quantity,
               product.reference_code AS product_global_id,
-              profile.global_id AS package_profile_global_id,
+              mapping.global_id AS pack_mapping_global_id,
+              version.global_id AS pack_version_global_id,
+              (line.package_profile_id IS NULL) AS legacy_override_cleared,
               (extract(microseconds FROM
                 candidate.provider_requested_delivery_at)::bigint % 1000
               )::integer AS provider_submillisecond,
@@ -1436,9 +1576,12 @@ async function verifyAcceptance(
        JOIN crm_products product
          ON product.pipeline_id = line.pipeline_id
         AND product.id = line.product_id
-       JOIN operations_product_package_profiles profile
-         ON profile.organization_id = line.organization_id
-        AND profile.id = line.package_profile_id
+       JOIN operations_commerce_variant_pack_mappings mapping
+         ON mapping.organization_id = line.organization_id
+        AND mapping.id = line.commerce_variant_pack_mapping_id
+       JOIN operations_product_pack_profile_versions version
+         ON version.organization_id = line.organization_id
+        AND version.id = line.pack_profile_version_id
        WHERE candidate.organization_id = $1::uuid
          AND candidate.pipeline_id = $2::uuid
          AND candidate.id = $3::uuid`,
@@ -1457,8 +1600,18 @@ async function verifyAcceptance(
       mapping_state: 'resolved',
       price_resolution_state: 'provider',
       packaging_state: 'resolved',
+      packaging_source: 'variant_pack_mapping',
+      packaging_weight_source: 'profile_version',
+      weight_grams: 907,
+      length_mm: 254,
+      width_mm: 203,
+      height_mm: 152,
+      pack_profile_package_level: 'each',
+      pack_profile_base_each_quantity: 1,
       product_global_id: needsInfoFixture.productGlobalId,
-      package_profile_global_id: needsInfoFixture.packageProfileGlobalId,
+      pack_mapping_global_id: needsInfoFixture.packMappingGlobalId,
+      pack_version_global_id: needsInfoFixture.packVersionGlobalId,
+      legacy_override_cleared: true,
       provider_submillisecond: 456,
       exact_provider_delivery: true,
       customers: 1,

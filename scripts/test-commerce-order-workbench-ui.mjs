@@ -56,7 +56,8 @@ for (const fragment of [
   'Requested delivery',
   'ClawPilot product',
   'Unit price',
-  'Package profile',
+  'Sellable pack override (optional)',
+  'Use mapped product pack and cartonization',
   'Provider SKU and quantity stay visible',
   'SKU ${line.sku || \'not supplied\'}',
   'Quantity ${line.quantity}',
@@ -110,9 +111,10 @@ assert.ok(
   drawer.includes("shippingRequired && draftReadiness !== 'carrier_ready'"),
   'Only orders with an actual shippable line may require a carrier-ready address before Accept',
 )
-assert.ok(
+assert.equal(
   drawer.includes("!line.requiresShipping || draft.packageProfileGlobalId"),
-  'A non-shipping line must not require a fabricated package profile',
+  false,
+  'A manual legacy package profile must not be required before cartonization can resolve the mapped product pack',
 )
 
 console.log('Commerce order workbench UI contract passed')

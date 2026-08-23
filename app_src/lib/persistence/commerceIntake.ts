@@ -430,6 +430,43 @@ type RuntimePackMappingRow = {
   channel_weight_grams: number | null
 }
 
+function runtimePackMapping(row: RuntimePackMappingRow): CommerceRuntimePackMapping {
+  return {
+    id: row.id,
+    globalId: row.global_id,
+    rowVersion: Number(row.row_version),
+    productId: row.product_id,
+    productMappingId: row.product_mapping_id,
+    externalProductId: row.external_product_id,
+    externalVariantId: row.external_variant_id,
+    projectionState: row.projection_state,
+    isCurrent: row.is_current,
+    sourceRevision: row.source_revision,
+    sourceHash: row.source_hash,
+    packEvidenceHash: row.pack_evidence_hash,
+    profileVersionId: row.profile_version_id,
+    profileVersionGlobalId: row.profile_version_global_id,
+    profileVersionRowVersion: Number(row.profile_version_row_version),
+    profileVersionIsCurrent: row.profile_version_is_current,
+    profileLifecycleState: row.profile_lifecycle_state,
+    profileStatus: row.profile_status,
+    fitModel: row.fit_model,
+    packageLevel: row.package_level,
+    baseEachQuantity: row.base_each_quantity,
+    lengthMm: row.length_mm,
+    widthMm: row.width_mm,
+    heightMm: row.height_mm,
+    dimensionBasis: row.dimension_basis,
+    grossWeightGrams: row.gross_weight_grams,
+    weightBasis: row.weight_basis,
+    evidenceType: row.evidence_type,
+    channelSourceRevision: row.channel_source_revision,
+    channelSourceHash: row.channel_source_hash,
+    channelPackEvidenceHash: row.channel_pack_evidence_hash,
+    channelWeightGrams: row.channel_weight_grams,
+  }
+}
+
 type ExactProductVariantStageEvidence = {
   externalVariantId: string
   variantSourceRevision: string
@@ -5986,42 +6023,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
     const runtimePackMappingByVariant = new Map(
       runtimePackMappings.rows.map((row) => [
         row.external_variant_id,
-        {
-          id: row.id,
-          globalId: row.global_id,
-          rowVersion: Number(row.row_version),
-          productId: row.product_id,
-          productMappingId: row.product_mapping_id,
-          externalProductId: row.external_product_id,
-          externalVariantId: row.external_variant_id,
-          projectionState: row.projection_state,
-          isCurrent: row.is_current,
-          sourceRevision: row.source_revision,
-          sourceHash: row.source_hash,
-          packEvidenceHash: row.pack_evidence_hash,
-          profileVersionId: row.profile_version_id,
-          profileVersionGlobalId: row.profile_version_global_id,
-          profileVersionRowVersion: Number(
-            row.profile_version_row_version,
-          ),
-          profileVersionIsCurrent: row.profile_version_is_current,
-          profileLifecycleState: row.profile_lifecycle_state,
-          profileStatus: row.profile_status,
-          fitModel: row.fit_model,
-          packageLevel: row.package_level,
-          baseEachQuantity: row.base_each_quantity,
-          lengthMm: row.length_mm,
-          widthMm: row.width_mm,
-          heightMm: row.height_mm,
-          dimensionBasis: row.dimension_basis,
-          grossWeightGrams: row.gross_weight_grams,
-          weightBasis: row.weight_basis,
-          evidenceType: row.evidence_type,
-          channelSourceRevision: row.channel_source_revision,
-          channelSourceHash: row.channel_source_hash,
-          channelPackEvidenceHash: row.channel_pack_evidence_hash,
-          channelWeightGrams: row.channel_weight_grams,
-        } satisfies CommerceRuntimePackMapping,
+        runtimePackMapping(row),
       ]),
     )
     const productCandidateByVariant = new Map<string, string>()
@@ -9808,6 +9810,117 @@ export async function excludeCommerceIntakeRejectionInPostgres(input: {
   })
 }
 
+async function readCurrentLineRuntimePackMapping(
+  client: PoolClient,
+  input: {
+    candidate: CandidateRow
+    line: CandidateLineRow
+    productId: string
+    productMappingId: string
+  },
+) {
+  if (!input.line.external_variant_id) return null
+  const result = await client.query<RuntimePackMappingRow>(
+    `SELECT
+       pack_mapping.id::text,
+       pack_mapping.global_id,
+       pack_mapping.row_version::text,
+       pack_mapping.product_id::text,
+       product_mapping.id::text AS product_mapping_id,
+       pack_mapping.external_product_id,
+       pack_mapping.external_variant_id,
+       pack_mapping.projection_state,
+       pack_mapping.is_current,
+       pack_mapping.source_revision,
+       pack_mapping.source_hash,
+       pack_mapping.pack_evidence_hash,
+       profile_version.id::text AS profile_version_id,
+       profile_version.global_id AS profile_version_global_id,
+       profile_version.row_version::text AS profile_version_row_version,
+       profile_version.is_current AS profile_version_is_current,
+       profile_version.lifecycle_state AS profile_lifecycle_state,
+       profile.status AS profile_status,
+       profile_version.fit_model,
+       profile.package_level,
+       profile_version.base_each_quantity,
+       profile_version.length_mm,
+       profile_version.width_mm,
+       profile_version.height_mm,
+       profile_version.dimension_basis,
+       profile_version.gross_weight_grams,
+       profile_version.weight_basis,
+       profile_version.evidence_type,
+       channel_state.source_revision AS channel_source_revision,
+       channel_state.source_hash AS channel_source_hash,
+       channel_state.pack_evidence_hash AS channel_pack_evidence_hash,
+       channel_state.weight_grams AS channel_weight_grams
+     FROM operations_commerce_variant_pack_mappings pack_mapping
+     JOIN operations_product_mappings product_mapping
+       ON product_mapping.organization_id = pack_mapping.organization_id
+      AND product_mapping.integration_account_id =
+            pack_mapping.integration_account_id
+      AND product_mapping.pipeline_id = pack_mapping.pipeline_id
+      AND product_mapping.product_id = pack_mapping.product_id
+      AND product_mapping.external_product_id =
+            pack_mapping.external_product_id
+      AND product_mapping.external_variant_id =
+            pack_mapping.external_variant_id
+      AND product_mapping.active = true
+     JOIN operations_product_pack_profile_versions profile_version
+       ON profile_version.organization_id = pack_mapping.organization_id
+      AND profile_version.pipeline_id = pack_mapping.pipeline_id
+      AND profile_version.product_id = pack_mapping.product_id
+      AND profile_version.id = pack_mapping.default_pack_profile_version_id
+     JOIN operations_product_pack_profiles profile
+       ON profile.organization_id = profile_version.organization_id
+      AND profile.pipeline_id = profile_version.pipeline_id
+      AND profile.product_id = profile_version.product_id
+      AND profile.id = profile_version.profile_id
+     LEFT JOIN operations_product_channel_states channel_state
+       ON channel_state.organization_id = pack_mapping.organization_id
+      AND channel_state.integration_account_id =
+            pack_mapping.integration_account_id
+      AND channel_state.pipeline_id = pack_mapping.pipeline_id
+      AND channel_state.provider = pack_mapping.provider
+      AND channel_state.external_product_id =
+            pack_mapping.external_product_id
+      AND channel_state.external_variant_id =
+            pack_mapping.external_variant_id
+      AND channel_state.product_id = pack_mapping.product_id
+      AND channel_state.product_mapping_id = product_mapping.id
+     WHERE pack_mapping.organization_id = $1::uuid
+       AND pack_mapping.integration_account_id = $2::uuid
+       AND pack_mapping.pipeline_id = $3::uuid
+       AND pack_mapping.provider = $4
+       AND pack_mapping.product_id = $5::uuid
+       AND product_mapping.id = $6::uuid
+       AND pack_mapping.external_product_id = $7
+       AND pack_mapping.external_variant_id = $8
+       AND pack_mapping.mapping_purpose = 'catalog'
+       AND pack_mapping.is_current = true
+     LIMIT 2
+     FOR UPDATE OF pack_mapping, product_mapping, profile_version, profile`,
+    [
+      input.candidate.organization_id,
+      input.candidate.integration_account_id,
+      input.candidate.pipeline_id,
+      input.candidate.provider,
+      input.productId,
+      input.productMappingId,
+      input.line.external_product_id,
+      input.line.external_variant_id,
+    ],
+  )
+  if (result.rows.length > 1) {
+    intakeError(
+      'COMMERCE_INTAKE_PACK_MAPPING_CURRENT_CONFLICT',
+      'This provider variant has multiple current Product pack mappings. Resolve the mapping conflict before continuing',
+      409,
+    )
+  }
+  return result.rows[0] ? runtimePackMapping(result.rows[0]) : null
+}
+
 export async function resolveCommerceCandidateProductInPostgres(input: {
   runtime: CommerceRuntimeCredentialRecord
   actorEmail: string
@@ -9960,6 +10073,57 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
         actorEmail: input.actorEmail,
       })
     }
+    const currentPackMapping = (
+      line.requires_shipping
+      && mapping
+    ) ? await readCurrentLineRuntimePackMapping(client, {
+      candidate,
+      line,
+      productId: product.id,
+      productMappingId: mapping.id,
+    }) : null
+    const currentPackResolution = resolveCommerceRuntimePack({
+      mapping: currentPackMapping,
+      providerUnitMultiplier: Number.isSafeInteger(Number(line.unit_multiplier))
+        ? Number(line.unit_multiplier)
+        : null,
+      providerPackaging: null,
+    })
+    const mappedPackaging = currentPackResolution.reason === 'resolved'
+      ? currentPackResolution.packaging
+      : null
+    const providerPackaging = (
+      currentPackResolution.reason === 'no_mapping'
+      && line.packaging_state === 'resolved'
+      && line.packaging_source === 'provider'
+      && Number.isSafeInteger(line.weight_grams)
+      && Number(line.weight_grams) > 0
+      && Number.isSafeInteger(line.length_mm)
+      && Number(line.length_mm) > 0
+      && Number.isSafeInteger(line.width_mm)
+      && Number(line.width_mm) > 0
+      && Number.isSafeInteger(line.height_mm)
+      && Number(line.height_mm) > 0
+    ) ? {
+      weightGrams: Number(line.weight_grams),
+      dimensionsMm: {
+        length: Number(line.length_mm),
+        width: Number(line.width_mm),
+        height: Number(line.height_mm),
+      },
+    } : null
+    const resolvedPackaging = mappedPackaging || providerPackaging
+    const mappedAssociation = currentPackResolution.association
+    const packagingState = line.requires_shipping
+      ? (resolvedPackaging ? 'resolved' : 'unresolved')
+      : 'not_required'
+    const packagingSource = mappedPackaging
+      ? 'variant_pack_mapping'
+      : currentPackResolution.reason === 'recipe_required'
+        ? 'variant_pack_mapping'
+      : providerPackaging
+        ? 'provider'
+        : 'none'
     const providerPriceSelected = (
       line.unit_price_minor !== null
       && line.currency_code === input.product.currency
@@ -9980,13 +10144,45 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
            resolved_tax_minor = NULL,
            resolved_other_adjustment_minor = NULL,
            resolved_total_minor = NULL,
+           packaging_state = $7,
+           package_profile_id = NULL,
+           commerce_variant_pack_mapping_id = $8::uuid,
+           commerce_variant_pack_mapping_row_version = $9::bigint,
+           pack_profile_version_id = $10::uuid,
+           pack_profile_version_row_version = $11::bigint,
+           pack_profile_package_level = $12,
+           pack_profile_base_each_quantity = $13,
+           packaging_source = $14,
+           packaging_weight_source = $15,
+           weight_grams = $16,
+           length_mm = $17,
+           width_mm = $18,
+           height_mm = $19,
            workflow_state = 'resolving',
-           blocking_codes = array_remove(
-             array_remove(blocking_codes, 'product_mapping_required'),
-             'line_price_required'
-           ),
+           blocking_codes = CASE
+             WHEN $7 IN ('resolved', 'not_required') THEN
+               array_remove(
+                 array_remove(
+                   array_remove(blocking_codes, 'product_mapping_required'),
+                   'line_price_required'
+                 ),
+                 'packaging_required'
+               )
+             WHEN 'packaging_required' = ANY(blocking_codes) THEN
+               array_remove(
+                 array_remove(blocking_codes, 'product_mapping_required'),
+                 'line_price_required'
+               )
+             ELSE array_append(
+               array_remove(
+                 array_remove(blocking_codes, 'product_mapping_required'),
+                 'line_price_required'
+               ),
+               'packaging_required'
+             )
+           END,
            row_version = row_version + 1,
-           updated_by = $7,
+           updated_by = $20,
            updated_at = now()
        WHERE id = $1::uuid`,
       [
@@ -9996,6 +10192,19 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
         priceResolution,
         input.product.currency,
         input.product.unitPriceMinor,
+        packagingState,
+        mappedAssociation?.mappingId || null,
+        mappedAssociation?.mappingRowVersion ?? null,
+        mappedAssociation?.profileVersionId || null,
+        mappedAssociation?.profileVersionRowVersion ?? null,
+        mappedAssociation?.packageLevel || null,
+        mappedAssociation?.baseEachQuantity || null,
+        packagingSource,
+        mappedPackaging?.weightSource || null,
+        resolvedPackaging?.weightGrams || null,
+        resolvedPackaging?.dimensionsMm.length || null,
+        resolvedPackaging?.dimensionsMm.width || null,
+        resolvedPackaging?.dimensionsMm.height || null,
         input.actorEmail,
       ],
     )
@@ -10060,6 +10269,14 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
         productGlobalId: product.globalId,
         productMappingGlobalId: mapping?.global_id || null,
         priceResolution,
+        packResolution: {
+          state: packagingState,
+          source: packagingSource,
+          reason: currentPackResolution.reason,
+          mappingGlobalId: currentPackMapping?.globalId || null,
+          profileVersionGlobalId:
+            currentPackMapping?.profileVersionGlobalId || null,
+        },
       },
     )
     await completeReceipt(

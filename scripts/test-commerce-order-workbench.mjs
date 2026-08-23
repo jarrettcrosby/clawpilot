@@ -157,6 +157,20 @@ assert.ok(
   'Provider delivery resolution must preserve exact stored timestamp precision',
 )
 for (const fragment of [
+  'readCurrentLineRuntimePackMapping',
+  'resolveCommerceRuntimePack({',
+  "packagingSource = mappedPackaging",
+  "? 'variant_pack_mapping'",
+  "array_remove(blocking_codes, 'product_mapping_required')",
+  "'packaging_required'",
+  'packResolution:',
+]) {
+  assert.ok(
+    candidateResolver.includes(fragment),
+    `Product resolution must reconcile the current mapped Product pack: ${fragment}`,
+  )
+}
+for (const fragment of [
   'Review each local value changed by the provider refresh.',
   'Keep mine:',
   'Use {providerLabel(order!.provider)}:',
@@ -167,10 +181,16 @@ for (const fragment of [
   "field === 'requestedDeliveryAt'",
   'savedDraftComplete',
   "shippingRequired && draftReadiness !== 'carrier_ready'",
-  '!line.requiresShipping || draft.packageProfileGlobalId',
+  'Sellable pack override (optional)',
+  'Use mapped product pack and cartonization',
 ]) {
   assert.ok(drawer.includes(fragment), `Drawer refresh is missing ${fragment}`)
 }
+assert.equal(
+  drawer.includes('!line.requiresShipping || draft.packageProfileGlobalId'),
+  false,
+  'The workbench must not require a manual legacy package profile when the mapped Product pack can be reconciled during acceptance',
+)
 assert.equal(
   /reasonValue|confirmationStatement|canActivate/u.test(route),
   false,
