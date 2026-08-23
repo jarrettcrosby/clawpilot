@@ -123,7 +123,7 @@ function editorFingerprint(input: {
 function blockerLabel(code: string) {
   if (code === 'product_mapping_required') return 'Select product'
   if (code === 'line_price_required') return 'Enter price'
-  if (code === 'packaging_required') return 'Select package profile'
+  if (code === 'packaging_required') return 'Product pack facts required'
   if (code === 'customer_resolution_required') return 'Select customer'
   if (code === 'delivery_decision_required') return 'Choose delivery date'
   return code.replaceAll('_', ' ')
@@ -236,8 +236,7 @@ export default function ImportedOrderWorkingCopyDrawer({
       const draft = lineDrafts[line.globalId]
       return Boolean(
         draft?.productGlobalId
-        && draft.unitPriceMajor.trim()
-        && (!line.requiresShipping || draft.packageProfileGlobalId),
+        && draft.unitPriceMajor.trim(),
       )
     })
   }, [
@@ -669,8 +668,9 @@ export default function ImportedOrderWorkingCopyDrawer({
                       <TextField
                         select
                         size="small"
-                        label="Package profile"
+                        label="Sellable pack override (optional)"
                         value={draft?.packageProfileGlobalId || ''}
+                        SelectProps={{ displayEmpty: true }}
                         onChange={(event) => updateLine(line.globalId, {
                           packageProfileGlobalId: event.target.value,
                         })}
@@ -683,12 +683,12 @@ export default function ImportedOrderWorkingCopyDrawer({
                         }
                         helperText={draft?.productGlobalId
                           ? packageProfiles.length
-                            ? 'Choose the measured package profile for this product'
-                            : 'This product has no active package profile'
+                            ? 'Normally leave blank. ClawPilot uses the current mapped product pack and cartonization chooses the outbound packaging. Select only a measured legacy override.'
+                            : 'No legacy override is available. ClawPilot will use the current mapped product pack for cartonization.'
                           : 'Select a product first'}
                         fullWidth
                       >
-                        <MenuItem value=""><em>Select package profile</em></MenuItem>
+                        <MenuItem value=""><em>Use mapped product pack and cartonization</em></MenuItem>
                         {packageProfiles.map((profile) => (
                           <MenuItem key={profile.globalId} value={profile.globalId}>
                             {profile.name}

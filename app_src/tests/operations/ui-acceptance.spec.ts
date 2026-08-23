@@ -1684,13 +1684,9 @@ test('incomplete imported order saves locally before explicit acceptance into ca
   await page.getByRole('option', { name: /Trail Pack · TRAIL-001/ }).click()
   await page.getByLabel('Unit price (USD)').fill('12.50')
 
-  const packageProfile = page.getByRole('combobox', {
-    name: 'Package profile',
-  })
-  await packageProfile.click()
-  await page.getByRole('option', {
-    name: 'Trail Pack measured single',
-  }).click()
+  await expect(page.getByRole('combobox', {
+    name: 'Sellable pack override (optional)',
+  })).toHaveText('Use mapped product pack and cartonization')
 
   const requestedDelivery = page.getByLabel('Requested delivery')
   await requestedDelivery.fill('2026-08-30T15:30')
@@ -1742,7 +1738,7 @@ test('incomplete imported order saves locally before explicit acceptance into ca
         productGlobalId: workbenchProductGlobalId,
         unitPriceMinor: 1250,
         currency: 'USD',
-        packageProfileGlobalId: workbenchPackageProfileGlobalId,
+        packageProfileGlobalId: null,
       }],
     },
   })
