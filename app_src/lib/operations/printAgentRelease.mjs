@@ -233,7 +233,7 @@ export async function verifyPrintAgentRelease({ configuration, request, download
   )
   if (String(repository.id || '') !== String(configuration.repositoryId)
     || repository.full_name !== REPOSITORY
-    || repository.private !== true) {
+    || repository.private !== false) {
     fail('PRINT_AGENT_RELEASE_REPOSITORY_INVALID', 'Print-agent release repository identity changed')
   }
 

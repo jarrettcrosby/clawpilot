@@ -2,10 +2,7 @@ name: Deployed runtime monitor
 
 on:
   schedule:
-    # Private-repository jobs round up to a full billable minute. Six checks
-    # per day preserve routine drift detection without consuming most of the
-    # monthly Actions allowance on a sub-minute health probe.
-    - cron: '17 */4 * * *'
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 permissions:

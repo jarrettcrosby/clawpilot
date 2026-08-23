@@ -106,7 +106,7 @@ function fixture(mutateIndex) {
       indexSha256: indexDigest,
       prerelease: false,
     },
-    repository: { id: Number(repositoryId), full_name: 'jarrettcrosby/clawpilot', private: true },
+    repository: { id: Number(repositoryId), full_name: 'jarrettcrosby/clawpilot', private: false },
     release: {
       tag_name: tag,
       target_commitish: sourceCommit,
@@ -202,6 +202,10 @@ try {
   const repoDrift = fixture()
   repoDrift.repository.id += 1
   await expectCode('PRINT_AGENT_RELEASE_REPOSITORY_INVALID', () => verify(repoDrift))
+
+  const visibilityDrift = fixture()
+  visibilityDrift.repository.private = true
+  await expectCode('PRINT_AGENT_RELEASE_REPOSITORY_INVALID', () => verify(visibilityDrift))
 
   for (const [field, value] of [['draft', true], ['prerelease', true], ['target_commitish', 'b'.repeat(40)]]) {
     const drift = fixture()
