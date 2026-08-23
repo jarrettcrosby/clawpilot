@@ -118,6 +118,8 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
 
 test('pre-signed macOS promotion re-verifies exact bytes from protected main', () => {
   const workflow = read('.github/workflows/print-gateway-promote-macos.yml')
+  assert.match(workflow, /preflight:\n(?:.*\n){0,4}\s+permissions:\n(?:\s+#.*\n)?\s+contents: write/)
+  assert.match(workflow, /verify_macos:\n(?:.*\n){0,6}\s+permissions:\n(?:\s+#.*\n)?\s+contents: write/)
   for (const gate of [
     "confirmation == 'VERIFY_AND_PUBLISH'",
     'refs/heads/main',
