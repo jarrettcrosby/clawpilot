@@ -83,6 +83,15 @@ hosted access remains behind browser authentication. The preview manifest and
 README declare `developers-only` distribution and no customer-release
 readiness.
 
+An already Developer ID-signed, notarized, and stapled macOS DMG may use the
+separate protected promotion workflow instead of importing signing credentials
+again. That workflow accepts only one exact draft-staged DMG, requires its
+independently recorded SHA-256 and source commit, proves that source is an
+ancestor of the protected `main` dispatch commit, and reruns signature,
+notarization, stapling, universal-payload, secret-scan, mounted-app smoke, and
+immutable Sigstore asset checks before publishing. It does not accept an
+unsigned application or bypass any customer-release verification.
+
 Do not conflate the native setup application with a browser printing path. Its
 managed workers run in the signed-in user's background tray after the setup
 window closes. The separate

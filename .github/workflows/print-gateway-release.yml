@@ -357,15 +357,29 @@ jobs:
             --target "$SOURCE_COMMIT" \
             --title "ClawPilot Print Agent $RELEASE_VERSION" \
             --notes "Signed macOS universal DMG and Windows x64 installer built from commit $SOURCE_COMMIT. Verify SHA256SUMS.txt and its Sigstore bundle before installation."
-          tag_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
-          if [ "$tag_commit" != "$SOURCE_COMMIT" ]; then
-            echo "Draft release tag resolved to unexpected commit $tag_commit" >&2
+          draft_target="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -ser --arg tag "$tag" '
+                [.[][] | select(.tag_name == $tag and .draft == true)]
+                | if length == 1 then .[0].target_commitish
+                  else error("expected exactly one draft release") end
+              '
+          )"
+          if [ "$draft_target" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release resolved to unexpected target $draft_target" >&2
             exit 1
           fi
           gh release upload "$tag" "$RUNNER_TEMP"/release/*
-          prepublish_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq '.object.sha')"
-          if [ "$prepublish_commit" != "$SOURCE_COMMIT" ]; then
-            echo "Draft release tag drifted during asset upload to $prepublish_commit; leaving release unpublished" >&2
+          prepublish_target="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -ser --arg tag "$tag" '
+                [.[][] | select(.tag_name == $tag and .draft == true)]
+                | if length == 1 then .[0].target_commitish
+                  else error("expected exactly one draft release") end
+              '
+          )"
+          if [ "$prepublish_target" != "$SOURCE_COMMIT" ]; then
+            echo "Draft release target drifted during asset upload to $prepublish_target; leaving release unpublished" >&2
             exit 1
           fi
           gh release edit "$tag" --draft=false
