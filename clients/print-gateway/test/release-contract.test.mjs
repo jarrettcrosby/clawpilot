@@ -62,6 +62,9 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
     'published_commit=',
     'cosign verify-blob',
     'assert-release-asset-set.mjs',
+    'RELEASE_PLATFORMS',
+    'Signed, notarized, and stapled macOS universal DMG built from commit',
+    'Signed, notarized, and stapled macOS universal DMG plus signed Windows x64 installer built from commit',
     '--draft',
     '--draft=false',
   ]) assert.ok(workflow.includes(gate), `Release workflow is missing ${gate}`)
