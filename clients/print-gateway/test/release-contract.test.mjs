@@ -57,8 +57,8 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
     "'--release-smoke-login-item'",
     'git ls-remote --exit-code --refs origin',
     'gh release upload',
-    'tag_commit=',
-    'prepublish_commit=',
+    'draft_target=',
+    'prepublish_target=',
     'published_commit=',
     'cosign verify-blob',
     'assert-release-asset-set.mjs',
@@ -73,7 +73,7 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
   assert.equal((workflow.match(/gh release edit "\$tag" --draft=false/g) || []).length, 1)
   assert.match(
     workflow,
-    /gh release upload[\s\S]*prepublish_commit=.*[\s\S]*if \[ "\$prepublish_commit" != "\$SOURCE_COMMIT" \][\s\S]*gh release edit "\$tag" --draft=false/,
+    /gh release upload[\s\S]*prepublish_target=.*[\s\S]*if \[ "\$prepublish_target" != "\$SOURCE_COMMIT" \][\s\S]*gh release edit "\$tag" --draft=false/,
   )
   assert.match(
     workflow,
@@ -108,6 +108,46 @@ test('customer release is fail-closed, secret-safe, exact-SHA tested, and action
     ]) assert.doesNotMatch(block, new RegExp(forbidden))
   }
 
+  for (const line of workflow.split('\n').filter((value) => value.includes('uses:'))) {
+    assert.match(line, /uses:\s+[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}(?:\s+#\s+v\d+)?\s*$/)
+  }
+})
+
+test('pre-signed macOS promotion re-verifies exact bytes from protected main', () => {
+  const workflow = read('.github/workflows/print-gateway-promote-macos.yml')
+  for (const gate of [
+    "confirmation == 'VERIFY_AND_PUBLISH'",
+    'refs/heads/main',
+    'print-gateway-customer-release',
+    'git merge-base --is-ancestor',
+    'gh api --paginate',
+    "select(.tag_name == $tag)",
+    "'.draft'",
+    "'.assets | length'",
+    'staging_target=',
+    'EXPECTED_SHA256',
+    'verify-release-artifacts.mjs --platform macos',
+    'Execute the exact mounted, signed, stapled DMG payload',
+    'run smoke:packaged',
+    'cosign verify-blob',
+    'assert-release-asset-set.mjs',
+    'draft_target=',
+    'prepublish_target=',
+    'published_commit=',
+    '--draft',
+    '--draft=false',
+  ]) assert.ok(workflow.includes(gate), `Promotion workflow is missing ${gate}`)
+  assert.doesNotMatch(workflow, /build:mac|APPLE_API_KEY|CERTIFICATE_BASE64|CSC_KEY_PASSWORD/)
+  assert.doesNotMatch(workflow, /^\s*push:/m)
+  assert.equal((workflow.match(/gh release create "\$tag"/g) || []).length, 1)
+  assert.equal((workflow.match(/gh release edit "\$tag" --draft=false/g) || []).length, 1)
+  assert.match(
+    workflow,
+    /gh release upload[\s\S]*prepublish_target=.*[\s\S]*if \[ "\$prepublish_target" != "\$SOURCE_COMMIT" \][\s\S]*gh release edit "\$tag" --draft=false/,
+  )
+  for (const runBlock of shellRunBlocks(workflow)) {
+    assert.doesNotMatch(runBlock, /\$\{\{\s*inputs\./)
+  }
   for (const line of workflow.split('\n').filter((value) => value.includes('uses:'))) {
     assert.match(line, /uses:\s+[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[a-f0-9]{40}(?:\s+#\s+v\d+)?\s*$/)
   }
