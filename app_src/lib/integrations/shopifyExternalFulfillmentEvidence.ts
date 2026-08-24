@@ -20,7 +20,7 @@ export type ShopifyExternalFulfillmentTarget = {
 }
 
 export type ShopifyExternalFulfillmentEvidenceSnapshot = {
-  version: 'shopify-external-fulfillment-reconciliation-v1'
+  version: 'shopify-external-fulfillment-reconciliation-v2'
   observedAt: string
   order: {
     id: string
@@ -39,6 +39,11 @@ export type ShopifyExternalFulfillmentEvidenceSnapshot = {
     createdAt: string
     updatedAt: string
     hasTracking: boolean
+    tracking: Array<{
+      company: string | null
+      number: string | null
+      url: string | null
+    }>
     fulfillmentOrderIds: string[]
     lines: Array<{
       externalLineId: string
@@ -121,6 +126,50 @@ function text(value: unknown, label: string, pattern?: RegExp): string {
     )
   }
   return normalized
+}
+
+function optionalText(
+  value: unknown,
+  label: string,
+  maxLength = 512,
+): string | null {
+  if (value === null || value === undefined || value === '') return null
+  const normalized = String(value).trim()
+  if (
+    !normalized
+    || normalized.length > maxLength
+    || /[\u0000-\u001f\u007f]/u.test(normalized)
+  ) {
+    fail(
+      'SHOPIFY_EXTERNAL_FULFILLMENT_RESPONSE_INVALID',
+      `Shopify returned malformed ${label}`,
+      502,
+    )
+  }
+  return normalized
+}
+
+function optionalTrackingUrl(value: unknown, label: string): string | null {
+  const normalized = optionalText(value, label, 2048)
+  if (!normalized) return null
+  let parsed: URL
+  try {
+    parsed = new URL(normalized)
+  } catch {
+    fail(
+      'SHOPIFY_EXTERNAL_FULFILLMENT_RESPONSE_INVALID',
+      `Shopify returned malformed ${label}`,
+      502,
+    )
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    fail(
+      'SHOPIFY_EXTERNAL_FULFILLMENT_RESPONSE_INVALID',
+      `Shopify returned malformed ${label}`,
+      502,
+    )
+  }
+  return parsed.toString()
 }
 
 function iso(value: unknown, label: string): string {
@@ -443,19 +492,54 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
   const successfulFulfillments = providerFulfillments.filter((value) => (
     value.status === 'SUCCESS'
     && value.displayStatus === 'FULFILLED'
-  )).map((value) => ({
-    id: text(value.id, 'fulfillment ID', SHOPIFY_FULFILLMENT_GID),
-    name: text(value.name, 'fulfillment name'),
-    status: 'SUCCESS' as const,
-    displayStatus: 'FULFILLED' as const,
-    createdAt: iso(value.createdAt, 'fulfillment creation time'),
-    updatedAt: iso(value.updatedAt, 'fulfillment update time'),
-    hasTracking: Array.isArray(value.trackingInfo)
-      && value.trackingInfo.length > 0,
-    fulfillmentOrders: connection(
-      value.fulfillmentOrders,
-      'fulfillment source orders',
-    ).map((fulfillmentOrder) => {
+  )).map((value) => {
+    const trackingValues = records(
+      value.trackingInfo,
+      'fulfillment tracking information',
+    )
+    if (trackingValues.length > 10) {
+      fail(
+        'SHOPIFY_EXTERNAL_FULFILLMENT_PAGINATION_REQUIRED',
+        'Shopify fulfillment tracking information exceeds the bounded reconciliation read',
+      )
+    }
+    const tracking = trackingValues.map((trackingValue, index) => {
+      const company = optionalText(
+        trackingValue.company,
+        `fulfillment tracking company ${index + 1}`,
+        255,
+      )
+      const number = optionalText(
+        trackingValue.number,
+        `fulfillment tracking number ${index + 1}`,
+        255,
+      )
+      const url = optionalTrackingUrl(
+        trackingValue.url,
+        `fulfillment tracking URL ${index + 1}`,
+      )
+      if (!company && !number && !url) {
+        fail(
+          'SHOPIFY_EXTERNAL_FULFILLMENT_RESPONSE_INVALID',
+          'Shopify returned empty fulfillment tracking information',
+          502,
+        )
+      }
+      return { company, number, url }
+    })
+    return {
+      id: text(value.id, 'fulfillment ID', SHOPIFY_FULFILLMENT_GID),
+      name: text(value.name, 'fulfillment name'),
+      status: 'SUCCESS' as const,
+      displayStatus: 'FULFILLED' as const,
+      createdAt: iso(value.createdAt, 'fulfillment creation time'),
+      updatedAt: iso(value.updatedAt, 'fulfillment update time'),
+      hasTracking: tracking.length > 0,
+      tracking,
+      fulfillmentOrders: connection(
+        value.fulfillmentOrders,
+        'fulfillment source orders',
+      ).map((fulfillmentOrder) => {
       const assignedLocation = record(
         fulfillmentOrder.assignedLocation,
         'fulfillment source-order assigned location',
@@ -476,11 +560,11 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
           SHOPIFY_LOCATION_GID,
         ),
       }
-    }).sort((left, right) => left.id.localeCompare(right.id)),
-    lines: connection(
-      value.fulfillmentLineItems,
-      'fulfillment lines',
-    ).map((line) => {
+      }).sort((left, right) => left.id.localeCompare(right.id)),
+      lines: connection(
+        value.fulfillmentLineItems,
+        'fulfillment lines',
+      ).map((line) => {
       const orderLine = record(line.lineItem, 'fulfillment source line')
       return {
         externalLineId: text(
@@ -490,10 +574,11 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
         ),
         quantity: wholeQuantity(line.quantity, 'fulfillment line quantity'),
       }
-    }).sort((left, right) => (
-      left.externalLineId.localeCompare(right.externalLineId)
-    )),
-  }))
+      }).sort((left, right) => (
+        left.externalLineId.localeCompare(right.externalLineId)
+      )),
+    }
+  })
   const expectedLines = [...target.lines].sort((left, right) => (
     left.externalLineId.localeCompare(right.externalLineId)
   ))
@@ -540,11 +625,12 @@ export function normalizeShopifyExternalFulfillmentEvidence(input: {
     createdAt: exactFulfillment.createdAt,
     updatedAt: exactFulfillment.updatedAt,
     hasTracking: exactFulfillment.hasTracking,
+    tracking: exactFulfillment.tracking,
     fulfillmentOrderIds: expectedFulfillmentOrderIds,
     lines: exactFulfillment.lines,
   }
   const snapshot: ShopifyExternalFulfillmentEvidenceSnapshot = {
-    version: 'shopify-external-fulfillment-reconciliation-v1',
+    version: 'shopify-external-fulfillment-reconciliation-v2',
     observedAt,
     order: {
       id: target.externalOrderId,

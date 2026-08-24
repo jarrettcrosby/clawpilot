@@ -42,6 +42,10 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
     'action', 'warehouseId', 'sourceArtifactGlobalId',
     'preferredPrinterGlobalId', 'maxAttempts',
   ]),
+  'enqueue-external-label-artifact': new Set([
+    'action', 'warehouseId', 'sourceArtifactGlobalId',
+    'preferredPrinterGlobalId', 'maxAttempts',
+  ]),
   'retry-job': new Set(['action', 'jobGlobalId', 'reason']),
   'reprint-job': new Set(['action', 'jobGlobalId', 'reason']),
   'cancel-job': new Set(['action', 'jobGlobalId', 'reason']),
@@ -294,6 +298,25 @@ export async function POST(req: NextRequest) {
         ...common,
         document: {
           type: 'packing_slip_artifact',
+          sourceArtifactGlobalId,
+        },
+      }
+    } else if (command.action === 'enqueue-external-label-artifact') {
+      const sourceArtifactGlobalId = text(
+        command.value.sourceArtifactGlobalId,
+        'External shipping-label artifact',
+        16,
+      )
+      if (!ARTIFACT_GLOBAL_ID.test(sourceArtifactGlobalId)) {
+        fail(
+          'OPERATIONS_PRINT_JOB_REQUEST_INVALID',
+          'External shipping-label artifact is invalid',
+        )
+      }
+      enqueue = {
+        ...common,
+        document: {
+          type: 'external_shipping_label_artifact',
           sourceArtifactGlobalId,
         },
       }

@@ -1098,6 +1098,8 @@ function OrderDetailDrawer({
   onGeneratePackingSlip,
   onPrintPackingSlip,
   onPrintLabel,
+  onUploadExternalLabel,
+  onPrintExternalLabel,
   onRetryLabel,
   onReprintLabel,
   onConfirmShipment,
@@ -1141,6 +1143,8 @@ function OrderDetailDrawer({
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onPrintLabel: (labelGlobalId: string) => void
+  onUploadExternalLabel: (trackingNumber: string, file: File) => void
+  onPrintExternalLabel: (artifactGlobalId: string) => void
   onRetryLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onReprintLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onConfirmShipment: () => void
@@ -1217,9 +1221,29 @@ function OrderDetailDrawer({
   const preparingFulfillment = primaryAction?.action === 'prepare_fulfillment'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
   const shipments = order?.shipments || []
+  const externalFulfillment = order?.externalFulfillment || null
   const trackingObservations = order?.trackingObservations || []
   const printArtifacts = order?.printArtifacts || []
   const labelPrintJobs = order?.labelPrintJobs || []
+  const externalLabelArtifacts = externalFulfillment
+    ? printArtifacts.filter((artifact) => (
+        artifact.documentType === 'shipping_label'
+        && artifact.externalFulfillmentReconciliationGlobalId
+          === externalFulfillment.reconciliationGlobalId
+      ))
+    : []
+  const missingExternalLabelArtifact = Boolean(
+    externalFulfillment
+    && (
+      externalFulfillment.tracking.length === 0
+      || externalFulfillment.tracking.some((tracking) => (
+        !tracking.number
+        || !externalLabelArtifacts.some(
+          (artifact) => artifact.externalTrackingNumber === tracking.number,
+        )
+      ))
+    ),
+  )
   const shippingLabels = order?.packages.flatMap((item) => (
     item.latestLabel ? [{ package: item, label: item.latestLabel }] : []
   )) || []
@@ -1244,6 +1268,8 @@ function OrderDetailDrawer({
         ? 'The ship-to changed after planning. Compare rates again before creating a label.'
       : order?.status !== 'packed'
         ? 'Verify package packing before creating a label.'
+        : order.packages.length !== 1
+          ? 'Use the package controls above for a multi-package shipment.'
         : activeLabel
           ? 'Void the active label before creating another.'
           : unresolvedAttempt
@@ -1262,7 +1288,7 @@ function OrderDetailDrawer({
       : order?.shipmentShipTo.rerateRequired
         ? 'The ship-to changed after planning. Compare rates again before creating labels.'
       : !sandboxE2eAuthorization
-        ? 'Authorize this exact commerce test order before creating package-specific sandbox labels.'
+        ? 'Enable sandbox fulfillment before creating package labels.'
         : order?.status !== 'packed'
           ? 'Verify every package before creating labels.'
           : unresolvedAttempt
@@ -1275,15 +1301,15 @@ function OrderDetailDrawer({
                   ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
                   : null
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
-    ? 'Only an authorized organization owner or administrator may authorize this test.'
+    ? 'Only an organization owner or administrator may enable sandbox fulfillment.'
     : !order?.sourceProvider
       || !['shopify', 'faire'].includes(order.sourceProvider)
-      ? 'Sandbox commerce E2E authorization requires a Shopify or Faire order.'
+      ? 'Sandbox fulfillment is available for Shopify and Faire orders.'
       : canonicalShopifyTestLane
         && !['imported', 'planned', 'released', 'picking', 'packed'].includes(order.status)
-        ? 'This Shopify test order is no longer at a resumable local stage.'
+        ? 'This order is no longer at a resumable fulfillment stage.'
         : !canonicalShopifyTestLane && order.status !== 'packed'
-          ? 'Verify every package before authorizing the test.'
+          ? 'Verify every package before enabling fulfillment.'
         : shipments.length > 0
           ? 'This order already has shipment evidence.'
           : null
@@ -1770,61 +1796,64 @@ function OrderDetailDrawer({
             {(
               canonicalShopifyTestLane
               || (
-                ['shopify', 'faire'].includes(order.sourceProvider || '')
+                order.sourceProvider === 'faire'
                 && order.status === 'packed'
               )
             ) && (
-              <DetailSection title={canonicalShopifyTestLane
-                ? 'Verified Shopify test-store workflow'
-                : 'Authorized sandbox commerce E2E'}>
+              <DetailSection title="Sandbox fulfillment">
                 {sandboxE2eAuthorization ? (
                   <Stack spacing={1.25}>
-                    <Alert
-                      severity="success"
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      alignItems="center"
                       data-testid="sandbox-commerce-e2e-authorization-active"
                     >
-                      Exact-order authorization{' '}
-                      {sandboxE2eAuthorization.authorizationGlobalId} is current until{' '}
-                      {formatUserDateTime(
-                        sandboxE2eAuthorization.expiresAt,
-                        dateTime,
-                        {
-                          year: 'numeric',
-                          month: 'short',
-                          day: 'numeric',
-                          hour: 'numeric',
-                          minute: '2-digit',
-                          fallback: sandboxE2eAuthorization.expiresAt,
-                        },
-                      )}. {canonicalShopifyAuthorization
-                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order. Provider writes must also be On before fulfillment is sent to Shopify.'
-                        : `It permits only this order's package-specific sandbox labels and reserved-inventory consumption. Provider writes must be On before ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment or tracking is sent.`}
-                    </Alert>
+                      <Chip size="small" color="success" label="Enabled" />
+                      <Typography variant="body2" color="text.secondary">
+                        Available until {formatUserDateTime(
+                          sandboxE2eAuthorization.expiresAt,
+                          dateTime,
+                          {
+                            year: 'numeric',
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                            fallback: sandboxE2eAuthorization.expiresAt,
+                          },
+                        )}
+                      </Typography>
+                    </Stack>
                     {canonicalShopifyAuthorization && order.status === 'packed' && (
                       canonicalShopifyAuthorization.fulfillmentConfirmedAt ? (
-                        <Alert
-                          severity="success"
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          alignItems="center"
                           data-testid="shopify-test-store-fulfillment-confirmed"
                         >
-                          The exact sandbox label and tracking snapshot was confirmed at{' '}
-                          {formatUserDateTime(
-                            canonicalShopifyAuthorization.fulfillmentConfirmedAt,
-                            dateTime,
-                            {
-                              year: 'numeric',
-                              month: 'short',
-                              day: 'numeric',
-                              hour: 'numeric',
-                              minute: '2-digit',
-                              fallback:
-                                canonicalShopifyAuthorization.fulfillmentConfirmedAt,
-                            },
-                          )}. Shopify customer notification is locked off.
-                        </Alert>
+                          <CheckCircleRounded color="success" fontSize="small" />
+                          <Typography variant="body2">
+                            Tracking reviewed {formatUserDateTime(
+                              canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                              dateTime,
+                              {
+                                year: 'numeric',
+                                month: 'short',
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit',
+                                fallback:
+                                  canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                              },
+                            )}
+                          </Typography>
+                        </Stack>
                       ) : (
                         <Tooltip title={canonicalLabelsReady
-                          ? 'Review the exact sandbox labels and explicitly confirm Shopify fulfillment'
-                          : 'Create one current sandbox label for every exact package first'}>
+                          ? 'Review package labels before completing fulfillment'
+                          : 'Create a current label for every package first'}>
                           <span>
                             <Button
                               fullWidth
@@ -1835,7 +1864,7 @@ function OrderDetailDrawer({
                               onClick={onConfirmShopifyTestFulfillment}
                               data-testid="review-shopify-test-store-fulfillment"
                             >
-                              Review and confirm Shopify fulfillment
+                              Review fulfillment
                             </Button>
                           </span>
                         </Tooltip>
@@ -1844,21 +1873,18 @@ function OrderDetailDrawer({
                   </Stack>
                 ) : (
                   <Stack spacing={1.25}>
-                    <Alert severity="warning">
-                      {canonicalShopifyTestLane
-                        ? `Authorize this exact provider-verified Shopify test order before starting or resuming its ${displayStatus(order.status)} local workflow. This does not enable unrelated orders, production postage, or customer notification.`
-                        : `This test path creates non-tracking sandbox labels and then performs real ClawPilot inventory and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment writes for this exact order. It does not authorize any other order or production carrier purchase.`}
-                    </Alert>
+                    <Typography variant="body2" color="text.secondary">
+                      Use the connected sandbox account for this order. Production postage is unavailable in this environment.
+                    </Typography>
                     <Tooltip
                       title={authorizeSandboxE2eBlockedReason
-                        || 'Review and authorize this exact commerce test order'}
+                        || 'Enable sandbox fulfillment for this order'}
                     >
                       <span>
                         <Button
                           fullWidth
                           variant="outlined"
-                          color="warning"
-                          startIcon={<WarningAmberRounded />}
+                          startIcon={<LocalShippingRounded />}
                           disabled={busy || Boolean(authorizeSandboxE2eBlockedReason)}
                           onClick={onAuthorizeSandboxE2e}
                           data-testid={canonicalShopifyTestLane
@@ -1866,10 +1892,8 @@ function OrderDetailDrawer({
                             : 'authorize-sandbox-commerce-e2e'}
                         >
                           {canonicalShopifyTestLane && order.status !== 'imported'
-                            ? 'Renew or resume verified test order'
-                            : canonicalShopifyTestLane
-                              ? 'Authorize verified test order'
-                              : 'Authorize exact-order E2E test'}
+                            ? 'Resume sandbox fulfillment'
+                            : 'Enable sandbox fulfillment'}
                         </Button>
                       </span>
                     </Tooltip>
@@ -2017,14 +2041,13 @@ function OrderDetailDrawer({
                           </Tooltip>
                         </Stack>
                       </Box>
-                    ) : (
-                      <Alert severity={createBlockedReason ? 'info' : 'warning'}>
-                        {createBlockedReason
-                          || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
-                      </Alert>
-                    )}
+                    ) : createBlockedReason ? (
+                      <Typography variant="body2" color="text.secondary">
+                        {createBlockedReason}
+                      </Typography>
+                    ) : null}
                     {!activeLabel && (
-                      <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
+                      <Tooltip title={createBlockedReason || 'Create a label and send it to the configured printer'}>
                         <span>
                           <Button
                             fullWidth
@@ -2072,6 +2095,7 @@ function OrderDetailDrawer({
 
             <DetailSection title="Shipment evidence">
               {shipments.length === 0
+                && !externalFulfillment
                 && trackingObservations.length === 0
                 && printArtifacts.length === 0
                 && shippingLabels.length === 0
@@ -2081,6 +2105,215 @@ function OrderDetailDrawer({
                   </Typography>
                 ) : (
                   <Stack spacing={2}>
+                    {externalFulfillment && (
+                      <Box data-testid="order-external-fulfillment-evidence">
+                        <Typography variant="caption" color="text.secondary">
+                          External fulfillment
+                        </Typography>
+                        <Stack spacing={1.25} sx={{ mt: 0.75 }}>
+                          <Box>
+                            <Typography fontWeight={700}>
+                              Shopify · {externalFulfillment.providerFulfillmentName}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {externalFulfillment.providerFulfillmentId}
+                              {' · Fulfilled '}{formatUserDateTime(
+                                externalFulfillment.fulfilledAt,
+                                dateTime,
+                                {
+                                  year: 'numeric',
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                  fallback: 'Unknown',
+                                },
+                              )}
+                              {' · Evidence '}{externalFulfillment.reconciliationGlobalId}
+                            </Typography>
+                          </Box>
+                          {externalFulfillment.tracking.length > 0 ? (
+                            <Stack divider={<Divider flexItem />}>
+                              {externalFulfillment.tracking.map((tracking, index) => {
+                                const artifact = externalLabelArtifacts.find(
+                                  (item) => item.externalTrackingNumber === tracking.number,
+                                ) || null
+                                const jobs = artifact
+                                  ? labelPrintJobs.filter(
+                                      (job) => job.sourceArtifactGlobalId === artifact.globalId,
+                                    )
+                                  : []
+                                const pendingJob = jobs.find(
+                                  (job) => job.status === 'queued' || job.status === 'claimed',
+                                ) || null
+                                const deliveredJob = jobs.find(
+                                  (job) => job.status === 'delivered',
+                                ) || null
+                                const failedJob = jobs.find(
+                                  (job) => job.status === 'failed',
+                                ) || null
+                                const busyKey = artifact?.globalId
+                                  || `external-upload:${tracking.number || index}`
+                                const busyLabel = labelPrintBusyGlobalId === busyKey
+                                const printBlockedReason = !canExecute
+                                  ? 'Warehouse execution access is required to print labels.'
+                                  : !order.warehouseId
+                                    ? 'The order has no fulfillment warehouse for printer routing.'
+                                    : pendingJob
+                                      ? `Print job ${pendingJob.globalId} is already ${pendingJob.status}.`
+                                      : jobs.length > 0 && !deliveredJob && !failedJob
+                                        ? 'Review the existing print job in Printing before authorizing another physical copy.'
+                                        : null
+                                return (
+                                  <Box
+                                    key={`${tracking.number || tracking.url || 'tracking'}-${index}`}
+                                    sx={{
+                                      py: 1,
+                                      display: 'grid',
+                                      gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                      gap: 1.5,
+                                      alignItems: 'center',
+                                    }}
+                                  >
+                                    <Box sx={{ minWidth: 0 }}>
+                                      <Typography fontWeight={600}>
+                                        {tracking.company || 'Carrier not supplied'}
+                                      </Typography>
+                                      <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                        {tracking.number || 'Tracking number not supplied'}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" display="block">
+                                        {artifact
+                                          ? `${artifact.globalId} · Exact original ${artifact.format} retained${jobs[0] ? ` · Latest print ${jobs[0].globalId} (${displayStatus(jobs[0].status)})` : ''}`
+                                          : 'Exact original label not yet retained'}
+                                      </Typography>
+                                    </Box>
+                                    <Stack direction="row" spacing={1} flexWrap="wrap" justifyContent="flex-end">
+                                      {tracking.url && (
+                                        <Button
+                                          component="a"
+                                          href={tracking.url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          size="small"
+                                          variant="outlined"
+                                          startIcon={<OpenInNewRounded />}
+                                        >
+                                          Track
+                                        </Button>
+                                      )}
+                                      {artifact?.contentUrl && (
+                                        <Button
+                                          component="a"
+                                          href={artifact.contentUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          size="small"
+                                          variant="outlined"
+                                          startIcon={<OpenInNewRounded />}
+                                        >
+                                          Open label
+                                        </Button>
+                                      )}
+                                      {artifact ? (
+                                        <Tooltip title={printBlockedReason || (
+                                          deliveredJob
+                                            ? 'Create an audited reprint from these exact retained bytes'
+                                            : failedJob
+                                              ? 'Retry the failed print job using the same retained bytes'
+                                              : 'Queue these exact retained bytes to the configured warehouse printer'
+                                        )}>
+                                          <span>
+                                            <Button
+                                              size="small"
+                                              variant="contained"
+                                              startIcon={busyLabel
+                                                ? <CircularProgress size={16} />
+                                                : deliveredJob || failedJob
+                                                  ? <ReplayRounded />
+                                                  : <PrintRounded />}
+                                              disabled={
+                                                busy
+                                                || busyLabel
+                                                || Boolean(printBlockedReason)
+                                              }
+                                              onClick={() => {
+                                                if (deliveredJob) {
+                                                  onReprintLabel(
+                                                    artifact.globalId,
+                                                    deliveredJob.globalId,
+                                                  )
+                                                } else if (failedJob) {
+                                                  onRetryLabel(
+                                                    artifact.globalId,
+                                                    failedJob.globalId,
+                                                  )
+                                                } else {
+                                                  onPrintExternalLabel(artifact.globalId)
+                                                }
+                                              }}
+                                              data-testid={`order-external-label-print-${artifact.globalId}`}
+                                            >
+                                              {busyLabel
+                                                ? 'Queueing'
+                                                : deliveredJob
+                                                  ? 'Reprint label'
+                                                  : failedJob
+                                                    ? 'Retry label'
+                                                    : pendingJob
+                                                      ? 'Print queued'
+                                                      : 'Print label'}
+                                            </Button>
+                                          </span>
+                                        </Tooltip>
+                                      ) : tracking.number ? (
+                                        <Tooltip title={!canManage || !canExecute
+                                          ? 'Operations management and warehouse execution access are required.'
+                                          : 'Retain the exact original label file without purchasing postage or writing to Shopify'}>
+                                          <span>
+                                            <Button
+                                              component="label"
+                                              size="small"
+                                              variant="contained"
+                                              startIcon={busyLabel
+                                                ? <CircularProgress size={16} />
+                                                : <MoveToInboxRounded />}
+                                              disabled={busy || busyLabel || !canManage || !canExecute}
+                                            >
+                                              {busyLabel ? 'Uploading' : 'Upload original label'}
+                                              <input
+                                                hidden
+                                                type="file"
+                                                accept=".zpl,.pdf,.png,application/vnd.zebra-zpl,application/pdf,image/png,text/plain"
+                                                onChange={(event) => {
+                                                  const file = event.target.files?.[0]
+                                                  event.target.value = ''
+                                                  if (file) onUploadExternalLabel(tracking.number!, file)
+                                                }}
+                                              />
+                                            </Button>
+                                          </span>
+                                        </Tooltip>
+                                      ) : null}
+                                    </Stack>
+                                  </Box>
+                                )
+                              })}
+                            </Stack>
+                          ) : (
+                            <Alert severity="info">
+                              Shopify did not supply tracking details for this fulfillment.
+                            </Alert>
+                          )}
+                          {missingExternalLabelArtifact && (
+                            <Alert severity="warning">
+                              Shopify supplied fulfillment and tracking facts, but not every exact original carrier-label document. Upload the original PDF, ZPL, or PNG from the label provider to enable audited order-level printing and reprinting. ClawPilot will not buy replacement postage automatically.
+                            </Alert>
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
+
                     {shipments.length > 0 && (
                       <Box>
                         <Typography variant="caption" color="text.secondary">Shipments</Typography>
@@ -2686,7 +2919,9 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
           <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave, and package verification records packing evidence and contract fees.</Typography></Box>
           <Box><Typography fontWeight={700}>4. Label, print, and void</Typography><Typography color="text.secondary">Authorized managers may purchase a label only through a verified sandbox UPS or FedEx account. ClawPilot records the provider attempt before the call, stores the result, routes the label to the configured printer, and requires the original account when voiding. Prepared or unknown attempts must be reconciled before retrying.</Typography></Box>
           <Box><Typography fontWeight={700}>5. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
-          <Alert severity="info">Hosted orders enter through approved commerce integrations. Sandbox label execution always uses the fixed John Doe test fixture between 101 Jegs Place and Massachusetts Maritime Academy. Deterministic mock adapters remain isolated to automated tests.</Alert>
+          <Typography variant="body2" color="text.secondary">
+            Hosted orders enter through connected commerce accounts. Sandbox carrier actions use non-billable test data.
+          </Typography>
         </Stack>
       </DialogContent>
       <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
@@ -2843,9 +3078,8 @@ export default function OperationsSection({
   const [retryingCommerceExport, setRetryingCommerceExport] = useState(false)
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
-  const [sandboxE2eConfirmationText, setSandboxE2eConfirmationText] = useState('')
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
-    'Authorized end-to-end validation for this exact commerce test order',
+    'Enable sandbox fulfillment for this order',
   )
   const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
   const pendingShopifyTestStoreAuthorization =
@@ -2853,7 +3087,7 @@ export default function OperationsSection({
   const [shopifyTestFulfillmentOpen, setShopifyTestFulfillmentOpen] = useState(false)
   const [shopifyTestFulfillmentText, setShopifyTestFulfillmentText] = useState('')
   const [shopifyTestFulfillmentReason, setShopifyTestFulfillmentReason] = useState(
-    'Reviewed the exact sandbox labels and tracking snapshot for Shopify test fulfillment',
+    'Reviewed package labels and tracking before fulfillment',
   )
   const [confirmingShopifyTestFulfillment, setConfirmingShopifyTestFulfillment] =
     useState(false)
@@ -4386,6 +4620,121 @@ export default function OperationsSection({
     }
   }
 
+  const uploadExternalShippingLabel = async (
+    trackingNumber: string,
+    file: File,
+  ) => {
+    if (
+      !detail?.externalFulfillment
+      || !detail.warehouseId
+      || labelPrintBusyGlobalId
+    ) return
+    const filename = file.name.toLowerCase()
+    const mime = file.type.toLowerCase()
+    const format = filename.endsWith('.zpl')
+      || mime === 'application/vnd.zebra-zpl'
+      || mime === 'text/plain'
+      ? 'ZPL'
+      : filename.endsWith('.pdf') || mime === 'application/pdf'
+        ? 'PDF'
+        : filename.endsWith('.png') || mime === 'image/png'
+          ? 'PNG'
+          : null
+    if (!format) {
+      setError('Choose the exact original label as a .zpl, .pdf, or .png file.')
+      return
+    }
+    const busyKey = `external-upload:${trackingNumber}`
+    setLabelPrintBusyGlobalId(busyKey)
+    setError('')
+    setNotice('')
+    try {
+      const form = new FormData()
+      form.set('file', file)
+      form.set('format', format)
+      form.set('media', 'label_4x6')
+      form.set('orderGlobalId', detail.globalId)
+      form.set('expectedOrderRowVersion', String(detail.rowVersion))
+      form.set(
+        'reconciliationGlobalId',
+        detail.externalFulfillment.reconciliationGlobalId,
+      )
+      form.set('trackingNumber', trackingNumber)
+      form.set(
+        'reason',
+        'Retain the exact original external carrier label for audited order-level reprint',
+      )
+      const response = await fetch('/api/operations/external-label-artifacts', {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': `operations-external-label-import:${detail.globalId}:${crypto.randomUUID()}`,
+        },
+        body: form,
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        result?: { artifactGlobalId?: string }
+      }
+      if (!response.ok || !payload.result?.artifactGlobalId) {
+        throw new Error(payload.error || 'External shipping label could not be retained')
+      }
+      setNotice(
+        `Exact original label ${payload.result.artifactGlobalId} was retained for tracking ${trackingNumber}. No postage was purchased and Shopify was not changed.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'External shipping label could not be retained',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const printExternalShippingLabel = async (artifactGlobalId: string) => {
+    if (!detail?.warehouseId || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(artifactGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-external-label-print:${artifactGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'enqueue-external-label-artifact',
+          warehouseId: detail.warehouseId,
+          sourceArtifactGlobalId: artifactGlobalId,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'External shipping label could not be queued for printing')
+      }
+      setNotice(
+        `Exact external shipping label ${artifactGlobalId} was queued as print job ${payload.job.globalId}.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'External shipping label could not be queued for printing',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
   const openLabelReprint = (
     labelGlobalId: string,
     printJobGlobalId: string,
@@ -4669,11 +5018,10 @@ export default function OperationsSection({
     if (!detail) return
     pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationConfirmed(false)
-    setSandboxE2eConfirmationText('')
     setSandboxE2eAuthorizationReason(
-      `Authorized end-to-end validation for ${detail.sourceProvider === 'faire'
+      `Enable sandbox fulfillment for ${detail.sourceProvider === 'faire'
         ? 'Faire'
-        : 'Shopify'} test order ${detail.orderNumber}`,
+        : 'Shopify'} order ${detail.orderNumber}`,
     )
     setSandboxE2eAuthorizationOpen(true)
   }
@@ -4683,7 +5031,6 @@ export default function OperationsSection({
     pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationOpen(false)
     setSandboxE2eAuthorizationConfirmed(false)
-    setSandboxE2eConfirmationText('')
   }
 
   const authorizeSandboxE2e = async (event: FormEvent) => {
@@ -4693,12 +5040,7 @@ export default function OperationsSection({
     )
     if (
       !detail
-      || (
-        canonicalShopifyTestLane
-          ? sandboxE2eConfirmationText
-            !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-          : !sandboxE2eAuthorizationConfirmed
-      )
+      || !sandboxE2eAuthorizationConfirmed
       || !sandboxE2eAuthorizationReason.trim()
     ) return
     setAuthorizingSandboxE2e(true)
@@ -4750,7 +5092,7 @@ export default function OperationsSection({
         || !('authorizationGlobalId' in payload.result)
       ) {
         throw new ShopifyTestStoreCommandHttpError(
-          payload.error || 'Sandbox commerce E2E authorization failed',
+          payload.error || 'Sandbox fulfillment could not be enabled',
           response.status,
           payload.code,
         )
@@ -4759,9 +5101,8 @@ export default function OperationsSection({
       pendingShopifyTestStoreAuthorization.current = null
       setSandboxE2eAuthorizationOpen(false)
       setSandboxE2eAuthorizationConfirmed(false)
-      setSandboxE2eConfirmationText('')
       setNotice(
-        `Exact-order sandbox E2E authorization ${result.authorizationGlobalId} is active until ${result.expiresAt}.`,
+        `Sandbox fulfillment is enabled until ${result.expiresAt}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
@@ -4779,9 +5120,8 @@ export default function OperationsSection({
         ) {
           pendingShopifyTestStoreAuthorization.current = null
           setSandboxE2eAuthorizationOpen(false)
-          setSandboxE2eConfirmationText('')
           setNotice(
-            `The exact authorization response was reconciled. Authorization ${refreshedAuthorization.authorizationGlobalId} is current until ${refreshedAuthorization.expiresAt}.`,
+            `Sandbox fulfillment is enabled until ${refreshedAuthorization.expiresAt}.`,
           )
           setError('')
         } else if (
@@ -4800,7 +5140,7 @@ export default function OperationsSection({
       } else {
         setError(caught instanceof Error
           ? caught.message
-          : 'Sandbox commerce E2E authorization failed')
+          : 'Sandbox fulfillment could not be enabled')
       }
     } finally {
       setAuthorizingSandboxE2e(false)
@@ -4812,7 +5152,7 @@ export default function OperationsSection({
     pendingShopifyTestStoreFulfillment.current = null
     setShopifyTestFulfillmentText('')
     setShopifyTestFulfillmentReason(
-      `Reviewed the exact sandbox labels and tracking snapshot for Shopify test order ${detail.orderNumber}`,
+      `Reviewed package labels and tracking for Shopify order ${detail.orderNumber}`,
     )
     setShopifyTestFulfillmentOpen(true)
   }
@@ -4868,7 +5208,7 @@ export default function OperationsSection({
         || !('authorizationGlobalId' in payload.result)
       ) {
         throw new ShopifyTestStoreCommandHttpError(
-          payload.error || 'Shopify test fulfillment confirmation failed',
+          payload.error || 'Shopify fulfillment review failed',
           response.status,
           payload.code,
         )
@@ -4883,7 +5223,7 @@ export default function OperationsSection({
     } catch (caught) {
       const message = caught instanceof Error
         ? caught.message
-        : 'Shopify test fulfillment confirmation failed'
+        : 'Shopify fulfillment review failed'
       const refreshed = await loadWorkspace(command.orderGlobalId)
         .catch(() => null)
       const refreshedAuthorization =
@@ -4927,7 +5267,7 @@ export default function OperationsSection({
     setCarrierAccountGlobalId(account?.globalId || '')
     setCreateLabelPackageGlobalId(packageGlobalId || '')
     setCreateLabelReason(packageGlobalId
-      ? `Create the authorized sandbox E2E label for package ${packageGlobalId}`
+      ? `Create a sandbox label for package ${packageGlobalId}`
       : 'Purchase a sandbox label for pack-to-ship validation')
     setCreateLabelIdempotencyKey(
       `operations-label-create:${detail?.globalId || 'order'}:${packageGlobalId || 'single'}:${crypto.randomUUID()}`,
@@ -6576,6 +6916,12 @@ export default function OperationsSection({
         onPrintLabel={(labelGlobalId) => {
           void printShippingLabel(labelGlobalId)
         }}
+        onUploadExternalLabel={(trackingNumber, file) => {
+          void uploadExternalShippingLabel(trackingNumber, file)
+        }}
+        onPrintExternalLabel={(artifactGlobalId) => {
+          void printExternalShippingLabel(artifactGlobalId)
+        }}
         onRetryLabel={(labelGlobalId, printJobGlobalId) => {
           void retryShippingLabel(labelGlobalId, printJobGlobalId)
         }}
@@ -7670,72 +8016,33 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
-          <DialogTitle>
-            {detail?.sourceProvider === 'shopify'
-              ? detail.status === 'imported'
-                ? 'Authorize verified Shopify test order'
-                : 'Renew or resume verified Shopify test order'
-              : 'Authorize exact-order sandbox E2E test'}
-          </DialogTitle>
+          <DialogTitle>Enable sandbox fulfillment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="error">
-                {detail?.sourceProvider === 'shopify'
-                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, and local order revision. It expires after two hours and never permits production postage or customer notification.`
-                  : `This authority is limited to ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). It permits non-tracking sandbox labels followed by real reserved inventory consumption and ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback. The authorization expires after two hours and is consumed by a successful shipment confirmation.`}
-              </Alert>
-              <Box
-                sx={{
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.16)',
-                  borderRadius: '8px',
-                }}
-              >
-                <Typography variant="body2">
-                  {detail?.sourceProvider === 'shopify'
-                    ? SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    : SANDBOX_COMMERCE_E2E_CONFIRMATION}
-                </Typography>
-              </Box>
-              {detail?.sourceProvider === 'shopify' ? (
-                <TextField
-                  required
-                  multiline
-                  minRows={4}
-                  label="Type the exact authorization statement"
-                  value={sandboxE2eConfirmationText}
-                  onChange={(event) => setSandboxE2eConfirmationText(event.target.value)}
-                  helperText={sandboxE2eConfirmationText
-                    === SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    ? 'Exact statement matched'
-                    : 'Copy the statement above exactly; whitespace and punctuation must match.'}
-                  inputProps={{
-                    'data-testid': 'shopify-test-store-authorization-statement',
-                  }}
-                />
-              ) : (
-                <FormControlLabel
-                  control={(
-                    <Checkbox
-                      checked={sandboxE2eAuthorizationConfirmed}
-                      onChange={(event) => {
-                        setSandboxE2eAuthorizationConfirmed(event.target.checked)
-                      }}
-                      data-testid="sandbox-commerce-e2e-confirmation"
-                    />
-                  )}
-                  label="I understand and explicitly authorize this exact order-bound test."
-                />
-              )}
+              <Typography variant="body2" color="text.secondary">
+                Labels and rates will use the connected sandbox account. Production postage is unavailable.
+              </Typography>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={sandboxE2eAuthorizationConfirmed}
+                    onChange={(event) => {
+                      setSandboxE2eAuthorizationConfirmed(event.target.checked)
+                    }}
+                    data-testid="sandbox-commerce-e2e-confirmation"
+                  />
+                )}
+                label={`Enable this for ${detail?.orderNumber || 'this order'}`}
+              />
               <TextField
                 required
                 multiline
-                minRows={3}
-                label="Authorization reason"
+                minRows={2}
+                label="Reason (audit log)"
                 value={sandboxE2eAuthorizationReason}
                 onChange={(event) => setSandboxE2eAuthorizationReason(event.target.value)}
                 inputProps={{ maxLength: 500 }}
-                helperText={`${sandboxE2eAuthorizationReason.trim().length}/500 · Recorded with the exact authorization`}
+                helperText={`${sandboxE2eAuthorizationReason.trim().length}/500`}
               />
             </Stack>
           </DialogContent>
@@ -7753,10 +8060,7 @@ export default function OperationsSection({
               disabled={
                 authorizingSandboxE2e
                 || (
-                  detail?.sourceProvider === 'shopify'
-                    ? sandboxE2eConfirmationText
-                      !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    : !sandboxE2eAuthorizationConfirmed
+                  !sandboxE2eAuthorizationConfirmed
                 )
                 || !sandboxE2eAuthorizationReason.trim()
               }
@@ -7767,7 +8071,7 @@ export default function OperationsSection({
             >
               {authorizingSandboxE2e
                 ? 'Verifying with Shopify'
-                : 'Authorize this exact order'}
+                : 'Enable sandbox fulfillment'}
             </Button>
           </DialogActions>
         </Box>
@@ -7781,51 +8085,36 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={confirmShopifyTestFulfillment}>
-          <DialogTitle>Confirm exact Shopify test fulfillment</DialogTitle>
+          <DialogTitle>Review fulfillment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="error">
-                This is the second owner/admin confirmation. ClawPilot will
-                freeze the exact sorted package, sandbox-label, and tracking
-                snapshot for {detail?.orderNumber || 'this order'}. Confirm
-                shipment will fail closed if a label is voided, replaced, or
-                changed. Shopify customer notification remains forcibly off.
-              </Alert>
-              <Box
-                sx={{
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.16)',
-                  borderRadius: '8px',
-                }}
-              >
-                <Typography variant="body2">
-                  {SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION}
-                </Typography>
-              </Box>
-              <TextField
-                required
-                multiline
-                minRows={4}
-                label="Type the exact fulfillment statement"
-                value={shopifyTestFulfillmentText}
-                onChange={(event) => setShopifyTestFulfillmentText(event.target.value)}
-                helperText={shopifyTestFulfillmentText
-                  === SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
-                  ? 'Exact statement matched'
-                  : 'Copy the statement above exactly; whitespace and punctuation must match.'}
-                inputProps={{
-                  'data-testid': 'shopify-test-store-fulfillment-statement',
-                }}
+              <Typography variant="body2" color="text.secondary">
+                Confirm that the package labels and tracking numbers are correct before completing this order.
+              </Typography>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={shopifyTestFulfillmentText
+                      === SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION}
+                    onChange={(event) => setShopifyTestFulfillmentText(
+                      event.target.checked
+                        ? SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+                        : '',
+                    )}
+                    data-testid="shopify-test-store-fulfillment-statement"
+                  />
+                )}
+                label={`Labels and tracking are correct for ${detail?.orderNumber || 'this order'}`}
               />
               <TextField
                 required
                 multiline
-                minRows={3}
-                label="Fulfillment confirmation reason"
+                minRows={2}
+                label="Reason (audit log)"
                 value={shopifyTestFulfillmentReason}
                 onChange={(event) => setShopifyTestFulfillmentReason(event.target.value)}
                 inputProps={{ maxLength: 500 }}
-                helperText={`${shopifyTestFulfillmentReason.trim().length}/500 · Stored with the immutable label snapshot`}
+                helperText={`${shopifyTestFulfillmentReason.trim().length}/500`}
               />
             </Stack>
           </DialogContent>
@@ -7852,8 +8141,8 @@ export default function OperationsSection({
               data-testid="confirm-shopify-test-store-fulfillment"
             >
               {confirmingShopifyTestFulfillment
-                ? 'Confirming exact evidence'
-                : 'Confirm exact sandbox tracking'}
+                ? 'Saving review'
+                : 'Confirm fulfillment'}
             </Button>
           </DialogActions>
         </Box>
@@ -7864,27 +8153,25 @@ export default function OperationsSection({
           <DialogTitle>Confirm shipment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="warning">
-                This consumes the reserved inventory, marks the order, package, and fulfillment
-                plan as shipped, creates immutable shipment and packing-slip evidence, seeds
-                tracking, and attempts the commerce fulfillment export for
-                {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
-                readiness checks are repeated when you confirm. For Shopify and Faire,
-                the exact connection&apos;s Provider writes control must still be On and
-                bound to its current credential and scopes.
-              </Alert>
+              <Typography variant="body2" color="text.secondary">
+                Completes warehouse work, consumes inventory reservations, records shipment evidence, and syncs fulfillment to the connected commerce account.
+              </Typography>
               {detail?.sandboxCommerceE2eAuthorization && (
-                <Alert severity="error" data-testid="sandbox-commerce-e2e-confirm-shipment-warning">
-                  Authorized sandbox E2E execution is active under{' '}
-                  {detail.sandboxCommerceE2eAuthorization.authorizationGlobalId}.
-                  Confirming will consume that one-time authorization and send
-                  every package&apos;s sandbox tracking number to{' '}
-                  {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} even though
-                  those labels will not track with the carrier.{' '}
-                  {detail.sourceProvider === 'faire'
-                    ? 'Faire may send a processing email when a NEW order is accepted, and submitting these tracking details triggers Faire\'s shipment email. Verify this test order uses a controlled recipient.'
-                    : 'Shopify customer notification is forcibly disabled for this test and cannot be overridden.'}
-                </Alert>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  alignItems="center"
+                  data-testid="sandbox-commerce-e2e-confirm-shipment-warning"
+                >
+                  <Chip size="small" label="Sandbox" color="info" />
+                  <Typography variant="body2">
+                    Sandbox tracking will be sent to{' '}
+                    {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
+                    {detail.sourceProvider === 'shopify'
+                      ? ' Customer notification is off.'
+                      : ''}
+                  </Typography>
+                </Stack>
               )}
               {detail?.fulfillmentNotificationPolicy?.mode === 'provider_managed' ? (
                 <Alert severity="info">
@@ -8298,26 +8585,22 @@ export default function OperationsSection({
         <Box component="form" onSubmit={createSandboxLabel}>
           <DialogTitle>
             {detailCreateLabelPackage
-              ? `Create package ${detailCreateLabelPackage.packageNumber} sandbox label`
-              : 'Create sandbox carrier label'}
+              ? `Create label · Package ${detailCreateLabelPackage.packageNumber}`
+              : 'Create carrier label'}
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               {detailCreateLabelPackage ? (
-                <Alert severity="error">
-                  Authorized E2E test package only. ClawPilot will create a
-                  non-tracking sandbox label for {detailCreateLabelPackage.globalId}
-                  using the exact order allocation. Do not void it: after every
-                  package is labeled, shipment confirmation will consume the
-                  reservation and write all tracking numbers to{' '}
-                  {detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
-                </Alert>
+                <Typography variant="body2" color="text.secondary">
+                  Uses this package&apos;s dimensions, weight, and selected sandbox carrier service.
+                </Typography>
               ) : (
-                <Alert severity="warning">
-                  Sandbox only. ClawPilot will use John Doe, Test Product, 101 Jegs Place in Delaware,
-                  Ohio, and Massachusetts Maritime Academy in Buzzards Bay. Inspect the label and
-                  print evidence, then void it immediately.
-                </Alert>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Chip size="small" label="Sandbox" color="info" />
+                  <Typography variant="body2" color="text.secondary">
+                    No production postage will be purchased.
+                  </Typography>
+                </Stack>
               )}
               {detailCreateLabelPackage && (
                 <Box>

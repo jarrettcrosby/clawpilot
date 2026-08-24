@@ -6659,7 +6659,6 @@ async function main() {
     'Customer notification not requested',
     'Use ClawPilot connection default',
     'shipment tracking triggers Faire&apos;s shipment email',
-    'Verify this test order uses a controlled recipient',
   ]) {
     assert.ok(
       operationsPanel.includes(fragment),

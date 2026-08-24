@@ -3459,6 +3459,7 @@ async function readOrderDetail(
     labelAttemptResult,
     labelPrintJobResult,
     shipmentResult,
+    externalFulfillmentResult,
     trackingResult,
     artifactResult,
     commerceExportResult,
@@ -3655,7 +3656,8 @@ async function readOrderDetail(
     ),
     query<QueryResultRow & {
       global_id: string
-      source_label_global_id: string
+      source_label_global_id: string | null
+      source_artifact_global_id: string
       status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
       reprint_of_job_global_id: string | null
       created_at: Date
@@ -3664,24 +3666,23 @@ async function readOrderDetail(
     }>(
       `SELECT job.global_id,
               label.global_id AS source_label_global_id,
+              artifact.global_id AS source_artifact_global_id,
               job.status,
               original.global_id AS reprint_of_job_global_id,
               job.created_at, job.delivered_at, job.last_error
        FROM operations_print_jobs job
-       JOIN operations_labels label
+       JOIN operations_print_artifacts artifact
+         ON artifact.organization_id = job.organization_id
+        AND artifact.id = job.artifact_id
+       LEFT JOIN operations_labels label
          ON label.organization_id = job.organization_id
         AND label.id = job.label_id
-       JOIN operations_packages package
-         ON package.organization_id = label.organization_id
-        AND package.id = label.package_id
-       JOIN operations_fulfillment_plans plan
-         ON plan.organization_id = package.organization_id
-        AND plan.id = package.plan_id
        LEFT JOIN operations_print_jobs original
          ON original.organization_id = job.organization_id
         AND original.id = job.reprint_of_job_id
-       WHERE plan.organization_id = $1::uuid
-         AND plan.order_id = $2::uuid
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.source_order_id = $2::uuid
+         AND artifact.document_type = 'shipping_label'
        ORDER BY job.created_at DESC, job.id DESC`,
       [organizationId, row.id],
     ),
@@ -3714,6 +3715,28 @@ async function readOrderDetail(
     ),
     query<QueryResultRow & {
       global_id: string
+      provider_fulfillment_id: string
+      provider_fulfillment_name: string
+      provider_fulfillment_created_at: Date
+      evidence_snapshot: Record<string, unknown>
+      reconciled_at: Date
+    }>(
+      `SELECT reconciliation.global_id,
+              reconciliation.provider_fulfillment_id,
+              reconciliation.provider_fulfillment_name,
+              reconciliation.provider_fulfillment_created_at,
+              reconciliation.evidence_snapshot,
+              reconciliation.reconciled_at
+       FROM operations_shopify_external_fulfillment_reconciliations
+              reconciliation
+       WHERE reconciliation.organization_id = $1::uuid
+         AND reconciliation.order_id = $2::uuid
+       ORDER BY reconciliation.reconciled_at DESC, reconciliation.id DESC
+       LIMIT 1`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
       shipment_global_id: string
       status: 'confirmed' | 'in_transit' | 'out_for_delivery' | 'delivered' | 'exception' | 'voided'
       provider: string
@@ -3738,6 +3761,8 @@ async function readOrderDetail(
       global_id: string
       package_global_id: string | null
       shipment_global_id: string | null
+      external_fulfillment_reconciliation_global_id: string | null
+      external_tracking_number: string | null
       document_type: 'shipping_label' | 'packing_slip'
       format: 'ZPL' | 'PDF' | 'PNG'
       media_size: 'label_4x6' | 'label_4x8' | 'letter' | 'a4'
@@ -3752,6 +3777,9 @@ async function readOrderDetail(
                 shipment_package.global_id
               ) AS package_global_id,
               shipment.global_id AS shipment_global_id,
+              external_reconciliation.global_id
+                AS external_fulfillment_reconciliation_global_id,
+              artifact.external_tracking_number,
               artifact.document_type, artifact.format, artifact.media_size,
               payload.filename, payload.template_version,
               (payload.artifact_id IS NOT NULL) AS has_payload,
@@ -3760,6 +3788,11 @@ async function readOrderDetail(
        LEFT JOIN operations_shipments shipment
          ON shipment.organization_id = artifact.organization_id
         AND shipment.id = artifact.source_shipment_id
+       LEFT JOIN operations_shopify_external_fulfillment_reconciliations
+              external_reconciliation
+         ON external_reconciliation.organization_id = artifact.organization_id
+        AND external_reconciliation.id =
+              artifact.source_external_fulfillment_reconciliation_id
        LEFT JOIN operations_packages artifact_package
          ON artifact_package.organization_id = artifact.organization_id
         AND artifact_package.id = artifact.source_package_id
@@ -3864,6 +3897,25 @@ async function readOrderDetail(
         : 'Checkout, sealed carton, and carrier evidence is incomplete.'
     }
   }
+
+  const externalFulfillmentRow = externalFulfillmentResult.rows[0]
+  const externalFulfillmentSnapshot = json(
+    externalFulfillmentRow?.evidence_snapshot,
+  )
+  const externalFulfillmentEvidence = json(
+    externalFulfillmentSnapshot.fulfillment,
+  )
+  const externalFulfillmentTracking = Array.isArray(
+    externalFulfillmentEvidence.tracking,
+  )
+    ? externalFulfillmentEvidence.tracking.flatMap((value) => {
+        const source = json(value)
+        const company = String(source.company || '').trim() || null
+        const number = String(source.number || '').trim() || null
+        const url = String(source.url || '').trim() || null
+        return company || number || url ? [{ company, number, url }] : []
+      })
+    : []
 
   return {
     id: row.id,
@@ -4065,6 +4117,27 @@ async function readOrderDetail(
       oneOffCarrierGroupGlobalId: item.one_off_carrier_group_global_id,
       shippedAt: item.shipped_at.toISOString(),
     })),
+    externalFulfillment: externalFulfillmentRow
+      ? {
+          reconciliationGlobalId: externalFulfillmentRow.global_id,
+          provider: 'shopify' as const,
+          providerFulfillmentId:
+            externalFulfillmentRow.provider_fulfillment_id,
+          providerFulfillmentName:
+            externalFulfillmentRow.provider_fulfillment_name,
+          fulfilledAt:
+            externalFulfillmentRow.provider_fulfillment_created_at
+              .toISOString(),
+          reconciledAt: externalFulfillmentRow.reconciled_at.toISOString(),
+          tracking: externalFulfillmentTracking,
+          exactLabelArtifactAvailable: artifactResult.rows.some((artifact) => (
+            artifact.external_fulfillment_reconciliation_global_id
+              === externalFulfillmentRow.global_id
+            && artifact.document_type === 'shipping_label'
+            && artifact.has_payload
+          )),
+        }
+      : null,
     trackingObservations: trackingResult.rows.map((item) => ({
       globalId: item.global_id,
       shipmentGlobalId: item.shipment_global_id,
@@ -4078,6 +4151,9 @@ async function readOrderDetail(
       globalId: item.global_id,
       packageGlobalId: item.package_global_id,
       shipmentGlobalId: item.shipment_global_id,
+      externalFulfillmentReconciliationGlobalId:
+        item.external_fulfillment_reconciliation_global_id,
+      externalTrackingNumber: item.external_tracking_number,
       documentType: item.document_type,
       documentKind: item.document_type === 'shipping_label'
         ? 'shipping_label' as const
@@ -4098,6 +4174,7 @@ async function readOrderDetail(
     labelPrintJobs: labelPrintJobResult.rows.map((item) => ({
       globalId: item.global_id,
       sourceLabelGlobalId: item.source_label_global_id,
+      sourceArtifactGlobalId: item.source_artifact_global_id,
       status: item.status,
       reprintOfJobGlobalId: item.reprint_of_job_global_id,
       createdAt: item.created_at.toISOString(),
