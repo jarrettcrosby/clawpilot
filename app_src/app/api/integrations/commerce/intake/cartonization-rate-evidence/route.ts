@@ -1159,6 +1159,13 @@ export async function POST(req: NextRequest) {
         addAllocation(allocation.lineGlobalId, allocation.quantity)
       }
     }
+    for (const packagePlan of operationalUnitMaterialPlan?.status === 'ready'
+      ? operationalUnitMaterialPlan.packages
+      : []) {
+      for (const allocation of packagePlan.allocations) {
+        addAllocation(allocation.lineGlobalId, allocation.quantity)
+      }
+    }
     for (const packagePlan of operationalGeometryRatePlan?.status === 'ready'
       ? operationalGeometryRatePlan.packages
       : []) {
@@ -1179,6 +1186,17 @@ export async function POST(req: NextRequest) {
     )
     const sandboxQuantityByLine = new Map<string, number>()
     for (const packagePlan of sandboxGeometryRatePlan?.packages || []) {
+      for (const allocation of packagePlan.allocations) {
+        sandboxQuantityByLine.set(
+          allocation.lineGlobalId,
+          (sandboxQuantityByLine.get(allocation.lineGlobalId) || 0)
+            + allocation.quantity,
+        )
+      }
+    }
+    for (const packagePlan of operationalUnitMaterialPlan?.status === 'ready'
+      ? operationalUnitMaterialPlan.packages
+      : []) {
       for (const allocation of packagePlan.allocations) {
         sandboxQuantityByLine.set(
           allocation.lineGlobalId,
@@ -1216,6 +1234,9 @@ export async function POST(req: NextRequest) {
     }
     const packagePlanCount = plan.recipePackages.length
       + (sandboxGeometryRatePlan?.packages.length || 0)
+      + (operationalUnitMaterialPlan?.status === 'ready'
+        ? operationalUnitMaterialPlan.packages.length
+        : 0)
       + (operationalGeometryRatePlan?.status === 'ready'
         ? operationalGeometryRatePlan.packages.length
         : 0)

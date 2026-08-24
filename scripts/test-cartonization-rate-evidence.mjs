@@ -224,6 +224,7 @@ function loadOperationalFaireRoute(
     activationState = 'shadow',
     providers = ['ups_rest', 'fedex_rest'],
     operationalGeometry = false,
+    operationalUnitMaterial = false,
     sandboxGeometry = false,
     planTransform = null,
     shadowTraining = false,
@@ -400,7 +401,8 @@ function loadOperationalFaireRoute(
       }],
     },
   }
-  let plan = sandboxGeometry || operationalGeometry ? {
+  let plan = sandboxGeometry || operationalGeometry
+    || operationalUnitMaterial ? {
     policyVersion: 'hybrid-cartonization-policy-v1',
     algorithmVersion: 'approved-recipe-v1',
     inputHash: 'a'.repeat(64),
@@ -412,7 +414,9 @@ function loadOperationalFaireRoute(
       lineGlobalId: 'gcol0000001',
       productGlobalId: 'gpr0000001',
       quantity: 1,
-      fitModel: 'rigid_3d',
+      fitModel: operationalUnitMaterial
+        ? 'unconstrained_unit'
+        : 'rigid_3d',
     }],
     assumptions: [],
     blockers: [],
@@ -535,6 +539,13 @@ function loadOperationalFaireRoute(
       ShopifyOrderPlanningAuthorityError: IntegrationError,
       inspectShopifyOrderPlanningAuthority: async () => {
         observed.shopifyAuthorityCalls = (observed.shopifyAuthorityCalls || 0) + 1
+        if (sourceProvider === 'shopify' && operationalUnitMaterial) {
+          return {
+            authorityHash: 'e'.repeat(64),
+            snapshot: { provider: 'shopify', state: 'open' },
+            providerReads: 2,
+          }
+        }
         throw new Error(
           shadowTraining
             ? 'Exact Shadow training must not read Shopify planning authority'
@@ -595,7 +606,48 @@ function loadOperationalFaireRoute(
     },
     '@/lib/operations/operationalUnitMaterialCartonization': {
       planOperationalUnitMaterialPackages: () => {
-        throw new Error('Unit-material planning is outside this route fixture')
+        if (!operationalUnitMaterial) {
+          throw new Error(
+            'Unit-material planning is outside this route fixture',
+          )
+        }
+        observed.unitMaterialCalls =
+          (observed.unitMaterialCalls || 0) + 1
+        return {
+          status: 'ready',
+          evidence: {
+            policyVersion: 'operational-unit-material-one-each-v1',
+          },
+          packages: [{
+            packageKey: 'unit-material-package-1',
+            packageSequence: 1,
+            planningMethod: 'unit_material_selection',
+            packagingMaterialGlobalId: 'gmat0000001',
+            materialRowVersion: 2,
+            recipes: [],
+            orToolsProfiles: [],
+            innerDimensionsMm: {
+              length: 270,
+              width: 220,
+              height: 170,
+            },
+            ratedOuterDimensionsMm: {
+              length: 280,
+              width: 230,
+              height: 180,
+            },
+            contentWeightGrams: 400,
+            tareWeightGrams: 120,
+            ratedGrossWeightGrams: 520,
+            maxWeightGrams: 5000,
+            allocations: [{
+              lineGlobalId: 'gcol0000001',
+              productGlobalId: 'gpr0000001',
+              title: 'Shopify unit item',
+              quantity: 1,
+            }],
+          }],
+        }
       },
     },
     '@/lib/operations/orToolsFulfillmentOptimizer': {
@@ -668,6 +720,7 @@ function loadOperationalFaireRoute(
     '@/lib/persistence/shopifyTestStoreCanonicalE2e': {
       ShopifyTestStoreCanonicalE2ePersistenceError: PersistenceError,
       assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres: async () => {
+        if (sourceProvider === 'shopify' && operationalUnitMaterial) return
         throw new Error('Unexpected Shopify test-store planning authorization')
       },
     },
@@ -2571,6 +2624,60 @@ assert.deepEqual(
 )
 assert.equal(upsOnlyObserved.write.quotes.length, 1)
 assert.equal(upsOnlyObserved.write.quotes[0].provider, 'ups_rest')
+
+const unitMaterialObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+}
+const unitMaterialRoute = loadOperationalFaireRoute(
+  unitMaterialObserved,
+  {
+    providers: ['ups_rest'],
+    sourceProvider: 'shopify',
+    operationalUnitMaterial: true,
+  },
+)
+const unitMaterialResponse = await unitMaterialRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'shopify-unit-material-route-acceptance',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+const unitMaterialPayload = await unitMaterialResponse.json()
+assert.equal(
+  unitMaterialResponse.status,
+  200,
+  JSON.stringify({
+    payload: unitMaterialPayload,
+    observed: unitMaterialObserved,
+  }),
+)
+assert.equal(unitMaterialObserved.unitMaterialCalls, 1)
+assert.equal(unitMaterialObserved.carrierReads.length, 1)
+assert.equal(unitMaterialObserved.write.packages.length, 1)
+assert.equal(
+  unitMaterialObserved.write.packages[0].planningMethod,
+  'unit_material_selection',
+)
+assert.equal(
+  unitMaterialObserved.write.planSnapshot
+    .operationalUnitMaterialPlan.packages.length,
+  1,
+)
 
 const sandboxRouteObserved = {
   carrierReads: [],
