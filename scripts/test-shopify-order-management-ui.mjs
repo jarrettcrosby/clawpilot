@@ -94,7 +94,7 @@ assert.doesNotMatch(
 )
 assert.match(
   source.panel,
-  /Refunds, restocking, and customer notifications remain separate\./,
+  /when Shopify reports the order is eligible\./,
 )
 
 assert.match(

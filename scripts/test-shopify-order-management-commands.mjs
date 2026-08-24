@@ -813,6 +813,39 @@ assert.equal(management.eligibility.cancel.allowed, true)
 assert.equal(management.eligibility.lineEdits[0].allowed, false)
 assert.match(management.eligibility.lineEdits[0].reason, /currencies to match/i)
 
+// Warehouse history must not hide the current Shopify facts. A shipped order
+// remains ineligible, but the UI receives the real fulfillment reason instead
+// of the internal unstarted-order write fence.
+reset()
+target = targetFixture({
+  orderStatus: 'shipped',
+  zeroDownstream: false,
+  materialState: 'provider_fulfilled',
+  acceptedProviderUpdatedAt: '2026-08-14T03:19:59.000Z',
+})
+inspection = inspectionFixture(previewFixture({
+  test: false,
+  displayFulfillmentStatus: 'FULFILLED',
+  lines: [{
+    ...previewFixture().lines[0],
+    unfulfilledQuantity: 0,
+  }],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(management.runtimeAvailable, true)
+assert.equal(
+  management.blockerCode,
+  'SHOPIFY_ORDER_MANAGEMENT_UNSTARTED_ORDER_REQUIRED',
+)
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.match(management.eligibility.cancel.reason, /fulfillment activity/i)
+assert.deepEqual(events.map(([event]) => event), [
+  'target-read', 'credential-read', 'decrypt', 'inspect',
+])
+
 // Execution repeats and revalidates the exact mutation, reason, intent hash,
 // and typed confirmation before it resolves credentials or claims an attempt.
 reset()

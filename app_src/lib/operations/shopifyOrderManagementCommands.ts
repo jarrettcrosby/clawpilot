@@ -141,6 +141,12 @@ function targetReadBlocker(target: ShopifyOrderManagementTarget) {
   if (!target.credentialCurrent) {
     return 'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT'
   }
+  return null
+}
+
+function targetWriteBlocker(target: ShopifyOrderManagementTarget) {
+  const readBlocker = targetReadBlocker(target)
+  if (readBlocker) return readBlocker
   if (
     target.orderStatus !== 'imported'
     || !target.zeroDownstream
@@ -164,7 +170,7 @@ function providerWriteBlocker(target: ShopifyOrderManagementTarget) {
 }
 
 function targetBlocker(target: ShopifyOrderManagementTarget) {
-  return targetReadBlocker(target) || providerWriteBlocker(target)
+  return targetWriteBlocker(target) || providerWriteBlocker(target)
 }
 
 function assertReconciliationTarget(
@@ -343,17 +349,19 @@ function publicState(input: {
   blockerCode: string | null
   authorization?: ShopifyOrderManagementAuthorization | null
 }) {
+  const readReason = input.blockerCode || targetReadBlocker(input.target)
   const targetReason = targetBlocker(input.target)
   const unresolved = openAttempt(
     input.authorization === undefined
       ? input.target.latestOpenAuthorization
       : input.authorization,
   )
-  const baseReason = input.blockerCode || targetReason || (
+  const baseReason = readReason || (
     unresolved
       ? 'Resolve the existing Shopify provider attempt first'
       : null
   )
+  const writeReason = baseReason || targetReason
   const writeOrders = hasEffectiveShopifyScope(
     input.grantedScopes,
     'write_orders',
@@ -362,10 +370,10 @@ function publicState(input: {
     input.grantedScopes,
     'write_order_edits',
   )
-  const addTagReason = baseReason || (!writeOrders
+  const addTagReason = writeReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
-  const ordinarySaveReason = baseReason || (!writeOrders
+  const ordinarySaveReason = writeReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
   const destructiveCurrent = exactCurrentSource(input.target)
@@ -373,26 +381,30 @@ function publicState(input: {
     && input.target.acceptedProviderUpdatedAt === input.preview.updatedAt
   const cancellationReason = baseReason
     || (!writeOrders ? 'The Shopify connection is missing write_orders' : null)
-    || (!destructiveCurrent
-      ? 'Refresh and accept the current provider revision before changing order state'
-      : null)
-    || (!input.preview.test
-      ? 'Cancellation is limited to Shopify test orders'
-      : null)
     || (input.preview.cancelledAt !== null
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || (!input.preview.unpaid || input.preview.capturable
-      ? 'Cancellation is limited to unpaid orders without a payment authorization'
+    || (input.preview.capturable
+      ? 'Release or capture the payment authorization before cancelling this order'
       : null)
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
-      ? 'Cancellation requires every line to be wholly unfulfilled'
+      ? 'This order has fulfillment activity. Cancel or return that fulfillment before cancelling the order'
       : null)
-  const lineBaseReason = baseReason
+    || (!input.preview.unpaid
+      ? 'Paid-order cancellation requires refund settings before it can be submitted'
+      : null)
+    || (!input.preview.test
+      ? 'Cancellation is limited to Shopify test orders'
+      : null)
+    || (!destructiveCurrent
+      ? 'Refresh and accept the current provider revision before changing order state'
+      : null)
+    || targetReason
+  const lineBaseReason = writeReason
     || (!writeOrderEdits
       ? 'The Shopify connection is missing write_order_edits'
       : null)
@@ -421,7 +433,7 @@ function publicState(input: {
 
   return Object.freeze({
     runtimeAvailable: input.runtimeAvailable,
-    blockerCode: baseReason,
+    blockerCode: baseReason || targetReason,
     accountLabel: input.target.accountDisplayName,
     shopDomain: input.target.shopDomain || 'unavailable.myshopify.com',
     order: Object.freeze({
@@ -788,7 +800,7 @@ async function localResult(input: {
       preview: placeholderPreview(target),
       grantedScopes: [],
       runtimeAvailable: targetReadBlocker(target) === null,
-      blockerCode: targetBlocker(target),
+      blockerCode: targetReadBlocker(target),
       authorization: input.authorization,
     }),
   })
