@@ -593,6 +593,11 @@ function loadOperationalFaireRoute(
         )
       },
     },
+    '@/lib/operations/operationalUnitMaterialCartonization': {
+      planOperationalUnitMaterialPackages: () => {
+        throw new Error('Unit-material planning is outside this route fixture')
+      },
+    },
     '@/lib/operations/orToolsFulfillmentOptimizer': {
       configuredOrToolsFulfillmentOptimizer: () => null,
     },
@@ -746,6 +751,9 @@ const sandboxFixedAxisMigration = read(
 const orToolsProfileMigration = read(
   'db/migrations/0261_operations_cartonization_or_tools_profile_evidence.sql',
 )
+const unitMaterialMigration = read(
+  'db/migrations/0323_operations_unit_material_cartonization.sql',
+)
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
 )
@@ -887,6 +895,15 @@ assertIncludes(orToolsProfileMigration, [
   "profile_version.lifecycle_state = 'active'",
   'profile_version.is_current = true',
 ], 'Operational OR-Tools profile evidence migration')
+assertIncludes(unitMaterialMigration, [
+  "'unit_material_selection'",
+  'ops_cart_rate_pkg_planning_method_check',
+  'validate_operations_cartonization_unit_material_package()',
+  'DEFERRABLE INITIALLY DEFERRED',
+  "evidence.evidence_mode = 'operational'",
+  'jsonb_array_length(NEW.allocations) <> 1',
+  'cannot retain recipe or Product-pack profile edges',
+], 'Operational unit-material planner provenance migration')
 
 assertIncludes(persistence, [
   'export function cartonizationRateEvidenceHash',
@@ -896,6 +913,8 @@ assertIncludes(persistence, [
   'assertCartonizationRateEvidenceCarrierCoverage',
   'assertCartonizationRateEvidenceOrToolsProfiles',
   'assertCartonizationRateEvidenceOperationalGeometryProvenance',
+  'assertCartonizationRateEvidenceUnitMaterialProvenance',
+  'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
   'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
   'canonicalOptimizerHash(optimizerInput)',
   'parseFulfillmentOptimizationResult(',
@@ -1029,7 +1048,7 @@ assertIncludes(route, [
 ], 'Executable package-and-rate workflow')
 const operationalGeometryFence = section(
   route,
-  "request.evidenceMode === 'operational'\n      && plan.geometryFallbackLines.length > 0",
+  "request.evidenceMode === 'operational'\n      && geometryProfileFallbackLines.length > 0",
   'const sandboxGeometryRatePlan =',
   'Operational geometry fence',
 )
@@ -1044,6 +1063,18 @@ assert.doesNotMatch(
   /activationState|CARTONIZATION_RATE_EVIDENCE_SHADOW_REQUIRED/u,
   'Operational read-only rating must not depend on workspace activation',
 )
+const unitMaterialFence = section(
+  route,
+  'const unitMaterialFallbackLines =',
+  'let operationalGeometryRatePlan = null',
+  'Operational unit-material fence',
+)
+assertIncludes(unitMaterialFence, [
+  "line.fitModel === 'unconstrained_unit'",
+  'planOperationalUnitMaterialPackages({',
+  'inventoryProducts: read.inventory.products',
+  "operationalUnitMaterialPlan.status === 'blocked'",
+], 'Unit items must use fail-closed factual material selection')
 const sandboxGeometrySection = section(
   route,
   'const sandboxGeometryRatePlan =',

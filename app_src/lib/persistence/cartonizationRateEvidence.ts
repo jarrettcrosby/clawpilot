@@ -94,6 +94,7 @@ export type CartonizationRateEvidencePackageInput = {
     | 'approved_recipe'
     | 'or_tools'
     | 'sandbox_fixed_axis'
+    | 'unit_material_selection'
   packagingMaterialGlobalId: string
   materialRowVersion: number
   recipes: CartonizationRateEvidenceRecipeInput[]
@@ -175,6 +176,7 @@ type EvidencePackageRow = {
     | 'approved_recipe'
     | 'or_tools'
     | 'sandbox_fixed_axis'
+    | 'unit_material_selection'
   packaging_material_global_id: string
   packaging_material_name: string
   approved_pack_recipe_global_id: string | null
@@ -302,6 +304,7 @@ export type CartonizationRateEvidence = {
       | 'approved_recipe'
       | 'or_tools'
       | 'sandbox_fixed_axis'
+      | 'unit_material_selection'
     packagingMaterialGlobalId: string
     packagingMaterialName: string
     approvedPackRecipeGlobalId: string | null
@@ -750,6 +753,139 @@ export function assertCartonizationRateEvidenceOperationalGeometryProvenance(
       400,
       'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_PROVENANCE_INVALID',
     )
+  }
+}
+
+export function assertCartonizationRateEvidenceUnitMaterialProvenance(
+  input: Pick<
+    CartonizationRateEvidenceWriteInput,
+    'evidenceMode' | 'packages' | 'planSnapshot'
+  >,
+) {
+  const unitPackages = input.packages.filter(
+    (item) => item.planningMethod === 'unit_material_selection',
+  )
+  const retained = input.planSnapshot.operationalUnitMaterialPlan
+  if (unitPackages.length === 0) {
+    if (retained !== null && retained !== undefined) {
+      fail(
+        'Unit-material provenance cannot be retained without unit-material packages',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+      )
+    }
+    return
+  }
+  if (
+    input.evidenceMode !== 'operational'
+    || !retained
+    || typeof retained !== 'object'
+    || Array.isArray(retained)
+  ) {
+    fail(
+      'Unit-material packages require exact retained operational provenance',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+    )
+  }
+  const retainedRecord = retained as Record<string, unknown>
+  const evidence = retainedRecord.evidence
+  const retainedPackages = retainedRecord.packages
+  if (
+    !evidence
+    || typeof evidence !== 'object'
+    || Array.isArray(evidence)
+    || !Array.isArray(retainedPackages)
+  ) {
+    fail(
+      'Unit-material packages require canonical retained evidence and packages',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+    )
+  }
+  const evidenceRecord = evidence as Record<string, unknown>
+  const retainedByKey = new Map<string, Record<string, unknown>>()
+  for (const raw of retainedPackages) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      fail(
+        'Retained unit-material package is invalid',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+      )
+    }
+    const packageRecord = raw as Record<string, unknown>
+    const key = String(packageRecord.packageKey || '')
+    if (!key || retainedByKey.has(key)) {
+      fail(
+        'Retained unit-material package keys are invalid',
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+      )
+    }
+    retainedByKey.set(key, packageRecord)
+  }
+  if (
+    evidenceRecord.policyVersion
+      !== 'operational-unit-material-one-each-v1'
+    || evidenceRecord.productPackConstraint
+      !== 'not_required_for_one_each_line'
+    || evidenceRecord.packageSelectionBasis
+      !== 'largest_selected_factual_container_with_available_stock'
+    || evidenceRecord.unitsPerPackage !== 1
+    || evidenceRecord.unitWeightAuthority
+      !== 'provider_or_order_specific'
+    || evidenceRecord.materialAuthority
+      !== 'current_active_material_and_unclaimed_warehouse_stock'
+    || ![
+      'shopify_provider_commitment_less_active_reservations',
+      'shadow_training_simulated',
+    ].includes(String(evidenceRecord.inventoryAuthority || ''))
+    || evidenceRecord.transformationHash
+      !== canonicalOptimizerHash(retainedPackages)
+    || retainedByKey.size !== unitPackages.length
+  ) {
+    fail(
+      'Retained unit-material planning evidence is not canonical',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+    )
+  }
+  for (const packageInput of unitPackages) {
+    const packageRecord = retainedByKey.get(packageInput.packageKey)
+    const allocations = packageRecord?.allocations
+    const unitEvidence = packageRecord?.unitMaterialEvidence
+    if (
+      !packageRecord
+      || packageRecord.planningMethod !== 'unit_material_selection'
+      || packageRecord.packageSequence !== packageInput.packageSequence
+      || packageRecord.packagingMaterialGlobalId
+        !== packageInput.packagingMaterialGlobalId
+      || packageRecord.materialRowVersion !== packageInput.materialRowVersion
+      || packageRecord.contentWeightGrams !== packageInput.contentWeightGrams
+      || packageRecord.tareWeightGrams !== packageInput.tareWeightGrams
+      || packageRecord.ratedGrossWeightGrams
+        !== packageInput.ratedGrossWeightGrams
+      || canonicalOptimizerHash(packageRecord.innerDimensionsMm)
+        !== canonicalOptimizerHash(packageInput.innerDimensionsMm)
+      || canonicalOptimizerHash(packageRecord.ratedOuterDimensionsMm)
+        !== canonicalOptimizerHash(packageInput.ratedOuterDimensionsMm)
+      || canonicalOptimizerHash(allocations)
+        !== canonicalOptimizerHash(packageInput.allocations)
+      || !Array.isArray(allocations)
+      || allocations.length !== 1
+      || Number((allocations[0] as Record<string, unknown>)?.quantity) !== 1
+      || packageInput.recipes.length !== 0
+      || packageInput.orToolsProfiles.length !== 0
+      || !unitEvidence
+      || typeof unitEvidence !== 'object'
+      || Array.isArray(unitEvidence)
+    ) {
+      fail(
+        `${packageInput.packageKey} lost its exact one-each material selection provenance`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+      )
+    }
   }
 }
 
@@ -1876,6 +2012,7 @@ export async function writeCartonizationRateEvidenceInPostgres(
   assertCartonizationRateEvidenceCarrierCoverage(input)
   assertCartonizationRateEvidenceOrToolsProfiles(input)
   assertCartonizationRateEvidenceOperationalGeometryProvenance(input)
+  assertCartonizationRateEvidenceUnitMaterialProvenance(input)
   assertCartonizationRateEvidenceMaterialAssumptions(input)
   const shadowTrainingEvidence = Object.hasOwn(
     input.planSnapshot,

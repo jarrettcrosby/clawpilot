@@ -139,12 +139,12 @@ export type HybridCartonizationReadResult = {
   lineEvidence: Array<{
     lineGlobalId: string
     productGlobalId: string
-    variantPackMappingGlobalId: string
-    capturedMappingRowVersion: number
-    currentMappingRowVersion: number
-    packProfileVersionGlobalId: string
-    capturedProfileRowVersion: number
-    currentProfileRowVersion: number
+    variantPackMappingGlobalId: string | null
+    capturedMappingRowVersion: number | null
+    currentMappingRowVersion: number | null
+    packProfileVersionGlobalId: string | null
+    capturedProfileRowVersion: number | null
+    currentProfileRowVersion: number | null
     fitModel: HybridCartonizationLine['profile']['fitModel']
     packagingState: string
     packagingSource: string
@@ -309,6 +309,7 @@ type CandidateLineRow = {
   requires_shipping: boolean
   ordered_quantity: string
   unfulfilled_quantity: string
+  unit_multiplier: string
   mapping_state: string
   packaging_state: string
   packaging_source: string
@@ -2191,6 +2192,7 @@ async function readCandidateLines(
        line.requires_shipping,
        line.ordered_quantity::text,
        line.unfulfilled_quantity::text,
+       line.unit_multiplier::text,
        line.mapping_state,
        line.packaging_state,
        line.packaging_source,
@@ -2347,7 +2349,7 @@ export function mapCandidateLines(
 ) {
   return rows.map((row): {
     productId: string
-    packProfileVersionId: string
+    packProfileVersionId: string | null
     line: HybridCartonizationLine
     evidence: HybridCartonizationReadResult['lineEvidence'][number]
   } => {
@@ -2356,6 +2358,92 @@ export function mapCandidateLines(
       `${row.global_id} unfulfilled quantity`,
       1,
     )
+    const unconstrainedUnit = (
+      Number(row.unit_multiplier) === 1
+      && row.mapping_state === 'resolved'
+      && row.packaging_state === 'not_required'
+      && row.packaging_source === 'none'
+      && row.product_id !== null
+      && row.product_global_id !== null
+      && row.pack_mapping_id === null
+      && row.pack_profile_version_id === null
+    )
+    if (unconstrainedUnit) {
+      const providerWeight = row.weight_grams ?? row.channel_weight_grams
+      if (!Number.isSafeInteger(providerWeight) || Number(providerWeight) < 1) {
+        fail(
+          `${row.product_title_snapshot} needs a positive provider or order-specific unit weight; a Product pack assignment is not required`,
+          422,
+          'HYBRID_CARTONIZATION_UNIT_WEIGHT_REQUIRED',
+        )
+      }
+      if (!row.channel_source_revision || !row.channel_source_hash) {
+        fail(
+          `${row.product_title_snapshot} needs current provider catalog lineage before cartonization`,
+          422,
+          'HYBRID_CARTONIZATION_UNIT_CHANNEL_EVIDENCE_REQUIRED',
+        )
+      }
+      const variant = row.variant_title_snapshot?.trim()
+      const title = variant && variant.toLowerCase() !== 'default title'
+        ? `${row.product_title_snapshot} · ${variant}`
+        : row.product_title_snapshot
+      const weightSource = row.packaging_weight_source === 'provider_order'
+        ? 'provider_order' as const
+        : 'provider_catalog' as const
+      return {
+        productId: row.product_id!,
+        packProfileVersionId: null,
+        line: {
+          lineGlobalId: row.global_id,
+          productGlobalId: row.product_global_id!,
+          title,
+          quantity,
+          unitWeightGrams: Number(providerWeight),
+          profile: {
+            // This is explicit non-profile lineage, not a fabricated Product
+            // pack Global ID. The dedicated fit model prevents it from
+            // entering recipe or geometry-profile validation.
+            versionGlobalId: `unit-item:${row.global_id}`,
+            capturedRowVersion: 0,
+            currentRowVersion: 0,
+            isCurrent: true,
+            lifecycleState: 'active',
+            fitModel: 'unconstrained_unit',
+            evidenceType: 'provider',
+            evidenceReference: row.channel_source_revision,
+            confirmedAt: null,
+            packageLevel: 'each',
+            baseEachQuantity: 1,
+            shipsAsOwnPackage: false,
+            outerDimensionsMm: null,
+            grossWeightGrams: Number(providerWeight),
+          },
+        },
+        evidence: {
+          lineGlobalId: row.global_id,
+          productGlobalId: row.product_global_id!,
+          variantPackMappingGlobalId: null,
+          capturedMappingRowVersion: null,
+          currentMappingRowVersion: null,
+          packProfileVersionGlobalId: null,
+          capturedProfileRowVersion: null,
+          currentProfileRowVersion: null,
+          fitModel: 'unconstrained_unit',
+          packagingState: row.packaging_state,
+          packagingSource: row.packaging_source,
+          weightSource,
+          weightGrams: Number(providerWeight),
+          channelSourceRevision: row.channel_source_revision,
+          channelSourceHash: row.channel_source_hash,
+          packLineageSource: row.pack_lineage_source,
+          checkoutReceiptGlobalId: row.checkout_receipt_global_id,
+          fulfillmentPackSource: 'candidate_capture',
+          checkoutPackBaseline: null,
+          fulfillmentPackEvidence: null,
+        },
+      }
+    }
     assertCurrentFulfillmentPackEvidenceAvailable({
       mode: input.mode,
       productTitle: row.product_title_snapshot,
@@ -2373,6 +2461,13 @@ export function mapCandidateLines(
       && row.current_pack_profile_width_mm === null
       && row.current_pack_profile_height_mm === null
       && row.current_pack_profile_dimension_basis === 'unspecified'
+    )
+    const optionalUnitPackAssociation = (
+      Number(row.unit_multiplier) === 1
+      && row.packaging_state === 'not_required'
+      && row.packaging_source === 'variant_pack_mapping'
+      && row.pack_mapping_id !== null
+      && row.pack_profile_version_id !== null
     )
     const publishedFaireOrderCapture = (
       row.provider === 'faire'
@@ -2402,6 +2497,7 @@ export function mapCandidateLines(
       || (
         row.packaging_state !== 'resolved'
         && !recipeOnlyAssociation
+        && !optionalUnitPackAssociation
       )
       || row.packaging_source !== 'variant_pack_mapping'
       || !row.pack_mapping_id
@@ -2497,6 +2593,9 @@ export function mapCandidateLines(
     const unitWeightGrams = exactInteger(
       recipeOnlyAssociation
         ? row.channel_weight_grams
+        : optionalUnitPackAssociation
+          ? row.current_pack_profile_gross_weight_grams
+            ?? row.channel_weight_grams
         : row.weight_grams,
       `${row.global_id} unit weight`,
       1,
@@ -2526,6 +2625,7 @@ export function mapCandidateLines(
     }
     if (
       !recipeOnlyAssociation
+      && !optionalUnitPackAssociation
       && ![
         'profile_version',
         'provider_order',
@@ -2554,6 +2654,10 @@ export function mapCandidateLines(
       : row.product_title_snapshot
     const weightSource = recipeOnlyAssociation
       ? 'provider_catalog'
+      : optionalUnitPackAssociation
+        ? row.current_pack_profile_gross_weight_grams !== null
+          ? 'profile_version'
+          : 'provider_catalog'
       : row.packaging_weight_source as
         | 'profile_version'
         | 'provider_order'
@@ -2922,7 +3026,7 @@ async function readRecipes(
   input: HybridCartonizationReadRequest,
   lineEvidence: Array<{
     productId: string
-    packProfileVersionId: string
+    packProfileVersionId: string | null
   }>,
   materialIds: string[],
 ) {
@@ -2991,7 +3095,7 @@ async function readRecipes(
     ],
   )
   const permittedPairs = new Set(
-    lineEvidence.map((entry) => (
+    lineEvidence.filter((entry) => entry.packProfileVersionId).map((entry) => (
       `${entry.productId}:${entry.packProfileVersionId}`
     )),
   )

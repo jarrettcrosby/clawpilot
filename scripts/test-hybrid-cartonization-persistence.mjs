@@ -442,6 +442,7 @@ const fulfillmentCandidate = {
   requires_shipping: true,
   ordered_quantity: '50',
   unfulfilled_quantity: '50',
+  unit_multiplier: '1',
   packaging_weight_source: 'provider_catalog',
   weight_grams: 170,
   mapping_state: 'resolved',
@@ -488,6 +489,78 @@ const fulfillmentCandidate = {
   fulfillment_pack_source: 'candidate_capture',
   checkout_pack_baseline: checkoutPackBaseline,
 }
+
+const unconstrainedUnitCandidate = {
+  ...fulfillmentCandidate,
+  packaging_state: 'not_required',
+  packaging_source: 'none',
+  packaging_weight_source: null,
+  weight_grams: null,
+  pack_mapping_id: null,
+  pack_mapping_global_id: null,
+  captured_pack_mapping_row_version: null,
+  current_pack_mapping_row_version: null,
+  pack_mapping_is_current: null,
+  pack_mapping_projection_state: null,
+  pack_mapping_source_revision: null,
+  pack_mapping_source_hash: null,
+  pack_mapping_pack_evidence_hash: null,
+  pack_mapping_purpose: null,
+  channel_pack_evidence_hash: null,
+  channel_weight_grams: 750,
+  pack_profile_version_id: null,
+  pack_profile_version_global_id: null,
+  captured_pack_profile_row_version: null,
+  current_pack_profile_row_version: null,
+  pack_profile_is_current: null,
+  pack_profile_lifecycle_state: null,
+  pack_profile_fit_model: null,
+  pack_profile_evidence_type: null,
+  pack_profile_evidence_reference: null,
+  pack_profile_confirmed_at: null,
+  pack_profile_status: null,
+  pack_profile_base_each_quantity: null,
+  current_pack_profile_base_each_quantity: null,
+  current_pack_profile_length_mm: null,
+  current_pack_profile_width_mm: null,
+  current_pack_profile_height_mm: null,
+  current_pack_profile_dimension_basis: null,
+  current_pack_profile_package_level: null,
+  current_pack_profile_ships_as_own_package: null,
+  current_pack_profile_gross_weight_grams: null,
+  current_pack_profile_weight_basis: null,
+  checkout_pack_baseline: null,
+}
+const mappedUnconstrainedUnit = mapCandidateLines(
+  { mode: 'production' },
+  [unconstrainedUnitCandidate],
+)[0]
+assert.equal(
+  mappedUnconstrainedUnit.packProfileVersionId,
+  null,
+  'A one-each line must not invent a Product-pack version',
+)
+assert.equal(
+  mappedUnconstrainedUnit.line.profile.fitModel,
+  'unconstrained_unit',
+  'A one-each line must enter the dedicated no-Product-pack planner',
+)
+assert.equal(
+  mappedUnconstrainedUnit.line.unitWeightGrams,
+  750,
+  'A one-each line must retain exact provider catalog weight',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{ ...unconstrainedUnitCandidate, channel_weight_grams: null }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_UNIT_WEIGHT_REQUIRED'
+  ),
+  'A one-each line without a Product pack must still fail closed on weight',
+)
 
 const publishedFaireSoldOutCandidate = {
   ...fulfillmentCandidate,
