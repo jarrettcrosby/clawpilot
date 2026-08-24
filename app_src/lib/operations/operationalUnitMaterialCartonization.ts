@@ -1,4 +1,4 @@
-import { canonicalOptimizerHash } from './fulfillmentOptimizerContract.ts'
+import { createHash } from 'node:crypto'
 import type {
   HybridCartonizationLine,
   HybridCartonizationMaterial,
@@ -9,8 +9,25 @@ import type {
 export const OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION =
   'operational-unit-material-one-each-v1' as const
 
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => (
+          left < right ? -1 : left > right ? 1 : 0
+        ))
+        .map(([key, entry]) => [key, canonicalValue(entry)]),
+    )
+  }
+  return value
+}
+
 function canonicalUnitMaterialHash(value: unknown) {
-  return canonicalOptimizerHash(value)
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalValue(value)))
+    .digest('hex')
 }
 
 type InventoryProductEvidence = {
