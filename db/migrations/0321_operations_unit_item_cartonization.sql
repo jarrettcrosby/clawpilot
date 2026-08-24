@@ -41,6 +41,48 @@ ALTER TABLE operations_commerce_order_candidate_lines
     )
   );
 
+-- Keep an approved recipe/pack association as optional evidence on a unit
+-- line even when that association does not contain promotable geometry. The
+-- association remains available to cartonization, but it is no longer an
+-- order-import blocker for a one-each pick.
+ALTER TABLE operations_commerce_order_candidate_lines
+  DROP CONSTRAINT IF EXISTS commerce_order_lines_mapped_pack_source_valid;
+
+ALTER TABLE operations_commerce_order_candidate_lines
+  ADD CONSTRAINT commerce_order_lines_mapped_pack_source_valid CHECK (
+    packaging_source <> 'variant_pack_mapping'
+    OR (
+      package_profile_id IS NULL
+      AND commerce_variant_pack_mapping_id IS NOT NULL
+      AND pack_profile_version_id IS NOT NULL
+      AND (
+        (
+          packaging_state = 'resolved'
+          AND packaging_weight_source IS NOT NULL
+        )
+        OR (
+          packaging_state = 'unresolved'
+          AND packaging_weight_source IS NULL
+          AND weight_grams IS NULL
+          AND length_mm IS NULL
+          AND width_mm IS NULL
+          AND height_mm IS NULL
+          AND 'packaging_required' = ANY(blocking_codes)
+        )
+        OR (
+          packaging_state = 'not_required'
+          AND unit_multiplier = 1
+          AND packaging_weight_source IS NULL
+          AND weight_grams IS NULL
+          AND length_mm IS NULL
+          AND width_mm IS NULL
+          AND height_mm IS NULL
+          AND NOT ('packaging_required' = ANY(blocking_codes))
+        )
+      )
+    )
+  );
+
 UPDATE operations_commerce_order_candidate_lines
 SET packaging_state = 'not_required',
     blocking_codes = array_remove(blocking_codes, 'packaging_required'),
@@ -76,5 +118,9 @@ WHERE 'packaging_required' = ANY(candidate.blocking_codes)
 COMMENT ON CONSTRAINT commerce_order_lines_ready_valid
   ON operations_commerce_order_candidate_lines IS
   'Unit items may defer outbound package choice to cartonization; multipacks and case picks require resolved approved Product pack evidence.';
+
+COMMENT ON CONSTRAINT commerce_order_lines_mapped_pack_source_valid
+  ON operations_commerce_order_candidate_lines IS
+  'Exact variant-pack evidence may resolve geometry, remain blocked for a case pick, or remain as a nonblocking approved association on a one-each line whose outbound package is chosen by cartonization.';
 
 COMMIT;
