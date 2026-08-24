@@ -346,6 +346,31 @@ async function seedNonShippingReadyFacts(client, fixture) {
   )
 }
 
+async function seedUnitCartonizationReadyFacts(client, fixture) {
+  await seedReadyFacts(client, fixture)
+  await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET blocking_codes = array_append(
+       blocking_codes, 'packaging_required'
+     )
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+  await client.query(
+    `UPDATE operations_commerce_order_candidate_lines
+     SET packaging_state = 'unresolved',
+         packaging_source = 'none',
+         weight_grams = NULL,
+         length_mm = NULL,
+         width_mm = NULL,
+         height_mm = NULL,
+         blocking_codes = ARRAY['packaging_required']::text[]
+     WHERE organization_id = $1::uuid
+       AND order_candidate_id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+}
+
 async function seedNeedsInfoFacts(client, fixture) {
   await client.query(
     `INSERT INTO crm_reference_registry (
@@ -646,7 +671,7 @@ async function seedFixtures(
     await seedReadyFacts(client, ready)
     await seedNeedsInfoFacts(client, needsInfo)
     await seedCurrentMappedProductPack(client, needsInfo)
-    await seedReadyFacts(client, accept)
+    await seedUnitCartonizationReadyFacts(client, accept)
     await seedNeedsInfoFacts(client, refresh)
     await seedNonShippingReadyFacts(client, nonShipping)
   } finally {
@@ -1857,6 +1882,9 @@ async function verifyAcceptance(
     assert.equal(unchangedReadyDraft.rowVersion, 1)
     assert.equal(unchangedReadyDraft.needsInfo, false)
     assert.equal(unchangedReadyDraft.shipTo.readiness, 'carrier_ready')
+    assert.equal(unchangedReadyDraft.lines[0].unitMultiplier, 1)
+    assert.equal(unchangedReadyDraft.lines[0].packageStatus, 'unresolved')
+    assert.deepEqual(unchangedReadyDraft.lines[0].blockerCodes, [])
     const acceptInput = {
       organizationId: acceptFixture.organization,
       actorEmail,
@@ -1894,6 +1922,31 @@ async function verifyAcceptance(
       ],
     )
     assert.equal(acceptedCanonicalCount.rows[0].count, 1)
+    const acceptedUnitCartonization = await pool.query(
+      `SELECT candidate_line.packaging_state,
+              canonical_line.weight_grams,
+              canonical_line.dimensions_mm
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_commerce_order_candidate_lines candidate_line
+         ON candidate_line.organization_id = candidate.organization_id
+        AND candidate_line.order_candidate_id = candidate.id
+       JOIN operations_order_lines canonical_line
+         ON canonical_line.organization_id = candidate_line.organization_id
+        AND canonical_line.id = candidate_line.canonical_order_line_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.id = $2::uuid`,
+      [acceptFixture.organization, acceptFixture.candidate],
+    )
+    assert.deepEqual(plain(acceptedUnitCartonization.rows[0]), {
+      packaging_state: 'not_required',
+      weight_grams: 0,
+      dimensions_mm: {
+        length: 1,
+        width: 1,
+        height: 1,
+        source: 'cartonization_pending',
+      },
+    })
 
     const nonShippingBefore = await candidateSnapshot(pool, nonShippingFixture)
     assert.equal(nonShippingBefore.ship_to_snapshot_state, 'missing')
