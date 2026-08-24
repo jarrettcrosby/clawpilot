@@ -34,6 +34,9 @@ import {
   planOperationalGeometryRatePackages,
 } from '@/lib/operations/operationalGeometryCartonization'
 import {
+  planOperationalUnitMaterialPackages,
+} from '@/lib/operations/operationalUnitMaterialCartonization'
+import {
   configuredOrToolsFulfillmentOptimizer,
 } from '@/lib/operations/orToolsFulfillmentOptimizer'
 import {
@@ -1001,10 +1004,49 @@ export async function POST(req: NextRequest) {
         'CARTONIZATION_RATE_EVIDENCE_SELF_PACKAGE_UNSUPPORTED',
       )
     }
+    const unitMaterialFallbackLines = plan.geometryFallbackLines.filter(
+      (line) => line.fitModel === 'unconstrained_unit',
+    )
+    const geometryProfileFallbackLines = plan.geometryFallbackLines.filter(
+      (line) => line.fitModel !== 'unconstrained_unit',
+    )
+    let operationalUnitMaterialPlan = null
+    if (
+      request.evidenceMode === 'operational'
+      && unitMaterialFallbackLines.length > 0
+    ) {
+      operationalUnitMaterialPlan = planOperationalUnitMaterialPackages({
+        provider: read.account.provider,
+        lines: read.input.lines,
+        fallbackLines: unitMaterialFallbackLines,
+        recipePackages: plan.recipePackages,
+        materials: read.input.materials,
+        inventoryProducts: read.inventory.products,
+        availabilityMode: request.shadowTraining
+          ? 'shadow_training_simulated'
+          : 'operational',
+        startingSequence: (
+          Math.max(
+            0,
+            ...plan.recipePackages.map((item) => item.sequence),
+          ) + 1
+        ),
+        maximumPackages:
+          MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+            - plan.recipePackages.length,
+      })
+      if (operationalUnitMaterialPlan.status === 'blocked') {
+        throw new RateEvidenceRequestError(
+          operationalUnitMaterialPlan.blocker.detail,
+          422,
+          operationalUnitMaterialPlan.blocker.code,
+        )
+      }
+    }
     let operationalGeometryRatePlan = null
     if (
       request.evidenceMode === 'operational'
-      && plan.geometryFallbackLines.length > 0
+      && geometryProfileFallbackLines.length > 0
     ) {
       let optimizer = null
       try {
@@ -1022,7 +1064,7 @@ export async function POST(req: NextRequest) {
           readAt: read.readAt,
           warehouseGlobalId: read.warehouse.globalId,
           lines: read.input.lines,
-          fallbackLines: plan.geometryFallbackLines,
+          fallbackLines: geometryProfileFallbackLines,
           recipePackages: plan.recipePackages,
           materials: read.input.materials,
           inventoryProducts: read.inventory.products,
@@ -1033,11 +1075,19 @@ export async function POST(req: NextRequest) {
             Math.max(
               0,
               ...plan.recipePackages.map((item) => item.sequence),
+              ...(operationalUnitMaterialPlan?.status === 'ready'
+                ? operationalUnitMaterialPlan.packages.map(
+                    (item) => item.packageSequence,
+                  )
+                : []),
             ) + 1
           ),
           maximumPackages:
             MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
-              - plan.recipePackages.length,
+              - plan.recipePackages.length
+              - (operationalUnitMaterialPlan?.status === 'ready'
+                ? operationalUnitMaterialPlan.packages.length
+                : 0),
           optimizer,
         })
       if (operationalGeometryRatePlan.status === 'blocked') {
@@ -1491,8 +1541,65 @@ export async function POST(req: NextRequest) {
           packageHash: cartonizationRateEvidenceHash(snapshot),
         }
       })
+    const operationalUnitMaterialPackageInputs:
+      CartonizationRateEvidencePackageInput[] = (
+        operationalUnitMaterialPlan?.status === 'ready'
+          ? operationalUnitMaterialPlan.packages
+          : []
+      ).map((packagePlan) => {
+        const carrierParcelRequest = {
+          description:
+            `Operational unit carton ${
+              read.candidate.orderNumber
+            }`.slice(0, 120),
+          exteriorInches: {
+            length: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.length
+                / MILLIMETERS_PER_INCH,
+            ),
+            width: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.width
+                / MILLIMETERS_PER_INCH,
+            ),
+            height: roundCarrierDecimal(
+              packagePlan.ratedOuterDimensionsMm.height
+                / MILLIMETERS_PER_INCH,
+            ),
+          },
+          grossPounds: roundCarrierDecimal(
+            packagePlan.ratedGrossWeightGrams / GRAMS_PER_POUND,
+          ),
+        }
+        const snapshot = {
+          packageKey: packagePlan.packageKey,
+          packageSequence: packagePlan.packageSequence,
+          planningMethod: packagePlan.planningMethod,
+          packagingMaterialGlobalId:
+            packagePlan.packagingMaterialGlobalId,
+          materialRowVersion: packagePlan.materialRowVersion,
+          recipes: packagePlan.recipes,
+          orToolsProfiles: packagePlan.orToolsProfiles,
+          innerDimensionsMm: packagePlan.innerDimensionsMm,
+          ratedOuterDimensionsMm:
+            packagePlan.ratedOuterDimensionsMm,
+          contentWeightGrams: packagePlan.contentWeightGrams,
+          tareWeightGrams: packagePlan.tareWeightGrams,
+          ratedGrossWeightGrams:
+            packagePlan.ratedGrossWeightGrams,
+          maxWeightGrams: packagePlan.maxWeightGrams,
+          allocations: packagePlan.allocations,
+          carrierParcel: normalizeCarrierSandboxParcel(
+            carrierParcelRequest,
+          ),
+        }
+        return {
+          ...snapshot,
+          packageHash: cartonizationRateEvidenceHash(snapshot),
+        }
+      })
     const packageInputs = [
       ...recipePackageInputs,
+      ...operationalUnitMaterialPackageInputs,
       ...operationalGeometryPackageInputs,
       ...sandboxGeometryPackageInputs,
     ].sort((left, right) => (
@@ -1530,6 +1637,13 @@ export async function POST(req: NextRequest) {
               optimizerResult:
                 operationalGeometryRatePlan.optimizerResult,
               packages: operationalGeometryRatePlan.packages,
+            }
+          : null,
+      operationalUnitMaterialPlan:
+        operationalUnitMaterialPlan?.status === 'ready'
+          ? {
+              evidence: operationalUnitMaterialPlan.evidence,
+              packages: operationalUnitMaterialPlan.packages,
             }
           : null,
       assumptions: plan.assumptions,

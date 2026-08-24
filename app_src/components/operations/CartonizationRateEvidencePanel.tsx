@@ -55,6 +55,7 @@ type EvidencePackage = {
     | 'approved_recipe'
     | 'or_tools'
     | 'sandbox_fixed_axis'
+    | 'unit_material_selection'
   packagingMaterialGlobalId: string
   packagingMaterialName: string
   approvedPackRecipeGlobalId: string | null
@@ -170,6 +171,9 @@ function planningMethodLabel(
   }
   if (method === 'sandbox_fixed_axis') {
     return 'Sandbox fixed-axis comparison'
+  }
+  if (method === 'unit_material_selection') {
+    return 'Unit item · selected carton'
   }
   return evidenceMode === 'assumption_backed_sandbox'
     ? 'Sandbox OR-Tools comparison'
@@ -827,6 +831,15 @@ export default function CartonizationRateEvidencePanel({
                         used the separately entered sandbox exterior and tare
                         assumptions. This is not an OR-Tools operational pack
                         plan.
+                      </Alert>
+                    ) : item.planningMethod
+                      === 'unit_material_selection' ? (
+                      <Alert severity="info">
+                        This one-each item does not require a Product pack
+                        assignment. ClawPilot retained the provider or
+                        order-specific unit weight and placed one unit in the
+                        selected factual carton. No product-geometry fit or
+                        multi-unit combination is claimed.
                       </Alert>
                     ) : (
                       <Alert severity="info">
