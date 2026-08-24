@@ -368,6 +368,135 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+async function installOrderLabelPrintRoutes(page: Page) {
+  const requests: Array<{
+    body: Record<string, unknown>
+    idempotencyKey: string
+  }> = []
+  let labelPrintJobs: Array<{
+    globalId: string
+    sourceLabelGlobalId: string
+    status: 'queued' | 'delivered'
+    reprintOfJobGlobalId: string | null
+    createdAt: string
+    deliveredAt: string | null
+    lastError: string | null
+  }> = []
+  const sourceLabelGlobalId = 'glb7654321'
+  const originalPrintJobGlobalId = 'gpj7654321'
+  const reprintJobGlobalId = 'gpj7654322'
+  const shippedOrder = () => ({
+    ...selectedOrder,
+    id: 'shipped-order-id',
+    globalId: 'gor7654322',
+    orderNumber: '#1004',
+    sourceProvider: 'mock-commerce',
+    externalOrderId: 'mock-1004',
+    status: 'shipped',
+    rowVersion: 6,
+    planStatus: 'fulfilled',
+    waveStatus: 'completed',
+    warehouseId: 'warehouse-id',
+    warehouseName: 'Primary Warehouse',
+    packageCount: 1,
+    plannedPackageCount: 0,
+    packedPackageCount: 1,
+    availableActions: [],
+    trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+    sandboxCommerceE2eAuthorization: null,
+    fulfillmentPreparation: null,
+    planningPreparation: null,
+    labelAttempts: [],
+    trackingObservations: [],
+    printArtifacts: [],
+    commerceExports: [],
+    labelPrintJobs,
+    packages: [{
+      ...selectedOrder.packages[0],
+      status: 'shipped',
+      contents: [],
+      latestLabel: {
+        globalId: sourceLabelGlobalId,
+        status: 'created',
+        carrier: 'UPS',
+        serviceCode: '03',
+        trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+        environment: 'sandbox',
+        createAttemptGlobalId: null,
+        voidAttemptGlobalId: null,
+        createdAt: '2026-08-22T16:12:00.000Z',
+        voidedAt: null,
+      },
+    }],
+    shipments: [{
+      globalId: 'gsh7654321',
+      status: 'confirmed',
+      carrier: 'UPS',
+      serviceCode: '03',
+      trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+      quotedCarrierCostMinor: '0',
+      oneOffCarrierGroupGlobalId: null,
+      shippedAt: '2026-08-22T16:13:00.000Z',
+    }],
+  })
+  const response = () => {
+    const base = workspace('resolved')
+    const order = shippedOrder()
+    return {
+      ...base,
+      orders: [order],
+      selectedOrder: order,
+      exceptions: [],
+      summary: {
+        ...base.summary,
+        openOrders: 0,
+        exceptions: 0,
+        shippedToday: 1,
+      },
+    }
+  }
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/print-jobs',
+    async (route) => {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      const idempotencyKey = route.request().headers()['idempotency-key'] || ''
+      requests.push({ body, idempotencyKey })
+      if (body.action === 'enqueue-label') {
+        labelPrintJobs = [{
+          globalId: originalPrintJobGlobalId,
+          sourceLabelGlobalId,
+          status: 'delivered',
+          reprintOfJobGlobalId: null,
+          createdAt: '2026-08-22T16:14:00.000Z',
+          deliveredAt: '2026-08-22T16:14:01.000Z',
+          lastError: null,
+        }]
+        return route.fulfill({
+          json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
+        })
+      }
+      expect(body.action).toBe('reprint-job')
+      labelPrintJobs = [{
+        globalId: reprintJobGlobalId,
+        sourceLabelGlobalId,
+        status: 'queued',
+        reprintOfJobGlobalId: originalPrintJobGlobalId,
+        createdAt: '2026-08-22T16:15:00.000Z',
+        deliveredAt: null,
+        lastError: null,
+      }, ...labelPrintJobs]
+      return route.fulfill({
+        json: { ok: true, job: { globalId: reprintJobGlobalId } },
+      })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    await route.fulfill({ json: { ok: true, operations: response() } })
+  })
+  return { requests, sourceLabelGlobalId, originalPrintJobGlobalId }
+}
+
 const workbenchCandidateGlobalId = 'gcoc7654321'
 const workbenchLatestCandidateGlobalId = 'gcoc7654322'
 const workbenchCanonicalOrderGlobalId = 'gor8765432'
@@ -895,6 +1024,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
       accountGlobalId: 'gia9286799',
       candidateGlobalId: 'gcoc35vrs9qjtmee',
       candidateRowVersion: 10,
+      testOrder: true,
     },
     lines: [{
       globalId: 'gol7654321',
@@ -1869,6 +1999,42 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+})
+
+test('shipped order prints and reprints the stored label without purchasing postage', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderLabelPrintRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1004/ }).click()
+  await expect(page.getByRole('heading', { name: 'Order #1004' })).toBeVisible()
+  await expect(page.getByText('Reprints reuse this stored label document and never purchase new postage.'))
+    .toBeVisible()
+
+  await page.getByRole('button', { name: 'Print label' }).click()
+  await expect(page.getByText(/was queued as print job gpj7654321/)).toBeVisible()
+  expect(capture.requests[0]).toEqual({
+    body: {
+      action: 'enqueue-label',
+      warehouseId: 'warehouse-id',
+      sourceLabelGlobalId: capture.sourceLabelGlobalId,
+      media: 'label_4x6',
+    },
+    idempotencyKey: `operations-shipping-label-print:${capture.sourceLabelGlobalId}`,
+  })
+
+  await page.getByRole('button', { name: 'Reprint label' }).click()
+  await expect(page.getByRole('heading', { name: 'Reprint shipping label' })).toBeVisible()
+  await expect(page.getByText(/does not call the carrier, buy postage/)).toBeVisible()
+  await page.getByRole('button', { name: 'Queue reprint' }).click()
+  await expect(page.getByText(/was queued for reprint as gpj7654322/)).toBeVisible()
+  expect(capture.requests[1].body).toEqual({
+    action: 'reprint-job',
+    jobGlobalId: capture.originalPrintJobGlobalId,
+    reason: 'Reprint shipping label for order #1004',
+  })
+  expect(capture.requests[1].idempotencyKey)
+    .toMatch(/^operations-shipping-label-reprint:gpj7654321:/)
 })
 
 test('measured outer dimensions save without a redundant evidence note', async ({ page }) => {

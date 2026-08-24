@@ -463,6 +463,27 @@ for (const fragment of [
 const operations = read('app_src/components/operations/OperationsSection.tsx')
 assert.ok(operations.includes('value="printing"'), 'Operations navigation must expose Printing')
 assert.ok(operations.includes('<PrinterConfigurationPanel />'), 'Operations must render printer configuration')
+for (const fragment of [
+  'data-testid="order-shipping-labels"',
+  "action: 'enqueue-label'",
+  "action: 'reprint-job'",
+  'Reprint shipping label',
+  'Reprints reuse this stored label document and never purchase new postage.',
+  'the original carrier-label document was not imported into ClawPilot',
+]) assert.ok(
+  operations.includes(fragment),
+  `Order workflow label printing is missing ${fragment}`,
+)
+const operationsPersistence = read('app_src/lib/persistence/operations.ts')
+for (const fragment of [
+  'labelPrintJobResult',
+  'label.global_id AS source_label_global_id',
+  'original.global_id AS reprint_of_job_global_id',
+  'labelPrintJobs: labelPrintJobResult.rows.map',
+]) assert.ok(
+  operationsPersistence.includes(fragment),
+  `Order label print-job projection is missing ${fragment}`,
+)
 assert.equal(
   existsSync(resolve(root, 'app_src/lib/persistence/operationsPrintDelivery.ts')),
   false,

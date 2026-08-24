@@ -3246,6 +3246,7 @@ async function readOrderDetail(
     integration_account_global_id: string | null
     planning_candidate_global_id: string | null
     planning_candidate_row_version: string | null
+    planning_candidate_test_order: boolean | null
     notify_customer_default: boolean | null
     notification_policy_revision: string | number | null
     status: OperationsOrderStatus
@@ -3291,6 +3292,7 @@ async function readOrderDetail(
        planning_candidate.global_id AS planning_candidate_global_id,
        planning_candidate.row_version::text
          AS planning_candidate_row_version,
+       planning_candidate.test_order AS planning_candidate_test_order,
        notification_policy.notify_customer_default,
        notification_policy.revision::text AS notification_policy_revision,
        orders.status, orders.currency, orders.ship_to,
@@ -3389,7 +3391,7 @@ async function readOrderDetail(
        ON source_account.organization_id = orders.organization_id
       AND source_account.id = orders.integration_account_id
      LEFT JOIN LATERAL (
-       SELECT candidate.global_id, candidate.row_version
+       SELECT candidate.global_id, candidate.row_version, candidate.test_order
        FROM operations_commerce_order_candidates candidate
        WHERE candidate.organization_id = orders.organization_id
          AND candidate.integration_account_id = orders.integration_account_id
@@ -3455,6 +3457,7 @@ async function readOrderDetail(
     rateResult,
     billableResult,
     labelAttemptResult,
+    labelPrintJobResult,
     shipmentResult,
     trackingResult,
     artifactResult,
@@ -3648,6 +3651,38 @@ async function readOrderDetail(
        WHERE attempt.organization_id = $1::uuid
          AND attempt.order_id = $2::uuid
        ORDER BY attempt.requested_at DESC, attempt.id DESC`,
+      [organizationId, row.id],
+    ),
+    query<QueryResultRow & {
+      global_id: string
+      source_label_global_id: string
+      status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
+      reprint_of_job_global_id: string | null
+      created_at: Date
+      delivered_at: Date | null
+      last_error: string | null
+    }>(
+      `SELECT job.global_id,
+              label.global_id AS source_label_global_id,
+              job.status,
+              original.global_id AS reprint_of_job_global_id,
+              job.created_at, job.delivered_at, job.last_error
+       FROM operations_print_jobs job
+       JOIN operations_labels label
+         ON label.organization_id = job.organization_id
+        AND label.id = job.label_id
+       JOIN operations_packages package
+         ON package.organization_id = label.organization_id
+        AND package.id = label.package_id
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = package.organization_id
+        AND plan.id = package.plan_id
+       LEFT JOIN operations_print_jobs original
+         ON original.organization_id = job.organization_id
+        AND original.id = job.reprint_of_job_id
+       WHERE plan.organization_id = $1::uuid
+         AND plan.order_id = $2::uuid
+       ORDER BY job.created_at DESC, job.id DESC`,
       [organizationId, row.id],
     ),
     query<QueryResultRow & {
@@ -3913,10 +3948,12 @@ async function readOrderDetail(
       row.integration_account_global_id
       && row.planning_candidate_global_id
       && row.planning_candidate_row_version !== null
+      && row.planning_candidate_test_order !== null
         ? {
             accountGlobalId: row.integration_account_global_id,
             candidateGlobalId: row.planning_candidate_global_id,
             candidateRowVersion: Number(row.planning_candidate_row_version),
+            testOrder: row.planning_candidate_test_order,
           }
         : null,
     fulfillmentNotificationPolicy: row.source_provider === 'shopify'
@@ -4057,6 +4094,15 @@ async function readOrderDetail(
         ? `/api/operations/artifacts/${encodeURIComponent(item.global_id)}`
         : null,
       createdAt: item.created_at.toISOString(),
+    })),
+    labelPrintJobs: labelPrintJobResult.rows.map((item) => ({
+      globalId: item.global_id,
+      sourceLabelGlobalId: item.source_label_global_id,
+      status: item.status,
+      reprintOfJobGlobalId: item.reprint_of_job_global_id,
+      createdAt: item.created_at.toISOString(),
+      deliveredAt: item.delivered_at?.toISOString() || null,
+      lastError: item.last_error,
     })),
     commerceExports: commerceExportResult.rows.map((item) => ({
       globalId: item.global_id,

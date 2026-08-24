@@ -777,6 +777,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     accountGlobalId: string
     candidateGlobalId: string
     candidateRowVersion: number
+    testOrder: boolean
   } | null
   fulfillmentNotificationPolicy:
     | {
@@ -894,6 +895,15 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     filename: string | null
     contentUrl: string | null
     createdAt: string
+  }>
+  labelPrintJobs: Array<{
+    globalId: string
+    sourceLabelGlobalId: string
+    status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
+    reprintOfJobGlobalId: string | null
+    createdAt: string
+    deliveredAt: string | null
+    lastError: string | null
   }>
   commerceExports: Array<{
     globalId: string
