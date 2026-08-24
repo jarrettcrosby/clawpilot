@@ -1098,6 +1098,7 @@ function OrderDetailDrawer({
   onGeneratePackingSlip,
   onPrintPackingSlip,
   onPrintLabel,
+  onRetryLabel,
   onReprintLabel,
   onConfirmShipment,
   onRetryCommerceExport,
@@ -1140,6 +1141,7 @@ function OrderDetailDrawer({
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
   onPrintLabel: (labelGlobalId: string) => void
+  onRetryLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onReprintLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onConfirmShipment: () => void
   onRetryCommerceExport: (
@@ -2146,6 +2148,9 @@ function OrderDetailDrawer({
                             const deliveredJob = jobs.find(
                               (job) => job.status === 'delivered',
                             ) || null
+                            const failedJob = jobs.find(
+                              (job) => job.status === 'failed',
+                            ) || null
                             const busyLabel = labelPrintBusyGlobalId === label.globalId
                             const canPrint = Boolean(
                               canExecute
@@ -2160,7 +2165,7 @@ function OrderDetailDrawer({
                                   ? 'Inactive or voided carrier labels cannot be printed.'
                                   : pendingJob
                                     ? `Print job ${pendingJob.globalId} is already ${pendingJob.status}.`
-                                    : jobs.length > 0 && !deliveredJob
+                                    : jobs.length > 0 && !deliveredJob && !failedJob
                                       ? 'Review the existing print job in Printing before authorizing another physical copy.'
                                       : null
                             return (
@@ -2194,6 +2199,8 @@ function OrderDetailDrawer({
                                 <Tooltip title={actionBlockedReason || (
                                   deliveredJob
                                     ? 'Create a new audited print job from the original label bytes'
+                                    : failedJob
+                                      ? 'Retry the failed print job from the same immutable label; no carrier call, postage purchase, or tracking change'
                                     : 'Queue the stored carrier label to the configured warehouse printer'
                                 )}>
                                   <span>
@@ -2204,6 +2211,8 @@ function OrderDetailDrawer({
                                         ? <CircularProgress size={16} />
                                         : deliveredJob
                                           ? <ReplayRounded />
+                                          : failedJob
+                                            ? <ReplayRounded />
                                           : <PrintRounded />}
                                       disabled={
                                         busy
@@ -2214,6 +2223,8 @@ function OrderDetailDrawer({
                                       onClick={() => {
                                         if (deliveredJob) {
                                           onReprintLabel(label.globalId, deliveredJob.globalId)
+                                        } else if (failedJob) {
+                                          onRetryLabel(label.globalId, failedJob.globalId)
                                         } else {
                                           onPrintLabel(label.globalId)
                                         }
@@ -2224,6 +2235,8 @@ function OrderDetailDrawer({
                                         ? 'Queueing'
                                         : deliveredJob
                                           ? 'Reprint label'
+                                          : failedJob
+                                            ? 'Retry label'
                                           : pendingJob
                                             ? 'Print queued'
                                             : jobs.length > 0
@@ -4388,6 +4401,48 @@ export default function OperationsSection({
     setLabelReprintOpen(true)
   }
 
+  const retryShippingLabel = async (
+    labelGlobalId: string,
+    printJobGlobalId: string,
+  ) => {
+    if (!detail || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(labelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-shipping-label-retry:${printJobGlobalId}:${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          action: 'retry-job',
+          jobGlobalId: printJobGlobalId,
+          reason: `Retry failed shipping label for order ${detail.orderNumber || detail.globalId}`,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping-label print job could not be retried')
+      }
+      setNotice(`Print job ${payload.job.globalId} was queued for another bounded attempt.`)
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping-label print job could not be retried',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
   const closeLabelReprint = () => {
     if (labelPrintBusyGlobalId) return
     setLabelReprintOpen(false)
@@ -6520,6 +6575,9 @@ export default function OperationsSection({
         }}
         onPrintLabel={(labelGlobalId) => {
           void printShippingLabel(labelGlobalId)
+        }}
+        onRetryLabel={(labelGlobalId, printJobGlobalId) => {
+          void retryShippingLabel(labelGlobalId, printJobGlobalId)
         }}
         onReprintLabel={openLabelReprint}
         onConfirmShipment={openConfirmShipment}

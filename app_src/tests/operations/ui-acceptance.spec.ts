@@ -368,7 +368,10 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
-async function installOrderLabelPrintRoutes(page: Page) {
+async function installOrderLabelPrintRoutes(
+  page: Page,
+  options: { initialFailedJob?: boolean } = {},
+) {
   const requests: Array<{
     body: Record<string, unknown>
     idempotencyKey: string
@@ -376,12 +379,20 @@ async function installOrderLabelPrintRoutes(page: Page) {
   let labelPrintJobs: Array<{
     globalId: string
     sourceLabelGlobalId: string
-    status: 'queued' | 'delivered'
+    status: 'queued' | 'delivered' | 'failed'
     reprintOfJobGlobalId: string | null
     createdAt: string
     deliveredAt: string | null
     lastError: string | null
-  }> = []
+  }> = options.initialFailedJob ? [{
+    globalId: 'gpj7654321',
+    sourceLabelGlobalId: 'glb7654321',
+    status: 'failed',
+    reprintOfJobGlobalId: null,
+    createdAt: '2026-08-22T16:14:00.000Z',
+    deliveredAt: null,
+    lastError: 'PRINTER_UNAVAILABLE',
+  }] : []
   const sourceLabelGlobalId = 'glb7654321'
   const originalPrintJobGlobalId = 'gpj7654321'
   const reprintJobGlobalId = 'gpj7654322'
@@ -472,6 +483,16 @@ async function installOrderLabelPrintRoutes(page: Page) {
           deliveredAt: '2026-08-22T16:14:01.000Z',
           lastError: null,
         }]
+        return route.fulfill({
+          json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
+        })
+      }
+      if (body.action === 'retry-job') {
+        labelPrintJobs = labelPrintJobs.map((job) => (
+          job.globalId === originalPrintJobGlobalId
+            ? { ...job, status: 'queued' as const, lastError: null }
+            : job
+        ))
         return route.fulfill({
           json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
         })
@@ -2035,6 +2056,25 @@ test('shipped order prints and reprints the stored label without purchasing post
   })
   expect(capture.requests[1].idempotencyKey)
     .toMatch(/^operations-shipping-label-reprint:gpj7654321:/)
+})
+
+test('failed shipping-label print retries from the order without purchasing postage', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderLabelPrintRoutes(page, { initialFailedJob: true })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1004/ }).click()
+  await expect(page.getByRole('button', { name: 'Retry label' })).toBeVisible()
+  await page.getByRole('button', { name: 'Retry label' }).click()
+  await expect(page.getByText(/was queued for another bounded attempt/)).toBeVisible()
+  expect(capture.requests[0].body).toEqual({
+    action: 'retry-job',
+    jobGlobalId: capture.originalPrintJobGlobalId,
+    reason: 'Retry failed shipping label for order #1004',
+  })
+  expect(capture.requests[0].idempotencyKey)
+    .toMatch(/^operations-shipping-label-retry:gpj7654321:/)
+  await expect(page.getByRole('button', { name: 'Print queued' })).toBeVisible()
 })
 
 test('measured outer dimensions save without a redundant evidence note', async ({ page }) => {
