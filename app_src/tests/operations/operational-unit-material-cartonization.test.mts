@@ -1,11 +1,9 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
   planOperationalUnitMaterialPackages,
 } from '../../lib/operations/operationalUnitMaterialCartonization.ts'
-import {
-  canonicalOptimizerHash,
-} from '../../lib/operations/fulfillmentOptimizerContract.ts'
 import type {
   HybridCartonizationLine,
   HybridCartonizationMaterial,
@@ -105,6 +103,29 @@ const baseInput = {
   maximumPackages: 50,
 }
 
+function persistenceCanonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(persistenceCanonicalValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value as Record<string, unknown>)
+        .sort()
+        .map((key) => [
+          key,
+          persistenceCanonicalValue(
+            (value as Record<string, unknown>)[key],
+          ),
+        ]),
+    )
+  }
+  return value
+}
+
+function persistenceCanonicalHash(value: unknown) {
+  return createHash('sha256')
+    .update(JSON.stringify(persistenceCanonicalValue(value)))
+    .digest('hex')
+}
+
 test('unit items use one factual selected material per unit without Product packs', () => {
   const result = planOperationalUnitMaterialPackages(baseInput)
   assert.equal(result.status, 'ready')
@@ -130,7 +151,7 @@ test('unit items use one factual selected material per unit without Product pack
   )
   assert.equal(
     result.evidence.transformationHash,
-    canonicalOptimizerHash(result.packages),
+    persistenceCanonicalHash(result.packages),
     'retained unit-material evidence must use the persistence validator hash contract',
   )
 })
