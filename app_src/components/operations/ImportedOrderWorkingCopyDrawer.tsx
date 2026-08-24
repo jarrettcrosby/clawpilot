@@ -123,7 +123,7 @@ function editorFingerprint(input: {
 function blockerLabel(code: string) {
   if (code === 'product_mapping_required') return 'Select product'
   if (code === 'line_price_required') return 'Enter price'
-  if (code === 'packaging_required') return 'Product pack facts required'
+  if (code === 'packaging_required') return 'Approved case pack required'
   if (code === 'customer_resolution_required') return 'Select customer'
   if (code === 'delivery_decision_required') return 'Choose delivery date'
   return code.replaceAll('_', ' ')
@@ -555,8 +555,9 @@ export default function ImportedOrderWorkingCopyDrawer({
               inputProps={{ step: 0.001 }}
               helperText={order?.delivery.status === 'not_required'
                 ? 'Optional for this order'
-                : order?.delivery.status === 'unresolved'
-                    || order?.delivery.status === 'not_supplied'
+                : order?.delivery.status === 'not_supplied'
+                  ? `${providerLabel(order.provider)} did not supply a requested date; this field is optional`
+                  : order?.delivery.status === 'unresolved'
                   ? 'Choose the delivery date requested for this order'
                   : order?.delivery.status === 'provider'
                     ? `Imported from ${providerLabel(order.provider)}`
@@ -580,6 +581,11 @@ export default function ImportedOrderWorkingCopyDrawer({
                 option.globalId === draft?.productGlobalId
               ))
               const packageProfiles = product?.packageProfiles || []
+              const packFactsRequired = line.requiresShipping
+                && (
+                  !Number.isSafeInteger(line.unitMultiplier)
+                  || line.unitMultiplier !== 1
+                )
               return (
                 <Box
                   key={line.globalId}
@@ -604,6 +610,13 @@ export default function ImportedOrderWorkingCopyDrawer({
                           variant="outlined"
                           label={`Quantity ${line.quantity}`}
                         />
+                        {packFactsRequired && (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            label={`Case pick · ${line.unitMultiplier} each`}
+                          />
+                        )}
                         {line.blockerCodes.map((code) => (
                           <Chip
                             key={code}
@@ -664,13 +677,16 @@ export default function ImportedOrderWorkingCopyDrawer({
                       inputProps={{ inputMode: 'decimal' }}
                       fullWidth
                     />
-                    {line.requiresShipping && (
+                    {line.requiresShipping && packageProfiles.length > 0 && (
                       <TextField
                         select
                         size="small"
-                        label="Sellable pack override (optional)"
+                        label={packFactsRequired
+                          ? 'Approved case-pick pack'
+                          : 'Approved pack constraint (optional)'}
                         value={draft?.packageProfileGlobalId || ''}
                         SelectProps={{ displayEmpty: true }}
+                        InputLabelProps={{ shrink: true }}
                         onChange={(event) => updateLine(line.globalId, {
                           packageProfileGlobalId: event.target.value,
                         })}
@@ -679,22 +695,30 @@ export default function ImportedOrderWorkingCopyDrawer({
                           || !canManage
                           || saving
                           || !draft?.productGlobalId
-                          || !packageProfiles.length
                         }
                         helperText={draft?.productGlobalId
-                          ? packageProfiles.length
-                            ? 'Normally leave blank. ClawPilot uses the current mapped product pack and cartonization chooses the outbound packaging. Select only a measured legacy override.'
-                            : 'No legacy override is available. ClawPilot will use the current mapped product pack for cartonization.'
+                          ? packFactsRequired
+                            ? 'Use the approved pack that represents this provider case pick.'
+                            : 'Cartonization chooses outbound packaging. Select only when this product must use an approved pack.'
                           : 'Select a product first'}
                         fullWidth
                       >
-                        <MenuItem value=""><em>Use mapped product pack and cartonization</em></MenuItem>
+                        <MenuItem value=""><em>{packFactsRequired
+                          ? 'Use current mapped case pack'
+                          : 'No pack constraint — use cartonization'}</em></MenuItem>
                         {packageProfiles.map((profile) => (
                           <MenuItem key={profile.globalId} value={profile.globalId}>
                             {profile.name}
                           </MenuItem>
                         ))}
                       </TextField>
+                    )}
+                    {line.requiresShipping && packageProfiles.length === 0 && (
+                      <Alert severity={packFactsRequired ? 'warning' : 'info'}>
+                        {packFactsRequired
+                          ? 'This case pick needs an approved Product pack before import.'
+                          : 'Unit item — cartonization chooses outbound packaging. No Product package assignment is required.'}
+                      </Alert>
                     )}
                   </Stack>
                 </Box>

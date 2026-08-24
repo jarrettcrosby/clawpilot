@@ -2161,7 +2161,12 @@ async function verifyFaireExactVariantPackBinding(
   const staleCandidate = candidateFor(scenarios.stale)
   for (const row of [successCandidate, staleCandidate]) {
     assert.equal(row.mapping_state, 'resolved')
-    assert.equal(row.packaging_state, 'unresolved')
+    assert.equal(row.packaging_state, 'not_required')
+    assert.equal(
+      row.blocking_codes.includes('packaging_required'),
+      false,
+      'A one-each line must not require Product pack facts before import',
+    )
     assert.equal(row.delivery_resolution_state, 'not_supplied')
     assert.equal(row.provider_requested_delivery_at, null)
     assert.equal(row.requested_delivery_at, null)
@@ -7589,8 +7594,11 @@ async function verifyAutomaticFaireExactRefreshLineage(
   )).rows[0]
   assert.equal(packExactCandidate.mapping_state, 'resolved')
   assert.equal(packExactCandidate.price_resolution_state, 'provider')
-  assert.equal(packExactCandidate.packaging_state, 'unresolved')
-  assert.ok(packExactCandidate.blocking_codes.includes('packaging_required'))
+  assert.equal(packExactCandidate.packaging_state, 'not_required')
+  assert.equal(
+    packExactCandidate.blocking_codes.includes('packaging_required'),
+    false,
+  )
   const packCustomer = await persistence
     .resolveCommerceCandidateCustomerInPostgres({
       runtime,

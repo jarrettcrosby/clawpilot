@@ -373,7 +373,6 @@ const workbenchLatestCandidateGlobalId = 'gcoc7654322'
 const workbenchCanonicalOrderGlobalId = 'gor8765432'
 const workbenchCustomerGlobalId = 'ga1234567'
 const workbenchProductGlobalId = 'gp1234567'
-const workbenchPackageProfileGlobalId = 'gpp1234567'
 const workbenchLineGlobalId = 'gcol7654321'
 
 const workbenchPartialShipTo = {
@@ -412,7 +411,6 @@ function importedWorkbenchOrder(
       'delivery_decision_required',
       'product_mapping_required',
       'line_price_required',
-      'packaging_required',
       'ship_to_region_required',
       'ship_to_postal_code_required',
     ],
@@ -444,6 +442,7 @@ function importedWorkbenchOrder(
       title: 'Trail Pack retail unit',
       sku: 'TRAIL-PROVIDER-001',
       quantity: 2,
+      unitMultiplier: 1,
       requiresShipping: true,
       mappingStatus: 'unresolved',
       priceStatus: 'unresolved',
@@ -455,17 +454,13 @@ function importedWorkbenchOrder(
       blockerCodes: [
         'product_mapping_required',
         'line_price_required',
-        'packaging_required',
       ],
     }] : [],
     productOptions: details ? [{
       globalId: workbenchProductGlobalId,
       name: 'Trail Pack',
       sku: 'TRAIL-001',
-      packageProfiles: [{
-        globalId: workbenchPackageProfileGlobalId,
-        name: 'Trail Pack measured single',
-      }],
+      packageProfiles: [],
     }] : [],
     shipTo: {
       value: workbenchPartialShipTo,
@@ -1684,9 +1679,12 @@ test('incomplete imported order saves locally before explicit acceptance into ca
   await page.getByRole('option', { name: /Trail Pack · TRAIL-001/ }).click()
   await page.getByLabel('Unit price (USD)').fill('12.50')
 
+  await expect(page.getByText(
+    'Unit item — cartonization chooses outbound packaging. No Product package assignment is required.',
+  )).toBeVisible()
   await expect(page.getByRole('combobox', {
-    name: 'Sellable pack override (optional)',
-  })).toHaveText('Use mapped product pack and cartonization')
+    name: 'Approved pack constraint (optional)',
+  })).toHaveCount(0)
 
   const requestedDelivery = page.getByLabel('Requested delivery')
   await requestedDelivery.fill('2026-08-30T15:30')

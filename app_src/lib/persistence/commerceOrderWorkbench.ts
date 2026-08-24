@@ -60,6 +60,17 @@ const ADDRESS_BLOCKERS = new Set([
   'ship_to_unavailable',
 ])
 
+function workbenchLinePackFactsRequired(input: Readonly<{
+  requiresShipping: boolean
+  unitMultiplier: number
+}>) {
+  return input.requiresShipping
+    && (
+      !Number.isSafeInteger(input.unitMultiplier)
+      || input.unitMultiplier !== 1
+    )
+}
+
 type WorkbenchReadRow = {
   candidate_id: string
   candidate_global_id: string
@@ -96,6 +107,7 @@ type WorkbenchReadRow = {
   canonical_order_global_id: string | null
   customer_name: string | null
   line_count: string
+  pack_facts_still_required: boolean
   party_snapshot_state: 'missing' | 'redacted' | 'protected'
   party_snapshot_ciphertext: Buffer | null
   party_snapshot_iv: Buffer | null
@@ -196,6 +208,7 @@ type WorkbenchLineReadRow = {
   product_title_snapshot: string
   sku_snapshot: string | null
   unfulfilled_quantity: string
+  unit_multiplier: string
   requires_shipping: boolean
   mapping_state:
     | 'unresolved'
@@ -711,7 +724,18 @@ function mappedWorkingCopy(
           || row.ship_to_snapshot_state === 'confirmed',
       })
   const issues = orderShipToIssues(shipTo)
-  const otherMissingFacts = row.blocking_codes.some((code) => (
+  const packFactsStillRequired = details
+    ? details.lines.some((line) => (
+        workbenchLinePackFactsRequired({
+          requiresShipping: line.requires_shipping,
+          unitMultiplier: Number(line.unit_multiplier),
+        }) && line.packaging_state !== 'resolved'
+      ))
+    : row.pack_facts_still_required
+  const effectiveBlockerCodes = row.blocking_codes.filter((code) => (
+    code !== 'packaging_required' || packFactsStillRequired
+  ))
+  const otherMissingFacts = effectiveBlockerCodes.some((code) => (
     !ADDRESS_BLOCKERS.has(code)
   ))
   const productOptions = new Map<string, OperationsImportedOrderWorkingCopy[
@@ -745,7 +769,7 @@ function mappedWorkingCopy(
     orderNumber: row.order_number_snapshot,
     status: 'imported',
     needsInfo: issues.length > 0 || otherMissingFacts,
-    blockerCodes: row.blocking_codes,
+    blockerCodes: effectiveBlockerCodes,
     customerName: customerSnapshotName(row),
     lineCount: Number(row.line_count),
     sourceUpdatedAt: (
@@ -788,6 +812,7 @@ function mappedWorkingCopy(
         title: line.product_title_snapshot,
         sku: line.sku_snapshot,
         quantity: Number(line.unfulfilled_quantity),
+        unitMultiplier: Number(line.unit_multiplier),
         requiresShipping: line.requires_shipping,
         mappingStatus: line.mapping_state,
         priceStatus: line.price_resolution_state,
@@ -808,7 +833,16 @@ function mappedWorkingCopy(
         packageProfileGlobalId: draft
           ? draft.packageProfileGlobalId
           : line.package_profile_global_id,
-        blockerCodes: line.blocking_codes,
+        blockerCodes: line.blocking_codes.filter((code) => (
+          code !== 'packaging_required'
+          || (
+            workbenchLinePackFactsRequired({
+              requiresShipping: line.requires_shipping,
+              unitMultiplier: Number(line.unit_multiplier),
+            })
+            && line.packaging_state !== 'resolved'
+          )
+        )),
       }
     }).map((line) => ({
       ...line,
@@ -861,6 +895,14 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
          AND candidate.expires_at > now()
          AND run.expires_at > now()
          AND run.workflow_state <> 'expired'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_orders canonical
+           WHERE canonical.organization_id = candidate.organization_id
+             AND canonical.integration_account_id
+               = candidate.integration_account_id
+             AND canonical.external_order_id = candidate.external_order_id
+         )
        ORDER BY
          candidate.integration_account_id,
          candidate.external_order_id,
@@ -889,6 +931,15 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        WHERE retained.organization_id = $1::uuid
          AND retained.canonical_order_id IS NULL
          AND retained_candidate.canonical_order_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM operations_orders canonical
+           WHERE canonical.organization_id = retained_candidate.organization_id
+             AND canonical.integration_account_id
+               = retained_candidate.integration_account_id
+             AND canonical.external_order_id
+               = retained_candidate.external_order_id
+         )
      )
      SELECT
        candidate.id::text AS candidate_id,
@@ -916,6 +967,7 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        canonical_order.global_id AS canonical_order_global_id,
        customer.name AS customer_name,
        line_count.line_count,
+       line_count.pack_facts_still_required,
        candidate.party_snapshot_state,
        candidate.party_snapshot_ciphertext,
        candidate.party_snapshot_iv,
@@ -966,7 +1018,13 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        ON resolved_customer.pipeline_id = candidate.pipeline_id
       AND resolved_customer.id = candidate.customer_id
      CROSS JOIN LATERAL (
-       SELECT count(*)::text AS line_count
+       SELECT count(*)::text AS line_count,
+              COALESCE(bool_or(
+                line.unfulfilled_quantity > 0
+                AND line.requires_shipping
+                AND line.unit_multiplier <> 1
+                AND line.packaging_state <> 'resolved'
+              ), false) AS pack_facts_still_required
        FROM operations_commerce_order_candidate_lines line
        WHERE line.organization_id = candidate.organization_id
          AND line.integration_account_id = candidate.integration_account_id
@@ -1013,6 +1071,7 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
         `SELECT line.order_candidate_id::text AS candidate_id,
                 line.global_id, line.product_title_snapshot,
                 line.sku_snapshot, line.unfulfilled_quantity::text,
+                line.unit_multiplier::text,
                 line.requires_shipping,
                 line.mapping_state, line.price_resolution_state,
                 line.packaging_state,

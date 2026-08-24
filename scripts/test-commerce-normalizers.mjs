@@ -70,6 +70,26 @@ const shopifyPath =
   'app_src/lib/integrations/shopifyCommerceNormalizer.ts'
 const fairePath = 'app_src/lib/integrations/faireCommerceNormalizer.ts'
 const common = loadTypeScriptModule(commonPath)
+assert.equal(common.commerceLinePackFactsRequired({
+  requiresShipping: true,
+  unitMultiplier: null,
+}), false, 'Shopify unit lines must not require Product pack facts')
+assert.equal(common.commerceLinePackFactsRequired({
+  requiresShipping: true,
+  unitMultiplier: 1,
+}), false, 'Explicit one-each lines must defer outbound packaging to cartonization')
+assert.equal(common.commerceLinePackFactsRequired({
+  requiresShipping: true,
+  unitMultiplier: 6,
+}), true, 'Case picks must retain exact approved Product pack requirements')
+assert.equal(common.commerceLinePackFactsRequired({
+  requiresShipping: true,
+  unitMultiplier: 0.5,
+}), true, 'Invalid non-unit multipliers must fail closed')
+assert.equal(common.commerceLinePackFactsRequired({
+  requiresShipping: false,
+  unitMultiplier: 12,
+}), false, 'Non-shipping lines must not require physical pack facts')
 const moduleMocks = {
   '@/lib/operations/commerceNormalization': common,
 }

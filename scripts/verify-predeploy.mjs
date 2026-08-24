@@ -377,6 +377,8 @@ for (const requiredPath of [
   'db/migrations/0318_operations_unpromised_canonical_rates.sql',
   'db/migrations/0319_operations_sandbox_label_tracking_uniqueness.sql',
   'db/migrations/0320_operations_standard_sandbox_masked_tracking.sql',
+  'db/migrations/0321_operations_unit_item_cartonization.sql',
+  'db/migrations/0322_operations_duplicate_order_workbench_recovery.sql',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
   'db/migrations/0309_operations_measured_packaging_evidence.sql',
   'app_src/components/shipping/ShippingSection.tsx',

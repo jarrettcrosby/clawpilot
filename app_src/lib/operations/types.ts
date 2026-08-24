@@ -1158,6 +1158,7 @@ export type OperationsImportedOrderWorkingCopy = {
     title: string
     sku: string | null
     quantity: number
+    unitMultiplier: number
     requiresShipping: boolean
     mappingStatus:
       | 'unresolved'
