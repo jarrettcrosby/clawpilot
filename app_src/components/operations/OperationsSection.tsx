@@ -1097,6 +1097,8 @@ function OrderDetailDrawer({
   onPrepareFulfillment,
   onGeneratePackingSlip,
   onPrintPackingSlip,
+  onPrintLabel,
+  onReprintLabel,
   onConfirmShipment,
   onRetryCommerceExport,
   onAuthorizeSandboxE2e,
@@ -1111,6 +1113,7 @@ function OrderDetailDrawer({
   onReviewOrderRevisionRecovery,
   generatingPackingSlipPackageId,
   printingPackingSlipArtifactId,
+  labelPrintBusyGlobalId,
 }: {
   order: OperationsOrderDetail | null
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
@@ -1136,6 +1139,8 @@ function OrderDetailDrawer({
   onPrepareFulfillment: () => void
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
+  onPrintLabel: (labelGlobalId: string) => void
+  onReprintLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onConfirmShipment: () => void
   onRetryCommerceExport: (
     commerceExportGlobalId: string,
@@ -1153,6 +1158,7 @@ function OrderDetailDrawer({
   onReviewOrderRevisionRecovery: (exceptionGlobalId: string) => void | Promise<void>
   generatingPackingSlipPackageId: string | null
   printingPackingSlipArtifactId: string | null
+  labelPrintBusyGlobalId: string | null
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
@@ -1170,7 +1176,8 @@ function OrderDetailDrawer({
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const canonicalShopifyTestLane = Boolean(
-    order?.sourceProvider === 'shopify',
+    order?.sourceProvider === 'shopify'
+    && order.planningPreparation?.testOrder === true,
   )
   const canonicalShopifyAuthorization =
     sandboxE2eAuthorization?.authorityKind === 'shopify_test_store_canonical'
@@ -1180,6 +1187,7 @@ function OrderDetailDrawer({
     order?.status === 'imported'
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce'
+    && (!canonicalShopifyTestLane || Boolean(canonicalShopifyAuthorization))
   )
   const trainingProviderOrder = Boolean(
     order?.sourceProvider
@@ -1209,6 +1217,10 @@ function OrderDetailDrawer({
   const shipments = order?.shipments || []
   const trackingObservations = order?.trackingObservations || []
   const printArtifacts = order?.printArtifacts || []
+  const labelPrintJobs = order?.labelPrintJobs || []
+  const shippingLabels = order?.packages.flatMap((item) => (
+    item.latestLabel ? [{ package: item, label: item.latestLabel }] : []
+  )) || []
   const commerceExports = order?.commerceExports || []
   const labelAttempts = order?.labelAttempts || []
   const selectedRate = order?.rates.find((rate) => rate.selected) || null
@@ -2060,6 +2072,7 @@ function OrderDetailDrawer({
               {shipments.length === 0
                 && trackingObservations.length === 0
                 && printArtifacts.length === 0
+                && shippingLabels.length === 0
                 && commerceExports.length === 0 ? (
                   <Typography variant="body2" color="text.secondary">
                     Confirmed shipment, tracking, packing-slip, and commerce-export evidence will appear here.
@@ -2116,6 +2129,119 @@ function OrderDetailDrawer({
                         </Stack>
                       </Box>
                     )}
+
+                    {shippingLabels.length > 0 ? (
+                      <Box data-testid="order-shipping-labels">
+                        <Typography variant="caption" color="text.secondary">
+                          Shipping labels
+                        </Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {shippingLabels.map(({ package: item, label }) => {
+                            const jobs = labelPrintJobs.filter(
+                              (job) => job.sourceLabelGlobalId === label.globalId,
+                            )
+                            const pendingJob = jobs.find(
+                              (job) => job.status === 'queued' || job.status === 'claimed',
+                            ) || null
+                            const deliveredJob = jobs.find(
+                              (job) => job.status === 'delivered',
+                            ) || null
+                            const busyLabel = labelPrintBusyGlobalId === label.globalId
+                            const canPrint = Boolean(
+                              canExecute
+                              && order.warehouseId
+                              && label.status === 'created',
+                            )
+                            const actionBlockedReason = !canExecute
+                              ? 'Warehouse execution access is required to print labels.'
+                              : !order.warehouseId
+                                ? 'The order has no fulfillment warehouse for printer routing.'
+                                : label.status !== 'created'
+                                  ? 'Inactive or voided carrier labels cannot be printed.'
+                                  : pendingJob
+                                    ? `Print job ${pendingJob.globalId} is already ${pendingJob.status}.`
+                                    : jobs.length > 0 && !deliveredJob
+                                      ? 'Review the existing print job in Printing before authorizing another physical copy.'
+                                      : null
+                            return (
+                              <Box
+                                key={label.globalId}
+                                sx={{
+                                  py: 1.25,
+                                  display: 'grid',
+                                  gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                  gap: 1.5,
+                                  alignItems: 'center',
+                                }}
+                              >
+                                <Box sx={{ minWidth: 0 }}>
+                                  <Typography fontWeight={700}>
+                                    Package {item.packageNumber} · {label.carrier} {label.serviceCode}
+                                  </Typography>
+                                  <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                    {label.trackingNumber}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {label.globalId} · {displayStatus(label.environment)}
+                                    {jobs[0]
+                                      ? ` · Latest print ${jobs[0].globalId} (${displayStatus(jobs[0].status)})`
+                                      : ' · Not yet printed from ClawPilot'}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary" display="block">
+                                    Reprints reuse this stored label document and never purchase new postage.
+                                  </Typography>
+                                </Box>
+                                <Tooltip title={actionBlockedReason || (
+                                  deliveredJob
+                                    ? 'Create a new audited print job from the original label bytes'
+                                    : 'Queue the stored carrier label to the configured warehouse printer'
+                                )}>
+                                  <span>
+                                    <Button
+                                      size="small"
+                                      variant="contained"
+                                      startIcon={busyLabel
+                                        ? <CircularProgress size={16} />
+                                        : deliveredJob
+                                          ? <ReplayRounded />
+                                          : <PrintRounded />}
+                                      disabled={
+                                        busy
+                                        || busyLabel
+                                        || !canPrint
+                                        || Boolean(actionBlockedReason)
+                                      }
+                                      onClick={() => {
+                                        if (deliveredJob) {
+                                          onReprintLabel(label.globalId, deliveredJob.globalId)
+                                        } else {
+                                          onPrintLabel(label.globalId)
+                                        }
+                                      }}
+                                      data-testid={`order-label-print-${label.globalId}`}
+                                    >
+                                      {busyLabel
+                                        ? 'Queueing'
+                                        : deliveredJob
+                                          ? 'Reprint label'
+                                          : pendingJob
+                                            ? 'Print queued'
+                                            : jobs.length > 0
+                                              ? 'Review print job'
+                                              : 'Print label'}
+                                    </Button>
+                                  </span>
+                                </Tooltip>
+                              </Box>
+                            )
+                          })}
+                        </Stack>
+                      </Box>
+                    ) : shipments.length > 0 ? (
+                      <Alert severity="warning">
+                        Tracking and shipment evidence are available, but the original carrier-label document was not imported into ClawPilot. Reprint is unavailable until that exact label artifact is retrieved from the shipping provider or uploaded; ClawPilot will not buy a replacement label automatically.
+                      </Alert>
+                    ) : null}
 
                     {printArtifacts.length > 0 && (
                       <Box>
@@ -2755,6 +2881,13 @@ export default function OperationsSection({
     printingPackingSlipArtifactId,
     setPrintingPackingSlipArtifactId,
   ] = useState<string | null>(null)
+  const [labelPrintBusyGlobalId, setLabelPrintBusyGlobalId] =
+    useState<string | null>(null)
+  const [labelReprintOpen, setLabelReprintOpen] = useState(false)
+  const [labelReprintLabelGlobalId, setLabelReprintLabelGlobalId] = useState('')
+  const [labelReprintJobGlobalId, setLabelReprintJobGlobalId] = useState('')
+  const [labelReprintReason, setLabelReprintReason] = useState('')
+  const [labelReprintIdempotencyKey, setLabelReprintIdempotencyKey] = useState('')
 
   useEffect(() => {
     const pendingOrderGlobalId = new URL(window.location.href).searchParams
@@ -4195,6 +4328,126 @@ export default function OperationsSection({
       )
     } finally {
       setPrintingPackingSlipArtifactId(null)
+    }
+  }
+
+  const printShippingLabel = async (labelGlobalId: string) => {
+    if (!detail?.warehouseId || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(labelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-shipping-label-print:${labelGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'enqueue-label',
+          warehouseId: detail.warehouseId,
+          sourceLabelGlobalId: labelGlobalId,
+          media: 'label_4x6',
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping label could not be queued for printing')
+      }
+      setNotice(
+        `Shipping label ${labelGlobalId} was queued as print job ${payload.job.globalId}.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping label could not be queued for printing',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const openLabelReprint = (
+    labelGlobalId: string,
+    printJobGlobalId: string,
+  ) => {
+    setLabelReprintLabelGlobalId(labelGlobalId)
+    setLabelReprintJobGlobalId(printJobGlobalId)
+    setLabelReprintReason(
+      `Reprint shipping label for order ${detail?.orderNumber || detail?.globalId || ''}`.trim(),
+    )
+    setLabelReprintIdempotencyKey(
+      `operations-shipping-label-reprint:${printJobGlobalId}:${crypto.randomUUID()}`,
+    )
+    setLabelReprintOpen(true)
+  }
+
+  const closeLabelReprint = () => {
+    if (labelPrintBusyGlobalId) return
+    setLabelReprintOpen(false)
+    setLabelReprintLabelGlobalId('')
+    setLabelReprintJobGlobalId('')
+    setLabelReprintReason('')
+    setLabelReprintIdempotencyKey('')
+  }
+
+  const reprintShippingLabel = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !labelReprintLabelGlobalId
+      || !labelReprintJobGlobalId
+      || !labelReprintReason.trim()
+      || !labelReprintIdempotencyKey
+      || labelPrintBusyGlobalId
+    ) return
+    setLabelPrintBusyGlobalId(labelReprintLabelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': labelReprintIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'reprint-job',
+          jobGlobalId: labelReprintJobGlobalId,
+          reason: labelReprintReason.trim(),
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping label reprint could not be queued')
+      }
+      setNotice(
+        `Shipping label ${labelReprintLabelGlobalId} was queued for reprint as ${payload.job.globalId}.`,
+      )
+      setLabelReprintOpen(false)
+      setLabelReprintLabelGlobalId('')
+      setLabelReprintJobGlobalId('')
+      setLabelReprintReason('')
+      setLabelReprintIdempotencyKey('')
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping label reprint could not be queued',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
     }
   }
 
@@ -6246,6 +6499,7 @@ export default function OperationsSection({
           || Boolean(oneOffGroupAction)
           || Boolean(generatingPackingSlipPackageId)
           || Boolean(printingPackingSlipArtifactId)
+          || Boolean(labelPrintBusyGlobalId)
         }
         onClose={closeDrawer}
         trainingRefreshToken={shadowTrainingRefreshToken}
@@ -6264,6 +6518,10 @@ export default function OperationsSection({
         onPrintPackingSlip={(artifactGlobalId) => {
           void printPackingSlip(artifactGlobalId)
         }}
+        onPrintLabel={(labelGlobalId) => {
+          void printShippingLabel(labelGlobalId)
+        }}
+        onReprintLabel={openLabelReprint}
         onConfirmShipment={openConfirmShipment}
         onRetryCommerceExport={openCommerceExportRetry}
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
@@ -6282,6 +6540,7 @@ export default function OperationsSection({
         onReviewOrderRevisionRecovery={reviewOrderRevisionRecovery}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}
+        labelPrintBusyGlobalId={labelPrintBusyGlobalId}
       />
       <ExceptionDetailDrawer
         key={selectedExceptionGlobalId || 'no-exception'}
@@ -6985,6 +7244,61 @@ export default function OperationsSection({
                 : shadowTrainingPlanTarget
                   ? 'Confirm local training plan'
                   : 'Confirm warehouse plan'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={labelReprintOpen}
+        onClose={closeLabelReprint}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={reprintShippingLabel}>
+          <DialogTitle>Reprint shipping label</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="info">
+                This creates a new audited print job from the original immutable label document. It does not call the carrier, buy postage, create tracking, or replace the shipment label.
+              </Alert>
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Source label
+                </Typography>
+                <Typography>{labelReprintLabelGlobalId}</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Acknowledged print job {labelReprintJobGlobalId}
+                </Typography>
+              </Box>
+              <TextField
+                fullWidth
+                multiline
+                minRows={3}
+                label="Reprint reason"
+                value={labelReprintReason}
+                onChange={(event) => setLabelReprintReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText="Required for the immutable print audit trail"
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeLabelReprint} disabled={Boolean(labelPrintBusyGlobalId)}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              startIcon={labelPrintBusyGlobalId
+                ? <CircularProgress size={16} />
+                : <ReplayRounded />}
+              disabled={
+                Boolean(labelPrintBusyGlobalId)
+                || !labelReprintReason.trim()
+              }
+            >
+              {labelPrintBusyGlobalId ? 'Queueing' : 'Queue reprint'}
             </Button>
           </DialogActions>
         </Box>
