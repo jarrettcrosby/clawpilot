@@ -74,7 +74,7 @@ const SHOPIFY_EXTERNAL_FULFILLMENT_QUERY = `query ClawPilotExternalFulfillmentRe
       displayStatus
       createdAt
       updatedAt
-      trackingInfo { number }
+      trackingInfo(first: 11) { company number url }
       fulfillmentOrders(first: ${MAX_FULFILLMENT_ORDERS}) {
         nodes {
           id

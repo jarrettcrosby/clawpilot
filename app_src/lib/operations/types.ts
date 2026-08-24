@@ -871,6 +871,20 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     oneOffCarrierGroupGlobalId: string | null
     shippedAt: string
   }>
+  externalFulfillment: {
+    reconciliationGlobalId: string
+    provider: 'shopify'
+    providerFulfillmentId: string
+    providerFulfillmentName: string
+    fulfilledAt: string
+    reconciledAt: string
+    tracking: Array<{
+      company: string | null
+      number: string | null
+      url: string | null
+    }>
+    exactLabelArtifactAvailable: boolean
+  } | null
   trackingObservations: Array<{
     globalId: string
     shipmentGlobalId: string
@@ -884,6 +898,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     globalId: string
     packageGlobalId: string | null
     shipmentGlobalId: string | null
+    externalFulfillmentReconciliationGlobalId: string | null
+    externalTrackingNumber: string | null
     documentType: 'shipping_label' | 'packing_slip'
     documentKind:
       | 'shipping_label'
@@ -898,7 +914,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
   }>
   labelPrintJobs: Array<{
     globalId: string
-    sourceLabelGlobalId: string
+    sourceLabelGlobalId: string | null
+    sourceArtifactGlobalId: string
     status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
     reprintOfJobGlobalId: string | null
     createdAt: string

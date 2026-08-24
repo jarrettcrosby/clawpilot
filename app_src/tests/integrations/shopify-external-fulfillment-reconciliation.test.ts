@@ -62,7 +62,11 @@ function providerOrder() {
       displayStatus: 'FULFILLED',
       createdAt: '2026-08-11T13:31:25.000Z',
       updatedAt: '2026-08-11T13:31:25.000Z',
-      trackingInfo: [],
+      trackingInfo: [{
+        company: 'UPS',
+        number: '1ZTESTEXTERNAL500',
+        url: 'https://www.ups.com/track?tracknum=1ZTESTEXTERNAL500',
+      }],
       fulfillmentOrders: {
         nodes: [{
           id: 'gid://shopify/FulfillmentOrder/400',
@@ -106,7 +110,13 @@ test('accepts one exact successful Shopify fulfillment after warehouse release',
   })
   assert.match(evidence.evidenceHash, /^[a-f0-9]{64}$/)
   assert.equal(evidence.snapshot.fulfillment.name, '#6603-F1')
-  assert.equal(evidence.snapshot.fulfillment.hasTracking, false)
+  assert.equal(evidence.snapshot.version, 'shopify-external-fulfillment-reconciliation-v2')
+  assert.equal(evidence.snapshot.fulfillment.hasTracking, true)
+  assert.deepEqual(evidence.snapshot.fulfillment.tracking, [{
+    company: 'UPS',
+    number: '1ZTESTEXTERNAL500',
+    url: 'https://www.ups.com/track?tracknum=1ZTESTEXTERNAL500',
+  }])
   assert.deepEqual(
     evidence.snapshot.fulfillmentOrders.map((item) => item.id),
     ['gid://shopify/FulfillmentOrder/400'],
@@ -317,6 +327,30 @@ test('rejects a fulfillment that predates the released warehouse work', () => {
   evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
     target,
     providerOrder: stale,
+  }))
+})
+
+test('rejects malformed and unbounded external tracking evidence', () => {
+  const malformed = providerOrder()
+  malformed.fulfillments[0].trackingInfo = [{
+    company: 'UPS',
+    number: '1ZTEST',
+    url: 'javascript:alert(1)',
+  }]
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: malformed,
+  }))
+
+  const unbounded = providerOrder()
+  unbounded.fulfillments[0].trackingInfo = Array.from({ length: 11 }, (_, index) => ({
+    company: 'UPS',
+    number: `1ZTEST${index}`,
+    url: `https://www.ups.com/track?tracknum=1ZTEST${index}`,
+  }))
+  evidenceError(() => normalizeShopifyExternalFulfillmentEvidence({
+    target,
+    providerOrder: unbounded,
   }))
 })
 

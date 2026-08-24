@@ -572,18 +572,22 @@ for (const fragment of [
 }
 
 for (const fragment of [
-  'Authorize verified test order',
-  'Renew or resume verified test order',
-  'Type the exact authorization statement',
-  'Type the exact fulfillment statement',
+  'Enable sandbox fulfillment',
+  'Resume sandbox fulfillment',
+  'Reason (audit log)',
+  'Labels and tracking are correct',
   'shopify-test-store-fulfillment-confirmed',
-  'Shopify customer notification is locked off',
+  'Tracking reviewed',
+  'Production postage is unavailable',
   'fullScreen={mobile}',
   'Current order state was refreshed. Review it before authorizing again.',
   'the exact authorization command is retained for retry.',
   'the exact fulfillment-confirmation command is retained for retry.',
   "'Idempotency-Key': canonicalCommand.idempotencyKey",
   "'Idempotency-Key': command.idempotencyKey",
+  "order.packages.length !== 1",
+  "order.sourceProvider === 'faire'",
+  'Use the package controls above for a multi-package shipment.',
 ]) {
   assert.ok(sources.ui.includes(fragment), `Operator UI missing ${fragment}`)
 }

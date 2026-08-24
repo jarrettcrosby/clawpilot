@@ -387,6 +387,10 @@ export type EnqueueOperationsPrintJobInput = {
       sourceArtifactGlobalId: string
     }
     | {
+      type: 'external_shipping_label_artifact'
+      sourceArtifactGlobalId: string
+    }
+    | {
       type: 'barcode_label_artifact'
       sourceArtifactGlobalId: string
     }
@@ -1171,7 +1175,8 @@ const PRINT_JOB_SELECT = `
     COALESCE(
       source_shipment.tracking_number,
       source_label.tracking_number,
-      rate_test_label.tracking_number
+      rate_test_label.tracking_number,
+      artifact.external_tracking_number
     )
       AS tracking_number,
     source_package.global_id AS package_global_id,
@@ -1513,6 +1518,32 @@ export async function readOperationsPrintArtifactPayloadInPostgres(input: {
       : artifact.format === 'PDF'
         ? 'application/pdf'
         : 'image/png'
+  } else if (
+    artifact.document_type === 'shipping_label'
+    && artifact.payload_filename
+    && artifact.artifact_payload
+  ) {
+    const expectedMimeType = artifact.format === 'ZPL'
+      ? 'application/vnd.zebra-zpl'
+      : artifact.format === 'PDF'
+        ? 'application/pdf'
+        : artifact.format === 'PNG'
+          ? 'image/png'
+          : null
+    if (!expectedMimeType || artifact.payload_mime_type !== expectedMimeType) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'Imported shipping-label content failed integrity validation',
+        500,
+      )
+    }
+    payload = validateLabelBytes(
+      artifact.format,
+      Buffer.from(artifact.artifact_payload),
+    )
+    filename = artifact.payload_filename
+    mimeType = expectedMimeType
+    templateVersion = artifact.template_version
   } else {
     throw new OperationsRequestError(
       'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
@@ -3743,6 +3774,103 @@ async function insertArtifact(
     }
   }
 
+  if (input.document.type === 'external_shipping_label_artifact') {
+    if (!ARTIFACT_GLOBAL_ID.test(input.document.sourceArtifactGlobalId)) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'External shipping-label artifact reference is invalid',
+      )
+    }
+    const artifactResult = await client.query<{
+      id: string
+      global_id: string
+      format: Extract<PrintFormat, 'ZPL' | 'PDF' | 'PNG'>
+      media_size: Extract<PrintMedia, 'label_4x6' | 'label_4x8'>
+      content_sha256: string
+      byte_length: string
+      payload: Buffer | null
+      order_id: string
+      order_global_id: string
+      order_number: string
+      tracking_number: string
+      warehouse_id: string
+    }>(
+      `SELECT artifact.id::text, artifact.global_id,
+              artifact.format, artifact.media_size,
+              artifact.content_sha256, artifact.byte_length::text,
+              payload.payload,
+              source_order.id::text AS order_id,
+              source_order.global_id AS order_global_id,
+              source_order.order_number,
+              artifact.external_tracking_number AS tracking_number,
+              plan.warehouse_id::text
+       FROM operations_print_artifacts artifact
+       JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       JOIN operations_shopify_external_fulfillment_reconciliations
+              reconciliation
+         ON reconciliation.organization_id = artifact.organization_id
+        AND reconciliation.id =
+              artifact.source_external_fulfillment_reconciliation_id
+       JOIN operations_orders source_order
+         ON source_order.organization_id = reconciliation.organization_id
+        AND source_order.id = reconciliation.order_id
+        AND source_order.id = artifact.source_order_id
+       JOIN operations_fulfillment_plans plan
+         ON plan.organization_id = reconciliation.organization_id
+        AND plan.id = reconciliation.plan_id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.global_id = $2
+         AND artifact.document_type = 'shipping_label'
+         AND artifact.source_external_fulfillment_reconciliation_id IS NOT NULL
+         AND artifact.external_tracking_number IS NOT NULL
+         AND artifact.format IN ('ZPL', 'PDF', 'PNG')
+         AND artifact.media_size IN ('label_4x6', 'label_4x8')
+       FOR SHARE OF artifact, payload, reconciliation, source_order, plan`,
+      [organizationId, input.document.sourceArtifactGlobalId],
+    )
+    const artifact = artifactResult.rows[0]
+    if (!artifact || artifact.warehouse_id !== input.warehouseId) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_INVALID',
+        'External shipping label was not found in the selected warehouse',
+        404,
+      )
+    }
+    const payload = artifact.payload
+      ? validateLabelBytes(artifact.format, Buffer.from(artifact.payload))
+      : null
+    if (
+      !payload
+      || payload.byteLength !== Number(artifact.byte_length)
+      || contentHash(payload) !== artifact.content_sha256
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_ARTIFACT_CORRUPT',
+        'External shipping-label content failed integrity validation',
+        500,
+      )
+    }
+    return {
+      id: artifact.id,
+      globalId: artifact.global_id,
+      labelId: null,
+      rateTestLabelId: null,
+      type: 'shipping_label' as const,
+      format: artifact.format,
+      media: artifact.media_size,
+      source: {
+        orderId: artifact.order_id,
+        orderGlobalId: artifact.order_global_id,
+        orderNumber: artifact.order_number,
+        shipmentId: null,
+        shipmentGlobalId: null,
+        trackingNumber: artifact.tracking_number,
+      },
+    }
+  }
+
   if (input.document.type === 'packing_slip_artifact') {
     if (!ARTIFACT_GLOBAL_ID.test(input.document.sourceArtifactGlobalId)) {
       throw new OperationsRequestError(
@@ -4111,6 +4239,46 @@ async function assertPackingSlipArtifactCanBeEnqueued(input: {
   )
 }
 
+async function assertExternalLabelArtifactCanBeEnqueued(input: {
+  client: PoolClient
+  organizationId: string
+  artifactGlobalId: string
+}) {
+  await acquireTransactionAdvisoryLock(
+    input.client,
+    `operations:print-external-label:${input.organizationId}:${input.artifactGlobalId}`,
+  )
+  const existing = await input.client.query<{
+    global_id: string
+    status: OperationsPrintJobListItem['status']
+  }>(
+    `SELECT job.global_id, job.status
+     FROM operations_print_jobs job
+     JOIN operations_print_artifacts artifact
+       ON artifact.organization_id = job.organization_id
+      AND artifact.id = job.artifact_id
+     WHERE job.organization_id = $1::uuid
+       AND artifact.global_id = $2
+       AND artifact.source_external_fulfillment_reconciliation_id IS NOT NULL
+       AND job.reprint_of_job_id IS NULL
+     LIMIT 1
+     FOR SHARE OF job, artifact`,
+    [input.organizationId, input.artifactGlobalId],
+  )
+  if (!existing.rows[0]) return
+  const job = existing.rows[0]
+  const nextStep = job.status === 'delivered'
+    ? 'Use the controlled reprint action and provide a reprint reason.'
+    : job.status === 'failed'
+      ? 'Review the latest failure and retry the same immutable label.'
+      : 'Wait for or manage the existing print job.'
+  throw new OperationsRequestError(
+    'OPERATIONS_PRINT_LABEL_ALREADY_ENQUEUED',
+    `External shipping label already has original print job ${job.global_id} (${job.status}). ${nextStep}`,
+    409,
+  )
+}
+
 export async function enqueueOperationsPrintJobInPostgres(
   input: EnqueueOperationsPrintJobInput,
   transactionClient: PoolClient | null = null,
@@ -4179,6 +4347,12 @@ export async function enqueueOperationsPrintJobInPostgres(
         client,
         organizationId,
         sourceRateTestLabelGlobalId: input.document.sourceRateTestLabelGlobalId,
+      })
+    } else if (input.document.type === 'external_shipping_label_artifact') {
+      await assertExternalLabelArtifactCanBeEnqueued({
+        client,
+        organizationId,
+        artifactGlobalId: input.document.sourceArtifactGlobalId,
       })
     }
     const artifact = await insertArtifact(client, input, organizationId, actorEmail)
@@ -4328,7 +4502,8 @@ const LOCKED_PRINT_JOB_SELECT = `
     COALESCE(
       source_shipment.tracking_number,
       source_label.tracking_number,
-      rate_test_label.tracking_number
+      rate_test_label.tracking_number,
+      artifact.external_tracking_number
     )
       AS tracking_number,
     job.artifact_id::text,
