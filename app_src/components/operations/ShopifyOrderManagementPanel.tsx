@@ -1061,7 +1061,7 @@ export default function ShopifyOrderManagementPanel({
                 <Typography fontWeight={700}>Cancel order</Typography>
               </Stack>
               <Typography variant="body2" color="text.secondary">
-                Cancels {state.order.name} in Shopify. Refunds, restocking, and customer notifications remain separate.
+                Cancels {state.order.name} when Shopify reports the order is eligible.
               </Typography>
               <Tooltip title={blocker || state.eligibility.cancel.reason || ''}>
                 <Box component="span" sx={{ display: 'block' }}>
