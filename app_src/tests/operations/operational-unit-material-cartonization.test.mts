@@ -3,6 +3,9 @@ import test from 'node:test'
 import {
   planOperationalUnitMaterialPackages,
 } from '../../lib/operations/operationalUnitMaterialCartonization.ts'
+import {
+  canonicalOptimizerHash,
+} from '../../lib/operations/fulfillmentOptimizerContract.ts'
 import type {
   HybridCartonizationLine,
   HybridCartonizationMaterial,
@@ -124,6 +127,11 @@ test('unit items use one factual selected material per unit without Product pack
   assert.equal(
     result.evidence.productPackConstraint,
     'not_required_for_one_each_line',
+  )
+  assert.equal(
+    result.evidence.transformationHash,
+    canonicalOptimizerHash(result.packages),
+    'retained unit-material evidence must use the persistence validator hash contract',
   )
 })
 
