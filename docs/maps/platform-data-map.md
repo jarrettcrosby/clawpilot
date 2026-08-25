@@ -17,6 +17,7 @@ app_visible: true
 | --- | --- | --- |
 | Users, organizations, boards, tasks, docs, short links, audit, execution | Railway Postgres | ClawPilot UI |
 | Pipeline operator rows | Managed Google Sheet | Postgres pipeline projection and CRM |
+| Jarrett career-site form submissions | Railway Postgres | Private Google Sheet tracker |
 | CRM application modules and subpanels | ClawPilot Postgres model | SuiteCRM |
 | Calendar and email provider state | Connected user account | ClawPilot CRM interactions and meetings |
 | Deployment history | Postgres release entries | Versions and Build Brief |
@@ -66,6 +67,7 @@ flowchart LR
 - [Toast POS and Accounting](../modules/toast-and-accounting.md)
 - [QuickBooks Accounting Connector](../modules/quickbooks-accounting.md)
 - [Shared Short Links](../modules/short-links.md)
+- [Career-Site Submissions](../modules/career-site-submissions.md)
 - [Postgres and Sheets Authority](../decisions/0001-postgres-and-sheets-authority.md)
 - [Google Workspace Integration](../operations/google-workspace-integration.md)
 - [SuiteCRM Railway Runbook](../operations/suitecrm.md)

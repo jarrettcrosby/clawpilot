@@ -29,6 +29,7 @@ const requiredCurrentDocuments = [
   'docs/modules/agents-and-execution.md',
   'docs/modules/knowledge-releases-and-checkpoints.md',
   'docs/modules/short-links.md',
+  'docs/modules/career-site-submissions.md',
   'docs/modules/user-integrations.md',
   'docs/modules/toast-and-accounting.md',
   'docs/modules/quickbooks-accounting.md',

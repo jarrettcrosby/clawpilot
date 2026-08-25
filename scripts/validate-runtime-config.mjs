@@ -7,6 +7,8 @@ import {
 
 const sourcePattern = /^[a-z][a-z0-9-]{1,39}$/
 const ownerDomainPattern = /^[a-z0-9.-]+$/
+const emailPattern = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
+let serviceClientSources = []
 
 function fail(message) {
   console.error(`[runtime-config] ${message}`)
@@ -50,6 +52,7 @@ function validateServiceClients() {
       if (sources.has(sourceApp)) fail(`Short-link service source ${sourceApp} is duplicated`)
       sources.add(sourceApp)
     }
+    serviceClientSources = [...sources]
     return clients.length
   }
 
@@ -58,7 +61,39 @@ function validateServiceClients() {
   if (secret.length < 32 || !sourcePattern.test(sourceApp)) {
     fail('SHORTLINK_SERVICE_CLIENTS_JSON or a valid legacy short-link service client must be configured')
   }
+  serviceClientSources = [sourceApp]
   return 1
+}
+
+function validateCareerSiteSubmissionsConfiguration() {
+  const enabled = String(process.env.CAREER_SITE_SUBMISSIONS_ENABLED || '0').trim()
+  if (enabled !== '0' && enabled !== '1') fail('CAREER_SITE_SUBMISSIONS_ENABLED must be 0 or 1')
+  if (enabled === '0') return 'disabled'
+
+  if (!serviceClientSources.includes('jarrett-career-site')) {
+    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires the jarrett-career-site short-link service client')
+  }
+  const ownerEmail = String(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL || '').trim().toLowerCase()
+  if (!ownerEmail || ownerEmail.length > 254 || !emailPattern.test(ownerEmail) || !/^[\x21-\x7e]+$/.test(ownerEmail)) {
+    fail('CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be a valid email address')
+  }
+  const sheetId = String(process.env.CAREER_SITE_SUBMISSIONS_SHEET_ID || '').trim()
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(sheetId)) {
+    fail('CAREER_SITE_SUBMISSIONS_SHEET_ID must be a valid Google Sheet ID')
+  }
+  const sheetTab = String(process.env.CAREER_SITE_SUBMISSIONS_SHEET_TAB || 'Submissions').trim()
+  if (!sheetTab || sheetTab.length > 100 || /[\u0000-\u001f\u007f]/.test(sheetTab)) {
+    fail('CAREER_SITE_SUBMISSIONS_SHEET_TAB is invalid')
+  }
+  const sheetHeaderRow = String(process.env.CAREER_SITE_SUBMISSIONS_SHEET_HEADER_ROW || '4').trim()
+  if (!/^\d+$/.test(sheetHeaderRow) || Number(sheetHeaderRow) < 1 || Number(sheetHeaderRow) > 1000) {
+    fail('CAREER_SITE_SUBMISSIONS_SHEET_HEADER_ROW must be an integer from 1 through 1000')
+  }
+  const pollMs = String(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS || '10000').trim()
+  if (!/^[0-9]+$/.test(pollMs) || Number(pollMs) < 5000 || Number(pollMs) > 300000) {
+    fail('CAREER_SITE_SUBMISSIONS_POLL_MS must be an integer from 5000 through 300000')
+  }
+  return 'enabled'
 }
 
 function validateEmbeddingConfiguration() {
@@ -202,9 +237,10 @@ function validateRevisionEvidenceConfiguration() {
 
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
+const careerSiteSubmissions = validateCareerSiteSubmissionsConfiguration()
 const embeddingProvider = validateEmbeddingConfiguration()
 const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
 const printAgentRelease = validatePrintAgentReleaseConfiguration()
 const revisionEvidence = validateRevisionEvidenceConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} careerSiteSubmissions=${careerSiteSubmissions} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
