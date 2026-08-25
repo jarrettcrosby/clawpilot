@@ -6,7 +6,7 @@ import {
 export const SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID =
   'giah34fedoa5b1o' as const
 export const SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID =
-  'gid://shopify/ProductVariant/51028106576119' as const
+  'gid://shopify/ProductVariant/51028106379511' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_PROJECT_ID =
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_ENVIRONMENT_ID =

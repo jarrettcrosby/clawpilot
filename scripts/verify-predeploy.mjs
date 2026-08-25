@@ -198,7 +198,7 @@ const shopifyReversalFixtureRuntimeSource = readFileSync(
 )
 for (const fragment of [
   'giah34fedoa5b1o',
-  'gid://shopify/ProductVariant/51028106576119',
+  'gid://shopify/ProductVariant/51028106379511',
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
   'e4abd95f-825c-4242-b37b-825a92597e98',
   '750aa268-0e31-4065-a99c-4016e4d4fab1',

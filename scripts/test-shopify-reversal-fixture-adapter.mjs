@@ -50,7 +50,7 @@ vm.runInNewContext(output, {
     if (specifier === '@/lib/integrations/shopifyReversalFixtureRuntime') {
       return {
         SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID:
-          'gid://shopify/ProductVariant/51028106576119',
+          'gid://shopify/ProductVariant/51028106379511',
       }
     }
     return requireFromApp(specifier)
@@ -81,7 +81,7 @@ const exactOrder = {
       unfulfilledQuantity: 1,
       requiresShipping: true,
       variant: {
-        id: 'gid://shopify/ProductVariant/51028106576119',
+        id: 'gid://shopify/ProductVariant/51028106379511',
       },
     }],
     pageInfo: { hasNextPage: false },
@@ -98,7 +98,7 @@ assert.deepEqual(
     sendReceipt: false,
     sendFulfillmentReceipt: false,
     inventoryBehaviour: 'BYPASS',
-    variantId: 'gid://shopify/ProductVariant/51028106576119',
+    variantId: 'gid://shopify/ProductVariant/51028106379511',
     quantity: 1,
     requiresShipping: true,
     shippingAddress: {
@@ -137,7 +137,7 @@ assert.deepEqual(calls[0].variables, {
     sourceIdentifier,
     tags: ['clawpilot-reversal-fixture', uniqueTag],
     lineItems: [{
-      variantId: 'gid://shopify/ProductVariant/51028106576119',
+      variantId: 'gid://shopify/ProductVariant/51028106379511',
       quantity: 1,
       requiresShipping: true,
     }],

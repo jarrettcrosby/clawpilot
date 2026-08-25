@@ -262,7 +262,7 @@ vm.runInNewContext(output, {
           sendReceipt: false,
           sendFulfillmentReceipt: false,
           inventoryBehaviour: 'BYPASS',
-          variantId: 'gid://shopify/ProductVariant/51028106576119',
+          variantId: 'gid://shopify/ProductVariant/51028106379511',
           quantity: 1,
           requiresShipping: true,
         },
