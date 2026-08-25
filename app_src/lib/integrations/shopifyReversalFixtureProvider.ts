@@ -5,8 +5,12 @@ import {
   type ShopifyCommerceRuntimeCredential,
 } from '@/lib/integrations/shopifyCommerceClient'
 import {
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
   SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
 } from '@/lib/integrations/shopifyReversalFixtureRuntime'
+import {
+  assertShopifyReversalFixtureOrderClaimCurrentInPostgres,
+} from '@/lib/persistence/shopifyReversalFixture'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_LINE_ITEM_GID =
@@ -191,6 +195,62 @@ export function shopifyReversalFixtureTagFingerprint(value: unknown) {
   return createHash('sha256').update(uniqueTag).digest('hex')
 }
 
+function exactOrderProviderPayload(input: {
+  shopDomain: unknown
+  sourceIdentifier: unknown
+  uniqueTag: unknown
+}) {
+  const shopDomain = String(input.shopDomain || '').trim().toLowerCase()
+  if (shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_STORE_CHANGED',
+      'The fixed Test Pro Bakery Bites Shopify domain is required',
+      403,
+    )
+  }
+  const sourceIdentifier = exactSourceIdentifier(input.sourceIdentifier)
+  const uniqueTag = exactUniqueTag(input.uniqueTag)
+  const variables = Object.freeze({
+    order: Object.freeze({
+      test: true as const,
+      financialStatus: 'PENDING' as const,
+      buyerAcceptsMarketing: false as const,
+      sourceIdentifier,
+      tags: Object.freeze([SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag]),
+      lineItems: Object.freeze([Object.freeze({
+        variantId: SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
+        quantity: 1 as const,
+        requiresShipping: true as const,
+      })]),
+      shippingAddress: SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE.shippingAddress,
+    }),
+    options: Object.freeze({
+      inventoryBehaviour: 'BYPASS' as const,
+      sendReceipt: false as const,
+      sendFulfillmentReceipt: false as const,
+    }),
+  })
+  const providerPayloadHash = createHash('sha256').update(JSON.stringify({
+    version: 'shopify-reversal-fixture-order-provider-payload-v1',
+    shopDomain,
+    variables,
+  })).digest('hex')
+  return Object.freeze({
+    sourceIdentifier,
+    uniqueTag,
+    variables,
+    providerPayloadHash,
+  })
+}
+
+export function shopifyReversalFixtureOrderProviderPayloadHash(input: {
+  shopDomain: unknown
+  sourceIdentifier: unknown
+  uniqueTag: unknown
+}) {
+  return exactOrderProviderPayload(input).providerPayloadHash
+}
+
 function normalizeFixtureOrder(
   value: unknown,
   expected: { sourceIdentifier: string; uniqueTag: string },
@@ -299,13 +359,37 @@ export async function createShopifyReversalFixtureOrder(
   input: {
     sourceIdentifier: unknown
     uniqueTag: unknown
-    beforeProviderMutation?: () => Promise<void>
+    claim: {
+      organizationId: string
+      commandId: string
+      attemptId: string
+      actorEmail: string
+    }
   },
   options: ShopifyCommerceClientOptions = {},
 ): Promise<ShopifyReversalFixtureOrder> {
-  const sourceIdentifier = exactSourceIdentifier(input.sourceIdentifier)
-  const uniqueTag = exactUniqueTag(input.uniqueTag)
-  await input.beforeProviderMutation?.()
+  if (credential.shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_STORE_CHANGED',
+      'The fixed Test Pro Bakery Bites Shopify domain is required',
+      403,
+    )
+  }
+  const providerPayload = exactOrderProviderPayload({
+    shopDomain: credential.shopDomain,
+    sourceIdentifier: input.sourceIdentifier,
+    uniqueTag: input.uniqueTag,
+  })
+  const {
+    sourceIdentifier,
+    uniqueTag,
+    variables,
+    providerPayloadHash,
+  } = providerPayload
+  await assertShopifyReversalFixtureOrderClaimCurrentInPostgres({
+    ...input.claim,
+    providerPayloadHash,
+  })
   let data: {
     orderCreate?: {
       order?: unknown
@@ -316,28 +400,7 @@ export async function createShopifyReversalFixtureOrder(
     data = await shopifyAdminGraphql(credential, {
       query: ORDER_CREATE_MUTATION,
       operationName: 'ClawPilotReversalFixtureOrderCreate',
-      variables: {
-        order: {
-          test: true,
-          financialStatus: 'PENDING',
-          buyerAcceptsMarketing: false,
-          sourceIdentifier,
-          tags: [SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag],
-          lineItems: [{
-            variantId: SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
-            quantity: 1,
-            requiresShipping: true,
-          }],
-          shippingAddress: {
-            ...SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE.shippingAddress,
-          },
-        },
-        options: {
-          inventoryBehaviour: 'BYPASS',
-          sendReceipt: false,
-          sendFulfillmentReceipt: false,
-        },
-      },
+      variables,
     }, options)
   } catch {
     throw new ShopifyReversalFixtureProviderError(
@@ -358,7 +421,18 @@ export async function createShopifyReversalFixtureOrder(
       true,
     )
   }
-  const errors = normalizeUserErrors(payload.userErrors)
+  let errors: string[]
+  try {
+    errors = normalizeUserErrors(payload.userErrors)
+  } catch {
+    throw new ShopifyReversalFixtureProviderError(
+      'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN',
+      'Shopify order creation returned malformed error evidence; reconcile this attempt',
+      502,
+      true,
+      true,
+    )
+  }
   if (errors.length > 0) {
     throw new ShopifyReversalFixtureProviderError(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',

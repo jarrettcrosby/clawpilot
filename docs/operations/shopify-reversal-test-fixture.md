@@ -13,28 +13,30 @@ app_visible: false
 
 ## Boundary
 
-This is a hidden operator fixture for proving the existing Shopify reversal and cancellation workflows. It is not an Operations feature, browser control, navigation item, or general Shopify order-creation API. The only interfaces are `POST /api/dev/shopify-test-fixtures` and the fixed-endpoint `scripts/shopify-test-fixture.mjs` client.
+This is a hidden operator fixture for proving the existing Shopify reversal and cancellation workflows. It is not an Operations feature, navigation item, or general Shopify order-creation API. The worker interfaces are `POST /api/dev/shopify-test-fixtures` and the fixed-endpoint `scripts/shopify-test-fixture.mjs` client. The exact command returned by preparation has a separate, unlinked `/api/dev/shopify-test-fixtures/approve` page for one authenticated human approval.
 
 The route is available only when all of these facts remain exact:
 
-- Railway project `b5169ebd-8166-4b96-9a81-7cc8adaa9270`, environment `e4abd95f-825c-4242-b37b-825a92597e98`, and environment name `development`;
+- Railway project `b5169ebd-8166-4b96-9a81-7cc8adaa9270`, ClawPilot service `f3fdf47c-6645-42ff-9a28-52843f8e4da2`, environment `e4abd95f-825c-4242-b37b-825a92597e98`, and environment name `development`;
 - durable database identity `750aa268-0e31-4065-a99c-4016e4d4fab1`;
 - `CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED=1`;
-- the existing Shopify order-test-write runtime is enabled and its allowlist contains only the intended account, including fixed fixture account `giah34fedoa5b1o`;
+- organization `c6c8e6e7-fffa-4969-9526-e99da0ab2754`, fixed fixture account `giah34fedoa5b1o`, Shopify Shop GID `gid://shopify/Shop/95083757815`, and canonical domain `test-pro-bakery-bites.myshopify.com`;
+- the existing Shopify order-test-write runtime is enabled and its allowlist contains the fixed fixture account;
 - the current integration is an active, verified Shopify sandbox client-credential connection with Provider writes On and current `read_orders`, `write_orders`, and `write_merchant_managed_fulfillment_orders` authority;
 - a live Shopify read proves the connected shop is still a Partner development store; and
-- the preparing and claiming actor has an active owner or administrator membership in the organization.
+- the named approver has an active owner or administrator membership in the organization; and
+- the one-time approval comes from that same human in a current, non-impersonated ClawPilot browser session whose active workspace is the fixed organization.
 
-Production, Vercel, local development, a different Railway project or environment, another database, another integration account, stale credentials, stale Provider-write bindings, missing scopes, and ordinary browser sessions fail closed. The route authenticates with the existing worker secret. The CLI reads that secret only from `PIPELINE_OUTBOX_WORKER_SECRET`; it has no secret argument, endpoint override, or credential output.
+Production, Vercel, local development, a different Railway project or environment, organization, database, integration account, Shop GID, or domain, stale credentials, stale Provider-write bindings, missing scopes, impersonation, and worker-only execution without the durable human approval fail closed. The worker route authenticates with the existing worker secret. The approval subroute is not covered by that public-route exception and requires the normal ClawPilot session. The CLI reads the worker secret only from `PIPELINE_OUTBOX_WORKER_SECRET`; it has no secret argument, endpoint override, or credential output.
 
 ## Phase 1: Fixed Test Order
 
-`prepare-order` creates an immutable five-minute command and returns its intent hash plus the short intent-bound confirmation statement. It performs provider identity and scope reads but no provider mutation. `execute` may claim that exact command once.
+`prepare-order` creates an immutable five-minute command and returns its intent hash, short intent-bound confirmation statement, and hidden approval path. It performs provider identity and scope reads but no provider mutation. Before `execute`, the same named owner or administrator must open that path in a normal signed-in ClawPilot session and type the exact confirmation. The approval is immutable, command- and intent-bound, expires with the command, and can authorize at most one claim. The session, membership, command expiry, exact account/store facts, immutable command phase, exact provider-payload hash, and absence of an outcome are checked again immediately before the provider mutation.
 
 The claimed provider mutation contains one fixed profile only:
 
 - `test: true`, `financialStatus: PENDING`, and `buyerAcceptsMarketing: false`;
-- fixed Selling Plans Ski Wax variant `gid://shopify/ProductVariant/51028106379511`, quantity `1`, and `requiresShipping: true`;
+- fixed variant `gid://shopify/ProductVariant/51028106379511`, quantity `1`, and `requiresShipping: true`;
 - the approved synthetic John Doe address at 101 Academy Drive, Buzzards Bay, Massachusetts 02532, US;
 - `inventoryBehaviour: BYPASS`, `sendReceipt: false`, and `sendFulfillmentReceipt: false`; and
 - a command-specific `sourceIdentifier` plus unique tag fingerprint.
@@ -48,7 +50,11 @@ node scripts/shopify-test-fixture.mjs prepare-order \
   --organization-id=<organization-uuid> \
   --actor-email=<active-owner-or-admin> \
   --idempotency-key=<stable-unique-key>
+```
 
+Open `https://dev.aiapp.eigenracing.com<returned-approval-path>` in the same actor's signed-in ClawPilot browser session and type the returned confirmation statement. Only after the page reports the immutable one-time approval, run:
+
+```sh
 node scripts/shopify-test-fixture.mjs execute \
   --organization-id=<organization-uuid> \
   --actor-email=<same-active-owner-or-admin> \
@@ -66,7 +72,7 @@ node scripts/shopify-test-fixture.mjs reconcile \
   --command=<unknown-command-global-id>
 ```
 
-An absent or ambiguous reconciliation is durable review evidence, not permission to retry the provider write.
+An absent or ambiguous reconciliation is durable review evidence, not permission to retry the provider write. If Shopify returned but the initial outcome and its audit could not be committed, the claimed command remains `processing` and becomes read-reconcilable only after the five-minute action window plus a 30-second in-flight request margin. Initial-outcome and reconciliation inserts are serialized, so they cannot create contradictory histories.
 
 ## Phase 2: Separate External Fulfillment
 
@@ -98,9 +104,9 @@ After the two fixture phases, use the existing ClawPilot reconciliation, reversa
 
 ## Durable Evidence and Readiness
 
-Migration `0326_operations_shopify_reversal_test_fixture.sql` creates three append-only ledgers: commands, provider attempts, and outcomes. Preparation is serialized per organization, account, and phase. An unclaimed command may be superseded only after expiry. A claimed command has at most one attempt, and any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
+Migration `0326_operations_shopify_reversal_test_fixture.sql` creates four append-only ledgers: commands, authenticated human approvals, provider attempts, and outcomes. Preparation is serialized per organization, account, and phase. Each command has at most one approval and one attempt. An unclaimed command may be superseded only after expiry, but its immutable approval cannot be replaced. Any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
 
-`/api/health` reports the fixture runtime, exact migration checksum, ledger structures, database identity, and prepared, processing, unknown, and terminal counts. When the fixture runtime flag is enabled, migration or database-identity drift makes health fail. Unresolved unknown outcomes are a warning.
+`/api/health` reports the fixture runtime, exact migration checksum, ledger structures, database identity, and awaiting-approval, prepared, processing, unknown, and terminal counts. When the fixture runtime flag is enabled, migration or database-identity drift makes health fail. Unresolved unknown outcomes are a warning.
 
 Run the implementation acceptances with:
 
@@ -108,4 +114,4 @@ Run the implementation acceptances with:
 npm run test:shopify-reversal-fixture
 ```
 
-Those acceptances prove fixed payload construction, runtime and route gates, command separation, unknown/reconciliation behavior, Postgres ledger fences, health readiness, and absence from normal UI. They mock provider I/O and are implementation evidence, not a Shopify provider end-to-end result. A provider E2E result exists only after an authorized operator executes the deployed two phases and records the returned provider evidence.
+Those acceptances prove fixed payload construction, runtime and route gates, authenticated non-impersonated one-time approval, command separation, action-time expiry, unknown/reconciliation behavior, Postgres ledger fences, health readiness, and absence from normal UI. They mock provider I/O and are implementation evidence, not a Shopify provider end-to-end result. A provider E2E result exists only after an authorized operator executes the deployed two phases and records the returned provider evidence.

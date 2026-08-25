@@ -24,6 +24,14 @@ let commandFailure = null
 const commandResult = async (name, input) => {
   if (commandFailure) throw commandFailure
   calls.push({ name, input })
+  if (name === 'status') {
+    return {
+      state: 'prepared',
+      approvalGlobalId: 'gsfa1234567',
+      approvedBy: 'owner@example.test',
+      approvedAt: '2026-08-25T12:01:00.000Z',
+    }
+  }
   return { command: name }
 }
 const output = ts.transpileModule(source, {
@@ -171,6 +179,14 @@ for (const fixture of cases) {
   assert.equal(response.status, 200, fixture.action)
   assert.equal(response.body.ok, true, fixture.action)
   assert.equal(calls.at(-1).name, fixture.action, fixture.action)
+  if (fixture.action === 'status') {
+    assert.deepEqual(response.body.result, {
+      state: 'prepared',
+      approvalGlobalId: 'gsfa1234567',
+      approvedBy: 'owner@example.test',
+      approvedAt: '2026-08-25T12:01:00.000Z',
+    })
+  }
 
   const rejected = await route.POST(request({
     action: fixture.action,

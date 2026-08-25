@@ -47,17 +47,35 @@ function load(env, orderRuntime = { available: true }, accountAllowed = true) {
 const exactEnv = {
   CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED: '1',
   RAILWAY_PROJECT_ID: 'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
+  RAILWAY_SERVICE_ID: 'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
   RAILWAY_ENVIRONMENT_ID: 'e4abd95f-825c-4242-b37b-825a92597e98',
   RAILWAY_ENVIRONMENT_NAME: 'development',
 }
 
 {
-  const runtime = load(exactEnv).shopifyReversalFixtureRuntime()
+  const fixture = load(exactEnv)
+  const runtime = fixture.shopifyReversalFixtureRuntime()
   assert.equal(runtime.available, true)
   assert.equal(runtime.accountGlobalId, 'giah34fedoa5b1o')
   assert.equal(runtime.routeOnly, true)
   assert.equal(runtime.normalUiAvailable, false)
   assert.equal(runtime.productionAvailable, false)
+  assert.equal(
+    fixture.SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID,
+    'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
+  )
+  assert.equal(
+    fixture.SHOPIFY_REVERSAL_FIXTURE_SHOP_GID,
+    'gid://shopify/Shop/95083757815',
+  )
+  assert.equal(
+    fixture.SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
+    'test-pro-bakery-bites.myshopify.com',
+  )
+  assert.equal(
+    fixture.SHOPIFY_REVERSAL_FIXTURE_RAILWAY_SERVICE_ID,
+    'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
+  )
 }
 
 for (const [name, env, blocker] of [
@@ -74,6 +92,18 @@ for (const [name, env, blocker] of [
   [
     'wrong environment',
     { ...exactEnv, RAILWAY_ENVIRONMENT_ID: 'wrong' },
+    'SHOPIFY_REVERSAL_FIXTURE_RAILWAY_DEVELOPMENT_REQUIRED',
+  ],
+  [
+    'missing service',
+    Object.fromEntries(
+      Object.entries(exactEnv).filter(([key]) => key !== 'RAILWAY_SERVICE_ID'),
+    ),
+    'SHOPIFY_REVERSAL_FIXTURE_RAILWAY_DEVELOPMENT_REQUIRED',
+  ],
+  [
+    'wrong service',
+    { ...exactEnv, RAILWAY_SERVICE_ID: 'wrong' },
     'SHOPIFY_REVERSAL_FIXTURE_RAILWAY_DEVELOPMENT_REQUIRED',
   ],
   [

@@ -59,6 +59,18 @@ function load(mocks) {
             },
         }
       }
+      if (specifier === '@/lib/persistence/shopifyReversalFixture') {
+        return {
+          assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres:
+            async () => {},
+        }
+      }
+      if (specifier === '@/lib/integrations/shopifyReversalFixtureRuntime') {
+        return {
+          SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
+            'test-pro-bakery-bites.myshopify.com',
+        }
+      }
       return nodeRequire(specifier)
     },
   }, { filename: path })
@@ -584,14 +596,145 @@ assert.equal(
 )
 const replayModule = providerOnlyModule(() => closedOrderWith(exactObservedFulfillment()))
 
-assert.deepEqual(JSON.parse(JSON.stringify(await replayModule.writeShopifyFulfillment(
-  credential,
-  providerInput,
-  preparation.signature,
-))), {
-  providerReference: fulfillmentGid, trackingNumber: '1ZTEST6567',
-  trackingNumbers: ['1ZTEST6567'], replayed: true,
+assert.equal(
+  replayModule.writeShopifyFulfillment,
+  undefined,
+  'The low-level provider mutation primitive must remain private',
+)
+
+const fixtureCredential = {
+  shopDomain: 'test-pro-bakery-bites.myshopify.com',
+  accessToken: 'fixture-token',
+}
+const fixtureInput = {
+  externalOrderId: orderGid,
+  trackingNumbers: ['CP-REV-GSFC1234567'],
+  carrier: 'ClawPilot Fixture',
+  notifyCustomer: false,
+  expectedLineItems: [{ lineItemId: lineItemGid, quantity: 1 }],
+  sandboxE2eAuthorityKind: null,
+  allowLegacySignatureWithoutAuthorityKind: false,
+}
+const fixtureOrder = () => ({
+  id: orderGid,
+  canNotifyCustomer: true,
+  fulfillmentsCount: { count: 0 },
+  fulfillments: [],
+  fulfillmentOrders: page([{
+    id: fulfillmentOrderGidA,
+    status: 'OPEN',
+    requestStatus: 'UNSUBMITTED',
+    assignedLocation: { location: { id: locationGid } },
+    lineItems: page([{
+      id: fulfillmentOrderLineItemGidA,
+      lineItem: { id: lineItemGid },
+      remainingQuantity: 1,
+    }]),
+  }]),
 })
+const fixtureProviderCalls = []
+let fixtureFenceError = null
+let expectedFixturePayloadHash = null
+const fixtureClaim = {
+  organizationId: 'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
+  commandId: '44444444-4444-4444-8444-444444444444',
+  attemptId: '55555555-5555-4555-8555-555555555555',
+  actorEmail: 'owner@example.test',
+}
+const fixtureModule = load({
+  '@/lib/integrations/commerceCredentialCrypto': {},
+  '@/lib/integrations/commerceCapabilities': {},
+  '@/lib/persistence/commerceIntegrations': {},
+  '@/lib/persistence/commerceProviderWrites': {},
+  '@/lib/integrations/shopifyCommerceClient': {
+    shopifyAdminGraphql: async (_credential, request) => {
+      fixtureProviderCalls.push(structuredClone(request))
+      if (request.operationName === 'ClawPilotOrderFulfillment') {
+        return {
+          order: { ...fixtureOrder(), id: request.variables.id },
+        }
+      }
+      return {
+        fulfillmentCreate: {
+          fulfillment: { id: fulfillmentGid, status: 'SUCCESS' },
+          userErrors: [],
+        },
+      }
+    },
+  },
+  '@/lib/persistence/shopifyReversalFixture': {
+    assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres:
+      async (claim) => {
+        assert.deepEqual({
+          organizationId: claim.organizationId,
+          commandId: claim.commandId,
+          attemptId: claim.attemptId,
+          actorEmail: claim.actorEmail,
+        }, fixtureClaim)
+        assert.match(claim.providerPayloadHash, /^[a-f0-9]{64}$/u)
+        if (fixtureFenceError) throw fixtureFenceError
+        if (claim.providerPayloadHash !== expectedFixturePayloadHash) {
+          throw Object.assign(new Error('stale provider payload'), {
+            code: 'SHOPIFY_REVERSAL_FIXTURE_CLAIM_STALE',
+          })
+        }
+      },
+  },
+})
+const fixtureAttempt = await fixtureModule.prepareShopifyFulfillmentProviderAttempt(
+  fixtureCredential,
+  fixtureInput,
+)
+expectedFixturePayloadHash =
+  fixtureModule.shopifyReversalFixtureFulfillmentProviderPayloadHash(
+    fixtureCredential,
+    fixtureInput,
+    fixtureAttempt.signature,
+  )
+fixtureFenceError = Object.assign(new Error('stale fixture claim'), {
+  code: 'SHOPIFY_REVERSAL_FIXTURE_CLAIM_STALE',
+})
+await assert.rejects(
+  () => fixtureModule.executeShopifyReversalFixtureFulfillmentProviderAttempt(
+    fixtureCredential,
+    fixtureInput,
+    fixtureAttempt.signature,
+    fixtureClaim,
+  ),
+  (error) => error?.code === 'SHOPIFY_REVERSAL_FIXTURE_CLAIM_STALE',
+)
+fixtureFenceError = null
+assert.equal(
+  fixtureProviderCalls.filter((request) => (
+    request.operationName === 'ClawPilotFulfillmentCreate'
+  )).length,
+  0,
+  'a final fixture fence failure must issue zero fulfillment mutations',
+)
+const substitutedFixtureInput = {
+  ...fixtureInput,
+  externalOrderId: 'gid://shopify/Order/6899404406985',
+}
+const substitutedFixtureAttempt = {
+  ...fixtureAttempt.signature,
+  externalOrderId: substitutedFixtureInput.externalOrderId,
+}
+await assert.rejects(
+  () => fixtureModule.executeShopifyReversalFixtureFulfillmentProviderAttempt(
+    fixtureCredential,
+    substitutedFixtureInput,
+    substitutedFixtureAttempt,
+    fixtureClaim,
+  ),
+  (error) => error?.code === 'SHOPIFY_REVERSAL_FIXTURE_CLAIM_STALE',
+)
+assert.equal(
+  fixtureProviderCalls.filter((request) => (
+    request.operationName === 'ClawPilotFulfillmentCreate'
+  )).length,
+  0,
+  'a substituted fixture payload must fail before fulfillmentCreate',
+)
 assert.deepEqual(JSON.parse(JSON.stringify(await replayModule.readShopifyFulfillment(
   credential,
   providerInput,
@@ -600,12 +743,6 @@ assert.deepEqual(JSON.parse(JSON.stringify(await replayModule.readShopifyFulfill
   providerReference: fulfillmentGid, trackingNumber: '1ZTEST6567',
   trackingNumbers: ['1ZTEST6567'], replayed: true,
 })
-await assert.rejects(
-  () => replayModule.writeShopifyFulfillment(credential, providerInput),
-  (error) => error?.code === 'SHOPIFY_FULFILLMENT_NOT_OPEN',
-  'A direct call must not replay based on tracking alone',
-)
-
 providerOrder = openOrder([exactObservedFulfillment()])
 calls.length = 0
 const replayPreparation = await module.prepareShopifyFulfillmentWriteback(input)

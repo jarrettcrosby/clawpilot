@@ -22,11 +22,23 @@ const healthPath =
   'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'
 const healthRoutePath = 'app_src/app/api/health/route.ts'
 const persistencePath = 'app_src/lib/persistence/shopifyReversalFixture.ts'
+const fulfillmentProviderPath =
+  'app_src/lib/integrations/shopifyFulfillmentWriteback.ts'
+const orderProviderPath =
+  'app_src/lib/integrations/shopifyReversalFixtureProvider.ts'
+const approvalRoutePath =
+  'app_src/app/api/dev/shopify-test-fixtures/approve/route.ts'
 const migration = readFileSync(resolve(root, migrationPath), 'utf8')
 const checksum = createHash('sha256').update(migration).digest('hex')
 const healthSource = readFileSync(resolve(root, healthPath), 'utf8')
 const healthRoute = readFileSync(resolve(root, healthRoutePath), 'utf8')
 const persistenceSource = readFileSync(resolve(root, persistencePath), 'utf8')
+const fulfillmentProviderSource = readFileSync(
+  resolve(root, fulfillmentProviderPath),
+  'utf8',
+)
+const orderProviderSource = readFileSync(resolve(root, orderProviderPath), 'utf8')
+const approvalRouteSource = readFileSync(resolve(root, approvalRoutePath), 'utf8')
 
 assert.match(healthSource, new RegExp(checksum, 'u'))
 assert.match(healthRoute, /readShopifyReversalFixtureHealthInPostgres/u)
@@ -43,6 +55,9 @@ for (const fragment of [
   "phase IN ('create_order', 'create_fulfillment')",
   "fixture_profile_version = 'shopify-reversal-fixture-v1'",
   "account.global_id = 'giah34fedoa5b1o'",
+  "'c6c8e6e7-fffa-4969-9526-e99da0ab2754'::uuid",
+  "'gid://shopify/Shop/95083757815'",
+  "'test-pro-bakery-bites.myshopify.com'",
   "'750aa268-0e31-4065-a99c-4016e4d4fab1'",
   "candidate.test_order = true",
   "candidate.normalized_payment_status = 'pending'",
@@ -62,6 +77,15 @@ for (const fragment of [
   'operations_fulfillment_executions',
   'operations_active_fulfillment_executions',
   'pg_advisory_xact_lock',
+  'operations_shopify_reversal_fixture_approvals',
+  'operations_shopify_reversal_fixture_approval_session_is_current',
+  'operations_shopify_reversal_fixture_provider_claim_is_current',
+  'provider_payload_hash',
+  "command.expires_at + interval '30 seconds'",
+  "'shopify-reversal-fixture-outcome:'",
+  "worker_principal = 'pipeline_outbox_worker'",
+  "session.auth_method IN (",
+  "user_account.status = 'active'",
   'Shopify reversal fixture ledgers are append-only',
 ]) {
   assert.ok(migration.includes(fragment), `0326 must include ${fragment}`)
@@ -94,20 +118,25 @@ vm.runInNewContext(output, {
           return { rows: [{
             migration_current: structureCurrent,
             command_table: structureCurrent,
+            approval_table: structureCurrent,
             attempt_table: structureCurrent,
             outcome_table: structureCurrent,
             state_view: structureCurrent,
             actor_function: structureCurrent,
             account_function: structureCurrent,
             database_function: structureCurrent,
+            approval_session_function: structureCurrent,
+            approval_function: structureCurrent,
             fulfillment_function: structureCurrent,
-            immutable_trigger_count: structureCurrent ? '6' : '0',
+            provider_claim_function: structureCurrent,
+            immutable_trigger_count: structureCurrent ? '8' : '0',
             database_identity:
               '750aa268-0e31-4065-a99c-4016e4d4fab1',
           }] }
         }
         return { rows: [{
-          prepared: '1', processing: '2', unknown: '3', terminal: '4',
+          awaiting_approval: '5', prepared: '1', processing: '2',
+          unknown: '3', terminal: '4',
         }] }
       },
     }
@@ -117,6 +146,7 @@ vm.runInNewContext(output, {
 const healthy = await module.exports.readShopifyReversalFixtureHealthInPostgres()
 assert.equal(healthy.migrationCurrent, true)
 assert.equal(healthy.structureCurrent, true)
+assert.equal(healthy.awaitingApproval, 5)
 assert.equal(healthy.unknown, 3)
 structureCurrent = false
 const unhealthy = await module.exports.readShopifyReversalFixtureHealthInPostgres()
@@ -156,5 +186,58 @@ assert.doesNotMatch(
   /normalizedPath === '\/api\/dev\/shopify-test-fixtures'/u,
   'the public proxy exception must be exact, not a trailing-slash alias',
 )
+assert.doesNotMatch(
+  proxy,
+  /pathname === '\/api\/dev\/shopify-test-fixtures\/approve'/u,
+  'the authenticated approval subroute must not be public',
+)
+assert.doesNotMatch(
+  proxy,
+  /pathname\.startsWith\('\/api\/dev\/shopify-test-fixtures/u,
+  'the worker-secret exception must not cover nested routes',
+)
+assert.match(healthRoute, /reversalFixtureDurable\.awaitingApproval/u)
+assert.match(healthRoute, /'awaiting-approval'/u)
+
+assert.doesNotMatch(
+  fulfillmentProviderSource,
+  /export async function writeShopifyFulfillment/u,
+  'the generic low-level fulfillment mutation primitive must remain private',
+)
+assert.match(
+  fulfillmentProviderSource,
+  /executeShopifyReversalFixtureFulfillmentProviderAttempt[\s\S]*shopifyReversalFixtureFulfillmentProviderPayloadHash[\s\S]*assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres\([\s\S]*providerPayloadHash/u,
+)
+assert.match(
+  orderProviderSource,
+  /const providerPayload = exactOrderProviderPayload\([\s\S]*assertShopifyReversalFixtureOrderClaimCurrentInPostgres\([\s\S]*providerPayloadHash[\s\S]*shopifyAdminGraphql\([\s\S]*variables/u,
+)
+assert.match(
+  orderProviderSource,
+  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v1'[\s\S]*variables/u,
+)
+assert.match(
+  persistenceSource,
+  /operations_shopify_reversal_fixture_provider_claim_is_current\([\s\S]*expectedPhase[\s\S]*payloadHash/u,
+)
+assert.match(
+  persistenceSource,
+  /initial\.outcome_state = 'unknown'[\s\S]*durable_command\.expires_at \+ interval '30 seconds'/u,
+)
+for (const fragment of [
+  'requireRequestSession(req)',
+  'requireRequestUserForWorkspace(',
+  'session.authenticatedUser !== session.effectiveUser',
+  'session.activeWorkspaceOrganizationId',
+  "role !== 'owner' && role !== 'admin'",
+  'assertSameOrigin(req)',
+  'browserSessionId: session.id',
+  'isPostgresStorageEnabled()',
+]) {
+  assert.ok(
+    approvalRouteSource.includes(fragment),
+    `approval route must include ${fragment}`,
+  )
+}
 
 console.log('Shopify reversal fixture health and hidden-surface boundary passed.')

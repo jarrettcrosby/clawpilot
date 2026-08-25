@@ -8341,7 +8341,11 @@ export async function GET() {
                 ? 'reconciliation-required'
                 : reversalFixtureDurable.processing > 0
                   ? 'processing'
-                  : 'ready'
+                  : reversalFixtureDurable.awaitingApproval > 0
+                    ? 'awaiting-approval'
+                    : reversalFixtureDurable.prepared > 0
+                      ? 'approved'
+                      : 'ready'
               : 'migration-pending'
             : 'disabled',
           runtime: shopifyReversalFixtureRuntimeState,

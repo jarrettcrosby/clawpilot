@@ -4,6 +4,9 @@ import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
   SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY,
+  SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID,
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_GID,
 } from '@/lib/integrations/shopifyReversalFixtureRuntime'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
@@ -50,6 +53,7 @@ export type ShopifyReversalFixtureCommand = Readonly<{
   idempotencyKey: string
   intentHash: string
   confirmationHash: string
+  providerPayloadHash: string
   sourceIdentifier: string | null
   uniqueTag: string | null
   tagFingerprint: string | null
@@ -80,6 +84,22 @@ export type ShopifyReversalFixtureFulfillmentTarget = Readonly<{
   providerLocationId: string
   expectedLines: ReadonlyArray<{ lineItemId: string; quantity: number }>
 }>
+
+export type ShopifyReversalFixtureApproval = Readonly<{
+  id: string
+  globalId: string
+  organizationId: string
+  commandId: string
+  approvedBy: string
+  approvedRole: 'owner' | 'admin'
+  browserSessionId: string
+  intentHash: string
+  confirmationHash: string
+  approvedAt: string
+}>
+
+export const SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL =
+  'pipeline_outbox_worker' as const
 
 export class ShopifyReversalFixturePersistenceError extends Error {
   constructor(
@@ -226,13 +246,19 @@ JOIN public.app_user_organization_memberships membership
  AND membership.user_email = $2
  AND membership.status = 'active'
  AND membership.role IN ('owner', 'admin')
+JOIN public.app_users user_account
+  ON user_account.email = membership.user_email
+ AND user_account.status = 'active'
 JOIN public.operations_commerce_provider_write_control_current control
   ON control.organization_id = account.organization_id
  AND control.integration_account_id = account.id
 JOIN public.app_settings setting
   ON setting.key = 'deployment.database.identity'
 WHERE account.organization_id = $1::uuid
+  AND account.organization_id = '${SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID}'::uuid
   AND account.global_id = '${SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID}'
+  AND account.external_account_id = '${SHOPIFY_REVERSAL_FIXTURE_SHOP_GID}'
+  AND account.configuration->>'shopDomain' = '${SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN}'
   AND public.operations_shopify_reversal_fixture_database_is_trusted()
 LIMIT 2`
 
@@ -240,7 +266,10 @@ function mapAuthority(row: AuthorityRow | undefined): ShopifyReversalFixtureAuth
   if (
     !row
     || !['owner', 'admin'].includes(row.actor_role)
+    || row.organization_id !== SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID
     || row.account_global_id !== SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID
+    || row.external_account_id !== SHOPIFY_REVERSAL_FIXTURE_SHOP_GID
+    || row.shop_domain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
     || row.database_identity !== SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY
     || row.exact_current !== true
     || Number(row.control_row_version) < 1
@@ -301,6 +330,7 @@ type CommandRow = QueryResultRow & {
   idempotency_key: string
   intent_hash: string
   confirmation_hash: string
+  provider_payload_hash: string
   source_identifier: string | null
   unique_tag: string | null
   tag_fingerprint: string | null
@@ -330,6 +360,7 @@ const COMMAND_SELECT = `SELECT
   command.id::text, command.global_id, command.organization_id::text,
   command.phase, command.prepared_by, command.prepared_role,
   command.idempotency_key, command.intent_hash, command.confirmation_hash,
+  command.provider_payload_hash,
   command.source_identifier, command.unique_tag, command.tag_fingerprint,
   command.predecessor_command_id::text, command.order_id::text,
   command.order_global_id, command.external_order_id,
@@ -385,6 +416,7 @@ function mapCommand(row: CommandRow | undefined): ShopifyReversalFixtureCommand 
     idempotencyKey: row.idempotency_key,
     intentHash: row.intent_hash,
     confirmationHash: row.confirmation_hash,
+    providerPayloadHash: row.provider_payload_hash,
     sourceIdentifier: row.source_identifier,
     uniqueTag: row.unique_tag,
     tagFingerprint: row.tag_fingerprint,
@@ -440,6 +472,171 @@ export async function readShopifyReversalFixtureCommandInPostgres(input: {
   return mapCommand(result.rows[0])
 }
 
+type ApprovalRow = QueryResultRow & {
+  id: string
+  global_id: string
+  organization_id: string
+  command_id: string
+  approved_by: string
+  approved_role: 'owner' | 'admin'
+  browser_session_id: string
+  intent_hash: string
+  confirmation_hash: string
+  approved_at: Date | string
+}
+
+const APPROVAL_SELECT = `SELECT approval.id::text, approval.global_id,
+  approval.organization_id::text, approval.command_id::text,
+  approval.approved_by, approval.approved_role,
+  approval.browser_session_id::text, approval.intent_hash,
+  approval.confirmation_hash, approval.approved_at
+FROM public.operations_shopify_reversal_fixture_approvals approval`
+
+function mapApproval(
+  row: ApprovalRow | undefined,
+): ShopifyReversalFixtureApproval {
+  if (!row) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_NOT_FOUND',
+      'Fixture approval was not found',
+      404,
+    )
+  }
+  return Object.freeze({
+    id: row.id,
+    globalId: row.global_id,
+    organizationId: row.organization_id,
+    commandId: row.command_id,
+    approvedBy: row.approved_by,
+    approvedRole: row.approved_role,
+    browserSessionId: row.browser_session_id,
+    intentHash: row.intent_hash,
+    confirmationHash: row.confirmation_hash,
+    approvedAt: timestamp(row.approved_at, 'Approval time'),
+  })
+}
+
+export async function approveShopifyReversalFixtureCommandInPostgres(input: {
+  organizationId: unknown
+  actorEmail: unknown
+  browserSessionId: unknown
+  commandGlobalId: unknown
+  intentHash: unknown
+  confirmationStatement: unknown
+}) {
+  const scopedOrganizationId = organizationId(input.organizationId)
+  const actor = actorEmail(input.actorEmail)
+  const sessionId = String(input.browserSessionId || '').trim().toLowerCase()
+  if (!UUID.test(sessionId)) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_SESSION_INVALID',
+      'An authenticated ClawPilot browser session is required',
+      403,
+    )
+  }
+  const globalId = commandGlobalId(input.commandGlobalId)
+  const intentHash = sha256(input.intentHash, 'Intent hash')
+  const statement = typeof input.confirmationStatement === 'string'
+    ? input.confirmationStatement
+    : ''
+  if (!/^(?:CREATE|FULFILL) TEST ORDER [a-f0-9]{12}$/u.test(statement)) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_CONFIRMATION_REQUIRED',
+      'Type the exact short fixture confirmation to approve this test write',
+      403,
+    )
+  }
+  const confirmationHash = createHash('sha256').update(statement).digest('hex')
+  return withTransaction(async (client) => {
+    const commandResult = await client.query<CommandRow>(
+      `${COMMAND_SELECT}
+       WHERE command.organization_id = $1::uuid
+         AND command.global_id = $2
+       LIMIT 1
+       FOR UPDATE OF command`,
+      [scopedOrganizationId, globalId],
+    )
+    const command = mapCommand(commandResult.rows[0])
+    if (
+      command.actorEmail !== actor
+      || command.intentHash !== intentHash
+      || command.confirmationHash !== confirmationHash
+      || Date.parse(command.expiresAt) <= Date.now()
+    ) {
+      fail(
+        'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_REQUIRED',
+        'The signed-in actor must approve the exact unexpired fixture intent',
+        403,
+      )
+    }
+    const existing = await client.query<ApprovalRow>(
+      `${APPROVAL_SELECT}
+       WHERE approval.organization_id = $1::uuid
+         AND approval.command_id = $2::uuid
+       LIMIT 1`,
+      [command.organizationId, command.id],
+    )
+    if (existing.rows[0]) {
+      const approval = mapApproval(existing.rows[0])
+      if (
+        approval.approvedBy !== actor
+        || approval.browserSessionId !== sessionId
+        || approval.intentHash !== intentHash
+        || approval.confirmationHash !== confirmationHash
+      ) {
+        fail(
+          'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_CONFLICT',
+          'This fixture command already has a different one-time approval',
+          409,
+        )
+      }
+      return approval
+    }
+    const inserted = await client.query<ApprovalRow>(
+      `WITH inserted AS (
+         INSERT INTO public.operations_shopify_reversal_fixture_approvals (
+           organization_id, command_id, approved_by, approved_role,
+           browser_session_id, intent_hash, confirmation_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5::uuid, $6, $7
+         ) RETURNING *
+       )
+       ${APPROVAL_SELECT.replace(
+         'FROM public.operations_shopify_reversal_fixture_approvals approval',
+         'FROM inserted approval',
+       )}`,
+      [
+        command.organizationId,
+        command.id,
+        actor,
+        command.actorRole,
+        sessionId,
+        command.intentHash,
+        command.confirmationHash,
+      ],
+    )
+    const approval = mapApproval(inserted.rows[0])
+    await recordAuditEvent({
+      actor,
+      eventType: 'operations.shopify_reversal_fixture.approved',
+      aggregateType: 'operations.shopify_reversal_fixture_command',
+      aggregateId: command.globalId,
+      organizationId: command.organizationId,
+      eventKey: `operations:shopify-reversal-fixture:approved:${approval.globalId}`,
+      payload: {
+        commandGlobalId: command.globalId,
+        approvalGlobalId: approval.globalId,
+        phase: command.phase,
+        intentHash: command.intentHash,
+        browserSessionId: sessionId,
+        approvedBy: actor,
+        machinePrincipal: null,
+      },
+    }, client)
+    return approval
+  })
+}
+
 export async function insertShopifyReversalFixtureCommandInPostgres(input: {
   commandGlobalId: unknown
   authority: ShopifyReversalFixtureAuthority
@@ -447,6 +644,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
   idempotencyKey: unknown
   intentHash: unknown
   confirmationHash: unknown
+  providerPayloadHash: unknown
   sourceIdentifier?: string | null
   uniqueTag?: string | null
   tagFingerprint?: string | null
@@ -460,6 +658,10 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
   const confirmationHash = sha256(
     input.confirmationHash,
     'Confirmation hash',
+  )
+  const providerPayloadHash = sha256(
+    input.providerPayloadHash,
+    'Provider payload hash',
   )
   const existing = await readShopifyReversalFixtureCommandByIdempotencyInPostgres({
     organizationId: input.authority.organizationId,
@@ -479,12 +681,14 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
     return existing
   }
   const target = input.fulfillmentTarget || null
-  const result = await query<CommandRow>(
+  return withTransaction(async (client) => {
+    const result = await client.query<CommandRow>(
     `WITH inserted AS (
        INSERT INTO public.operations_shopify_reversal_fixture_commands (
          global_id, organization_id, integration_account_id,
          phase, fixture_profile_version, prepared_by, prepared_role,
          idempotency_key, intent_hash, confirmation_hash,
+         provider_payload_hash,
          provider_write_control_row_version, credential_generation,
          granted_scope_digest, external_account_id, shop_domain,
          source_identifier, unique_tag, tag_fingerprint,
@@ -497,13 +701,13 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
        ) VALUES (
          $1, $2::uuid, $3::uuid,
          $4, 'shopify-reversal-fixture-v1', $5, $6,
-         $7, $8, $9,
-         $10::bigint, $11::integer, $12, $13, $14,
-         $15, $16, $17,
-         $18::uuid, $19::uuid, $20,
-         $21, $22::bigint,
-         $23::timestamptz, $24, $25::jsonb,
-         $26::jsonb, $27,
+         $7, $8, $9, $10,
+         $11::bigint, $12::integer, $13, $14, $15,
+         $16, $17, $18,
+         $19::uuid, $20::uuid, $21,
+         $22, $23::bigint,
+         $24::timestamptz, $25, $26::jsonb,
+         $27::jsonb, $28,
          pg_catalog.clock_timestamp() + interval '5 minutes'
        ) RETURNING *
      )
@@ -521,6 +725,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
       key,
       intentHash,
       confirmationHash,
+      providerPayloadHash,
       input.authority.controlRowVersion,
       input.authority.credentialGeneration,
       input.authority.grantedScopeDigest,
@@ -543,25 +748,30 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
       input.fulfillmentAttemptSignatureHash || null,
     ],
   )
-  const command = mapCommand(result.rows[0])
-  await recordAuditEvent({
-    actor: command.actorEmail,
-    eventType: 'operations.shopify_reversal_fixture.prepared',
-    aggregateType: 'operations.shopify_reversal_fixture_command',
-    aggregateId: command.globalId,
-    organizationId: command.organizationId,
-    eventKey: `operations:shopify-reversal-fixture:prepared:${command.globalId}`,
-    payload: {
-      commandGlobalId: command.globalId,
-      phase: command.phase,
-      intentHash: command.intentHash,
-      accountGlobalId: SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
-      fixtureProfileVersion: 'shopify-reversal-fixture-v1',
-      normalUiAvailable: false,
-      providerWrites: 0,
-    },
+    const command = mapCommand(result.rows[0])
+    await recordAuditEvent({
+      actor: null,
+      subject: command.actorEmail,
+      isSystem: true,
+      eventType: 'operations.shopify_reversal_fixture.prepared',
+      aggregateType: 'operations.shopify_reversal_fixture_command',
+      aggregateId: command.globalId,
+      organizationId: command.organizationId,
+      eventKey: `operations:shopify-reversal-fixture:prepared:${command.globalId}`,
+      payload: {
+        commandGlobalId: command.globalId,
+        phase: command.phase,
+        intentHash: command.intentHash,
+        accountGlobalId: SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
+        fixtureProfileVersion: 'shopify-reversal-fixture-v1',
+        normalUiAvailable: false,
+        providerWrites: 0,
+        requestedApprover: command.actorEmail,
+        machinePrincipal: SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL,
+      },
+    }, client)
+    return command
   })
-  return command
 }
 
 type FulfillmentTargetRow = QueryResultRow & {
@@ -758,30 +968,55 @@ export async function claimShopifyReversalFixtureCommandInPostgres(input: {
         403,
       )
     }
+    const approvalResult = await client.query<ApprovalRow>(
+      `${APPROVAL_SELECT}
+       WHERE approval.organization_id = $1::uuid
+         AND approval.command_id = $2::uuid
+         AND approval.approved_by = $3
+         AND approval.intent_hash = $4
+         AND approval.confirmation_hash = $5
+         AND public.operations_shopify_reversal_fixture_approval_is_current(
+           approval.organization_id, approval.command_id, approval.id
+         )
+       LIMIT 1`,
+      [
+        command.organizationId,
+        command.id,
+        actor,
+        command.intentHash,
+        command.confirmationHash,
+      ],
+    )
+    const approval = mapApproval(approvalResult.rows[0])
     const inserted = await client.query<{
       id: string
       global_id: string
       claimed_at: Date | string
     }>(
       `INSERT INTO public.operations_shopify_reversal_fixture_attempts (
-         organization_id, command_id, phase,
-         claimed_by, claimed_role, intent_hash, confirmation_hash
+         organization_id, command_id, approval_id, phase,
+         claimed_by, claimed_role, intent_hash, confirmation_hash,
+         worker_principal
        ) VALUES (
-         $1::uuid, $2::uuid, $3, $4, $5, $6, $7
+         $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9
        ) RETURNING id::text, global_id, claimed_at`,
       [
         command.organizationId,
         command.id,
+        approval.id,
         command.phase,
         actor,
         command.actorRole,
         command.intentHash,
         command.confirmationHash,
+        SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL,
       ],
     )
     const attempt = inserted.rows[0]
     await recordAuditEvent({
-      actor,
+      actor: null,
+      subject: actor,
+      isSystem: true,
       eventType: 'operations.shopify_reversal_fixture.claimed',
       aggregateType: 'operations.shopify_reversal_fixture_command',
       aggregateId: command.globalId,
@@ -790,69 +1025,52 @@ export async function claimShopifyReversalFixtureCommandInPostgres(input: {
       payload: {
         commandGlobalId: command.globalId,
         attemptGlobalId: attempt.global_id,
+        approvalGlobalId: approval.globalId,
         phase: command.phase,
         intentHash: command.intentHash,
+        approvedBy: actor,
+        approvalSessionId: approval.browserSessionId,
+        machinePrincipal: SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL,
       },
     }, client)
     return Object.freeze({
       command,
       attemptId: attempt.id,
       attemptGlobalId: attempt.global_id,
+      approval,
       claimedAt: timestamp(attempt.claimed_at, 'Claim time'),
     })
   })
 }
 
-export async function assertShopifyReversalFixtureClaimCurrentInPostgres(input: {
+type ShopifyReversalFixtureProviderFenceInput = {
   organizationId: string
   commandId: string
   attemptId: string
   actorEmail: string
-}) {
+  providerPayloadHash: string
+}
+
+async function assertShopifyReversalFixtureClaimCurrentInPostgres(
+  input: ShopifyReversalFixtureProviderFenceInput,
+  expectedPhase: ShopifyReversalFixturePhase,
+) {
+  const payloadHash = sha256(
+    input.providerPayloadHash,
+    'Provider payload hash',
+  )
   const result = await query<{ current: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1
-       FROM public.operations_shopify_reversal_fixture_commands command
-       JOIN public.operations_shopify_reversal_fixture_attempts attempt
-         ON attempt.organization_id = command.organization_id
-        AND attempt.command_id = command.id
-       WHERE command.organization_id = $1::uuid
-         AND command.id = $2::uuid
-         AND attempt.id = $3::uuid
-         AND attempt.claimed_by = $4
-         AND public.operations_shopify_reversal_fixture_database_is_trusted()
-         AND public.operations_shopify_reversal_fixture_actor_is_manager(
-           command.organization_id, attempt.claimed_by, attempt.claimed_role
-         )
-         AND public.operations_shopify_reversal_fixture_account_is_current(
-           command.organization_id,
-           command.integration_account_id,
-           command.provider_write_control_row_version,
-           command.credential_generation,
-           command.granted_scope_digest,
-           command.external_account_id,
-           command.shop_domain
-         )
-         AND (
-           command.phase <> 'create_fulfillment'
-           OR public.operations_shopify_reversal_fixture_fulfillment_is_safe(
-             command.organization_id,
-             command.predecessor_command_id,
-             command.order_id,
-             command.expected_order_row_version,
-             command.released_at,
-             command.provider_location_id,
-             command.expected_lines
-           )
-         )
-         AND NOT EXISTS (
-           SELECT 1
-           FROM public.operations_shopify_reversal_fixture_outcomes outcome
-           WHERE outcome.organization_id = attempt.organization_id
-             AND outcome.attempt_id = attempt.id
-         )
+    `SELECT public.operations_shopify_reversal_fixture_provider_claim_is_current(
+       $1::uuid, $2::uuid, $3::uuid, $4, $5, $6
      ) AS current`,
-    [input.organizationId, input.commandId, input.attemptId, input.actorEmail],
+    [
+      input.organizationId,
+      input.commandId,
+      input.attemptId,
+      input.actorEmail,
+      expectedPhase,
+      payloadHash,
+    ],
   )
   if (result.rows[0]?.current !== true) {
     fail(
@@ -861,6 +1079,24 @@ export async function assertShopifyReversalFixtureClaimCurrentInPostgres(input: 
       409,
     )
   }
+}
+
+export async function assertShopifyReversalFixtureOrderClaimCurrentInPostgres(
+  input: ShopifyReversalFixtureProviderFenceInput,
+) {
+  return assertShopifyReversalFixtureClaimCurrentInPostgres(
+    input,
+    'create_order',
+  )
+}
+
+export async function assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres(
+  input: ShopifyReversalFixtureProviderFenceInput,
+) {
+  return assertShopifyReversalFixtureClaimCurrentInPostgres(
+    input,
+    'create_fulfillment',
+  )
 }
 
 export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
@@ -876,12 +1112,13 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
   errorCode?: string | null
   evidenceHash?: string | null
 }) {
-  const result = await query<{
-    global_id: string
-    outcome_state: ShopifyReversalFixtureOutcomeState
-    recorded_at: Date | string
-  }>(
-    `INSERT INTO public.operations_shopify_reversal_fixture_outcomes (
+  return withTransaction(async (client) => {
+    const result = await client.query<{
+      global_id: string
+      outcome_state: ShopifyReversalFixtureOutcomeState
+      recorded_at: Date | string
+    }>(
+      `INSERT INTO public.operations_shopify_reversal_fixture_outcomes (
        organization_id, command_id, attempt_id, outcome_state,
        provider_mutation_attempted, provider_writes,
        provider_reference, provider_order_id, provider_order_name,
@@ -891,45 +1128,50 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
        $5, $6::integer,
        $7, $8, $9, $10::timestamptz, $11, $12, $13
      ) RETURNING global_id, outcome_state, recorded_at`,
-    [
-      input.command.organizationId,
-      input.command.id,
-      input.attemptId,
-      input.outcomeState,
-      input.providerMutationAttempted,
-      input.providerWrites,
-      input.providerReference || null,
-      input.providerOrderId || null,
-      input.providerOrderName || null,
-      input.providerOrderUpdatedAt || null,
-      input.errorCode || null,
-      input.evidenceHash || null,
-      input.command.actorEmail,
-    ],
-  )
-  const outcome = result.rows[0]
-  await recordAuditEvent({
-    actor: input.command.actorEmail,
-    eventType: 'operations.shopify_reversal_fixture.outcome_recorded',
-    aggregateType: 'operations.shopify_reversal_fixture_command',
-    aggregateId: input.command.globalId,
-    organizationId: input.command.organizationId,
-    eventKey: `operations:shopify-reversal-fixture:outcome:${outcome.global_id}`,
-    payload: {
-      commandGlobalId: input.command.globalId,
+      [
+        input.command.organizationId,
+        input.command.id,
+        input.attemptId,
+        input.outcomeState,
+        input.providerMutationAttempted,
+        input.providerWrites,
+        input.providerReference || null,
+        input.providerOrderId || null,
+        input.providerOrderName || null,
+        input.providerOrderUpdatedAt || null,
+        input.errorCode || null,
+        input.evidenceHash || null,
+        input.command.actorEmail,
+      ],
+    )
+    const outcome = result.rows[0]
+    await recordAuditEvent({
+      actor: null,
+      subject: input.command.actorEmail,
+      isSystem: true,
+      eventType: 'operations.shopify_reversal_fixture.outcome_recorded',
+      aggregateType: 'operations.shopify_reversal_fixture_command',
+      aggregateId: input.command.globalId,
+      organizationId: input.command.organizationId,
+      eventKey: `operations:shopify-reversal-fixture:outcome:${outcome.global_id}`,
+      payload: {
+        commandGlobalId: input.command.globalId,
+        outcomeGlobalId: outcome.global_id,
+        phase: input.command.phase,
+        outcomeState: outcome.outcome_state,
+        providerMutationAttempted: input.providerMutationAttempted,
+        providerWrites: input.providerWrites,
+        providerReference: input.providerReference || null,
+        errorCode: input.errorCode || null,
+        approvedBy: input.command.actorEmail,
+        machinePrincipal: SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL,
+      },
+    }, client)
+    return Object.freeze({
       outcomeGlobalId: outcome.global_id,
-      phase: input.command.phase,
-      outcomeState: outcome.outcome_state,
-      providerMutationAttempted: input.providerMutationAttempted,
-      providerWrites: input.providerWrites,
-      providerReference: input.providerReference || null,
-      errorCode: input.errorCode || null,
-    },
-  })
-  return Object.freeze({
-    outcomeGlobalId: outcome.global_id,
-    state: outcome.outcome_state,
-    recordedAt: timestamp(outcome.recorded_at, 'Outcome time'),
+      state: outcome.outcome_state,
+      recordedAt: timestamp(outcome.recorded_at, 'Outcome time'),
+    })
   })
 }
 
@@ -958,12 +1200,23 @@ export async function readUnknownShopifyReversalFixtureCommandInPostgres(input: 
     `SELECT attempt.id::text AS attempt_id,
             attempt.global_id AS attempt_global_id
      FROM public.operations_shopify_reversal_fixture_attempts attempt
-     JOIN public.operations_shopify_reversal_fixture_outcomes outcome
-       ON outcome.organization_id = attempt.organization_id
-      AND outcome.attempt_id = attempt.id
-      AND outcome.outcome_state = 'unknown'
+     JOIN public.operations_shopify_reversal_fixture_commands durable_command
+       ON durable_command.organization_id = attempt.organization_id
+      AND durable_command.id = attempt.command_id
+     LEFT JOIN public.operations_shopify_reversal_fixture_outcomes initial
+       ON initial.organization_id = attempt.organization_id
+      AND initial.attempt_id = attempt.id
+      AND initial.outcome_state IN ('succeeded', 'rejected', 'unknown')
      WHERE attempt.organization_id = $1::uuid
        AND attempt.command_id = $2::uuid
+       AND (
+         initial.outcome_state = 'unknown'
+         OR (
+           initial.id IS NULL
+           AND durable_command.expires_at + interval '30 seconds'
+                 <= pg_catalog.clock_timestamp()
+         )
+       )
        AND NOT EXISTS (
          SELECT 1
          FROM public.operations_shopify_reversal_fixture_outcomes resolved
@@ -977,7 +1230,7 @@ export async function readUnknownShopifyReversalFixtureCommandInPostgres(input: 
   if (result.rows.length !== 1) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_RECONCILIATION_NOT_REQUIRED',
-      'This exact fixture command has no unresolved unknown provider outcome',
+      'This exact fixture command has no unresolved or unrecorded provider outcome',
     )
   }
   return Object.freeze({
@@ -996,6 +1249,9 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
   const result = await query<{
     phase: ShopifyReversalFixturePhase
     state: string
+    approval_global_id: string | null
+    approved_by: string | null
+    approved_at: Date | string | null
     attempt_global_id: string | null
     initial_outcome_global_id: string | null
     reconciliation_outcome_global_id: string | null
@@ -1004,7 +1260,8 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
     prepared_at: Date | string
     expires_at: Date | string
   }>(
-    `SELECT phase, state, attempt_global_id,
+    `SELECT phase, state, approval_global_id, approved_by, approved_at,
+            attempt_global_id,
             initial_outcome_global_id, reconciliation_outcome_global_id,
             provider_order_id, provider_reference,
             prepared_at, expires_at
@@ -1026,6 +1283,11 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
     commandGlobalId: globalId,
     phase: row.phase,
     state: row.state,
+    approvalGlobalId: row.approval_global_id,
+    approvedBy: row.approved_by,
+    approvedAt: row.approved_at
+      ? timestamp(row.approved_at, 'Approval time')
+      : null,
     attemptGlobalId: row.attempt_global_id,
     initialOutcomeGlobalId: row.initial_outcome_global_id,
     reconciliationOutcomeGlobalId: row.reconciliation_outcome_global_id,

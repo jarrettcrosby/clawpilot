@@ -13,8 +13,9 @@ import {
   prepareShopifyFulfillmentProviderAttempt,
   readShopifyFulfillment,
   shopifyFulfillmentAttemptSignatureHash,
+  shopifyReversalFixtureFulfillmentProviderPayloadHash,
   ShopifyFulfillmentWritebackError,
-  writeShopifyFulfillment,
+  executeShopifyReversalFixtureFulfillmentProviderAttempt,
   type ShopifyFulfillmentAttemptSignature,
   type ShopifyFulfillmentProviderInput,
 } from '@/lib/integrations/shopifyFulfillmentWriteback'
@@ -26,11 +27,15 @@ import {
   reconcileShopifyReversalFixtureOrder,
   SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE,
   SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
+  shopifyReversalFixtureOrderProviderPayloadHash,
   shopifyReversalFixtureTagFingerprint,
   ShopifyReversalFixtureProviderError,
 } from '@/lib/integrations/shopifyReversalFixtureProvider'
 import {
   SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
+  SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID,
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_GID,
   shopifyReversalFixtureRuntime,
 } from '@/lib/integrations/shopifyReversalFixtureRuntime'
 import {
@@ -41,11 +46,12 @@ import {
 } from '@/lib/persistence/commerceProviderWrites'
 import {
   allocateShopifyReversalFixtureCommandGlobalIdInPostgres,
-  assertShopifyReversalFixtureClaimCurrentInPostgres,
+  approveShopifyReversalFixtureCommandInPostgres,
   claimShopifyReversalFixtureCommandInPostgres,
   insertShopifyReversalFixtureCommandInPostgres,
   readShopifyReversalFixtureAuthorityInPostgres,
   readShopifyReversalFixtureCommandByIdempotencyInPostgres,
+  readShopifyReversalFixtureCommandInPostgres,
   readShopifyReversalFixtureCommandStateInPostgres,
   readShopifyReversalFixtureFulfillmentTargetInPostgres,
   readUnknownShopifyReversalFixtureCommandInPostgres,
@@ -130,6 +136,19 @@ function idempotencyKey(value: unknown) {
 async function liveCredential(
   authority: ShopifyReversalFixtureAuthority,
 ): Promise<ShopifyCommerceRuntimeCredential> {
+  if (
+    authority.organizationId !== SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID
+    || authority.accountGlobalId
+      !== SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID
+    || authority.externalAccountId !== SHOPIFY_REVERSAL_FIXTURE_SHOP_GID
+    || authority.shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
+  ) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_STORE_CHANGED',
+      'The exact Test Pro Bakery Bites fixture identity is required',
+      403,
+    )
+  }
   const providerWrites = await requireCurrentCommerceProviderWritesInPostgres({
     organizationId: authority.organizationId,
     accountGlobalId: SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
@@ -199,8 +218,8 @@ async function liveCredential(
   const credential = { shopDomain, accessToken: grant.accessToken }
   const probe = await probeShopifyConnection(credential)
   if (
-    probe.shopId !== authority.externalAccountId
-    || probe.shopDomain !== shopDomain
+    probe.shopId !== SHOPIFY_REVERSAL_FIXTURE_SHOP_GID
+    || probe.shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
   ) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_STORE_CHANGED',
@@ -221,8 +240,8 @@ async function liveCredential(
   const shop = await readShopifyLocationAdministrationShop(credential)
   if (
     shop.partnerDevelopment !== true
-    || shop.id !== authority.externalAccountId
-    || shop.domain !== shopDomain
+    || shop.id !== SHOPIFY_REVERSAL_FIXTURE_SHOP_GID
+    || shop.domain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
   ) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_PARTNER_STORE_REQUIRED',
@@ -243,8 +262,59 @@ function prepareResponse(command: ShopifyReversalFixtureCommand) {
     ),
     expiresAt: command.expiresAt,
     orderGlobalId: command.orderGlobalId,
+    approvalPath:
+      `/api/dev/shopify-test-fixtures/approve?command=${command.globalId}`,
     providerWrites: 0 as const,
     normalUiAvailable: false as const,
+  })
+}
+
+export async function readShopifyReversalFixtureApprovalIntent(input: {
+  organizationId: unknown
+  actorEmail: unknown
+  commandGlobalId: unknown
+}) {
+  runtimeGate()
+  const authority = await readShopifyReversalFixtureAuthorityInPostgres(input)
+  const command = await readShopifyReversalFixtureCommandInPostgres(input)
+  if (
+    command.actorEmail !== authority.actorEmail
+    || command.organizationId !== authority.organizationId
+  ) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_ACTOR_MISMATCH',
+      'The signed-in actor does not own this fixture approval',
+      403,
+    )
+  }
+  if (Date.parse(command.expiresAt) <= Date.now()) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_APPROVAL_EXPIRED',
+      'This fixture approval window has expired',
+      409,
+    )
+  }
+  return prepareResponse(command)
+}
+
+export async function approveShopifyReversalFixtureCommand(input: {
+  organizationId: unknown
+  actorEmail: unknown
+  browserSessionId: unknown
+  commandGlobalId: unknown
+  intentHash: unknown
+  confirmationStatement: unknown
+}) {
+  runtimeGate()
+  const approval =
+    await approveShopifyReversalFixtureCommandInPostgres(input)
+  return Object.freeze({
+    approvalGlobalId: approval.globalId,
+    commandGlobalId: input.commandGlobalId,
+    approvedBy: approval.approvedBy,
+    approvedAt: approval.approvedAt,
+    providerWrites: 0 as const,
+    oneTime: true as const,
   })
 }
 
@@ -271,7 +341,7 @@ export async function prepareShopifyReversalFixtureOrder(input: {
     }
     return prepareResponse(replay)
   }
-  await liveCredential(authority)
+  const credential = await liveCredential(authority)
   const globalId =
     await allocateShopifyReversalFixtureCommandGlobalIdInPostgres()
   const sourceIdentifier = `clawpilot-reversal-fixture:${globalId}`
@@ -281,6 +351,12 @@ export async function prepareShopifyReversalFixtureOrder(input: {
     organizationId: authority.organizationId,
   }).slice(0, 24)}`
   const tagFingerprint = shopifyReversalFixtureTagFingerprint(uniqueTag)
+  const providerPayloadHash =
+    shopifyReversalFixtureOrderProviderPayloadHash({
+      shopDomain: credential.shopDomain,
+      sourceIdentifier,
+      uniqueTag,
+    })
   const intentHash = hash({
     version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
     phase: 'create_order',
@@ -295,6 +371,7 @@ export async function prepareShopifyReversalFixtureOrder(input: {
     sourceIdentifier,
     uniqueTag,
     tagFingerprint,
+    providerPayloadHash,
     orderProfile: SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE,
   })
   const statement = confirmationStatement('create_order', intentHash)
@@ -305,6 +382,7 @@ export async function prepareShopifyReversalFixtureOrder(input: {
     idempotencyKey: key,
     intentHash,
     confirmationHash: createHash('sha256').update(statement).digest('hex'),
+    providerPayloadHash,
     sourceIdentifier,
     uniqueTag,
     tagFingerprint,
@@ -366,6 +444,12 @@ export async function prepareShopifyReversalFixtureFulfillment(input: {
   const signatureHash = shopifyFulfillmentAttemptSignatureHash(
     preparation.signature,
   )
+  const providerPayloadHash =
+    shopifyReversalFixtureFulfillmentProviderPayloadHash(
+      credential,
+      preparation.providerInput,
+      preparation.signature,
+    )
   const intentHash = hash({
     version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
     phase: 'create_fulfillment',
@@ -382,6 +466,7 @@ export async function prepareShopifyReversalFixtureFulfillment(input: {
     carrier: FIXTURE_CARRIER,
     trackingNumbers,
     signatureHash,
+    providerPayloadHash,
   })
   const statement = confirmationStatement('create_fulfillment', intentHash)
   const command = await insertShopifyReversalFixtureCommandInPostgres({
@@ -391,6 +476,7 @@ export async function prepareShopifyReversalFixtureFulfillment(input: {
     idempotencyKey: key,
     intentHash,
     confirmationHash: createHash('sha256').update(statement).digest('hex'),
+    providerPayloadHash,
     fulfillmentTarget: target,
     fulfillmentAttemptSignature: preparation.signature as unknown as
       Record<string, unknown>,
@@ -406,13 +492,34 @@ function safeErrorCode(error: unknown, fallback: string) {
   return /^[A-Z][A-Z0-9_]{1,127}$/u.test(value) ? value : fallback
 }
 
+async function recordOutcomeConservatively(
+  input: Parameters<typeof recordShopifyReversalFixtureOutcomeInPostgres>[0],
+) {
+  try {
+    return await recordShopifyReversalFixtureOutcomeInPostgres(input)
+  } catch {
+    return Object.freeze({
+      outcomeGlobalId: null,
+      state: 'unknown' as const,
+      recordedAt: null,
+      outcomePersistence: 'failed' as const,
+      errorCode: 'SHOPIFY_REVERSAL_FIXTURE_OUTCOME_PERSISTENCE_UNKNOWN',
+    })
+  }
+}
+
 async function executeOrder(
   claimed: Awaited<ReturnType<
     typeof claimShopifyReversalFixtureCommandInPostgres
   >>,
 ) {
   const { command } = claimed
-  let mutationFencePassed = false
+  let providerOrder: Awaited<ReturnType<
+    typeof createShopifyReversalFixtureOrder
+  >> | null = null
+  let outcomeInput: Parameters<
+    typeof recordShopifyReversalFixtureOutcomeInPostgres
+  >[0]
   try {
     const credential = await liveCredential(command.authority)
     if (!command.sourceIdentifier || !command.uniqueTag) {
@@ -422,41 +529,40 @@ async function executeOrder(
         500,
       )
     }
-    const order = await createShopifyReversalFixtureOrder(credential, {
+    providerOrder = await createShopifyReversalFixtureOrder(credential, {
       sourceIdentifier: command.sourceIdentifier,
       uniqueTag: command.uniqueTag,
-      beforeProviderMutation: async () => {
-        await assertShopifyReversalFixtureClaimCurrentInPostgres({
-          organizationId: command.organizationId,
-          commandId: command.id,
-          attemptId: claimed.attemptId,
-          actorEmail: command.actorEmail,
-        })
-        mutationFencePassed = true
+      claim: {
+        organizationId: command.organizationId,
+        commandId: command.id,
+        attemptId: claimed.attemptId,
+        actorEmail: command.actorEmail,
       },
     })
-    const outcome = await recordShopifyReversalFixtureOutcomeInPostgres({
+    outcomeInput = {
       command,
       attemptId: claimed.attemptId,
       outcomeState: 'succeeded',
       providerMutationAttempted: true,
       providerWrites: 1,
-      providerReference: order.id,
-      providerOrderId: order.id,
-      providerOrderName: order.name,
-      providerOrderUpdatedAt: order.updatedAt,
-      evidenceHash: hash(order),
-    })
-    return { ...outcome, providerOrderId: order.id, providerOrderName: order.name }
+      providerReference: providerOrder.id,
+      providerOrderId: providerOrder.id,
+      providerOrderName: providerOrder.name,
+      providerOrderUpdatedAt: providerOrder.updatedAt,
+      evidenceHash: hash(providerOrder),
+    }
   } catch (error) {
-    const explicitRejection = error instanceof ShopifyReversalFixtureProviderError
-      && error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
-    const unknown = mutationFencePassed && !explicitRejection
-    const outcome = await recordShopifyReversalFixtureOutcomeInPostgres({
+    const providerMutationAttempted =
+      error instanceof ShopifyReversalFixtureProviderError
+      && error.providerMutationAttempted
+    const unknown = providerMutationAttempted
+      && error instanceof ShopifyReversalFixtureProviderError
+      && error.outcomeUnknown
+    outcomeInput = {
       command,
       attemptId: claimed.attemptId,
       outcomeState: unknown ? 'unknown' : 'rejected',
-      providerMutationAttempted: mutationFencePassed,
+      providerMutationAttempted,
       providerWrites: unknown ? null : 0,
       errorCode: safeErrorCode(
         error,
@@ -464,8 +570,14 @@ async function executeOrder(
           ? 'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN'
           : 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',
       ),
-    })
-    return { ...outcome, providerOrderId: null, providerOrderName: null }
+    }
+  }
+  const outcome = await recordOutcomeConservatively(outcomeInput)
+  const evidenceDurable = outcome.outcomeGlobalId !== null
+  return {
+    ...outcome,
+    providerOrderId: evidenceDurable ? providerOrder?.id || null : null,
+    providerOrderName: evidenceDurable ? providerOrder?.name || null : null,
   }
 }
 
@@ -504,26 +616,27 @@ async function executeFulfillment(
   >>,
 ) {
   const { command } = claimed
-  let mutationFencePassed = false
+  let providerReference: string | null = null
+  let outcomeInput: Parameters<
+    typeof recordShopifyReversalFixtureOutcomeInPostgres
+  >[0]
   try {
     const providerInput = fulfillmentProviderInput(command)
     const credential = await liveCredential(command.authority)
-    const result = await writeShopifyFulfillment(
+    const result = await executeShopifyReversalFixtureFulfillmentProviderAttempt(
       credential,
       providerInput,
       command.fulfillmentAttemptSignature,
-      async () => {
-        await assertShopifyReversalFixtureClaimCurrentInPostgres({
-          organizationId: command.organizationId,
-          commandId: command.id,
-          attemptId: claimed.attemptId,
-          actorEmail: command.actorEmail,
-        })
-        mutationFencePassed = true
+      {
+        organizationId: command.organizationId,
+        commandId: command.id,
+        attemptId: claimed.attemptId,
+        actorEmail: command.actorEmail,
       },
     )
+    providerReference = result.providerReference
     if (result.replayed) {
-      const outcome = await recordShopifyReversalFixtureOutcomeInPostgres({
+      outcomeInput = {
         command,
         attemptId: claimed.attemptId,
         outcomeState: 'rejected',
@@ -537,41 +650,35 @@ async function executeFulfillment(
           providerReference: result.providerReference,
           resolution: 'preexisting',
         }),
-      })
-      return {
-        ...outcome,
-        providerOrderId: command.externalOrderId,
+      }
+    } else {
+      outcomeInput = {
+        command,
+        attemptId: claimed.attemptId,
+        outcomeState: 'succeeded',
+        providerMutationAttempted: true,
+        providerWrites: 1,
         providerReference: result.providerReference,
+        providerOrderId: command.externalOrderId,
+        evidenceHash: hash({
+          signatureHash: command.fulfillmentAttemptSignatureHash,
+          providerReference: result.providerReference,
+        }),
       }
     }
-    const outcome = await recordShopifyReversalFixtureOutcomeInPostgres({
-      command,
-      attemptId: claimed.attemptId,
-      outcomeState: 'succeeded',
-      providerMutationAttempted: true,
-      providerWrites: 1,
-      providerReference: result.providerReference,
-      providerOrderId: command.externalOrderId,
-      evidenceHash: hash({
-        signatureHash: command.fulfillmentAttemptSignatureHash,
-        providerReference: result.providerReference,
-      }),
-    })
-    return {
-      ...outcome,
-      providerOrderId: command.externalOrderId,
-      providerReference: result.providerReference,
-    }
   } catch (error) {
-    const unknown = mutationFencePassed && (
-      !(error instanceof ShopifyFulfillmentWritebackError)
-      || error.outcomeUnknown
-    )
-    const outcome = await recordShopifyReversalFixtureOutcomeInPostgres({
+    const explicitRejection = error instanceof ShopifyFulfillmentWritebackError
+      && error.code === 'SHOPIFY_FULFILLMENT_REJECTED'
+    const providerMutationAttempted =
+      error instanceof ShopifyFulfillmentWritebackError
+      && (error.outcomeUnknown || explicitRejection)
+    const unknown = error instanceof ShopifyFulfillmentWritebackError
+      && error.outcomeUnknown
+    outcomeInput = {
       command,
       attemptId: claimed.attemptId,
       outcomeState: unknown ? 'unknown' : 'rejected',
-      providerMutationAttempted: mutationFencePassed,
+      providerMutationAttempted,
       providerWrites: unknown ? null : 0,
       providerOrderId: command.externalOrderId,
       errorCode: safeErrorCode(
@@ -580,12 +687,15 @@ async function executeFulfillment(
           ? 'SHOPIFY_REVERSAL_FIXTURE_FULFILLMENT_OUTCOME_UNKNOWN'
           : 'SHOPIFY_REVERSAL_FIXTURE_FULFILLMENT_REJECTED',
       ),
-    })
-    return {
-      ...outcome,
-      providerOrderId: command.externalOrderId,
-      providerReference: null,
     }
+  }
+  const outcome = await recordOutcomeConservatively(outcomeInput)
+  return {
+    ...outcome,
+    providerOrderId: command.externalOrderId,
+    providerReference: outcome.outcomeGlobalId === null
+      ? null
+      : providerReference,
   }
 }
 
@@ -607,6 +717,7 @@ export async function executeShopifyReversalFixtureCommand(input: {
     phase: claimed.command.phase,
     ...result,
     retryAllowed: false as const,
+    reconciliationRequired: result.state === 'unknown',
   })
 }
 

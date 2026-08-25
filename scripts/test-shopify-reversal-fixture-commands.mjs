@@ -14,7 +14,7 @@ const ts = requireFromApp('typescript')
 const path = 'app_src/lib/operations/shopifyReversalFixtureCommands.ts'
 const source = readFileSync(resolve(path), 'utf8')
 
-const organizationId = '11111111-1111-4111-8111-111111111111'
+const organizationId = 'c6c8e6e7-fffa-4969-9526-e99da0ab2754'
 const actorEmail = 'owner@example.test'
 const authority = Object.freeze({
   organizationId,
@@ -22,8 +22,8 @@ const authority = Object.freeze({
   actorRole: 'owner',
   integrationAccountId: '22222222-2222-4222-8222-222222222222',
   accountGlobalId: 'giah34fedoa5b1o',
-  externalAccountId: 'gid://shopify/Shop/123456789',
-  shopDomain: 'fixed-development-store.myshopify.com',
+  externalAccountId: 'gid://shopify/Shop/95083757815',
+  shopDomain: 'test-pro-bakery-bites.myshopify.com',
   controlRowVersion: 7,
   credentialGeneration: 3,
   grantedScopeDigest: 'a'.repeat(64),
@@ -73,12 +73,14 @@ const calls = {
   inserts: [],
   outcomes: [],
   providerWrites: [],
+  approvals: [],
 }
 let replay = null
 let claimed = null
 let unknown = null
 let createOrderMode = 'success'
 let fulfillmentMode = 'success'
+let outcomePersistenceMode = null
 
 class FixtureProviderError extends Error {
   constructor(code, outcomeUnknown = false) {
@@ -114,6 +116,7 @@ function commandFromInsert(input) {
     idempotencyKey: input.idempotencyKey,
     intentHash: input.intentHash,
     confirmationHash: input.confirmationHash,
+    providerPayloadHash: input.providerPayloadHash,
     sourceIdentifier: input.sourceIdentifier || null,
     uniqueTag: input.uniqueTag || null,
     tagFingerprint: input.tagFingerprint || null,
@@ -129,7 +132,7 @@ function commandFromInsert(input) {
     fulfillmentAttemptSignatureHash:
       input.fulfillmentAttemptSignatureHash || null,
     preparedAt: '2026-08-25T12:00:01.000Z',
-    expiresAt: '2026-08-25T12:05:01.000Z',
+    expiresAt: '2099-08-25T12:05:01.000Z',
     authority,
   })
 }
@@ -189,6 +192,8 @@ vm.runInNewContext(output, {
       return {
         ShopifyFulfillmentWritebackError: FulfillmentError,
         shopifyFulfillmentAttemptSignatureHash: () => 'b'.repeat(64),
+        shopifyReversalFixtureFulfillmentProviderPayloadHash:
+          () => 'e'.repeat(64),
         prepareShopifyFulfillmentProviderAttempt: async (
           _credential,
           input,
@@ -198,11 +203,11 @@ vm.runInNewContext(output, {
           assert.deepEqual(input.expectedLineItems, target.expectedLines)
           return { signature, existing: null, providerInput: input }
         },
-        writeShopifyFulfillment: async (
+        executeShopifyReversalFixtureFulfillmentProviderAttempt: async (
           _credential,
           input,
           suppliedSignature,
-          beforeProviderMutation,
+          claim,
         ) => {
           calls.fulfillmentWrite += 1
           assert.equal(input.notifyCustomer, false)
@@ -216,7 +221,9 @@ vm.runInNewContext(output, {
               replayed: true,
             }
           }
-          await beforeProviderMutation()
+          assert.equal(claim.organizationId, organizationId)
+          assert.equal(claim.actorEmail, actorEmail)
+          calls.assertCurrent += 1
           if (fulfillmentMode === 'unknown') {
             throw new FulfillmentError(
               'SHOPIFY_FULFILLMENT_OUTCOME_UNKNOWN',
@@ -225,7 +232,7 @@ vm.runInNewContext(output, {
           }
           if (fulfillmentMode === 'rejected') {
             throw new FulfillmentError(
-              'SHOPIFY_FULFILLMENT_PROVIDER_REJECTED',
+              'SHOPIFY_FULFILLMENT_REJECTED',
               false,
             )
           }
@@ -271,13 +278,17 @@ vm.runInNewContext(output, {
         shopifyReversalFixtureTagFingerprint: (tag) => (
           createHash('sha256').update(tag).digest('hex')
         ),
+        shopifyReversalFixtureOrderProviderPayloadHash:
+          () => 'd'.repeat(64),
         ShopifyReversalFixtureProviderError: FixtureProviderError,
         createShopifyReversalFixtureOrder: async (
           _credential,
           input,
         ) => {
           calls.createOrder += 1
-          await input.beforeProviderMutation()
+          assert.equal(input.claim.organizationId, organizationId)
+          assert.equal(input.claim.actorEmail, actorEmail)
+          calls.assertCurrent += 1
           if (createOrderMode === 'unknown') {
             throw new FixtureProviderError(
               'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN',
@@ -310,6 +321,11 @@ vm.runInNewContext(output, {
     if (specifier === '@/lib/integrations/shopifyReversalFixtureRuntime') {
       return {
         SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID: 'giah34fedoa5b1o',
+        SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID: organizationId,
+        SHOPIFY_REVERSAL_FIXTURE_SHOP_GID:
+          'gid://shopify/Shop/95083757815',
+        SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
+          'test-pro-bakery-bites.myshopify.com',
         shopifyReversalFixtureRuntime: () => ({
           available: true,
           blockerCode: null,
@@ -352,6 +368,19 @@ vm.runInNewContext(output, {
     if (specifier === '@/lib/persistence/shopifyReversalFixture') {
       return {
         readShopifyReversalFixtureAuthorityInPostgres: async () => authority,
+        readShopifyReversalFixtureCommandInPostgres: async () => (
+          calls.inserts.length > 0
+            ? commandFromInsert(calls.inserts[0])
+            : null
+        ),
+        approveShopifyReversalFixtureCommandInPostgres: async (input) => {
+          calls.approvals.push(input)
+          return {
+            globalId: 'gsfa1234567',
+            approvedBy: actorEmail,
+            approvedAt: '2026-08-25T12:00:01.500Z',
+          }
+        },
         readShopifyReversalFixtureCommandByIdempotencyInPostgres:
           async () => replay,
         allocateShopifyReversalFixtureCommandGlobalIdInPostgres:
@@ -365,11 +394,13 @@ vm.runInNewContext(output, {
         readShopifyReversalFixtureFulfillmentTargetInPostgres:
           async () => target,
         claimShopifyReversalFixtureCommandInPostgres: async () => claimed,
-        assertShopifyReversalFixtureClaimCurrentInPostgres: async () => {
-          calls.assertCurrent += 1
-        },
         recordShopifyReversalFixtureOutcomeInPostgres: async (input) => {
           calls.outcomes.push(input)
+          if (outcomePersistenceMode) {
+            throw new Error(
+              `${outcomePersistenceMode} failure after provider success`,
+            )
+          }
           return {
             outcomeGlobalId: 'gsfo1234567',
             state: input.outcomeState,
@@ -396,10 +427,34 @@ const preparedOrder = await commands.prepareShopifyReversalFixtureOrder({
 })
 assert.equal(preparedOrder.phase, 'create_order')
 assert.match(preparedOrder.confirmationStatement, /^CREATE TEST ORDER [a-f0-9]{12}$/u)
+assert.equal(
+  preparedOrder.approvalPath,
+  '/api/dev/shopify-test-fixtures/approve?command=gsfc1234567',
+)
 assert.equal(calls.createOrder, 0, 'prepare must not create the provider order')
 assert.equal(calls.fulfillmentPrepare, 0, 'phase 1 must not inspect fulfillment')
 assert.equal(calls.inserts[0].sourceIdentifier, 'clawpilot-reversal-fixture:gsfc1234567')
 assert.match(calls.inserts[0].uniqueTag, /^clawpilot-reversal-[a-f0-9]{24}$/u)
+assert.equal(calls.inserts[0].providerPayloadHash, 'd'.repeat(64))
+
+const approvalIntent =
+  await commands.readShopifyReversalFixtureApprovalIntent({
+    organizationId,
+    actorEmail,
+    commandGlobalId: preparedOrder.commandGlobalId,
+  })
+assert.equal(approvalIntent.intentHash, preparedOrder.intentHash)
+const approval = await commands.approveShopifyReversalFixtureCommand({
+  organizationId,
+  actorEmail,
+  browserSessionId: '99999999-9999-4999-8999-999999999999',
+  commandGlobalId: preparedOrder.commandGlobalId,
+  intentHash: preparedOrder.intentHash,
+  confirmationStatement: preparedOrder.confirmationStatement,
+})
+assert.equal(approval.approvalGlobalId, 'gsfa1234567')
+assert.equal(approval.oneTime, true)
+assert.equal(calls.approvals.length, 1)
 
 const orderCommand = commandFromInsert(calls.inserts[0])
 claimed = {
@@ -419,6 +474,34 @@ assert.equal(calls.createOrder, 1)
 assert.equal(calls.assertCurrent, 1)
 assert.equal(calls.fulfillmentWrite, 0, 'phase 1 must not auto-chain phase 2')
 assert.equal(calls.outcomes.at(-1).providerMutationAttempted, true)
+
+for (const failureMode of ['outcome insert', 'outcome audit']) {
+  outcomePersistenceMode = failureMode
+  const writesBeforeFailure = calls.createOrder
+  const outcomeAttemptsBeforeFailure = calls.outcomes.length
+  const persistenceFailure =
+    await commands.executeShopifyReversalFixtureCommand({
+      organizationId,
+      actorEmail,
+      commandGlobalId: orderCommand.globalId,
+      intentHash: orderCommand.intentHash,
+      confirmationStatement: preparedOrder.confirmationStatement,
+    })
+  assert.equal(calls.createOrder, writesBeforeFailure + 1)
+  assert.equal(calls.outcomes.length, outcomeAttemptsBeforeFailure + 1)
+  assert.equal(calls.outcomes.at(-1).outcomeState, 'succeeded')
+  assert.equal(persistenceFailure.state, 'unknown')
+  assert.equal(persistenceFailure.outcomeGlobalId, null)
+  assert.equal(persistenceFailure.outcomePersistence, 'failed')
+  assert.equal(
+    persistenceFailure.errorCode,
+    'SHOPIFY_REVERSAL_FIXTURE_OUTCOME_PERSISTENCE_UNKNOWN',
+  )
+  assert.equal(persistenceFailure.providerOrderId, null)
+  assert.equal(persistenceFailure.retryAllowed, false)
+  assert.equal(persistenceFailure.reconciliationRequired, true)
+}
+outcomePersistenceMode = null
 
 createOrderMode = 'unknown'
 await commands.executeShopifyReversalFixtureCommand({
@@ -463,6 +546,7 @@ assert.equal(
   calls.inserts.at(-1).fulfillmentAttemptSignatureHash,
   'b'.repeat(64),
 )
+assert.equal(calls.inserts.at(-1).providerPayloadHash, 'e'.repeat(64))
 
 const fulfillmentCommand = commandFromInsert(calls.inserts.at(-1))
 claimed = {

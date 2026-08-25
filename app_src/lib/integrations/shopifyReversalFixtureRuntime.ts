@@ -5,10 +5,18 @@ import {
 
 export const SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID =
   'giah34fedoa5b1o' as const
+export const SHOPIFY_REVERSAL_FIXTURE_ORGANIZATION_ID =
+  'c6c8e6e7-fffa-4969-9526-e99da0ab2754' as const
+export const SHOPIFY_REVERSAL_FIXTURE_SHOP_GID =
+  'gid://shopify/Shop/95083757815' as const
+export const SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN =
+  'test-pro-bakery-bites.myshopify.com' as const
 export const SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID =
   'gid://shopify/ProductVariant/51028106379511' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_PROJECT_ID =
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270' as const
+export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_SERVICE_ID =
+  'f3fdf47c-6645-42ff-9a28-52843f8e4da2' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_ENVIRONMENT_ID =
   'e4abd95f-825c-4242-b37b-825a92597e98' as const
 export const SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY =
@@ -55,6 +63,8 @@ export function shopifyReversalFixtureRuntime(): ShopifyReversalFixtureRuntime {
     process.env.VERCEL
     || String(process.env.RAILWAY_PROJECT_ID || '').trim()
       !== SHOPIFY_REVERSAL_FIXTURE_RAILWAY_PROJECT_ID
+    || String(process.env.RAILWAY_SERVICE_ID || '').trim()
+      !== SHOPIFY_REVERSAL_FIXTURE_RAILWAY_SERVICE_ID
     || String(process.env.RAILWAY_ENVIRONMENT_ID || '').trim()
       !== SHOPIFY_REVERSAL_FIXTURE_RAILWAY_ENVIRONMENT_ID
     || String(process.env.RAILWAY_ENVIRONMENT_NAME || '').trim().toLowerCase()

@@ -39,7 +39,7 @@ const orderEditingReleaseMigrations = new Map([
 
 const shopifyReversalFixtureMigration = [
   'db/migrations/0326_operations_shopify_reversal_test_fixture.sql',
-  'fe7e5ebb5e5cae4eedfe69a8d0dc863ef76ce90a0c003d7193d94fafcd8be074',
+  '8e23a84f09527467acaf2a1ec500642cd6bf11f532c4131dd98b4b8655e09a25',
 ]
 
 const legacyUnitMeasurementMigration = [
@@ -162,11 +162,14 @@ const shopifyReversalFixtureRequiredFiles = [
   'app_src/lib/persistence/shopifyReversalFixtureHealth.ts',
   'app_src/lib/operations/shopifyReversalFixtureCommands.ts',
   'app_src/app/api/dev/shopify-test-fixtures/route.ts',
+  'app_src/app/api/dev/shopify-test-fixtures/approve/route.ts',
   'scripts/shopify-test-fixture.mjs',
   'scripts/test-shopify-reversal-fixture-runtime.mjs',
   'scripts/test-shopify-reversal-fixture-adapter.mjs',
   'scripts/test-shopify-reversal-fixture-commands.mjs',
   'scripts/test-shopify-reversal-fixture-api.mjs',
+  'scripts/test-shopify-reversal-fixture-approval-api.mjs',
+  'scripts/test-shopify-reversal-fixture-persistence-atomic.mjs',
   'scripts/test-shopify-reversal-fixture-postgres.mjs',
   'scripts/test-shopify-reversal-fixture-static.mjs',
   'docs/operations/shopify-reversal-test-fixture.md',
@@ -184,6 +187,8 @@ for (const command of [
   'node scripts/test-shopify-reversal-fixture-adapter.mjs',
   'node scripts/test-shopify-reversal-fixture-commands.mjs',
   'node scripts/test-shopify-reversal-fixture-api.mjs',
+  'node scripts/test-shopify-reversal-fixture-approval-api.mjs',
+  'node scripts/test-shopify-reversal-fixture-persistence-atomic.mjs',
   'node scripts/test-shopify-reversal-fixture-postgres.mjs',
   'node scripts/test-shopify-reversal-fixture-static.mjs',
 ]) {
@@ -203,8 +208,12 @@ const shopifyReversalFixtureRuntimeSource = readFileSync(
 )
 for (const fragment of [
   'giah34fedoa5b1o',
+  'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
+  'gid://shopify/Shop/95083757815',
+  'test-pro-bakery-bites.myshopify.com',
   'gid://shopify/ProductVariant/51028106379511',
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
+  'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
   'e4abd95f-825c-4242-b37b-825a92597e98',
   '750aa268-0e31-4065-a99c-4016e4d4fab1',
   'CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED',
@@ -234,8 +243,14 @@ if (
   || proxySource.includes(
     "normalizedPath === '/api/dev/shopify-test-fixtures'",
   )
+  || proxySource.includes(
+    "pathname === '/api/dev/shopify-test-fixtures/approve'",
+  )
+  || proxySource.includes(
+    "pathname.startsWith('/api/dev/shopify-test-fixtures",
+  )
 ) {
-  fail('Shopify reversal fixture proxy exception must match only the exact route')
+  fail('Shopify reversal fixture proxy exception must match only the exact worker route')
 }
 const [legacyUnitMeasurementMigrationPath,
   legacyUnitMeasurementMigrationChecksum] = legacyUnitMeasurementMigration

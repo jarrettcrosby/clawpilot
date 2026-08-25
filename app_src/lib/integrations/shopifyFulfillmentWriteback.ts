@@ -28,6 +28,12 @@ import {
 import {
   requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
+  assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres,
+} from '@/lib/persistence/shopifyReversalFixture'
+import {
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
+} from '@/lib/integrations/shopifyReversalFixtureRuntime'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_GID = /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
@@ -1358,11 +1364,11 @@ function findExactExistingFulfillment(
   }
 }
 
-export async function writeShopifyFulfillment(
+async function writeShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
   input: ShopifyFulfillmentProviderInput,
-  attemptSignature?: unknown,
-  beforeProviderMutation?: () => Promise<void>,
+  attemptSignature: unknown,
+  beforeProviderMutation: () => Promise<void>,
 ): Promise<ShopifyFulfillmentWritebackResult> {
   const suppliedSignature = attemptSignature === undefined
     ? null
@@ -1402,7 +1408,7 @@ export async function writeShopifyFulfillment(
     }
   }
   let mutation: FulfillmentCreateResponse
-  await beforeProviderMutation?.()
+  await beforeProviderMutation()
   try {
     mutation = await shopifyAdminGraphql<FulfillmentCreateResponse>(credential, {
       query: FULFILLMENT_CREATE_MUTATION,
@@ -1477,6 +1483,81 @@ export async function writeShopifyFulfillment(
     trackingNumbers: input.trackingNumbers,
     replayed: false,
   }
+}
+
+/**
+ * Narrow provider adapter for the hidden Test Pro Bakery Bites reversal
+ * fixture. Unlike the ordinary fulfillment path, the fixture owns a separate
+ * append-only claim ledger. Keep the generic mutation primitive private so no
+ * other caller can bypass the normal sealed commerce-export authority.
+ */
+export function shopifyReversalFixtureFulfillmentProviderPayloadHash(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ShopifyFulfillmentProviderInput,
+  attemptSignature: unknown,
+) {
+  const fixedTracking = input.trackingNumbers.length === 1
+    && /^CP-REV-GSFC(?:[0-9]{7}|[0-9A-V]{12})$/u.test(
+      input.trackingNumbers[0],
+    )
+  const fixedLine = input.expectedLineItems.length === 1
+    && SHOPIFY_LINE_ITEM_GID.test(input.expectedLineItems[0].lineItemId)
+    && input.expectedLineItems[0].quantity === 1
+  if (
+    credential.shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
+    || input.carrier !== 'ClawPilot Fixture'
+    || input.notifyCustomer !== false
+    || input.sandboxE2eAuthorityKind !== null
+    || input.allowLegacySignatureWithoutAuthorityKind !== false
+    || !fixedTracking
+    || !fixedLine
+  ) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_REVERSAL_FIXTURE_FULFILLMENT_PROVIDER_INPUT_INVALID',
+      'The hidden reversal fixture accepts only its exact fixed sandbox fulfillment input',
+    )
+  }
+  const signature = normalizeAttemptSignatureForInput(attemptSignature, input)
+  return createHash('sha256').update(JSON.stringify({
+    version: 'shopify-reversal-fixture-fulfillment-provider-payload-v1',
+    shopDomain: credential.shopDomain,
+    externalOrderId: input.externalOrderId,
+    carrier: input.carrier,
+    trackingNumbers: input.trackingNumbers,
+    notifyCustomer: input.notifyCustomer,
+    expectedLineItems: input.expectedLineItems,
+    signature,
+  })).digest('hex')
+}
+
+export async function executeShopifyReversalFixtureFulfillmentProviderAttempt(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ShopifyFulfillmentProviderInput,
+  attemptSignature: unknown,
+  claim: {
+    organizationId: string
+    commandId: string
+    attemptId: string
+    actorEmail: string
+  },
+): Promise<ShopifyFulfillmentWritebackResult> {
+  const providerPayloadHash =
+    shopifyReversalFixtureFulfillmentProviderPayloadHash(
+      credential,
+      input,
+      attemptSignature,
+    )
+  return writeShopifyFulfillment(
+    credential,
+    input,
+    attemptSignature,
+    async () => {
+      await assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres({
+        ...claim,
+        providerPayloadHash,
+      })
+    },
+  )
 }
 
 async function inspectShopifyFulfillment(

@@ -1,10 +1,10 @@
 -- Hidden development-only Shopify reversal fixture authority.
 --
 -- This is not an Operations workflow and it does not weaken any ordinary
--- order, fulfillment, or reversal command.  The three ledgers are immutable:
--- one prepared command, at most one provider claim, and append-only terminal
--- outcome evidence.  An unknown provider outcome can only be reconciled by a
--- read; it can never be claimed again.
+-- order, fulfillment, or reversal command.  The four ledgers are immutable:
+-- one prepared command, one authenticated human approval, at most one provider
+-- claim, and append-only terminal outcome evidence.  An unknown provider
+-- outcome can only be reconciled by a read; it can never be claimed again.
 
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
@@ -14,6 +14,8 @@ INSERT INTO public.global_reference_entity_types (
 ) VALUES
   ('gsfc', 'operations.shopify_reversal_fixture_command',
    'Shopify reversal fixture command'),
+  ('gsfa', 'operations.shopify_reversal_fixture_approval',
+   'Shopify reversal fixture human approval'),
   ('gsft', 'operations.shopify_reversal_fixture_attempt',
    'Shopify reversal fixture provider attempt'),
   ('gsfo', 'operations.shopify_reversal_fixture_outcome',
@@ -38,6 +40,8 @@ CREATE TABLE public.operations_shopify_reversal_fixture_commands (
   intent_hash text NOT NULL CHECK (intent_hash ~ '^[a-f0-9]{64}$'),
   confirmation_hash text NOT NULL
     CHECK (confirmation_hash ~ '^[a-f0-9]{64}$'),
+  provider_payload_hash text NOT NULL
+    CHECK (provider_payload_hash ~ '^[a-f0-9]{64}$'),
   provider_write_control_row_version bigint NOT NULL
     CHECK (provider_write_control_row_version > 0),
   credential_generation integer NOT NULL CHECK (credential_generation > 0),
@@ -140,12 +144,47 @@ CREATE TABLE public.operations_shopify_reversal_fixture_commands (
   )
 );
 
+CREATE TABLE public.operations_shopify_reversal_fixture_approvals (
+  id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
+  global_id text NOT NULL DEFAULT public.allocate_global_reference('gsfa'),
+  organization_id uuid NOT NULL
+    REFERENCES public.workspace_organizations(id) ON DELETE RESTRICT,
+  command_id uuid NOT NULL,
+  approved_by text NOT NULL
+    REFERENCES public.app_users(email) ON DELETE RESTRICT,
+  approved_role text NOT NULL CHECK (approved_role IN ('owner', 'admin')),
+  browser_session_id uuid NOT NULL
+    REFERENCES public.app_sessions(id) ON DELETE RESTRICT,
+  intent_hash text NOT NULL CHECK (intent_hash ~ '^[a-f0-9]{64}$'),
+  confirmation_hash text NOT NULL
+    CHECK (confirmation_hash ~ '^[a-f0-9]{64}$'),
+  approved_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_global_valid
+    CHECK (global_id ~ '^gsfa(?:[0-9]{7}|[0-9a-v]{12})$'),
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_global_unique
+    UNIQUE (global_id),
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_registry_fkey
+    FOREIGN KEY (global_id)
+    REFERENCES public.crm_reference_registry(reference_code)
+    ON DELETE RESTRICT,
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_command_fkey
+    FOREIGN KEY (organization_id, command_id)
+    REFERENCES public.operations_shopify_reversal_fixture_commands(
+      organization_id, id
+    ) ON DELETE RESTRICT,
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_command_unique
+    UNIQUE (organization_id, command_id),
+  CONSTRAINT operations_shopify_reversal_fixture_approvals_org_id_unique
+    UNIQUE (organization_id, id)
+);
+
 CREATE TABLE public.operations_shopify_reversal_fixture_attempts (
   id uuid PRIMARY KEY DEFAULT pg_catalog.gen_random_uuid(),
   global_id text NOT NULL DEFAULT public.allocate_global_reference('gsft'),
   organization_id uuid NOT NULL
     REFERENCES public.workspace_organizations(id) ON DELETE RESTRICT,
   command_id uuid NOT NULL,
+  approval_id uuid NOT NULL,
   phase text NOT NULL CHECK (phase IN ('create_order', 'create_fulfillment')),
   claimed_by text NOT NULL
     REFERENCES public.app_users(email) ON DELETE RESTRICT,
@@ -153,6 +192,8 @@ CREATE TABLE public.operations_shopify_reversal_fixture_attempts (
   intent_hash text NOT NULL CHECK (intent_hash ~ '^[a-f0-9]{64}$'),
   confirmation_hash text NOT NULL
     CHECK (confirmation_hash ~ '^[a-f0-9]{64}$'),
+  worker_principal text NOT NULL
+    CHECK (worker_principal = 'pipeline_outbox_worker'),
   claimed_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp(),
   CONSTRAINT operations_shopify_reversal_fixture_attempts_global_valid
     CHECK (global_id ~ '^gsft(?:[0-9]{7}|[0-9a-v]{12})$'),
@@ -165,6 +206,11 @@ CREATE TABLE public.operations_shopify_reversal_fixture_attempts (
   CONSTRAINT operations_shopify_reversal_fixture_attempts_command_fkey
     FOREIGN KEY (organization_id, command_id)
     REFERENCES public.operations_shopify_reversal_fixture_commands(
+      organization_id, id
+    ) ON DELETE RESTRICT,
+  CONSTRAINT operations_shopify_reversal_fixture_attempts_approval_fkey
+    FOREIGN KEY (organization_id, approval_id)
+    REFERENCES public.operations_shopify_reversal_fixture_approvals(
       organization_id, id
     ) ON DELETE RESTRICT,
   CONSTRAINT operations_shopify_reversal_fixture_attempts_command_unique
@@ -280,6 +326,9 @@ AS $$
   SELECT EXISTS (
     SELECT 1
     FROM public.app_user_organization_memberships membership
+    JOIN public.app_users user_account
+      ON user_account.email = membership.user_email
+     AND user_account.status = 'active'
     WHERE membership.organization_id = p_organization_id
       AND membership.user_email = p_actor
       AND membership.status = 'active'
@@ -313,6 +362,8 @@ AS $$
       ON control.organization_id = account.organization_id
      AND control.integration_account_id = account.id
     WHERE account.organization_id = p_organization_id
+      AND account.organization_id =
+            'c6c8e6e7-fffa-4969-9526-e99da0ab2754'::uuid
       AND account.id = p_account_id
       AND account.global_id = 'giah34fedoa5b1o'
       AND account.integration_type = 'commerce'
@@ -321,6 +372,10 @@ AS $$
       AND account.status = 'active'
       AND account.external_account_id = p_external_account_id
       AND account.configuration->>'shopDomain' = p_shop_domain
+      AND account.external_account_id =
+            'gid://shopify/Shop/95083757815'
+      AND account.configuration->>'shopDomain' =
+            'test-pro-bakery-bites.myshopify.com'
       AND account.commerce_credential_generation = p_credential_generation
       AND credential.credential_version = p_credential_generation
       AND credential.external_account_id = p_external_account_id
@@ -361,6 +416,82 @@ AS $$
     WHERE setting.key = 'deployment.database.identity'
       AND setting.value->>'id' =
             '750aa268-0e31-4065-a99c-4016e4d4fab1'
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION
+  public.operations_shopify_reversal_fixture_approval_session_is_current(
+    p_organization_id uuid,
+    p_command_id uuid,
+    p_browser_session_id uuid,
+    p_actor text,
+    p_role text,
+    p_intent_hash text,
+    p_confirmation_hash text
+  )
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_reversal_fixture_commands command
+    JOIN public.app_sessions session
+      ON session.id = p_browser_session_id
+    JOIN public.app_users actor
+      ON actor.email = p_actor
+     AND actor.status = 'active'
+    WHERE command.organization_id = p_organization_id
+      AND command.id = p_command_id
+      AND command.prepared_by = p_actor
+      AND command.prepared_role = p_role
+      AND command.intent_hash = p_intent_hash
+      AND command.confirmation_hash = p_confirmation_hash
+      AND command.expires_at > pg_catalog.clock_timestamp()
+      AND session.authenticated_user_email = p_actor
+      AND session.effective_user_email = p_actor
+      AND session.active_workspace_organization_id = p_organization_id
+      AND session.auth_method IN (
+        'magic_code', 'google_sso', 'operator_password'
+      )
+      AND session.revoked_at IS NULL
+      AND session.idle_expires_at > pg_catalog.clock_timestamp()
+      AND session.absolute_expires_at > pg_catalog.clock_timestamp()
+      AND session.impersonation_started_at IS NULL
+      AND session.impersonation_expires_at IS NULL
+      AND public.operations_shopify_reversal_fixture_actor_is_manager(
+        p_organization_id, p_actor, p_role
+      )
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION
+  public.operations_shopify_reversal_fixture_approval_is_current(
+    p_organization_id uuid,
+    p_command_id uuid,
+    p_approval_id uuid
+  )
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_reversal_fixture_approvals approval
+    WHERE approval.organization_id = p_organization_id
+      AND approval.command_id = p_command_id
+      AND approval.id = p_approval_id
+      AND public.operations_shopify_reversal_fixture_approval_session_is_current(
+        approval.organization_id,
+        approval.command_id,
+        approval.browser_session_id,
+        approval.approved_by,
+        approval.approved_role,
+        approval.intent_hash,
+        approval.confirmation_hash
+      )
   )
 $$;
 
@@ -603,6 +734,76 @@ AS $$
 $$;
 
 CREATE OR REPLACE FUNCTION
+  public.operations_shopify_reversal_fixture_provider_claim_is_current(
+    p_organization_id uuid,
+    p_command_id uuid,
+    p_attempt_id uuid,
+    p_actor text,
+    p_expected_phase text,
+    p_provider_payload_hash text
+  )
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.operations_shopify_reversal_fixture_commands command
+    JOIN public.operations_shopify_reversal_fixture_attempts attempt
+      ON attempt.organization_id = command.organization_id
+     AND attempt.command_id = command.id
+    JOIN public.operations_shopify_reversal_fixture_approvals approval
+      ON approval.organization_id = attempt.organization_id
+     AND approval.command_id = attempt.command_id
+     AND approval.id = attempt.approval_id
+    WHERE command.organization_id = p_organization_id
+      AND command.id = p_command_id
+      AND attempt.id = p_attempt_id
+      AND attempt.claimed_by = p_actor
+      AND command.phase = p_expected_phase
+      AND attempt.phase = p_expected_phase
+      AND command.provider_payload_hash = p_provider_payload_hash
+      AND attempt.worker_principal = 'pipeline_outbox_worker'
+      AND command.expires_at > pg_catalog.clock_timestamp()
+      AND public.operations_shopify_reversal_fixture_database_is_trusted()
+      AND public.operations_shopify_reversal_fixture_actor_is_manager(
+        command.organization_id, attempt.claimed_by, attempt.claimed_role
+      )
+      AND public.operations_shopify_reversal_fixture_approval_is_current(
+        command.organization_id, command.id, approval.id
+      )
+      AND public.operations_shopify_reversal_fixture_account_is_current(
+        command.organization_id,
+        command.integration_account_id,
+        command.provider_write_control_row_version,
+        command.credential_generation,
+        command.granted_scope_digest,
+        command.external_account_id,
+        command.shop_domain
+      )
+      AND (
+        command.phase <> 'create_fulfillment'
+        OR public.operations_shopify_reversal_fixture_fulfillment_is_safe(
+          command.organization_id,
+          command.predecessor_command_id,
+          command.order_id,
+          command.expected_order_row_version,
+          command.released_at,
+          command.provider_location_id,
+          command.expected_lines
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.operations_shopify_reversal_fixture_outcomes outcome
+        WHERE outcome.organization_id = attempt.organization_id
+          AND outcome.attempt_id = attempt.id
+      )
+  )
+$$;
+
+CREATE OR REPLACE FUNCTION
   public.protect_shopify_reversal_fixture_command_insert()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -679,6 +880,46 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION
+  public.protect_shopify_reversal_fixture_approval_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'shopify-reversal-fixture-approval:'
+        || NEW.organization_id::text
+        || ':' || NEW.command_id::text,
+      0
+    )
+  );
+  IF NOT public.operations_shopify_reversal_fixture_database_is_trusted()
+     OR NOT public.operations_shopify_reversal_fixture_approval_session_is_current(
+       NEW.organization_id,
+       NEW.command_id,
+       NEW.browser_session_id,
+       NEW.approved_by,
+       NEW.approved_role,
+       NEW.intent_hash,
+       NEW.confirmation_hash
+     )
+     OR EXISTS (
+       SELECT 1
+       FROM public.operations_shopify_reversal_fixture_attempts attempt
+       WHERE attempt.organization_id = NEW.organization_id
+         AND attempt.command_id = NEW.command_id
+     )
+  THEN
+    RAISE EXCEPTION
+      'Shopify reversal fixture human approval is not currently authorized';
+  END IF;
+  NEW.approved_at := pg_catalog.clock_timestamp();
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION
   public.protect_shopify_reversal_fixture_attempt_insert()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -688,6 +929,10 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM public.operations_shopify_reversal_fixture_commands command
+    JOIN public.operations_shopify_reversal_fixture_approvals approval
+      ON approval.organization_id = command.organization_id
+     AND approval.command_id = command.id
+     AND approval.id = NEW.approval_id
     WHERE command.organization_id = NEW.organization_id
       AND command.id = NEW.command_id
       AND command.phase = NEW.phase
@@ -695,10 +940,18 @@ BEGIN
       AND command.confirmation_hash = NEW.confirmation_hash
       AND command.prepared_by = NEW.claimed_by
       AND command.prepared_role = NEW.claimed_role
+      AND approval.approved_by = NEW.claimed_by
+      AND approval.approved_role = NEW.claimed_role
+      AND approval.intent_hash = NEW.intent_hash
+      AND approval.confirmation_hash = NEW.confirmation_hash
+      AND NEW.worker_principal = 'pipeline_outbox_worker'
       AND command.expires_at > pg_catalog.clock_timestamp()
       AND public.operations_shopify_reversal_fixture_database_is_trusted()
       AND public.operations_shopify_reversal_fixture_actor_is_manager(
         command.organization_id, NEW.claimed_by, NEW.claimed_role
+      )
+      AND public.operations_shopify_reversal_fixture_approval_is_current(
+        command.organization_id, command.id, approval.id
       )
       AND public.operations_shopify_reversal_fixture_account_is_current(
         command.organization_id,
@@ -737,6 +990,14 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp
 AS $$
 BEGIN
+  PERFORM pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'shopify-reversal-fixture-outcome:'
+        || NEW.organization_id::text
+        || ':' || NEW.attempt_id::text,
+      0
+    )
+  );
   IF NOT EXISTS (
     SELECT 1
     FROM public.operations_shopify_reversal_fixture_attempts attempt
@@ -746,12 +1007,42 @@ BEGIN
       AND attempt.claimed_by = NEW.recorded_by
   ) OR (
     NEW.outcome_state LIKE 'reconciled_%'
+    AND EXISTS (
+      SELECT 1
+      FROM public.operations_shopify_reversal_fixture_outcomes initial_outcome
+      WHERE initial_outcome.organization_id = NEW.organization_id
+        AND initial_outcome.attempt_id = NEW.attempt_id
+        AND initial_outcome.outcome_state IN ('succeeded', 'rejected')
+    )
+  ) OR (
+    NEW.outcome_state LIKE 'reconciled_%'
     AND NOT EXISTS (
       SELECT 1
-      FROM public.operations_shopify_reversal_fixture_outcomes unknown_outcome
-      WHERE unknown_outcome.organization_id = NEW.organization_id
-        AND unknown_outcome.attempt_id = NEW.attempt_id
-        AND unknown_outcome.outcome_state = 'unknown'
+      FROM public.operations_shopify_reversal_fixture_outcomes initial_unknown
+      WHERE initial_unknown.organization_id = NEW.organization_id
+        AND initial_unknown.attempt_id = NEW.attempt_id
+        AND initial_unknown.outcome_state = 'unknown'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.operations_shopify_reversal_fixture_attempts attempt
+      JOIN public.operations_shopify_reversal_fixture_commands command
+        ON command.organization_id = attempt.organization_id
+       AND command.id = attempt.command_id
+      WHERE attempt.organization_id = NEW.organization_id
+        AND attempt.id = NEW.attempt_id
+        AND attempt.command_id = NEW.command_id
+        AND command.expires_at + interval '30 seconds'
+              <= pg_catalog.clock_timestamp()
+    )
+  ) OR (
+    NEW.outcome_state NOT LIKE 'reconciled_%'
+    AND EXISTS (
+      SELECT 1
+      FROM public.operations_shopify_reversal_fixture_outcomes reconciliation
+      WHERE reconciliation.organization_id = NEW.organization_id
+        AND reconciliation.attempt_id = NEW.attempt_id
+        AND reconciliation.outcome_state LIKE 'reconciled_%'
     )
   ) THEN
     RAISE EXCEPTION 'Shopify reversal fixture outcome is not authorized';
@@ -776,6 +1067,10 @@ CREATE TRIGGER protect_shopify_reversal_fixture_command_insert
 BEFORE INSERT ON public.operations_shopify_reversal_fixture_commands
 FOR EACH ROW EXECUTE FUNCTION
   public.protect_shopify_reversal_fixture_command_insert();
+CREATE TRIGGER protect_shopify_reversal_fixture_approval_insert
+BEFORE INSERT ON public.operations_shopify_reversal_fixture_approvals
+FOR EACH ROW EXECUTE FUNCTION
+  public.protect_shopify_reversal_fixture_approval_insert();
 CREATE TRIGGER protect_shopify_reversal_fixture_attempt_insert
 BEFORE INSERT ON public.operations_shopify_reversal_fixture_attempts
 FOR EACH ROW EXECUTE FUNCTION
@@ -788,6 +1083,11 @@ FOR EACH ROW EXECUTE FUNCTION
 CREATE TRIGGER immutable_shopify_reversal_fixture_commands
 BEFORE UPDATE OR DELETE
 ON public.operations_shopify_reversal_fixture_commands
+FOR EACH ROW EXECUTE FUNCTION
+  public.reject_shopify_reversal_fixture_ledger_mutation();
+CREATE TRIGGER immutable_shopify_reversal_fixture_approvals
+BEFORE UPDATE OR DELETE
+ON public.operations_shopify_reversal_fixture_approvals
 FOR EACH ROW EXECUTE FUNCTION
   public.reject_shopify_reversal_fixture_ledger_mutation();
 CREATE TRIGGER immutable_shopify_reversal_fixture_attempts
@@ -808,11 +1108,15 @@ SELECT command.organization_id,
        command.global_id AS command_global_id,
        command.phase,
        CASE
+         WHEN approval.id IS NULL THEN 'awaiting_approval'
          WHEN attempt.id IS NULL THEN 'prepared'
-         WHEN initial_outcome.id IS NULL THEN 'processing'
          WHEN reconciliation.id IS NOT NULL THEN reconciliation.outcome_state
+         WHEN initial_outcome.id IS NULL THEN 'processing'
          ELSE initial_outcome.outcome_state
        END AS state,
+       approval.global_id AS approval_global_id,
+       approval.approved_by,
+       approval.approved_at,
        attempt.global_id AS attempt_global_id,
        initial_outcome.global_id AS initial_outcome_global_id,
        reconciliation.global_id AS reconciliation_outcome_global_id,
@@ -827,6 +1131,9 @@ SELECT command.organization_id,
        command.prepared_at,
        command.expires_at
 FROM public.operations_shopify_reversal_fixture_commands command
+LEFT JOIN public.operations_shopify_reversal_fixture_approvals approval
+  ON approval.organization_id = command.organization_id
+ AND approval.command_id = command.id
 LEFT JOIN public.operations_shopify_reversal_fixture_attempts attempt
   ON attempt.organization_id = command.organization_id
  AND attempt.command_id = command.id
@@ -841,6 +1148,8 @@ LEFT JOIN public.operations_shopify_reversal_fixture_outcomes reconciliation
 
 COMMENT ON TABLE public.operations_shopify_reversal_fixture_commands IS
   'Immutable hidden development-only fixed-profile Shopify reversal fixture commands. These records do not authorize the normal reversal or cancellation workflows.';
+COMMENT ON TABLE public.operations_shopify_reversal_fixture_approvals IS
+  'One immutable non-impersonated ClawPilot browser-session approval for an exact unexpired hidden fixture command.';
 COMMENT ON TABLE public.operations_shopify_reversal_fixture_attempts IS
   'One immutable provider claim per Shopify reversal fixture command. A command cannot be retried after claim.';
 COMMENT ON TABLE public.operations_shopify_reversal_fixture_outcomes IS
