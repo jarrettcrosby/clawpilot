@@ -35,7 +35,7 @@ Production, Vercel, local development, a different Railway project or environmen
 
 The claimed provider mutation contains one fixed profile only:
 
-- `test: true`, `financialStatus: PENDING`, and `buyerAcceptsMarketing: false`;
+- `test: true`, `financialStatus: PENDING`, and no customer or marketing-consent input;
 - fixed variant `gid://shopify/ProductVariant/51028106379511`, quantity `1`, and `requiresShipping: true`;
 - the approved synthetic John Doe address at 101 Academy Drive, Buzzards Bay, Massachusetts 02532, US;
 - `inventoryBehaviour: BYPASS`, `sendReceipt: false`, and `sendFulfillmentReceipt: false`; and

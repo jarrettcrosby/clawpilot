@@ -18,9 +18,19 @@ const SHOPIFY_LINE_ITEM_GID =
 const SOURCE_IDENTIFIER =
   /^clawpilot-reversal-fixture:gsfc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const UNIQUE_TAG = /^clawpilot-reversal-[a-f0-9]{24}$/u
+const ORDER_CREATE_ERROR_FIELD_TOKEN = /^[A-Za-z0-9_]{1,64}$/u
+const ORDER_CREATE_ERROR_CODES = new Set([
+  'FULFILLMENT_SERVICE_INVALID',
+  'INVALID',
+  'INVENTORY_CLAIM_FAILED',
+  'PROCESSED_AT_INVALID',
+  'REDUNDANT_CUSTOMER_FIELDS',
+  'SHOP_DORMANT',
+  'TAX_LINE_RATE_MISSING',
+])
 
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION =
-  'shopify-reversal-fixture-v1' as const
+  'shopify-reversal-fixture-v2' as const
 export const SHOPIFY_REVERSAL_FIXTURE_BASE_TAG =
   'clawpilot-reversal-fixture' as const
 
@@ -28,7 +38,7 @@ export const SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE = Object.freeze({
   version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
   test: true as const,
   financialStatus: 'PENDING' as const,
-  buyerAcceptsMarketing: false as const,
+  marketingConsent: 'UNSET' as const,
   sendReceipt: false as const,
   sendFulfillmentReceipt: false as const,
   inventoryBehaviour: 'BYPASS' as const,
@@ -74,7 +84,7 @@ const ORDER_CREATE_MUTATION = `mutation ClawPilotReversalFixtureOrderCreate(
 ) {
   orderCreate(order: $order, options: $options) {
     order { ${ORDER_FIELDS} }
-    userErrors { field message }
+    userErrors { code field message }
   }
 }`
 
@@ -109,6 +119,7 @@ export class ShopifyReversalFixtureProviderError extends Error {
     readonly status = 409,
     readonly providerMutationAttempted = false,
     readonly outcomeUnknown = false,
+    readonly providerErrorSummary: string | null = null,
   ) {
     super(message)
     this.name = 'ShopifyReversalFixtureProviderError'
@@ -214,7 +225,8 @@ function exactOrderProviderPayload(input: {
     order: Object.freeze({
       test: true as const,
       financialStatus: 'PENDING' as const,
-      buyerAcceptsMarketing: false as const,
+      // The fixture has no customer or email, so marketing consent must remain
+      // unset in Shopify. Receipt and fulfillment notifications remain off.
       sourceIdentifier,
       tags: Object.freeze([SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag]),
       lineItems: Object.freeze([Object.freeze({
@@ -231,7 +243,7 @@ function exactOrderProviderPayload(input: {
     }),
   })
   const providerPayloadHash = createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v1',
+    version: 'shopify-reversal-fixture-order-provider-payload-v2',
     shopDomain,
     variables,
   })).digest('hex')
@@ -350,8 +362,64 @@ function normalizeUserErrors(value: unknown) {
   }
   return value.map((entry) => {
     const error = record(entry, 'order-create error')
-    return text(error.message, 'order-create error message', 500)
+    text(error.message, 'order-create error message', 500)
+    const code = error.code === null
+      ? null
+      : text(error.code, 'order-create error code', 64)
+    if (code !== null && !ORDER_CREATE_ERROR_CODES.has(code)) {
+      fail(
+        'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+        'Shopify returned an unknown order-create error code',
+        502,
+      )
+    }
+    let fieldPath: string | null = null
+    if (error.field !== null) {
+      if (
+        !Array.isArray(error.field)
+        || error.field.length < 1
+        || error.field.length > 16
+        || error.field.some((token) => (
+          typeof token !== 'string'
+          || !ORDER_CREATE_ERROR_FIELD_TOKEN.test(token)
+        ))
+      ) {
+        fail(
+          'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+          'Shopify returned a malformed order-create error field',
+          502,
+        )
+      }
+      fieldPath = error.field.join('.')
+      if (fieldPath.length > 255) {
+        fail(
+          'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+          'Shopify returned an oversized order-create error field',
+          502,
+        )
+      }
+    }
+    return Object.freeze({ code, fieldPath })
   })
+}
+
+function providerRejectionSummary(
+  errors: ReadonlyArray<Readonly<{ code: string | null; fieldPath: string | null }>>,
+) {
+  const evidence = [...new Set(errors.map((error) => (
+    `${error.code || 'UNSPECIFIED'}${
+      error.fieldPath ? ` at ${error.fieldPath}` : ''
+    }`
+  )))]
+  const prefix = 'Shopify rejected order creation ('
+  const suffix = ')'
+  let details = ''
+  for (const fact of evidence) {
+    const candidate = details ? `${details}; ${fact}` : fact
+    if (`${prefix}${candidate}${suffix}`.length > 500) break
+    details = candidate
+  }
+  return `${prefix}${details}${suffix}`
 }
 
 export async function createShopifyReversalFixtureOrder(
@@ -421,7 +489,10 @@ export async function createShopifyReversalFixtureOrder(
       true,
     )
   }
-  let errors: string[]
+  let errors: ReadonlyArray<Readonly<{
+    code: string | null
+    fieldPath: string | null
+  }>>
   try {
     errors = normalizeUserErrors(payload.userErrors)
   } catch {
@@ -434,12 +505,14 @@ export async function createShopifyReversalFixtureOrder(
     )
   }
   if (errors.length > 0) {
+    const errorSummary = providerRejectionSummary(errors)
     throw new ShopifyReversalFixtureProviderError(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',
-      errors.join('; ').slice(0, 500),
+      errorSummary,
       409,
       true,
       false,
+      errorSummary,
     )
   }
   if (!payload.order) {

@@ -135,10 +135,10 @@ const exactOrder = {
 assert.deepEqual(
   JSON.parse(JSON.stringify(adapter.SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE)),
   {
-    version: 'shopify-reversal-fixture-v1',
+    version: 'shopify-reversal-fixture-v2',
     test: true,
     financialStatus: 'PENDING',
-    buyerAcceptsMarketing: false,
+    marketingConsent: 'UNSET',
     sendReceipt: false,
     sendFulfillmentReceipt: false,
     inventoryBehaviour: 'BYPASS',
@@ -176,7 +176,6 @@ assert.deepEqual(calls[0].variables, {
   order: {
     test: true,
     financialStatus: 'PENDING',
-    buyerAcceptsMarketing: false,
     sourceIdentifier,
     tags: ['clawpilot-reversal-fixture', uniqueTag],
     lineItems: [{
@@ -201,7 +200,7 @@ assert.deepEqual(calls[0].variables, {
   },
 })
 const exactEmittedPayloadHash = createHash('sha256').update(JSON.stringify({
-  version: 'shopify-reversal-fixture-order-provider-payload-v1',
+  version: 'shopify-reversal-fixture-order-provider-payload-v2',
   shopDomain: credential.shopDomain,
   variables: calls[0].variables,
 })).digest('hex')
@@ -214,7 +213,7 @@ const changedBaseTagVariables = structuredClone(calls[0].variables)
 changedBaseTagVariables.order.tags[0] = 'changed-fixture-base-tag'
 assert.notEqual(
   createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v1',
+    version: 'shopify-reversal-fixture-order-provider-payload-v2',
     shopDomain: credential.shopDomain,
     variables: changedBaseTagVariables,
   })).digest('hex'),
@@ -223,7 +222,7 @@ assert.notEqual(
 )
 const serializedWrite = JSON.stringify(calls[0].variables)
 for (const forbidden of [
-  'email', 'phone', 'customer', 'billingAddress', 'transactions',
+  'email', 'phone', 'customer', 'buyerAcceptsMarketing', 'billingAddress', 'transactions',
   'discount', 'tax', 'shippingLine', 'payment', 'notifyCustomer',
 ]) {
   assert.equal(
@@ -234,7 +233,14 @@ for (const forbidden of [
 }
 
 providerResponse = {
-  orderCreate: { order: null, userErrors: [{ message: 'Rejected exactly' }] },
+  orderCreate: {
+    order: null,
+    userErrors: [{
+      code: 'INVALID',
+      field: ['order', 'lineItems', '0', 'variantId'],
+      message: 'Rejected exactly and must never be retained',
+    }],
+  },
 }
 await assert.rejects(
   () => adapter.createShopifyReversalFixtureOrder(credential, {
@@ -243,9 +249,44 @@ await assert.rejects(
     claim: exactClaim,
   }),
   (error) => error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
+    && error.message
+      === 'Shopify rejected order creation (INVALID at order.lineItems.0.variantId)'
+    && error.providerErrorSummary === error.message
+    && !error.message.includes('must never be retained')
     && error.providerMutationAttempted === true
     && error.outcomeUnknown === false,
 )
+
+for (const invalidProviderError of [
+  {
+    code: 'UNRECOGNIZED_PROVIDER_CODE',
+    field: ['order'],
+    message: 'Unknown provider code',
+  },
+  {
+    code: 'INVALID',
+    field: ['order', 'lineItems', 'invalid.field'],
+    message: 'Malformed field path',
+  },
+]) {
+  providerResponse = {
+    orderCreate: { order: null, userErrors: [invalidProviderError] },
+  }
+  await assert.rejects(
+    () => adapter.createShopifyReversalFixtureOrder(credential, {
+      sourceIdentifier,
+      uniqueTag,
+      claim: exactClaim,
+    }),
+    (error) => (
+      error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN'
+      && error.providerMutationAttempted === true
+      && error.outcomeUnknown === true
+      && error.providerErrorSummary === null
+    ),
+    'unrecognized provider error evidence must fail closed without retention',
+  )
+}
 
 providerError = new Error('network timeout')
 await assert.rejects(

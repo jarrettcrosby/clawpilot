@@ -69,6 +69,18 @@ const REQUIRED_SCOPES = [
 const CREATE_CONFIRMATION_PREFIX = 'CREATE TEST ORDER'
 const FULFILL_CONFIRMATION_PREFIX = 'FULFILL TEST ORDER'
 const FIXTURE_CARRIER = 'ClawPilot Fixture'
+const SAFE_ORDER_CREATE_PROVIDER_ERROR_CODES = new Set([
+  'FULFILLMENT_SERVICE_INVALID',
+  'INVALID',
+  'INVENTORY_CLAIM_FAILED',
+  'PROCESSED_AT_INVALID',
+  'REDUNDANT_CUSTOMER_FIELDS',
+  'SHOP_DORMANT',
+  'TAX_LINE_RATE_MISSING',
+  'UNSPECIFIED',
+])
+const SAFE_ORDER_CREATE_PROVIDER_ERROR_FACT =
+  /^([A-Z][A-Z0-9_]{1,63})(?: at ([A-Za-z0-9_]{1,64}(?:\.[A-Za-z0-9_]{1,64}){0,15}))?$/u
 
 export class ShopifyReversalFixtureCommandError extends Error {
   constructor(
@@ -492,6 +504,32 @@ function safeErrorCode(error: unknown, fallback: string) {
   return /^[A-Z][A-Z0-9_]{1,127}$/u.test(value) ? value : fallback
 }
 
+function safeProviderErrorSummary(
+  error: unknown,
+  providerMutationAttempted: boolean,
+) {
+  if (
+    !providerMutationAttempted
+    || !(error instanceof ShopifyReversalFixtureProviderError)
+    || typeof error.providerErrorSummary !== 'string'
+  ) return null
+  const summary = error.providerErrorSummary
+  if (
+    summary.length < 1
+    || summary.length > 500
+    || summary !== summary.trim()
+    || /[\u0000-\u001f\u007f-\u009f]/u.test(summary)
+  ) return null
+  const match = /^Shopify rejected order creation \((.+)\)$/u.exec(summary)
+  if (!match) return null
+  const facts = match[1].split('; ')
+  if (facts.length < 1 || facts.some((fact) => {
+    const parsed = SAFE_ORDER_CREATE_PROVIDER_ERROR_FACT.exec(fact)
+    return !parsed || !SAFE_ORDER_CREATE_PROVIDER_ERROR_CODES.has(parsed[1])
+  })) return null
+  return summary
+}
+
 async function recordOutcomeConservatively(
   input: Parameters<typeof recordShopifyReversalFixtureOutcomeInPostgres>[0],
 ) {
@@ -558,6 +596,10 @@ async function executeOrder(
     const unknown = providerMutationAttempted
       && error instanceof ShopifyReversalFixtureProviderError
       && error.outcomeUnknown
+    const providerErrorSummary = safeProviderErrorSummary(
+      error,
+      providerMutationAttempted,
+    )
     outcomeInput = {
       command,
       attemptId: claimed.attemptId,
@@ -570,6 +612,7 @@ async function executeOrder(
           ? 'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN'
           : 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',
       ),
+      ...(providerErrorSummary ? { providerErrorSummary } : {}),
     }
   }
   const outcome = await recordOutcomeConservatively(outcomeInput)
