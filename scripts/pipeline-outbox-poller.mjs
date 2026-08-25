@@ -11,6 +11,8 @@ const baseUrl = String(process.env.PIPELINE_OUTBOX_URL || `http://127.0.0.1:${po
 const pipelineIntervalMs = Math.max(1000, Math.min(Number(process.env.PIPELINE_OUTBOX_POLL_MS || 10000), 300000))
 const agentIntervalMs = Math.max(1000, Math.min(Number(process.env.AGENT_DISPATCH_POLL_MS || 5000), 300000))
 const researchIntervalMs = Math.max(5000, Math.min(Number(process.env.AGENT_RESEARCH_POLL_MS || 10000), 300000))
+const careerSiteSubmissionsIntervalMs = Math.max(5000, Math.min(Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS || 10000), 300000))
+const careerSiteSubmissionsEnabled = String(process.env.CAREER_SITE_SUBMISSIONS_ENABLED || '0') === '1'
 const toastIntervalMs = Math.max(5000, Math.min(Number(process.env.TOAST_SYNC_POLL_MS || 15000), 300000))
 const quickBooksIntervalMs = Math.max(5000, Math.min(Number(process.env.QUICKBOOKS_SYNC_POLL_MS || 30000), 300000))
 const commerceCatalogIntervalMs = Math.max(5000, Math.min(Number(process.env.COMMERCE_CATALOG_SYNC_POLL_MS || 10000), 300000))
@@ -74,6 +76,9 @@ await Promise.all([
   runLoop('crm-integrations', '/api/crm/integrations/process', 10, crmIntegrationIntervalMs),
   runLoop('agent-dispatch', '/api/agents/dispatch/process', 1, agentIntervalMs),
   runLoop('agent-research', '/api/agents/research/process', 1, researchIntervalMs),
+  ...(careerSiteSubmissionsEnabled
+    ? [runLoop('career-site-submissions', '/api/career-site/submissions/outbox/process', 10, careerSiteSubmissionsIntervalMs)]
+    : []),
   runLoop('toast-sync', '/api/integrations/toast/process', 4, toastIntervalMs),
   runLoop('quickbooks-sync', '/api/integrations/quickbooks/process', 2, quickBooksIntervalMs),
   ...(commerceCatalogEnabled
