@@ -6,6 +6,7 @@ import {
 } from '@/lib/careerSiteSubmissionContract'
 import { processCareerSiteSubmissionOutbox } from '@/lib/careerSiteSubmissionOutbox'
 import {
+  readCareerSiteSubmissionOperationalHealthFromPostgres,
   recordCareerSiteSubmissionWorkerHeartbeatInPostgres,
 } from '@/lib/persistence/careerSiteSubmissions'
 
@@ -72,16 +73,41 @@ export async function POST(req: NextRequest) {
       dead: 0,
     })
     const result = await processCareerSiteSubmissionOutbox({ limit: Number(body.limit) || undefined })
+    const phase = result.dead > 0 ? 'failed' : result.failed > 0 ? 'degraded' : 'completed'
     const heartbeat = await recordCareerSiteSubmissionWorkerHeartbeatInPostgres({
-      phase: 'completed',
+      phase,
       workerId,
       claimed: result.claimed,
       succeeded: result.succeeded,
       failed: result.failed,
       dead: result.dead,
     })
-    return NextResponse.json({ ok: true, ...result, heartbeatAt: heartbeat.checkedAt })
+    const health = await readCareerSiteSubmissionOperationalHealthFromPostgres({
+      sourceApp: configuration.sourceApp,
+      ownerEmail: configuration.ownerEmail!,
+      pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
+      leaseSeconds: 900,
+    })
+    const ok = health.healthy && result.failed === 0 && result.dead === 0
+    return NextResponse.json({
+      ok,
+      ...result,
+      deliveryStatus: health.status,
+      heartbeatAt: heartbeat.checkedAt,
+    }, { status: ok ? 200 : 503 })
   } catch (error) {
+    try {
+      await recordCareerSiteSubmissionWorkerHeartbeatInPostgres({
+        phase: 'failed',
+        workerId,
+        claimed: 0,
+        succeeded: 0,
+        failed: 1,
+        dead: 0,
+      })
+    } catch {
+      // Preserve the original failure while leaving health to report a missing/stale heartbeat.
+    }
     console.error('[career-site-submissions] worker failed', {
       name: error instanceof Error ? error.name : typeof error,
     })

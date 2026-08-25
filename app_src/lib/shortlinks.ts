@@ -68,6 +68,7 @@ type ShortLinkServiceClient = {
   sourceApp: string
   secret: string
   ownerDomain: string | null
+  ownerEmail: string | null
 }
 
 export class ShortLinkRequestError extends Error {
@@ -186,8 +187,15 @@ function configuredServiceClients(): ShortLinkServiceClient[] {
         const sourceApp = normalizeSource(record.sourceApp)
         const secret = String(record.secret || '')
         const ownerDomain = String(record.ownerDomain || '').trim().toLowerCase() || null
-        if (secret.length < 32 || (ownerDomain && !/^[a-z0-9.-]+$/.test(ownerDomain))) throw new Error()
-        return { sourceApp, secret, ownerDomain }
+        const ownerEmail = record.ownerEmail === undefined || record.ownerEmail === null || record.ownerEmail === ''
+          ? null
+          : normalizeUserEmail(record.ownerEmail)
+        if (
+          secret.length < 32
+          || (ownerDomain && !/^[a-z0-9.-]+$/.test(ownerDomain))
+          || (ownerEmail && ownerDomain && ownerEmail.split('@')[1] !== ownerDomain)
+        ) throw new Error()
+        return { sourceApp, secret, ownerDomain, ownerEmail }
       })
     } catch {
       throw new ShortLinkRequestError('Short-link service authentication is misconfigured', 503)
@@ -200,6 +208,7 @@ function configuredServiceClients(): ShortLinkServiceClient[] {
     sourceApp: normalizeSource(process.env.SHORTLINK_SERVICE_SOURCE, 'external-app'),
     secret,
     ownerDomain: String(process.env.SHORTLINK_SERVICE_ALLOWED_OWNER_DOMAIN || '').trim().toLowerCase() || null,
+    ownerEmail: null,
   }]
 }
 
@@ -216,6 +225,31 @@ export function validateShortLinkConfiguration(options: { requireServiceClient?:
     clients.findIndex((candidate) => candidate.sourceApp === client.sourceApp) !== index
   ))
   if (duplicateSources.length > 0) throw new Error('Short-link service client sources must be unique')
+  if (process.env.CAREER_SITE_SUBMISSIONS_ENABLED === '1') {
+    if (!String(process.env.SHORTLINK_SERVICE_CLIENTS_JSON || '').trim()) {
+      throw new Error('Career-site submissions require an isolated JSON short-link service client')
+    }
+    const expectedOwner = normalizeUserEmail(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL)
+    const careerClient = clients.find((client) => client.sourceApp === 'jarrett-career-site')
+    if (
+      !careerClient
+      || careerClient.ownerDomain !== 'suburbiasandwichco.com'
+      || careerClient.ownerEmail !== expectedOwner
+    ) {
+      throw new Error('Career-site short-link service identity is not exact')
+    }
+    if (clients.some((client) => client !== careerClient && secureEqual(client.secret, careerClient.secret))) {
+      throw new Error('Career-site short-link service secret must be unique')
+    }
+    for (const otherSecret of [
+      process.env.SHORTLINK_SERVICE_SECRET,
+      process.env.PIPELINE_OUTBOX_WORKER_SECRET,
+    ]) {
+      if (otherSecret && secureEqual(otherSecret, careerClient.secret)) {
+        throw new Error('Career-site short-link service secret must be isolated from worker and legacy credentials')
+      }
+    }
+  }
   return { origin, serviceClientCount: clients.length }
 }
 
@@ -243,6 +277,9 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
     }
     if (client.ownerDomain && ownerEmail.split('@')[1] !== client.ownerDomain) {
       throw new ShortLinkRequestError('Authenticated user is outside the allowed domain', 403)
+    }
+    if (client.ownerEmail && ownerEmail !== client.ownerEmail) {
+      throw new ShortLinkRequestError('Authenticated user is not allowed for this service client', 403)
     }
     let organizationId: string
     try {

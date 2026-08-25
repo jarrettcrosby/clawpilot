@@ -22,7 +22,7 @@ Record accepted contact, résumé-request, and explicit vlog-newsletter submissi
 - `POST /api/career-site/submissions` is server-to-server only. It reuses the existing authenticated short-link service identity and accepts only the `jarrett-career-site` source, the configured owner email, and that owner's active ClawPilot workspace membership.
 - The caller supplies the same backend-only bearer secret, `x-shortlink-source`, and `x-shortlink-owner` headers used by the short-link client. Browser code must never receive the secret.
 - Every request requires a caller-generated UUID `submissionId`. Exact replays return the existing record; reuse with different normalized data fails with `409`.
-- `CAREER_SITE_SUBMISSIONS_ENABLED` defaults off. Enabling it requires the exact owner email, private Sheet ID, a matching short-link client, and the expected tab/header location.
+- `CAREER_SITE_SUBMISSIONS_ENABLED` defaults off. Enabling it requires the exact owner email, private My Drive Sheet ID, a dedicated short-link client with an unreused secret, and the expected tab/header location.
 
 ## Accepted forms
 
@@ -76,7 +76,7 @@ The bearer secret stays in the career site's server-only environment and must ma
 }
 ```
 
-The résumé route maps its local `context` field to `message` and local `variant` to `resumeVariant`. `resumeVariant` is exactly `executive`, `servicenow`, or `odyssey`. `networkInterest` and `roleFit` are explicit booleans. It must not send `newsletterConsent`.
+The résumé route maps its local `context` field to `message` and local `variant` to `resumeVariant`. `resumeVariant` is exactly `executive`, `servicenow`, or `odyssey`. Both `networkInterest` and `roleFit` must be present as explicit booleans; omission is rejected. It must not send `newsletterConsent`.
 
 ```json
 {
@@ -94,14 +94,16 @@ A new accepted UUID returns `201`; an exact replay returns `200` and the origina
 
 ## Durable delivery
 
-Migration `0328_career_site_submissions.sql` creates:
+Migration `0329_career_site_submissions.sql` creates:
 
 - `career_site_submissions`, scoped by the authenticated ClawPilot owner and workspace membership;
-- `career_site_submission_outbox`, with one delivery item per submission, leased with `FOR UPDATE SKIP LOCKED`, bounded retries, and dead-letter state.
+- `career_site_submission_outbox`, with one delivery item per submission, scoped by the configured source and owner before claim, leased one item at a time with `FOR UPDATE SKIP LOCKED`, bounded retries, and dead-letter state.
 
 The application commits the submission and outbox row in one Postgres transaction before returning `201`. The Railway poller calls `POST /api/career-site/submissions/outbox/process` with `PIPELINE_OUTBOX_WORKER_SECRET`. The worker uses ClawPilot's existing encrypted Google Workspace credential through `resolveGoogleWorkspaceProvisioningRuntime`; the career site does not need a Google service-account JSON.
 
-The worker verifies the configured spreadsheet, exact tab, and header row; creates the header only when that row is empty; and refuses a mismatched contract. It checks the immutable submission ID column in the bounded data range before append, then writes with Sheets `valueInputOption=RAW`. This prevents visitor text beginning with `=`, `+`, `-`, or `@` from becoming a formula and lets an ambiguous append response deduplicate safely on retry. If the verified 50,000-row deduplication range fills, synchronization stops safely instead of risking a duplicate append.
+Before reading or writing PII, the worker uses the Drive API to verify that the target is Jarrett's untrashed My Drive spreadsheet, Jarrett is its sole owner, the configured ClawPilot service account is its only writer, editors cannot reshare it, and there are no public, domain, group, pending-owner, or other-user permissions. It then verifies the exact tab and header row, creating the header only when that row is empty. The permission boundary is checked again immediately before each PII write.
+
+Sheet processing is serialized across replicas with a transaction-scoped Postgres advisory lock. The worker claims exactly one source/owner-scoped item, renews its 15-minute lease immediately before the external write, and checks the immutable submission-ID column for prior delivery. A new submission is written with an idempotent, exact-row Sheets `PUT` and `valueInputOption=RAW`; it never uses the non-idempotent append/insert API. This prevents visitor text beginning with `=`, `+`, `-`, or `@` from becoming a formula and lets an ambiguous response resolve safely on retry. Every write rechecks the next exact row and enforces the 50,000-data-row maximum, so concurrent workers cannot exceed capacity.
 
 ## Private Sheet contract
 
@@ -129,7 +131,7 @@ The private tracker uses tab `Submissions`, headers in row 4, and data beginning
 
 The ingress writes `New` to Status. It writes `Pending` to Shortlink Status for résumé requests and `Not applicable` for contact/newsletter submissions. Approval Mode, Resume Edition, and Internal Notes remain blank for Jarrett's private workflow. It records the authenticated ClawPilot owner, never a caller-supplied owner, and initializes Last Updated At to the submitted timestamp.
 
-`Shortlink Status` is lifecycle text only. Do not add approval tokens, résumé URLs, ClawPilot short links, or access-grant data to this Sheet. Keep sharing limited to Jarrett and the configured ClawPilot service account. If the Sheet lives in Jarrett's My Drive, Jarrett remains its owner and grants that service account editor access. If it lives in the selected Shared Drive, preserve the Shared Drive's restricted membership and do not create `anyone`, domain, or public permissions.
+`Shortlink Status` is lifecycle text only. Do not add approval tokens, résumé URLs, ClawPilot short links, or access-grant data to this Sheet. The tracker must stay in Jarrett's private My Drive. Jarrett remains its only owner, grants the configured ClawPilot service account writer access, disables the editor setting that allows resharing, and adds no other user, group, domain, or `anyone` permissions. A Shared Drive target fails closed because its broader membership cannot satisfy this personal PII boundary.
 
 ## Runtime configuration
 
@@ -142,13 +144,19 @@ Set these Railway variables before enabling intake:
 - `CAREER_SITE_SUBMISSIONS_SHEET_HEADER_ROW=4`
 - optional `CAREER_SITE_SUBMISSIONS_POLL_MS=10000`
 
-The existing `SHORTLINK_SERVICE_CLIENTS_JSON` must contain `jarrett-career-site`, and the Google Workspace integration in **Settings > Integrations > Google Workspace** must report a verified API key, service account, and selected writable Shared Drive. Do not copy the stored service-account JSON into Vercel or source control.
+The existing `SHORTLINK_SERVICE_CLIENTS_JSON` must contain a dedicated entry like this (generate a fresh secret; do not reuse another client, the legacy short-link secret, or the outbox-worker secret):
+
+```json
+{"sourceApp":"jarrett-career-site","secret":"<unique 32+ character server-only secret>","ownerDomain":"suburbiasandwichco.com","ownerEmail":"jarrett@suburbiasandwichco.com"}
+```
+
+The Google Workspace integration in **Settings > Integrations > Google Workspace** must report a verified API key and service account. The selected Shared Drive may remain configured for other ClawPilot features, but the career tracker itself must satisfy the private My Drive boundary above. Do not copy the stored service-account JSON into Vercel or source control.
 
 ## Operational checks
 
 1. Keep the feature disabled while the migration and private Sheet are prepared.
-2. Verify the Google Workspace integration and share the Sheet with the displayed service-account email.
+2. Verify the Google Workspace integration, share only the Sheet with the displayed service-account email as writer, and disable editor resharing.
 3. Enable the five runtime values above and deploy through the normal `dev` to `main` release path.
 4. Submit one contact test with a unique UUID and confirm Postgres returns `201` without returning PII.
 5. Confirm the outbox worker appends one row, then replay the same UUID and verify no second row appears.
-6. Verify `/api/health` and `/api/persistence/status` remain healthy and inspect only counts/statuses when diagnosing failures; do not log form bodies.
+6. Verify `/api/health` and `/api/persistence/status` report the exact migration/checksum, queue counts, heartbeat freshness, scope drift, stale leases, and dead rows without PII. Enabled delivery returns a non-success health response while any of those delivery controls is unhealthy; do not log form bodies.

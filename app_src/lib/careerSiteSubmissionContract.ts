@@ -6,6 +6,7 @@ const GOOGLE_RESOURCE_ID_PATTERN = /^[A-Za-z0-9_-]{1,256}$/
 const OWNER_EMAIL_MAX_LENGTH = 254
 const REQUESTER_EMAIL_MAX_LENGTH = 160
 const CAREER_SITE_SOURCE_APP = 'jarrett-career-site'
+const CAREER_SITE_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
 const CAREER_SITE_PUBLIC_ORIGIN = 'https://jarrett.suburbiasandwichco.com'
 
 const CONTACT_INTERESTS = new Set([
@@ -64,6 +65,25 @@ export type CareerSiteSubmissionConfiguration = {
   sheetHeaderRow: number
 }
 
+export type CareerSiteGoogleDriveFile = {
+  id?: unknown
+  mimeType?: unknown
+  trashed?: unknown
+  driveId?: unknown
+  writersCanShare?: unknown
+  capabilities?: { canEdit?: unknown } | null
+  owners?: Array<{ emailAddress?: unknown }> | null
+}
+
+export type CareerSiteGoogleDrivePermission = {
+  id?: unknown
+  type?: unknown
+  role?: unknown
+  emailAddress?: unknown
+  deleted?: unknown
+  pendingOwner?: unknown
+}
+
 export class CareerSiteSubmissionRequestError extends Error {
   constructor(
     message: string,
@@ -85,6 +105,13 @@ export class CareerSiteSubmissionConfigurationError extends Error {
   }
 }
 
+export class CareerSiteSubmissionSheetBoundaryError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CareerSiteSubmissionSheetBoundaryError'
+  }
+}
+
 function normalizeEmail(value: unknown, label: string, maxLength: number) {
   const email = typeof value === 'string' ? value.trim().toLowerCase() : ''
   if (
@@ -100,6 +127,14 @@ function normalizeEmail(value: unknown, label: string, maxLength: number) {
     )
   }
   return email
+}
+
+function boundaryEmail(value: unknown, label: string) {
+  try {
+    return normalizeEmail(value, label, OWNER_EMAIL_MAX_LENGTH)
+  } catch {
+    throw new CareerSiteSubmissionSheetBoundaryError(`${label} is invalid`)
+  }
 }
 
 function cleanSingleLine(
@@ -157,10 +192,9 @@ function cleanMessage(
   return cleaned
 }
 
-function optionalBoolean(value: unknown, label: string) {
-  if (value === undefined) return false
+function requiredBoolean(value: unknown, label: string) {
   if (typeof value !== 'boolean') {
-    throw new CareerSiteSubmissionRequestError(`${label} must be true or false`)
+    throw new CareerSiteSubmissionRequestError(`${label} must be explicitly true or false`)
   }
   return value
 }
@@ -232,9 +266,6 @@ export function parseCareerSiteSubmission(value: unknown): NormalizedCareerSiteS
   const formType = formTypeValue as CareerSiteSubmissionFormType
   const requesterEmail = normalizeEmail(record.email, 'email', REQUESTER_EMAIL_MAX_LENGTH)
   const requesterOrganization = cleanSingleLine(record.organization, 'organization', { max: 120 })
-  const networkInterest = optionalBoolean(record.networkInterest, 'networkInterest')
-  const roleFit = optionalBoolean(record.roleFit, 'roleFit')
-  const newsletterConsent = optionalBoolean(record.newsletterConsent, 'newsletterConsent')
   const sourceUrl = optionalSourceUrl(record.sourceUrl)
 
   if (formType === 'contact') {
@@ -243,7 +274,12 @@ export function parseCareerSiteSubmission(value: unknown): NormalizedCareerSiteS
     if (!CONTACT_INTERESTS.has(interest)) {
       throw new CareerSiteSubmissionRequestError('contact interest is invalid')
     }
-    if (networkInterest || roleFit || newsletterConsent || record.resumeVariant !== undefined) {
+    if (
+      record.networkInterest !== undefined
+      || record.roleFit !== undefined
+      || record.newsletterConsent !== undefined
+      || record.resumeVariant !== undefined
+    ) {
       throw new CareerSiteSubmissionRequestError(
         'Contact submissions cannot imply résumé or newsletter consent',
         400,
@@ -272,13 +308,15 @@ export function parseCareerSiteSubmission(value: unknown): NormalizedCareerSiteS
     if (!RESUME_VARIANTS.has(resumeVariant)) {
       throw new CareerSiteSubmissionRequestError('resumeVariant is invalid')
     }
-    if (newsletterConsent || record.interest !== undefined) {
+    if (record.newsletterConsent !== undefined || record.interest !== undefined) {
       throw new CareerSiteSubmissionRequestError(
         'Résumé requests do not create newsletter consent',
         400,
         'CAREER_SITE_SUBMISSION_CONSENT_INVALID',
       )
     }
+    const networkInterest = requiredBoolean(record.networkInterest, 'networkInterest')
+    const roleFit = requiredBoolean(record.roleFit, 'roleFit')
     return {
       externalSubmissionId,
       formType,
@@ -296,13 +334,13 @@ export function parseCareerSiteSubmission(value: unknown): NormalizedCareerSiteS
   }
 
   if (
-    newsletterConsent !== true
+    record.newsletterConsent !== true
     || record.name !== undefined
     || record.organization !== undefined
     || record.interest !== undefined
     || record.message !== undefined
-    || networkInterest
-    || roleFit
+    || record.networkInterest !== undefined
+    || record.roleFit !== undefined
     || record.resumeVariant !== undefined
   ) {
     throw new CareerSiteSubmissionRequestError(
@@ -381,6 +419,80 @@ export function careerSiteSubmissionSheetRow(input: CareerSiteSubmissionSheetRec
   ]
 }
 
+export function assertPrivateCareerSiteSheetBoundary(input: {
+  sheetId: string
+  ownerEmail: string
+  serviceAccountEmail: string
+  file: CareerSiteGoogleDriveFile
+  permissions: CareerSiteGoogleDrivePermission[]
+}) {
+  const ownerEmail = boundaryEmail(input.ownerEmail, 'Career-site Sheet owner email')
+  const serviceAccountEmail = boundaryEmail(
+    input.serviceAccountEmail,
+    'Career-site Google service-account email',
+  )
+  if (ownerEmail === serviceAccountEmail) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet owner and service account must be separate identities',
+    )
+  }
+  if (
+    input.file.id !== input.sheetId
+    || input.file.mimeType !== 'application/vnd.google-apps.spreadsheet'
+    || input.file.trashed === true
+    || Boolean(input.file.driveId)
+    || input.file.capabilities?.canEdit !== true
+    || input.file.writersCanShare !== false
+  ) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet must be an editable, owner-controlled private My Drive spreadsheet',
+    )
+  }
+  const ownerEmails = (input.file.owners || []).map((owner) => (
+    boundaryEmail(owner.emailAddress, 'Career-site Sheet owner metadata')
+  ))
+  if (ownerEmails.length !== 1 || ownerEmails[0] !== ownerEmail) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet owner metadata does not match the configured owner',
+    )
+  }
+
+  const activePermissions = input.permissions.filter((permission) => permission.deleted !== true)
+  if (activePermissions.length !== 2) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet must be shared only with its owner and the configured service account',
+    )
+  }
+  const identities = new Map<string, string>()
+  for (const permission of activePermissions) {
+    if (
+      permission.type !== 'user'
+      || permission.pendingOwner === true
+      || typeof permission.id !== 'string'
+      || !GOOGLE_RESOURCE_ID_PATTERN.test(permission.id)
+    ) {
+      throw new CareerSiteSubmissionSheetBoundaryError(
+        'Career-site Sheet contains an unsupported sharing permission',
+      )
+    }
+    const email = boundaryEmail(permission.emailAddress, 'Career-site Sheet permission email')
+    if (identities.has(email) || (email !== ownerEmail && email !== serviceAccountEmail)) {
+      throw new CareerSiteSubmissionSheetBoundaryError(
+        'Career-site Sheet contains an unexpected or duplicate sharing identity',
+      )
+    }
+    identities.set(email, String(permission.role || ''))
+  }
+  if (
+    identities.get(ownerEmail) !== 'owner'
+    || identities.get(serviceAccountEmail) !== 'writer'
+  ) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet permissions must keep Jarrett as owner and the service account as writer',
+    )
+  }
+}
+
 export function resolveCareerSiteSubmissionConfiguration(
   environment: NodeJS.ProcessEnv = process.env,
 ): CareerSiteSubmissionConfiguration {
@@ -425,6 +537,11 @@ export function resolveCareerSiteSubmissionConfiguration(
   } catch {
     throw new CareerSiteSubmissionConfigurationError(
       'CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be a valid email address',
+    )
+  }
+  if (ownerEmail !== CAREER_SITE_OWNER_EMAIL) {
+    throw new CareerSiteSubmissionConfigurationError(
+      'CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be the Jarrett career-site owner identity',
     )
   }
   const sheetId = String(environment.CAREER_SITE_SUBMISSIONS_SHEET_ID || '').trim()

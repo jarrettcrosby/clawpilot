@@ -12,6 +12,7 @@ import {
 import {
   resolveShortLinkActor,
   ShortLinkRequestError,
+  validateShortLinkConfiguration,
 } from '@/lib/shortlinks'
 
 export const dynamic = 'force-dynamic'
@@ -83,6 +84,13 @@ export async function POST(req: NextRequest) {
     const configuration = resolveCareerSiteSubmissionConfiguration()
     if (!configuration.enabled || !configuration.ownerEmail) {
       throw new CareerSiteSubmissionConfigurationError('Career-site submissions are disabled')
+    }
+    try {
+      validateShortLinkConfiguration({ requireServiceClient: true })
+    } catch {
+      throw new CareerSiteSubmissionConfigurationError(
+        'Career-site submissions require an isolated service identity',
+      )
     }
     const actor = await resolveShortLinkActor(req)
     if (

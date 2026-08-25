@@ -9,6 +9,7 @@ const sourcePattern = /^[a-z][a-z0-9-]{1,39}$/
 const ownerDomainPattern = /^[a-z0-9.-]+$/
 const emailPattern = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 let serviceClientSources = []
+let serviceClients = []
 
 function fail(message) {
   console.error(`[runtime-config] ${message}`)
@@ -46,13 +47,25 @@ function validateServiceClients() {
       const sourceApp = String(client?.sourceApp || '').trim().toLowerCase()
       const secret = String(client?.secret || '')
       const ownerDomain = String(client?.ownerDomain || '').trim().toLowerCase()
-      if (!sourcePattern.test(sourceApp) || secret.length < 32 || (ownerDomain && !ownerDomainPattern.test(ownerDomain))) {
-        fail('Each short-link service client needs a valid sourceApp, 32-character secret, and optional ownerDomain')
+      const ownerEmail = String(client?.ownerEmail || '').trim().toLowerCase()
+      if (
+        !sourcePattern.test(sourceApp)
+        || secret.length < 32
+        || (ownerDomain && !ownerDomainPattern.test(ownerDomain))
+        || (ownerEmail && (!emailPattern.test(ownerEmail) || ownerEmail.split('@')[1] !== ownerDomain))
+      ) {
+        fail('Each short-link service client needs a valid sourceApp, 32-character secret, and optional matching ownerDomain/ownerEmail')
       }
       if (sources.has(sourceApp)) fail(`Short-link service source ${sourceApp} is duplicated`)
       sources.add(sourceApp)
     }
     serviceClientSources = [...sources]
+    serviceClients = clients.map((client) => ({
+      sourceApp: String(client.sourceApp).trim().toLowerCase(),
+      secret: String(client.secret),
+      ownerDomain: String(client.ownerDomain || '').trim().toLowerCase(),
+      ownerEmail: String(client.ownerEmail || '').trim().toLowerCase(),
+    }))
     return clients.length
   }
 
@@ -62,6 +75,12 @@ function validateServiceClients() {
     fail('SHORTLINK_SERVICE_CLIENTS_JSON or a valid legacy short-link service client must be configured')
   }
   serviceClientSources = [sourceApp]
+  serviceClients = [{
+    sourceApp,
+    secret,
+    ownerDomain: String(process.env.SHORTLINK_SERVICE_ALLOWED_OWNER_DOMAIN || '').trim().toLowerCase(),
+    ownerEmail: '',
+  }]
   return 1
 }
 
@@ -70,12 +89,33 @@ function validateCareerSiteSubmissionsConfiguration() {
   if (enabled !== '0' && enabled !== '1') fail('CAREER_SITE_SUBMISSIONS_ENABLED must be 0 or 1')
   if (enabled === '0') return 'disabled'
 
-  if (!serviceClientSources.includes('jarrett-career-site')) {
-    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires the jarrett-career-site short-link service client')
+  if (!String(process.env.SHORTLINK_SERVICE_CLIENTS_JSON || '').trim()) {
+    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires an isolated SHORTLINK_SERVICE_CLIENTS_JSON entry')
   }
   const ownerEmail = String(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL || '').trim().toLowerCase()
   if (!ownerEmail || ownerEmail.length > 254 || !emailPattern.test(ownerEmail) || !/^[\x21-\x7e]+$/.test(ownerEmail)) {
     fail('CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be a valid email address')
+  }
+  if (ownerEmail !== 'jarrett@suburbiasandwichco.com') {
+    fail('CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be the exact Jarrett career-site owner identity')
+  }
+  const careerClient = serviceClients.find((client) => client.sourceApp === 'jarrett-career-site')
+  if (
+    !serviceClientSources.includes('jarrett-career-site')
+    || !careerClient
+    || careerClient.ownerDomain !== 'suburbiasandwichco.com'
+    || careerClient.ownerEmail !== ownerEmail
+  ) {
+    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires the exact jarrett-career-site source, ownerDomain, and ownerEmail identity')
+  }
+  if (serviceClients.some((client) => client !== careerClient && client.secret === careerClient.secret)) {
+    fail('The jarrett-career-site short-link service secret must not be reused by another source')
+  }
+  if ([
+    process.env.SHORTLINK_SERVICE_SECRET,
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET,
+  ].some((secret) => secret && secret === careerClient.secret)) {
+    fail('The jarrett-career-site short-link service secret must be isolated from worker and legacy credentials')
   }
   const sheetId = String(process.env.CAREER_SITE_SUBMISSIONS_SHEET_ID || '').trim()
   if (!/^[A-Za-z0-9_-]{1,256}$/.test(sheetId)) {
