@@ -300,6 +300,29 @@ function loadHealthRoute({ configuredCarriersApplied, diagnosticsApplied }) {
     '@/lib/integrations/shopifyOrderManagementRuntime': {
       shopifyOrderManagementRuntime: () => runtime,
     },
+    '@/lib/integrations/shopifyReversalFixtureRuntime': {
+      SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY:
+        '750aa268-0e31-4065-a99c-4016e4d4fab1',
+      shopifyReversalFixtureRuntime: () => ({
+        available: false,
+        blockerCode: 'SHOPIFY_REVERSAL_FIXTURE_DISABLED',
+        accountGlobalId: 'giah34fedoa5b1o',
+        routeOnly: true,
+        normalUiAvailable: false,
+        productionAvailable: false,
+      }),
+    },
+    '@/lib/persistence/shopifyReversalFixtureHealth': {
+      readShopifyReversalFixtureHealthInPostgres: async () => ({
+        migrationCurrent: true,
+        structureCurrent: true,
+        databaseIdentity: '750aa268-0e31-4065-a99c-4016e4d4fab1',
+        prepared: 0,
+        processing: 0,
+        unknown: 0,
+        terminal: 0,
+      }),
+    },
     '@/lib/integrations/commerceIntake': {
       commerceReadRuntimeAvailable: () => false,
     },
