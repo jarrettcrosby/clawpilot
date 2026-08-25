@@ -38,15 +38,18 @@ const organizationId = '11111111-1111-4111-8111-111111111111'
 const accountGlobalId = 'gia1234567'
 const orderGlobalId = 'gor1234567'
 const authorizationGlobalId = 'gsom1234567'
+const predecessorAuthorizationGlobalId = 'gsom7654321'
 const attemptGlobalId = 'gsoa1234567'
 const externalAccountId = 'gid://shopify/Shop/123'
 const externalOrderId = 'gid://shopify/Order/6909860774088'
 const lineItemGid = 'gid://shopify/LineItem/123'
+const fulfillmentGid = 'gid://shopify/Fulfillment/456'
 const actorEmail = 'owner@example.com'
 const reason = 'Verify exact mutation against the Shopify test order'
 const idempotencyKey = 'shopify-order-test-0001'
 const intentHash = 'a'.repeat(64)
 const providerUpdatedAt = '2026-08-14T03:20:00.000Z'
+const fulfillmentUpdatedAt = '2026-08-14T03:19:00.000Z'
 const sourceShippingAddress = {
   firstName: 'Pat',
   lastName: 'Buyer',
@@ -97,9 +100,36 @@ function targetFixture(overrides = {}) {
     latestProviderUpdatedAt: providerUpdatedAt,
     latestProviderOrderTest: true,
     zeroDownstream: true,
+    reversibleExternalFulfillmentGid: null,
+    reversibleExternalFulfillmentUpdatedAt: null,
+    fulfillmentReversalSafe: false,
+    postReversalOrderCancellationSafe: false,
+    postReversalOrderCancellationPredecessorGlobalId: null,
     latestOpenAuthorization: null,
     ...overrides,
   }
+}
+
+function reversalTargetFixture(overrides = {}) {
+  return targetFixture({
+    orderStatus: 'cancelled',
+    zeroDownstream: false,
+    materialState: 'provider_fulfilled',
+    reversibleExternalFulfillmentGid: fulfillmentGid,
+    reversibleExternalFulfillmentUpdatedAt: fulfillmentUpdatedAt,
+    fulfillmentReversalSafe: true,
+    ...overrides,
+  })
+}
+
+function postReversalCancellationTargetFixture(overrides = {}) {
+  return reversalTargetFixture({
+    fulfillmentReversalSafe: false,
+    postReversalOrderCancellationSafe: true,
+    postReversalOrderCancellationPredecessorGlobalId:
+      predecessorAuthorizationGlobalId,
+    ...overrides,
+  })
 }
 
 function previewFixture(overrides = {}) {
@@ -138,8 +168,49 @@ function previewFixture(overrides = {}) {
       nonFulfillableQuantity: 0,
       merchantEditable: true,
     }],
+    fulfillments: [],
     ...overrides,
   }
+}
+
+function fulfillmentFixture(overrides = {}) {
+  return {
+    id: fulfillmentGid,
+    name: '#6600.1',
+    status: 'SUCCESS',
+    displayStatus: 'FULFILLED',
+    createdAt: '2026-08-14T03:15:00.000Z',
+    updatedAt: fulfillmentUpdatedAt,
+    deliveredAt: null,
+    totalQuantity: 2,
+    tracking: [{
+      company: 'UPS',
+      number: '1ZTEST6600',
+      url: 'https://www.ups.com/track?loc=en_US&tracknum=1ZTEST6600',
+    }],
+    service: null,
+    fulfillmentOrders: [{
+      id: 'gid://shopify/FulfillmentOrder/789',
+      assignedLocation: {
+        location: {
+          id: 'gid://shopify/Location/321',
+          name: 'AG Alchemy HQ',
+        },
+      },
+    }],
+    ...overrides,
+  }
+}
+
+function postReversalPreviewFixture(overrides = {}) {
+  return previewFixture({
+    fulfillments: [fulfillmentFixture({
+      status: 'CANCELLED',
+      displayStatus: 'CANCELLED',
+      updatedAt: '2026-08-14T03:21:00.000Z',
+    })],
+    ...overrides,
+  })
 }
 
 function inspectionFixture(preview = previewFixture(), overrides = {}) {
@@ -147,11 +218,17 @@ function inspectionFixture(preview = previewFixture(), overrides = {}) {
     probe: {
       shopId: externalAccountId,
       shopDomain: 'ag-alchemy.myshopify.com',
-      grantedScopes: ['write_orders', 'write_order_edits'],
+      grantedScopes: [
+        'read_orders', 'write_orders', 'write_order_edits',
+        'write_merchant_managed_fulfillment_orders',
+      ],
     },
     preview,
     job: null,
-    grantedScopes: ['write_orders', 'write_order_edits'],
+    grantedScopes: [
+      'read_orders', 'write_orders', 'write_order_edits',
+      'write_merchant_managed_fulfillment_orders',
+    ],
     providerReads: 2,
     ...overrides,
   }
@@ -159,6 +236,21 @@ function inspectionFixture(preview = previewFixture(), overrides = {}) {
 
 function actionFixture(kind = 'add_tag') {
   if (kind === 'add_tag') return { type: 'add_tag', tag: 'ClawPilot test' }
+  if (kind === 'cancel_fulfillment') {
+    return {
+      type: 'cancel_fulfillment',
+      fulfillmentGid,
+      expectedFulfillmentUpdatedAt: fulfillmentUpdatedAt,
+    }
+  }
+  if (kind === 'cancel_order_after_fulfillment_reversal') {
+    return {
+      type: 'cancel_order_after_fulfillment_reversal',
+      predecessorAuthorizationGlobalId,
+      reason: 'STAFF',
+      staffNote: `ClawPilot authorized test action: ${reason}`,
+    }
+  }
   if (kind === 'cancel') {
     return {
       type: 'cancel',
@@ -176,6 +268,7 @@ function actionFixture(kind = 'add_tag') {
 
 function authorizationFixture({
   action = actionFixture(),
+  predecessorFulfillmentGid = undefined,
   status = 'prepared',
   providerAttemptGlobalId = null,
   providerWriteCount = 0,
@@ -201,15 +294,32 @@ function authorizationFixture({
     orderNumber: '#6600',
     expectedOrderRowVersion: 7,
     expectedSourceHash: 'b'.repeat(64),
-    acceptedObservationId: action.type === 'add_tag'
+    acceptedObservationId: [
+      'add_tag', 'cancel_fulfillment',
+      'cancel_order_after_fulfillment_reversal',
+    ].includes(action.type)
       ? null : '11111111-1111-4111-8111-111111111112',
-    acceptedProviderOrderUpdatedAt: action.type === 'add_tag'
+    acceptedProviderOrderUpdatedAt: [
+      'add_tag', 'cancel_fulfillment',
+      'cancel_order_after_fulfillment_reversal',
+    ].includes(action.type)
       ? null : providerUpdatedAt,
     providerOrderUpdatedAt: providerUpdatedAt,
     providerOrderObservedAt: '2026-08-14T03:20:01.000Z',
     providerOrderTest: true,
     providerSnapshotHash: 'c'.repeat(64),
     action: action.type,
+    fulfillmentGid: action.type === 'cancel_fulfillment'
+      ? action.fulfillmentGid : null,
+    expectedFulfillmentUpdatedAt: action.type === 'cancel_fulfillment'
+      ? action.expectedFulfillmentUpdatedAt : null,
+    predecessorAuthorizationGlobalId:
+      action.type === 'cancel_order_after_fulfillment_reversal'
+        ? action.predecessorAuthorizationGlobalId : null,
+    predecessorFulfillmentGid: predecessorFulfillmentGid === undefined
+      ? action.type === 'cancel_order_after_fulfillment_reversal'
+        ? fulfillmentGid : null
+      : predecessorFulfillmentGid,
     lineItemGid: action.type === 'set_line_quantity'
       ? action.lineItemGid : null,
     expectedLineQuantity: action.type === 'set_line_quantity' ? 2 : null,
@@ -221,8 +331,11 @@ function authorizationFixture({
           tag: action.tag,
         })
       : null,
-    cancelReason: action.type === 'cancel' ? action.reason : null,
+    cancelReason: [
+      'cancel', 'cancel_order_after_fulfillment_reversal',
+    ].includes(action.type) ? action.reason : null,
     staffNoteHash: action.type === 'cancel'
+      || action.type === 'cancel_order_after_fulfillment_reversal'
       || action.type === 'set_line_quantity'
       ? evidenceHash({
           schema: 'shopify-order-management-staff-note-v1',
@@ -836,15 +949,420 @@ management = await commands.readShopifyOrderManagementState({
   orderGlobalId,
 })
 assert.equal(management.runtimeAvailable, true)
-assert.equal(
-  management.blockerCode,
-  'SHOPIFY_ORDER_MANAGEMENT_UNSTARTED_ORDER_REQUIRED',
-)
+assert.equal(management.blockerCode, null)
 assert.equal(management.eligibility.cancel.allowed, false)
 assert.match(management.eligibility.cancel.reason, /fulfillment activity/i)
 assert.deepEqual(events.map(([event]) => event), [
   'target-read', 'credential-read', 'decrypt', 'inspect',
 ])
+
+// Fulfillment reversal has its own tightly bounded lane. It is available only
+// for the exact externally reconciled fulfillment on a locally cancelled,
+// provider-fulfilled order, while the ordinary editor keeps its original
+// unstarted-order fence.
+reset()
+target = reversalTargetFixture()
+inspection = inspectionFixture(previewFixture({
+  displayFulfillmentStatus: 'FULFILLED',
+  lines: [{
+    ...previewFixture().lines[0],
+    unfulfilledQuantity: 0,
+  }],
+  fulfillments: [fulfillmentFixture()],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.deepEqual(
+  plain(events.filter(([event]) => event === 'inspect').at(-1)[1]
+    .requiredActions),
+  ['cancel_fulfillment'],
+)
+assert.equal(management.blockerCode, null)
+assert.equal(management.eligibility.ordinarySave.allowed, false)
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.deepEqual(plain(management.order.fulfillments), [{
+  fulfillmentId: fulfillmentGid,
+  name: '#6600.1',
+  status: 'SUCCESS',
+  displayStatus: 'FULFILLED',
+  updatedAt: fulfillmentUpdatedAt,
+  deliveredAt: null,
+  quantity: 2,
+  tracking: [{
+    company: 'UPS',
+    number: '1ZTEST6600',
+    url: 'https://www.ups.com/track?loc=en_US&tracknum=1ZTEST6600',
+  }],
+}])
+assert.deepEqual(plain(management.eligibility.fulfillments), [{
+  fulfillmentId: fulfillmentGid,
+  expectedUpdatedAt: fulfillmentUpdatedAt,
+  allowed: true,
+  reason: null,
+}])
+
+prepared = await commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: {
+    kind: 'cancel_fulfillment',
+    fulfillmentId: fulfillmentGid,
+    expectedFulfillmentUpdatedAt: fulfillmentUpdatedAt,
+  },
+  reason: 'Reverse the exact Shopify test fulfillment',
+  idempotencyKey: 'shopify-fulfillment-reversal-0001',
+})
+assert.deepEqual(plain(lastPrepareInput.action), {
+  type: 'cancel_fulfillment',
+  fulfillmentGid,
+  expectedFulfillmentUpdatedAt: fulfillmentUpdatedAt,
+})
+assert.deepEqual(
+  plain(events.filter(([event]) => event === 'inspect').at(-1)[1]
+    .requiredActions),
+  ['cancel_fulfillment'],
+)
+assert.equal(
+  events.filter(([event]) => event === 'inspect').at(-1)[1]
+    .fulfillmentGid,
+  fulfillmentGid,
+)
+assert.equal(prepared.preview.fulfillmentId, fulfillmentGid)
+assert.equal(
+  prepared.preview.expectedFulfillmentUpdatedAt,
+  fulfillmentUpdatedAt,
+)
+
+for (const override of [{
+  reversibleExternalFulfillmentGid: 'gid://shopify/Fulfillment/999',
+}, {
+  reversibleExternalFulfillmentUpdatedAt: '2026-08-14T03:18:59.000Z',
+}]) {
+  reset()
+  target = reversalTargetFixture(override)
+  inspection = inspectionFixture(previewFixture({
+    fulfillments: [fulfillmentFixture()],
+  }))
+  management = await commands.readShopifyOrderManagementState({
+    organizationId,
+    orderGlobalId,
+  })
+  assert.equal(management.eligibility.fulfillments[0].allowed, false)
+  assert.match(
+    management.eligibility.fulfillments[0].reason,
+    /exact reconciled external fulfillment/i,
+  )
+}
+
+for (const override of [{ orderStatus: 'shipped' }, {
+  materialState: 'current',
+}, {
+  fulfillmentReversalSafe: false,
+}]) {
+  reset()
+  target = reversalTargetFixture(override)
+  inspection = inspectionFixture(previewFixture({
+    fulfillments: [fulfillmentFixture()],
+  }))
+  management = await commands.readShopifyOrderManagementState({
+    organizationId,
+    orderGlobalId,
+  })
+  assert.equal(management.eligibility.fulfillments[0].allowed, false)
+  assert.match(
+    management.eligibility.fulfillments[0].reason,
+    /not eligible for Shopify fulfillment reversal/i,
+  )
+}
+
+// The timestamp shown with the exact fulfillment is part of the mutation.
+// A stale or substituted value fails before durable preparation.
+reset()
+target = reversalTargetFixture()
+inspection = inspectionFixture(previewFixture({
+  displayFulfillmentStatus: 'FULFILLED',
+  fulfillments: [fulfillmentFixture()],
+}))
+await expectCode(commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: {
+    kind: 'cancel_fulfillment',
+    fulfillmentId: fulfillmentGid,
+    expectedFulfillmentUpdatedAt: '2026-08-14T03:18:59.000Z',
+  },
+  reason: 'Reverse the exact Shopify test fulfillment',
+  idempotencyKey: 'shopify-fulfillment-reversal-stale-0001',
+}), 'SHOPIFY_FULFILLMENT_CANCEL_NOT_ELIGIBLE')
+assert.equal(lastPrepareInput, null)
+
+// Provider scope, the test-order lane, delivered state, and exact successful
+// fulfillment status each independently prevent reversal.
+for (const fixture of [
+  {
+    preview: previewFixture({ fulfillments: [fulfillmentFixture()] }),
+    inspection: {
+      grantedScopes: ['write_merchant_managed_fulfillment_orders'],
+    },
+    reason: /read_orders/i,
+  },
+  {
+    preview: previewFixture({ fulfillments: [fulfillmentFixture()] }),
+    inspection: {
+      grantedScopes: [
+        'read_orders', 'write_order_edits',
+        'write_merchant_managed_fulfillment_orders',
+      ],
+    },
+    reason: /write_orders/i,
+  },
+  {
+    preview: previewFixture({ fulfillments: [fulfillmentFixture()] }),
+    inspection: {
+      grantedScopes: [
+        'read_orders', 'write_orders', 'write_order_edits',
+      ],
+    },
+    reason: /write_merchant_managed_fulfillment_orders/i,
+  },
+  {
+    preview: previewFixture({
+      test: false,
+      fulfillments: [fulfillmentFixture()],
+    }),
+    reason: /test orders/i,
+  },
+  {
+    preview: previewFixture({
+      fulfillments: [fulfillmentFixture({
+        deliveredAt: '2026-08-14T04:00:00.000Z',
+      })],
+    }),
+    reason: /require a return/i,
+  },
+  {
+    preview: previewFixture({
+      fulfillments: [fulfillmentFixture({ status: 'CANCELLED' })],
+    }),
+    reason: /already reversed/i,
+  },
+  {
+    preview: previewFixture({
+      fulfillments: [fulfillmentFixture({ displayStatus: null })],
+    }),
+    reason: /successful, fulfilled/i,
+  },
+  {
+    preview: previewFixture({
+      fulfillments: [fulfillmentFixture({
+        fulfillmentOrders: [{
+          id: 'gid://shopify/FulfillmentOrder/789',
+          assignedLocation: { location: null },
+        }],
+      })],
+    }),
+    reason: /assigned fulfillment location/i,
+  },
+]) {
+  reset()
+  target = reversalTargetFixture()
+  inspection = inspectionFixture(fixture.preview, fixture.inspection || {})
+  management = await commands.readShopifyOrderManagementState({
+    organizationId,
+    orderGlobalId,
+  })
+  assert.equal(management.eligibility.fulfillments[0].allowed, false)
+  assert.match(management.eligibility.fulfillments[0].reason, fixture.reason)
+}
+
+// A completed fulfillment reversal unlocks one distinct order-cancellation
+// action. Ordinary cancellation remains blocked by its imported-order fence,
+// and the provider must still report the exact predecessor fulfillment as
+// CANCELLED before this second write can be prepared.
+reset()
+target = postReversalCancellationTargetFixture()
+inspection = inspectionFixture(previewFixture({
+  fulfillments: [fulfillmentFixture({
+    status: 'CANCELLED',
+    displayStatus: 'CANCELLED',
+    updatedAt: '2026-08-14T03:21:00.000Z',
+  })],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.deepEqual(
+  plain(events.filter(([event]) => event === 'inspect').at(-1)[1]
+    .requiredActions),
+  ['cancel_order_after_fulfillment_reversal'],
+)
+assert.equal(management.blockerCode, null)
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.deepEqual(
+  plain(management.eligibility.cancelAfterFulfillmentReversal),
+  {
+    allowed: true,
+    reason: null,
+    predecessorAuthorizationGlobalId,
+  },
+)
+
+prepared = await commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: {
+    kind: 'cancel_order_after_fulfillment_reversal',
+    predecessorAuthorizationGlobalId,
+  },
+  reason: 'Cancel the Shopify test order after fulfillment reversal',
+  idempotencyKey: 'shopify-post-reversal-cancel-0001',
+})
+assert.deepEqual(plain(lastPrepareInput.action), {
+  type: 'cancel_order_after_fulfillment_reversal',
+  predecessorAuthorizationGlobalId,
+  reason: 'STAFF',
+  staffNote: 'ClawPilot authorized test action: Cancel the Shopify test order after fulfillment reversal',
+})
+assert.deepEqual(
+  plain(events.filter(([event]) => event === 'inspect').at(-1)[1]
+    .requiredActions),
+  ['cancel_order_after_fulfillment_reversal'],
+)
+assert.equal(
+  prepared.preview.predecessorAuthorizationGlobalId,
+  predecessorAuthorizationGlobalId,
+)
+
+// Shopify refresh/webhook reconciliation may mark the local material state for
+// review after the fulfillment reversal. The separately confirmed order cancel
+// remains available while the exact predecessor is still CANCELLED.
+reset()
+target = postReversalCancellationTargetFixture({
+  materialState: 'review_required',
+})
+inspection = inspectionFixture(postReversalPreviewFixture())
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.deepEqual(
+  plain(management.eligibility.cancelAfterFulfillmentReversal),
+  {
+    allowed: true,
+    reason: null,
+    predecessorAuthorizationGlobalId,
+  },
+)
+
+reset()
+target = postReversalCancellationTargetFixture()
+inspection = inspectionFixture(previewFixture({
+  fulfillments: [fulfillmentFixture({
+    status: 'CANCELLED',
+    displayStatus: 'CANCELLED',
+  })],
+}))
+await expectCode(commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: {
+    kind: 'cancel_order_after_fulfillment_reversal',
+    predecessorAuthorizationGlobalId: 'gsom9999999',
+  },
+  reason: 'Cancel the Shopify test order after fulfillment reversal',
+  idempotencyKey: 'shopify-post-reversal-cancel-altered-0001',
+}), 'SHOPIFY_ORDER_POST_REVERSAL_CANCEL_NOT_ELIGIBLE')
+assert.equal(lastPrepareInput, null)
+
+reset()
+target = postReversalCancellationTargetFixture()
+inspection = inspectionFixture(previewFixture({
+  fulfillments: [fulfillmentFixture()],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(
+  management.eligibility.cancelAfterFulfillmentReversal.allowed,
+  false,
+)
+assert.match(
+  management.eligibility.cancelAfterFulfillmentReversal.reason,
+  /predecessor fulfillment is not cancelled/i,
+)
+
+for (const fixture of [
+  {
+    preview: postReversalPreviewFixture(),
+    inspection: {
+      grantedScopes: [
+        'read_orders', 'write_merchant_managed_fulfillment_orders',
+      ],
+    },
+    reason: /write_orders/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ test: false }),
+    reason: /test orders/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ cancelledAt: providerUpdatedAt }),
+    reason: /already cancelled/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ closed: true }),
+    reason: /closed/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ capturable: true }),
+    reason: /payment authorization/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ returnStatus: 'RETURNED' }),
+    reason: /return activity/i,
+  },
+  {
+    preview: postReversalPreviewFixture({
+      lines: [{
+        ...previewFixture().lines[0],
+        unfulfilledQuantity: 0,
+      }],
+    }),
+    reason: /wholly unfulfilled/i,
+  },
+  {
+    preview: postReversalPreviewFixture({ unpaid: false }),
+    reason: /refund settings/i,
+  },
+]) {
+  reset()
+  target = postReversalCancellationTargetFixture()
+  inspection = inspectionFixture(fixture.preview, fixture.inspection || {})
+  management = await commands.readShopifyOrderManagementState({
+    organizationId,
+    orderGlobalId,
+  })
+  assert.equal(
+    management.eligibility.cancelAfterFulfillmentReversal.allowed,
+    false,
+  )
+  assert.match(
+    management.eligibility.cancelAfterFulfillmentReversal.reason,
+    fixture.reason,
+  )
+}
 
 // Execution repeats and revalidates the exact mutation, reason, intent hash,
 // and typed confirmation before it resolves credentials or claims an attempt.
@@ -871,6 +1389,89 @@ await expectCode(commands.executeShopifyOrderManagementCommand(commandInput({
 })), 'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH')
 assert.deepEqual(events.map(([event]) => event), ['authorization-read'])
 assert.equal(providerExecutionCount, 0)
+
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel_fulfillment'),
+})
+await expectCode(commands.executeShopifyOrderManagementCommand(commandInput({
+  confirmationStatement:
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_FULFILLMENT #6600',
+  mutation: {
+    kind: 'cancel_fulfillment',
+    fulfillmentId: fulfillmentGid,
+    expectedFulfillmentUpdatedAt: '2026-08-14T03:18:59.000Z',
+  },
+})), 'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH')
+assert.deepEqual(events.map(([event]) => event), ['authorization-read'])
+assert.equal(providerExecutionCount, 0)
+
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel_order_after_fulfillment_reversal'),
+})
+await expectCode(commands.executeShopifyOrderManagementCommand(commandInput({
+  confirmationStatement:
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+  mutation: {
+    kind: 'cancel_order_after_fulfillment_reversal',
+    predecessorAuthorizationGlobalId: 'gsom9999999',
+  },
+})), 'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH')
+assert.deepEqual(events.map(([event]) => event), ['authorization-read'])
+assert.equal(providerExecutionCount, 0)
+
+// Execution resolves the original fulfillment through the exact predecessor
+// authorization and passes that durable binding to the adapter. The operator
+// never supplies or alters this fulfillment GID in the second mutation.
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel_order_after_fulfillment_reversal'),
+})
+adapterExecution = successfulExecution({
+  action: 'cancel_order_after_fulfillment_reversal',
+})
+const postReversalResult = await commands.executeShopifyOrderManagementCommand(commandInput({
+  confirmationStatement:
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+  mutation: {
+    kind: 'cancel_order_after_fulfillment_reversal',
+    predecessorAuthorizationGlobalId,
+  },
+}))
+const postReversalProviderCall = events.find(
+  ([event]) => event === 'provider-execute',
+)[1]
+assert.deepEqual(plain(postReversalProviderCall.action), {
+  type: 'cancel_order_after_fulfillment_reversal',
+  predecessorAuthorizationGlobalId,
+  reason: 'STAFF',
+  staffNote: `ClawPilot authorized test action: ${reason}`,
+  reversedFulfillmentGid: fulfillmentGid,
+})
+assert.equal(postReversalResult.state, 'succeeded')
+
+// A claimed post-reversal command without its durable predecessor fulfillment
+// fails before the adapter can dispatch Shopify's orderCancel mutation.
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel_order_after_fulfillment_reversal'),
+  predecessorFulfillmentGid: null,
+})
+const missingPredecessorResult = await commands.executeShopifyOrderManagementCommand(commandInput({
+  confirmationStatement:
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+  mutation: {
+    kind: 'cancel_order_after_fulfillment_reversal',
+    predecessorAuthorizationGlobalId,
+  },
+}))
+assert.equal(providerExecutionCount, 0)
+assert.equal(missingPredecessorResult.state, 'failed')
+assert.equal(
+  lastOutcomeInput.errorCode,
+  'SHOPIFY_ORDER_POST_REVERSAL_PREDECESSOR_MISSING',
+)
 
 // The durable provider-attempt claim is completed before the adapter can
 // dispatch a mutation, and the adapter outcome is retained afterward.
@@ -1205,10 +1806,8 @@ assert.equal(lastReconcileInput.authorizationGlobalId, authorizationGlobalId)
 assert.equal(lastReconcileInput.providerAttemptGlobalId, attemptGlobalId)
 assert.equal(lastReconcileInput.resolution, 'applied')
 assert.equal(providerExecutionCount, 0)
-assert.equal(
-  result.management.blockerCode,
-  'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
-)
+assert.equal(result.management.blockerCode, null)
+assert.equal(result.management.eligibility.addTag.allowed, false)
 assert.deepEqual(events.map(([event]) => event), [
   'attempt-read',
   'target-read',
@@ -1328,6 +1927,57 @@ result = await commands.reconcileShopifyOrderManagementCommand({
 assert.equal(result.state, 'unknown')
 assert.equal(result.providerReads, 3)
 assert.equal(lastReconcileInput, null)
+
+// Fulfillment-reversal reconciliation is affirmative-only: the exact
+// fulfillment must still be present and report CANCELLED. SUCCESS or a
+// missing fulfillment can race Shopify visibility and remains unknown.
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel_fulfillment'),
+  status: 'unknown',
+  providerAttemptGlobalId: attemptGlobalId,
+  providerWriteCount: 1,
+  providerReference: fulfillmentGid,
+})
+inspection = inspectionFixture(previewFixture({
+  fulfillments: [fulfillmentFixture({
+    status: 'CANCELLED',
+    updatedAt: '2026-08-14T03:21:00.000Z',
+  })],
+}))
+result = await commands.reconcileShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  attemptGlobalId,
+  idempotencyKey: 'shopify-fulfillment-reconcile-applied-0001',
+})
+assert.equal(result.state, 'reconciled')
+assert.equal(lastReconcileInput.resolution, 'applied')
+assert.equal(lastReconcileInput.evidence.fulfillmentId, fulfillmentGid)
+assert.equal(
+  lastReconcileInput.evidence.observedFulfillmentStatus,
+  'CANCELLED',
+)
+
+for (const fulfillments of [[fulfillmentFixture()], []]) {
+  reset()
+  currentAuthorization = authorizationFixture({
+    action: actionFixture('cancel_fulfillment'),
+    status: 'unknown',
+    providerAttemptGlobalId: attemptGlobalId,
+    providerWriteCount: 1,
+    providerReference: fulfillmentGid,
+  })
+  inspection = inspectionFixture(previewFixture({ fulfillments }))
+  result = await commands.reconcileShopifyOrderManagementCommand({
+    organizationId,
+    actorEmail,
+    attemptGlobalId,
+    idempotencyKey: `shopify-fulfillment-reconcile-unknown-${fulfillments.length}`,
+  })
+  assert.equal(result.state, 'unknown')
+  assert.equal(lastReconcileInput, null)
+}
 
 // A different organization cannot read or reconcile the attempt even when it
 // knows the opaque global identifier.

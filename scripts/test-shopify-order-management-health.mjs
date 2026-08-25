@@ -19,6 +19,15 @@ const singleSaveMigration = readFileSync(
 const singleSaveMigrationChecksum = createHash('sha256')
   .update(singleSaveMigration)
   .digest('hex')
+const fulfillmentReversalMigrationPath =
+  'db/migrations/0325_operations_shopify_fulfillment_reversal.sql'
+const fulfillmentReversalMigration = readFileSync(
+  resolve(root, fulfillmentReversalMigrationPath),
+  'utf8',
+)
+const fulfillmentReversalMigrationChecksum = createHash('sha256')
+  .update(fulfillmentReversalMigration)
+  .digest('hex')
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
@@ -36,6 +45,14 @@ const managementFunctions = [
   'protect_shopify_order_management_attempt()',
   'protect_shopify_order_management_outcome()',
   'protect_shopify_order_management_downstream_race()',
+  'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)',
+  'operations_shopify_post_reversal_order_cancellation_is_safe(uuid,uuid,uuid)',
+  'protect_shopify_fulfillment_reversal_authorization_insert()',
+  'protect_shopify_fulfillment_reversal_attempt_insert()',
+  'protect_shopify_post_reversal_order_cancel_authorization_insert()',
+  'protect_shopify_post_reversal_order_cancel_attempt_insert()',
+  'enforce_shopify_order_management_downstream_race(uuid,uuid)',
+  'protect_shopify_order_management_indirect_downstream_race()',
 ]
 const managementTriggers = [
   [
@@ -79,6 +96,54 @@ const managementTriggers = [
     'protect_shopify_order_management_downstream_race()',
   ],
 ]
+const fulfillmentReversalTriggers = [
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_order_management_authorization_insert',
+    'protect_shopify_order_management_authorization()',
+  ],
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_fulfillment_reversal_authorization_insert',
+    'protect_shopify_fulfillment_reversal_authorization_insert()',
+  ],
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_post_reversal_order_cancel_authorization_insert',
+    'protect_shopify_post_reversal_order_cancel_authorization_insert()',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_order_management_attempt_insert',
+    'protect_shopify_order_management_attempt()',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_fulfillment_reversal_attempt_insert',
+    'protect_shopify_fulfillment_reversal_attempt_insert()',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_post_reversal_order_cancel_attempt_insert',
+    'protect_shopify_post_reversal_order_cancel_attempt_insert()',
+  ],
+]
+const fulfillmentReversalRaceTriggers = [
+  ['operations_active_fulfillment_executions', 'protect_shopify_order_management_active_execution_race'],
+  ['operations_commerce_fulfillment_exports', 'protect_shopify_order_management_export_race'],
+  ['operations_fulfillment_executions', 'protect_shopify_order_management_execution_race'],
+  ['operations_fulfillment_plans', 'protect_shopify_order_management_plan_race'],
+  ['operations_label_attempts', 'protect_shopify_order_management_label_attempt_race'],
+  ['operations_labels', 'protect_shopify_order_management_label_race'],
+  ['operations_packages', 'protect_shopify_order_management_package_race'],
+  ['operations_packaging_material_claims', 'protect_shopify_order_management_packaging_claim_race'],
+  ['operations_pick_tasks', 'protect_shopify_order_management_pick_race'],
+  ['operations_production_fulfillment_rerate_runs', 'protect_shopify_order_management_rerate_race'],
+  ['operations_reservations', 'protect_shopify_order_management_reservation_race'],
+  ['operations_shipment_groups', 'protect_shopify_order_management_shipment_group_race'],
+  ['operations_shipments', 'protect_shopify_order_management_shipment_race'],
+  ['operations_waves', 'protect_shopify_order_management_wave_race'],
+]
 
 assert.equal(
   singleSaveMigrationChecksum,
@@ -95,7 +160,26 @@ assert.doesNotMatch(
   /ADD COLUMN (?:shipping_address|address1|address2|city|zip|postal_code)/u,
   'address PII must remain represented only by the requested projection hash',
 )
-
+assert.equal(
+  fulfillmentReversalMigrationChecksum,
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
+  'health attestation must pin the exact fulfillment-reversal migration',
+)
+for (const fragment of [
+  'ADD COLUMN fulfillment_gid text',
+  'ADD COLUMN expected_fulfillment_updated_at timestamptz',
+  'ADD COLUMN predecessor_authorization_id uuid',
+  "action = 'cancel_fulfillment'",
+  "action = 'cancel_order_after_fulfillment_reversal'",
+  'operations_shopify_fulfillment_reversal_is_safe',
+  'operations_shopify_post_reversal_order_cancellation_is_safe',
+  'protect_shopify_order_management_indirect_downstream_race',
+]) {
+  assert.ok(
+    fulfillmentReversalMigration.includes(fragment),
+    `Fulfillment-reversal migration missing ${fragment}`,
+  )
+}
 for (const fragment of [
   "from '@/lib/persistence/shopifyOrderManagement'",
   'readShopifyOrderManagementHealthFromPostgres',
@@ -128,6 +212,23 @@ for (const fragment of [
   "'ops_shopify_order_mgmt_auth_projection_hash_valid'",
   "'ops_shopify_order_mgmt_attempt_projection_hash_valid'",
   "'ops_shopify_order_mgmt_outcome_write_count_valid'",
+  "'0325_operations_shopify_fulfillment_reversal.sql'",
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
+  '0a036803128e3152d7d200262e7980e913cc0197c852686c139918b81990b3b3',
+  'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
+  '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
+  '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
+  'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+  'fc9b1d5fef57ae7a7f305713e7944713fd41026c00534c8d1216b983f5f05d2c',
+  '2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc',
+  '0ff13ea37552b62b039a3d6dfa7eeeb66db49fc21e7a7e266d2738912b4af101',
+  "'fulfillment_gid'",
+  "'expected_fulfillment_updated_at'",
+  "'predecessor_authorization_id'",
+  "'operations_shopify_post_reversal_order_cancellation_is_safe(uuid,uuid,uuid)'",
+  "'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)'",
+  "'protect_shopify_fulfillment_reversal_authorization_insert()'",
+  "'protect_shopify_fulfillment_reversal_attempt_insert()'",
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -156,6 +257,19 @@ for (const [table, trigger, signature] of managementTriggers) {
     `Health structural query missing exact trigger mapping ${trigger}`,
   )
 }
+for (const [, trigger] of fulfillmentReversalTriggers) {
+  assert.ok(
+    routeSource.includes(`'${trigger}'`),
+    `Health structural query missing split trigger ${trigger}`,
+  )
+}
+for (const [table, trigger] of fulfillmentReversalRaceTriggers) {
+  assert.ok(
+    routeSource.includes(`'${table}'`)
+      && routeSource.includes(`'${trigger}'`),
+    `Health structural query missing downstream race trigger ${trigger}`,
+  )
+}
 assert.match(
   routeSource,
   /installed_shopify_order_management_trigger\.tgfoid\s*=\s*[\s\S]{0,120}to_regprocedure/u,
@@ -173,13 +287,13 @@ assert.match(
 )
 assert.match(
   routeSource,
-  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0312_operations_shopify_order_single_save\.sql[\s\S]{0,180}OR \(/u,
-  'Health readiness must accept the 0308 function bodies only while 0312 is absent',
+  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0312_operations_shopify_order_single_save\.sql[\s\S]{0,220}AND NOT EXISTS \([\s\S]{0,180}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,180}OR \(/u,
+  'Health readiness may accept the 0308 function bodies only before both 0312 and 0325',
 )
 assert.match(
   routeSource,
-  /CASE[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
-  'Function attestation must select the exact 0312 or frozen 0308 aggregate',
+  /CASE[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
+  'Function attestation must select the exact 0325, 0312, or frozen 0308 aggregate',
 )
 assert.match(
   routeSource,
@@ -618,6 +732,18 @@ if (liveDatabaseUrl) {
     phaseStart,
     phaseEnd,
   )
+  for (const requiredPhaseFragment of [
+    '0a036803128e3152d7d200262e7980e913cc0197c852686c139918b81990b3b3',
+    'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
+    '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
+    '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
+    'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+  ]) {
+    assert.ok(
+      providerWriteHealthExpression.includes(requiredPhaseFragment),
+      `Extracted Provider writes phase omits ${requiredPhaseFragment}`,
+    )
+  }
   const structuralReady = async () => {
     const result = await client.query(
       `SELECT ${providerWriteHealthExpression} AS ready`,
@@ -626,6 +752,25 @@ if (liveDatabaseUrl) {
   }
   try {
     assert.equal(await structuralReady(), true)
+
+    await client.query('BEGIN')
+    await client.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0325_operations_shopify_fulfillment_reversal.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0325_operations_shopify_fulfillment_reversal.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
 
     await client.query('BEGIN')
     await client.query(
@@ -649,8 +794,44 @@ if (liveDatabaseUrl) {
     await client.query('BEGIN')
     await client.query(
       `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       ALTER COLUMN fulfillment_gid SET DEFAULT ''`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       DROP CONSTRAINT ops_shopify_order_mgmt_auth_action_valid`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
          public.operations_shopify_order_management_attempts
        ALTER COLUMN requires_order_edits SET DEFAULT true`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `CREATE OR REPLACE FUNCTION
+         public.operations_shopify_fulfillment_reversal_is_safe(
+           p_organization_id uuid,
+           p_order_id uuid,
+           p_fulfillment_gid text,
+           p_fulfillment_updated_at timestamptz
+         )
+       RETURNS boolean
+       LANGUAGE sql
+       STABLE
+       SET search_path = pg_catalog, public, pg_temp
+       AS 'SELECT true'`,
     )
     assert.equal(await structuralReady(), false)
     await client.query('ROLLBACK')
@@ -697,6 +878,16 @@ if (liveDatabaseUrl) {
          public.operations_shopify_order_management_authorizations
        DISABLE TRIGGER
          protect_shopify_order_management_authorization_write`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       DISABLE TRIGGER
+         protect_shopify_fulfillment_reversal_authorization_insert`,
     )
     assert.equal(await structuralReady(), false)
     await client.query('ROLLBACK')

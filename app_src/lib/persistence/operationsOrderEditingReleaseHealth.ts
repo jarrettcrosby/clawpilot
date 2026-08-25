@@ -21,6 +21,9 @@ export const OPERATIONS_CARRIER_WRITES_INDEPENDENT_ACTIVATION_MIGRATION_CHECKSUM
 export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM =
   'c6d40d41082fea69cd01966642f824ed56776a1c4efad47bc6d74f75242ab71d'
 
+export const OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM =
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
+
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
          installed_namespace.nspname || '.' || installed_table.relname
@@ -547,6 +550,8 @@ export const OPERATIONS_COMMERCE_ORDER_WORKBENCH_ARTIFACT_HASH =
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT = 74
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH =
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0'
+export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0325_ARTIFACT_HASH =
+  'd0049adc200df110ed90132dd77bd300d0cfb9703b4921abcc5ae8bdb4eef24a'
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH =
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf'
@@ -602,9 +607,22 @@ export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
         pg_catalog.string_agg(
           kind || '|' || identity || '|' || definition,
           pg_catalog.chr(10) ORDER BY kind, identity
-        ), 'UTF8'
-      ), 'sha256'), 'hex') =
-        '${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH}'
+      ), 'UTF8'
+      ), 'sha256'), 'hex') = CASE
+        WHEN NOT EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0325_operations_shopify_fulfillment_reversal.sql'
+        ) THEN '${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH}'
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0325_operations_shopify_fulfillment_reversal.sql'
+            AND checksum =
+              '${OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM}'
+        ) THEN '${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0325_ARTIFACT_HASH}'
+        ELSE NULL
+      END
     FROM artifacts
   )
   AND (

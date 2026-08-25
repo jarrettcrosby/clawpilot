@@ -85,6 +85,9 @@ for (const field of [
   'Address phone',
 ]) assert.ok(source.panel.includes(field), `Shopify source address is missing ${field}`)
 assert.match(source.panel, />Line quantities</)
+assert.match(source.panel, />Shopify fulfillments</)
+assert.match(source.panel, />\s*Reverse fulfillment\s*</)
+assert.match(source.panel, />\s*Track\s*</)
 assert.match(source.panel, />Cancel order</)
 assert.match(source.panel, /if \(!canManage\) return/)
 assert.doesNotMatch(
@@ -131,6 +134,19 @@ for (const saveField of [
 }
 assert.match(source.panel, /action: 'reconcile' as const/)
 assert.match(source.panel, /attemptGlobalId: attempt\.attemptGlobalId/)
+const reconcileHandler = source.panel.slice(
+  source.panel.indexOf('const reconcile = async'),
+  source.panel.indexOf('\n  return (', source.panel.indexOf('const reconcile = async')),
+)
+const resolvedReconciliationBranch = reconcileHandler.slice(
+  reconcileHandler.indexOf('} else {'),
+  reconcileHandler.indexOf('} catch'),
+)
+assert.match(
+  resolvedReconciliationBranch,
+  /await load\(\)[\s\S]{0,120}await Promise\.resolve\(onOrderChanged\(\)\)/,
+  'a proved reconciliation must reload management eligibility before the order callback',
+)
 assert.match(source.panel, />\s*Save order\s*</)
 assert.match(source.panel, />\s*Cancel Shopify order\s*</)
 assert.match(source.panel, /kind: 'save_order'/)
@@ -153,6 +169,58 @@ assert.equal(
 assert.doesNotMatch(source.panel, />\s*Save tag\s*</)
 assert.doesNotMatch(source.panel, />\s*Save quantity\s*</)
 assert.match(source.panel, /save\(\{ kind: 'cancel' \}\)/)
+assert.match(source.panel, /kind: 'cancel_fulfillment'/)
+assert.match(source.panel, /fulfillmentId: fulfillment\.fulfillmentId/)
+assert.match(
+  source.panel,
+  /expectedFulfillmentUpdatedAt: eligibility\.expectedUpdatedAt/,
+)
+assert.match(source.panel, /const confirmed = window\.confirm\(/)
+assert.match(source.panel, /This does not cancel or refund the order\./)
+assert.match(source.panel, /It does not void the '/)
+assert.match(source.panel, /carrier label or remove saved label and reprint history\./)
+assert.match(
+  source.panel,
+  /mutation\.kind === 'cancel_fulfillment'[\s\S]{0,140}\|\| mutation\.kind === 'cancel_order_after_fulfillment_reversal'[\s\S]{0,40}\) await load\(\)/,
+  'successful fulfillment reversal must refresh the exact provider state',
+)
+assert.doesNotMatch(
+  source.panel,
+  /cancel_fulfillment[\s\S]{0,500}save\(\{ kind: 'cancel' \}\)/,
+  'fulfillment reversal must not chain order cancellation or refund behavior',
+)
+assert.match(
+  source.panel,
+  /disabled=\{busy[\s\S]{0,120}\|\| Boolean\(blocker\)[\s\S]{0,120}\|\| !eligibility\.allowed\}/,
+  'the exact per-fulfillment eligibility must control the reversal action',
+)
+assert.doesNotMatch(
+  source.panel,
+  /const blocker =[\s\S]{0,500}: state\?\.blockerCode/,
+  'ordinary Save and Cancel blockers must not become a panel-global reversal blocker',
+)
+assert.match(source.panel, />\s*Cancel order after reversal\s*</)
+assert.match(source.panel, /data-testid="save-shopify-cancel-after-reversal"/)
+assert.match(source.panel, /kind: 'cancel_order_after_fulfillment_reversal'/)
+assert.match(source.panel, /predecessorAuthorizationGlobalId: predecessor/)
+assert.match(
+  source.panel,
+  /This is a separate Shopify order cancellation after the fulfillment '/,
+)
+assert.match(source.panel, /It does not issue a refund\./)
+assert.match(
+  source.panel,
+  /onClick=\{\(\) => void cancelAfterFulfillmentReversal\(\)\}/,
+)
+const reversalHandler = source.panel.slice(
+  source.panel.indexOf('const reverseFulfillment = async'),
+  source.panel.indexOf('const cancelAfterFulfillmentReversal = async'),
+)
+assert.doesNotMatch(
+  reversalHandler,
+  /cancel_order_after_fulfillment_reversal/,
+  'fulfillment reversal must not automatically dispatch order cancellation',
+)
 
 for (const retiredCeremony of [
   /action: 'prepare'/,

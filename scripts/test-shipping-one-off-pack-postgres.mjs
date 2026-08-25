@@ -10,6 +10,8 @@ import vm from 'node:vm'
 import {
   SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL,
   SHIPPING_ONE_OFF_PACK_HEALTH_SQL,
+  SHIPPING_ONE_OFF_PACK_POST_0325_CATALOG_HASH,
+  SHIPPING_ONE_OFF_PACK_POST_0325_MIGRATION_CHECKSUM,
 } from '../app_src/lib/persistence/shippingOneOffPackHealth.ts'
 
 const root = process.cwd()
@@ -497,6 +499,20 @@ async function exerciseHealthTamper() {
       'Fresh 0304 checksum and exact catalog must be healthy',
     )
     const cases = [
+      ['missing 0325 migration ledger', async () => {
+        await client.query(
+          `DELETE FROM public.schema_migrations
+           WHERE filename =
+             '0325_operations_shopify_fulfillment_reversal.sql'`,
+        )
+      }],
+      ['wrong 0325 migration checksum', async () => {
+        await client.query(
+          `UPDATE public.schema_migrations SET checksum = repeat('0', 64)
+           WHERE filename =
+             '0325_operations_shopify_fulfillment_reversal.sql'`,
+        )
+      }],
       ['migration checksum', async () => {
         await client.query(
           `UPDATE schema_migrations SET checksum = repeat('0', 64)
@@ -1812,6 +1828,15 @@ try {
 }
 
 try {
+  const fulfillmentReversalLedger = await pool.query(
+    `SELECT checksum
+     FROM public.schema_migrations
+     WHERE filename =
+       '0325_operations_shopify_fulfillment_reversal.sql'`,
+  )
+  assert.deepEqual(fulfillmentReversalLedger.rows, [{
+    checksum: SHIPPING_ONE_OFF_PACK_POST_0325_MIGRATION_CHECKSUM,
+  }])
   const healthFingerprint = await pool.query(
     SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL,
   )
@@ -1820,8 +1845,7 @@ try {
   }
   assert.deepEqual(healthFingerprint.rows[0], {
     artifact_count: 75,
-    artifact_hash:
-      'b463547928148723e9f5b35d92b310992c57e8dfc6a646a5bb3221898ba2c992',
+    artifact_hash: SHIPPING_ONE_OFF_PACK_POST_0325_CATALOG_HASH,
   })
   await exerciseHealthTamper()
   const exact = await pool.query(
