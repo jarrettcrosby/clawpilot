@@ -37,6 +37,11 @@ const orderEditingReleaseMigrations = new Map([
   ],
 ])
 
+const shopifyReversalFixtureMigration = [
+  'db/migrations/0326_operations_shopify_reversal_test_fixture.sql',
+  'fe7e5ebb5e5cae4eedfe69a8d0dc863ef76ce90a0c003d7193d94fafcd8be074',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -130,6 +135,103 @@ for (const requiredFragment of [
 }
 
 const rootPackage = readJson('package.json')
+const [shopifyReversalFixtureMigrationPath,
+  shopifyReversalFixtureMigrationChecksum] = shopifyReversalFixtureMigration
+if (!existsSync(resolve(root, shopifyReversalFixtureMigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture migration: ${shopifyReversalFixtureMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, shopifyReversalFixtureMigrationPath)))
+    .digest('hex') !== shopifyReversalFixtureMigrationChecksum
+) {
+  fail('Shopify reversal fixture migration checksum drifted')
+}
+const shopifyReversalFixtureRequiredFiles = [
+  'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
+  'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
+  'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
+  'app_src/lib/persistence/shopifyReversalFixture.ts',
+  'app_src/lib/persistence/shopifyReversalFixtureHealth.ts',
+  'app_src/lib/operations/shopifyReversalFixtureCommands.ts',
+  'app_src/app/api/dev/shopify-test-fixtures/route.ts',
+  'scripts/shopify-test-fixture.mjs',
+  'scripts/test-shopify-reversal-fixture-runtime.mjs',
+  'scripts/test-shopify-reversal-fixture-adapter.mjs',
+  'scripts/test-shopify-reversal-fixture-commands.mjs',
+  'scripts/test-shopify-reversal-fixture-api.mjs',
+  'scripts/test-shopify-reversal-fixture-postgres.mjs',
+  'scripts/test-shopify-reversal-fixture-static.mjs',
+  'docs/operations/shopify-reversal-test-fixture.md',
+]
+for (const requiredPath of shopifyReversalFixtureRequiredFiles) {
+  if (!existsSync(resolve(root, requiredPath))) {
+    fail(`missing Shopify reversal fixture artifact: ${requiredPath}`)
+  }
+}
+const shopifyReversalFixtureTest = String(
+  rootPackage?.scripts?.['test:shopify-reversal-fixture'] || '',
+)
+for (const command of [
+  'node scripts/test-shopify-reversal-fixture-runtime.mjs',
+  'node scripts/test-shopify-reversal-fixture-adapter.mjs',
+  'node scripts/test-shopify-reversal-fixture-commands.mjs',
+  'node scripts/test-shopify-reversal-fixture-api.mjs',
+  'node scripts/test-shopify-reversal-fixture-postgres.mjs',
+  'node scripts/test-shopify-reversal-fixture-static.mjs',
+]) {
+  if (!shopifyReversalFixtureTest.includes(command)) {
+    fail(`test:shopify-reversal-fixture must run "${command}"`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:commerce'] || '')
+    .includes('npm run test:shopify-reversal-fixture')
+) {
+  fail('test:commerce must run Shopify reversal fixture acceptance')
+}
+const shopifyReversalFixtureRuntimeSource = readFileSync(
+  resolve(root, 'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts'),
+  'utf8',
+)
+for (const fragment of [
+  'giah34fedoa5b1o',
+  'gid://shopify/ProductVariant/51028106576119',
+  'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
+  'e4abd95f-825c-4242-b37b-825a92597e98',
+  '750aa268-0e31-4065-a99c-4016e4d4fab1',
+  'CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED',
+  'normalUiAvailable: false',
+  'productionAvailable: false',
+]) {
+  if (!shopifyReversalFixtureRuntimeSource.includes(fragment)) {
+    fail(`Shopify reversal fixture runtime is missing ${fragment}`)
+  }
+}
+const shopifyReversalFixtureHealthSource = readFileSync(
+  resolve(root, 'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'),
+  'utf8',
+)
+if (
+  !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureMigrationChecksum,
+  )
+  || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
+  || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')
+) {
+  fail('runtime health is missing the Shopify reversal fixture readiness gate')
+}
+const proxySource = readFileSync(resolve(root, 'app_src/proxy.ts'), 'utf8')
+if (
+  !proxySource.includes("pathname === '/api/dev/shopify-test-fixtures'")
+  || proxySource.includes(
+    "normalizedPath === '/api/dev/shopify-test-fixtures'",
+  )
+) {
+  fail('Shopify reversal fixture proxy exception must match only the exact route')
+}
 const checkoutAudienceTest = String(
   rootPackage?.scripts?.['test:shopify-checkout-audience-policy'] || '',
 )

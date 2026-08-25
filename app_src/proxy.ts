@@ -63,6 +63,7 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/integrations/commerce/orders/process'
     || normalizedPath === '/api/integrations/commerce/images/process'
     || normalizedPath === '/api/integrations/commerce/fulfillment/process'
+    || pathname === '/api/dev/shopify-test-fixtures'
     || normalizedPath.startsWith('/api/integrations/commerce/shopify/webhooks/')
     || normalizedPath.startsWith('/api/integrations/commerce/shopify/carrier-service/')
     || normalizedPath === '/api/integrations/commerce/shopify/rate-warm'

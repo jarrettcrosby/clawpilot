@@ -1,0 +1,160 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+import {
+  readFileSync,
+  readdirSync,
+  statSync,
+} from 'node:fs'
+import { extname, resolve } from 'node:path'
+import vm from 'node:vm'
+
+const root = process.cwd()
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const ts = requireFromApp('typescript')
+const migrationPath =
+  'db/migrations/0326_operations_shopify_reversal_test_fixture.sql'
+const healthPath =
+  'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'
+const healthRoutePath = 'app_src/app/api/health/route.ts'
+const persistencePath = 'app_src/lib/persistence/shopifyReversalFixture.ts'
+const migration = readFileSync(resolve(root, migrationPath), 'utf8')
+const checksum = createHash('sha256').update(migration).digest('hex')
+const healthSource = readFileSync(resolve(root, healthPath), 'utf8')
+const healthRoute = readFileSync(resolve(root, healthRoutePath), 'utf8')
+const persistenceSource = readFileSync(resolve(root, persistencePath), 'utf8')
+
+assert.match(healthSource, new RegExp(checksum, 'u'))
+assert.match(healthRoute, /readShopifyReversalFixtureHealthInPostgres/u)
+assert.match(healthRoute, /SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY/u)
+assert.match(healthRoute, /shopifyReversalFixtureRuntimeState\.available/u)
+assert.match(healthRoute, /reversalFixtureReady/u)
+assert.match(
+  persistenceSource,
+  /\^\(\?:CREATE\|FULFILL\) TEST ORDER \[a-f0-9\]\{12\}\$/u,
+  'claim confirmation must be a fixed short intent-hash-bound statement',
+)
+
+for (const fragment of [
+  "phase IN ('create_order', 'create_fulfillment')",
+  "fixture_profile_version = 'shopify-reversal-fixture-v1'",
+  "account.global_id = 'giah34fedoa5b1o'",
+  "'750aa268-0e31-4065-a99c-4016e4d4fab1'",
+  "candidate.test_order = true",
+  "candidate.normalized_payment_status = 'pending'",
+  "candidate.normalized_fulfillment_status = 'unfulfilled'",
+  "wave.released_at = p_released_at",
+  'p_released_at <= pg_catalog.clock_timestamp()',
+  "pick.status = 'ready'",
+  "COALESCE(pick.picked_quantity, 0) = 0",
+  'operations_shopify_external_fulfillment_reconciliations',
+  'operations_label_attempts',
+  'operations_labels',
+  'operations_print_artifacts',
+  'operations_packages',
+  'operations_shipments',
+  'operations_commerce_fulfillment_exports',
+  'operations_billable_events',
+  'operations_fulfillment_executions',
+  'operations_active_fulfillment_executions',
+  'pg_advisory_xact_lock',
+  'Shopify reversal fixture ledgers are append-only',
+]) {
+  assert.ok(migration.includes(fragment), `0326 must include ${fragment}`)
+}
+
+const output = ts.transpileModule(healthSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.CommonJS,
+    target: ts.ScriptTarget.ES2022,
+  },
+  fileName: healthPath,
+}).outputText
+let queries = 0
+let structureCurrent = true
+const module = { exports: {} }
+vm.runInNewContext(output, {
+  Boolean,
+  Number,
+  Object,
+  exports: module.exports,
+  module,
+  require(specifier) {
+    assert.equal(specifier, '@/lib/persistence/postgres')
+    return {
+      query: async (_sql, values) => {
+        queries += 1
+        if (queries % 2 === 1) {
+          assert.equal(values[0], migrationPath.split('/').at(-1))
+          assert.equal(values[1], checksum)
+          return { rows: [{
+            migration_current: structureCurrent,
+            command_table: structureCurrent,
+            attempt_table: structureCurrent,
+            outcome_table: structureCurrent,
+            state_view: structureCurrent,
+            actor_function: structureCurrent,
+            account_function: structureCurrent,
+            database_function: structureCurrent,
+            fulfillment_function: structureCurrent,
+            immutable_trigger_count: structureCurrent ? '6' : '0',
+            database_identity:
+              '750aa268-0e31-4065-a99c-4016e4d4fab1',
+          }] }
+        }
+        return { rows: [{
+          prepared: '1', processing: '2', unknown: '3', terminal: '4',
+        }] }
+      },
+    }
+  },
+}, { filename: healthPath })
+
+const healthy = await module.exports.readShopifyReversalFixtureHealthInPostgres()
+assert.equal(healthy.migrationCurrent, true)
+assert.equal(healthy.structureCurrent, true)
+assert.equal(healthy.unknown, 3)
+structureCurrent = false
+const unhealthy = await module.exports.readShopifyReversalFixtureHealthInPostgres()
+assert.equal(unhealthy.migrationCurrent, false)
+assert.equal(unhealthy.structureCurrent, false)
+
+function filesBelow(directory) {
+  const result = []
+  for (const name of readdirSync(directory)) {
+    const path = resolve(directory, name)
+    const stat = statSync(path)
+    if (stat.isDirectory()) result.push(...filesBelow(path))
+    else result.push(path)
+  }
+  return result
+}
+
+const uiRoots = [
+  resolve(root, 'app_src/app'),
+  resolve(root, 'app_src/components'),
+]
+const fixtureIdentifier = /shopify-test-fixtures|shopifyReversalFixture|SHOPIFY_REVERSAL_FIXTURE/iu
+for (const path of uiRoots.flatMap(filesBelow)) {
+  if (!['.ts', '.tsx', '.js', '.jsx'].includes(extname(path))) continue
+  if (path.includes('/app/api/')) continue
+  assert.doesNotMatch(
+    readFileSync(path, 'utf8'),
+    fixtureIdentifier,
+    `fixture lane must not appear in normal UI: ${path}`,
+  )
+}
+
+const proxy = readFileSync(resolve(root, 'app_src/proxy.ts'), 'utf8')
+assert.match(proxy, /pathname === '\/api\/dev\/shopify-test-fixtures'/u)
+assert.doesNotMatch(
+  proxy,
+  /normalizedPath === '\/api\/dev\/shopify-test-fixtures'/u,
+  'the public proxy exception must be exact, not a trailing-slash alias',
+)
+
+console.log('Shopify reversal fixture health and hidden-surface boundary passed.')

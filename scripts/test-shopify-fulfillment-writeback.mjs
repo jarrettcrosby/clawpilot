@@ -567,6 +567,21 @@ const credential = {
   shopDomain: 'ag-alchemy.myshopify.com',
   accessToken: 'token',
 }
+const fixturePreparation = await providerOnlyModule(() => openOrder())
+  .prepareShopifyFulfillmentProviderAttempt(credential, providerInput)
+assert.equal(fixturePreparation.existing, null)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(fixturePreparation.providerInput)),
+  {
+    ...providerInput,
+    sandboxE2eAuthorityKind: null,
+    allowLegacySignatureWithoutAuthorityKind: false,
+  },
+)
+assert.equal(
+  fixturePreparation.signature.sandboxE2eAuthorityKind,
+  null,
+)
 const replayModule = providerOnlyModule(() => closedOrderWith(exactObservedFulfillment()))
 
 assert.deepEqual(JSON.parse(JSON.stringify(await replayModule.writeShopifyFulfillment(

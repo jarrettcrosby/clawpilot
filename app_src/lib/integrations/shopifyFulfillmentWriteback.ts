@@ -636,7 +636,7 @@ const FULFILLMENT_CREATE_MUTATION = `mutation ClawPilotFulfillmentCreate($fulfil
   }
 }`
 
-type ProviderWriteInput = {
+export type ShopifyFulfillmentProviderInput = {
   externalOrderId: string
   trackingNumbers: string[]
   carrier: string
@@ -644,6 +644,59 @@ type ProviderWriteInput = {
   expectedLineItems: Array<{ lineItemId: string; quantity: number }>
   sandboxE2eAuthorityKind: SandboxE2eAuthorityKind | null
   allowLegacySignatureWithoutAuthorityKind: boolean
+}
+
+/**
+ * Low-level preparation for a caller that already owns a separate durable
+ * provider-write claim. It performs one bounded Shopify read and returns the
+ * immutable signature that must be used for the later mutation or read-only
+ * reconciliation. It does not authorize a provider write by itself.
+ */
+export async function prepareShopifyFulfillmentProviderAttempt(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: {
+    externalOrderId: unknown
+    trackingNumbers: unknown
+    carrier: unknown
+    notifyCustomer: unknown
+    expectedLineItems: unknown
+  },
+): Promise<ShopifyFulfillmentWritebackPreparation & {
+  providerInput: ShopifyFulfillmentProviderInput
+}> {
+  if (typeof input.notifyCustomer !== 'boolean') {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_NOTIFICATION_DECISION_REQUIRED',
+      'An explicit Shopify customer notification decision is required',
+    )
+  }
+  const providerInput: ShopifyFulfillmentProviderInput = {
+    externalOrderId: orderGid(input.externalOrderId),
+    trackingNumbers: normalizedTrackingNumbers(
+      undefined,
+      input.trackingNumbers,
+    ),
+    carrier: clean(input.carrier, 'Carrier', 64),
+    notifyCustomer: input.notifyCustomer,
+    expectedLineItems: normalizeExpectedLineItems(input.expectedLineItems),
+    sandboxE2eAuthorityKind: null,
+    allowLegacySignatureWithoutAuthorityKind: false,
+  }
+  const inspection = await inspectShopifyFulfillment(
+    credential,
+    providerInput,
+  )
+  const plan = deriveOpenFulfillmentPlan(inspection.order, providerInput)
+  requirePlanMatchesExpectedLines(plan, providerInput)
+  return {
+    providerInput,
+    signature: plan.signature,
+    existing: findExactExistingFulfillment(
+      inspection.fulfillments,
+      plan.signature,
+      providerInput,
+    ),
+  }
 }
 
 type ObservedFulfillment = {
@@ -971,7 +1024,7 @@ export function shopifyFulfillmentAttemptSignatureHashCandidates(
 
 function normalizeAttemptSignatureForInput(
   value: unknown,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   const normalized = normalizeAttemptSignature(value)
   const omittedAuthorityKind = Boolean(
@@ -1006,7 +1059,7 @@ function signaturesEqual(
 
 function requireSignatureMatchesInput(
   signature: ShopifyFulfillmentAttemptSignature,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   const requestShape = {
     externalOrderId: input.externalOrderId,
@@ -1034,7 +1087,7 @@ function requireSignatureMatchesInput(
 
 function deriveOpenFulfillmentPlan(
   order: Record<string, unknown>,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): OpenFulfillmentPlan {
   if (typeof order.canNotifyCustomer !== 'boolean') {
     return providerShapeError('Shopify returned malformed order.canNotifyCustomer')
@@ -1161,7 +1214,7 @@ function deriveOpenFulfillmentPlan(
 
 function requirePlanMatchesExpectedLines(
   plan: OpenFulfillmentPlan,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   if (JSON.stringify(plan.signature.lineItems) !== JSON.stringify(input.expectedLineItems)) {
     throw new ShopifyFulfillmentWritebackError(
@@ -1283,7 +1336,7 @@ function observedMatchesSignature(
 function findExactExistingFulfillment(
   fulfillments: ObservedFulfillment[],
   signature: ShopifyFulfillmentAttemptSignature,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): ShopifyFulfillmentWritebackResult | null {
   const matches = fulfillments.filter((fulfillment) => (
     fulfillment.status === 'SUCCESS'
@@ -1307,7 +1360,7 @@ function findExactExistingFulfillment(
 
 export async function writeShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
   attemptSignature?: unknown,
   beforeProviderMutation?: () => Promise<void>,
 ): Promise<ShopifyFulfillmentWritebackResult> {
@@ -1428,7 +1481,7 @@ export async function writeShopifyFulfillment(
 
 async function inspectShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): Promise<ShopifyFulfillmentInspection> {
   const data = await shopifyAdminGraphql<{ order?: unknown }>(credential, {
     query: ORDER_FULFILLMENT_QUERY,
@@ -1499,7 +1552,7 @@ async function inspectShopifyFulfillment(
 
 export async function readShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
   attemptSignature: unknown,
 ): Promise<ShopifyFulfillmentWritebackResult | null> {
   if (attemptSignature === undefined) {
