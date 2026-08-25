@@ -139,7 +139,7 @@ import {
 } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import {
-  packagingDimensionEvidenceReady,
+  packagingMaterialReadiness,
   packagingRatedOuterEvidenceReady,
   type PackagingMaterial,
   type PackagingMaterialsWorkspace,
@@ -673,29 +673,33 @@ function money(minor: string | null | undefined, currency = 'USD') {
 function operationalPlanningMaterialBlockers(
   material: PackagingMaterial,
   warehouseGlobalId: string,
+  orderCurrency: string | null | undefined,
   requireStock = true,
 ) {
   const blockers: string[] = []
-  const inner = material.innerDimensionsMm
   const ratedOuter = material.ratedOuterDimensionsMm
+  const warehouseStock = material.stock.filter((item) => (
+    item.warehouseGlobalId === warehouseGlobalId
+  ))
+  const readiness = packagingMaterialReadiness({
+    status: material.status,
+    innerDimensionsMm: material.innerDimensionsMm,
+    dimensionBasis: material.dimensionBasis,
+    dimensionEvidenceType: material.dimensionEvidenceType,
+    dimensionEvidenceReference: material.dimensionEvidenceReference,
+    dimensionConfirmedAt: material.dimensionConfirmedAt,
+    tareWeightGrams: material.tareWeightGrams,
+    maxWeightGrams: material.maxWeightGrams,
+    unitCostMinor: material.unitCostMinor,
+    stock: warehouseStock,
+  })
   if (material.status !== 'active') blockers.push('not active')
-  if (
-    !Number.isSafeInteger(inner.length)
-    || Number(inner.length) < 1
-    || !Number.isSafeInteger(inner.width)
-    || Number(inner.width) < 1
-    || !Number.isSafeInteger(inner.height)
-    || Number(inner.height) < 1
-  ) {
+  if (readiness.missing.includes('dimensions')) {
     blockers.push('usable inner dimensions missing')
   }
   if (
-    material.dimensionBasis !== 'inner'
-    || !packagingDimensionEvidenceReady({
-      evidenceType: material.dimensionEvidenceType,
-      evidenceReference: material.dimensionEvidenceReference,
-      confirmedAt: material.dimensionConfirmedAt,
-    })
+    readiness.missing.includes('dimension_basis')
+    || readiness.missing.includes('dimension_evidence')
   ) {
     blockers.push('factual inner evidence missing')
   }
@@ -711,20 +715,42 @@ function operationalPlanningMaterialBlockers(
   ) {
     blockers.push('factual exterior evidence missing')
   }
-  if (!material.tareWeightGrams || material.tareWeightGrams <= 0) {
+  if (
+    readiness.missing.includes('tare_weight')
+    || !Number.isSafeInteger(material.tareWeightGrams)
+    || Number(material.tareWeightGrams) < 1
+  ) {
     blockers.push('tare weight missing')
   }
-  const stock = material.stock.find((item) => (
-    item.warehouseGlobalId === warehouseGlobalId
-  ))
+  if (
+    readiness.missing.includes('max_weight')
+    || !Number.isSafeInteger(material.maxWeightGrams)
+    || Number(material.maxWeightGrams) < 1
+  ) {
+    blockers.push('maximum weight missing')
+  }
+  if (
+    readiness.missing.includes('unit_cost')
+    || !Number.isSafeInteger(material.unitCostMinor)
+    || Number(material.unitCostMinor) < 1
+  ) {
+    blockers.push('material cost missing')
+  }
+  if (!orderCurrency) {
+    blockers.push('order currency missing')
+  }
+  if (!material.currency) {
+    blockers.push('material currency missing')
+  } else if (orderCurrency && material.currency !== orderCurrency) {
+    blockers.push(
+      `material currency ${material.currency} does not match order ${orderCurrency}`,
+    )
+  }
   if (
     requireStock
     && (
-    !stock
-    || stock.warehouseStatus !== 'active'
-    || !stock.isAvailable
-    || !stock.onHandQuantity
-    || stock.onHandQuantity <= 0
+      readiness.missing.includes('warehouse_stock')
+      || readiness.missing.includes('available_stock')
     )
   ) {
     blockers.push('available warehouse stock missing')
@@ -1277,9 +1303,9 @@ function OrderDetailDrawer({
             : !selectedRate
               ? 'Select a carrier rate before creating a label.'
               : !selectedProvider
-                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                ? `${selectedRate.carrier} does not support test labels.`
                 : eligibleCarrierAccounts.length === 0
-                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  ? `Connect and verify a TEST ${selectedRate.carrier} account first.`
                   : null
   const authorizedPackageCreateBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
@@ -1288,7 +1314,7 @@ function OrderDetailDrawer({
       : order?.shipmentShipTo.rerateRequired
         ? 'The ship-to changed after planning. Compare rates again before creating labels.'
       : !sandboxE2eAuthorization
-        ? 'Enable sandbox fulfillment before creating package labels.'
+        ? 'Enable test fulfillment before creating package labels.'
         : order?.status !== 'packed'
           ? 'Verify every package before creating labels.'
           : unresolvedAttempt
@@ -1296,15 +1322,15 @@ function OrderDetailDrawer({
             : !selectedRate
               ? 'Select a carrier rate before creating labels.'
               : !selectedProvider
-                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                ? `${selectedRate.carrier} does not support test labels.`
                 : eligibleCarrierAccounts.length === 0
-                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  ? `Connect and verify a TEST ${selectedRate.carrier} account first.`
                   : null
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
-    ? 'Only an organization owner or administrator may enable sandbox fulfillment.'
+    ? 'Only an organization owner or administrator may enable test fulfillment.'
     : !order?.sourceProvider
       || !['shopify', 'faire'].includes(order.sourceProvider)
-      ? 'Sandbox fulfillment is available for Shopify and Faire orders.'
+      ? 'Test fulfillment is available for Shopify and Faire orders.'
       : canonicalShopifyTestLane
         && !['imported', 'planned', 'released', 'picking', 'packed'].includes(order.status)
         ? 'This order is no longer at a resumable fulfillment stage.'
@@ -1800,7 +1826,7 @@ function OrderDetailDrawer({
                 && order.status === 'packed'
               )
             ) && (
-              <DetailSection title="Sandbox fulfillment">
+              <DetailSection title="Test fulfillment">
                 {sandboxE2eAuthorization ? (
                   <Stack spacing={1.25}>
                     <Stack
@@ -1874,11 +1900,11 @@ function OrderDetailDrawer({
                 ) : (
                   <Stack spacing={1.25}>
                     <Typography variant="body2" color="text.secondary">
-                      Use the connected sandbox account for this order. Production postage is unavailable in this environment.
+                      Uses connected TEST carrier accounts. No live postage will be purchased.
                     </Typography>
                     <Tooltip
                       title={authorizeSandboxE2eBlockedReason
-                        || 'Enable sandbox fulfillment for this order'}
+                        || 'Enable test fulfillment for this order'}
                     >
                       <span>
                         <Button
@@ -1892,8 +1918,8 @@ function OrderDetailDrawer({
                             : 'authorize-sandbox-commerce-e2e'}
                         >
                           {canonicalShopifyTestLane && order.status !== 'imported'
-                            ? 'Resume sandbox fulfillment'
-                            : 'Enable sandbox fulfillment'}
+                            ? 'Resume test fulfillment'
+                            : 'Enable test fulfillment'}
                         </Button>
                       </span>
                     </Tooltip>
@@ -1929,13 +1955,10 @@ function OrderDetailDrawer({
                 {sandboxE2eAuthorization ? (
                   <Stack spacing={1.25} data-testid="sandbox-commerce-e2e-packages">
                     <Alert severity="info">
-                      Create one sandbox label for each exact package. When all{' '}
-                      {order.packages.length} packages are labeled, Confirm shipment
-                      will consume the reserved inventory and write every tracking
-                      number to {order.sourceProvider === 'faire'
+                      Create one test label per package. Confirming shipment updates
+                      inventory and sends tracking to {order.sourceProvider === 'faire'
                         ? 'Faire'
-                        : 'Shopify'} under authorization{' '}
-                      {sandboxE2eAuthorization.authorizationGlobalId}.
+                        : 'Shopify'}.
                     </Alert>
                     {order.packages.map((item) => {
                       const packageLabel = item.latestLabel?.status === 'created'
@@ -1970,7 +1993,7 @@ function OrderDetailDrawer({
                               <Chip
                                 size="small"
                                 color={packageLabel ? 'success' : 'default'}
-                                label={packageLabel ? 'Sandbox label ready' : 'Label required'}
+                                label={packageLabel ? 'Test label ready' : 'Label required'}
                               />
                             </Stack>
                             {packageLabel ? (
@@ -1986,7 +2009,7 @@ function OrderDetailDrawer({
                             ) : (
                               <Tooltip
                                 title={authorizedPackageCreateBlockedReason
-                                  || `Create the sandbox label for package ${item.packageNumber}`}
+                                  || `Create the test label for package ${item.packageNumber}`}
                               >
                                 <span>
                                   <Button
@@ -1998,7 +2021,7 @@ function OrderDetailDrawer({
                                     onClick={() => onCreateSandboxLabel(item.globalId)}
                                     data-testid={`create-sandbox-label-${item.globalId}`}
                                   >
-                                    Create package {item.packageNumber} sandbox label
+                                    Create package {item.packageNumber} label
                                   </Button>
                                 </span>
                               </Tooltip>
@@ -2025,7 +2048,7 @@ function OrderDetailDrawer({
                               {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
                             </Typography>
                           </Box>
-                          <Tooltip title={voidBlockedReason || 'Void through the same sandbox account used to purchase this label'}>
+                          <Tooltip title={voidBlockedReason || 'Void through the same TEST account used to create this label'}>
                             <span>
                               <Button
                                 color="error"
@@ -2056,7 +2079,7 @@ function OrderDetailDrawer({
                             disabled={busy || Boolean(createBlockedReason)}
                             onClick={() => onCreateSandboxLabel()}
                           >
-                            Create sandbox label
+                            Create test label
                           </Button>
                         </span>
                       </Tooltip>
@@ -3079,7 +3102,7 @@ export default function OperationsSection({
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
-    'Enable sandbox fulfillment for this order',
+    'Enable test fulfillment for this order',
   )
   const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
   const pendingShopifyTestStoreAuthorization =
@@ -3094,13 +3117,13 @@ export default function OperationsSection({
   const pendingShopifyTestStoreFulfillment =
     useRef<ShopifyTestStoreFulfillmentCommand | null>(null)
   const [createLabelOpen, setCreateLabelOpen] = useState(false)
-  const [createLabelReason, setCreateLabelReason] = useState('Purchase a sandbox label for pack-to-ship validation')
+  const [createLabelReason, setCreateLabelReason] = useState('Create a test shipping label')
   const [createLabelIdempotencyKey, setCreateLabelIdempotencyKey] = useState('')
   const [carrierAccountGlobalId, setCarrierAccountGlobalId] = useState('')
   const [createLabelPackageGlobalId, setCreateLabelPackageGlobalId] = useState('')
   const [creatingLabel, setCreatingLabel] = useState(false)
   const [voidLabelOpen, setVoidLabelOpen] = useState(false)
-  const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
+  const [voidLabelReason, setVoidLabelReason] = useState('Void the test shipping label')
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [voidingLabel, setVoidingLabel] = useState(false)
   const [oneOffExecutionState, setOneOffExecutionState] =
@@ -3747,6 +3770,7 @@ export default function OperationsSection({
             operationalPlanningMaterialBlockers(
               material,
               warehouseGlobalId,
+              order.currency,
               !localTraining,
             ).length === 0
           ))
@@ -3858,6 +3882,7 @@ export default function OperationsSection({
       operationalPlanningMaterialBlockers(
         material,
         planWarehouseGlobalId,
+        detail?.currency,
         !shadowTrainingPlanTarget,
       )
         .map((reason) => `${material.code}: ${reason}`)
@@ -5019,7 +5044,7 @@ export default function OperationsSection({
     pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationConfirmed(false)
     setSandboxE2eAuthorizationReason(
-      `Enable sandbox fulfillment for ${detail.sourceProvider === 'faire'
+      `Enable test fulfillment for ${detail.sourceProvider === 'faire'
         ? 'Faire'
         : 'Shopify'} order ${detail.orderNumber}`,
     )
@@ -5092,7 +5117,7 @@ export default function OperationsSection({
         || !('authorizationGlobalId' in payload.result)
       ) {
         throw new ShopifyTestStoreCommandHttpError(
-          payload.error || 'Sandbox fulfillment could not be enabled',
+          payload.error || 'Test fulfillment could not be enabled',
           response.status,
           payload.code,
         )
@@ -5102,7 +5127,7 @@ export default function OperationsSection({
       setSandboxE2eAuthorizationOpen(false)
       setSandboxE2eAuthorizationConfirmed(false)
       setNotice(
-        `Sandbox fulfillment is enabled until ${result.expiresAt}.`,
+        `Test fulfillment is enabled until ${result.expiresAt}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
@@ -5121,7 +5146,7 @@ export default function OperationsSection({
           pendingShopifyTestStoreAuthorization.current = null
           setSandboxE2eAuthorizationOpen(false)
           setNotice(
-            `Sandbox fulfillment is enabled until ${refreshedAuthorization.expiresAt}.`,
+            `Test fulfillment is enabled until ${refreshedAuthorization.expiresAt}.`,
           )
           setError('')
         } else if (
@@ -5140,7 +5165,7 @@ export default function OperationsSection({
       } else {
         setError(caught instanceof Error
           ? caught.message
-          : 'Sandbox fulfillment could not be enabled')
+          : 'Test fulfillment could not be enabled')
       }
     } finally {
       setAuthorizingSandboxE2e(false)
@@ -5217,7 +5242,7 @@ export default function OperationsSection({
       setShopifyTestFulfillmentOpen(false)
       setShopifyTestFulfillmentText('')
       setNotice(
-        'The exact sandbox label and tracking snapshot is confirmed. Shopify customer notification is locked off; Confirm shipment now requires this same evidence.',
+        'Fulfillment review saved. Shopify customer notification remains off.',
       )
       await loadWorkspace(detail.globalId)
     } catch (caught) {
@@ -5237,7 +5262,7 @@ export default function OperationsSection({
         setShopifyTestFulfillmentOpen(false)
         setShopifyTestFulfillmentText('')
         setNotice(
-          'The exact fulfillment-confirmation response was reconciled. Customer notification remains locked off.',
+          'Fulfillment review saved after refreshing the order. Shopify customer notification remains off.',
         )
         setError('')
       } else if (
@@ -5267,8 +5292,8 @@ export default function OperationsSection({
     setCarrierAccountGlobalId(account?.globalId || '')
     setCreateLabelPackageGlobalId(packageGlobalId || '')
     setCreateLabelReason(packageGlobalId
-      ? `Create a sandbox label for package ${packageGlobalId}`
-      : 'Purchase a sandbox label for pack-to-ship validation')
+      ? `Create a test label for package ${packageGlobalId}`
+      : 'Create a test shipping label')
     setCreateLabelIdempotencyKey(
       `operations-label-create:${detail?.globalId || 'order'}:${packageGlobalId || 'single'}:${crypto.randomUUID()}`,
     )
@@ -5319,7 +5344,7 @@ export default function OperationsSection({
       })
       const payload = await response.json() as OperationsPayload
       if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
-        throw new Error(payload.error || 'Sandbox label could not be created')
+        throw new Error(payload.error || 'Test label could not be created')
       }
       const result = payload.result
       setCreateLabelOpen(false)
@@ -5328,19 +5353,19 @@ export default function OperationsSection({
       setCreateLabelPackageGlobalId('')
       setNotice(
         result.printWarning
-          ? `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
-          : `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}${result.printJobGlobalId ? ` and print job ${result.printJobGlobalId}` : ''}.`,
+          ? `Test label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
+          : `Test label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}${result.printJobGlobalId ? ` and print job ${result.printJobGlobalId}` : ''}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be created')
+      setError(caught instanceof Error ? caught.message : 'Test label could not be created')
     } finally {
       setCreatingLabel(false)
     }
   }
 
   const openVoidLabel = () => {
-    setVoidLabelReason('Void the sandbox label after validation')
+    setVoidLabelReason('Void the test shipping label')
     setVoidLabelIdempotencyKey(`operations-label-void:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
     setVoidLabelOpen(true)
   }
@@ -5373,15 +5398,15 @@ export default function OperationsSection({
       })
       const payload = await response.json() as OperationsPayload
       if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
-        throw new Error(payload.error || 'Sandbox label could not be voided')
+        throw new Error(payload.error || 'Test label could not be voided')
       }
       const result = payload.result
       setVoidLabelOpen(false)
       setVoidLabelIdempotencyKey('')
-      setNotice(`Sandbox label ${result.labelGlobalId} and tracking ${result.trackingNumber} were voided.`)
+      setNotice(`Test label ${result.labelGlobalId} and tracking ${result.trackingNumber} were voided.`)
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be voided')
+      setError(caught instanceof Error ? caught.message : 'Test label could not be voided')
     } finally {
       setVoidingLabel(false)
     }
@@ -7467,6 +7492,7 @@ export default function OperationsSection({
                           (material) => operationalPlanningMaterialBlockers(
                             material,
                             warehouseGlobalId,
+                            detail?.currency,
                             !shadowTrainingPlanTarget,
                           ).length === 0,
                         )
@@ -7533,6 +7559,7 @@ export default function OperationsSection({
                         const blockers = operationalPlanningMaterialBlockers(
                           material,
                           planWarehouseGlobalId,
+                          detail?.currency,
                           !shadowTrainingPlanTarget,
                         )
                         const selected = planMaterialGlobalIds.includes(material.globalId)
@@ -8016,11 +8043,11 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
-          <DialogTitle>Enable sandbox fulfillment</DialogTitle>
+          <DialogTitle>Enable test fulfillment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               <Typography variant="body2" color="text.secondary">
-                Labels and rates will use the connected sandbox account. Production postage is unavailable.
+                Rates and labels will use TEST carrier accounts. No live postage will be purchased.
               </Typography>
               <FormControlLabel
                 control={(
@@ -8071,7 +8098,7 @@ export default function OperationsSection({
             >
               {authorizingSandboxE2e
                 ? 'Verifying with Shopify'
-                : 'Enable sandbox fulfillment'}
+                : 'Enable test fulfillment'}
             </Button>
           </DialogActions>
         </Box>
@@ -8163,9 +8190,9 @@ export default function OperationsSection({
                   alignItems="center"
                   data-testid="sandbox-commerce-e2e-confirm-shipment-warning"
                 >
-                  <Chip size="small" label="Sandbox" color="info" />
+                  <Chip size="small" label="Test" color="info" />
                   <Typography variant="body2">
-                    Sandbox tracking will be sent to{' '}
+                    Test tracking will be sent to{' '}
                     {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
                     {detail.sourceProvider === 'shopify'
                       ? ' Customer notification is off.'
@@ -8592,13 +8619,13 @@ export default function OperationsSection({
             <Stack spacing={2}>
               {detailCreateLabelPackage ? (
                 <Typography variant="body2" color="text.secondary">
-                  Uses this package&apos;s dimensions, weight, and selected sandbox carrier service.
+                  Uses this package&apos;s dimensions, weight, and selected TEST carrier service.
                 </Typography>
               ) : (
                 <Stack direction="row" spacing={1} alignItems="center">
-                  <Chip size="small" label="Sandbox" color="info" />
+                  <Chip size="small" label="Test" color="info" />
                   <Typography variant="body2" color="text.secondary">
-                    No production postage will be purchased.
+                    No live postage will be purchased.
                   </Typography>
                 </Stack>
               )}
@@ -8624,10 +8651,10 @@ export default function OperationsSection({
               <TextField
                 required
                 select
-                label="Sandbox carrier account"
+                label="TEST carrier account"
                 value={carrierAccountGlobalId}
                 onChange={(event) => setCarrierAccountGlobalId(event.target.value)}
-                helperText="Only active, verified sandbox credentials for the selected carrier are available."
+                helperText="Only active, verified TEST accounts for the selected carrier are available."
               >
                 {eligibleSandboxCarrierAccounts.map((account) => (
                   <MenuItem key={account.globalId} value={account.globalId}>
@@ -8666,7 +8693,7 @@ export default function OperationsSection({
             >
               {creatingLabel
                 ? 'Creating label'
-                : 'Create sandbox label'}
+                : 'Create test label'}
             </Button>
           </DialogActions>
         </Box>
@@ -8675,7 +8702,7 @@ export default function OperationsSection({
       <Dialog open={voidLabelOpen} onClose={closeVoidLabel} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={voidSandboxLabel}>
           <DialogTitle>
-            Void sandbox carrier label
+            Void test carrier label
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>

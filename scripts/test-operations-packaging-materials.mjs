@@ -84,6 +84,44 @@ const {
   packagingMaterialReadiness,
   packagingRatedOuterEvidenceReady,
 } = loadDomain()
+
+function loadOperationalPlanningMaterialBlockers() {
+  const path = 'app_src/components/operations/OperationsSection.tsx'
+  const source = read(path)
+  const start = source.indexOf('function operationalPlanningMaterialBlockers(')
+  const end = source.indexOf('\nfunction metric(', start)
+  assert.ok(start >= 0 && end > start, 'Operations material blocker helper is missing')
+  const output = ts.transpileModule(
+    `${source.slice(start, end)}\nexport { operationalPlanningMaterialBlockers }`,
+    {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+        esModuleInterop: true,
+      },
+      fileName: path,
+    },
+  ).outputText
+  const module = { exports: {} }
+  vm.runInNewContext(output, {
+    Array,
+    Boolean,
+    Error,
+    Math,
+    Number,
+    Object,
+    String,
+    console,
+    exports: module.exports,
+    module,
+    packagingMaterialReadiness,
+    packagingRatedOuterEvidenceReady,
+    require: requireFromApp,
+  }, { filename: path })
+  return module.exports.operationalPlanningMaterialBlockers
+}
+
+const operationalPlanningMaterialBlockers = loadOperationalPlanningMaterialBlockers()
 const {
   SHOPIFY_PACKAGING_IMPORT_HEADERS,
   SHOPIFY_PACKAGING_IMPORT_TEMPLATE,
@@ -715,23 +753,122 @@ const operationalMaterialBlocker = operationsSection.slice(
   )),
 )
 for (const fragment of [
+  'packagingMaterialReadiness({',
   'material.innerDimensionsMm',
-  "material.dimensionBasis !== 'inner'",
-  'packagingDimensionEvidenceReady({',
-  'evidenceType: material.dimensionEvidenceType',
-  'evidenceReference: material.dimensionEvidenceReference',
-  'confirmedAt: material.dimensionConfirmedAt',
+  'dimensionBasis: material.dimensionBasis',
+  'dimensionEvidenceType: material.dimensionEvidenceType',
+  'dimensionEvidenceReference: material.dimensionEvidenceReference',
+  'dimensionConfirmedAt: material.dimensionConfirmedAt',
+  "readiness.missing.includes('dimension_evidence')",
   "blockers.push('factual inner evidence missing')",
   'packagingRatedOuterEvidenceReady({',
   'evidenceType: material.ratedOuterDimensionEvidenceType',
   'evidenceReference: material.ratedOuterDimensionEvidenceReference',
   'confirmedAt: material.ratedOuterDimensionConfirmedAt',
+  "readiness.missing.includes('max_weight')",
+  'Number.isSafeInteger(material.maxWeightGrams)',
+  "blockers.push('maximum weight missing')",
+  "readiness.missing.includes('unit_cost')",
+  'Number.isSafeInteger(material.unitCostMinor)',
+  "blockers.push('material cost missing')",
+  "blockers.push('material currency missing')",
+  "blockers.push('order currency missing')",
+  'material.currency !== orderCurrency',
+  'does not match order ${orderCurrency}',
+  "readiness.missing.includes('warehouse_stock')",
 ]) {
   assert.ok(
     operationalMaterialBlocker.includes(fragment),
     `Order planning material selection must fail closed on ${fragment}`,
   )
 }
+for (const fragment of ['order.currency,', 'detail?.currency,']) {
+  assert.ok(
+    operationsSection.includes(fragment),
+    `Order planning material selection must receive ${fragment}`,
+  )
+}
+
+const operationalMaterialFixture = {
+  status: 'active',
+  innerDimensionsMm: { length: 100, width: 90, height: 80 },
+  dimensionBasis: 'inner',
+  dimensionEvidenceType: 'measured',
+  dimensionEvidenceReference: null,
+  dimensionConfirmedAt: '2026-08-25T12:00:00.000Z',
+  ratedOuterDimensionsMm: { length: 110, width: 100, height: 90 },
+  ratedOuterDimensionEvidenceType: 'measured',
+  ratedOuterDimensionEvidenceReference: null,
+  ratedOuterDimensionConfirmedAt: '2026-08-25T12:00:00.000Z',
+  tareWeightGrams: 25,
+  maxWeightGrams: 1000,
+  unitCostMinor: 75,
+  currency: 'USD',
+  stock: [{
+    warehouseGlobalId: 'gwhmaterial1',
+    warehouseStatus: 'active',
+    isAvailable: true,
+    onHandQuantity: 10,
+  }],
+}
+assert.deepEqual(
+  Array.from(operationalPlanningMaterialBlockers(
+    operationalMaterialFixture,
+    'gwhmaterial1',
+    'USD',
+  )),
+  [],
+  'A fully factual material is eligible for order planning',
+)
+for (const maxWeightGrams of [0, -1]) {
+  assert.deepEqual(
+    Array.from(operationalPlanningMaterialBlockers(
+      { ...operationalMaterialFixture, maxWeightGrams },
+      'gwhmaterial1',
+      'USD',
+    )),
+    ['maximum weight missing'],
+    'Zero and negative maximum weight remain blocked before cartonization',
+  )
+}
+for (const unitCostMinor of [0, -1]) {
+  assert.deepEqual(
+    Array.from(operationalPlanningMaterialBlockers(
+      { ...operationalMaterialFixture, unitCostMinor },
+      'gwhmaterial1',
+      'USD',
+    )),
+    ['material cost missing'],
+    'Zero and negative material cost remain blocked before cartonization',
+  )
+}
+assert.deepEqual(
+  Array.from(operationalPlanningMaterialBlockers(
+    { ...operationalMaterialFixture, currency: null },
+    'gwhmaterial1',
+    'USD',
+  )),
+  ['material currency missing'],
+  'Missing material currency remains blocked before cartonization',
+)
+assert.deepEqual(
+  Array.from(operationalPlanningMaterialBlockers(
+    operationalMaterialFixture,
+    'gwhmaterial1',
+    null,
+  )),
+  ['order currency missing'],
+  'Missing order currency remains blocked before cartonization',
+)
+assert.deepEqual(
+  Array.from(operationalPlanningMaterialBlockers(
+    { ...operationalMaterialFixture, currency: 'CAD' },
+    'gwhmaterial1',
+    'USD',
+  )),
+  ['material currency CAD does not match order USD'],
+  'A material whose currency differs from the order remains blocked',
+)
 const navigation = read('app_src/components/Navigation.tsx')
 const home = read('app_src/app/HomeClient.tsx')
 for (const source of [operationsSection, navigation, home]) {

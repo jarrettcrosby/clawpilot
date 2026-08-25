@@ -564,21 +564,23 @@ for (const fragment of [
   "action === 'authorize-shopify-test-store-canonical-e2e'",
   "action === 'confirm-shopify-test-store-e2e-fulfillment'",
   '!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute',
-  'Only an organization owner or administrator may authorize',
-  'Only an organization owner or administrator may confirm',
+  'Only an organization owner or administrator may enable test fulfillment',
+  'Only an organization owner or administrator may confirm test fulfillment',
   'idempotencyKey: idempotencyKeyValue(req)',
 ]) {
   assert.ok(sources.route.includes(fragment), `Owner/admin route missing ${fragment}`)
 }
 
 for (const fragment of [
-  'Enable sandbox fulfillment',
-  'Resume sandbox fulfillment',
+  'Enable test fulfillment',
+  'Resume test fulfillment',
   'Reason (audit log)',
   'Labels and tracking are correct',
   'shopify-test-store-fulfillment-confirmed',
   'Tracking reviewed',
-  'Production postage is unavailable',
+  'No live postage will be purchased',
+  'Create one test label per package.',
+  'Fulfillment review saved. Shopify customer notification remains off.',
   'fullScreen={mobile}',
   'Current order state was refreshed. Review it before authorizing again.',
   'the exact authorization command is retained for retry.',
@@ -591,6 +593,24 @@ for (const fragment of [
 ]) {
   assert.ok(sources.ui.includes(fragment), `Operator UI missing ${fragment}`)
 }
+
+for (const fragment of [
+  '<DetailSection title="Sandbox fulfillment">',
+  'Create one sandbox label for each exact package.',
+  'pack-to-ship validation',
+]) {
+  assert.equal(
+    sources.ui.includes(fragment),
+    false,
+    `normal operator UI must not expose internal test copy: ${fragment}`,
+  )
+}
+
+assert.equal(
+  sources.route.includes('sandbox commerce E2E test'),
+  false,
+  'permission errors must not expose the internal E2E action name',
+)
 
 for (const fragment of [
   'assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres',

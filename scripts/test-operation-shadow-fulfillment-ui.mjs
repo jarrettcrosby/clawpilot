@@ -99,7 +99,7 @@ for (const fragment of [
   'No shipment, tracking number, carrier',
   'label, postage purchase, commerce write, or final packing slip exists.',
   "activationState === 'shadow' || order.fulfillmentPreparation",
-  'Connect and verify a sandbox ${selectedRate.carrier} account first.',
+  'Connect and verify a TEST ${selectedRate.carrier} account first.',
   "!activeLabel && (",
   'const createBlockedReason = !canExecute',
   'const authorizedPackageCreateBlockedReason = !canExecute',
@@ -131,6 +131,28 @@ for (const fragment of [
   'renderValue: (selected) => ACTIVATION_OPTIONS.find(',
 ]) {
   assert.ok(uiSource.includes(fragment), `Shadow evidence UI missing ${fragment}`)
+}
+
+for (const fragment of [
+  '<DetailSection title="Test fulfillment">',
+  'Uses connected TEST carrier accounts. No live postage will be purchased.',
+  'Create one test label per package.',
+  'Fulfillment review saved. Shopify customer notification remains off.',
+]) {
+  assert.ok(uiSource.includes(fragment), `operator fulfillment copy missing ${fragment}`)
+}
+
+for (const fragment of [
+  '<DetailSection title="Sandbox fulfillment">',
+  'Create one sandbox label for each exact package.',
+  'under authorization',
+  'pack-to-ship validation',
+]) {
+  assert.equal(
+    uiSource.includes(fragment),
+    false,
+    `normal operator UI must not expose internal test copy: ${fragment}`,
+  )
 }
 
 assert.equal(
