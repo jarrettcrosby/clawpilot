@@ -133,6 +133,21 @@ function validateCareerSiteSubmissionsConfiguration() {
   if (!/^[0-9]+$/.test(pollMs) || Number(pollMs) < 5000 || Number(pollMs) > 300000) {
     fail('CAREER_SITE_SUBMISSIONS_POLL_MS must be an integer from 5000 through 300000')
   }
+  const mailFrom = String(process.env.CAREER_SITE_MAIL_FROM || '').trim().toLowerCase()
+  if (mailFrom !== 'info@suburbiasandwichco.com') {
+    fail('CAREER_SITE_MAIL_FROM must be the verified info@suburbiasandwichco.com Gmail alias')
+  }
+  if (String(process.env.CAREER_SITE_MAIL_FROM_NAME || '').trim() !== 'Jarrett Crosby') {
+    fail('CAREER_SITE_MAIL_FROM_NAME must be Jarrett Crosby')
+  }
+  const mailReplyTo = String(process.env.CAREER_SITE_MAIL_REPLY_TO || '').trim().toLowerCase()
+  if (mailReplyTo !== 'jarrettcrosby@gmail.com') {
+    fail('CAREER_SITE_MAIL_REPLY_TO must be JarrettCrosby@gmail.com')
+  }
+  const mailApprovalTo = String(process.env.CAREER_SITE_MAIL_APPROVAL_TO || '').trim().toLowerCase()
+  if (mailApprovalTo !== 'jarrettcrosby@gmail.com') {
+    fail('CAREER_SITE_MAIL_APPROVAL_TO must be JarrettCrosby@gmail.com')
+  }
   return 'enabled'
 }
 

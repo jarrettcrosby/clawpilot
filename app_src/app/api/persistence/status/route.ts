@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
 import { resolveCareerSiteSubmissionConfiguration } from '@/lib/careerSiteSubmissionContract'
+import { resolveCareerSiteMailConfiguration } from '@/lib/careerSiteMailContract'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { readCareerSiteSubmissionOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteSubmissions'
+import { readCareerSiteMailOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteMailOutbox'
 import { query } from '@/lib/persistence/postgres'
 
 export async function GET() {
@@ -16,6 +18,11 @@ export async function GET() {
       driver,
       database: 'not-configured',
       careerSiteSubmissions: {
+        enabled: careerSiteEnabled,
+        healthy: !careerSiteEnabled,
+        status: careerSiteEnabled ? 'unhealthy' : 'disabled',
+      },
+      careerSiteMail: {
         enabled: careerSiteEnabled,
         healthy: !careerSiteEnabled,
         status: careerSiteEnabled ? 'unhealthy' : 'disabled',
@@ -49,6 +56,11 @@ export async function GET() {
     healthy: true,
     status: 'disabled',
   }
+  let careerSiteMail: Record<string, unknown> = {
+    enabled: false,
+    healthy: true,
+    status: 'disabled',
+  }
   if (process.env.CAREER_SITE_SUBMISSIONS_ENABLED === '1') {
     try {
       const configuration = resolveCareerSiteSubmissionConfiguration()
@@ -72,6 +84,28 @@ export async function GET() {
       ok = false
       errors.push('career-site submission delivery health could not be verified')
     }
+    try {
+      const mailConfiguration = resolveCareerSiteMailConfiguration()
+      if (!mailConfiguration.ownerEmail) throw new Error('career-site mail owner identity is missing')
+      careerSiteMail = await readCareerSiteMailOperationalHealthFromPostgres({
+        sourceApp: mailConfiguration.sourceApp,
+        ownerEmail: mailConfiguration.ownerEmail,
+        pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
+        leaseSeconds: 900,
+      })
+      if (careerSiteMail.healthy !== true) {
+        ok = false
+        errors.push('career-site email delivery is unhealthy')
+      }
+    } catch {
+      careerSiteMail = {
+        enabled: true,
+        healthy: false,
+        status: 'unhealthy',
+      }
+      ok = false
+      errors.push('career-site email delivery health could not be verified')
+    }
   }
 
   return NextResponse.json({
@@ -80,6 +114,7 @@ export async function GET() {
     database: databaseResult.status === 'fulfilled' ? 'reachable' : 'unreachable',
     agentCredentials: credentialResult.status === 'fulfilled' ? 'reachable' : 'unreachable',
     careerSiteSubmissions,
+    careerSiteMail,
     databaseFingerprint,
     checkedAt: databaseResult.status === 'fulfilled'
       ? databaseResult.value.rows[0]?.now || new Date().toISOString()

@@ -52,6 +52,7 @@ async function poll(name, path, limit) {
     if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`)
     const result = text ? JSON.parse(text) : {}
     const claimed = Number(result.claimed || result.actions?.claimed || 0)
+      + Number(result.mail?.claimed || 0)
     const ingested = Number(result.ingested || result.ingestion?.messagesStored || 0)
     if (claimed > 0 || ingested > 0) {
       console.log(`[${name}] ${JSON.stringify(result)}`)
