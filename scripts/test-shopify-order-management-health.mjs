@@ -79,6 +79,146 @@ const managementTriggers = [
     'protect_shopify_order_management_downstream_race()',
   ],
 ]
+const futureColumns = [
+  'fulfillment_gid',
+  'expected_fulfillment_updated_at',
+  'predecessor_authorization_id',
+]
+const futureConstraints = [
+  'operations_shopify_order_management_authorizations_action_check',
+  'ops_shopify_order_mgmt_auth_action_valid',
+  'operations_shopify_order_management_attempts_action_check',
+  'ops_shopify_order_mgmt_attempt_identity_valid',
+  'ops_shopify_order_mgmt_auth_predecessor_fkey',
+  'ops_shopify_order_mgmt_attempt_predecessor_fkey',
+]
+const futureFunctions = [
+  'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)',
+  'operations_shopify_post_reversal_order_cancellation_is_safe(uuid,uuid,uuid)',
+  'operations_shopify_order_management_is_current(uuid,uuid,boolean)',
+  'protect_shopify_fulfillment_reversal_authorization_insert()',
+  'protect_shopify_fulfillment_reversal_attempt_insert()',
+  'protect_shopify_post_reversal_order_cancel_authorization_insert()',
+  'protect_shopify_post_reversal_order_cancel_attempt_insert()',
+  'enforce_shopify_order_management_downstream_race(uuid,uuid)',
+  'protect_shopify_order_management_downstream_race()',
+  'protect_shopify_order_management_indirect_downstream_race()',
+]
+const futureSplitTriggers = [
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_order_management_authorization_insert',
+  ],
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_fulfillment_reversal_authorization_insert',
+  ],
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_post_reversal_order_cancel_authorization_insert',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_order_management_attempt_insert',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_fulfillment_reversal_attempt_insert',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_post_reversal_order_cancel_attempt_insert',
+  ],
+  [
+    'operations_shopify_order_management_authorizations',
+    'protect_shopify_order_management_authorization_write',
+  ],
+  [
+    'operations_shopify_order_management_attempts',
+    'protect_shopify_order_management_attempt_write',
+  ],
+]
+const futureRaceTriggers = [
+  ['operations_fulfillment_plans', 'protect_shopify_order_management_plan_race'],
+  ['operations_reservations', 'protect_shopify_order_management_reservation_race'],
+  ['operations_waves', 'protect_shopify_order_management_wave_race'],
+  ['operations_pick_tasks', 'protect_shopify_order_management_pick_race'],
+  [
+    'operations_packaging_material_claims',
+    'protect_shopify_order_management_packaging_claim_race',
+  ],
+  ['operations_packages', 'protect_shopify_order_management_package_race'],
+  ['operations_labels', 'protect_shopify_order_management_label_race'],
+  ['operations_shipments', 'protect_shopify_order_management_shipment_race'],
+  [
+    'operations_commerce_fulfillment_exports',
+    'protect_shopify_order_management_export_race',
+  ],
+  [
+    'operations_fulfillment_executions',
+    'protect_shopify_order_management_execution_race',
+  ],
+  [
+    'operations_active_fulfillment_executions',
+    'protect_shopify_order_management_active_execution_race',
+  ],
+  [
+    'operations_label_attempts',
+    'protect_shopify_order_management_label_attempt_race',
+  ],
+  [
+    'operations_shipment_groups',
+    'protect_shopify_order_management_shipment_group_race',
+  ],
+  [
+    'operations_production_fulfillment_rerate_runs',
+    'protect_shopify_order_management_rerate_race',
+  ],
+]
+
+function balancedSqlExpression(source, openingParenthesisIndex) {
+  let depth = 0
+  let quoted = false
+  for (
+    let index = openingParenthesisIndex;
+    index < source.length;
+    index += 1
+  ) {
+    const character = source[index]
+    if (character === "'") {
+      if (quoted && source[index + 1] === "'") {
+        index += 1
+      } else {
+        quoted = !quoted
+      }
+    } else if (!quoted && character === '(') {
+      depth += 1
+    } else if (!quoted && character === ')') {
+      depth -= 1
+      if (depth === 0) return source.slice(openingParenthesisIndex, index + 1)
+    }
+  }
+  throw new Error('Unbalanced SQL health expression')
+}
+
+const firstFutureColumnIndex = routeSource.indexOf("'fulfillment_gid'")
+assert.ok(firstFutureColumnIndex > 0, 'Future 0325 columns must be attested')
+const futureGateNotExistsIndex = routeSource.lastIndexOf(
+  'NOT EXISTS (',
+  firstFutureColumnIndex,
+)
+const futureGateStart = routeSource.lastIndexOf(
+  'AND (',
+  futureGateNotExistsIndex,
+)
+assert.ok(
+  futureGateNotExistsIndex > 0 && futureGateStart > 0,
+  'Future 0325 attestation must have an explicit absence gate',
+)
+const futureGate = balancedSqlExpression(
+  routeSource,
+  routeSource.indexOf('(', futureGateStart),
+)
 
 assert.equal(
   singleSaveMigrationChecksum,
@@ -95,7 +235,6 @@ assert.doesNotMatch(
   /ADD COLUMN (?:shipping_address|address1|address2|city|zip|postal_code)/u,
   'address PII must remain represented only by the requested projection hash',
 )
-
 for (const fragment of [
   "from '@/lib/persistence/shopifyOrderManagement'",
   'readShopifyOrderManagementHealthFromPostgres',
@@ -128,6 +267,23 @@ for (const fragment of [
   "'ops_shopify_order_mgmt_auth_projection_hash_valid'",
   "'ops_shopify_order_mgmt_attempt_projection_hash_valid'",
   "'ops_shopify_order_mgmt_outcome_write_count_valid'",
+  "'0325_operations_shopify_fulfillment_reversal.sql'",
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
+  '0a036803128e3152d7d200262e7980e913cc0197c852686c139918b81990b3b3',
+  'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
+  '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
+  '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
+  'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+  'fc9b1d5fef57ae7a7f305713e7944713fd41026c00534c8d1216b983f5f05d2c',
+  '2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc',
+  '0ff13ea37552b62b039a3d6dfa7eeeb66db49fc21e7a7e266d2738912b4af101',
+  "'fulfillment_gid'",
+  "'expected_fulfillment_updated_at'",
+  "'predecessor_authorization_id'",
+  "'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)'",
+  "'operations_shopify_post_reversal_order_cancellation_is_safe(uuid,uuid,uuid)'",
+  "'protect_shopify_fulfillment_reversal_authorization_insert()'",
+  "'protect_shopify_fulfillment_reversal_attempt_insert()'",
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -157,6 +313,48 @@ for (const [table, trigger, signature] of managementTriggers) {
   )
 }
 assert.match(
+  futureGate,
+  /NOT EXISTS \([\s\S]{0,180}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,180}OR \(/u,
+  'Future schema checks must be skipped as one unit while 0325 is absent',
+)
+for (const fragment of [
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
+  '0a036803128e3152d7d200262e7980e913cc0197c852686c139918b81990b3b3',
+  'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
+  '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
+  '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
+  'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+]) {
+  assert.ok(
+    futureGate.includes(fragment),
+    `Future-only health attestation escaped the 0325 absence gate: ${fragment}`,
+  )
+}
+for (const fragment of [
+  ...futureColumns,
+  ...futureConstraints,
+  ...futureFunctions,
+]) {
+  assert.ok(
+    futureGate.includes(`'${fragment}'`),
+    `Future-only contract escaped the 0325 absence gate: ${fragment}`,
+  )
+}
+for (const [table, trigger] of [
+  ...futureSplitTriggers,
+  ...futureRaceTriggers,
+]) {
+  const mapping = new RegExp(
+    `['"]${table}['"][\\s\\S]{0,240}['"]${trigger}['"]`,
+    'u',
+  )
+  assert.match(
+    futureGate,
+    mapping,
+    `Future trigger escaped the 0325 absence gate: ${trigger}`,
+  )
+}
+assert.match(
   routeSource,
   /installed_shopify_order_management_trigger\.tgfoid\s*=\s*[\s\S]{0,120}to_regprocedure/u,
   'Health structural query must compare exact trigger function OIDs',
@@ -173,13 +371,23 @@ assert.match(
 )
 assert.match(
   routeSource,
-  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0312_operations_shopify_order_single_save\.sql[\s\S]{0,180}OR \(/u,
-  'Health readiness must accept the 0308 function bodies only while 0312 is absent',
+  /NOT EXISTS \([\s\S]{0,180}public\.schema_migrations[\s\S]{0,220}0312_operations_shopify_order_single_save\.sql[\s\S]{0,220}AND NOT EXISTS \([\s\S]{0,180}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,180}OR \(/u,
+  'Health readiness may accept the 0308 function bodies only before both 0312 and 0325',
 )
 assert.match(
   routeSource,
-  /CASE[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
-  'Function attestation must select the exact 0312 or frozen 0308 aggregate',
+  /CASE[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
+  'Function attestation must select the exact 0325, 0312, or frozen 0308 aggregate',
+)
+assert.match(
+  routeSource,
+  /CASE[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}fc9b1d5fef57ae7a7f305713e7944713fd41026c00534c8d1216b983f5f05d2c[\s\S]{0,180}ELSE[\s\S]{0,180}acf4d37a8b2d32bbd2b5731994bccf86f1b5549ce69fe9e4060d24e79c28c650/u,
+  'Constraint attestation must keep the exact 0312 aggregate until 0325 exists',
+)
+assert.match(
+  routeSource,
+  /CASE[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}0ff13ea37552b62b039a3d6dfa7eeeb66db49fc21e7a7e266d2738912b4af101[\s\S]{0,180}ELSE[\s\S]{0,180}9d0946bfb810bd7be8b859e8643b1fa51a946dd98c32b5e781b573c163cdbaf5/u,
+  'Trigger attestation must keep the exact 0312 aggregate until 0325 exists',
 )
 assert.match(
   routeSource,
@@ -700,6 +908,7 @@ if (liveDatabaseUrl) {
     )
     assert.equal(await structuralReady(), false)
     await client.query('ROLLBACK')
+
     assert.equal(await structuralReady(), true)
   } finally {
     await client.query('ROLLBACK').catch(() => undefined)
