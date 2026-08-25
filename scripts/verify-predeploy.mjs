@@ -271,6 +271,16 @@ if (String(vercel.buildCommand || '') !== 'npm run build:vercel') {
   fail('app_src/vercel.json buildCommand must be "npm run build:vercel"')
 }
 
+const vercelDeploymentEnabled = vercel?.git?.deploymentEnabled
+if (
+  !vercelDeploymentEnabled
+  || vercelDeploymentEnabled.dev !== false
+  || vercelDeploymentEnabled.main !== false
+  || Object.keys(vercelDeploymentEnabled).length !== 2
+) {
+  fail('app_src/vercel.json must disable automatic dev and main deployments while leaving feature previews enabled')
+}
+
 if (String(vercel.outputDirectory || '') !== '.next') {
   fail('app_src/vercel.json outputDirectory must be ".next"')
 }

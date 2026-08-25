@@ -480,4 +480,38 @@ const railwayStart = read('scripts/start-railway.sh')
 assert.ok(railwayStart.indexOf('/api/health') < railwayStart.indexOf('npm run release:record'))
 assert.ok(railwayStart.includes('application did not pass health validation'))
 
+const vercelConfig = JSON.parse(read('app_src/vercel.json'))
+assert.deepEqual(
+  vercelConfig.git?.deploymentEnabled,
+  { dev: false, main: false },
+  'Vercel must wait for an explicit exact-commit deployment on dev and main while retaining feature previews',
+)
+
+const vercelBuild = read('scripts/vercel-build.mjs')
+for (const fragment of [
+  "run('npm', ['run', 'build'], appRoot)",
+  "if (environment === 'production')",
+  "if (branch !== 'main')",
+  "environment === 'preview' && branch === 'dev'",
+  "resolve(root, 'scripts', 'verify-mail-sender.mjs')",
+  'database migrations are owned by the Railway deployment path',
+]) {
+  assert.ok(vercelBuild.includes(fragment), `Vercel build contract missing ${fragment}`)
+}
+for (const forbiddenMigrationPath of [
+  'db-migrate.mjs',
+  'db:migrate',
+  'predeploy-railway.sh',
+]) {
+  assert.ok(
+    !vercelBuild.includes(forbiddenMigrationPath),
+    `Vercel build must not invoke the migration authority through ${forbiddenMigrationPath}`,
+  )
+}
+assert.ok(
+  vercelBuild.indexOf("run('npm', ['run', 'build'], appRoot)")
+    < vercelBuild.indexOf("resolve(root, 'scripts', 'verify-mail-sender.mjs')"),
+  'Vercel must compile before its managed mail verification gate',
+)
+
 console.log('PASS test-release-contract')
