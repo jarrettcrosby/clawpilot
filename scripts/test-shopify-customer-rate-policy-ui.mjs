@@ -256,7 +256,7 @@ requireAll(setupPanel, [
   'Restricted customers — require an exact local policy',
   'All eligible checkouts',
   'Save desired checkout controls',
-  'Restricted cache preparation requires a signed-in customer',
+  'Restricted access requires a signed-in, currently eligible customer.',
   'Customer-specific and per-service Shopify enforcement requires an eligible Delivery Customization',
   'Refresh checkout-audience status',
 ], 'carrier-service setup integration')
