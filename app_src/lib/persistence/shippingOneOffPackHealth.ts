@@ -133,6 +133,15 @@ const SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL = String.raw`
 export const SHIPPING_ONE_OFF_PACK_MIGRATION_CHECKSUM =
   '8a844c03da549100d1da669d0ba12c2cbab24f31337f37fcd0d0071ecf80b84b'
 
+export const SHIPPING_ONE_OFF_PACK_POST_0325_MIGRATION_CHECKSUM =
+  'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
+
+export const SHIPPING_ONE_OFF_PACK_PRE_0325_CATALOG_HASH =
+  'b463547928148723e9f5b35d92b310992c57e8dfc6a646a5bb3221898ba2c992'
+
+export const SHIPPING_ONE_OFF_PACK_POST_0325_CATALOG_HASH =
+  '1878d43ef868796d1fb5bde57af30b25c3f1d1c35863593c5bd90f2d3dad3074'
+
 export const SHIPPING_ONE_OFF_PACK_CATALOG_FINGERPRINT_SQL = String.raw`
   WITH ${SHIPPING_ONE_OFF_PACK_ARTIFACTS_SQL}
   SELECT count(*)::integer AS artifact_count,
@@ -155,8 +164,21 @@ export const SHIPPING_ONE_OFF_PACK_HEALTH_SQL = String.raw`
       AND encode(digest(convert_to(string_agg(
         kind || '|' || identity || '|' || definition,
         chr(10) ORDER BY kind, identity
-      ), 'UTF8'), 'sha256'), 'hex') =
-        'b463547928148723e9f5b35d92b310992c57e8dfc6a646a5bb3221898ba2c992'
+      ), 'UTF8'), 'sha256'), 'hex') = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0325_operations_shopify_fulfillment_reversal.sql'
+            AND checksum =
+              '${SHIPPING_ONE_OFF_PACK_POST_0325_MIGRATION_CHECKSUM}'
+        ) THEN '${SHIPPING_ONE_OFF_PACK_POST_0325_CATALOG_HASH}'
+        WHEN NOT EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0325_operations_shopify_fulfillment_reversal.sql'
+        ) THEN '${SHIPPING_ONE_OFF_PACK_PRE_0325_CATALOG_HASH}'
+        ELSE NULL
+      END
     FROM artifact
   )
 `
