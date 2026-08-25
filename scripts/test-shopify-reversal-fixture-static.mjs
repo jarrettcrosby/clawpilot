@@ -18,10 +18,14 @@ const requireFromApp = createRequire(
 const ts = requireFromApp('typescript')
 const migrationPath =
   'db/migrations/0326_operations_shopify_reversal_test_fixture.sql'
+const providerErrorMigrationPath =
+  'db/migrations/0328_operations_shopify_reversal_fixture_provider_errors.sql'
 const healthPath =
   'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'
 const healthRoutePath = 'app_src/app/api/health/route.ts'
 const persistencePath = 'app_src/lib/persistence/shopifyReversalFixture.ts'
+const commandsPath =
+  'app_src/lib/operations/shopifyReversalFixtureCommands.ts'
 const fulfillmentProviderPath =
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts'
 const orderProviderPath =
@@ -29,10 +33,15 @@ const orderProviderPath =
 const approvalRoutePath =
   'app_src/app/api/dev/shopify-test-fixtures/approve/route.ts'
 const migration = readFileSync(resolve(root, migrationPath), 'utf8')
+const providerErrorMigration = readFileSync(
+  resolve(root, providerErrorMigrationPath),
+  'utf8',
+)
 const checksum = createHash('sha256').update(migration).digest('hex')
 const healthSource = readFileSync(resolve(root, healthPath), 'utf8')
 const healthRoute = readFileSync(resolve(root, healthRoutePath), 'utf8')
 const persistenceSource = readFileSync(resolve(root, persistencePath), 'utf8')
+const commandsSource = readFileSync(resolve(root, commandsPath), 'utf8')
 const fulfillmentProviderSource = readFileSync(
   resolve(root, fulfillmentProviderPath),
   'utf8',
@@ -90,6 +99,86 @@ for (const fragment of [
 ]) {
   assert.ok(migration.includes(fragment), `0326 must include ${fragment}`)
 }
+for (const fragment of [
+  'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION',
+  providerErrorMigrationPath.split('/').at(-1),
+  createHash('sha256').update(providerErrorMigration).digest('hex'),
+  'provider_error_migration_current',
+  'provider_error_column',
+  'provider_error_constraint',
+  'profile_version_constraint',
+  'provider_error_view_columns',
+]) {
+  assert.ok(
+    healthSource.includes(fragment),
+    `fixture health must gate provider-error evidence with ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  'shopify_reversal_fixture_commands_profile_version_valid',
+  "'shopify-reversal-fixture-v1'",
+  "'shopify-reversal-fixture-v2'",
+  'ADD COLUMN provider_error_summary text',
+  "outcome_state IN ('rejected', 'unknown')",
+  'provider_mutation_attempted = true',
+  'pg_catalog.char_length(provider_error_summary) BETWEEN 1 AND 500',
+  "provider_error_summary !~ '[[:cntrl:]]'",
+  "'^Shopify rejected order creation \\('",
+  'FULFILLMENT_SERVICE_INVALID|INVALID|INVENTORY_CLAIM_FAILED',
+  'TAX_LINE_RATE_MISSING|UNSPECIFIED',
+  'initial_outcome.error_code AS provider_error_code',
+  'initial_outcome.provider_error_summary',
+]) {
+  assert.ok(
+    providerErrorMigration.includes(fragment),
+    `0328 must include ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  providerErrorMigration,
+  /^\s*(?:BEGIN|COMMIT);\s*$/imu,
+  '0328 must use the migrator transaction',
+)
+for (const fragment of [
+  'providerErrorSummary?: string | null',
+  'provider_order_updated_at, error_code, provider_error_summary',
+  'provider_error_code: string | null',
+  'provider_error_summary: string | null',
+  'providerErrorCode: row.provider_error_code',
+  'providerErrorSummary: row.provider_error_summary',
+]) {
+  assert.ok(
+    persistenceSource.includes(fragment),
+    `provider-error persistence must include ${fragment}`,
+  )
+}
+const safeSummaryStart = commandsSource.indexOf(
+  'function safeProviderErrorSummary(',
+)
+const safeSummaryEnd = commandsSource.indexOf(
+  '\nasync function recordOutcomeConservatively',
+  safeSummaryStart,
+)
+assert.ok(safeSummaryStart >= 0 && safeSummaryEnd > safeSummaryStart)
+const safeSummarySource = commandsSource.slice(safeSummaryStart, safeSummaryEnd)
+assert.match(
+  safeSummarySource,
+  /error instanceof ShopifyReversalFixtureProviderError/u,
+)
+assert.match(safeSummarySource, /error\.providerErrorSummary/u)
+assert.match(safeSummarySource, /summary\.length > 500/u)
+assert.match(
+  safeSummarySource,
+  /\^Shopify rejected order creation \\\(/u,
+)
+assert.match(safeSummarySource, /SAFE_ORDER_CREATE_PROVIDER_ERROR_FACT/u)
+assert.match(safeSummarySource, /SAFE_ORDER_CREATE_PROVIDER_ERROR_CODES/u)
+assert.doesNotMatch(
+  safeSummarySource,
+  /error\.message/u,
+  'durable provider evidence must never derive from the raw provider message',
+)
 
 const output = ts.transpileModule(healthSource, {
   compilerOptions: {
@@ -115,12 +204,22 @@ vm.runInNewContext(output, {
         if (queries % 2 === 1) {
           assert.equal(values[0], migrationPath.split('/').at(-1))
           assert.equal(values[1], checksum)
+          assert.equal(values[2], providerErrorMigrationPath.split('/').at(-1))
+          assert.equal(
+            values[3],
+            createHash('sha256').update(providerErrorMigration).digest('hex'),
+          )
           return { rows: [{
             migration_current: structureCurrent,
+            provider_error_migration_current: structureCurrent,
             command_table: structureCurrent,
             approval_table: structureCurrent,
             attempt_table: structureCurrent,
             outcome_table: structureCurrent,
+            provider_error_column: structureCurrent,
+            provider_error_constraint: structureCurrent,
+            profile_version_constraint: structureCurrent,
+            provider_error_view_columns: structureCurrent,
             state_view: structureCurrent,
             actor_function: structureCurrent,
             account_function: structureCurrent,
@@ -212,9 +311,14 @@ assert.match(
   orderProviderSource,
   /const providerPayload = exactOrderProviderPayload\([\s\S]*assertShopifyReversalFixtureOrderClaimCurrentInPostgres\([\s\S]*providerPayloadHash[\s\S]*shopifyAdminGraphql\([\s\S]*variables/u,
 )
+assert.match(orderProviderSource, /userErrors \{ code field message \}/u)
 assert.match(
   orderProviderSource,
-  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v1'[\s\S]*variables/u,
+  /const errorSummary = providerRejectionSummary\(errors\)[\s\S]*true,[\s\S]*false,[\s\S]*errorSummary,/u,
+)
+assert.match(
+  orderProviderSource,
+  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v2'[\s\S]*variables/u,
 )
 assert.match(
   persistenceSource,

@@ -700,7 +700,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
          expires_at
        ) VALUES (
          $1, $2::uuid, $3::uuid,
-         $4, 'shopify-reversal-fixture-v1', $5, $6,
+         $4, 'shopify-reversal-fixture-v2', $5, $6,
          $7, $8, $9, $10,
          $11::bigint, $12::integer, $13, $14, $15,
          $16, $17, $18,
@@ -763,7 +763,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
         phase: command.phase,
         intentHash: command.intentHash,
         accountGlobalId: SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
-        fixtureProfileVersion: 'shopify-reversal-fixture-v1',
+        fixtureProfileVersion: 'shopify-reversal-fixture-v2',
         normalUiAvailable: false,
         providerWrites: 0,
         requestedApprover: command.actorEmail,
@@ -1110,6 +1110,7 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
   providerOrderName?: string | null
   providerOrderUpdatedAt?: string | null
   errorCode?: string | null
+  providerErrorSummary?: string | null
   evidenceHash?: string | null
 }) {
   return withTransaction(async (client) => {
@@ -1122,11 +1123,12 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
        organization_id, command_id, attempt_id, outcome_state,
        provider_mutation_attempted, provider_writes,
        provider_reference, provider_order_id, provider_order_name,
-       provider_order_updated_at, error_code, evidence_hash, recorded_by
+       provider_order_updated_at, error_code, provider_error_summary,
+       evidence_hash, recorded_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4,
        $5, $6::integer,
-       $7, $8, $9, $10::timestamptz, $11, $12, $13
+       $7, $8, $9, $10::timestamptz, $11, $12, $13, $14
      ) RETURNING global_id, outcome_state, recorded_at`,
       [
         input.command.organizationId,
@@ -1140,6 +1142,7 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
         input.providerOrderName || null,
         input.providerOrderUpdatedAt || null,
         input.errorCode || null,
+        input.providerErrorSummary || null,
         input.evidenceHash || null,
         input.command.actorEmail,
       ],
@@ -1163,6 +1166,7 @@ export async function recordShopifyReversalFixtureOutcomeInPostgres(input: {
         providerWrites: input.providerWrites,
         providerReference: input.providerReference || null,
         errorCode: input.errorCode || null,
+        providerErrorSummary: input.providerErrorSummary || null,
         approvedBy: input.command.actorEmail,
         machinePrincipal: SHOPIFY_REVERSAL_FIXTURE_WORKER_PRINCIPAL,
       },
@@ -1257,6 +1261,8 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
     reconciliation_outcome_global_id: string | null
     provider_order_id: string | null
     provider_reference: string | null
+    provider_error_code: string | null
+    provider_error_summary: string | null
     prepared_at: Date | string
     expires_at: Date | string
   }>(
@@ -1264,7 +1270,8 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
             attempt_global_id,
             initial_outcome_global_id, reconciliation_outcome_global_id,
             provider_order_id, provider_reference,
-            prepared_at, expires_at
+            prepared_at, expires_at,
+            provider_error_code, provider_error_summary
      FROM public.operations_shopify_reversal_fixture_command_state
      WHERE organization_id = $1::uuid
        AND command_global_id = $2
@@ -1293,6 +1300,8 @@ export async function readShopifyReversalFixtureCommandStateInPostgres(input: {
     reconciliationOutcomeGlobalId: row.reconciliation_outcome_global_id,
     providerOrderId: row.provider_order_id,
     providerReference: row.provider_reference,
+    providerErrorCode: row.provider_error_code,
+    providerErrorSummary: row.provider_error_summary,
     preparedAt: timestamp(row.prepared_at, 'Preparation time'),
     expiresAt: timestamp(row.expires_at, 'Expiration time'),
   })

@@ -42,6 +42,11 @@ const shopifyReversalFixtureMigration = [
   '8e23a84f09527467acaf2a1ec500642cd6bf11f532c4131dd98b4b8655e09a25',
 ]
 
+const shopifyReversalFixtureProviderErrorsMigration = [
+  'db/migrations/0328_operations_shopify_reversal_fixture_provider_errors.sql',
+  'a08b02ab69b6cedf34087a7baee7d16f50a7717a7a9c32d0901944a7ca1e32aa',
+]
+
 const legacyUnitMeasurementMigration = [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
@@ -154,7 +159,25 @@ if (
 ) {
   fail('Shopify reversal fixture migration checksum drifted')
 }
+const [shopifyReversalFixtureProviderErrorsMigrationPath,
+  shopifyReversalFixtureProviderErrorsMigrationChecksum] =
+  shopifyReversalFixtureProviderErrorsMigration
+if (!existsSync(resolve(root, shopifyReversalFixtureProviderErrorsMigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture provider-error migration: ${shopifyReversalFixtureProviderErrorsMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyReversalFixtureProviderErrorsMigrationPath),
+    ))
+    .digest('hex') !== shopifyReversalFixtureProviderErrorsMigrationChecksum
+) {
+  fail('Shopify reversal fixture provider-error migration checksum drifted')
+}
 const shopifyReversalFixtureRequiredFiles = [
+  shopifyReversalFixtureProviderErrorsMigrationPath,
   'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
   'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
