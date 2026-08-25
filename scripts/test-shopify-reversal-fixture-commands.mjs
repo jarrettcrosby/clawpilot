@@ -53,7 +53,7 @@ const signature = Object.freeze({
   version: 'shopify-fulfillment-attempt-v2',
   externalOrderId: target.externalOrderId,
   carrier: 'ClawPilot Fixture',
-  trackingNumbers: ['CP-REV-GSFC7654321'],
+  trackingNumbers: ['CP-REV-gsfc7654321'],
   fulfillmentOrders: [{
     fulfillmentOrderId: 'gid://shopify/FulfillmentOrder/100',
     locationId: target.providerLocationId,

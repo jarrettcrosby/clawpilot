@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -608,7 +609,7 @@ const fixtureCredential = {
 }
 const fixtureInput = {
   externalOrderId: orderGid,
-  trackingNumbers: ['CP-REV-GSFC1234567'],
+  trackingNumbers: ['CP-REV-gsfc1234567'],
   carrier: 'ClawPilot Fixture',
   notifyCustomer: false,
   expectedLineItems: [{ lineItemId: lineItemGid, quantity: 1 }],
@@ -734,6 +735,39 @@ assert.equal(
   )).length,
   0,
   'a substituted fixture payload must fail before fulfillmentCreate',
+)
+await fixtureModule.executeShopifyReversalFixtureFulfillmentProviderAttempt(
+  fixtureCredential,
+  fixtureInput,
+  fixtureAttempt.signature,
+  fixtureClaim,
+)
+const emittedFixtureMutation = fixtureProviderCalls.findLast((request) => (
+  request.operationName === 'ClawPilotFulfillmentCreate'
+))
+assert.ok(emittedFixtureMutation)
+const exactEmittedFixtureHash = createHash('sha256').update(JSON.stringify({
+  version: 'shopify-reversal-fixture-fulfillment-provider-payload-v1',
+  shopDomain: fixtureCredential.shopDomain,
+  externalOrderId: fixtureInput.externalOrderId,
+  variables: emittedFixtureMutation.variables,
+})).digest('hex')
+assert.equal(
+  exactEmittedFixtureHash,
+  expectedFixturePayloadHash,
+  'the final fulfillment fence must hash the exact emitted GraphQL variables',
+)
+const changedFixtureVariables = structuredClone(emittedFixtureMutation.variables)
+changedFixtureVariables.fulfillment.trackingInfo.company = 'Changed carrier'
+assert.notEqual(
+  createHash('sha256').update(JSON.stringify({
+    version: 'shopify-reversal-fixture-fulfillment-provider-payload-v1',
+    shopDomain: fixtureCredential.shopDomain,
+    externalOrderId: fixtureInput.externalOrderId,
+    variables: changedFixtureVariables,
+  })).digest('hex'),
+  expectedFixturePayloadHash,
+  'mutation-only fulfillment drift must change the final provider payload hash',
 )
 assert.deepEqual(JSON.parse(JSON.stringify(await replayModule.readShopifyFulfillment(
   credential,

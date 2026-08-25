@@ -424,7 +424,7 @@ export async function prepareShopifyReversalFixtureFulfillment(input: {
   const credential = await liveCredential(authority)
   const globalId =
     await allocateShopifyReversalFixtureCommandGlobalIdInPostgres()
-  const trackingNumbers = [`CP-REV-${globalId.toUpperCase()}`]
+  const trackingNumbers = [`CP-REV-${globalId}`]
   const preparation = await prepareShopifyFulfillmentProviderAttempt(
     credential,
     {

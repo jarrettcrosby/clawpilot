@@ -729,11 +729,25 @@ type ShopifyFulfillmentInspection = {
 
 type OpenFulfillmentPlan = {
   signature: ShopifyFulfillmentAttemptSignature
-  lineItemsByFulfillmentOrder: Array<{
-    fulfillmentOrderId: string
-    fulfillmentOrderLineItems: Array<{ id: string; quantity: number }>
-  }>
 }
+
+type ShopifyFulfillmentCreateVariables = Readonly<{
+  fulfillment: Readonly<{
+    lineItemsByFulfillmentOrder: ReadonlyArray<Readonly<{
+      fulfillmentOrderId: string
+      fulfillmentOrderLineItems: ReadonlyArray<Readonly<{
+        id: string
+        quantity: number
+      }>>
+    }>>
+    notifyCustomer: boolean
+    trackingInfo: Readonly<{
+      company: string
+      number?: string
+      numbers?: ReadonlyArray<string>
+    }>
+  }>
+}>
 
 function providerShapeError(message: string): never {
   throw new ShopifyFulfillmentWritebackError(
@@ -1206,16 +1220,39 @@ function deriveOpenFulfillmentPlan(
     notifyCustomer: input.notifyCustomer,
     sandboxE2eAuthorityKind: input.sandboxE2eAuthorityKind,
   })
-  return {
-    signature,
-    lineItemsByFulfillmentOrder: signature.fulfillmentOrders.map((fulfillmentOrder) => ({
+  return { signature }
+}
+
+function exactFulfillmentCreateVariables(
+  signature: ShopifyFulfillmentAttemptSignature,
+): ShopifyFulfillmentCreateVariables {
+  const lineItemsByFulfillmentOrder = Object.freeze(
+    signature.fulfillmentOrders.map((fulfillmentOrder) => Object.freeze({
       fulfillmentOrderId: fulfillmentOrder.fulfillmentOrderId,
-      fulfillmentOrderLineItems: fulfillmentOrder.lineItems.map((line) => ({
-        id: line.fulfillmentOrderLineItemId,
-        quantity: line.quantity,
-      })),
+      fulfillmentOrderLineItems: Object.freeze(
+        fulfillmentOrder.lineItems.map((line) => Object.freeze({
+          id: line.fulfillmentOrderLineItemId,
+          quantity: line.quantity,
+        })),
+      ),
     })),
-  }
+  )
+  const trackingInfo = signature.trackingNumbers.length === 1
+    ? Object.freeze({
+      number: signature.trackingNumbers[0],
+      company: signature.carrier,
+    })
+    : Object.freeze({
+      numbers: Object.freeze([...signature.trackingNumbers]),
+      company: signature.carrier,
+    })
+  return Object.freeze({
+    fulfillment: Object.freeze({
+      lineItemsByFulfillmentOrder,
+      notifyCustomer: signature.notifyCustomer,
+      trackingInfo,
+    }),
+  })
 }
 
 function requirePlanMatchesExpectedLines(
@@ -1368,7 +1405,9 @@ async function writeShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
   input: ShopifyFulfillmentProviderInput,
   attemptSignature: unknown,
-  beforeProviderMutation: () => Promise<void>,
+  beforeProviderMutation: (
+    variables: ShopifyFulfillmentCreateVariables,
+  ) => Promise<void>,
 ): Promise<ShopifyFulfillmentWritebackResult> {
   const suppliedSignature = attemptSignature === undefined
     ? null
@@ -1408,23 +1447,13 @@ async function writeShopifyFulfillment(
     }
   }
   let mutation: FulfillmentCreateResponse
-  await beforeProviderMutation()
+  const variables = exactFulfillmentCreateVariables(plan.signature)
+  await beforeProviderMutation(variables)
   try {
     mutation = await shopifyAdminGraphql<FulfillmentCreateResponse>(credential, {
       query: FULFILLMENT_CREATE_MUTATION,
       operationName: 'ClawPilotFulfillmentCreate',
-      variables: {
-        fulfillment: {
-          lineItemsByFulfillmentOrder: plan.lineItemsByFulfillmentOrder,
-          notifyCustomer: input.notifyCustomer,
-          trackingInfo: {
-            ...(input.trackingNumbers.length === 1
-              ? { number: input.trackingNumbers[0] }
-              : { numbers: input.trackingNumbers }),
-            company: input.carrier,
-          },
-        },
-      },
+      variables,
     })
   } catch {
     throw new ShopifyFulfillmentWritebackError(
@@ -1497,7 +1526,7 @@ export function shopifyReversalFixtureFulfillmentProviderPayloadHash(
   attemptSignature: unknown,
 ) {
   const fixedTracking = input.trackingNumbers.length === 1
-    && /^CP-REV-GSFC(?:[0-9]{7}|[0-9A-V]{12})$/u.test(
+    && /^CP-REV-gsfc(?:[0-9]{7}|[0-9a-v]{12})$/u.test(
       input.trackingNumbers[0],
     )
   const fixedLine = input.expectedLineItems.length === 1
@@ -1518,15 +1547,23 @@ export function shopifyReversalFixtureFulfillmentProviderPayloadHash(
     )
   }
   const signature = normalizeAttemptSignatureForInput(attemptSignature, input)
+  return shopifyReversalFixtureFulfillmentVariablesHash(
+    credential,
+    signature.externalOrderId,
+    exactFulfillmentCreateVariables(signature),
+  )
+}
+
+function shopifyReversalFixtureFulfillmentVariablesHash(
+  credential: ShopifyCommerceRuntimeCredential,
+  externalOrderId: string,
+  variables: ShopifyFulfillmentCreateVariables,
+) {
   return createHash('sha256').update(JSON.stringify({
     version: 'shopify-reversal-fixture-fulfillment-provider-payload-v1',
     shopDomain: credential.shopDomain,
-    externalOrderId: input.externalOrderId,
-    carrier: input.carrier,
-    trackingNumbers: input.trackingNumbers,
-    notifyCustomer: input.notifyCustomer,
-    expectedLineItems: input.expectedLineItems,
-    signature,
+    externalOrderId,
+    variables,
   })).digest('hex')
 }
 
@@ -1541,17 +1578,22 @@ export async function executeShopifyReversalFixtureFulfillmentProviderAttempt(
     actorEmail: string
   },
 ): Promise<ShopifyFulfillmentWritebackResult> {
-  const providerPayloadHash =
-    shopifyReversalFixtureFulfillmentProviderPayloadHash(
-      credential,
-      input,
-      attemptSignature,
-    )
+  shopifyReversalFixtureFulfillmentProviderPayloadHash(
+    credential,
+    input,
+    attemptSignature,
+  )
   return writeShopifyFulfillment(
     credential,
     input,
     attemptSignature,
-    async () => {
+    async (variables) => {
+      const providerPayloadHash =
+        shopifyReversalFixtureFulfillmentVariablesHash(
+          credential,
+          input.externalOrderId,
+          variables,
+        )
       await assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres({
         ...claim,
         providerPayloadHash,
