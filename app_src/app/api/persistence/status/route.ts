@@ -11,7 +11,7 @@ export async function GET() {
   if (driver !== 'postgres') {
     const hosted = isHostedRuntime()
     const careerSiteEnabled = process.env.CAREER_SITE_SUBMISSIONS_ENABLED === '1'
-    return NextResponse.json({
+    const payload = {
       ok: !hosted && !careerSiteEnabled,
       driver,
       database: 'not-configured',
@@ -20,7 +20,9 @@ export async function GET() {
         healthy: !careerSiteEnabled,
         status: careerSiteEnabled ? 'unhealthy' : 'disabled',
       },
-    }, { status: hosted || careerSiteEnabled ? 503 : 200 })
+    }
+    if (careerSiteEnabled) return NextResponse.json(payload, { status: 503 })
+    return NextResponse.json(payload, { status: hosted ? 503 : 200 })
   }
 
   const [databaseResult, credentialResult] = await Promise.allSettled([
