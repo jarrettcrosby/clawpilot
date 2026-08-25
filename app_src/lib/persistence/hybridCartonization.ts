@@ -148,8 +148,15 @@ export type HybridCartonizationReadResult = {
     fitModel: HybridCartonizationLine['profile']['fitModel']
     packagingState: string
     packagingSource: string
-    weightSource: 'profile_version' | 'provider_order' | 'provider_catalog'
+    weightSource:
+      | 'profile_version'
+      | 'provider_order'
+      | 'provider_catalog'
+      | 'manual_resolution'
     weightGrams: number
+    weightEvidenceReference: string
+    weightEvidenceHash: string | null
+    weightEvidenceRequestHash: string | null
     channelSourceRevision: string
     channelSourceHash: string
     packLineageSource:
@@ -315,6 +322,23 @@ type CandidateLineRow = {
   packaging_source: string
   packaging_weight_source: string | null
   weight_grams: number | null
+  length_mm: number | null
+  width_mm: number | null
+  height_mm: number | null
+  line_source_revision: string
+  line_source_hash: string
+  manual_measurement_evidence_id: string | null
+  manual_measurement_source: string | null
+  manual_measurement_weight_grams: number | null
+  manual_measurement_length_mm: number | null
+  manual_measurement_width_mm: number | null
+  manual_measurement_height_mm: number | null
+  manual_measurement_line_source_revision: string | null
+  manual_measurement_line_source_hash: string | null
+  manual_measurement_request_hash: string | null
+  manual_measurement_result_payload_hash: string | null
+  manual_measurement_decision_global_id: string | null
+  manual_measurement_decision_created_at: Date | string | null
   pack_mapping_id: string | null
   pack_mapping_global_id: string | null
   captured_pack_mapping_row_version: string | null
@@ -2198,6 +2222,26 @@ async function readCandidateLines(
        line.packaging_source,
        line.packaging_weight_source,
        line.weight_grams,
+       line.length_mm,
+       line.width_mm,
+       line.height_mm,
+       line.source_revision AS line_source_revision,
+       line.source_hash AS line_source_hash,
+       manual_measurement.id::text AS manual_measurement_evidence_id,
+       manual_measurement.measurement_source AS manual_measurement_source,
+       manual_measurement.weight_grams AS manual_measurement_weight_grams,
+       manual_measurement.length_mm AS manual_measurement_length_mm,
+       manual_measurement.width_mm AS manual_measurement_width_mm,
+       manual_measurement.height_mm AS manual_measurement_height_mm,
+       manual_measurement.line_source_revision
+         AS manual_measurement_line_source_revision,
+       manual_measurement.line_source_hash
+         AS manual_measurement_line_source_hash,
+       manual_measurement.request_hash AS manual_measurement_request_hash,
+       manual_measurement.result_payload_hash
+         AS manual_measurement_result_payload_hash,
+       manual_decision.global_id AS manual_measurement_decision_global_id,
+       manual_decision.created_at AS manual_measurement_decision_created_at,
        pack_mapping.id::text AS pack_mapping_id,
        pack_mapping.global_id AS pack_mapping_global_id,
        line.commerce_variant_pack_mapping_row_version::text
@@ -2254,6 +2298,16 @@ async function readCandidateLines(
      LEFT JOIN crm_products product
        ON product.pipeline_id = line.pipeline_id
       AND product.id = line.product_id
+     LEFT JOIN operations_commerce_legacy_unit_measurement_evidence
+       manual_measurement
+       ON manual_measurement.organization_id = line.organization_id
+      AND manual_measurement.integration_account_id =
+            line.integration_account_id
+      AND manual_measurement.pipeline_id = line.pipeline_id
+      AND manual_measurement.candidate_line_id = line.id
+     LEFT JOIN operations_commerce_resolution_decisions manual_decision
+       ON manual_decision.organization_id = manual_measurement.organization_id
+      AND manual_decision.id = manual_measurement.resolution_decision_id
      LEFT JOIN operations_commerce_variant_pack_mappings pack_mapping
        ON pack_mapping.organization_id = line.organization_id
       AND pack_mapping.integration_account_id =
@@ -2358,23 +2412,95 @@ export function mapCandidateLines(
       `${row.global_id} unfulfilled quantity`,
       1,
     )
-    const unconstrainedUnit = (
+    const hasNoVersionedProductPackEvidence = (
+      row.pack_mapping_id === null
+      && row.pack_profile_version_id === null
+    )
+    const deferredUnit = (
       Number(row.unit_multiplier) === 1
       && row.mapping_state === 'resolved'
       && row.packaging_state === 'not_required'
       && row.packaging_source === 'none'
       && row.product_id !== null
       && row.product_global_id !== null
-      && row.pack_mapping_id === null
-      && row.pack_profile_version_id === null
+      && hasNoVersionedProductPackEvidence
     )
-    if (unconstrainedUnit) {
-      const providerWeight = row.weight_grams ?? row.channel_weight_grams
-      if (!Number.isSafeInteger(providerWeight) || Number(providerWeight) < 1) {
+    const legacyManualUnitShape = (
+      Number(row.unit_multiplier) === 1
+      && row.mapping_state === 'resolved'
+      && row.packaging_state === 'resolved'
+      && row.packaging_source === 'manual'
+      && row.packaging_weight_source === null
+      && row.product_id !== null
+      && row.product_global_id !== null
+      && hasNoVersionedProductPackEvidence
+    )
+    const manualMeasurementPresent = Boolean(
+      row.manual_measurement_evidence_id,
+    )
+    const manualMeasurementMatches = Boolean(
+      manualMeasurementPresent
+      && row.manual_measurement_source === 'manual_package_resolution'
+      && Number.isSafeInteger(row.manual_measurement_weight_grams)
+      && Number(row.manual_measurement_weight_grams) > 0
+      && row.manual_measurement_weight_grams === row.weight_grams
+      && row.manual_measurement_length_mm === row.length_mm
+      && row.manual_measurement_width_mm === row.width_mm
+      && row.manual_measurement_height_mm === row.height_mm
+      && row.manual_measurement_line_source_revision ===
+        row.line_source_revision
+      && row.manual_measurement_line_source_hash === row.line_source_hash
+      && /^[a-f0-9]{64}$/.test(
+        row.manual_measurement_request_hash || '',
+      )
+      && /^[a-f0-9]{64}$/.test(
+        row.manual_measurement_result_payload_hash || '',
+      )
+      && /^gcrd(?:[0-9]{7}|[0-9a-v]{12})$/.test(
+        row.manual_measurement_decision_global_id || '',
+      )
+      && row.manual_measurement_decision_created_at !== null
+    )
+    if (
+      manualMeasurementPresent
+      && (deferredUnit || legacyManualUnitShape)
+      && !manualMeasurementMatches
+    ) {
+      fail(
+        `${row.product_title_snapshot} has invalid retained manual unit-measurement evidence`,
+        422,
+        'HYBRID_CARTONIZATION_UNIT_MANUAL_EVIDENCE_INVALID',
+      )
+    }
+    const manualResolutionUnit = (
+      manualMeasurementMatches
+      && (deferredUnit || legacyManualUnitShape)
+    )
+    if (deferredUnit || manualResolutionUnit) {
+      const providerOrderWeight = (
+        !manualResolutionUnit
+        && row.packaging_weight_source === 'provider_order'
+      )
+      const unitWeight = manualResolutionUnit
+        ? row.manual_measurement_weight_grams
+        : providerOrderWeight
+          ? row.weight_grams
+          : row.channel_weight_grams
+      if (!Number.isSafeInteger(unitWeight) || Number(unitWeight) < 1) {
         fail(
           `${row.product_title_snapshot} needs a positive provider or order-specific unit weight; a Product pack assignment is not required`,
           422,
           'HYBRID_CARTONIZATION_UNIT_WEIGHT_REQUIRED',
+        )
+      }
+      if (
+        providerOrderWeight
+        && (!row.line_source_revision || !row.line_source_hash)
+      ) {
+        fail(
+          `${row.product_title_snapshot} needs exact order-line lineage for its order-specific unit weight`,
+          422,
+          'HYBRID_CARTONIZATION_UNIT_ORDER_EVIDENCE_REQUIRED',
         )
       }
       if (!row.channel_source_revision || !row.channel_source_hash) {
@@ -2388,9 +2514,24 @@ export function mapCandidateLines(
       const title = variant && variant.toLowerCase() !== 'default title'
         ? `${row.product_title_snapshot} · ${variant}`
         : row.product_title_snapshot
-      const weightSource = row.packaging_weight_source === 'provider_order'
-        ? 'provider_order' as const
-        : 'provider_catalog' as const
+      const weightSource = manualResolutionUnit
+        ? 'manual_resolution' as const
+        : providerOrderWeight
+          ? 'provider_order' as const
+          : 'provider_catalog' as const
+      const weightEvidenceReference = manualResolutionUnit
+        ? row.manual_measurement_decision_global_id!
+        : providerOrderWeight
+          ? row.line_source_revision
+          : row.channel_source_revision
+      const weightEvidenceHash = manualResolutionUnit
+        ? row.manual_measurement_result_payload_hash
+        : providerOrderWeight
+          ? row.line_source_hash
+          : row.channel_source_hash
+      const weightEvidenceRequestHash = manualResolutionUnit
+        ? row.manual_measurement_request_hash
+        : null
       return {
         productId: row.product_id!,
         packProfileVersionId: null,
@@ -2399,7 +2540,7 @@ export function mapCandidateLines(
           productGlobalId: row.product_global_id!,
           title,
           quantity,
-          unitWeightGrams: Number(providerWeight),
+          unitWeightGrams: Number(unitWeight),
           profile: {
             // This is explicit non-profile lineage, not a fabricated Product
             // pack Global ID. The dedicated fit model prevents it from
@@ -2410,14 +2551,19 @@ export function mapCandidateLines(
             isCurrent: true,
             lifecycleState: 'active',
             fitModel: 'unconstrained_unit',
-            evidenceType: 'provider',
-            evidenceReference: row.channel_source_revision,
-            confirmedAt: null,
+            evidenceType: manualResolutionUnit ? 'legacy' : 'provider',
+            evidenceReference: weightEvidenceReference,
+            confirmedAt: manualResolutionUnit
+              ? timestamp(
+                  row.manual_measurement_decision_created_at,
+                  `${row.global_id} manual unit-measurement decision`,
+                )
+              : null,
             packageLevel: 'each',
             baseEachQuantity: 1,
             shipsAsOwnPackage: false,
             outerDimensionsMm: null,
-            grossWeightGrams: Number(providerWeight),
+            grossWeightGrams: Number(unitWeight),
           },
         },
         evidence: {
@@ -2433,7 +2579,10 @@ export function mapCandidateLines(
           packagingState: row.packaging_state,
           packagingSource: row.packaging_source,
           weightSource,
-          weightGrams: Number(providerWeight),
+          weightGrams: Number(unitWeight),
+          weightEvidenceReference,
+          weightEvidenceHash,
+          weightEvidenceRequestHash,
           channelSourceRevision: row.channel_source_revision,
           channelSourceHash: row.channel_source_hash,
           packLineageSource: row.pack_lineage_source,
@@ -2716,6 +2865,17 @@ export function mapCandidateLines(
         packagingSource: row.packaging_source,
         weightSource,
         weightGrams: unitWeightGrams,
+        weightEvidenceReference: weightSource === 'provider_order'
+          ? row.line_source_revision
+          : weightSource === 'provider_catalog'
+            ? row.channel_source_revision
+            : row.pack_profile_evidence_reference,
+        weightEvidenceHash: weightSource === 'provider_order'
+          ? row.line_source_hash
+          : weightSource === 'provider_catalog'
+            ? row.channel_source_hash
+            : null,
+        weightEvidenceRequestHash: null,
         channelSourceRevision: row.channel_source_revision,
         channelSourceHash: row.channel_source_hash,
         packLineageSource: row.pack_lineage_source,

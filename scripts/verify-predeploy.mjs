@@ -37,6 +37,16 @@ const orderEditingReleaseMigrations = new Map([
   ],
 ])
 
+const shopifyReversalFixtureMigration = [
+  'db/migrations/0326_operations_shopify_reversal_test_fixture.sql',
+  '8e23a84f09527467acaf2a1ec500642cd6bf11f532c4131dd98b4b8655e09a25',
+]
+
+const legacyUnitMeasurementMigration = [
+  'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
+  '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -130,6 +140,174 @@ for (const requiredFragment of [
 }
 
 const rootPackage = readJson('package.json')
+const [shopifyReversalFixtureMigrationPath,
+  shopifyReversalFixtureMigrationChecksum] = shopifyReversalFixtureMigration
+if (!existsSync(resolve(root, shopifyReversalFixtureMigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture migration: ${shopifyReversalFixtureMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, shopifyReversalFixtureMigrationPath)))
+    .digest('hex') !== shopifyReversalFixtureMigrationChecksum
+) {
+  fail('Shopify reversal fixture migration checksum drifted')
+}
+const shopifyReversalFixtureRequiredFiles = [
+  'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
+  'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
+  'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
+  'app_src/lib/persistence/shopifyReversalFixture.ts',
+  'app_src/lib/persistence/shopifyReversalFixtureHealth.ts',
+  'app_src/lib/operations/shopifyReversalFixtureCommands.ts',
+  'app_src/app/api/dev/shopify-test-fixtures/route.ts',
+  'app_src/app/api/dev/shopify-test-fixtures/approve/route.ts',
+  'scripts/shopify-test-fixture.mjs',
+  'scripts/test-shopify-reversal-fixture-runtime.mjs',
+  'scripts/test-shopify-reversal-fixture-adapter.mjs',
+  'scripts/test-shopify-reversal-fixture-commands.mjs',
+  'scripts/test-shopify-reversal-fixture-api.mjs',
+  'scripts/test-shopify-reversal-fixture-approval-api.mjs',
+  'scripts/test-shopify-reversal-fixture-persistence-atomic.mjs',
+  'scripts/test-shopify-reversal-fixture-postgres.mjs',
+  'scripts/test-shopify-reversal-fixture-static.mjs',
+  'docs/operations/shopify-reversal-test-fixture.md',
+]
+for (const requiredPath of shopifyReversalFixtureRequiredFiles) {
+  if (!existsSync(resolve(root, requiredPath))) {
+    fail(`missing Shopify reversal fixture artifact: ${requiredPath}`)
+  }
+}
+const shopifyReversalFixtureTest = String(
+  rootPackage?.scripts?.['test:shopify-reversal-fixture'] || '',
+)
+for (const command of [
+  'node scripts/test-shopify-reversal-fixture-runtime.mjs',
+  'node scripts/test-shopify-reversal-fixture-adapter.mjs',
+  'node scripts/test-shopify-reversal-fixture-commands.mjs',
+  'node scripts/test-shopify-reversal-fixture-api.mjs',
+  'node scripts/test-shopify-reversal-fixture-approval-api.mjs',
+  'node scripts/test-shopify-reversal-fixture-persistence-atomic.mjs',
+  'node scripts/test-shopify-reversal-fixture-postgres.mjs',
+  'node scripts/test-shopify-reversal-fixture-static.mjs',
+]) {
+  if (!shopifyReversalFixtureTest.includes(command)) {
+    fail(`test:shopify-reversal-fixture must run "${command}"`)
+  }
+}
+if (
+  !String(rootPackage?.scripts?.['test:commerce'] || '')
+    .includes('npm run test:shopify-reversal-fixture')
+) {
+  fail('test:commerce must run Shopify reversal fixture acceptance')
+}
+const shopifyReversalFixtureRuntimeSource = readFileSync(
+  resolve(root, 'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts'),
+  'utf8',
+)
+for (const fragment of [
+  'giah34fedoa5b1o',
+  'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
+  'gid://shopify/Shop/95083757815',
+  'test-pro-bakery-bites.myshopify.com',
+  'gid://shopify/ProductVariant/51028106379511',
+  'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
+  'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
+  'e4abd95f-825c-4242-b37b-825a92597e98',
+  '750aa268-0e31-4065-a99c-4016e4d4fab1',
+  'CLAWPILOT_SHOPIFY_REVERSAL_FIXTURE_ENABLED',
+  'normalUiAvailable: false',
+  'productionAvailable: false',
+]) {
+  if (!shopifyReversalFixtureRuntimeSource.includes(fragment)) {
+    fail(`Shopify reversal fixture runtime is missing ${fragment}`)
+  }
+}
+const shopifyReversalFixtureHealthSource = readFileSync(
+  resolve(root, 'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'),
+  'utf8',
+)
+if (
+  !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureMigrationChecksum,
+  )
+  || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
+  || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')
+) {
+  fail('runtime health is missing the Shopify reversal fixture readiness gate')
+}
+const proxySource = readFileSync(resolve(root, 'app_src/proxy.ts'), 'utf8')
+if (
+  !proxySource.includes("pathname === '/api/dev/shopify-test-fixtures'")
+  || proxySource.includes(
+    "normalizedPath === '/api/dev/shopify-test-fixtures'",
+  )
+  || proxySource.includes(
+    "pathname === '/api/dev/shopify-test-fixtures/approve'",
+  )
+  || proxySource.includes(
+    "pathname.startsWith('/api/dev/shopify-test-fixtures",
+  )
+) {
+  fail('Shopify reversal fixture proxy exception must match only the exact worker route')
+}
+const [legacyUnitMeasurementMigrationPath,
+  legacyUnitMeasurementMigrationChecksum] = legacyUnitMeasurementMigration
+if (!existsSync(resolve(root, legacyUnitMeasurementMigrationPath))) {
+  fail(
+    `missing legacy unit-measurement migration: ${legacyUnitMeasurementMigrationPath}`,
+  )
+}
+const legacyUnitMeasurementMigrationSource = readFileSync(
+  resolve(root, legacyUnitMeasurementMigrationPath),
+  'utf8',
+)
+if (
+  createHash('sha256')
+    .update(legacyUnitMeasurementMigrationSource)
+    .digest('hex') !== legacyUnitMeasurementMigrationChecksum
+) {
+  fail('legacy unit-measurement migration checksum drifted')
+}
+if (/^\s*(?:BEGIN|COMMIT);\s*$/imu.test(legacyUnitMeasurementMigrationSource)) {
+  fail('legacy unit-measurement migration must use the migrator transaction')
+}
+const legacyUnitMeasurementHealthPath =
+  'app_src/lib/persistence/operationsLegacyUnitMeasurementHealth.ts'
+if (!existsSync(resolve(root, legacyUnitMeasurementHealthPath))) {
+  fail(`missing legacy unit-measurement health: ${legacyUnitMeasurementHealthPath}`)
+}
+const legacyUnitMeasurementHealthSource = readFileSync(
+  resolve(root, legacyUnitMeasurementHealthPath),
+  'utf8',
+)
+for (const requiredFragment of [
+  legacyUnitMeasurementMigrationChecksum,
+  'OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL',
+  'operations_commerce_legacy_unit_measurement_evidence',
+  'protect_operations_commerce_legacy_unit_measurement_receipt',
+  'bd1fe5bc733b4abe6ea1f8cc02e21fd862c4d0d126b8f063d3be963e8f40da3a',
+  '50f7a63234f9a8598d950419200ae090b3a7d802904062119fd0e264483413a2',
+  '18131dcc43f74c35d5abafa5ef0a7ad8baa692014875e8171e785e65543976da',
+  '7579fc4cb426e8b1e07a41ead2d9dba971fde0e63fb6d8bec7547a0952fe482f',
+  '1ddc53f5259f2b297017ace3572d1efcc608bb1484c1c0bb3406ecb9cbb8020e',
+]) {
+  if (!legacyUnitMeasurementHealthSource.includes(requiredFragment)) {
+    fail(`legacy unit-measurement health is missing ${requiredFragment}`)
+  }
+}
+for (const requiredFragment of [
+  "from '@/lib/persistence/operationsLegacyUnitMeasurementHealth'",
+  '${OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL}',
+  'AS operations_legacy_unit_measurement_applied',
+  '&& row?.operations_legacy_unit_measurement_applied',
+  '|| !row?.operations_legacy_unit_measurement_applied',
+]) {
+  if (!healthRoute.includes(requiredFragment)) {
+    fail(`runtime health is missing legacy unit-measurement gate ${requiredFragment}`)
+  }
+}
 const checkoutAudienceTest = String(
   rootPackage?.scripts?.['test:shopify-checkout-audience-policy'] || '',
 )
@@ -397,6 +575,7 @@ for (const requiredPath of [
   'db/migrations/0323_operations_unit_material_cartonization.sql',
   'db/migrations/0324_operations_external_fulfillment_label_artifacts.sql',
   'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
+  'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
@@ -451,6 +630,7 @@ for (const requiredPath of [
   'app_src/lib/operations/shopifyPackagingImport.ts',
   'app_src/lib/persistence/packagingMaterials.ts',
   'app_src/lib/persistence/operationsMeasuredPackagingEvidenceHealth.ts',
+  'app_src/lib/persistence/operationsLegacyUnitMeasurementHealth.ts',
   'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
   'app_src/app/api/operations/packaging-materials/import/route.ts',
   'scripts/test-operations-packaging-materials.mjs',
@@ -854,6 +1034,7 @@ for (const requiredPath of [
   'scripts/fixtures/carrier-rates/ups-whole-shipment-recorded.json',
   'scripts/fixtures/carrier-rates/fedex-whole-shipment-recorded.json',
   'scripts/test-hybrid-cartonization-persistence.mjs',
+  'scripts/test-hybrid-cartonization-legacy-unit-postgres.mjs',
   'scripts/test-operations-regression-artifacts.mjs',
   'scripts/test-operations-regression-replay.mjs',
   'scripts/test-operations-regression-replay-postgres.mjs',

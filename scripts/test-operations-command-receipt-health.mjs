@@ -102,6 +102,20 @@ async function createFixture(client) {
       organization_id uuid NOT NULL,
       global_id text NOT NULL UNIQUE
     );
+    CREATE TABLE operations_commerce_order_candidates (
+      id uuid PRIMARY KEY,
+      organization_id uuid NOT NULL,
+      integration_account_id uuid NOT NULL,
+      global_id text NOT NULL UNIQUE,
+      canonical_order_id uuid
+    );
+    CREATE TABLE operations_commerce_order_workbench (
+      id uuid PRIMARY KEY,
+      organization_id uuid NOT NULL,
+      integration_account_id uuid NOT NULL,
+      candidate_id uuid NOT NULL,
+      canonical_order_id uuid
+    );
     CREATE TABLE operations_command_receipts (
       id uuid PRIMARY KEY,
       organization_id uuid NOT NULL,
@@ -751,6 +765,61 @@ function succeededPlan(organizationId, orderGlobalId, overrides = {}) {
   }
 }
 
+function externalFulfillmentResult(orderGlobalId, overrides = {}) {
+  return {
+    orderGlobalId,
+    orderStatus: 'cancelled',
+    rowVersion: 4,
+    reconciliationGlobalId: 'gsfr9000001',
+    providerFulfillmentId: 'gid://shopify/Fulfillment/9000001',
+    providerFulfillmentName: '#1002.1',
+    providerReads: 2,
+    providerWrites: 0,
+    replayed: false,
+    ...overrides,
+  }
+}
+
+function failedExternalFulfillmentLine(
+  organizationId,
+  orderGlobalId,
+  idempotencyKey,
+  overrides = {},
+) {
+  return {
+    organizationId,
+    commandType: 'reconcile_shopify_external_fulfillment',
+    idempotencyKey,
+    targetGlobalId: orderGlobalId,
+    status: 'failed',
+    errorCode: 'SHOPIFY_EXTERNAL_FULFILLMENT_LINE_CHANGED',
+    errorMessage: 'Shopify line quantities no longer match the released warehouse work',
+    createdAt: '2026-08-24T13:00:00Z',
+    completedAt: '2026-08-24T13:00:01Z',
+    ...overrides,
+  }
+}
+
+function succeededExternalFulfillment(
+  organizationId,
+  orderGlobalId,
+  idempotencyKey,
+  overrides = {},
+) {
+  return {
+    organizationId,
+    commandType: 'reconcile_shopify_external_fulfillment',
+    idempotencyKey,
+    targetGlobalId: orderGlobalId,
+    status: 'succeeded',
+    resultGlobalId: orderGlobalId,
+    resultPayload: externalFulfillmentResult(orderGlobalId),
+    createdAt: '2026-08-24T14:00:00Z',
+    completedAt: '2026-08-24T14:00:01Z',
+    ...overrides,
+  }
+}
+
 async function seedFixture(client) {
   const primary = randomUUID()
   const other = randomUUID()
@@ -910,11 +979,11 @@ async function seedFixture(client) {
 
   await insertReceipt(client, failedPlan(
     primary,
-    'gor1000000',
-    'custom-plan-failure-1000000',
+    'gorilqvk7mb2v7e',
+    'test-pro-plan-invalid-offers',
   ))
-  await insertReceipt(client, succeededPlan(primary, 'gor1000000', {
-    resultPayload: planningResult('gor1000000', {
+  await insertReceipt(client, succeededPlan(primary, 'gorilqvk7mb2v7e', {
+    resultPayload: planningResult('gorilqvk7mb2v7e', {
       fulfillmentPlanGlobalId: 'gfp1000000',
       cartonizationEvidenceGlobalId: 'gcte1000000',
     }),
@@ -1038,6 +1107,192 @@ async function seedFixture(client) {
   ))
   await insertReceipt(client, succeededPlan(primary, 'gor1000015'))
 
+  const wrongOrganizationWearableOrder = 'gort9uq4bh2e64j'
+  await client.query(
+    `INSERT INTO operations_orders (id, organization_id, global_id)
+     VALUES ($1::uuid, $2::uuid, $3)`,
+    [randomUUID(), other, wrongOrganizationWearableOrder],
+  )
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'record_wearable_pick_scan_evidence',
+    idempotencyKey: 'wearable-scan-wrong-organization-live',
+    targetGlobalId: wrongOrganizationWearableOrder,
+    status: 'failed',
+    errorCode: 'OPERATIONS_ORDER_NOT_FOUND',
+    errorMessage: 'Operations order was not found',
+    createdAt: '2026-08-24T12:00:00Z',
+    completedAt: '2026-08-24T12:00:01Z',
+  })
+
+  const externallyFulfilledOrder = 'gor9000001'
+  for (const number of [1, 2, 3, 4]) {
+    await insertReceipt(client, failedExternalFulfillmentLine(
+      primary,
+      externallyFulfilledOrder,
+      `external-lines-live-${number}`,
+      {
+        createdAt: `2026-08-24T13:0${number}:00Z`,
+        completedAt: `2026-08-24T13:0${number}:01Z`,
+      },
+    ))
+  }
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'confirm_operations_order_picks',
+    idempotencyKey: 'confirm-picks-reconciliation-live',
+    targetGlobalId: externallyFulfilledOrder,
+    status: 'failed',
+    errorCode:
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED',
+    errorMessage: 'Shopify reports that this released order was fulfilled externally',
+    createdAt: '2026-08-24T13:10:00Z',
+    completedAt: '2026-08-24T13:10:01Z',
+  })
+  await insertReceipt(client, succeededExternalFulfillment(
+    primary,
+    externallyFulfilledOrder,
+    'external-reconciliation-live-success',
+  ))
+
+  const canonicalOrderId = randomUUID()
+  const workbenchCandidateId = randomUUID()
+  const workbenchIntegrationAccountId = randomUUID()
+  const workbenchCandidateGlobalId = 'gcock29oa2sdkgt2'
+  const canonicalOrderGlobalId = 'gor9000002'
+  await client.query(
+    `INSERT INTO operations_orders (id, organization_id, global_id)
+     VALUES ($1::uuid, $2::uuid, $3)`,
+    [canonicalOrderId, primary, canonicalOrderGlobalId],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_order_candidates (
+       id, organization_id, integration_account_id, global_id,
+       canonical_order_id
+     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, NULL)`,
+    [
+      workbenchCandidateId,
+      primary,
+      workbenchIntegrationAccountId,
+      workbenchCandidateGlobalId,
+    ],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_order_workbench (
+       id, organization_id, integration_account_id, candidate_id,
+       canonical_order_id
+     ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid)`,
+    [
+      randomUUID(),
+      primary,
+      workbenchIntegrationAccountId,
+      workbenchCandidateId,
+      canonicalOrderId,
+    ],
+  )
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'operations.commerce_order_workbench.update_ship_to',
+    idempotencyKey: 'workbench-canonical-live',
+    targetGlobalId: workbenchCandidateGlobalId,
+    status: 'failed',
+    resultGlobalId: canonicalOrderGlobalId,
+    errorCode: 'OPERATIONS_IMPORTED_ORDER_ALREADY_CANONICAL',
+    errorMessage: 'This provider order is already available in Orders',
+    createdAt: '2026-08-24T15:00:00Z',
+    completedAt: '2026-08-24T15:00:01Z',
+  })
+
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'record_wearable_pick_scan_evidence',
+    idempotencyKey: 'wearable-scan-missing-order-near-miss',
+    targetGlobalId: 'gor9000100',
+    status: 'failed',
+    errorCode: 'OPERATIONS_ORDER_NOT_FOUND',
+    errorMessage: 'Operations order was not found',
+    createdAt: '2026-08-24T12:01:00Z',
+    completedAt: '2026-08-24T12:01:01Z',
+  })
+
+  await insertReceipt(client, failedExternalFulfillmentLine(
+    primary,
+    'gor9000101',
+    'external-lines-malformed-success-near-miss',
+  ))
+  await insertReceipt(client, succeededExternalFulfillment(
+    primary,
+    'gor9000101',
+    'external-lines-malformed-success',
+    {
+      resultPayload: externalFulfillmentResult('gor9000101', {
+        providerWrites: 1,
+      }),
+    },
+  ))
+
+  await insertReceipt(client, failedExternalFulfillmentLine(
+    primary,
+    'gor9000102',
+    'external-lines-other-organization-near-miss',
+  ))
+  await insertReceipt(client, succeededExternalFulfillment(
+    other,
+    'gor9000102',
+    'external-lines-other-organization-success',
+  ))
+
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'confirm_operations_order_picks',
+    idempotencyKey: 'confirm-picks-other-target-near-miss',
+    targetGlobalId: 'gor9000103',
+    status: 'failed',
+    errorCode:
+      'OPERATIONS_SHOPIFY_EXTERNAL_FULFILLMENT_RECONCILIATION_REQUIRED',
+    errorMessage: 'Shopify reports that this released order was fulfilled externally',
+    createdAt: '2026-08-24T13:20:00Z',
+    completedAt: '2026-08-24T13:20:01Z',
+  })
+  await insertReceipt(client, succeededExternalFulfillment(
+    primary,
+    'gor9000104',
+    'confirm-picks-other-target-success',
+  ))
+
+  const mismatchedCanonicalOrderId = randomUUID()
+  const mismatchedCandidateId = randomUUID()
+  const mismatchedIntegrationAccountId = randomUUID()
+  await client.query(
+    `INSERT INTO operations_orders (id, organization_id, global_id)
+     VALUES ($1::uuid, $2::uuid, 'gor9000105')`,
+    [mismatchedCanonicalOrderId, primary],
+  )
+  await client.query(
+    `INSERT INTO operations_commerce_order_candidates (
+       id, organization_id, integration_account_id, global_id,
+       canonical_order_id
+     ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'gcoc9000001', $4::uuid)`,
+    [
+      mismatchedCandidateId,
+      primary,
+      mismatchedIntegrationAccountId,
+      mismatchedCanonicalOrderId,
+    ],
+  )
+  await insertReceipt(client, {
+    organizationId: primary,
+    commandType: 'operations.commerce_order_workbench.update_ship_to',
+    idempotencyKey: 'workbench-canonical-result-near-miss',
+    targetGlobalId: 'gcoc9000001',
+    status: 'failed',
+    resultGlobalId: 'gor9000106',
+    errorCode: 'OPERATIONS_IMPORTED_ORDER_ALREADY_CANONICAL',
+    errorMessage: 'This provider order is already available in Orders',
+    createdAt: '2026-08-24T15:01:00Z',
+    completedAt: '2026-08-24T15:01:01Z',
+  })
+
   await insertReceipt(client, { ...exactPolicy, organizationId: demo })
   await insertReceipt(client, {
     organizationId: demo,
@@ -1093,6 +1348,14 @@ async function verify(databaseUrl) {
         row.classification,
       ])),
       {
+        'confirm-picks-other-target-near-miss': 'actionable',
+        'confirm-picks-reconciliation-live': 'superseded',
+        'external-lines-live-1': 'superseded',
+        'external-lines-live-2': 'superseded',
+        'external-lines-live-3': 'superseded',
+        'external-lines-live-4': 'superseded',
+        'external-lines-malformed-success-near-miss': 'actionable',
+        'external-lines-other-organization-near-miss': 'actionable',
         'mock-commerce:bad key:planned': 'actionable',
         'mock-commerce:message-near-miss:planned': 'actionable',
         'mock-commerce:unexpected-result:planned': 'actionable',
@@ -1115,7 +1378,6 @@ async function verify(databaseUrl) {
           'actionable',
         'operations-shadow-fulfillment-gor8888888-20260801-v1':
           'actionable',
-        'custom-plan-failure-1000000': 'superseded',
         'custom-plan-failure-1000001': 'actionable',
         'custom-plan-failure-1000002': 'actionable',
         'custom-plan-failure-1000003': 'actionable',
@@ -1134,17 +1396,57 @@ async function verify(databaseUrl) {
           'superseded',
         'operations-plan:gor3gqctppbqk2c:22222222-2222-4222-8222-222222222222':
           'superseded',
+        'test-pro-plan-invalid-offers': 'superseded',
+        'wearable-scan-missing-order-near-miss': 'actionable',
+        'wearable-scan-wrong-organization-live': 'policy_rejected',
+        'workbench-canonical-live': 'superseded',
+        'workbench-canonical-result-near-miss': 'actionable',
       },
+    )
+
+    const exactLiveAdjudicationKeys = [
+      'mock-commerce:zebra-proof-20260801:planned',
+      'operations-shadow-fulfillment-gor0a1b2c3d4e5f-20260801-v1',
+      'operations-shadow-fulfillment-gor7386776-20260801-v1',
+      'operations-plan:gor3gqctppbqk2c:11111111-1111-4111-8111-111111111111',
+      'test-pro-plan-invalid-offers',
+      'wearable-scan-wrong-organization-live',
+      'external-lines-live-1',
+      'external-lines-live-2',
+      'external-lines-live-3',
+      'external-lines-live-4',
+      'confirm-picks-reconciliation-live',
+      'workbench-canonical-live',
+    ]
+    const exactLiveAdjudication = await client.query(
+      `${classificationCtes}
+       SELECT classification, count(*)::integer AS count
+       FROM classified_failures
+       WHERE idempotency_key = ANY($1::text[])
+       GROUP BY classification
+       ORDER BY classification`,
+      [exactLiveAdjudicationKeys],
+    )
+    assert.deepEqual(
+      Object.fromEntries(exactLiveAdjudication.rows.map((row) => [
+        row.classification,
+        row.count,
+      ])),
+      {
+        policy_rejected: 2,
+        superseded: 10,
+      },
+      'The exact 12-receipt audit partitions into policy and superseded evidence',
     )
     const result = await client.query(healthQuery)
     assert.equal(result.rowCount, 1)
     assert.deepEqual(result.rows[0], {
       processing: 2,
-      failed: 29,
+      failed: 41,
       stale_processing: 1,
-      policy_rejected: 1,
-      superseded: 5,
-      actionable_failed: 23,
+      policy_rejected: 2,
+      superseded: 11,
+      actionable_failed: 28,
       active_organizations: 1,
       shadow_organizations: 1,
     })

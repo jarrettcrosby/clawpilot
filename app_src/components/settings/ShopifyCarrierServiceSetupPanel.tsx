@@ -1584,7 +1584,7 @@ export default function ShopifyCarrierServiceSetupPanel({
           ? 'Saving…'
           : registered
             ? 'Save checkout rate sources'
-            : 'Save exact callback setup'}
+            : 'Save callback setup'}
       </Button>
     </Stack>
   )
@@ -1606,10 +1606,10 @@ export default function ShopifyCarrierServiceSetupPanel({
       </Alert>
       <Alert severity="warning" sx={{ mt: 1 }}>
         {checkoutAudience?.mode === 'all_eligible'
-          ? `All-eligible cache preparation skips the customer allow-policy lookup. It still requires a signed-in customer to read saved addresses, and exact product mapping, inventory, packaging, and ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier readiness remain fail-closed.`
+          ? `All eligible customers may prepare saved-address rates after signing in. Product, inventory, packaging, and ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier checks still apply.`
           : checkoutAudience?.mode === 'off'
-            ? 'Checkout rates are Off. Cache preparation is disabled and does not request a Shopify Admin token or read saved customer addresses.'
-            : 'Restricted cache preparation requires a signed-in customer with an unexpired allow policy. Shopify does not guarantee Customer GID in CarrierService callbacks, and its successful-rate cache is customer-neutral; cache preparation is not deterministic customer enforcement.'}
+            ? 'Checkout rates are off. Cache preparation is unavailable and saved addresses are not read.'
+            : 'Restricted access requires a signed-in, currently eligible customer. Shopify may reuse a cached rate for up to 15 minutes.'}
       </Alert>
       <Stack spacing={1} sx={{ mt: 1 }}>
         <FormControlLabel
@@ -2313,7 +2313,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       key: 'audience',
       label: 'Choose checkout audience and rate source',
       description:
-        'Set the account-level desired audience and explicit TEST or LIVE carrier lane. Read only does not pause rating. Disabled and Frozen make new authenticated callbacks empty, but Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.',
+        'Choose who receives checkout rates and whether ClawPilot uses TEST or LIVE carrier accounts. Read only does not pause checkout rates.',
       state: stepState(
         Boolean(setup?.config && checkoutAudienceReady),
         Boolean(setup?.config),
@@ -2356,20 +2356,10 @@ export default function ShopifyCarrierServiceSetupPanel({
         <Stack spacing={1}>
           {pendingRateControlCommand ? (
             <Alert severity="warning">
-              A prior save has an unknown response. Audience, source, and
-              reason are locked until the exact saved request is retried and
-              authoritatively reconciled.
+              The previous save has an unknown result. Retry that saved request
+              before making another change.
             </Alert>
           ) : null}
-          <Alert severity="info">
-            Shopify sends rate requests for the store, not for existing orders.
-            These desired controls are independent of Advanced safety except
-            that Disabled and Frozen make new authenticated callbacks empty.
-            Shopify may still reuse a prior successful customer-neutral rate
-            response for up to 15 minutes. Product mapping, fresh inventory,
-            factual packaging, destination, and the selected carrier lane
-            still fail closed.
-          </Alert>
           <FormControl size="small" fullWidth>
             <InputLabel id={`shopify-checkout-audience-${accountGlobalId}`}>
               Checkout audience
@@ -2444,7 +2434,7 @@ export default function ShopifyCarrierServiceSetupPanel({
             onChange={(event) => setCheckoutRateControlReason(
               event.target.value,
             )}
-            helperText="Required and retained with the immutable control revision."
+            helperText="Required for the audit log."
           />
           <Button
             size="small"
@@ -2473,22 +2463,22 @@ export default function ShopifyCarrierServiceSetupPanel({
           <Alert severity={checkoutAudienceReady ? 'info' : 'warning'}>
             {setup.checkoutRateOperatingProfile.effectiveReason
               === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_DISABLED'
-              ? 'Disabled makes new authenticated callbacks empty. Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+              ? 'Checkout rates are disabled. Shopify may reuse a cached rate for up to 15 minutes.'
               : setup.checkoutRateOperatingProfile.effectiveReason
                 === 'SHOPIFY_CHECKOUT_RATES_EMERGENCY_FROZEN'
-                ? 'Frozen makes new authenticated callbacks empty. Shopify may reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+                ? 'Checkout rates are frozen. Shopify may reuse a cached rate for up to 15 minutes.'
                 : setup.checkoutRateOperatingProfile.effectiveReason
                   === 'SHOPIFY_SHADOW_GUARD_AUDIENCE_OFF'
-                  ? 'The saved audience is Off; authenticated callbacks return an empty 200 before cart parsing or carrier calls.'
+                  ? 'Checkout rates are off.'
                   : setup.checkoutRateOperatingProfile.effectiveReason
                     === 'SHOPIFY_CHECKOUT_PRODUCTION_RATE_SOURCE_REQUIRED'
-                    ? 'The TEST source is saved as desired, but this production Shopify store returns authenticated empty rates. Choose LIVE only when the desired audience is safe to serve.'
+                    ? 'TEST rates are not served on production stores. Select LIVE to enable checkout rates.'
                   : setup.checkoutRateOperatingProfile.effectiveReason
                     === 'SHOPIFY_CHECKOUT_RESTRICTED_LIVE_ENFORCEMENT_REQUIRED'
-                    ? 'Restricted + LIVE is saved as desired, but new authenticated callbacks return empty rates until customer-specific provider enforcement is durably verified. Shopify caches successful CarrierService rates without customer identity.'
+                    ? 'Restricted checkout rates remain off until Shopify customer enforcement is verified.'
                   : setup.checkoutRateOperatingProfile.serving
-                    ? `Serving ${setup.checkoutRateOperatingProfile.desiredAudience === 'all_eligible' ? 'all otherwise eligible checkouts' : 'restricted customers'} from the ${setup.checkoutRateOperatingProfile.desiredRateSource === 'production' ? 'LIVE' : 'TEST'} carrier lane.`
-                    : 'Desired controls are saved, but current mapping, inventory, package, origin, registration, credential, or carrier facts are not ready.'}
+                    ? `Serving ${setup.checkoutRateOperatingProfile.desiredAudience === 'all_eligible' ? 'all otherwise eligible checkouts' : 'restricted customers'} from the ${setup.checkoutRateOperatingProfile.desiredRateSource === 'production' ? 'LIVE' : 'TEST'} carrier lane. Only mapped, in-stock items with usable packaging, destination, origin, and carrier service receive rates.`
+                    : 'Checkout rates are saved but not ready. Review the setup checks below.'}
           </Alert>
           {checkoutRateControl.audience === 'restricted_customers' ? (
             <>
@@ -2522,7 +2512,7 @@ export default function ShopifyCarrierServiceSetupPanel({
       key: 'rate-warm',
       label: 'Prepare saved-address rate cache',
       description:
-        'Optional best-effort cache preparation follows customer selection. It never replaces the authoritative live checkout callback and does not prove customer-specific enforcement.',
+        'Optionally prepare rates for saved customer addresses. This does not change checkout access or customer eligibility.',
       optional: true,
       state: stepState(
         rateWarmConfigured,
@@ -2553,15 +2543,15 @@ export default function ShopifyCarrierServiceSetupPanel({
     {
       key: 'evidence',
       label: checkoutAudience?.mode === 'off'
-        ? 'Verify new callbacks return no rates'
-        : 'Prove a live cart request',
+        ? 'Confirm checkout rates are off'
+        : 'Confirm checkout rates',
       description: checkoutAudience?.mode === 'off'
-        ? 'Open an otherwise eligible Shopify cart and confirm a new authenticated ClawPilot callback returns an empty 200 without parsing the cart, creating a receipt, reading inventory, or calling a carrier. Shopify may still reuse a prior successful customer-neutral rate response for up to 15 minutes.'
+        ? 'Open an eligible Shopify cart and confirm no ClawPilot rates appear. Shopify may reuse a cached rate for up to 15 minutes.'
         : !callbackServingReady
-          ? 'The saved checkout controls are not runtime-ready. Resolve the exact registration, mapping, inventory, package, origin, credential, and selected carrier-lane blockers before a live proof.'
+          ? 'Complete the setup checks before confirming checkout rates.'
           : checkoutAudience?.mode === 'all_eligible'
-            ? `Use any otherwise eligible cart. No customer gate is applied, but exact product mapping, fresh inventory, factual packaging, destination, and ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier readiness still fail closed.`
-            : 'Use a signed-in Shopify customer covered by an unexpired Checkout audience allow policy and an exactly mapped shippable item. ClawPilot should retain a customer-neutral receipt, inventory-aware package plan, and whole-shipment carrier offers with zero callback provider writes.',
+            ? `Open an eligible cart and confirm ${selectedRateEnvironment === 'production' ? 'LIVE' : 'TEST'} carrier rates appear.`
+            : 'Sign in as an allowed Shopify customer, then confirm the selected rates appear.',
       state: stepState(
         evidenceComplete,
         Boolean(
@@ -2593,8 +2583,8 @@ export default function ShopifyCarrierServiceSetupPanel({
             : 'None yet',
         },
         {
-          label: 'Provider writes per callback',
-          value: '0 (database-enforced)',
+          label: 'Shopify account changes',
+          value: 'None',
         },
       ],
       action: setup?.reference.evidence.latest.length ? (
@@ -2679,14 +2669,11 @@ export default function ShopifyCarrierServiceSetupPanel({
                   Current operating profile
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  Store sync is independently controlled here. Pausing stops
-                  new provider catalog, order,
-                  image, and inventory mirroring; existing mirrored data
-                  remains available. Desired checkout audience and rate source
-                  are also account-level.
-                  Disabled or Frozen makes new authenticated callbacks empty;
-                  Shopify may retain a prior successful customer-neutral rate
-                  response for up to 15 minutes.
+                  Store sync controls new catalog, order, image, and inventory
+                  updates. Existing mirrored data remains available. Checkout
+                  access and rate source apply to this account. Disabled or
+                  Frozen returns no new rates; Shopify may reuse a cached rate
+                  for up to 15 minutes.
                 </Typography>
               </Box>
               <Chip

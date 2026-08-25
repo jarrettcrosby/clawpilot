@@ -53,6 +53,13 @@ import {
   shopifyOrderManagementRuntime,
 } from '@/lib/integrations/shopifyOrderManagementRuntime'
 import {
+  shopifyReversalFixtureRuntime,
+  SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY,
+} from '@/lib/integrations/shopifyReversalFixtureRuntime'
+import {
+  readShopifyReversalFixtureHealthInPostgres,
+} from '@/lib/persistence/shopifyReversalFixtureHealth'
+import {
   readFaireInventoryPollHealthFromPostgres,
   readFaireInventoryPollWorkerHeartbeatFromPostgres,
 } from '@/lib/persistence/faireInventoryPolling'
@@ -80,6 +87,9 @@ import {
 import {
   OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL,
 } from '@/lib/persistence/operationsMeasuredPackagingEvidenceHealth'
+import {
+  OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL,
+} from '@/lib/persistence/operationsLegacyUnitMeasurementHealth'
 import {
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
 } from '@/lib/persistence/operationsOrderEditingReleaseHealth'
@@ -2847,6 +2857,8 @@ export async function GET() {
     const commerceReadReconciliation = commerceReadRuntimeSummary()
     const shopifyOrderManagementRuntimeState =
       shopifyOrderManagementRuntime()
+    const shopifyReversalFixtureRuntimeState =
+      shopifyReversalFixtureRuntime()
     const shopifyOrderManagementRuntimeSummary = {
       available: shopifyOrderManagementRuntimeState.available,
       mode: shopifyOrderManagementRuntimeState.mode,
@@ -2861,6 +2873,13 @@ export async function GET() {
     let shopifyOrderManagement: Record<string, unknown> = {
       status: 'migration-pending',
       runtime: shopifyOrderManagementRuntimeSummary,
+      durable: null,
+    }
+    let shopifyReversalFixture: Record<string, unknown> = {
+      status: shopifyReversalFixtureRuntimeState.available
+        ? 'migration-pending'
+        : 'disabled',
+      runtime: shopifyReversalFixtureRuntimeState,
       durable: null,
     }
     const fulfillmentOptimizer = fulfillmentOptimizerRuntimeHealth()
@@ -3273,6 +3292,7 @@ export async function GET() {
           operations_commerce_provider_write_controls_applied: boolean
           operations_order_editing_release_applied: boolean
           operations_measured_packaging_evidence_applied: boolean
+          operations_legacy_unit_measurement_applied: boolean
           operations_commerce_store_sync_controls_applied: boolean
           operations_commerce_store_sync_authority_contract: string | null
           operations_shopify_order_webhook_reconciliation_applied: boolean
@@ -6390,6 +6410,9 @@ export async function GET() {
               (
                 ${OPERATIONS_MEASURED_PACKAGING_EVIDENCE_HEALTH_SQL}
               ) AS operations_measured_packaging_evidence_applied,
+              (
+                ${OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL}
+              ) AS operations_legacy_unit_measurement_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -7989,6 +8012,7 @@ export async function GET() {
             && row?.operations_shopify_order_management_applied
             && row?.operations_order_editing_release_applied
             && row?.operations_measured_packaging_evidence_applied
+            && row?.operations_legacy_unit_measurement_applied
             && row?.operations_commerce_store_sync_controls_applied
             && row?.operations_shopify_order_webhook_reconciliation_applied
             && row?.migration_checksums_present
@@ -8302,6 +8326,41 @@ export async function GET() {
             )
           }
         }
+        const reversalFixtureDurable =
+          await readShopifyReversalFixtureHealthInPostgres()
+        const reversalFixtureReady = Boolean(
+          reversalFixtureDurable.migrationCurrent
+          && reversalFixtureDurable.structureCurrent
+          && reversalFixtureDurable.databaseIdentity
+            === SHOPIFY_REVERSAL_FIXTURE_DATABASE_IDENTITY,
+        )
+        shopifyReversalFixture = {
+          status: shopifyReversalFixtureRuntimeState.available
+            ? reversalFixtureReady
+              ? reversalFixtureDurable.unknown > 0
+                ? 'reconciliation-required'
+                : reversalFixtureDurable.processing > 0
+                  ? 'processing'
+                  : reversalFixtureDurable.awaitingApproval > 0
+                    ? 'awaiting-approval'
+                    : reversalFixtureDurable.prepared > 0
+                      ? 'approved'
+                      : 'ready'
+              : 'migration-pending'
+            : 'disabled',
+          runtime: shopifyReversalFixtureRuntimeState,
+          durable: reversalFixtureDurable,
+        }
+        if (shopifyReversalFixtureRuntimeState.available && !reversalFixtureReady) {
+          errors.push(
+            'Shopify reversal fixture runtime is enabled without its exact development database contract.',
+          )
+        }
+        if (reversalFixtureDurable.unknown > 0) {
+          warnings.push(
+            'A hidden Shopify reversal fixture has an unknown provider outcome requiring read-only reconciliation.',
+          )
+        }
         if (
           !row?.worker_migration_applied
           || !row?.auth_migration_applied
@@ -8499,6 +8558,7 @@ export async function GET() {
           || !row?.operations_shopify_order_management_applied
           || !row?.operations_order_editing_release_applied
           || !row?.operations_measured_packaging_evidence_applied
+          || !row?.operations_legacy_unit_measurement_applied
           || !row?.operations_commerce_store_sync_controls_applied
           || !row?.operations_shopify_order_webhook_reconciliation_applied
           || !row?.migration_checksums_present
@@ -9834,6 +9894,7 @@ export async function GET() {
       commerceOrderReconciliationWorker,
       commerceOrderHistory,
       shopifyOrderManagement,
+      shopifyReversalFixture,
       shopifyInventoryRefreshWorker,
       shopifyWebhookReceipts,
       faireInventoryPollWorker,
