@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -9,6 +10,7 @@ import vm from 'node:vm'
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
+const { chromium } = requireFromApp('@playwright/test')
 const ts = requireFromApp('typescript')
 const { NextRequest } = requireFromApp('next/server')
 const path =
@@ -271,11 +273,80 @@ for (const mode of ['legacy', 'impersonated', 'wrong-workspace', 'member']) {
 sessionMode = 'owner'
 response = await route.GET(getRequest())
 assert.equal(response.status, 200)
+assert.equal(response.headers.get('referrer-policy'), 'strict-origin')
+const approvalHeaders = Object.fromEntries(response.headers.entries())
 const form = await response.text()
 assert.match(form, /Approve Shopify test fixture/u)
 assert.match(form, new RegExp(commandGlobalId, 'u'))
 assert.match(form, new RegExp(confirmationStatement, 'u'))
 assert.equal(providerWrites, 0)
+
+let resolveBrowserSubmission
+let rejectBrowserSubmission
+const browserSubmission = new Promise((resolve, reject) => {
+  resolveBrowserSubmission = resolve
+  rejectBrowserSubmission = reject
+})
+const approvalServer = createServer((request, serverResponse) => {
+  if (request.method === 'GET') {
+    for (const [name, value] of Object.entries(approvalHeaders)) {
+      serverResponse.setHeader(name, value)
+    }
+    serverResponse.end(form)
+    return
+  }
+  if (request.method !== 'POST') {
+    serverResponse.writeHead(405).end()
+    return
+  }
+  const chunks = []
+  request.on('data', (chunk) => chunks.push(chunk))
+  request.on('error', rejectBrowserSubmission)
+  request.on('end', () => {
+    resolveBrowserSubmission({
+      body: Buffer.concat(chunks).toString('utf8'),
+      headers: request.headers,
+    })
+    serverResponse.setHeader('content-type', 'text/html; charset=utf-8')
+    serverResponse.end('<h1>Captured</h1>')
+  })
+})
+await new Promise((resolve, reject) => {
+  approvalServer.once('error', reject)
+  approvalServer.listen(0, '127.0.0.1', resolve)
+})
+const address = approvalServer.address()
+assert.ok(address && typeof address === 'object')
+const approvalOrigin = `http://127.0.0.1:${address.port}`
+const browser = await chromium.launch({ headless: true })
+try {
+  const page = await browser.newPage()
+  await page.goto(
+    `${approvalOrigin}/api/dev/shopify-test-fixtures/approve?command=${commandGlobalId}`,
+  )
+  await page.getByLabel(new RegExp(confirmationStatement, 'u')).fill(
+    confirmationStatement,
+  )
+  await Promise.all([
+    page.waitForURL(`${approvalOrigin}/api/dev/shopify-test-fixtures/approve?command=${commandGlobalId}`),
+    page.getByRole('button', { name: 'Approve once' }).click(),
+  ])
+  const submitted = await browserSubmission
+  assert.equal(submitted.headers.origin, approvalOrigin)
+  assert.equal(submitted.headers['sec-fetch-site'], 'same-origin')
+  assert.equal(new URL(submitted.headers.referer).origin, approvalOrigin)
+  assert.equal(submitted.headers.referer.includes('?command='), false)
+  assert.equal(submitted.headers.referer.includes(commandGlobalId), false)
+  assert.equal(
+    new URLSearchParams(submitted.body).get('confirmationStatement'),
+    confirmationStatement,
+  )
+} finally {
+  await browser.close()
+  await new Promise((resolve, reject) => {
+    approvalServer.close((error) => error ? reject(error) : resolve())
+  })
+}
 
 response = await route.GET(getRequest('gsfc7654321'))
 assert.equal(response.status, 409)

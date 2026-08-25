@@ -21,7 +21,7 @@ export const dynamic = 'force-dynamic'
 const NO_STORE_HEADERS = {
   'Cache-Control': 'private, no-store, max-age=0',
   'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-  'Referrer-Policy': 'no-referrer',
+  'Referrer-Policy': 'strict-origin',
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'X-Robots-Tag': 'noindex, nofollow, noarchive',
