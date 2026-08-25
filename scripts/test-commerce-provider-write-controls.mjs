@@ -297,7 +297,7 @@ assert.match(shopifyFulfillment, /providerAttemptGlobalId/u)
 assert.match(shopifyFulfillment, /providerAttemptRequestHash/u)
 assert.match(shopifyFulfillment, /commerceExportGlobalId/u)
 assert.match(shopifyFulfillment, /leaseCheckPhase: 'provider_mutation'/u)
-assert.match(shopifyFulfillment, /await beforeProviderMutation\(\)/u)
+assert.match(shopifyFulfillment, /await beforeProviderMutation\(variables\)/u)
 assert.match(
   faireFulfillment,
   /requireCurrentCommerceProviderWritesInPostgres/u,
