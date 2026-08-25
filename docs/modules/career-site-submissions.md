@@ -1,11 +1,11 @@
 ---
 id: cp-module-career-site-submissions
 title: Career-site submissions
-summary: Durable private intake and Google Sheet projection for Jarrett Crosby's career-site forms.
+summary: Durable private intake, Google Sheet projection, and Google Mail delivery for Jarrett Crosby's career site.
 status: active
 kind: module-contract
 area: integrations
-tags: [career-site, forms, postgres, google-sheets, outbox, privacy]
+tags: [career-site, forms, postgres, google-sheets, google-mail, outbox, privacy]
 app_visible: true
 ---
 
@@ -34,7 +34,7 @@ The source URL must use `https://jarrett.suburbiasandwichco.com`; query paramete
 
 ## Server caller contract
 
-The production ingress is `POST https://aiapp.eigenracing.com/api/career-site/submissions`. Each of the career site's three server routes calls it only after its own body limits, rate limit, honeypot, timing, schema, and Turnstile checks pass. Required headers are:
+The production ingress is `POST https://aiapp.eigenracing.com/api/career-site/submissions`. Each of the career site's three server routes calls it only after its own body limits, rate limit, honeypot, timing, schema, and anti-automation checks pass. Required headers are:
 
 ```http
 Authorization: Bearer <jarrett-career-site service secret>
@@ -92,6 +92,30 @@ The newsletter route maps its independently checked local `consent` field to `ne
 
 A new accepted UUID returns `201`; an exact replay returns `200` and the original record. Both responses contain only the external submission UUID, received timestamp, outbox status, and duplicate flag. Reusing the same source/UUID with different normalized data returns `409`. Invalid data returns `400`, an oversized body returns `413`, invalid service credentials return `401`, an authenticated but wrong owner/source or inactive workspace returns `403`, and disabled/incomplete persistence returns `503`. The caller may retry timeouts and `5xx` responses with the same body and UUID.
 
+## Transactional mail caller contract
+
+The career site queues transactional mail through `POST https://aiapp.eigenracing.com/api/career-site/mail`; it does not call a separate email vendor. This endpoint uses the same isolated service identity and active-workspace checks as submission intake. Required headers are:
+
+```http
+Authorization: Bearer <jarrett-career-site service secret>
+Content-Type: application/json
+Idempotency-Key: <message prefix>/<submission or request UUID>
+x-shortlink-source: jarrett-career-site
+x-shortlink-owner: jarrett@suburbiasandwichco.com
+x-shortlink-organization: <optional exact ClawPilot organization UUID>
+```
+
+The body has exactly `messageType`, `idempotencyKey`, and `data`. The header and body idempotency keys must match. Accepted types and exact key prefixes are:
+
+- `contact-notification` with `contact/<submission UUID>` and data fields `submissionId`, `name`, `email`, optional `organization`, `interest`, and `message`;
+- `newsletter-request` with `newsletter/<submission UUID>` and data fields `submissionId` and `email`;
+- `resume-approval-request` with `resume-request/<request UUID>` and data fields `requestId`, `name`, `email`, optional `organization`, optional `context`, explicit `networkInterest` and `roleFit` booleans, `variant`, and `approvalUrl`;
+- `approved-resume-link` with `resume-approved/<request UUID>` and data fields `requestId`, `name`, `email`, `shortUrl`, `variant`, `documentStyle`, `accessMode`, and `expiresAt`.
+
+The service rejects unknown fields. Approval URLs must be HTTPS on `jarrett.suburbiasandwichco.com` or the bounded `jarrett-suburbia*.vercel.app` preview family and must target `/resume/approve` with only its token. Secure résumé links must be the expected `https://aiapp.eigenracing.com/s/jc-…` form. The site cannot supply From, Reply-To, or the internal notification recipient.
+
+A new message returns `202` with `{"ok":true,"delivery":{"idempotencyKey":"…","status":"queued","duplicate":false}}`. An exact replay returns `200`, `duplicate: true`, and `status: "sent"` only when durable delivery already succeeded; otherwise status remains `queued`. Reusing a key for different normalized data returns `409`. The caller retries a timeout or `5xx` once with the identical body, header, and key, and never retries a `4xx` response.
+
 ## Durable delivery
 
 Migration `0329_career_site_submissions.sql` creates:
@@ -104,6 +128,14 @@ The application commits the submission and outbox row in one Postgres transactio
 Before reading or writing PII, the worker uses the Drive API to verify that the target is Jarrett's untrashed My Drive spreadsheet, Jarrett is its sole owner, the configured ClawPilot service account is its only writer, editors cannot reshare it, and there are no public, domain, group, pending-owner, or other-user permissions. It then verifies the exact tab and header row, creating the header only when that row is empty. The permission boundary is checked again immediately before each PII write.
 
 Sheet processing is serialized across replicas with a transaction-scoped Postgres advisory lock. The worker claims exactly one source/owner-scoped item, renews its 15-minute lease immediately before the external write, and checks the immutable submission-ID column for prior delivery. A new submission is written with an idempotent, exact-row Sheets `PUT` and `valueInputOption=RAW`; it never uses the non-idempotent append/insert API. This prevents visitor text beginning with `=`, `+`, `-`, or `@` from becoming a formula and lets an ambiguous response resolve safely on retry. Every write rechecks the next exact row and enforces the 50,000-data-row maximum, so concurrent workers cannot exceed capacity.
+
+Migration `0330_career_site_mail_outbox.sql` adds the source/owner-scoped transactional-mail outbox. Enqueue and idempotency conflict detection occur in Postgres before `202` is returned. The existing Railway poller processes one mail item per cycle alongside Sheet projection, with a lease, bounded exponential retries, a dead-letter state, a separate heartbeat, and migration/checksum and queue health.
+
+Mail delivery reuses `MATON_API_KEY` and `MATON_GMAIL_CONNECTION_ID`. It does not modify or fall back from the global `CLAWPILOT_MAIL_FROM` sender. Before processing, the worker calls Gmail's `settings/sendAs` API for `info@suburbiasandwichco.com` and requires both the exact alias and `verificationStatus: accepted`.
+
+For retry-safe delivery, the worker assigns one deterministic RFC Message-ID per idempotency key, creates and durably records a Gmail draft, and sends that exact draft. A retry first searches Sent mail for the RFC Message-ID. If the prior send consumed the draft but its response was lost, the worker recovers the sent message instead of creating or sending a second message. An unrecorded draft can be orphaned by a crash before its ID is committed, but it is never sent; only the durably recorded draft is eligible for delivery.
+
+Internal notifications go to `JarrettCrosby@gmail.com`. Requester-facing mail comes from `Jarrett Crosby <info@suburbiasandwichco.com>`, replies to `JarrettCrosby@gmail.com`, calls the URL a secure résumé link, and says only that the requested résumé is ready. It does not expose backend branding or imply that the requester was screened. Newsletter language explicitly preserves separate consent and states that automatic enrollment did not occur.
 
 ## Private Sheet contract
 
@@ -143,6 +175,10 @@ Set these Railway variables before enabling intake:
 - `CAREER_SITE_SUBMISSIONS_SHEET_TAB=Submissions`
 - `CAREER_SITE_SUBMISSIONS_SHEET_HEADER_ROW=4`
 - optional `CAREER_SITE_SUBMISSIONS_POLL_MS=10000`
+- `CAREER_SITE_MAIL_FROM=info@suburbiasandwichco.com`
+- `CAREER_SITE_MAIL_FROM_NAME=Jarrett Crosby`
+- `CAREER_SITE_MAIL_REPLY_TO=JarrettCrosby@gmail.com`
+- `CAREER_SITE_MAIL_APPROVAL_TO=JarrettCrosby@gmail.com`
 
 The existing `SHORTLINK_SERVICE_CLIENTS_JSON` must contain a dedicated entry like this (generate a fresh secret; do not reuse another client, the legacy short-link secret, or the outbox-worker secret):
 
@@ -150,13 +186,14 @@ The existing `SHORTLINK_SERVICE_CLIENTS_JSON` must contain a dedicated entry lik
 {"sourceApp":"jarrett-career-site","secret":"<unique 32+ character server-only secret>","ownerDomain":"suburbiasandwichco.com","ownerEmail":"jarrett@suburbiasandwichco.com"}
 ```
 
-The Google Workspace integration in **Settings > Integrations > Google Workspace** must report a verified API key and service account. The selected Shared Drive may remain configured for other ClawPilot features, but the career tracker itself must satisfy the private My Drive boundary above. Do not copy the stored service-account JSON into Vercel or source control.
+The Google Workspace integration in **Settings > Integrations > Google Workspace** must report a verified API key and service account. The selected Shared Drive may remain configured for other ClawPilot features, but the career tracker itself must satisfy the private My Drive boundary above. Do not copy the stored service-account JSON into Vercel or source control. The existing Maton Google Mail connection must be the Suburbia mailbox that owns the accepted `info@suburbiasandwichco.com` send-as alias.
 
 ## Operational checks
 
 1. Keep the feature disabled while the migration and private Sheet are prepared.
 2. Verify the Google Workspace integration, share only the Sheet with the displayed service-account email as writer, and disable editor resharing.
-3. Enable the five runtime values above and deploy through the normal `dev` to `main` release path.
+3. Verify the `info@suburbiasandwichco.com` alias with Gmail `settings/sendAs`, configure the four career mail values, then enable intake and deploy through the normal `dev` to `main` release path.
 4. Submit one contact test with a unique UUID and confirm Postgres returns `201` without returning PII.
 5. Confirm the outbox worker appends one row, then replay the same UUID and verify no second row appears.
-6. Verify `/api/health` and `/api/persistence/status` report the exact migration/checksum, queue counts, heartbeat freshness, scope drift, stale leases, and dead rows without PII. Enabled delivery returns a non-success health response while any of those delivery controls is unhealthy; do not log form bodies.
+6. Queue each of the four mail types, replay each exact key, and verify only one Gmail Sent message exists for each deterministic RFC Message-ID.
+7. Verify `/api/health` and `/api/persistence/status` report both exact migrations/checksums, queue counts, heartbeat freshness, scope drift, stale leases, and dead rows without PII. Enabled delivery returns a non-success health response while any of those delivery controls is unhealthy; do not log form or mail bodies.
