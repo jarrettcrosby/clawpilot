@@ -1,0 +1,1146 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict'
+import { createHash, randomUUID } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import {
+  applyMigration,
+  command,
+  loadTypeScriptModule,
+  migrations,
+  waitForPostgres,
+} from './test-commerce-order-revisions-postgres.mjs'
+
+const root = process.cwd()
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const { Pool } = requireFromApp('pg')
+const migrationName =
+  '0327_operations_legacy_unit_pack_compatibility.sql'
+const exactLineGlobalId = 'gcol1vbvhkqodkjl'
+const exactCandidateGlobalId = 'gcocq1570l31rv1l'
+const exactLineSourceRevision = '2026-08-15T00:14:33.000Z'
+const exactLineSourceHash =
+  'bcf500459545d85e24aef8dae7d91c39e577560f008246ff317e65d061ecb4f0'
+const exactCandidateSourceHash =
+  'a9dca21bcac92d3dc79f3bee8fd13e798213e2bf1983a433cf2ee01108fc95b3'
+
+function hash(value) {
+  return createHash('sha256').update(String(value)).digest('hex')
+}
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function runtimeModules() {
+  const hybrid = loadTypeScriptModule(
+    'app_src/lib/operations/hybridCartonization.ts',
+  )
+  const persistence = loadTypeScriptModule(
+    'app_src/lib/persistence/hybridCartonization.ts',
+    {
+      '@/lib/integrations/shopifyCheckoutChannelEligibility': {
+        isShopifyRatingCheckoutChannelEligible: () => true,
+      },
+      '@/lib/persistence/postgres': {
+        getPostgresPool() {
+          throw new Error('The focused test calls the exported row mapper')
+        },
+      },
+      '@/lib/persistence/shopifyCheckoutRating': {
+        shopifyCheckoutRateLineageIsRequired: () => false,
+        shopifyCheckoutRatingHash: (value) => hash(JSON.stringify(value)),
+      },
+    },
+  )
+  const unitMaterial = loadTypeScriptModule(
+    'app_src/lib/operations/operationalUnitMaterialCartonization.ts',
+  )
+  return { hybrid, persistence, unitMaterial }
+}
+
+async function seedLegacyFixture(pool) {
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12)
+  const actorEmail = `legacy-unit-${suffix}@example.test`
+  await pool.query(
+    `INSERT INTO app_users (email, role, status, display_name)
+     VALUES ($1, 'owner', 'active', 'Legacy unit cartonization test')`,
+    [actorEmail],
+  )
+  const organization = await pool.query(
+    `INSERT INTO workspace_organizations (
+       name, organization_type, created_by, updated_by
+     ) VALUES ($1, 'root', $2, $2)
+     RETURNING id::text`,
+    [`Legacy unit compatibility ${suffix}`, actorEmail],
+  )
+  const organizationId = organization.rows[0].id
+  const pipeline = await pool.query(
+    `INSERT INTO pipeline_spaces (
+       name, owner_email, is_default, workspace_organization_id
+     ) VALUES ('Legacy unit pipeline', $1, true, $2::uuid)
+     RETURNING id::text`,
+    [actorEmail, organizationId],
+  )
+  const pipelineId = pipeline.rows[0].id
+  const customer = await pool.query(
+    `INSERT INTO crm_organizations (
+       pipeline_id, source_key, name, identity_key,
+       workspace_organization_id, relationship_type, source_hash,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, 'Snowdevil', $2,
+       $3::uuid, 'customer', $4, $5, $5
+     ) RETURNING id::text`,
+    [
+      pipelineId,
+      `legacy-unit-customer-${suffix}`,
+      organizationId,
+      hash(`legacy-unit-customer-${suffix}`),
+      actorEmail,
+    ],
+  )
+  const product = await pool.query(
+    `INSERT INTO crm_products (
+       pipeline_id, source_key, name, sku, product_type, price, cost,
+       currency, source_hash, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, 'The 3p Fulfilled Snowboard', 'sku-hosted-1',
+       'Good', 699.95, 300.00, 'USD', $3, $4, $4
+     ) RETURNING id::text, reference_code`,
+    [
+      pipelineId,
+      `legacy-unit-product-${suffix}`,
+      hash(`legacy-unit-product-${suffix}`),
+      actorEmail,
+    ],
+  )
+  const productId = product.rows[0].id
+  const account = await pool.query(
+    `INSERT INTO operations_integration_accounts (
+       organization_id, provider, integration_type, environment,
+       display_name, status, configuration, external_account_id,
+       commerce_credential_generation, created_by, updated_by
+     ) VALUES (
+       $1::uuid, 'shopify', 'commerce', 'sandbox',
+       'Test Pro Bakery Bites', 'active',
+       jsonb_build_object('shopDomain', $2::text),
+       $3, 1, $4, $4
+     ) RETURNING id::text, global_id`,
+    [
+      organizationId,
+      `legacy-unit-${suffix}.myshopify.com`,
+      `gid://shopify/Shop/${BigInt(`0x${suffix}`).toString()}`,
+      actorEmail,
+    ],
+  )
+  const accountId = account.rows[0].id
+  const mapping = await pool.query(
+    `INSERT INTO operations_product_mappings (
+       organization_id, integration_account_id, pipeline_id,
+       product_id, channel_sku, external_product_id,
+       external_variant_id, external_inventory_item_id,
+       mapping_method, mapping_source_revision, active, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'sku-hosted-1', 'gid://shopify/Product/10054534529271',
+       'gid://shopify/ProductVariant/51028106576119',
+       'gid://shopify/InventoryItem/51028106576119',
+       'exact_variant', $5, true, $6
+     ) RETURNING id::text, global_id`,
+    [
+      organizationId,
+      accountId,
+      pipelineId,
+      productId,
+      exactLineSourceRevision,
+      actorEmail,
+    ],
+  )
+  const productMappingId = mapping.rows[0].id
+  const channelSourceRevision = '2026-08-15T00:49:42.000Z'
+  const channelSourceHash =
+    '1384325941fd1978da2c9cf3978f598166e469cdf39f849354b087dbc568914d'
+  await pool.query(
+    `INSERT INTO operations_product_channel_states (
+       organization_id, integration_account_id, pipeline_id, provider,
+       external_product_id, external_variant_id,
+       external_inventory_item_id, product_id, product_mapping_id,
+       provider_product_title, provider_variant_title, provider_sku,
+       provider_status_raw, normalized_status, provider_active,
+       requires_shipping, weight_grams, observed_at, source_revision,
+       source_hash, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 'shopify',
+       'gid://shopify/Product/10054534529271',
+       'gid://shopify/ProductVariant/51028106576119',
+       'gid://shopify/InventoryItem/51028106576119',
+       $4::uuid, $5::uuid,
+       'The 3p Fulfilled Snowboard', NULL, 'sku-hosted-1',
+       'ACTIVE', 'active', true, true, NULL, now(), $6, $7, $8, $8
+     )`,
+    [
+      organizationId,
+      accountId,
+      pipelineId,
+      productId,
+      productMappingId,
+      channelSourceRevision,
+      channelSourceHash,
+      actorEmail,
+    ],
+  )
+  const legacyProfile = await pool.query(
+    `INSERT INTO operations_product_package_profiles (
+       organization_id, pipeline_id, product_id,
+       profile_key, profile_name, package_type, unit_of_measure,
+       units_per_package, measurement_system, length_mm, width_mm,
+       height_mm, weight_grams, is_default, active, source,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid,
+       'approved-each', 'Approved each', 'each', 'each',
+       1, 'imperial', 1524, 254, 254, 2268,
+       true, true, 'manual', $4, $4
+     ) RETURNING id::text`,
+    [organizationId, pipelineId, productId, actorEmail],
+  )
+  const order = await pool.query(
+    `INSERT INTO operations_orders (
+       organization_id, pipeline_id, customer_id, integration_account_id,
+       source_provider, external_order_id, order_number, status, currency,
+       merchandise_total_minor, ship_to, source_payload,
+       created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'shopify', $5, '#1001', 'imported', 'USD', 69995,
+       $6::jsonb, '{}'::jsonb, $7, $7
+     ) RETURNING id::text, global_id`,
+    [
+      organizationId,
+      pipelineId,
+      customer.rows[0].id,
+      accountId,
+      `gid://shopify/Order/${BigInt(`0x${suffix}`).toString()}`,
+      JSON.stringify({
+        name: 'Snowdevil',
+        line1: '35 Saxony Drive',
+        city: 'Trumbull',
+        region: 'CT',
+        postalCode: '06611',
+        country: 'US',
+      }),
+      actorEmail,
+    ],
+  )
+  const canonicalLine = await pool.query(
+    `INSERT INTO operations_order_lines (
+       organization_id, order_id, pipeline_id, product_id,
+       external_line_id, channel_sku, description, quantity,
+       unit_price_minor, weight_grams, dimensions_mm
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+       'gid://shopify/LineItem/19786681221367', 'sku-hosted-1',
+       'The 3p Fulfilled Snowboard', 1, 69995, 2268,
+       '{"length":1524,"width":254,"height":254}'::jsonb
+     ) RETURNING id::text`,
+    [organizationId, order.rows[0].id, pipelineId, productId],
+  )
+  const promotionReceipt = await pool.query(
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, status, correlation_id, result_global_id,
+       result_payload, completed_at
+     ) VALUES (
+       $1::uuid, 'promote_commerce_order', $2, $3,
+       $4, 'succeeded', $5::uuid, $6, '{}'::jsonb, now()
+     ) RETURNING id::text`,
+    [
+      organizationId,
+      `legacy-unit-promote-${suffix}`,
+      hash(`legacy-unit-promote-${suffix}`),
+      actorEmail,
+      randomUUID(),
+      order.rows[0].global_id,
+    ],
+  )
+  const run = await pool.query(
+    `INSERT INTO operations_commerce_intake_runs (
+       organization_id, integration_account_id, pipeline_id,
+       provider, resource, credential_version, provider_api_version,
+       normalizer_version, idempotency_key, request_hash, window_end,
+       workflow_state, records_seen, records_staged, records_promoted,
+       canonical_orders_created, completed_at, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid,
+       'shopify', 'orders', 1, '2026-07', 'legacy-unit-test-v1',
+       $4, $5, now(), 'promoted', 1, 1, 1, 1, now(), $6, $6
+     ) RETURNING id::text, global_id`,
+    [
+      organizationId,
+      accountId,
+      pipelineId,
+      `legacy-unit-run-${suffix}`,
+      hash(`legacy-unit-run-${suffix}`),
+      actorEmail,
+    ],
+  )
+  await pool.query(
+    `INSERT INTO crm_reference_number_registry (number_value)
+     VALUES ($1), ($2)
+     ON CONFLICT (number_value) DO NOTHING`,
+    [
+      exactCandidateGlobalId.slice('gcoc'.length),
+      exactLineGlobalId.slice('gcol'.length),
+    ],
+  )
+  await pool.query(
+    `INSERT INTO crm_reference_registry (
+       reference_code, prefix, canonical_code, status, entity_type
+     ) VALUES
+       ($1, 'gcoc', $1, 'active', 'operations.commerce_order_candidate'),
+       ($2, 'gcol', $2, 'active', 'operations.commerce_order_candidate_line')`,
+    [exactCandidateGlobalId, exactLineGlobalId],
+  )
+  const candidate = await pool.query(
+    `INSERT INTO operations_commerce_order_candidates (
+       global_id, organization_id, integration_account_id, pipeline_id,
+       run_id, provider, external_order_id, order_number_snapshot,
+       source_channel, provider_order_status_raw,
+       provider_financial_status_raw, provider_fulfillment_status_raw,
+       provider_return_status_raw, normalized_order_status,
+       normalized_payment_status, normalized_fulfillment_status,
+       normalized_return_status, test_order, requires_shipping,
+       currency_code, subtotal_minor, discount_minor,
+       brand_discount_minor, shipping_minor, tax_minor,
+       other_adjustment_minor, total_minor, party_kind,
+       party_snapshot_state, customer_resolution_state,
+       customer_match_method, customer_id, ship_to_snapshot_state,
+       ship_to_snapshot_source, ship_to_snapshot_ciphertext,
+       ship_to_snapshot_iv, ship_to_snapshot_tag, ship_to_snapshot_hash,
+       ship_to_snapshot_encryption_version, delivery_resolution_state,
+       observed_at, source_revision, source_hash,
+       provider_api_version, normalizer_version, workflow_state,
+       blocking_codes, canonical_order_id, promotion_command_receipt_id,
+       promotion_idempotency_key, promotion_request_hash, promoted_at,
+       row_version, created_by, updated_by, expires_at
+     ) VALUES (
+       $1, $2::uuid, $3::uuid, $4::uuid,
+       $5::uuid, 'shopify', $6, '#1001', 'online_store',
+       'open', 'paid', 'unfulfilled', 'none',
+       'open', 'paid', 'unfulfilled', 'none', false, true,
+       'USD', 69995, 0, 0, 0, 0, 0, 69995, 'consumer',
+       'missing', 'resolved', 'exact_email', $7::uuid,
+       'confirmed', 'manual', $8, $9, $10, $11, 1, 'not_supplied',
+       now(), $12, $13, '2026-07', 'legacy-unit-test-v1',
+       'promoted', '{}'::text[], $14::uuid, $15::uuid,
+       $16, $17, now(), 10, $18, $18, now() + interval '7 days'
+     ) RETURNING id::text, global_id`,
+    [
+      exactCandidateGlobalId,
+      organizationId,
+      accountId,
+      pipelineId,
+      run.rows[0].id,
+      `gid://shopify/Order/${BigInt(`0x${suffix}`).toString()}`,
+      customer.rows[0].id,
+      Buffer.from('legacy unit confirmed ship-to'),
+      Buffer.alloc(12, 1),
+      Buffer.alloc(16, 2),
+      hash(`legacy-unit-ship-to-${suffix}`),
+      exactLineSourceRevision,
+      exactCandidateSourceHash,
+      order.rows[0].id,
+      promotionReceipt.rows[0].id,
+      `legacy-unit-promote-${suffix}`,
+      hash(`legacy-unit-promote-request-${suffix}`),
+      actorEmail,
+    ],
+  )
+  const candidateId = candidate.rows[0].id
+
+  async function insertLine({
+    globalId = null,
+    externalLineId,
+    unitMultiplier,
+    workflowState,
+    packagingSource,
+    packageProfileId = null,
+    canonicalOrderLineId = null,
+    rowVersion,
+  }) {
+    const result = await pool.query(
+      `INSERT INTO operations_commerce_order_candidate_lines (
+         global_id, organization_id, integration_account_id, pipeline_id,
+         run_id, order_candidate_id, provider, external_line_id,
+         external_product_id, external_variant_id,
+         external_inventory_item_id, sku_snapshot,
+         product_title_snapshot, provider_status_raw, normalized_status,
+         ordered_quantity, current_quantity, unfulfilled_quantity,
+         unit_multiplier, physical_quantity, currency_code,
+         unit_price_minor, subtotal_minor, discount_minor,
+         brand_discount_minor, tax_minor, other_adjustment_minor,
+         total_minor, price_resolution_state, resolved_currency_code,
+         resolved_unit_price_minor, resolved_subtotal_minor,
+         resolved_discount_minor, resolved_brand_discount_minor,
+         resolved_tax_minor, resolved_other_adjustment_minor,
+         resolved_total_minor, requires_shipping, mapping_state,
+         product_id, product_mapping_id, packaging_state,
+         package_profile_id, packaging_source, packaging_weight_source,
+         weight_grams, length_mm, width_mm, height_mm,
+         observed_at, source_revision, source_hash,
+         provider_api_version, normalizer_version, workflow_state,
+         blocking_codes, canonical_order_line_id, promoted_at,
+         row_version, created_by, updated_by, expires_at
+       ) VALUES (
+         COALESCE($1, allocate_global_reference('gcol')),
+         $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+         'shopify', $7,
+         'gid://shopify/Product/10054534529271',
+         'gid://shopify/ProductVariant/51028106576119',
+         'gid://shopify/InventoryItem/51028106576119',
+         'sku-hosted-1', 'The 3p Fulfilled Snowboard', 'open', 'open',
+         1, 1, 1, $8, $8, 'USD',
+         69995, 69995, 0, 0, 0, 0, 69995,
+         'provider', 'USD', 69995, 69995, 0, 0, 0, 0, 69995,
+         true, 'resolved', $9::uuid, $10::uuid, 'resolved',
+         $11::uuid, $12, NULL,
+         2268, 1524, 254, 254,
+         now(), $13, $14, '2026-07', 'legacy-unit-test-v1', $15,
+         '{}'::text[], $16::uuid,
+         CASE WHEN $15 = 'promoted' THEN now() ELSE NULL END,
+         $17, $18, $18, now() + interval '7 days'
+       ) RETURNING id::text, global_id, row_version::text`,
+      [
+        globalId,
+        organizationId,
+        accountId,
+        pipelineId,
+        run.rows[0].id,
+        candidateId,
+        externalLineId,
+        unitMultiplier,
+        productId,
+        productMappingId,
+        packageProfileId,
+        packagingSource,
+        exactLineSourceRevision,
+        exactLineSourceHash,
+        workflowState,
+        canonicalOrderLineId,
+        rowVersion,
+        actorEmail,
+      ],
+    )
+    return result.rows[0]
+  }
+
+  const exactLine = await insertLine({
+    globalId: exactLineGlobalId,
+    externalLineId: 'gid://shopify/LineItem/19786681221367',
+    unitMultiplier: 1,
+    workflowState: 'promoted',
+    packagingSource: 'manual',
+    canonicalOrderLineId: canonicalLine.rows[0].id,
+    rowVersion: 10,
+  })
+  const multipackLine = await insertLine({
+    externalLineId: `gid://shopify/LineItem/multipack-${suffix}`,
+    unitMultiplier: 6,
+    workflowState: 'ready',
+    packagingSource: 'manual',
+    rowVersion: 3,
+  })
+  const unprovenManualLine = await insertLine({
+    externalLineId: `gid://shopify/LineItem/unproven-${suffix}`,
+    unitMultiplier: 1,
+    workflowState: 'ready',
+    packagingSource: 'manual',
+    rowVersion: 6,
+  })
+  const conflictingManualLine = await insertLine({
+    externalLineId: `gid://shopify/LineItem/conflicting-${suffix}`,
+    unitMultiplier: 1,
+    workflowState: 'ready',
+    packagingSource: 'manual',
+    rowVersion: 7,
+  })
+  const malformedManualLine = await insertLine({
+    externalLineId: `gid://shopify/LineItem/malformed-${suffix}`,
+    unitMultiplier: 1,
+    workflowState: 'ready',
+    packagingSource: 'manual',
+    rowVersion: 8,
+  })
+  const approvedProfileLine = await insertLine({
+    externalLineId: `gid://shopify/LineItem/profile-${suffix}`,
+    unitMultiplier: 1,
+    workflowState: 'ready',
+    packagingSource: 'profile',
+    packageProfileId: legacyProfile.rows[0].id,
+    rowVersion: 4,
+  })
+  async function recordManualResolution({
+    line,
+    marker,
+    weightGrams = 2268,
+    dimensionsMm = { width: 254, height: 254, length: 1524 },
+    omitDimensions = false,
+  }) {
+    const idempotencyKey = `legacy-unit-package-${marker}-${suffix}`
+    const requestHash = hash(idempotencyKey)
+    const resultPayload = {
+      action: 'resolve-package',
+      replayed: false,
+      rowVersion: 4,
+      weightGrams,
+      dimensionsMm,
+      lineGlobalId: line.global_id,
+      packageSource: 'manual',
+      workflowState: 'resolving',
+      providerWrites: 0,
+      candidateGlobalId: exactCandidateGlobalId,
+      syncCursorAdvanced: false,
+      packageProfileGlobalId: null,
+    }
+    if (omitDimensions) delete resultPayload.dimensionsMm
+    const receipt = await pool.query(
+      `INSERT INTO operations_command_receipts (
+         organization_id, command_type, idempotency_key, request_hash,
+         actor_email, status, correlation_id, result_global_id,
+         result_payload, completed_at
+       ) VALUES (
+         $1::uuid, 'commerce.intake.resolve_package', $2, $3,
+         $4, 'succeeded', $5::uuid, $6, $7::jsonb, now()
+       ) RETURNING id::text`,
+      [
+        organizationId,
+        idempotencyKey,
+        requestHash,
+        actorEmail,
+        randomUUID(),
+        exactCandidateGlobalId,
+        JSON.stringify(resultPayload),
+      ],
+    )
+    const decision = await pool.query(
+      `INSERT INTO operations_commerce_resolution_decisions (
+         organization_id, integration_account_id, pipeline_id,
+         intake_run_global_id, target_type, target_global_id,
+         target_source_revision, target_source_hash,
+         decision_type, outcome, resulting_workflow_state,
+         reason_code, policy_version, product_id,
+         command_receipt_id, idempotency_key, request_hash,
+         actor_email, correlation_id
+       ) SELECT
+         $1::uuid, $2::uuid, $3::uuid,
+         $4, 'order_candidate_line', $5,
+         $6, $7, 'package_resolution', 'applied', 'resolving',
+         'manual_package_recorded', 'commerce-intake-resolution-v1',
+         $8::uuid, $9::uuid, $10, $11,
+         receipt.actor_email, receipt.correlation_id
+       FROM operations_command_receipts receipt
+       WHERE receipt.organization_id = $1::uuid
+         AND receipt.id = $9::uuid
+       RETURNING id::text, global_id`,
+      [
+        organizationId,
+        accountId,
+        pipelineId,
+        run.rows[0].global_id,
+        line.global_id,
+        exactLineSourceRevision,
+        exactLineSourceHash,
+        productId,
+        receipt.rows[0].id,
+        idempotencyKey,
+        requestHash,
+      ],
+    )
+    return {
+      decision: decision.rows[0],
+      receipt: receipt.rows[0],
+    }
+  }
+
+  const exactManualResolutions = [
+    await recordManualResolution({
+      line: exactLine,
+      marker: 'exact-a',
+    }),
+    await recordManualResolution({
+      line: exactLine,
+      marker: 'exact-b',
+    }),
+  ]
+  await recordManualResolution({
+    line: conflictingManualLine,
+    marker: 'conflict-matching',
+  })
+  await recordManualResolution({
+    line: conflictingManualLine,
+    marker: 'conflict-weight',
+    weightGrams: 2269,
+  })
+  await recordManualResolution({
+    line: malformedManualLine,
+    marker: 'malformed-matching',
+  })
+  await recordManualResolution({
+    line: malformedManualLine,
+    marker: 'malformed-missing-dimensions',
+    omitDimensions: true,
+  })
+  return {
+    accountEnvironment: 'sandbox',
+    accountId,
+    approvedProfileLine,
+    candidateId,
+    channelSourceHash,
+    channelSourceRevision,
+    conflictingManualLine,
+    exactLine,
+    exactManualResolutions,
+    malformedManualLine,
+    multipackLine,
+    organizationId,
+    productGlobalId: product.rows[0].reference_code,
+    unprovenManualLine,
+  }
+}
+
+async function verify(databaseUrl) {
+  const pool = new Pool({ connectionString: databaseUrl, max: 2 })
+  try {
+    const fixture = await seedLegacyFixture(pool)
+    const before = await pool.query(
+      `SELECT line.global_id, line.row_version::integer,
+              line.packaging_state, line.packaging_source,
+              line.packaging_weight_source, line.weight_grams,
+              line.length_mm, line.width_mm, line.height_mm,
+              line.source_revision, line.source_hash,
+              candidate.source_hash AS candidate_source_hash
+       FROM operations_commerce_current_planning_lines line
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.id = line.order_candidate_id
+       WHERE line.global_id = $1`,
+      [exactLineGlobalId],
+    )
+    assert.deepEqual(plain(before.rows[0]), {
+      global_id: exactLineGlobalId,
+      row_version: 10,
+      packaging_state: 'resolved',
+      packaging_source: 'manual',
+      packaging_weight_source: null,
+      weight_grams: 2268,
+      length_mm: 1524,
+      width_mm: 254,
+      height_mm: 254,
+      source_revision: exactLineSourceRevision,
+      source_hash: exactLineSourceHash,
+      candidate_source_hash: exactCandidateSourceHash,
+    })
+
+    const migrationSql = readFileSync(
+      resolve(root, 'db/migrations', migrationName),
+      'utf8',
+    )
+    const client = await pool.connect()
+    try {
+      await applyMigration(client, migrationName)
+    } finally {
+      client.release()
+    }
+
+    const rows = await pool.query(
+      `SELECT global_id, row_version::integer, unit_multiplier::integer,
+              packaging_state, packaging_source, packaging_weight_source,
+              package_profile_id::text, weight_grams,
+              length_mm, width_mm, height_mm, source_revision, source_hash
+       FROM operations_commerce_order_candidate_lines
+       WHERE id = ANY($1::uuid[])
+       ORDER BY global_id`,
+      [[
+        fixture.exactLine.id,
+        fixture.multipackLine.id,
+        fixture.unprovenManualLine.id,
+        fixture.conflictingManualLine.id,
+        fixture.malformedManualLine.id,
+        fixture.approvedProfileLine.id,
+      ]],
+    )
+    const byId = new Map(rows.rows.map((row) => [row.global_id, row]))
+    assert.deepEqual(
+      plain(byId.get(exactLineGlobalId)),
+      {
+        global_id: exactLineGlobalId,
+        row_version: 11,
+        unit_multiplier: 1,
+        packaging_state: 'not_required',
+        packaging_source: 'none',
+        packaging_weight_source: null,
+        package_profile_id: null,
+        weight_grams: 2268,
+        length_mm: 1524,
+        width_mm: 254,
+        height_mm: 254,
+        source_revision: exactLineSourceRevision,
+        source_hash: exactLineSourceHash,
+      },
+      '0327 must normalize only the legacy no-profile one-each projection while retaining exact order evidence',
+    )
+    const multipack = byId.get(fixture.multipackLine.global_id)
+    assert.equal(multipack.row_version, 3)
+    assert.equal(multipack.packaging_state, 'resolved')
+    assert.equal(multipack.packaging_source, 'manual')
+    assert.equal(multipack.packaging_weight_source, null)
+    const unproven = byId.get(fixture.unprovenManualLine.global_id)
+    assert.equal(unproven.row_version, 6)
+    assert.equal(unproven.packaging_state, 'resolved')
+    assert.equal(unproven.packaging_source, 'manual')
+    assert.equal(unproven.packaging_weight_source, null)
+    const conflicting = byId.get(fixture.conflictingManualLine.global_id)
+    assert.equal(conflicting.row_version, 7)
+    assert.equal(conflicting.packaging_state, 'resolved')
+    assert.equal(conflicting.packaging_source, 'manual')
+    assert.equal(conflicting.packaging_weight_source, null)
+    const malformed = byId.get(fixture.malformedManualLine.global_id)
+    assert.equal(malformed.row_version, 8)
+    assert.equal(malformed.packaging_state, 'resolved')
+    assert.equal(malformed.packaging_source, 'manual')
+    assert.equal(malformed.packaging_weight_source, null)
+    const approved = byId.get(fixture.approvedProfileLine.global_id)
+    assert.equal(approved.row_version, 4)
+    assert.equal(approved.packaging_state, 'resolved')
+    assert.equal(approved.packaging_source, 'profile')
+    assert.equal(approved.package_profile_id !== null, true)
+
+    const retainedEvidence = await pool.query(
+      `SELECT
+         evidence.id::text,
+         evidence.candidate_line_id::text,
+         evidence.resolution_decision_id::text,
+         evidence.command_receipt_id::text,
+         evidence.measurement_source,
+         evidence.weight_grams,
+         evidence.length_mm,
+         evidence.width_mm,
+         evidence.height_mm,
+         evidence.line_source_revision,
+         evidence.line_source_hash,
+         evidence.request_hash,
+         evidence.result_payload_hash,
+         decision.global_id AS decision_global_id,
+         decision.request_hash AS decision_request_hash,
+         receipt.request_hash AS receipt_request_hash,
+         pg_catalog.encode(
+           digest(
+             pg_catalog.convert_to(receipt.result_payload::text, 'UTF8'),
+             'sha256'
+           ),
+           'hex'
+         ) AS computed_result_payload_hash
+       FROM operations_commerce_legacy_unit_measurement_evidence evidence
+       JOIN operations_commerce_resolution_decisions decision
+         ON decision.id = evidence.resolution_decision_id
+       JOIN operations_command_receipts receipt
+         ON receipt.organization_id = evidence.organization_id
+        AND receipt.id = evidence.command_receipt_id
+       WHERE evidence.candidate_line_id = ANY($1::uuid[])
+       ORDER BY evidence.candidate_line_id`,
+      [[
+        fixture.exactLine.id,
+        fixture.unprovenManualLine.id,
+        fixture.conflictingManualLine.id,
+        fixture.malformedManualLine.id,
+      ]],
+    )
+    assert.equal(
+      retainedEvidence.rowCount,
+      1,
+      'Only the unambiguous #1001-shaped manual measurement may be retained',
+    )
+    const evidence = retainedEvidence.rows[0]
+    assert.equal(evidence.candidate_line_id, fixture.exactLine.id)
+    assert.equal(evidence.measurement_source, 'manual_package_resolution')
+    assert.equal(evidence.weight_grams, 2268)
+    assert.equal(evidence.length_mm, 1524)
+    assert.equal(evidence.width_mm, 254)
+    assert.equal(evidence.height_mm, 254)
+    assert.equal(evidence.line_source_revision, exactLineSourceRevision)
+    assert.equal(evidence.line_source_hash, exactLineSourceHash)
+    assert.equal(evidence.request_hash, evidence.decision_request_hash)
+    assert.equal(evidence.request_hash, evidence.receipt_request_hash)
+    assert.equal(
+      evidence.result_payload_hash,
+      evidence.computed_result_payload_hash,
+    )
+    assert.ok(
+      fixture.exactManualResolutions.some((resolution) => (
+        resolution.decision.id === evidence.resolution_decision_id
+        && resolution.decision.global_id === evidence.decision_global_id
+      )),
+      'The retained evidence must reference one of the agreeing immutable decisions',
+    )
+
+    await pool.query(migrationSql)
+    const rerun = await pool.query(
+      `SELECT line.row_version::integer, line.source_revision,
+              line.source_hash, candidate.source_hash AS candidate_source_hash,
+              count(evidence.id)::integer AS evidence_count
+       FROM operations_commerce_order_candidate_lines line
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.id = line.order_candidate_id
+       LEFT JOIN operations_commerce_legacy_unit_measurement_evidence evidence
+         ON evidence.candidate_line_id = line.id
+       WHERE line.global_id = $1
+       GROUP BY line.id, candidate.source_hash`,
+      [exactLineGlobalId],
+    )
+    assert.deepEqual(plain(rerun.rows[0]), {
+      row_version: 11,
+      source_revision: exactLineSourceRevision,
+      source_hash: exactLineSourceHash,
+      candidate_source_hash: exactCandidateSourceHash,
+      evidence_count: 1,
+    }, '0327 must be idempotent and must not rewrite provider signatures')
+
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_commerce_legacy_unit_measurement_evidence
+         SET weight_grams = weight_grams
+         WHERE id = $1::uuid`,
+        [evidence.id],
+      ),
+      /Legacy unit measurement evidence is append-only/,
+      'Retained manual measurement evidence must be immutable',
+    )
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_command_receipts
+         SET result_payload = result_payload
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, evidence.command_receipt_id],
+      ),
+      /referenced by immutable evidence cannot change/,
+      'The exact command result supporting retained weight must be immutable',
+    )
+    const agreeingReceipt = fixture.exactManualResolutions.find(
+      (resolution) => (
+        resolution.receipt.id !== evidence.command_receipt_id
+      ),
+    )?.receipt
+    assert.ok(agreeingReceipt)
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_command_receipts
+         SET result_payload = result_payload
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [fixture.organizationId, agreeingReceipt.id],
+      ),
+      /referenced by immutable evidence cannot change/,
+      'Every agreeing receipt used to establish consensus must remain immutable',
+    )
+    await assert.rejects(
+      pool.query(
+        `UPDATE operations_commerce_resolution_decisions
+         SET reason_code = reason_code
+         WHERE id = $1::uuid`,
+        [evidence.resolution_decision_id],
+      ),
+      /Commerce resolution decisions are append-only/,
+      'Existing resolution-decision protection must preserve the exact manual decision',
+    )
+
+    const runtimeRows = await pool.query(
+      `SELECT
+         line.global_id, line.provider,
+         account.environment AS account_environment,
+         line.product_id::text, product.reference_code AS product_global_id,
+         line.product_title_snapshot, line.variant_title_snapshot,
+         line.external_product_id, line.external_variant_id,
+         line.requires_shipping, line.ordered_quantity::text,
+         line.unfulfilled_quantity::text, line.unit_multiplier::text,
+         line.mapping_state, line.packaging_state, line.packaging_source,
+         line.packaging_weight_source, line.weight_grams,
+         line.length_mm, line.width_mm, line.height_mm,
+         line.source_revision AS line_source_revision,
+         line.source_hash AS line_source_hash,
+         manual_measurement.id::text AS manual_measurement_evidence_id,
+         manual_measurement.measurement_source AS manual_measurement_source,
+         manual_measurement.weight_grams AS manual_measurement_weight_grams,
+         manual_measurement.length_mm AS manual_measurement_length_mm,
+         manual_measurement.width_mm AS manual_measurement_width_mm,
+         manual_measurement.height_mm AS manual_measurement_height_mm,
+         manual_measurement.line_source_revision
+           AS manual_measurement_line_source_revision,
+         manual_measurement.line_source_hash
+           AS manual_measurement_line_source_hash,
+         manual_measurement.request_hash
+           AS manual_measurement_request_hash,
+         manual_measurement.result_payload_hash
+           AS manual_measurement_result_payload_hash,
+         manual_decision.global_id
+           AS manual_measurement_decision_global_id,
+         manual_decision.created_at
+           AS manual_measurement_decision_created_at,
+         channel.source_revision AS channel_source_revision,
+         channel.source_hash AS channel_source_hash,
+         channel.weight_grams AS channel_weight_grams,
+         channel.provider_status_raw AS channel_provider_status_raw,
+         channel.normalized_status AS channel_normalized_status,
+         channel.provider_active AS channel_provider_active,
+         channel.requires_shipping AS channel_requires_shipping
+       FROM operations_commerce_current_planning_lines line
+       JOIN operations_integration_accounts account
+         ON account.id = line.integration_account_id
+       JOIN crm_products product ON product.id = line.product_id
+       LEFT JOIN operations_commerce_legacy_unit_measurement_evidence
+         manual_measurement
+         ON manual_measurement.organization_id = line.organization_id
+        AND manual_measurement.integration_account_id =
+              line.integration_account_id
+        AND manual_measurement.pipeline_id = line.pipeline_id
+        AND manual_measurement.candidate_line_id = line.id
+       LEFT JOIN operations_commerce_resolution_decisions manual_decision
+         ON manual_decision.organization_id =
+              manual_measurement.organization_id
+        AND manual_decision.id = manual_measurement.resolution_decision_id
+       LEFT JOIN operations_product_channel_states channel
+         ON channel.organization_id = line.organization_id
+        AND channel.integration_account_id = line.integration_account_id
+        AND channel.pipeline_id = line.pipeline_id
+        AND channel.provider = line.provider
+        AND channel.external_product_id = line.external_product_id
+        AND channel.external_variant_id = line.external_variant_id
+        AND channel.product_id = line.product_id
+        AND channel.product_mapping_id = line.product_mapping_id
+       WHERE line.global_id = ANY($1::text[])`,
+      [[
+        exactLineGlobalId,
+        fixture.conflictingManualLine.global_id,
+        fixture.malformedManualLine.global_id,
+      ]],
+    )
+    function mappedInput(row) {
+      return {
+        ...row,
+        pack_mapping_id: null,
+        pack_mapping_global_id: null,
+        captured_pack_mapping_row_version: null,
+        current_pack_mapping_row_version: null,
+        pack_mapping_is_current: null,
+        pack_mapping_projection_state: null,
+        pack_mapping_source_revision: null,
+        pack_mapping_source_hash: null,
+        pack_mapping_pack_evidence_hash: null,
+        pack_mapping_purpose: null,
+        channel_pack_evidence_hash: null,
+        pack_profile_version_id: null,
+        pack_profile_version_global_id: null,
+        captured_pack_profile_row_version: null,
+        current_pack_profile_row_version: null,
+        pack_profile_is_current: null,
+        pack_profile_lifecycle_state: null,
+        pack_profile_fit_model: null,
+        pack_profile_evidence_type: null,
+        pack_profile_evidence_reference: null,
+        pack_profile_confirmed_at: null,
+        pack_profile_status: null,
+        pack_profile_base_each_quantity: null,
+        current_pack_profile_base_each_quantity: null,
+        current_pack_profile_length_mm: null,
+        current_pack_profile_width_mm: null,
+        current_pack_profile_height_mm: null,
+        current_pack_profile_dimension_basis: null,
+        current_pack_profile_package_level: null,
+        current_pack_profile_ships_as_own_package: null,
+        current_pack_profile_gross_weight_grams: null,
+        current_pack_profile_weight_basis: null,
+        pack_lineage_source: 'order_candidate_capture',
+        checkout_receipt_global_id: null,
+        fulfillment_pack_source: 'candidate_capture',
+        checkout_pack_baseline: null,
+      }
+    }
+    const { hybrid, persistence, unitMaterial } = runtimeModules()
+    const runtimeById = new Map(runtimeRows.rows.map((row) => [
+      row.global_id,
+      row,
+    ]))
+    const mapped = persistence.mapCandidateLines(
+      { mode: 'production' },
+      [mappedInput(runtimeById.get(exactLineGlobalId))],
+    )[0]
+    assert.throws(
+      () => persistence.mapCandidateLines(
+        { mode: 'production' },
+        [mappedInput(
+          runtimeById.get(fixture.conflictingManualLine.global_id),
+        )],
+      ),
+      (error) => (
+        error?.code === 'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED'
+      ),
+      'Conflicting manual results must remain fail-closed at runtime',
+    )
+    assert.throws(
+      () => persistence.mapCandidateLines(
+        { mode: 'production' },
+        [mappedInput(
+          runtimeById.get(fixture.malformedManualLine.global_id),
+        )],
+      ),
+      (error) => (
+        error?.code === 'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED'
+      ),
+      'A malformed successful manual result must remain fail-closed at runtime',
+    )
+    assert.equal(mapped.line.profile.fitModel, 'unconstrained_unit')
+    assert.equal(mapped.line.unitWeightGrams, 2268)
+    assert.equal(mapped.evidence.weightSource, 'manual_resolution')
+    assert.equal(
+      mapped.evidence.weightEvidenceReference,
+      evidence.decision_global_id,
+    )
+    assert.equal(
+      mapped.evidence.weightEvidenceHash,
+      evidence.result_payload_hash,
+    )
+    assert.equal(
+      mapped.evidence.weightEvidenceRequestHash,
+      evidence.request_hash,
+    )
+
+    const hybridPlan = hybrid.planHybridCartonization({
+      mode: 'production',
+      lines: [mapped.line],
+      recipes: [],
+      materials: [],
+    })
+    assert.deepEqual(plain(hybridPlan.geometryFallbackLines), [{
+      lineGlobalId: exactLineGlobalId,
+      productGlobalId: fixture.productGlobalId,
+      quantity: 1,
+      fitModel: 'unconstrained_unit',
+    }])
+    const materialPlan = unitMaterial.planOperationalUnitMaterialPackages({
+      provider: 'shopify',
+      lines: [mapped.line],
+      fallbackLines: hybridPlan.geometryFallbackLines,
+      recipePackages: [],
+      materials: [{
+        materialGlobalId: 'gpmat1vbvhkqodkj',
+        capturedRowVersion: 2,
+        currentRowVersion: 2,
+        isCurrent: true,
+        status: 'active',
+        innerDimensionsMm: { length: 1600, width: 350, height: 350 },
+        dimensionBasis: 'inner',
+        dimensionEvidenceType: 'measured',
+        dimensionEvidenceReference: 'exact #1001 material fixture',
+        dimensionConfirmedAt: '2026-08-15T00:00:00.000Z',
+        tareWeightGrams: 200,
+        unitCostMinor: 125,
+        currency: 'USD',
+        maximumGrossWeightGrams: 5000,
+        availableQuantity: 1,
+        ratedOuterDimensionsMm: {
+          length: 1620,
+          width: 370,
+          height: 370,
+        },
+      }],
+      inventoryProducts: [{
+        productGlobalId: fixture.productGlobalId,
+        availabilityAuthority: 'shopify_provider_commitment',
+        providerCommittedQuantity: 1,
+        activeReservedQuantity: 0,
+        effectiveAvailableQuantity: 1,
+        sourceLevelGlobalIds: ['gcil1vbvhkqodkj'],
+        sourcePositionGlobalIds: ['gip1vbvhkqodkjl'],
+        sourcePositionVersion: 0,
+      }],
+      startingSequence: 1,
+      maximumPackages: 8,
+    })
+    assert.equal(materialPlan.status, 'ready')
+    assert.equal(materialPlan.packages.length, 1)
+    assert.equal(materialPlan.packages[0].contentWeightGrams, 2268)
+    assert.deepEqual(
+      plain(materialPlan.packages[0].innerDimensionsMm),
+      { length: 1600, width: 350, height: 350 },
+      'Unit-material planning must use the selected factual material dimensions',
+    )
+    assert.deepEqual(
+      plain(materialPlan.packages[0].ratedOuterDimensionsMm),
+      { length: 1620, width: 370, height: 370 },
+      'Carrier dimensions must come from the material, not legacy item dimensions',
+    )
+    assert.equal(
+      mapped.line.profile.outerDimensionsMm,
+      null,
+      'Legacy manual item dimensions must not become invented Product-pack geometry',
+    )
+    assert.equal(
+      materialPlan.packages[0].planningMethod,
+      'unit_material_selection',
+    )
+  } finally {
+    await pool.end()
+  }
+}
+
+async function main() {
+  command('docker', ['info'], { timeout: 30_000 })
+  const container =
+    `clawpilot-legacy-unit-${process.pid}-${randomUUID().slice(0, 8)}`
+  try {
+    command('docker', [
+      'run', '--rm', '-d', '--name', container,
+      '-e', 'POSTGRES_PASSWORD=legacy_unit',
+      '-e', 'POSTGRES_DB=legacy_unit',
+      '-p', '127.0.0.1::5432',
+      'pgvector/pgvector:pg16',
+    ], { timeout: 180_000 })
+    const portOutput = command('docker', ['port', container, '5432/tcp'])
+    const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])
+    assert.ok(port > 0, `Unable to resolve PostgreSQL port: ${portOutput}`)
+    const databaseUrl =
+      `postgresql://postgres:legacy_unit@127.0.0.1:${port}/legacy_unit`
+    await waitForPostgres(databaseUrl)
+    const pool = new Pool({ connectionString: databaseUrl, max: 1 })
+    const client = await pool.connect()
+    try {
+      const files = migrations()
+      const migrationIndex = files.indexOf(migrationName)
+      assert.ok(migrationIndex > 0, `${migrationName} is missing`)
+      for (const file of files.slice(0, migrationIndex)) {
+        await applyMigration(client, file)
+      }
+    } finally {
+      client.release()
+      await pool.end()
+    }
+    await verify(databaseUrl)
+  } finally {
+    spawnSync('docker', ['stop', '-t', '1', container], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 20_000,
+    })
+  }
+  console.log(
+    'Legacy #1001 one-each migration and material-cartonization PostgreSQL acceptance passed',
+  )
+}
+
+main().catch((error) => {
+  console.error(error)
+  process.exit(1)
+})

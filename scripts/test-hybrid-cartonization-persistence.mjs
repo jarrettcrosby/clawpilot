@@ -445,6 +445,23 @@ const fulfillmentCandidate = {
   unit_multiplier: '1',
   packaging_weight_source: 'provider_catalog',
   weight_grams: 170,
+  length_mm: 203,
+  width_mm: 152,
+  height_mm: 51,
+  line_source_revision: 'line-source-revision-a',
+  line_source_hash: 'b'.repeat(64),
+  manual_measurement_evidence_id: null,
+  manual_measurement_source: null,
+  manual_measurement_weight_grams: null,
+  manual_measurement_length_mm: null,
+  manual_measurement_width_mm: null,
+  manual_measurement_height_mm: null,
+  manual_measurement_line_source_revision: null,
+  manual_measurement_line_source_hash: null,
+  manual_measurement_request_hash: null,
+  manual_measurement_result_payload_hash: null,
+  manual_measurement_decision_global_id: null,
+  manual_measurement_decision_created_at: null,
   mapping_state: 'resolved',
   packaging_state: 'resolved',
   packaging_source: 'variant_pack_mapping',
@@ -561,6 +578,106 @@ assert.throws(
   ),
   'A one-each line without a Product pack must still fail closed on weight',
 )
+
+const legacyOrderSpecificUnitCandidate = {
+  ...unconstrainedUnitCandidate,
+  global_id: 'gcol1vbvhkqodkjl',
+  product_title_snapshot: 'The 3p Fulfilled Snowboard',
+  packaging_state: 'resolved',
+  packaging_source: 'manual',
+  packaging_weight_source: null,
+  weight_grams: 2268,
+  length_mm: 1524,
+  width_mm: 254,
+  height_mm: 254,
+  channel_weight_grams: null,
+  line_source_revision: '2026-08-15T00:14:33.000Z',
+  line_source_hash:
+    'bcf500459545d85e24aef8dae7d91c39e577560f008246ff317e65d061ecb4f0',
+  manual_measurement_evidence_id:
+    '00000000-0000-4000-8000-000000000041',
+  manual_measurement_source: 'manual_package_resolution',
+  manual_measurement_weight_grams: 2268,
+  manual_measurement_length_mm: 1524,
+  manual_measurement_width_mm: 254,
+  manual_measurement_height_mm: 254,
+  manual_measurement_line_source_revision:
+    '2026-08-15T00:14:33.000Z',
+  manual_measurement_line_source_hash:
+    'bcf500459545d85e24aef8dae7d91c39e577560f008246ff317e65d061ecb4f0',
+  manual_measurement_request_hash: '9'.repeat(64),
+  manual_measurement_result_payload_hash: '8'.repeat(64),
+  manual_measurement_decision_global_id: 'gcrd9rgkh0dr87mq',
+  manual_measurement_decision_created_at: '2026-08-15T00:57:08.685Z',
+}
+const mappedLegacyOrderSpecificUnit = mapCandidateLines(
+  { mode: 'production' },
+  [legacyOrderSpecificUnitCandidate],
+)[0]
+assert.equal(
+  mappedLegacyOrderSpecificUnit.line.profile.fitModel,
+  'unconstrained_unit',
+  'The exact #1001 legacy one-each shape must not require a Product pack',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.line.unitWeightGrams,
+  2268,
+  'The #1001 compatibility path must retain its positive order-specific weight',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightSource,
+  'manual_resolution',
+  'Legacy manual order-pack weight must retain an honest manual-resolution source',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceReference,
+  legacyOrderSpecificUnitCandidate.manual_measurement_decision_global_id,
+  'Manual weight evidence must retain the exact append-only decision',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceHash,
+  legacyOrderSpecificUnitCandidate.manual_measurement_result_payload_hash,
+  'Manual weight evidence must retain the exact command-result hash',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceRequestHash,
+  legacyOrderSpecificUnitCandidate.manual_measurement_request_hash,
+  'Manual weight evidence must retain the exact package-resolution request hash',
+)
+for (const [override, code, detail] of [
+  [
+    { weight_grams: null },
+    'HYBRID_CARTONIZATION_UNIT_MANUAL_EVIDENCE_INVALID',
+    'missing order-specific weight',
+  ],
+  [
+    { manual_measurement_evidence_id: null },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'missing manual package-resolution evidence',
+  ],
+  [
+    { unit_multiplier: '6' },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'case-pick multiplier',
+  ],
+  [
+    { pack_mapping_id: '00000000-0000-4000-8000-000000000099' },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'explicit Product-pack constraint',
+  ],
+]) {
+  assert.throws(
+    () => mapCandidateLines(
+      { mode: 'production' },
+      [{ ...legacyOrderSpecificUnitCandidate, ...override }],
+    ),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code === code
+    ),
+    `The #1001 compatibility path must fail closed for ${detail}`,
+  )
+}
 
 const publishedFaireSoldOutCandidate = {
   ...fulfillmentCandidate,
