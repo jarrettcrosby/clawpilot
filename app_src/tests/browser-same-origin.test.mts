@@ -53,6 +53,13 @@ test('rejects missing, cross-site, unrelated, and scheme-mismatched origins', ()
   }), false)
   assert.equal(isBrowserSameOriginRequest({
     headers: headers({
+      origin: 'null',
+      'sec-fetch-site': 'same-origin',
+    }),
+    requestOrigin: 'https://dev.aiapp.eigenracing.com',
+  }), false)
+  assert.equal(isBrowserSameOriginRequest({
+    headers: headers({
       origin: 'https://dev.aiapp.eigenracing.com',
       'sec-fetch-site': 'cross-site',
     }),
