@@ -1300,6 +1300,10 @@ async function verifyShipmentCompletion(databaseUrl) {
               }
             },
           },
+          '@/lib/integrations/shopifyReversalFixtureRuntime': {
+            SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
+              'test-pro-bakery-bites.myshopify.com',
+          },
           '@/lib/persistence/commerceIntegrations': {
             readCommerceRuntimeCredentialFromPostgres: async (input) => ({
               organizationId: input.organizationId,
@@ -1317,6 +1321,14 @@ async function verifyShipmentCompletion(databaseUrl) {
             }),
           },
           '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
+          '@/lib/persistence/shopifyReversalFixture': {
+            assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres:
+              async () => {
+                throw new Error(
+                  'Shipment completion acceptance does not use the hidden reversal fixture',
+                )
+              },
+          },
           '@/lib/persistence/shopifyTestStoreCanonicalE2e':
             shopifyTestStorePersistence,
           '@/lib/persistence/sandboxCommerceE2eAuthorization':
