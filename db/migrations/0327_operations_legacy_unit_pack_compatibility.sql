@@ -1,5 +1,3 @@
-BEGIN;
-
 -- Migration 0321 made ordinary one-each lines independent of a Product pack,
 -- but it intentionally updated only held/resolving unresolved rows. Older
 -- ready/promoted lines can retain a manual package-resolution shape. Manual
@@ -638,5 +636,3 @@ FOR EACH ROW EXECUTE FUNCTION
 COMMENT ON TABLE
   operations_commerce_legacy_unit_measurement_evidence IS
   'Immutable compatibility evidence for a legacy one-each manual package-resolution result. It authenticates retained order-specific weight without treating the manual measurement as a provider or Product-pack fact.';
-
-COMMIT;

@@ -317,6 +317,7 @@ function loadHealthRoute({ configuredCarriersApplied, diagnosticsApplied }) {
         migrationCurrent: true,
         structureCurrent: true,
         databaseIdentity: '750aa268-0e31-4065-a99c-4016e4d4fab1',
+        awaitingApproval: 0,
         prepared: 0,
         processing: 0,
         unknown: 0,

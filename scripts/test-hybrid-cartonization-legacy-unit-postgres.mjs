@@ -650,9 +650,306 @@ async function verify(databaseUrl) {
       resolve(root, 'db/migrations', migrationName),
       'utf8',
     )
+    const legacyUnitHealth = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsLegacyUnitMeasurementHealth.ts',
+    )
+    const healthSql =
+      legacyUnitHealth.OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL
     const client = await pool.connect()
     try {
       await applyMigration(client, migrationName)
+      const catalogDigests = await client.query(`
+        SELECT
+          (
+            SELECT pg_catalog.count(attribute.attnum)::integer
+            FROM pg_catalog.pg_attribute attribute
+            WHERE attribute.attrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+          ) AS column_count,
+          (
+            SELECT pg_catalog.encode(public.digest(
+              pg_catalog.convert_to(pg_catalog.string_agg(
+                pg_catalog.concat_ws('|',
+                  attribute.attnum::text,
+                  attribute.attname,
+                  pg_catalog.format_type(
+                    attribute.atttypid,
+                    attribute.atttypmod
+                  ),
+                  attribute.attnotnull::text,
+                  COALESCE(pg_catalog.pg_get_expr(
+                    attribute_default.adbin,
+                    attribute_default.adrelid
+                  ), '')
+                ), E'\\n' ORDER BY attribute.attnum
+              ), 'UTF8'), 'sha256'
+            ), 'hex')
+            FROM pg_catalog.pg_attribute attribute
+            LEFT JOIN pg_catalog.pg_attrdef attribute_default
+              ON attribute_default.adrelid = attribute.attrelid
+             AND attribute_default.adnum = attribute.attnum
+            WHERE attribute.attrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+          ) AS column_hash,
+          (
+            SELECT pg_catalog.count(installed.oid)::integer
+            FROM pg_catalog.pg_constraint installed
+            WHERE installed.conrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+              AND installed.contype <> 'n'
+          ) AS constraint_count,
+          (
+            SELECT pg_catalog.encode(public.digest(
+              pg_catalog.convert_to(pg_catalog.string_agg(
+                pg_catalog.concat_ws('|',
+                  installed_namespace.nspname,
+                  table_row.relname,
+                  installed.conname,
+                  installed.contype::text,
+                  installed.convalidated::text,
+                  installed.connoinherit::text,
+                  pg_catalog.pg_get_constraintdef(installed.oid, true)
+                ), E'\\n' ORDER BY installed.conname
+              ), 'UTF8'), 'sha256'
+            ), 'hex')
+            FROM pg_catalog.pg_constraint installed
+            JOIN pg_catalog.pg_class table_row
+              ON table_row.oid = installed.conrelid
+            JOIN pg_catalog.pg_namespace installed_namespace
+              ON installed_namespace.oid = installed.connamespace
+            WHERE installed.conrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+              AND installed.contype <> 'n'
+          ) AS constraint_hash,
+          (
+            SELECT pg_catalog.count(installed.indexrelid)::integer
+            FROM pg_catalog.pg_index installed
+            WHERE installed.indrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+          ) AS index_count,
+          (
+            SELECT pg_catalog.encode(public.digest(
+              pg_catalog.convert_to(pg_catalog.string_agg(
+                pg_catalog.concat_ws('|',
+                  index_row.relname,
+                  installed.indisunique::text,
+                  installed.indisprimary::text,
+                  installed.indisvalid::text,
+                  installed.indisready::text,
+                  pg_catalog.btrim(pg_catalog.regexp_replace(
+                    pg_catalog.pg_get_indexdef(installed.indexrelid),
+                    '[[:space:]]+', ' ', 'g'
+                  ))
+                ), E'\\n' ORDER BY index_row.relname
+              ), 'UTF8'), 'sha256'
+            ), 'hex')
+            FROM pg_catalog.pg_index installed
+            JOIN pg_catalog.pg_class index_row
+              ON index_row.oid = installed.indexrelid
+            WHERE installed.indrelid = pg_catalog.to_regclass(
+              'public.operations_commerce_legacy_unit_measurement_evidence'
+            )
+          ) AS index_hash,
+          (
+            SELECT pg_catalog.count(installed.oid)::integer
+            FROM (VALUES
+              ('validate_operations_commerce_legacy_unit_measurement_evidence()'),
+              ('protect_operations_commerce_legacy_unit_measurement_evidence()'),
+              ('protect_operations_commerce_legacy_unit_measurement_receipt()')
+            ) required(signature)
+            LEFT JOIN pg_catalog.pg_proc installed
+              ON installed.oid = pg_catalog.to_regprocedure(
+                'public.' || required.signature
+              )
+          ) AS function_count,
+          (
+            SELECT pg_catalog.encode(public.digest(
+              pg_catalog.convert_to(pg_catalog.string_agg(
+                pg_catalog.concat_ws('|',
+                  required.signature,
+                  installed_namespace.nspname,
+                  language.lanname,
+                  installed.prokind::text,
+                  installed.provolatile::text,
+                  installed.proparallel::text,
+                  installed.proisstrict::text,
+                  installed.prosecdef::text,
+                  installed.proleakproof::text,
+                  pg_catalog.format_type(installed.prorettype, NULL),
+                  installed.pronargs::text,
+                  installed.pronargdefaults::text,
+                  COALESCE(pg_catalog.array_to_string(
+                    installed.proconfig, ','
+                  ), ''),
+                  pg_catalog.btrim(pg_catalog.regexp_replace(
+                    installed.prosrc, '[[:space:]]+', ' ', 'g'
+                  ))
+                ), E'\\n' ORDER BY required.signature
+              ), 'UTF8'), 'sha256'
+            ), 'hex')
+            FROM (VALUES
+              ('validate_operations_commerce_legacy_unit_measurement_evidence()'),
+              ('protect_operations_commerce_legacy_unit_measurement_evidence()'),
+              ('protect_operations_commerce_legacy_unit_measurement_receipt()')
+            ) required(signature)
+            LEFT JOIN pg_catalog.pg_proc installed
+              ON installed.oid = pg_catalog.to_regprocedure(
+                'public.' || required.signature
+              )
+            LEFT JOIN pg_catalog.pg_namespace installed_namespace
+              ON installed_namespace.oid = installed.pronamespace
+            LEFT JOIN pg_catalog.pg_language language
+              ON language.oid = installed.prolang
+          ) AS function_hash,
+          (
+            SELECT pg_catalog.count(installed.oid)::integer
+            FROM (VALUES
+              (
+                'operations_commerce_legacy_unit_measurement_evidence',
+                'validate_operations_commerce_legacy_unit_measurement_evidence'
+              ),
+              (
+                'operations_commerce_legacy_unit_measurement_evidence',
+                'protect_operations_commerce_legacy_unit_measurement_evidence'
+              ),
+              (
+                'operations_command_receipts',
+                'protect_operations_commerce_legacy_unit_measurement_receipt'
+              )
+            ) required(table_name, trigger_name)
+            LEFT JOIN pg_catalog.pg_trigger installed
+              ON installed.tgrelid = pg_catalog.to_regclass(
+                'public.' || required.table_name
+              )
+             AND installed.tgname = required.trigger_name
+          ) AS trigger_count,
+          (
+            SELECT pg_catalog.encode(public.digest(
+              pg_catalog.convert_to(pg_catalog.string_agg(
+                pg_catalog.concat_ws('|',
+                  required.table_name,
+                  table_namespace.nspname,
+                  installed.tgname,
+                  installed.tgtype::text,
+                  installed.tgenabled::text,
+                  installed.tgisinternal::text,
+                  function_namespace.nspname || '.' ||
+                    trigger_function.proname || '(' ||
+                    pg_catalog.pg_get_function_identity_arguments(
+                      trigger_function.oid
+                    ) || ')',
+                  COALESCE(pg_catalog.pg_get_expr(
+                    installed.tgqual, installed.tgrelid
+                  ), ''),
+                  pg_catalog.btrim(pg_catalog.regexp_replace(
+                    pg_catalog.pg_get_triggerdef(installed.oid),
+                    '[[:space:]]+', ' ', 'g'
+                  ))
+                ), E'\\n' ORDER BY required.table_name,
+                  required.trigger_name
+              ), 'UTF8'), 'sha256'
+            ), 'hex')
+            FROM (VALUES
+              (
+                'operations_commerce_legacy_unit_measurement_evidence',
+                'validate_operations_commerce_legacy_unit_measurement_evidence'
+              ),
+              (
+                'operations_commerce_legacy_unit_measurement_evidence',
+                'protect_operations_commerce_legacy_unit_measurement_evidence'
+              ),
+              (
+                'operations_command_receipts',
+                'protect_operations_commerce_legacy_unit_measurement_receipt'
+              )
+            ) required(table_name, trigger_name)
+            LEFT JOIN pg_catalog.pg_trigger installed
+              ON installed.tgrelid = pg_catalog.to_regclass(
+                'public.' || required.table_name
+              )
+             AND installed.tgname = required.trigger_name
+            LEFT JOIN pg_catalog.pg_class table_row
+              ON table_row.oid = installed.tgrelid
+            LEFT JOIN pg_catalog.pg_namespace table_namespace
+              ON table_namespace.oid = table_row.relnamespace
+            LEFT JOIN pg_catalog.pg_proc trigger_function
+              ON trigger_function.oid = installed.tgfoid
+            LEFT JOIN pg_catalog.pg_namespace function_namespace
+              ON function_namespace.oid = trigger_function.pronamespace
+          ) AS trigger_hash
+      `)
+      assert.deepEqual(plain(catalogDigests.rows[0]), {
+        column_count: 17,
+        column_hash:
+          'bd1fe5bc733b4abe6ea1f8cc02e21fd862c4d0d126b8f063d3be963e8f40da3a',
+        constraint_count: 15,
+        constraint_hash:
+          '50f7a63234f9a8598d950419200ae090b3a7d802904062119fd0e264483413a2',
+        index_count: 2,
+        index_hash:
+          '18131dcc43f74c35d5abafa5ef0a7ad8baa692014875e8171e785e65543976da',
+        function_count: 3,
+        function_hash:
+          '7579fc4cb426e8b1e07a41ead2d9dba971fde0e63fb6d8bec7547a0952fe482f',
+        trigger_count: 3,
+        trigger_hash:
+          '1ddc53f5259f2b297017ace3572d1efcc608bb1484c1c0bb3406ecb9cbb8020e',
+      }, '0327 runtime catalog digests must remain exact')
+      const currentHealth = await client.query(
+        `SELECT (${healthSql}) AS applied`,
+      )
+      assert.equal(
+        currentHealth.rows[0]?.applied,
+        true,
+        'Hosted health must attest the exact 0327 ledger and runtime structure',
+      )
+
+      await client.query('BEGIN')
+      try {
+        await client.query(
+          `UPDATE schema_migrations
+           SET checksum = repeat('0', 64)
+           WHERE filename = $1`,
+          [migrationName],
+        )
+        const driftedLedger = await client.query(
+          `SELECT (${healthSql}) AS applied`,
+        )
+        assert.equal(
+          driftedLedger.rows[0]?.applied,
+          false,
+          'Hosted health must reject a drifted 0327 ledger checksum',
+        )
+      } finally {
+        await client.query('ROLLBACK')
+      }
+
+      await client.query('BEGIN')
+      try {
+        await client.query(
+          `ALTER TABLE operations_command_receipts DISABLE TRIGGER
+             protect_operations_commerce_legacy_unit_measurement_receipt`,
+        )
+        const driftedStructure = await client.query(
+          `SELECT (${healthSql}) AS applied`,
+        )
+        assert.equal(
+          driftedStructure.rows[0]?.applied,
+          false,
+          'Hosted health must reject disabled 0327 integrity structure',
+        )
+      } finally {
+        await client.query('ROLLBACK')
+      }
     } finally {
       client.release()
     }

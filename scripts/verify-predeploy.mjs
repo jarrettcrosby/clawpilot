@@ -42,6 +42,11 @@ const shopifyReversalFixtureMigration = [
   'fe7e5ebb5e5cae4eedfe69a8d0dc863ef76ce90a0c003d7193d94fafcd8be074',
 ]
 
+const legacyUnitMeasurementMigration = [
+  'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
+  '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -231,6 +236,62 @@ if (
   )
 ) {
   fail('Shopify reversal fixture proxy exception must match only the exact route')
+}
+const [legacyUnitMeasurementMigrationPath,
+  legacyUnitMeasurementMigrationChecksum] = legacyUnitMeasurementMigration
+if (!existsSync(resolve(root, legacyUnitMeasurementMigrationPath))) {
+  fail(
+    `missing legacy unit-measurement migration: ${legacyUnitMeasurementMigrationPath}`,
+  )
+}
+const legacyUnitMeasurementMigrationSource = readFileSync(
+  resolve(root, legacyUnitMeasurementMigrationPath),
+  'utf8',
+)
+if (
+  createHash('sha256')
+    .update(legacyUnitMeasurementMigrationSource)
+    .digest('hex') !== legacyUnitMeasurementMigrationChecksum
+) {
+  fail('legacy unit-measurement migration checksum drifted')
+}
+if (/^\s*(?:BEGIN|COMMIT);\s*$/imu.test(legacyUnitMeasurementMigrationSource)) {
+  fail('legacy unit-measurement migration must use the migrator transaction')
+}
+const legacyUnitMeasurementHealthPath =
+  'app_src/lib/persistence/operationsLegacyUnitMeasurementHealth.ts'
+if (!existsSync(resolve(root, legacyUnitMeasurementHealthPath))) {
+  fail(`missing legacy unit-measurement health: ${legacyUnitMeasurementHealthPath}`)
+}
+const legacyUnitMeasurementHealthSource = readFileSync(
+  resolve(root, legacyUnitMeasurementHealthPath),
+  'utf8',
+)
+for (const requiredFragment of [
+  legacyUnitMeasurementMigrationChecksum,
+  'OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL',
+  'operations_commerce_legacy_unit_measurement_evidence',
+  'protect_operations_commerce_legacy_unit_measurement_receipt',
+  'bd1fe5bc733b4abe6ea1f8cc02e21fd862c4d0d126b8f063d3be963e8f40da3a',
+  '50f7a63234f9a8598d950419200ae090b3a7d802904062119fd0e264483413a2',
+  '18131dcc43f74c35d5abafa5ef0a7ad8baa692014875e8171e785e65543976da',
+  '7579fc4cb426e8b1e07a41ead2d9dba971fde0e63fb6d8bec7547a0952fe482f',
+  '1ddc53f5259f2b297017ace3572d1efcc608bb1484c1c0bb3406ecb9cbb8020e',
+]) {
+  if (!legacyUnitMeasurementHealthSource.includes(requiredFragment)) {
+    fail(`legacy unit-measurement health is missing ${requiredFragment}`)
+  }
+}
+for (const requiredFragment of [
+  "from '@/lib/persistence/operationsLegacyUnitMeasurementHealth'",
+  '${OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL}',
+  'AS operations_legacy_unit_measurement_applied',
+  '&& row?.operations_legacy_unit_measurement_applied',
+  '|| !row?.operations_legacy_unit_measurement_applied',
+]) {
+  if (!healthRoute.includes(requiredFragment)) {
+    fail(`runtime health is missing legacy unit-measurement gate ${requiredFragment}`)
+  }
 }
 const checkoutAudienceTest = String(
   rootPackage?.scripts?.['test:shopify-checkout-audience-policy'] || '',
@@ -554,6 +615,7 @@ for (const requiredPath of [
   'app_src/lib/operations/shopifyPackagingImport.ts',
   'app_src/lib/persistence/packagingMaterials.ts',
   'app_src/lib/persistence/operationsMeasuredPackagingEvidenceHealth.ts',
+  'app_src/lib/persistence/operationsLegacyUnitMeasurementHealth.ts',
   'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
   'app_src/app/api/operations/packaging-materials/import/route.ts',
   'scripts/test-operations-packaging-materials.mjs',
