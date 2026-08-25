@@ -5,6 +5,8 @@ import {
   CAREER_SITE_SUBMISSION_SHEET_HEADERS,
   CareerSiteSubmissionConfigurationError,
   CareerSiteSubmissionRequestError,
+  CareerSiteSubmissionSheetBoundaryError,
+  assertPrivateCareerSiteSheetBoundary,
   careerSiteSubmissionPayloadHash,
   careerSiteSubmissionSheetRow,
   parseCareerSiteSubmission,
@@ -64,6 +66,87 @@ test('keeps résumé networking and role-fit choices separate from newsletter co
     }),
     CareerSiteSubmissionRequestError,
   )
+  for (const missing of ['networkInterest', 'roleFit'] as const) {
+    const body: Record<string, unknown> = {
+      submissionId: resumeId,
+      formType: 'resume-request',
+      name: 'Morgan Hiring Manager',
+      email: 'morgan@example.com',
+      networkInterest: false,
+      roleFit: false,
+      resumeVariant: 'executive',
+    }
+    delete body[missing]
+    assert.throws(
+      () => parseCareerSiteSubmission(body),
+      (error: unknown) => (
+        error instanceof CareerSiteSubmissionRequestError
+        && error.message === `${missing} must be explicitly true or false`
+      ),
+    )
+  }
+})
+
+test('requires an exact private My Drive owner and service-account permission boundary', () => {
+  const valid = {
+    sheetId: '1abc_DEF-234',
+    ownerEmail: 'jarrett@suburbiasandwichco.com',
+    serviceAccountEmail: 'clawpilot@project.iam.gserviceaccount.com',
+    file: {
+      id: '1abc_DEF-234',
+      mimeType: 'application/vnd.google-apps.spreadsheet',
+      trashed: false,
+      writersCanShare: false,
+      capabilities: { canEdit: true },
+      owners: [{ emailAddress: 'jarrett@suburbiasandwichco.com' }],
+    },
+    permissions: [
+      {
+        id: 'owner-permission',
+        type: 'user',
+        role: 'owner',
+        emailAddress: 'jarrett@suburbiasandwichco.com',
+      },
+      {
+        id: 'service-permission',
+        type: 'user',
+        role: 'writer',
+        emailAddress: 'clawpilot@project.iam.gserviceaccount.com',
+      },
+    ],
+  }
+  assert.doesNotThrow(() => assertPrivateCareerSiteSheetBoundary(valid))
+
+  const invalidBoundaries = [
+    { ...valid, file: { ...valid.file, driveId: 'shared-drive-id' } },
+    { ...valid, file: { ...valid.file, writersCanShare: true } },
+    {
+      ...valid,
+      file: {
+        ...valid.file,
+        owners: [{ emailAddress: 'someone-else@example.com' }],
+      },
+    },
+    {
+      ...valid,
+      permissions: [
+        ...valid.permissions,
+        { id: 'public-permission', type: 'anyone', role: 'reader' },
+      ],
+    },
+    {
+      ...valid,
+      permissions: valid.permissions.map((permission) => (
+        permission.role === 'writer' ? { ...permission, role: 'reader' } : permission
+      )),
+    },
+  ]
+  for (const boundary of invalidBoundaries) {
+    assert.throws(
+      () => assertPrivateCareerSiteSheetBoundary(boundary),
+      CareerSiteSubmissionSheetBoundaryError,
+    )
+  }
 })
 
 test('requires a standalone explicit newsletter opt-in', () => {
@@ -251,6 +334,14 @@ test('configuration is disabled by default and fails closed when enabled incompl
   assert.throws(
     () => resolveCareerSiteSubmissionConfiguration({
       CAREER_SITE_SUBMISSIONS_SHEET_HEADER_ROW: '0',
+    }),
+    CareerSiteSubmissionConfigurationError,
+  )
+  assert.throws(
+    () => resolveCareerSiteSubmissionConfiguration({
+      CAREER_SITE_SUBMISSIONS_ENABLED: '1',
+      CAREER_SITE_SUBMISSIONS_OWNER_EMAIL: 'other@suburbiasandwichco.com',
+      CAREER_SITE_SUBMISSIONS_SHEET_ID: '1abc_DEF-234',
     }),
     CareerSiteSubmissionConfigurationError,
   )

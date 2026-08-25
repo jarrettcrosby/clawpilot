@@ -1,8 +1,11 @@
 import {
   CAREER_SITE_SUBMISSION_SHEET_HEADERS,
   CareerSiteSubmissionConfigurationError,
+  CareerSiteSubmissionSheetBoundaryError,
+  assertPrivateCareerSiteSheetBoundary,
   careerSiteSubmissionSheetRow,
   resolveCareerSiteSubmissionConfiguration,
+  type CareerSiteGoogleDriveFile,
 } from '@/lib/careerSiteSubmissionContract'
 import {
   GoogleWorkspaceRequestError,
@@ -10,6 +13,7 @@ import {
 } from '@/lib/integrations/googleWorkspace'
 import {
   GoogleWorkspaceClientError,
+  googleDriveJson,
   googleSheetsJson,
   type GoogleWorkspaceRuntime,
 } from '@/lib/integrations/googleWorkspaceClient'
@@ -17,10 +21,13 @@ import {
   claimCareerSiteSubmissionOutboxInPostgres,
   completeCareerSiteSubmissionOutboxInPostgres,
   failCareerSiteSubmissionOutboxInPostgres,
+  renewCareerSiteSubmissionOutboxLeaseInPostgres,
+  withCareerSiteSubmissionSheetLock,
   type CareerSiteSubmissionOutboxItem,
 } from '@/lib/persistence/careerSiteSubmissions'
 
-const MAX_DEDUPE_ROWS = 50_000
+const MAX_SHEET_DATA_ROWS = 50_000
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 class CareerSiteSubmissionSheetContractError extends Error {
   constructor(message: string) {
@@ -50,12 +57,77 @@ async function readValues(runtime: GoogleWorkspaceRuntime, sheetId: string, rang
   return Array.isArray(response.values) ? response.values : []
 }
 
+async function verifyPrivateSheetBoundary(input: {
+  runtime: GoogleWorkspaceRuntime
+  sheetId: string
+  ownerEmail: string
+}) {
+  const metadataParameters = new URLSearchParams({
+    supportsAllDrives: 'true',
+    fields: [
+      'id',
+      'mimeType',
+      'trashed',
+      'driveId',
+      'writersCanShare',
+      'capabilities(canEdit)',
+      'owners(emailAddress)',
+    ].join(','),
+  })
+  const file = await googleDriveJson<CareerSiteGoogleDriveFile>(
+    input.runtime,
+    `/drive/v3/files/${input.sheetId}?${metadataParameters.toString()}`,
+  )
+
+  const permissions: Array<{
+    id?: unknown
+    type?: unknown
+    role?: unknown
+    emailAddress?: unknown
+    deleted?: unknown
+    pendingOwner?: unknown
+  }> = []
+  let pageToken = ''
+  for (let page = 0; page < 10; page += 1) {
+    const permissionParameters = new URLSearchParams({
+      supportsAllDrives: 'true',
+      pageSize: '100',
+      fields: 'nextPageToken,permissions(id,type,role,emailAddress,deleted,pendingOwner)',
+    })
+    if (pageToken) permissionParameters.set('pageToken', pageToken)
+    const response = await googleDriveJson<{
+      nextPageToken?: unknown
+      permissions?: typeof permissions
+    }>(
+      input.runtime,
+      `/drive/v3/files/${input.sheetId}/permissions?${permissionParameters.toString()}`,
+    )
+    permissions.push(...(Array.isArray(response.permissions) ? response.permissions : []))
+    pageToken = typeof response.nextPageToken === 'string' ? response.nextPageToken.trim() : ''
+    if (!pageToken) {
+      assertPrivateCareerSiteSheetBoundary({
+        sheetId: input.sheetId,
+        ownerEmail: input.ownerEmail,
+        serviceAccountEmail: input.runtime.serviceAccountEmail,
+        file,
+        permissions,
+      })
+      return
+    }
+  }
+  throw new CareerSiteSubmissionSheetContractError(
+    'Career-site Sheet permission listing exceeded the safe page limit',
+  )
+}
+
 async function prepareSheet(input: {
   runtime: GoogleWorkspaceRuntime
   sheetId: string
+  ownerEmail: string
   sheetTab: string
   sheetHeaderRow: number
 }) {
+  await verifyPrivateSheetBoundary(input)
   const metadata = await googleSheetsJson<{
     spreadsheetId?: string
     sheets?: Array<{ properties?: { title?: string } }>
@@ -93,60 +165,64 @@ async function prepareSheet(input: {
   }
 
   const firstDataRow = input.sheetHeaderRow + 1
-  const idRange = `${quotedTab}!A${firstDataRow}:A${firstDataRow + MAX_DEDUPE_ROWS - 1}`
+  const idRange = `${quotedTab}!A${firstDataRow}:A${firstDataRow + MAX_SHEET_DATA_ROWS}`
   const existingRows = await readValues(input.runtime, input.sheetId, idRange)
-  if (
-    existingRows.length >= MAX_DEDUPE_ROWS
-    && String(existingRows[MAX_DEDUPE_ROWS - 1]?.[0] || '').trim()
-  ) {
+  if (existingRows.length > MAX_SHEET_DATA_ROWS) {
     throw new CareerSiteSubmissionSheetContractError(
-      'Configured career-site Google Sheet exceeded the verified deduplication range',
+      `Configured career-site Google Sheet exceeded its ${MAX_SHEET_DATA_ROWS}-row data limit`,
     )
   }
-  const existingSubmissionIds = new Set(
-    existingRows
-      .map((row) => String(row[0] || '').trim().toLowerCase())
-      .filter(Boolean),
-  )
+  const existingSubmissionIds = new Set<string>()
+  for (const row of existingRows) {
+    const id = String(row[0] || '').trim().toLowerCase()
+    if (!UUID_PATTERN.test(id) || existingSubmissionIds.has(id)) {
+      throw new CareerSiteSubmissionSheetContractError(
+        'Configured career-site Google Sheet contains a missing, invalid, or duplicate submission ID',
+      )
+    }
+    existingSubmissionIds.add(id)
+  }
   return {
-    appendRange: `${quotedTab}!A${input.sheetHeaderRow}:S`,
+    firstDataRow,
+    nextDataRow: firstDataRow + existingRows.length,
+    atCapacity: existingRows.length >= MAX_SHEET_DATA_ROWS,
+    quotedTab,
     existingSubmissionIds,
   }
 }
 
-async function appendSubmission(input: {
+async function writeSubmission(input: {
   runtime: GoogleWorkspaceRuntime
   sheetId: string
-  appendRange: string
+  rowNumber: number
+  quotedTab: string
   item: CareerSiteSubmissionOutboxItem
 }) {
-  const range = input.appendRange
+  const range = `${input.quotedTab}!A${input.rowNumber}:S${input.rowNumber}`
+  const existing = await readValues(input.runtime, input.sheetId, range)
+  if (existing.some((row) => row.some((value) => String(value ?? '') !== ''))) {
+    throw new CareerSiteSubmissionSheetContractError(
+      'Configured career-site Google Sheet next row is not empty',
+    )
+  }
   await googleSheetsJson(
     input.runtime,
-    `${valuesPath(input.sheetId, range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+    `${valuesPath(input.sheetId, range)}?valueInputOption=RAW`,
     {
-      method: 'POST',
+      method: 'PUT',
       body: {
         range,
         majorDimension: 'ROWS',
         values: [careerSiteSubmissionSheetRow(input.item)],
       },
-      idempotent: false,
     },
   )
-}
-
-function permanentError(error: unknown) {
-  if (error instanceof CareerSiteSubmissionSheetContractError) return true
-  if (error instanceof CareerSiteSubmissionConfigurationError) return true
-  if (error instanceof GoogleWorkspaceClientError) return !error.retryable
-  if (error instanceof GoogleWorkspaceRequestError) return error.status < 500
-  return false
 }
 
 function safeErrorMessage(error: unknown) {
   if (
     error instanceof CareerSiteSubmissionSheetContractError
+    || error instanceof CareerSiteSubmissionSheetBoundaryError
     || error instanceof CareerSiteSubmissionConfigurationError
     || error instanceof GoogleWorkspaceClientError
     || error instanceof GoogleWorkspaceRequestError
@@ -161,59 +237,76 @@ export async function processCareerSiteSubmissionOutbox(input: {
   maxAttempts?: number
 } = {}) {
   const configuration = resolveCareerSiteSubmissionConfiguration()
-  if (!configuration.enabled || !configuration.sheetId) {
+  if (!configuration.enabled || !configuration.sheetId || !configuration.ownerEmail) {
     return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
   }
+  const sheetId = configuration.sheetId
+  const ownerEmail = configuration.ownerEmail
 
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 8), 20))
-  const items = await claimCareerSiteSubmissionOutboxInPostgres({
-    limit: input.limit,
-    maxAttempts,
-  })
-  const results: Array<{ id: string; status: 'succeeded' | 'failed' | 'dead' }> = []
-  let runtime: GoogleWorkspaceRuntime | null = null
-  let sheet: Awaited<ReturnType<typeof prepareSheet>> | null = null
-
-  for (const item of items) {
+  const locked = await withCareerSiteSubmissionSheetLock(sheetId, async () => {
+    const items = await claimCareerSiteSubmissionOutboxInPostgres({
+      sourceApp: configuration.sourceApp,
+      ownerEmail,
+      limit: input.limit,
+      maxAttempts,
+      leaseSeconds: 900,
+    })
+    const item = items[0]
+    if (!item) {
+      return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
+    }
     try {
-      if (item.sourceApp !== configuration.sourceApp || item.ownerEmail !== configuration.ownerEmail) {
-        throw new CareerSiteSubmissionSheetContractError(
-          'Claimed career-site submission is outside the configured owner or source scope',
-        )
-      }
-      runtime ||= await resolveGoogleWorkspaceProvisioningRuntime()
-      sheet ||= await prepareSheet({
+      const runtime = await resolveGoogleWorkspaceProvisioningRuntime()
+      const sheet = await prepareSheet({
         runtime,
-        sheetId: configuration.sheetId,
+        sheetId,
+        ownerEmail,
         sheetTab: configuration.sheetTab,
         sheetHeaderRow: configuration.sheetHeaderRow,
       })
       if (!sheet.existingSubmissionIds.has(item.externalSubmissionId)) {
-        await appendSubmission({
+        if (sheet.atCapacity) {
+          throw new CareerSiteSubmissionSheetContractError(
+            `Configured career-site Google Sheet reached its ${MAX_SHEET_DATA_ROWS}-row data limit`,
+          )
+        }
+        await verifyPrivateSheetBoundary({ runtime, sheetId, ownerEmail })
+        await renewCareerSiteSubmissionOutboxLeaseInPostgres(item)
+        await writeSubmission({
           runtime,
-          sheetId: configuration.sheetId,
-          appendRange: sheet.appendRange,
+          sheetId,
+          rowNumber: sheet.nextDataRow,
+          quotedTab: sheet.quotedTab,
           item,
         })
-        sheet.existingSubmissionIds.add(item.externalSubmissionId)
       }
       await completeCareerSiteSubmissionOutboxInPostgres(item)
-      results.push({ id: item.id, status: 'succeeded' })
+      return {
+        claimed: 1,
+        succeeded: 1,
+        failed: 0,
+        dead: 0,
+        items: [{ id: item.id, status: 'succeeded' as const }],
+      }
     } catch (error) {
       const status = await failCareerSiteSubmissionOutboxInPostgres({
         item,
         error: safeErrorMessage(error),
-        maxAttempts: permanentError(error) ? item.attempts : maxAttempts,
+        maxAttempts,
       })
-      results.push({ id: item.id, status })
+      return {
+        claimed: 1,
+        succeeded: 0,
+        failed: status === 'failed' ? 1 : 0,
+        dead: status === 'dead' ? 1 : 0,
+        items: [{ id: item.id, status }],
+      }
     }
-  }
+  })
 
-  return {
-    claimed: items.length,
-    succeeded: results.filter((result) => result.status === 'succeeded').length,
-    failed: results.filter((result) => result.status === 'failed').length,
-    dead: results.filter((result) => result.status === 'dead').length,
-    items: results,
+  if (!locked.acquired || !locked.value) {
+    return { claimed: 0, succeeded: 0, failed: 0, dead: 0, busy: true, items: [] }
   }
+  return { ...locked.value, busy: false }
 }

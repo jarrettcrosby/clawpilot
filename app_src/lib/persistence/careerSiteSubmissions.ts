@@ -11,6 +11,8 @@ import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
 const OUTBOX_WORKER_HEARTBEAT_KEY = 'career_site.submissions.outbox.worker.heartbeat'
+export const CAREER_SITE_SUBMISSIONS_MIGRATION_FILENAME = '0329_career_site_submissions.sql'
+export const CAREER_SITE_SUBMISSIONS_MIGRATION_CHECKSUM = '0f66211b10bf21e3d6e61b093d99b460f469635055af294f4d6b3f7d97fe2e78'
 
 type CareerSiteSubmissionActor = {
   ownerEmail: string
@@ -54,6 +56,35 @@ export type CareerSiteSubmissionOutboxItem = CareerSiteSubmissionSheetRecord & {
   submissionId: string
   attempts: number
   lockToken: string
+}
+
+export type CareerSiteSubmissionOperationalHealth = {
+  enabled: true
+  healthy: boolean
+  status: 'healthy' | 'degraded' | 'unhealthy'
+  migration: {
+    filename: typeof CAREER_SITE_SUBMISSIONS_MIGRATION_FILENAME
+    applied: boolean
+    checksumMatches: boolean
+    tablesPresent: boolean
+  }
+  queue: {
+    queued: number
+    processing: number
+    succeeded: number
+    failed: number
+    dead: number
+    staleProcessing: number
+    outOfScopePending: number
+    oldestPendingAt: string | null
+  }
+  worker: {
+    phase: 'started' | 'completed' | 'degraded' | 'failed' | 'missing' | 'invalid'
+    checkedAt: string | null
+    ageSeconds: number | null
+    stale: boolean
+  }
+  checkedAt: string
 }
 
 export class CareerSiteSubmissionPersistenceConflictError extends Error {
@@ -257,39 +288,48 @@ export async function createCareerSiteSubmissionInPostgres(input: {
 }
 
 export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
+  sourceApp: string
+  ownerEmail: string
   limit?: number
   maxAttempts?: number
   leaseSeconds?: number
-} = {}): Promise<CareerSiteSubmissionOutboxItem[]> {
+}): Promise<CareerSiteSubmissionOutboxItem[]> {
   requirePostgres()
-  const limit = Math.max(1, Math.min(Math.trunc(Number(input.limit) || 10), 50))
+  const limit = 1
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 8), 20))
-  const leaseSeconds = Math.max(30, Math.min(Math.trunc(Number(input.leaseSeconds) || 300), 3600))
+  const leaseSeconds = Math.max(300, Math.min(Math.trunc(Number(input.leaseSeconds) || 900), 3600))
   const lockToken = crypto.randomUUID()
 
   return withTransaction(async (client) => {
     await client.query(
-      `UPDATE career_site_submission_outbox
-       SET status = CASE WHEN attempts >= $1 THEN 'dead' ELSE 'failed' END,
+      `UPDATE career_site_submission_outbox outbox
+       SET status = CASE WHEN outbox.attempts >= $1 THEN 'dead' ELSE 'failed' END,
            last_error = COALESCE(last_error, 'worker lease expired'),
            available_at = now(),
-           processed_at = CASE WHEN attempts >= $1 THEN now() ELSE NULL END,
+           processed_at = CASE WHEN outbox.attempts >= $1 THEN now() ELSE NULL END,
            locked_at = NULL,
            lock_token = NULL,
            updated_at = now()
-       WHERE status = 'processing'
-         AND (locked_at IS NULL OR locked_at < now() - ($2::text || ' seconds')::interval)`,
-      [maxAttempts, leaseSeconds],
+       FROM career_site_submissions submission
+       WHERE outbox.submission_id = submission.id
+         AND submission.source_app = $3
+         AND submission.owner_email = $4
+         AND outbox.status = 'processing'
+         AND (outbox.locked_at IS NULL OR outbox.locked_at < now() - ($2::text || ' seconds')::interval)`,
+      [maxAttempts, leaseSeconds, input.sourceApp, input.ownerEmail],
     )
 
     const result = await client.query<CareerSiteSubmissionClaimRow>(
       `WITH candidates AS (
-         SELECT id
-         FROM career_site_submission_outbox
-         WHERE status IN ('queued', 'failed')
-           AND attempts < $2
-           AND available_at <= now()
-         ORDER BY available_at ASC, created_at ASC, id ASC
+         SELECT outbox.id
+         FROM career_site_submission_outbox outbox
+         JOIN career_site_submissions submission ON submission.id = outbox.submission_id
+         WHERE submission.source_app = $4
+           AND submission.owner_email = $5
+           AND outbox.status IN ('queued', 'failed')
+           AND outbox.attempts < $2
+           AND outbox.available_at <= now()
+         ORDER BY outbox.available_at ASC, outbox.created_at ASC, outbox.id ASC
          FOR UPDATE SKIP LOCKED
          LIMIT $1
        ), claimed AS (
@@ -312,7 +352,7 @@ export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
        FROM claimed
        JOIN career_site_submissions submission ON submission.id = claimed.submission_id
        ORDER BY submission.created_at ASC, submission.id ASC`,
-      [limit, maxAttempts, lockToken],
+      [limit, maxAttempts, lockToken, input.sourceApp, input.ownerEmail],
     )
 
     return result.rows.map((row) => ({
@@ -323,6 +363,37 @@ export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
       ...toSheetRecord(row),
     }))
   })
+}
+
+export async function withCareerSiteSubmissionSheetLock<T>(
+  sheetId: string,
+  fn: () => Promise<T>,
+): Promise<{ acquired: boolean; value: T | null }> {
+  requirePostgres()
+  return withTransaction(async (client) => {
+    const result = await client.query<{ acquired: boolean }>(
+      `SELECT pg_try_advisory_xact_lock(
+         hashtextextended('career-site-submissions:sheet:' || $1::text, 0)
+       ) AS acquired`,
+      [sheetId],
+    )
+    if (result.rows[0]?.acquired !== true) return { acquired: false, value: null }
+    return { acquired: true, value: await fn() }
+  })
+}
+
+export async function renewCareerSiteSubmissionOutboxLeaseInPostgres(
+  item: Pick<CareerSiteSubmissionOutboxItem, 'id' | 'lockToken'>,
+) {
+  const result = await query(
+    `UPDATE career_site_submission_outbox
+     SET locked_at = now(), updated_at = now()
+     WHERE id = $1::uuid
+       AND status = 'processing'
+       AND lock_token = $2`,
+    [item.id, item.lockToken],
+  )
+  if (result.rowCount !== 1) throw new Error(`Career-site outbox lease lost for ${item.id}`)
 }
 
 export async function completeCareerSiteSubmissionOutboxInPostgres(
@@ -373,7 +444,7 @@ export async function failCareerSiteSubmissionOutboxInPostgres(input: {
 }
 
 export async function recordCareerSiteSubmissionWorkerHeartbeatInPostgres(input: {
-  phase: 'started' | 'completed'
+  phase: 'started' | 'completed' | 'degraded' | 'failed'
   workerId: string
   claimed: number
   succeeded: number
@@ -388,4 +459,182 @@ export async function recordCareerSiteSubmissionWorkerHeartbeatInPostgres(input:
     [OUTBOX_WORKER_HEARTBEAT_KEY, JSON.stringify({ ...input, checkedAt })],
   )
   return { checkedAt }
+}
+
+export async function readCareerSiteSubmissionOperationalHealthFromPostgres(input: {
+  sourceApp: string
+  ownerEmail: string
+  pollMs?: number
+  leaseSeconds?: number
+}): Promise<CareerSiteSubmissionOperationalHealth> {
+  requirePostgres()
+  const checkedAtMs = Date.now()
+  const checkedAt = new Date(checkedAtMs).toISOString()
+  const pollMs = Math.max(5_000, Math.min(Math.trunc(Number(input.pollMs) || 10_000), 300_000))
+  const leaseSeconds = Math.max(300, Math.min(Math.trunc(Number(input.leaseSeconds) || 900), 3_600))
+  const migration = await query<{
+    applied: boolean
+    checksum_matches: boolean
+    tables_present: boolean
+  }>(
+    `SELECT
+       EXISTS (
+         SELECT 1 FROM schema_migrations WHERE filename = $1
+       ) AS applied,
+       EXISTS (
+         SELECT 1 FROM schema_migrations WHERE filename = $1 AND checksum = $2
+       ) AS checksum_matches,
+       to_regclass('public.career_site_submissions') IS NOT NULL
+         AND to_regclass('public.career_site_submission_outbox') IS NOT NULL
+         AS tables_present`,
+    [CAREER_SITE_SUBMISSIONS_MIGRATION_FILENAME, CAREER_SITE_SUBMISSIONS_MIGRATION_CHECKSUM],
+  )
+  const migrationRow = migration.rows[0]
+  const migrationState = {
+    filename: CAREER_SITE_SUBMISSIONS_MIGRATION_FILENAME,
+    applied: migrationRow?.applied === true,
+    checksumMatches: migrationRow?.checksum_matches === true,
+    tablesPresent: migrationRow?.tables_present === true,
+  } as const
+  const emptyQueue = {
+    queued: 0,
+    processing: 0,
+    succeeded: 0,
+    failed: 0,
+    dead: 0,
+    staleProcessing: 0,
+    outOfScopePending: 0,
+    oldestPendingAt: null,
+  }
+  const missingWorker = {
+    phase: 'missing' as const,
+    checkedAt: null,
+    ageSeconds: null,
+    stale: true,
+  }
+  if (!migrationState.applied || !migrationState.checksumMatches || !migrationState.tablesPresent) {
+    return {
+      enabled: true,
+      healthy: false,
+      status: 'unhealthy',
+      migration: migrationState,
+      queue: emptyQueue,
+      worker: missingWorker,
+      checkedAt,
+    }
+  }
+
+  const result = await query<{
+    queued: string
+    processing: string
+    succeeded: string
+    failed: string
+    dead: string
+    stale_processing: string
+    out_of_scope_pending: string
+    oldest_pending_at: string | null
+    worker_heartbeat: unknown
+  }>(
+    `SELECT
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'queued'
+       )::text AS queued,
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'processing'
+       )::text AS processing,
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'succeeded'
+       )::text AS succeeded,
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'failed'
+       )::text AS failed,
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'dead'
+       )::text AS dead,
+       count(*) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status = 'processing'
+           AND (outbox.locked_at IS NULL OR outbox.locked_at < now() - ($3::text || ' seconds')::interval)
+       )::text AS stale_processing,
+       count(*) FILTER (
+         WHERE outbox.status IN ('queued', 'failed', 'processing')
+           AND NOT (submission.source_app = $1 AND submission.owner_email = $2)
+       )::text AS out_of_scope_pending,
+       min(outbox.created_at) FILTER (
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND outbox.status IN ('queued', 'failed', 'processing')
+       )::text AS oldest_pending_at,
+       (SELECT value FROM app_settings WHERE key = $4) AS worker_heartbeat
+     FROM career_site_submission_outbox outbox
+     JOIN career_site_submissions submission ON submission.id = outbox.submission_id`,
+    [input.sourceApp, input.ownerEmail, leaseSeconds, OUTBOX_WORKER_HEARTBEAT_KEY],
+  )
+  const row = result.rows[0]
+  const count = (value: string | undefined) => {
+    const parsed = Number(value || 0)
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
+  }
+  const queue = {
+    queued: count(row?.queued),
+    processing: count(row?.processing),
+    succeeded: count(row?.succeeded),
+    failed: count(row?.failed),
+    dead: count(row?.dead),
+    staleProcessing: count(row?.stale_processing),
+    outOfScopePending: count(row?.out_of_scope_pending),
+    oldestPendingAt: row?.oldest_pending_at
+      ? new Date(row.oldest_pending_at).toISOString()
+      : null,
+  }
+  const heartbeat = row?.worker_heartbeat && typeof row.worker_heartbeat === 'object'
+    ? row.worker_heartbeat as Record<string, unknown>
+    : null
+  const phaseValue = String(heartbeat?.phase || '')
+  const checkedAtValue = typeof heartbeat?.checkedAt === 'string' ? heartbeat.checkedAt : ''
+  const heartbeatMs = Date.parse(checkedAtValue)
+  const heartbeatValid = ['started', 'completed', 'degraded', 'failed'].includes(phaseValue)
+    && Number.isFinite(heartbeatMs)
+    && heartbeatMs <= checkedAtMs + 30_000
+  const ageSeconds = heartbeatValid
+    ? Math.max(0, Math.floor((checkedAtMs - heartbeatMs) / 1000))
+    : null
+  const stale = ageSeconds === null || ageSeconds * 1000 > Math.max(60_000, pollMs * 3)
+  const worker = {
+    phase: heartbeatValid
+      ? phaseValue as 'started' | 'completed' | 'degraded' | 'failed'
+      : heartbeat ? 'invalid' as const : 'missing' as const,
+    checkedAt: heartbeatValid ? new Date(heartbeatMs).toISOString() : null,
+    ageSeconds,
+    stale,
+  }
+  const unhealthy = queue.dead > 0
+    || queue.staleProcessing > 0
+    || queue.outOfScopePending > 0
+    || worker.phase === 'missing'
+    || worker.phase === 'invalid'
+    || worker.phase === 'failed'
+    || worker.stale
+  const degraded = !unhealthy && (queue.failed > 0 || worker.phase === 'degraded')
+  const status = unhealthy ? 'unhealthy' : degraded ? 'degraded' : 'healthy'
+  return {
+    enabled: true,
+    healthy: status === 'healthy',
+    status,
+    migration: migrationState,
+    queue,
+    worker,
+    checkedAt,
+  }
 }
