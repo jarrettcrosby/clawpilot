@@ -39,7 +39,7 @@ Use `http://localhost:4002`. The start script supplies isolated `data-dev` paths
 | SuiteCRM | `https://crm.eigenracing.com` | `https://dev.crm.eigenracing.com` |
 | Fulfillment optimizer | Isolated Railway service over `fulfillment-optimizer.railway.internal` | Isolated Railway service over `fulfillment-optimizer.railway.internal` |
 
-Railway runs the Next.js server, background outbox and agent workers, environment-specific Postgres, private SuiteCRM service, dedicated SuiteCRM MariaDB, and SuiteCRM volume. Vercel provides protected Next.js previews and an independent build/deployment check; it does not replace Railway workers or own durable writes.
+Railway runs the Next.js server, background outbox and agent workers, environment-specific Postgres, private SuiteCRM service, dedicated SuiteCRM MariaDB, and SuiteCRM volume. The Railway deployment path, including its predeploy gate and idempotent release-record check, is the sole authority for append-only Postgres migrations. Vercel provides protected Next.js previews and an independent build/deployment check; it does not replace Railway workers, run migrations, or own durable writes.
 
 Development and production must keep capability and service-topology parity.
 Environment-specific data, credentials, endpoints, and approved resource
@@ -80,12 +80,12 @@ The owning active contract must be current before promotion. A clean committed-f
 2. Update the owning active contract and release copy without waiting for a separate documentation request.
 3. Confirm the required Railway and provider backups before risky migrations or destructive work.
 4. Promote through a reviewed `dev` to `main` pull request.
-5. Railway applies append-only Postgres migrations before starting the application and workers.
-6. Wait for `/api/health` and worker heartbeats before recording the deployment as successful.
-7. Record one idempotent release entry in Postgres after health succeeds.
-8. Verify custom domains and the protected Vercel deployment against the same candidate.
+5. The Railway deployment path applies append-only Postgres migrations before starting the application and workers.
+6. Verify that Railway is running the exact reviewed commit, then wait for `/api/health`, `/api/persistence/status`, and worker heartbeats before recording the deployment as successful.
+7. Record one idempotent Railway release entry in Postgres after Railway health succeeds. This entry is Railway runtime evidence; it does not by itself prove that Vercel is synchronized.
+8. Create the protected Vercel deployment explicitly from the same Git commit SHA, then verify its runtime identity, health, and database fingerprint before considering the surfaces synchronized.
 
-Vercel runs database gates only for `dev` and `main`; other previews compile without mutating the shared development database.
+Automatic Vercel deployments are disabled for `dev` and `main` so a new web runtime cannot reach an environment before Railway has applied its migrations and passed health. Feature branches remain eligible for automatic protected previews; those previews compile without running managed environment gates or mutating the shared development database. A migration-dependent feature preview is compile/UI evidence only until the Railway migration is deployed and must not be treated as runtime acceptance against the shared database. After Railway succeeds, use Vercel's **Create Deployment** flow with the exact commit SHA rather than the moving branch name. The resulting `dev` or `main` deployment also verifies the managed mail configuration. Vercel builds never run `db:migrate`.
 
 ## Deployed Verification
 

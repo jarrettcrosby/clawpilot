@@ -2347,13 +2347,21 @@ assertIncludes(migrator, "pg_advisory_lock(hashtext('clawpilot-schema-migrations
 assertIncludes(migrator, "createHash('sha256')", 'migration checksums')
 assertIncludes(migrator, 'migration checksum mismatch', 'migration drift detection')
 
-const vercelConfig = read('app_src/vercel.json')
-assertIncludes(vercelConfig, 'npm run build:vercel', 'Vercel deployment migration gate')
+const vercelConfigSource = read('app_src/vercel.json')
+assertIncludes(vercelConfigSource, 'npm run build:vercel', 'Vercel managed build gate')
+const vercelConfig = JSON.parse(vercelConfigSource)
+assert.deepEqual(
+  vercelConfig.git?.deploymentEnabled,
+  { dev: false, main: false },
+  'Vercel dev and main deployments must remain explicit while feature previews stay enabled by default',
+)
 const vercelBuild = read('scripts/vercel-build.mjs')
 assertIncludes(vercelBuild, "if (environment === 'production')", 'production Vercel deployment gate')
 assertIncludes(vercelBuild, "if (branch !== 'main')", 'production Vercel fail-closed branch gate')
 assertIncludes(vercelBuild, "environment === 'preview' && branch === 'dev'", 'development Vercel deployment gate')
-assertIncludes(vercelBuild, "run('npm', ['run', 'build'], appRoot)", 'Vercel compile-before-migrate ordering')
+assertIncludes(vercelBuild, "run('npm', ['run', 'build'], appRoot)", 'Vercel compile-first ordering')
+assert.ok(!vercelBuild.includes('db-migrate.mjs'), 'Vercel builds must not invoke the database migrator')
+assert.ok(!vercelBuild.includes('db:migrate'), 'Vercel builds must not invoke the migration package script')
 
 const versionsRoute = read('app_src/app/api/versions/route.ts')
 assertIncludes(versionsRoute, 'getLocalReleaseOverview', 'local release history')
