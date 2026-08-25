@@ -24,7 +24,9 @@ import SaveRounded from '@mui/icons-material/SaveRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 
-type MutationKind = 'add_tag' | 'cancel' | 'set_line_quantity' | 'save_order'
+type MutationKind = 'add_tag' | 'cancel_fulfillment' | 'cancel'
+  | 'cancel_order_after_fulfillment_reversal'
+  | 'set_line_quantity' | 'save_order'
 type ShopifyLine = Readonly<{
   lineItemId: string
   title: string
@@ -38,6 +40,31 @@ type LineEligibility = Readonly<{
   reason: string | null
   minQuantity: number
   maxQuantity: number
+}>
+type ShopifyFulfillment = Readonly<{
+  fulfillmentId: string
+  name: string
+  status: string
+  displayStatus: string | null
+  updatedAt: string
+  deliveredAt: string | null
+  quantity: number
+  tracking: Array<Readonly<{
+    company: string | null
+    number: string | null
+    url: string | null
+  }>>
+}>
+type FulfillmentEligibility = Readonly<{
+  fulfillmentId: string
+  expectedUpdatedAt: string
+  allowed: boolean
+  reason: string | null
+}>
+type PostReversalCancellationEligibility = Readonly<{
+  allowed: boolean
+  reason: string | null
+  predecessorAuthorizationGlobalId: string | null
 }>
 type ShopifyShippingAddress = Readonly<{
   firstName: string | null
@@ -98,16 +125,28 @@ type ShopifyManagement = Readonly<{
     shippingAddress: ShopifyShippingAddress | null
     tags: string[]
     lines: ShopifyLine[]
+    fulfillments: ShopifyFulfillment[]
   }>
   eligibility: Readonly<{
     addTag: Readonly<{ allowed: boolean; reason: string | null }>
     ordinarySave: Readonly<{ allowed: boolean; reason: string | null }>
     cancel: Readonly<{ allowed: boolean; reason: string | null }>
+    cancelAfterFulfillmentReversal: PostReversalCancellationEligibility
+    fulfillments: FulfillmentEligibility[]
     lineEdits: LineEligibility[]
   }>
   openAttempt?: OpenAttempt | null
 }>
 type ShopifyMutation = Readonly<{ kind: 'add_tag'; tag: string }>
+  | Readonly<{
+      kind: 'cancel_fulfillment'
+      fulfillmentId: string
+      expectedFulfillmentUpdatedAt: string
+    }>
+  | Readonly<{
+      kind: 'cancel_order_after_fulfillment_reversal'
+      predecessorAuthorizationGlobalId: string
+    }>
   | Readonly<{ kind: 'cancel' }>
   | Readonly<{
       kind: 'set_line_quantity'
@@ -152,6 +191,8 @@ const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/
 const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/
 const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
+const SHOPIFY_FULFILLMENT_GID =
+  /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]{0,20}$/
 const SHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/
 const SHA256 = /^[a-f0-9]{64}$/
 const COUNTRY_CODE = /^[A-Z]{2}$/
@@ -199,6 +240,11 @@ function optionalText(value: unknown): value is string | null {
 }
 function integer(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value)
+}
+function isoInstant(value: unknown): value is string {
+  if (!text(value)) return false
+  const parsed = new Date(value)
+  return !Number.isNaN(parsed.valueOf()) && parsed.toISOString() === value
 }
 function shippingAddress(value: unknown): value is ShopifyShippingAddress | null {
   if (value === null) return true
@@ -259,6 +305,47 @@ function lineEligibility(value: unknown): value is LineEligibility {
     && integer(item.minQuantity) && item.minQuantity >= 0
     && integer(item.maxQuantity) && item.maxQuantity >= item.minQuantity
 }
+function trackingUrl(value: string | null) {
+  if (value === null) return true
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+function fulfillment(value: unknown): value is ShopifyFulfillment {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<ShopifyFulfillment>
+  return typeof item.fulfillmentId === 'string'
+    && SHOPIFY_FULFILLMENT_GID.test(item.fulfillmentId)
+    && text(item.name)
+    && text(item.status)
+    && optionalText(item.displayStatus)
+    && isoInstant(item.updatedAt)
+    && optionalText(item.deliveredAt)
+    && (item.deliveredAt === null || isoInstant(item.deliveredAt))
+    && integer(item.quantity) && item.quantity >= 0
+    && Array.isArray(item.tracking)
+    && item.tracking.length <= 20
+    && item.tracking.every((tracking) => (
+      optionalText(tracking.company)
+      && optionalText(tracking.number)
+      && optionalText(tracking.url)
+      && trackingUrl(tracking.url)
+    ))
+}
+function fulfillmentEligibility(
+  value: unknown,
+): value is FulfillmentEligibility {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<FulfillmentEligibility>
+  return typeof item.fulfillmentId === 'string'
+    && SHOPIFY_FULFILLMENT_GID.test(item.fulfillmentId)
+    && isoInstant(item.expectedUpdatedAt)
+    && typeof item.allowed === 'boolean'
+    && optionalText(item.reason)
+}
 function openAttempt(value: unknown): value is OpenAttempt {
   if (!value || typeof value !== 'object') return false
   const item = value as Partial<OpenAttempt>
@@ -268,7 +355,11 @@ function openAttempt(value: unknown): value is OpenAttempt {
     && AUTHORIZATION_GLOBAL_ID.test(item.authorizationGlobalId)
     && typeof item.intentHash === 'string' && SHA256.test(item.intentHash)
     && (item.state === 'processing' || item.state === 'unknown')
-    && ['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(item.actionKind || '')
+    && [
+      'add_tag', 'cancel_fulfillment',
+      'cancel_order_after_fulfillment_reversal', 'cancel',
+      'set_line_quantity', 'save_order',
+    ].includes(item.actionKind || '')
     && optionalText(item.providerReference)
     && optionalText(item.errorCode)
     && text(item.createdAt) && !Number.isNaN(Date.parse(item.createdAt))
@@ -289,6 +380,12 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
   const edits = Array.isArray(eligibility?.lineEdits)
     ? eligibility.lineEdits
     : []
+  const fulfillments = Array.isArray(order?.fulfillments)
+    ? order.fulfillments
+    : []
+  const fulfillmentEligibilityItems = Array.isArray(
+    eligibility?.fulfillments,
+  ) ? eligibility.fulfillments : []
   return typeof item.runtimeAvailable === 'boolean'
     && optionalText(item.blockerCode)
     && text(item.accountLabel)
@@ -311,12 +408,46 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && shippingAddress(order.shippingAddress)
     && Array.isArray(order.tags) && order.tags.every(text)
     && lines.every(line)
+    && fulfillments.length <= 50
+    && fulfillments.every(fulfillment)
     && typeof eligibility?.addTag?.allowed === 'boolean'
     && optionalText(eligibility.addTag.reason)
     && typeof eligibility?.ordinarySave?.allowed === 'boolean'
     && optionalText(eligibility.ordinarySave.reason)
     && typeof eligibility?.cancel?.allowed === 'boolean'
     && optionalText(eligibility.cancel.reason)
+    && typeof eligibility?.cancelAfterFulfillmentReversal?.allowed === 'boolean'
+    && optionalText(eligibility.cancelAfterFulfillmentReversal.reason)
+    && (
+      eligibility.cancelAfterFulfillmentReversal
+        .predecessorAuthorizationGlobalId === null
+      || (
+        typeof eligibility.cancelAfterFulfillmentReversal
+          .predecessorAuthorizationGlobalId === 'string'
+        && AUTHORIZATION_GLOBAL_ID.test(
+          eligibility.cancelAfterFulfillmentReversal
+            .predecessorAuthorizationGlobalId,
+        )
+      )
+    )
+    && (
+      eligibility.cancelAfterFulfillmentReversal.allowed !== true
+      || eligibility.cancelAfterFulfillmentReversal
+        .predecessorAuthorizationGlobalId !== null
+    )
+    && fulfillmentEligibilityItems.length <= 50
+    && fulfillmentEligibilityItems.every(fulfillmentEligibility)
+    && fulfillmentEligibilityItems.length === fulfillments.length
+    && new Set(fulfillments.map((fulfillment) => (
+      fulfillment.fulfillmentId
+    ))).size === fulfillments.length
+    && new Set(fulfillmentEligibilityItems.map((candidate) => (
+      candidate.fulfillmentId
+    ))).size === fulfillmentEligibilityItems.length
+    && fulfillmentEligibilityItems.every((candidate) => fulfillments.some(
+      (item) => item.fulfillmentId === candidate.fulfillmentId
+        && item.updatedAt === candidate.expectedUpdatedAt,
+    ))
     && edits.every(lineEligibility)
     && edits.every((edit) => lines.some(
       (candidate) => candidate.lineItemId === edit.lineItemId,
@@ -391,6 +522,10 @@ export default function ShopifyOrderManagementPanel({
   const [quantities, setQuantities] = useState<Record<string, string>>({})
   const [lastResult, setLastResult] = useState<ManagementResult | null>(null)
   const [ambiguousSave, setAmbiguousSave] = useState(false)
+  const [reversingFulfillmentId, setReversingFulfillmentId] =
+    useState<string | null>(null)
+  const [cancellingAfterReversal, setCancellingAfterReversal] =
+    useState(false)
   const saveAttempt = useRef<IdempotencyAttempt | null>(null)
   const reconcileAttempt = useRef<IdempotencyAttempt | null>(null)
 
@@ -443,6 +578,8 @@ export default function ShopifyOrderManagementPanel({
     setError('')
     setLastResult(null)
     setAmbiguousSave(false)
+    setReversingFulfillmentId(null)
+    setCancellingAfterReversal(false)
     saveAttempt.current = null
     reconcileAttempt.current = null
     const controller = new AbortController()
@@ -613,7 +750,15 @@ export default function ShopifyOrderManagementPanel({
         ))
         setNotice(saved.replayed
           ? 'The already-completed Shopify save was loaded.'
-          : 'Saved to Shopify.')
+          : mutation.kind === 'cancel_fulfillment'
+            ? 'Shopify fulfillment reversed.'
+            : mutation.kind === 'cancel_order_after_fulfillment_reversal'
+              ? 'Shopify order cancelled.'
+            : 'Saved to Shopify.')
+        if (
+          mutation.kind === 'cancel_fulfillment'
+          || mutation.kind === 'cancel_order_after_fulfillment_reversal'
+        ) await load()
         await Promise.resolve(onOrderChanged())
       }
     } catch (caught) {
@@ -627,6 +772,57 @@ export default function ShopifyOrderManagementPanel({
       }
     } finally {
       setAction(null)
+    }
+  }
+
+  const reverseFulfillment = async (
+    fulfillment: ShopifyFulfillment,
+    eligibility: FulfillmentEligibility,
+  ) => {
+    if (!eligibility.allowed || blocker || busy) return
+    const confirmed = window.confirm(
+      `Reverse ${fulfillment.name} in Shopify?\n\n`
+      + 'This does not cancel or refund the order. It does not void the '
+      + 'carrier label or remove saved label and reprint history.',
+    )
+    if (!confirmed) return
+    setReversingFulfillmentId(fulfillment.fulfillmentId)
+    try {
+      await save({
+        kind: 'cancel_fulfillment',
+        fulfillmentId: fulfillment.fulfillmentId,
+        expectedFulfillmentUpdatedAt: eligibility.expectedUpdatedAt,
+      })
+    } finally {
+      setReversingFulfillmentId(null)
+    }
+  }
+
+  const cancelAfterFulfillmentReversal = async () => {
+    const currentState = state
+    const eligibility = currentState?.eligibility.cancelAfterFulfillmentReversal
+    const predecessor = eligibility?.predecessorAuthorizationGlobalId
+    if (
+      !currentState
+      || !eligibility?.allowed
+      || !predecessor
+      || blocker
+      || busy
+    ) return
+    const confirmed = window.confirm(
+      `Cancel ${currentState.order.name} in Shopify?\n\n`
+      + 'This is a separate Shopify order cancellation after the fulfillment '
+      + 'reversal. It does not issue a refund.',
+    )
+    if (!confirmed) return
+    setCancellingAfterReversal(true)
+    try {
+      await save({
+        kind: 'cancel_order_after_fulfillment_reversal',
+        predecessorAuthorizationGlobalId: predecessor,
+      })
+    } finally {
+      setCancellingAfterReversal(false)
     }
   }
 
@@ -671,6 +867,7 @@ export default function ShopifyOrderManagementPanel({
         reconcileAttempt.current = null
         saveAttempt.current = null
         setNotice('Shopify outcome reconciled from a read-only check.')
+        await load()
         await Promise.resolve(onOrderChanged())
       }
     } catch (caught) {
@@ -780,6 +977,118 @@ export default function ShopifyOrderManagementPanel({
                 </Button>
               </Stack>
             </Alert>
+          )}
+
+          {state.order.fulfillments.length > 0 && (
+            <Box
+              sx={{
+                p: 1.5,
+                border: 1,
+                borderColor: 'divider',
+                borderRadius: 1.5,
+              }}
+              data-testid="shopify-fulfillments"
+            >
+              <Stack spacing={1.25}>
+                <Typography fontWeight={700}>Shopify fulfillments</Typography>
+                {state.order.fulfillments.map((fulfillment) => {
+                  const eligibility = state.eligibility.fulfillments.find(
+                    (candidate) => (
+                      candidate.fulfillmentId === fulfillment.fulfillmentId
+                    ),
+                  )
+                  const disabledReason = eligibility?.allowed
+                    ? null
+                    : eligibility?.reason
+                      || 'Shopify fulfillment reversal is unavailable.'
+                  return (
+                    <Box
+                      key={fulfillment.fulfillmentId}
+                      sx={{
+                        p: 1.25,
+                        border: 1,
+                        borderColor: 'divider',
+                        borderRadius: 1,
+                      }}
+                    >
+                      <Stack spacing={0.75}>
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={0.5}
+                          justifyContent="space-between"
+                        >
+                          <Typography fontWeight={600}>
+                            {fulfillment.name}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            {fulfillment.displayStatus || fulfillment.status}
+                            {' · '}{fulfillment.quantity} items
+                          </Typography>
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary">
+                          Updated {new Date(fulfillment.updatedAt).toLocaleString()}
+                        </Typography>
+                        {fulfillment.tracking.map((tracking, index) => (
+                          <Stack
+                            key={`${tracking.number || 'tracking'}:${index}`}
+                            direction="row"
+                            spacing={1}
+                            alignItems="center"
+                          >
+                            <Typography
+                              variant="body2"
+                              color="text.secondary"
+                              sx={{ overflowWrap: 'anywhere' }}
+                            >
+                              {[tracking.company, tracking.number]
+                                .filter(Boolean).join(' · ') || 'Tracking available'}
+                            </Typography>
+                            {tracking.url && (
+                              <Button
+                                component="a"
+                                href={tracking.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                size="small"
+                              >
+                                Track
+                              </Button>
+                            )}
+                          </Stack>
+                        ))}
+                        {eligibility && (
+                          <Tooltip title={blocker || disabledReason || ''}>
+                            <Box component="span" sx={{ display: 'block' }}>
+                              <Button
+                                fullWidth
+                                variant="outlined"
+                                color="error"
+                                startIcon={reversingFulfillmentId
+                                  === fulfillment.fulfillmentId
+                                  ? <CircularProgress size={16} />
+                                  : <CancelRounded />}
+                                disabled={busy
+                                  || Boolean(blocker)
+                                  || !eligibility.allowed}
+                                onClick={() => void reverseFulfillment(
+                                  fulfillment,
+                                  eligibility,
+                                )}
+                                sx={{ minHeight: 44 }}
+                                data-testid="reverse-shopify-fulfillment"
+                              >
+                                Reverse fulfillment
+                              </Button>
+                            </Box>
+                          </Tooltip>
+                        )}
+                        <DisabledReason value={disabledReason} />
+                      </Stack>
+                    </Box>
+                  )
+                })}
+              </Stack>
+            </Box>
           )}
 
           <Divider />
@@ -1054,8 +1363,66 @@ export default function ShopifyOrderManagementPanel({
               : state.eligibility.ordinarySave.reason} />
           </Box>
 
-          <Box sx={{ p: 1.5, border: 1, borderColor: 'error.dark', borderRadius: 1.5 }}>
-            <Stack spacing={1.25}>
+          {state.eligibility.cancelAfterFulfillmentReversal
+            .predecessorAuthorizationGlobalId && (
+            <Box
+              sx={{
+                p: 1.5,
+                border: 1,
+                borderColor: 'error.dark',
+                borderRadius: 1.5,
+              }}
+              data-testid="cancel-shopify-after-fulfillment-reversal"
+            >
+              <Stack spacing={1.25}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <CancelRounded color="error" fontSize="small" />
+                  <Typography fontWeight={700}>
+                    Cancel order after reversal
+                  </Typography>
+                </Stack>
+                <Typography variant="body2" color="text.secondary">
+                  The fulfillment reversal is complete. Order cancellation is
+                  a separate Shopify action.
+                </Typography>
+                <Tooltip title={blocker
+                  || state.eligibility.cancelAfterFulfillmentReversal.reason
+                  || ''}
+                >
+                  <Box component="span" sx={{ display: 'block' }}>
+                    <Button
+                      fullWidth
+                      variant="outlined"
+                      color="error"
+                      startIcon={cancellingAfterReversal
+                        ? <CircularProgress size={16} />
+                        : <CancelRounded />}
+                      disabled={busy
+                        || Boolean(blocker)
+                        || !state.eligibility
+                          .cancelAfterFulfillmentReversal.allowed}
+                      onClick={() => void cancelAfterFulfillmentReversal()}
+                      sx={{ minHeight: 44 }}
+                      data-testid="save-shopify-cancel-after-reversal"
+                    >
+                      Cancel Shopify order
+                    </Button>
+                  </Box>
+                </Tooltip>
+                <DisabledReason
+                  value={state.eligibility.cancelAfterFulfillmentReversal
+                    .allowed
+                    ? null
+                    : state.eligibility.cancelAfterFulfillmentReversal.reason}
+                />
+              </Stack>
+            </Box>
+          )}
+
+          {!state.eligibility.cancelAfterFulfillmentReversal
+            .predecessorAuthorizationGlobalId && (
+            <Box sx={{ p: 1.5, border: 1, borderColor: 'error.dark', borderRadius: 1.5 }}>
+              <Stack spacing={1.25}>
               <Stack direction="row" spacing={1} alignItems="center">
                 <CancelRounded color="error" fontSize="small" />
                 <Typography fontWeight={700}>Cancel order</Typography>
@@ -1086,8 +1453,9 @@ export default function ShopifyOrderManagementPanel({
               <DisabledReason value={state.eligibility.cancel.allowed
                 ? null
                 : state.eligibility.cancel.reason} />
-            </Stack>
-          </Box>
+              </Stack>
+            </Box>
+          )}
 
           {lastResult && (
             <Typography

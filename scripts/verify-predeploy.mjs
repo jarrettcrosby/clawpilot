@@ -31,6 +31,10 @@ const orderEditingReleaseMigrations = new Map([
     'db/migrations/0316_operations_commerce_fulfillment_authority_leases.sql',
     'c6d40d41082fea69cd01966642f824ed56776a1c4efad47bc6d74f75242ab71d',
   ],
+  [
+    'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
+    'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
+  ],
 ])
 
 function fail(message) {
@@ -94,6 +98,7 @@ for (const requiredFragment of [
   '72324e014c76e161ee66133f7980aa22620bf76914adc9bbc53a2bad3cf0f164',
   'OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT = 74',
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0',
+  'd0049adc200df110ed90132dd77bd300d0cfb9703b4921abcc5ae8bdb4eef24a',
   'OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50',
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf',
   'b778ce078c72111b3b73d2302acc38191ac4af9e9c88e6973ce0cbb1658b03d6',
@@ -381,6 +386,7 @@ for (const requiredPath of [
   'db/migrations/0322_operations_duplicate_order_workbench_recovery.sql',
   'db/migrations/0323_operations_unit_material_cartonization.sql',
   'db/migrations/0324_operations_external_fulfillment_label_artifacts.sql',
+  'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',

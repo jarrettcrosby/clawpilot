@@ -28,7 +28,18 @@ export type ShopifyOrderManagementShippingAddress = {
 export type ShopifyOrderManagementAction =
   | { type: 'add_tag'; tag: string }
   | {
+      type: 'cancel_fulfillment'
+      fulfillmentGid: string
+      expectedFulfillmentUpdatedAt: string
+    }
+  | {
       type: 'cancel'
+      reason?: 'STAFF' | 'OTHER'
+      staffNote?: string
+    }
+  | {
+      type: 'cancel_order_after_fulfillment_reversal'
+      predecessorAuthorizationGlobalId: string
       reason?: 'STAFF' | 'OTHER'
       staffNote?: string
     }
@@ -87,6 +98,10 @@ export type ShopifyOrderManagementAuthorization = {
   providerOrderTest: boolean
   providerSnapshotHash: string
   action: ShopifyOrderManagementAction['type']
+  fulfillmentGid: string | null
+  expectedFulfillmentUpdatedAt: string | null
+  predecessorAuthorizationGlobalId: string | null
+  predecessorFulfillmentGid: string | null
   lineItemGid: string | null
   expectedLineQuantity: number | null
   requestedQuantity: number | null
@@ -161,6 +176,11 @@ export type ShopifyOrderManagementTarget = {
   latestProviderUpdatedAt: string | null
   latestProviderOrderTest: boolean | null
   zeroDownstream: boolean
+  reversibleExternalFulfillmentGid: string | null
+  reversibleExternalFulfillmentUpdatedAt: string | null
+  fulfillmentReversalSafe: boolean
+  postReversalOrderCancellationSafe: boolean
+  postReversalOrderCancellationPredecessorGlobalId: string | null
   latestOpenAuthorization: ShopifyOrderManagementAuthorization | null
 }
 
@@ -266,6 +286,11 @@ type AuthorizationRow = {
   provider_order_test: boolean
   provider_snapshot_hash: string
   action: ShopifyOrderManagementAction['type']
+  fulfillment_gid: string | null
+  expected_fulfillment_updated_at: TimestampValue | null
+  predecessor_authorization_id: string | null
+  predecessor_authorization_global_id?: string | null
+  predecessor_fulfillment_gid?: string | null
   line_item_id: string | null
   expected_line_quantity: number | null
   requested_quantity: number | null
@@ -336,6 +361,11 @@ type BindingRow = {
   latest_source_hash: string | null
   material_state: string
   zero_downstream: boolean
+  fulfillment_reversal_safe: boolean
+  post_reversal_order_cancellation_safe: boolean
+  predecessor_authorization_id: string | null
+  predecessor_authorization_global_id: string | null
+  predecessor_fulfillment_gid: string | null
 }
 
 export class ShopifyOrderManagementPersistenceError extends Error {
@@ -357,6 +387,8 @@ const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/
 const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/
 const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
+const SHOPIFY_FULFILLMENT_GID =
+  /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]{0,20}$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/
@@ -729,6 +761,24 @@ export function normalizeShopifyOrderManagementAction(
     }
     return { type: 'add_tag', tag }
   }
+  if (input.type === 'cancel_fulfillment') {
+    const fulfillmentGid = String(input.fulfillmentGid || '').trim()
+    if (!SHOPIFY_FULFILLMENT_GID.test(fulfillmentGid)) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'A valid Shopify Fulfillment GID is required',
+        400,
+      )
+    }
+    return {
+      type: 'cancel_fulfillment',
+      fulfillmentGid,
+      expectedFulfillmentUpdatedAt: timestamp(
+        input.expectedFulfillmentUpdatedAt,
+        'Expected Shopify fulfillment updated time',
+      ),
+    }
+  }
   if (input.type === 'cancel') {
     const reason = input.reason === undefined ? 'STAFF' : input.reason
     if (reason !== 'STAFF' && reason !== 'OTHER') {
@@ -745,6 +795,33 @@ export function normalizeShopifyOrderManagementAction(
     )
     return {
       type: 'cancel',
+      reason,
+      ...(staffNote ? { staffNote } : {}),
+    }
+  }
+  if (input.type === 'cancel_order_after_fulfillment_reversal') {
+    const predecessorAuthorizationGlobalId = globalId(
+      input.predecessorAuthorizationGlobalId,
+      AUTHORIZATION_GLOBAL_ID,
+      'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+      'A valid fulfillment-reversal authorization is required',
+    )
+    const reason = input.reason === undefined ? 'STAFF' : input.reason
+    if (reason !== 'STAFF' && reason !== 'OTHER') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Cancellation reason must be STAFF or OTHER',
+        400,
+      )
+    }
+    const staffNote = optionalText(
+      input.staffNote,
+      'Cancellation staff note',
+      255,
+    )
+    return {
+      type: 'cancel_order_after_fulfillment_reversal',
+      predecessorAuthorizationGlobalId,
       reason,
       ...(staffNote ? { staffNote } : {}),
     }
@@ -847,7 +924,7 @@ export function normalizeShopifyOrderManagementAction(
   }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
-    'Supported actions are add_tag, cancel, set_line_quantity, and save_order',
+    'Supported actions are add_tag, cancel_fulfillment, cancel, cancel_order_after_fulfillment_reversal, set_line_quantity, and save_order',
     400,
   )
 }
@@ -856,6 +933,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
   if (action.type === 'add_tag') {
     return {
       action: action.type,
+      fulfillmentGid: null,
+      expectedFulfillmentUpdatedAt: null,
+      predecessorAuthorizationGlobalId: null,
       lineItemGid: null,
       requestedQuantity: null,
       tagHash: shopifyOrderManagementEvidenceHash({
@@ -866,9 +946,31 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
       staffNoteHash: null,
     }
   }
-  if (action.type === 'cancel') {
+  if (action.type === 'cancel_fulfillment') {
     return {
       action: action.type,
+      fulfillmentGid: action.fulfillmentGid,
+      expectedFulfillmentUpdatedAt: action.expectedFulfillmentUpdatedAt,
+      predecessorAuthorizationGlobalId: null,
+      lineItemGid: null,
+      requestedQuantity: null,
+      tagHash: null,
+      cancelReason: null,
+      staffNoteHash: null,
+    }
+  }
+  if (
+    action.type === 'cancel'
+    || action.type === 'cancel_order_after_fulfillment_reversal'
+  ) {
+    return {
+      action: action.type,
+      fulfillmentGid: null,
+      expectedFulfillmentUpdatedAt: null,
+      predecessorAuthorizationGlobalId:
+        action.type === 'cancel_order_after_fulfillment_reversal'
+          ? action.predecessorAuthorizationGlobalId
+          : null,
       lineItemGid: null,
       requestedQuantity: null,
       tagHash: null,
@@ -884,6 +986,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
   if (action.type === 'save_order') {
     return {
       action: action.type,
+      fulfillmentGid: null,
+      expectedFulfillmentUpdatedAt: null,
+      predecessorAuthorizationGlobalId: null,
       lineItemGid: null,
       requestedQuantity: null,
       tagHash: null,
@@ -893,6 +998,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
   }
   return {
     action: action.type,
+    fulfillmentGid: null,
+    expectedFulfillmentUpdatedAt: null,
+    predecessorAuthorizationGlobalId: null,
     lineItemGid: action.lineItemGid,
     requestedQuantity: action.quantity,
     tagHash: null,
@@ -1027,6 +1135,12 @@ function authorization(
     providerOrderTest: row.provider_order_test,
     providerSnapshotHash: row.provider_snapshot_hash,
     action: row.action,
+    fulfillmentGid: row.fulfillment_gid,
+    expectedFulfillmentUpdatedAt:
+      iso(row.expected_fulfillment_updated_at),
+    predecessorAuthorizationGlobalId:
+      row.predecessor_authorization_global_id || null,
+    predecessorFulfillmentGid: row.predecessor_fulfillment_gid || null,
     lineItemGid: row.line_item_id,
     expectedLineQuantity: row.expected_line_quantity === null
       ? null : Number(row.expected_line_quantity),
@@ -1081,14 +1195,19 @@ const AUTHORIZATION_SELECT = `SELECT
   outcome.reconciliation_resolution,
   outcome.provider_write_count,
   outcome.provider_reference,
-  outcome.error_code
+  outcome.error_code,
+  predecessor.global_id AS predecessor_authorization_global_id,
+  predecessor.fulfillment_gid AS predecessor_fulfillment_gid
 FROM operations_shopify_order_management_authorizations authz
 LEFT JOIN operations_shopify_order_management_attempts attempt
   ON attempt.organization_id = authz.organization_id
  AND attempt.id = authz.provider_attempt_id
 LEFT JOIN operations_shopify_order_management_outcomes outcome
   ON outcome.organization_id = authz.organization_id
- AND outcome.id = authz.latest_outcome_id`
+ AND outcome.id = authz.latest_outcome_id
+LEFT JOIN operations_shopify_order_management_authorizations predecessor
+  ON predecessor.organization_id = authz.organization_id
+ AND predecessor.id = authz.predecessor_authorization_id`
 
 async function requireActorRole(
   client: PoolClient,
@@ -1127,6 +1246,9 @@ async function readBinding(
     organizationId: string
     accountGlobalId: string
     orderGlobalId: string
+    fulfillmentGid: string | null
+    expectedFulfillmentUpdatedAt: string | null
+    predecessorAuthorizationGlobalId: string | null
   },
 ) {
   const result = await client.query<BindingRow>(
@@ -1182,7 +1304,27 @@ async function readBinding(
        target.material_state,
        ocr_order_has_zero_downstream(
          order_row.organization_id, order_row.id
-       ) AS zero_downstream
+       ) AS zero_downstream,
+       CASE
+         WHEN $4::text IS NULL OR $5::timestamptz IS NULL THEN false
+         ELSE operations_shopify_fulfillment_reversal_is_safe(
+           order_row.organization_id,
+           order_row.id,
+           $4,
+           $5::timestamptz
+         )
+       END AS fulfillment_reversal_safe,
+       predecessor.id::text AS predecessor_authorization_id,
+       predecessor.global_id AS predecessor_authorization_global_id,
+       predecessor.fulfillment_gid AS predecessor_fulfillment_gid,
+       CASE
+         WHEN predecessor.id IS NULL THEN false
+         ELSE operations_shopify_post_reversal_order_cancellation_is_safe(
+           order_row.organization_id,
+           order_row.id,
+           predecessor.id
+         )
+       END AS post_reversal_order_cancellation_safe
      FROM operations_orders order_row
      JOIN operations_integration_accounts account
        ON account.organization_id = order_row.organization_id
@@ -1196,6 +1338,13 @@ async function readBinding(
      JOIN operations_commerce_order_revision_targets target
        ON target.organization_id = order_row.organization_id
       AND target.order_id = order_row.id
+     LEFT JOIN operations_shopify_order_management_authorizations predecessor
+       ON predecessor.organization_id = order_row.organization_id
+      AND predecessor.order_id = order_row.id
+      AND predecessor.integration_account_id = account.id
+      AND predecessor.external_order_id = order_row.external_order_id
+      AND predecessor.global_id = $6
+      AND predecessor.action = 'cancel_fulfillment'
      LEFT JOIN operations_commerce_order_revision_observations accepted
        ON accepted.organization_id = target.organization_id
       AND accepted.id = target.accepted_observation_id
@@ -1210,7 +1359,14 @@ async function readBinding(
        AND account.global_id = $2
        AND order_row.global_id = $3
      FOR UPDATE OF order_row, account, credential, target`,
-    [input.organizationId, input.accountGlobalId, input.orderGlobalId],
+    [
+      input.organizationId,
+      input.accountGlobalId,
+      input.orderGlobalId,
+      input.fulfillmentGid,
+      input.expectedFulfillmentUpdatedAt,
+      input.predecessorAuthorizationGlobalId,
+    ],
   )
   const row = result.rows[0]
   if (!row) {
@@ -1233,6 +1389,9 @@ function assertCurrentBinding(
     requiresOrderEdits?: boolean
   },
 ) {
+  const fulfillmentReversal = input.action === 'cancel_fulfillment'
+  const postReversalOrderCancellation =
+    input.action === 'cancel_order_after_fulfillment_reversal'
   if (
     row.account_environment !== 'sandbox'
     || !row.external_account_id
@@ -1257,6 +1416,10 @@ function assertCurrentBinding(
     || !SHA256.test(row.provider_write_scope_digest)
     || (input.requiresOrderEdits
       && !row.provider_write_bound_scopes?.includes('write_order_edits'))
+    || (fulfillmentReversal
+      && !row.provider_write_bound_scopes?.includes(
+        'write_merchant_managed_fulfillment_orders',
+      ))
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
@@ -1265,7 +1428,13 @@ function assertCurrentBinding(
   }
   if (
     Number(row.order_row_version) !== input.expectedOrderRowVersion
-    || row.order_status !== 'imported'
+    || (
+      fulfillmentReversal
+        ? row.order_status !== 'cancelled'
+        : postReversalOrderCancellation
+          ? row.order_status !== 'cancelled'
+        : row.order_status !== 'imported'
+    )
     || row.archived_at !== null
     || row.source_hash !== input.expectedSourceHash
     || row.accepted_source_hash !== input.expectedSourceHash
@@ -1277,6 +1446,12 @@ function assertCurrentBinding(
             'provider_cancelled',
             'provider_fulfilled',
           ].includes(row.material_state)
+        : fulfillmentReversal
+          ? row.material_state !== 'provider_fulfilled'
+        : postReversalOrderCancellation
+          ? !['provider_fulfilled', 'review_required'].includes(
+              row.material_state,
+            )
         : (
             !row.accepted_observation_id
             || !row.accepted_provider_order_updated_at
@@ -1287,11 +1462,21 @@ function assertCurrentBinding(
             || row.material_state !== 'current'
           )
     )
-    || row.zero_downstream !== true
+    || (
+      fulfillmentReversal
+        ? row.fulfillment_reversal_safe !== true
+        : postReversalOrderCancellation
+          ? row.post_reversal_order_cancellation_safe !== true
+        : row.zero_downstream !== true
+    )
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
-      'The order changed, left Imported status, or has downstream warehouse work',
+      fulfillmentReversal
+        ? 'The order changed or is no longer eligible for fulfillment reversal'
+        : postReversalOrderCancellation
+          ? 'The order changed or is no longer eligible for cancellation after fulfillment reversal'
+        : 'The order changed, left Imported status, or has downstream warehouse work',
     )
   }
 }
@@ -1401,7 +1586,9 @@ export async function prepareShopifyOrderManagementInPostgres(
     const providerOrderTest = input.providerOrderTest
     if (
       (
-        action.type === 'cancel'
+        action.type === 'cancel_fulfillment'
+        || action.type === 'cancel_order_after_fulfillment_reversal'
+        || action.type === 'cancel'
         || action.type === 'set_line_quantity'
         || requiresOrderEdits
       )
@@ -1409,7 +1596,7 @@ export async function prepareShopifyOrderManagementInPostgres(
     ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
-        'Cancellation and line quantity changes require a Shopify test order',
+        'Fulfillment reversal, cancellation, and line quantity changes require a Shopify test order',
         409,
       )
     }
@@ -1420,6 +1607,19 @@ export async function prepareShopifyOrderManagementInPostgres(
       providerOrderUpdatedAt,
       providerOrderObservedAt,
       providerOrderTest,
+      ...(action.type === 'cancel_fulfillment'
+        ? {
+            fulfillmentGid: actionFacts.fulfillmentGid,
+            expectedFulfillmentUpdatedAt:
+              actionFacts.expectedFulfillmentUpdatedAt,
+          }
+        : {}),
+      ...(action.type === 'cancel_order_after_fulfillment_reversal'
+        ? {
+            predecessorAuthorizationGlobalId:
+              actionFacts.predecessorAuthorizationGlobalId,
+          }
+        : {}),
       expectedLineQuantity: expectedLineQuantityValue,
       requestedProjectionHash,
       requiresOrderEdits,
@@ -1449,6 +1649,11 @@ export async function prepareShopifyOrderManagementInPostgres(
       organizationId: scopedOrganizationId,
       accountGlobalId,
       orderGlobalId,
+      fulfillmentGid: actionFacts.fulfillmentGid,
+      expectedFulfillmentUpdatedAt:
+        actionFacts.expectedFulfillmentUpdatedAt,
+      predecessorAuthorizationGlobalId:
+        actionFacts.predecessorAuthorizationGlobalId,
     })
     assertCurrentBinding(binding, {
       expectedOrderRowVersion,
@@ -1457,9 +1662,15 @@ export async function prepareShopifyOrderManagementInPostgres(
       providerOrderUpdatedAt,
       requiresOrderEdits,
     })
-    const acceptedObservationId = action.type === 'add_tag'
+    const acceptedObservationId = [
+      'add_tag', 'cancel_fulfillment',
+      'cancel_order_after_fulfillment_reversal',
+    ].includes(action.type)
       ? null : binding.accepted_observation_id
-    const acceptedProviderOrderUpdatedAt = action.type === 'add_tag'
+    const acceptedProviderOrderUpdatedAt = [
+      'add_tag', 'cancel_fulfillment',
+      'cancel_order_after_fulfillment_reversal',
+    ].includes(action.type)
       ? null : iso(binding.accepted_provider_order_updated_at)
 
     const inserted = await client.query<AuthorizationRow>(
@@ -1475,7 +1686,8 @@ export async function prepareShopifyOrderManagementInPostgres(
          external_order_id, order_number, expected_order_row_version,
          expected_source_hash, provider_order_updated_at,
          provider_order_observed_at, provider_order_test,
-         provider_snapshot_hash, action, line_item_id,
+         provider_snapshot_hash, action, fulfillment_gid,
+         expected_fulfillment_updated_at, line_item_id,
          expected_line_quantity, requested_quantity,
          tag_hash, cancel_reason, staff_note_hash,
          requested_projection_hash, requires_order_edits,
@@ -1483,14 +1695,16 @@ export async function prepareShopifyOrderManagementInPostgres(
          intent_hash,
          idempotency_key, request_hash, status, authorized_by,
          authorized_role, accepted_observation_id,
-         accepted_provider_order_updated_at, prepared_at, expires_at
+         accepted_provider_order_updated_at, predecessor_authorization_id,
+         prepared_at, expires_at
        )
        SELECT
          $1::uuid, $2::uuid, $3, 'shopify', $4, $5, $6, $7,
          $8, $9, $10::uuid, $11, $12, $13, $14::bigint, $15,
          $16::timestamptz, $17::timestamptz, $18, $19, $20, $21,
-         $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-         $32, 'prepared', $33, $34, $35::uuid, $36::timestamptz,
+         $22::timestamptz, $23, $24, $25, $26, $27, $28, $29,
+         $30, $31, $32, $33, $34, 'prepared', $35, $36,
+         $37::uuid, $38::timestamptz, $39::uuid,
          prepared_clock.prepared_at,
          prepared_clock.prepared_at + interval '5 minutes'
        FROM prepared_clock
@@ -1516,6 +1730,8 @@ export async function prepareShopifyOrderManagementInPostgres(
         providerOrderTest,
         providerSnapshotHash,
         actionFacts.action,
+        actionFacts.fulfillmentGid,
+        actionFacts.expectedFulfillmentUpdatedAt,
         actionFacts.lineItemGid,
         expectedLineQuantityValue,
         actionFacts.requestedQuantity,
@@ -1532,6 +1748,7 @@ export async function prepareShopifyOrderManagementInPostgres(
         role,
         acceptedObservationId,
         acceptedProviderOrderUpdatedAt,
+        binding.predecessor_authorization_id,
       ],
     )
     const row = inserted.rows[0]
@@ -1560,13 +1777,24 @@ export async function prepareShopifyOrderManagementInPostgres(
         intentHash: exactIntentHash,
         authorizationReason: reason,
         expectedLineQuantity: expectedLineQuantityValue,
+        fulfillmentGid: actionFacts.fulfillmentGid,
+        expectedFulfillmentUpdatedAt:
+          actionFacts.expectedFulfillmentUpdatedAt,
+        predecessorAuthorizationGlobalId:
+          actionFacts.predecessorAuthorizationGlobalId,
+        predecessorFulfillmentGid: binding.predecessor_fulfillment_gid,
         requestedProjectionHash,
         requiresOrderEdits,
         expiresAt: iso(row.expires_at),
         providerWrites: 0,
       },
     }, client)
-    return authorization(row)
+    return authorization({
+      ...row,
+      predecessor_authorization_global_id:
+        actionFacts.predecessorAuthorizationGlobalId,
+      predecessor_fulfillment_gid: binding.predecessor_fulfillment_gid,
+    })
   })
 }
 
@@ -1703,6 +1931,19 @@ export async function claimShopifyOrderManagementInPostgres(
       acceptedProviderOrderUpdatedAt:
         iso(row.accepted_provider_order_updated_at),
       providerSnapshotHash: row.provider_snapshot_hash,
+      ...(row.action === 'cancel_fulfillment'
+        ? {
+            fulfillmentGid: row.fulfillment_gid,
+            expectedFulfillmentUpdatedAt:
+              iso(row.expected_fulfillment_updated_at),
+          }
+        : {}),
+      ...(row.action === 'cancel_order_after_fulfillment_reversal'
+        ? {
+            predecessorAuthorizationGlobalId:
+              row.predecessor_authorization_global_id,
+          }
+        : {}),
       expectedLineQuantity: row.expected_line_quantity,
       requestedProjectionHash: row.requested_projection_hash,
       requiresOrderEdits: row.requires_order_edits,
@@ -1723,15 +1964,18 @@ export async function claimShopifyOrderManagementInPostgres(
          credential_generation, provider_write_control_row_version,
          provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
-         expected_source_hash, provider_snapshot_hash, action, intent_hash,
+         expected_source_hash, provider_snapshot_hash, action,
+         fulfillment_gid, expected_fulfillment_updated_at, intent_hash,
          expected_line_quantity, requested_projection_hash,
          requires_order_edits, attempt_hash, dispatch_state, claimed_by,
          accepted_observation_id, accepted_provider_order_updated_at,
-         claimed_at, processing_lease_expires_at
+         predecessor_authorization_id, claimed_at,
+         processing_lease_expires_at
        ) SELECT
          $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
-         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15, $16,
-         $17, $18, $19, $20, 'authorized', $21, $22::uuid, $23::timestamptz,
+         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15,
+         $16, $17::timestamptz, $18, $19, $20, $21, $22,
+         'authorized', $23, $24::uuid, $25::timestamptz, $26::uuid,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -1753,6 +1997,8 @@ export async function claimShopifyOrderManagementInPostgres(
         row.expected_source_hash,
         row.provider_snapshot_hash,
         row.action,
+        row.fulfillment_gid,
+        row.expected_fulfillment_updated_at,
         row.intent_hash,
         row.expected_line_quantity,
         row.requested_projection_hash,
@@ -1761,6 +2007,7 @@ export async function claimShopifyOrderManagementInPostgres(
         claimedBy,
         row.accepted_observation_id,
         row.accepted_provider_order_updated_at,
+        row.predecessor_authorization_id,
       ],
     )
     const attempt = attempted.rows[0]
@@ -1804,6 +2051,12 @@ export async function claimShopifyOrderManagementInPostgres(
         acceptedProviderOrderUpdatedAt:
           iso(row.accepted_provider_order_updated_at),
         providerSnapshotHash: row.provider_snapshot_hash,
+        fulfillmentGid: row.fulfillment_gid,
+        expectedFulfillmentUpdatedAt:
+          iso(row.expected_fulfillment_updated_at),
+        predecessorAuthorizationGlobalId:
+          row.predecessor_authorization_global_id || null,
+        predecessorFulfillmentGid: row.predecessor_fulfillment_gid || null,
         expectedLineQuantity: row.expected_line_quantity,
         requestedProjectionHash: row.requested_projection_hash,
         requiresOrderEdits: row.requires_order_edits,
@@ -1817,7 +2070,13 @@ export async function claimShopifyOrderManagementInPostgres(
     }, client)
     return {
       expired: false as const,
-      row: updated.rows[0],
+      row: {
+        ...updated.rows[0],
+        predecessor_authorization_global_id:
+          row.predecessor_authorization_global_id || null,
+        predecessor_fulfillment_gid:
+          row.predecessor_fulfillment_gid || null,
+      },
       attempt,
       attemptHash,
     }
@@ -2534,6 +2793,11 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     latest_provider_updated_at: string | null
     latest_provider_order_test: string | null
     zero_downstream: boolean
+    reversible_external_fulfillment_gid: string | null
+    reversible_external_fulfillment_updated_at: TimestampValue | null
+    fulfillment_reversal_safe: boolean
+    post_reversal_order_cancellation_safe: boolean
+    predecessor_authorization_global_id: string | null
   }>(
     `SELECT
        account.global_id AS account_global_id,
@@ -2595,7 +2859,24 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
          AS latest_provider_order_test,
        ocr_order_has_zero_downstream(
          order_row.organization_id, order_row.id
-       ) AS zero_downstream
+       ) AS zero_downstream,
+       external_reconciliation.provider_fulfillment_id
+         AS reversible_external_fulfillment_gid,
+       external_reconciliation.provider_fulfillment_updated_at
+         AS reversible_external_fulfillment_updated_at,
+       CASE
+         WHEN external_reconciliation.id IS NULL THEN false
+         ELSE operations_shopify_fulfillment_reversal_is_safe(
+           order_row.organization_id,
+           order_row.id,
+           external_reconciliation.provider_fulfillment_id,
+           external_reconciliation.provider_fulfillment_updated_at
+         )
+       END AS fulfillment_reversal_safe,
+       post_reversal_predecessor.global_id
+         AS predecessor_authorization_global_id,
+       (post_reversal_predecessor.id IS NOT NULL)
+         AS post_reversal_order_cancellation_safe
      FROM operations_orders order_row
      JOIN operations_integration_accounts account
        ON account.organization_id = order_row.organization_id
@@ -2627,6 +2908,26 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
      LEFT JOIN operations_commerce_order_revision_reads latest_read
        ON latest_read.organization_id = target.organization_id
       AND latest_read.id = target.latest_read_id
+     LEFT JOIN operations_shopify_external_fulfillment_reconciliations
+       external_reconciliation
+       ON external_reconciliation.organization_id = order_row.organization_id
+      AND external_reconciliation.order_id = order_row.id
+     LEFT JOIN LATERAL (
+       SELECT candidate.id, candidate.global_id
+       FROM operations_shopify_order_management_authorizations candidate
+       WHERE candidate.organization_id = order_row.organization_id
+         AND candidate.order_id = order_row.id
+         AND candidate.integration_account_id = account.id
+         AND candidate.external_order_id = order_row.external_order_id
+         AND candidate.action = 'cancel_fulfillment'
+         AND operations_shopify_post_reversal_order_cancellation_is_safe(
+               order_row.organization_id,
+               order_row.id,
+               candidate.id
+             )
+       ORDER BY candidate.completed_at DESC, candidate.id DESC
+       LIMIT 1
+     ) post_reversal_predecessor ON true
      WHERE order_row.organization_id = $1::uuid
        AND order_row.global_id = $2
        AND order_row.source_provider = 'shopify'
@@ -2692,6 +2993,15 @@ export async function readShopifyOrderManagementTargetInPostgres(input: {
     latestProviderUpdatedAt: providerUpdatedAt,
     latestProviderOrderTest: providerOrderTest,
     zeroDownstream: row.zero_downstream === true,
+    reversibleExternalFulfillmentGid:
+      row.reversible_external_fulfillment_gid,
+    reversibleExternalFulfillmentUpdatedAt:
+      iso(row.reversible_external_fulfillment_updated_at),
+    fulfillmentReversalSafe: row.fulfillment_reversal_safe === true,
+    postReversalOrderCancellationSafe:
+      row.post_reversal_order_cancellation_safe === true,
+    postReversalOrderCancellationPredecessorGlobalId:
+      row.predecessor_authorization_global_id,
     latestOpenAuthorization: latestOpen.rows[0]
       ? authorization(latestOpen.rows[0]) : null,
   }

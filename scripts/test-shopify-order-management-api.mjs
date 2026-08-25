@@ -62,11 +62,36 @@ function managementFixture(globalId = 'gor1234567') {
         unfulfilledQuantity: 2,
         fulfilledQuantity: 0,
       }],
+      fulfillments: [{
+        fulfillmentId: 'gid://shopify/Fulfillment/456',
+        name: '#6600.1',
+        status: 'SUCCESS',
+        displayStatus: 'FULFILLED',
+        updatedAt: '2026-08-14T03:19:00.000Z',
+        deliveredAt: null,
+        quantity: 2,
+        tracking: [{
+          company: 'UPS',
+          number: '1ZTEST6600',
+          url: 'https://www.ups.com/track?tracknum=1ZTEST6600',
+        }],
+      }],
     },
     eligibility: {
       addTag: { allowed: true, reason: null },
       ordinarySave: { allowed: true, reason: null },
       cancel: { allowed: true, reason: null },
+      cancelAfterFulfillmentReversal: {
+        allowed: false,
+        reason: 'No completed fulfillment reversal is available',
+        predecessorAuthorizationGlobalId: null,
+      },
+      fulfillments: [{
+        fulfillmentId: 'gid://shopify/Fulfillment/456',
+        expectedUpdatedAt: '2026-08-14T03:19:00.000Z',
+        allowed: true,
+        reason: null,
+      }],
       lineEdits: [{
         lineItemId: 'gid://shopify/LineItem/123',
         allowed: true,
@@ -93,6 +118,9 @@ function authorizationFixture() {
       orderTest: true,
       orderUpdatedAt: '2026-08-14T03:20:00.000Z',
       action: 'add_tag',
+      fulfillmentId: null,
+      expectedFulfillmentUpdatedAt: null,
+      predecessorAuthorizationGlobalId: null,
       lineItemId: null,
       previousQuantity: null,
       requestedQuantity: null,
@@ -384,6 +412,19 @@ assert.deepEqual(plain(calls), [['read', {
 }]])
 assert.equal(result.headers.get('cache-control'), 'private, no-store')
 assert.equal(result.headers.get('vary'), 'Cookie')
+assert.deepEqual(
+  result.payload.management.order.fulfillments,
+  managementFixture(orderGlobalId).order.fulfillments,
+)
+assert.deepEqual(
+  result.payload.management.eligibility.fulfillments,
+  managementFixture(orderGlobalId).eligibility.fulfillments,
+)
+assert.deepEqual(
+  result.payload.management.eligibility.cancelAfterFulfillmentReversal,
+  managementFixture(orderGlobalId).eligibility
+    .cancelAfterFulfillmentReversal,
+)
 
 result = await get(orderGlobalId, `&organizationId=${organizationA}`)
 assert.equal(result.status, 400)
@@ -413,6 +454,49 @@ assert.deepEqual(plain(calls), [['save', {
   idempotencyKey: idempotency,
 }]])
 assert.equal(JSON.stringify(result.payload).includes(organizationB), false)
+
+const reverseFulfillmentMutation = Object.freeze({
+  kind: 'cancel_fulfillment',
+  fulfillmentId: 'gid://shopify/Fulfillment/456',
+  expectedFulfillmentUpdatedAt: '2026-08-14T03:19:00.000Z',
+})
+reset()
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: reverseFulfillmentMutation,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['save', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: reverseFulfillmentMutation,
+  idempotencyKey: idempotency,
+}]])
+
+const cancelAfterReversalMutation = Object.freeze({
+  kind: 'cancel_order_after_fulfillment_reversal',
+  predecessorAuthorizationGlobalId: 'gsom7654321',
+})
+reset()
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelAfterReversalMutation,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['save', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelAfterReversalMutation,
+  idempotencyKey: idempotency,
+}]])
 
 const ordinarySaveMutation = Object.freeze({
   kind: 'save_order',
@@ -535,6 +619,41 @@ for (const [body, expectedCode] of [
   [{
     action: 'save', orderGlobalId, expectedRowVersion: 7,
     mutation: {
+      ...reverseFulfillmentMutation,
+      fulfillmentId: 'gid://shopify/Fulfillment/not-numeric',
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...reverseFulfillmentMutation,
+      expectedFulfillmentUpdatedAt: '2026-08-14T03:19:00Z',
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...reverseFulfillmentMutation,
+      refund: true,
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...cancelAfterReversalMutation,
+      predecessorAuthorizationGlobalId: 'gsom-not-valid',
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
+      ...cancelAfterReversalMutation,
+      refund: true,
+    },
+  }, 'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID'],
+  [{
+    action: 'save', orderGlobalId, expectedRowVersion: 7,
+    mutation: {
       ...ordinarySaveMutation,
       tagAdds: ['priority'],
       tagRemoves: ['priority'],
@@ -626,6 +745,30 @@ assert.equal(result.status, 500)
 assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_INTERNAL_ERROR')
 assert.equal(JSON.stringify(result.payload).includes('client-secret-value'), false)
 assert.equal(JSON.stringify(routeErrors).includes('client-secret-value'), false)
+
+reset()
+readImpl = async (input) => {
+  const fixture = managementFixture(input.orderGlobalId)
+  fixture.order.fulfillments[0].tracking[0].url = 'javascript:alert(1)'
+  return fixture
+}
+result = await get()
+assert.equal(result.status, 500)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_RESULT_INVALID')
+
+reset()
+readImpl = async (input) => {
+  const fixture = managementFixture(input.orderGlobalId)
+  fixture.eligibility.cancelAfterFulfillmentReversal = {
+    allowed: true,
+    reason: null,
+    predecessorAuthorizationGlobalId: null,
+  }
+  return fixture
+}
+result = await get()
+assert.equal(result.status, 500)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_MANAGEMENT_RESULT_INVALID')
 
 // Successful responses are explicit public projections rather than a spread
 // of command objects. Unknown credential/evidence fields cannot cross the API.

@@ -18,6 +18,12 @@ import {
 const ORDER_GID_PATTERN = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOP_GID_PATTERN = /^gid:\/\/shopify\/Shop\/[1-9][0-9]*$/
 const LINE_ITEM_GID_PATTERN = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]*$/
+const FULFILLMENT_GID_PATTERN =
+  /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
+const FULFILLMENT_ORDER_GID_PATTERN =
+  /^gid:\/\/shopify\/FulfillmentOrder\/[1-9][0-9]*$/
+const LOCATION_GID_PATTERN = /^gid:\/\/shopify\/Location\/[1-9][0-9]*$/
+const AUTHORIZATION_GLOBAL_ID_PATTERN = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/
 const CALCULATED_ORDER_GID_PATTERN =
   /^gid:\/\/shopify\/CalculatedOrder\/[A-Za-z0-9][A-Za-z0-9-]*$/
 const ORDER_EDIT_SESSION_GID_PATTERN =
@@ -29,6 +35,9 @@ const SAFE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,127}$/
 const CURRENCY_CODE_PATTERN = /^(?:[A-Z]{3}|USDC)$/
 const DECIMAL_AMOUNT_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/
 const MAX_ORDER_LINES = 250
+const MAX_ORDER_FULFILLMENTS = 10
+const MAX_FULFILLMENT_ORDERS = 10
+const MAX_FULFILLMENT_TRACKING_ENTRIES = 10
 const MAX_GID_LENGTH = 255
 const MAX_TAGS = 250
 const MAX_TAG_LENGTH = 255
@@ -48,7 +57,7 @@ const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/
 
 export const SHOPIFY_ORDER_MANAGEMENT_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 export const SHOPIFY_ORDER_MANAGEMENT_ADAPTER_VERSION =
-  'shopify-graphql-2026-07-order-management-v2'
+  'shopify-graphql-2026-07-order-management-v3'
 
 if (SHOPIFY_ORDER_MANAGEMENT_API_VERSION !== '2026-07') {
   throw new Error('Shopify order management requires Admin API 2026-07')
@@ -61,6 +70,18 @@ export type ShopifyOrderManagementAction =
     }
   | {
       type: 'cancel'
+      reason?: 'OTHER' | 'STAFF'
+      staffNote?: string | null
+    }
+  | {
+      type: 'cancel_fulfillment'
+      fulfillmentGid: string
+      expectedFulfillmentUpdatedAt: string
+    }
+  | {
+      type: 'cancel_order_after_fulfillment_reversal'
+      predecessorAuthorizationGlobalId: string
+      reversedFulfillmentGid?: string
       reason?: 'OTHER' | 'STAFF'
       staffNote?: string | null
     }
@@ -116,6 +137,35 @@ export type ShopifyOrderShippingAddress = {
   phone: string | null
 }
 
+export type ShopifyOrderManagementFulfillmentTracking = {
+  company: string | null
+  number: string | null
+  url: string | null
+}
+
+export type ShopifyOrderManagementFulfillmentOrder = {
+  id: string
+  assignedLocation: {
+    location: {
+      id: string
+      name: string
+    } | null
+  }
+}
+
+export type ShopifyOrderManagementFulfillment = {
+  id: string
+  name: string
+  status: string
+  displayStatus: string | null
+  createdAt: string
+  updatedAt: string
+  deliveredAt: string | null
+  totalQuantity: number
+  tracking: ShopifyOrderManagementFulfillmentTracking[]
+  fulfillmentOrders: ShopifyOrderManagementFulfillmentOrder[]
+}
+
 export type ShopifyOrderManagementPreview = {
   id: string
   legacyResourceId: string
@@ -143,6 +193,7 @@ export type ShopifyOrderManagementPreview = {
   shippingAddress: ShopifyOrderShippingAddress | null
   tags: string[]
   lines: ShopifyOrderManagementLine[]
+  fulfillments: ShopifyOrderManagementFulfillment[]
 }
 
 export type ShopifyOrderTagMutationResult = {
@@ -172,6 +223,11 @@ export type ShopifyOrderSaveResult = {
 export type ShopifyOrderCancelMutationResult = {
   jobGid: string
   done: boolean
+}
+
+export type ShopifyFulfillmentCancelMutationResult = {
+  fulfillmentGid: string
+  status: string
 }
 
 export type ShopifyOrderManagementJobRead = {
@@ -252,6 +308,7 @@ export type ShopifyOrderManagementExecutionResult = {
   after: ShopifyOrderManagementPreview | null
   result:
     | ShopifyOrderCancelMutationResult
+    | ShopifyFulfillmentCancelMutationResult
     | ShopifyOrderEditCommitResult
     | ShopifyOrderTagMutationResult
     | ShopifyOrderSaveResult
@@ -277,6 +334,7 @@ export type InspectShopifyOrderManagementTargetInput = {
     orderName?: string
   }
   requiredActions?: readonly ShopifyOrderManagementAction['type'][]
+  fulfillmentGid?: string
   jobGid?: string
   clientOptions?: ShopifyCommerceClientOptions
 }
@@ -976,6 +1034,151 @@ function parseLine(value: unknown): ShopifyOrderManagementLine {
   }
 }
 
+function parseFulfillmentTracking(
+  value: unknown,
+): ShopifyOrderManagementFulfillmentTracking {
+  const tracking = safeRecord(value)
+  if (!tracking) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid fulfillment tracking evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  return {
+    company: nullableResponseText(
+      tracking.company,
+      'fulfillment tracking company',
+      255,
+    ),
+    number: nullableResponseText(
+      tracking.number,
+      'fulfillment tracking number',
+      255,
+    ),
+    url: nullableResponseText(
+      tracking.url,
+      'fulfillment tracking URL',
+      2_048,
+    ),
+  }
+}
+
+function parseFulfillmentOrder(
+  value: unknown,
+): ShopifyOrderManagementFulfillmentOrder {
+  const fulfillmentOrder = safeRecord(value)
+  const assignedLocation = safeRecord(fulfillmentOrder?.assignedLocation)
+  const location = safeRecord(assignedLocation?.location)
+  if (
+    !fulfillmentOrder
+    || !assignedLocation
+    || (assignedLocation.location !== null && !location)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid fulfillment ownership evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  return {
+    id: strictGid(
+      fulfillmentOrder.id,
+      'fulfillment order identity',
+      FULFILLMENT_ORDER_GID_PATTERN,
+    ),
+    assignedLocation: {
+      location: location
+        ? {
+            id: strictGid(
+              location.id,
+              'fulfillment location identity',
+              LOCATION_GID_PATTERN,
+            ),
+            name: strictText(location.name, 'fulfillment location name', 255),
+          }
+        : null,
+    },
+  }
+}
+
+function parseFulfillment(value: unknown): ShopifyOrderManagementFulfillment {
+  const fulfillment = safeRecord(value)
+  const fulfillmentOrders = safeRecord(fulfillment?.fulfillmentOrders)
+  const pageInfo = safeRecord(fulfillmentOrders?.pageInfo)
+  if (
+    !fulfillment
+    || !Array.isArray(fulfillment.trackingInfo)
+    || fulfillment.trackingInfo.length > MAX_FULFILLMENT_TRACKING_ENTRIES
+    || (fulfillment?.fulfillmentOrders !== undefined && (
+      !fulfillmentOrders
+      || !pageInfo
+      || !Array.isArray(fulfillmentOrders.nodes)
+      || fulfillmentOrders.nodes.length > MAX_FULFILLMENT_ORDERS
+      || typeof pageInfo.hasNextPage !== 'boolean'
+    ))
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid fulfillment evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  if (pageInfo?.hasNextPage) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_FULFILLMENT_TOO_LARGE',
+      'A Shopify fulfillment has more fulfillment orders than the bounded preview can verify',
+      409,
+      { stage: 'provider_preview' },
+    )
+  }
+  const parsedFulfillmentOrders = fulfillmentOrders
+    ? (fulfillmentOrders.nodes as unknown[]).map(parseFulfillmentOrder)
+    : []
+  if (
+    new Set(parsedFulfillmentOrders.map((entry) => entry.id)).size
+      !== parsedFulfillmentOrders.length
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned duplicate fulfillment ownership evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  return {
+    id: strictGid(
+      fulfillment.id,
+      'fulfillment identity',
+      FULFILLMENT_GID_PATTERN,
+    ),
+    name: strictText(fulfillment.name, 'fulfillment name', 255),
+    status: strictText(fulfillment.status, 'fulfillment status', 64),
+    displayStatus: fulfillment.displayStatus === null
+      ? null
+      : strictText(
+          fulfillment.displayStatus,
+          'fulfillment display status',
+          64,
+        ),
+    createdAt: isoDate(fulfillment.createdAt, 'fulfillment creation timestamp'),
+    updatedAt: isoDate(fulfillment.updatedAt, 'fulfillment update timestamp'),
+    deliveredAt: optionalIsoDate(
+      fulfillment.deliveredAt,
+      'fulfillment delivery timestamp',
+    ),
+    totalQuantity: strictNonnegativeInteger(
+      fulfillment.totalQuantity,
+      'fulfillment total quantity',
+    ),
+    tracking: fulfillment.trackingInfo.map(parseFulfillmentTracking),
+    fulfillmentOrders: parsedFulfillmentOrders,
+  }
+}
+
 function parsePreview(
   value: unknown,
   shopCurrencyInput: unknown,
@@ -990,6 +1193,8 @@ function parsePreview(
     || !Array.isArray(lineItems.nodes)
     || lineItems.nodes.length > MAX_ORDER_LINES
     || typeof pageInfo.hasNextPage !== 'boolean'
+    || !Array.isArray(order.fulfillments)
+    || order.fulfillments.length > MAX_ORDER_FULFILLMENTS
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
@@ -1011,6 +1216,18 @@ function parsePreview(
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
       'Shopify returned invalid or duplicate order lines',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  const fulfillments = order.fulfillments.map(parseFulfillment)
+  if (
+    new Set(fulfillments.map((fulfillment) => fulfillment.id)).size
+      !== fulfillments.length
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned duplicate fulfillments',
       502,
       { stage: 'provider_preview' },
     )
@@ -1101,12 +1318,35 @@ function parsePreview(
     shippingAddress: parseShippingAddress(order.shippingAddress),
     tags: strictTags(order.tags),
     lines,
+    fulfillments,
   }
 }
 
 const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
-  `query ClawPilotShopifyOrderManagementPreview($id: ID!) {
+  `query ClawPilotShopifyOrderManagementPreview(
+    $id: ID!
+    $fulfillmentId: ID!
+    $includeExactFulfillment: Boolean!
+    $includeFulfillmentOwnership: Boolean!
+  ) {
     shop { currencyCode }
+    exactFulfillment: node(id: $fulfillmentId)
+      @include(if: $includeExactFulfillment) {
+      ... on Fulfillment {
+        ...ClawPilotShopifyFulfillmentEvidence
+        order { id }
+        fulfillmentOrders(first: 10)
+          @include(if: $includeFulfillmentOwnership) {
+          nodes {
+            id
+            assignedLocation {
+              location { id name }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }
+    }
     order(id: $id) {
       id
       legacyResourceId
@@ -1147,6 +1387,9 @@ const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
         phone
       }
       tags
+      fulfillments(first: 10) {
+        ...ClawPilotShopifyFulfillmentEvidence
+      }
       lineItems(first: 250) {
         nodes {
           id
@@ -1160,6 +1403,21 @@ const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
         pageInfo { hasNextPage }
       }
     }
+  }
+  fragment ClawPilotShopifyFulfillmentEvidence on Fulfillment {
+    id
+    name
+    status
+    displayStatus
+    createdAt
+    updatedAt
+    deliveredAt
+    totalQuantity
+    trackingInfo(first: 10) {
+      company
+      number
+      url
+    }
   }`
 
 export async function readShopifyOrderManagementPreview(
@@ -1167,18 +1425,35 @@ export async function readShopifyOrderManagementPreview(
   orderGid: unknown,
   options: ShopifyCommerceClientOptions = {},
   overrides: Partial<ShopifyOrderManagementDependencies> = {},
+  exactFulfillmentGid?: unknown,
+  includeFulfillmentOwnership = false,
 ): Promise<ShopifyOrderManagementPreview> {
   const id = inputGid(orderGid, 'Shopify order ID', ORDER_GID_PATTERN)
+  const includeExactFulfillment = exactFulfillmentGid !== undefined
+  const fulfillmentId = includeExactFulfillment
+    ? inputGid(
+        exactFulfillmentGid,
+        'exact Shopify fulfillment ID',
+        FULFILLMENT_GID_PATTERN,
+      )
+    : id
   const dependencies = { ...DEFAULT_DEPENDENCIES, ...overrides }
   const data = await dependencies.graphql<{
     order?: unknown
     shop?: unknown
+    exactFulfillment?: unknown
   }>(
     credential,
     {
       query: SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY,
       operationName: 'ClawPilotShopifyOrderManagementPreview',
-      variables: { id },
+      variables: {
+        id,
+        fulfillmentId,
+        includeExactFulfillment,
+        includeFulfillmentOwnership:
+          includeExactFulfillment && includeFulfillmentOwnership,
+      },
     },
     options,
   )
@@ -1217,7 +1492,34 @@ export async function readShopifyOrderManagementPreview(
       { stage: 'provider_preview' },
     )
   }
-  return preview
+  if (!includeExactFulfillment) return preview
+  const exactFulfillment = safeRecord(root.exactFulfillment)
+  const exactOrder = safeRecord(exactFulfillment?.order)
+  if (
+    !exactFulfillment
+    || !exactOrder
+    || strictGid(
+      exactOrder.id,
+      'fulfillment order identity',
+      ORDER_GID_PATTERN,
+    ) !== preview.id
+  ) {
+    fail(
+      'SHOPIFY_FULFILLMENT_NOT_FOUND',
+      'The exact Shopify fulfillment was not found on this order',
+      404,
+      { stage: 'provider_preview' },
+    )
+  }
+  const parsedFulfillment = parseFulfillment(exactFulfillment)
+  const fulfillments = preview.fulfillments.some((entry) => (
+    entry.id === parsedFulfillment.id
+  ))
+    ? preview.fulfillments.map((entry) => (
+        entry.id === parsedFulfillment.id ? parsedFulfillment : entry
+      ))
+    : [...preview.fulfillments, parsedFulfillment]
+  return { ...preview, fulfillments }
 }
 
 const SHOPIFY_ORDER_MANAGEMENT_JOB_QUERY =
@@ -1627,6 +1929,83 @@ export async function cancelShopifyTestOrder(
   }
 }
 
+const SHOPIFY_FULFILLMENT_CANCEL_MUTATION =
+  `mutation ClawPilotShopifyTestFulfillmentCancel($id: ID!) {
+    fulfillmentCancel(id: $id) {
+      fulfillment { id status }
+      userErrors { field message }
+    }
+  }`
+
+export async function cancelShopifyTestFulfillment(
+  credential: ShopifyCommerceRuntimeCredential,
+  fulfillmentGidInput: unknown,
+  options: ShopifyCommerceClientOptions = {},
+  overrides: Partial<ShopifyOrderManagementDependencies> = {},
+): Promise<ShopifyFulfillmentCancelMutationResult> {
+  const fulfillmentGid = inputGid(
+    fulfillmentGidInput,
+    'Shopify fulfillment ID',
+    FULFILLMENT_GID_PATTERN,
+  )
+  const dependencies = { ...DEFAULT_DEPENDENCIES, ...overrides }
+  const data = await dependencies.graphql<{ fulfillmentCancel?: unknown }>(
+    credential,
+    {
+      query: SHOPIFY_FULFILLMENT_CANCEL_MUTATION,
+      operationName: 'ClawPilotShopifyTestFulfillmentCancel',
+      variables: { id: fulfillmentGid },
+    },
+    options,
+  )
+  const payload = safeRecord(safeRecord(data)?.fulfillmentCancel)
+  if (!payload) {
+    fail(
+      'SHOPIFY_FULFILLMENT_CANCEL_RESPONSE_INVALID',
+      'Shopify returned an invalid fulfillment cancellation response',
+      502,
+      { stage: 'cancel_fulfillment' },
+    )
+  }
+  if (safeUserErrors(payload.userErrors).length) {
+    providerRejected(
+      'SHOPIFY_FULFILLMENT_CANCEL_REJECTED',
+      'Shopify rejected the test-order fulfillment cancellation',
+      'cancel_fulfillment',
+    )
+  }
+  const fulfillment = safeRecord(payload.fulfillment)
+  if (!fulfillment) {
+    fail(
+      'SHOPIFY_FULFILLMENT_CANCEL_RESPONSE_INVALID',
+      'Shopify did not return the cancelled fulfillment',
+      502,
+      { stage: 'cancel_fulfillment' },
+    )
+  }
+  const result = {
+    fulfillmentGid: strictGid(
+      fulfillment.id,
+      'cancelled fulfillment identity',
+      FULFILLMENT_GID_PATTERN,
+    ),
+    status: strictText(
+      fulfillment.status,
+      'cancelled fulfillment status',
+      64,
+    ),
+  }
+  if (result.fulfillmentGid !== fulfillmentGid || result.status !== 'CANCELLED') {
+    fail(
+      'SHOPIFY_FULFILLMENT_CANCEL_RESPONSE_MISMATCH',
+      'Shopify returned a different or non-cancelled fulfillment',
+      502,
+      { stage: 'cancel_fulfillment' },
+    )
+  }
+  return result
+}
+
 const SHOPIFY_ORDER_EDIT_BEGIN_MUTATION =
   `mutation ClawPilotShopifyOrderEditBegin($id: ID!) {
     orderEditBegin(id: $id) {
@@ -1961,6 +2340,44 @@ function normalizeAction(action: ShopifyOrderManagementAction): ShopifyOrderMana
       staffNote: normalizeStaffNote(action.staffNote, false),
     }
   }
+  if (action.type === 'cancel_order_after_fulfillment_reversal') {
+    const reason = action.reason === undefined ? 'STAFF' : action.reason
+    if (reason !== 'OTHER' && reason !== 'STAFF') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify cancellation reason must be STAFF or OTHER',
+      )
+    }
+    return {
+      type: 'cancel_order_after_fulfillment_reversal',
+      predecessorAuthorizationGlobalId: inputGid(
+        action.predecessorAuthorizationGlobalId,
+        'fulfillment-reversal authorization ID',
+        AUTHORIZATION_GLOBAL_ID_PATTERN,
+      ),
+      reversedFulfillmentGid: inputGid(
+        action.reversedFulfillmentGid,
+        'reversed Shopify fulfillment ID',
+        FULFILLMENT_GID_PATTERN,
+      ),
+      reason,
+      staffNote: normalizeStaffNote(action.staffNote, false),
+    }
+  }
+  if (action.type === 'cancel_fulfillment') {
+    return {
+      type: 'cancel_fulfillment',
+      fulfillmentGid: inputGid(
+        action.fulfillmentGid,
+        'Shopify fulfillment ID',
+        FULFILLMENT_GID_PATTERN,
+      ),
+      expectedFulfillmentUpdatedAt: expectedIsoDate(
+        action.expectedFulfillmentUpdatedAt,
+        'expected Shopify fulfillment timestamp',
+      ),
+    }
+  }
   if (action.type === 'set_line_quantity') {
     if (!Number.isSafeInteger(action.quantity) || action.quantity < 0) {
       fail(
@@ -2171,7 +2588,13 @@ export function requestedShopifyOrderSaveProjectionHash(
 }
 
 function requiredScopes(action: ShopifyOrderManagementAction): ShopifyAccessScope[] {
-  return action.type === 'set_line_quantity'
+  return action.type === 'cancel_fulfillment'
+    ? [
+        'read_orders',
+        'write_orders',
+        'write_merchant_managed_fulfillment_orders',
+      ]
+    : action.type === 'set_line_quantity'
     ? ['read_orders', 'write_order_edits']
     : action.type === 'save_order' && action.lineQuantities.length > 0
       ? ['read_orders', 'write_orders', 'write_order_edits']
@@ -2290,6 +2713,83 @@ function assertCancellationEligible(preview: ShopifyOrderManagementPreview) {
       { stage: 'eligibility' },
     )
   }
+}
+
+function assertPostReversalCancellationEligible(
+  preview: ShopifyOrderManagementPreview,
+  action: Extract<
+    ShopifyOrderManagementAction,
+    { type: 'cancel_order_after_fulfillment_reversal' }
+  >,
+) {
+  assertCancellationEligible(preview)
+  const reversedFulfillment = targetFulfillment(
+    preview,
+    action.reversedFulfillmentGid!,
+  )
+  if (reversedFulfillment.status !== 'CANCELLED') {
+    fail(
+      'SHOPIFY_ORDER_POST_REVERSAL_CANCEL_NOT_ELIGIBLE',
+      'The exact predecessor fulfillment is not cancelled in Shopify',
+      409,
+      { stage: 'eligibility' },
+    )
+  }
+}
+
+function targetFulfillment(
+  preview: ShopifyOrderManagementPreview,
+  fulfillmentGid: string,
+): ShopifyOrderManagementFulfillment {
+  const fulfillment = preview.fulfillments.find((candidate) => (
+    candidate.id === fulfillmentGid
+  ))
+  if (!fulfillment) {
+    fail(
+      'SHOPIFY_FULFILLMENT_NOT_FOUND',
+      'The selected Shopify fulfillment was not found on this order',
+      404,
+      { stage: 'eligibility' },
+    )
+  }
+  return fulfillment
+}
+
+function assertFulfillmentCancellationEligible(
+  preview: ShopifyOrderManagementPreview,
+  action: Extract<
+    ShopifyOrderManagementAction,
+    { type: 'cancel_fulfillment' }
+  >,
+): ShopifyOrderManagementFulfillment {
+  assertTestOrder(preview)
+  const fulfillment = targetFulfillment(preview, action.fulfillmentGid)
+  if (fulfillment.updatedAt !== action.expectedFulfillmentUpdatedAt) {
+    fail(
+      'SHOPIFY_FULFILLMENT_STALE',
+      'The Shopify fulfillment changed after this reversal was prepared',
+      409,
+      { stage: 'eligibility' },
+    )
+  }
+  if (
+    fulfillment.status !== 'SUCCESS'
+    || fulfillment.displayStatus !== 'FULFILLED'
+    || fulfillment.deliveredAt !== null
+    || fulfillment.totalQuantity < 1
+    || fulfillment.fulfillmentOrders.length < 1
+    || fulfillment.fulfillmentOrders.some((fulfillmentOrder) => (
+      fulfillmentOrder.assignedLocation.location === null
+    ))
+  ) {
+    fail(
+      'SHOPIFY_FULFILLMENT_CANCEL_NOT_ELIGIBLE',
+      'Only a successful, undelivered Shopify fulfillment with exact assigned-location evidence can be reversed',
+      409,
+      { stage: 'eligibility' },
+    )
+  }
+  return fulfillment
 }
 
 function targetLine(
@@ -2500,7 +3000,7 @@ function inspectionActions(
   value: InspectShopifyOrderManagementTargetInput['requiredActions'],
 ): ShopifyOrderManagementAction['type'][] {
   if (value === undefined) return []
-  if (!Array.isArray(value) || value.length > 4) {
+  if (!Array.isArray(value) || value.length > 6) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
       'Required Shopify order actions are invalid',
@@ -2510,6 +3010,8 @@ function inspectionActions(
   if (actions.some((action) => ![
     'add_tag',
     'cancel',
+    'cancel_order_after_fulfillment_reversal',
+    'cancel_fulfillment',
     'set_line_quantity',
     'save_order',
   ].includes(action))) {
@@ -2542,6 +3044,13 @@ export async function inspectShopifyOrderManagementTarget(
     'expected Shopify order ID',
     ORDER_GID_PATTERN,
   )
+  const fulfillmentGid = input.fulfillmentGid === undefined
+    ? undefined
+    : inputGid(
+        input.fulfillmentGid,
+        'exact Shopify fulfillment ID',
+        FULFILLMENT_GID_PATTERN,
+      )
   const orderName = input.expected.orderName === undefined
     ? null
     : inputText(
@@ -2572,9 +3081,14 @@ export async function inspectShopifyOrderManagementTarget(
   assertProbeIdentity(probe, { shopId, shopDomain })
   const required = new Set<ShopifyAccessScope>(['read_orders'])
   for (const action of actions) {
-    required.add(action === 'set_line_quantity'
-      ? 'write_order_edits'
-      : 'write_orders')
+    if (action === 'set_line_quantity') {
+      required.add('write_order_edits')
+      continue
+    }
+    required.add('write_orders')
+    if (action === 'cancel_fulfillment') {
+      required.add('write_merchant_managed_fulfillment_orders')
+    }
   }
   assertRequiredScopes(
     [...required],
@@ -2586,6 +3100,8 @@ export async function inspectShopifyOrderManagementTarget(
     orderGid,
     options,
     dependencies,
+    fulfillmentGid,
+    actions.includes('cancel_fulfillment'),
   )
   if (
     preview.id !== orderGid
@@ -2651,11 +3167,18 @@ export async function executeShopifyOrderManagementAction(
   const probe = await dependencies.probeConnection(runtimeCredential, options)
   assertProbeIdentity(probe, expected)
   assertScopes(action, token.grantedScopes, probe.grantedScopes)
+  const exactFulfillmentGid = action.type === 'cancel_fulfillment'
+    ? action.fulfillmentGid
+    : action.type === 'cancel_order_after_fulfillment_reversal'
+      ? action.reversedFulfillmentGid
+      : undefined
   const before = await readShopifyOrderManagementPreview(
     runtimeCredential,
     expected.orderGid,
     options,
     dependencies,
+    exactFulfillmentGid,
+    action.type === 'cancel_fulfillment',
   )
   assertOrderIdentity(before, expected)
 
@@ -2899,8 +3422,89 @@ export async function executeShopifyOrderManagementAction(
     }
   }
 
-  if (action.type === 'cancel') {
-    assertCancellationEligible(before)
+  if (action.type === 'cancel_fulfillment') {
+    const fulfillment = assertFulfillmentCancellationEligible(before, action)
+    let mutation: ShopifyFulfillmentCancelMutationResult
+    try {
+      mutation = await cancelShopifyTestFulfillment(
+        runtimeCredential,
+        fulfillment.id,
+        options,
+        dependencies,
+      )
+    } catch (error) {
+      return explicitFirstMutationRejection(error)
+        ? rejectedResult({ action: action.type, probe, before, error })
+        : unknownResult({
+            action: action.type,
+            probe,
+            before,
+            providerWritesKnown: false,
+            providerWrites: null,
+            error,
+          })
+    }
+    try {
+      const after = await readShopifyOrderManagementPreview(
+        runtimeCredential,
+        before.id,
+        options,
+        dependencies,
+        fulfillment.id,
+        true,
+      )
+      const cancelledFulfillment = after.fulfillments.find((candidate) => (
+        candidate.id === fulfillment.id
+      ))
+      if (
+        after.id !== before.id
+        || after.name !== before.name
+        || mutation.fulfillmentGid !== fulfillment.id
+        || mutation.status !== 'CANCELLED'
+        || !cancelledFulfillment
+        || cancelledFulfillment.status !== 'CANCELLED'
+      ) {
+        fail(
+          'SHOPIFY_FULFILLMENT_CANCEL_READBACK_MISMATCH',
+          'Shopify fulfillment readback did not show the exact fulfillment as cancelled',
+          502,
+          { stage: 'cancel_fulfillment_readback' },
+        )
+      }
+      return {
+        ...resultBase({ action: action.type, probe, before, providerReads: 3 }),
+        outcome: 'succeeded',
+        providerMutationAttempted: true,
+        providerWritesKnown: true,
+        providerWrites: 1,
+        after,
+        result: mutation,
+        providerReference: mutation.fulfillmentGid,
+        errorCode: null,
+        safeMessage: null,
+      }
+    } catch (error) {
+      return unknownResult({
+        action: action.type,
+        probe,
+        before,
+        providerReads: 3,
+        providerWritesKnown: true,
+        providerWrites: 1,
+        error,
+      })
+    }
+  }
+
+  if (
+    action.type === 'cancel'
+    || action.type === 'cancel_order_after_fulfillment_reversal'
+  ) {
+    if (action.type === 'cancel_order_after_fulfillment_reversal') {
+      assertPostReversalCancellationEligible(before, action)
+    } else {
+      assertCancellationEligible(before)
+    }
     let mutation: ShopifyOrderCancelMutationResult
     try {
       mutation = await cancelShopifyTestOrder(
@@ -2945,6 +3549,9 @@ export async function executeShopifyOrderManagementAction(
         before.id,
         options,
         dependencies,
+        action.type === 'cancel_order_after_fulfillment_reversal'
+          ? action.reversedFulfillmentGid
+          : undefined,
       )
       if (after.id !== before.id || after.name !== before.name || !after.cancelledAt) {
         fail(

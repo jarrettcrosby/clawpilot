@@ -32,9 +32,19 @@ import { readCommerceRuntimeCredentialFromPostgres } from '@/lib/persistence/com
 
 const SHA256 = /^[a-f0-9]{64}$/u
 const JOB_GID = /^gid:\/\/shopify\/Job\/[A-Za-z0-9][A-Za-z0-9-]*$/u
+const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/u
 
 export type ShopifyOrderManagementMutation =
   | Readonly<{ kind: 'add_tag'; tag: string }>
+  | Readonly<{
+      kind: 'cancel_fulfillment'
+      fulfillmentId: string
+      expectedFulfillmentUpdatedAt: string
+    }>
+  | Readonly<{
+      kind: 'cancel_order_after_fulfillment_reversal'
+      predecessorAuthorizationGlobalId: string
+    }>
   | Readonly<{ kind: 'cancel' }>
   | Readonly<{
       kind: 'set_line_quantity'
@@ -81,6 +91,22 @@ function providerAction(
 ): ShopifyOrderManagementAction {
   if (mutation.kind === 'add_tag') {
     return { type: 'add_tag', tag: mutation.tag }
+  }
+  if (mutation.kind === 'cancel_fulfillment') {
+    return {
+      type: 'cancel_fulfillment',
+      fulfillmentGid: mutation.fulfillmentId,
+      expectedFulfillmentUpdatedAt: mutation.expectedFulfillmentUpdatedAt,
+    }
+  }
+  if (mutation.kind === 'cancel_order_after_fulfillment_reversal') {
+    return {
+      type: 'cancel_order_after_fulfillment_reversal',
+      predecessorAuthorizationGlobalId:
+        mutation.predecessorAuthorizationGlobalId,
+      reason: 'STAFF',
+      staffNote: staffNote(reason),
+    }
   }
   if (mutation.kind === 'cancel') {
     return {
@@ -171,6 +197,50 @@ function providerWriteBlocker(target: ShopifyOrderManagementTarget) {
 
 function targetBlocker(target: ShopifyOrderManagementTarget) {
   return targetWriteBlocker(target) || providerWriteBlocker(target)
+}
+
+function fulfillmentReversalTargetBlocker(
+  target: ShopifyOrderManagementTarget,
+) {
+  const readBlocker = targetReadBlocker(target)
+  if (readBlocker) return readBlocker
+  const writeBlocker = providerWriteBlocker(target)
+  if (writeBlocker) return writeBlocker
+  if (
+    !target.sourceHash
+    || target.acceptedSourceHash !== target.sourceHash
+    || target.orderStatus !== 'cancelled'
+    || target.materialState !== 'provider_fulfilled'
+    || target.fulfillmentReversalSafe !== true
+  ) {
+    return 'This order is not eligible for Shopify fulfillment reversal'
+  }
+  return null
+}
+
+function postReversalOrderCancellationTargetBlocker(
+  target: ShopifyOrderManagementTarget,
+) {
+  const readBlocker = targetReadBlocker(target)
+  if (readBlocker) return readBlocker
+  const writeBlocker = providerWriteBlocker(target)
+  if (writeBlocker) return writeBlocker
+  if (
+    !target.sourceHash
+    || target.acceptedSourceHash !== target.sourceHash
+    || target.orderStatus !== 'cancelled'
+    || ![
+      'provider_fulfilled', 'review_required',
+    ].includes(target.materialState)
+    || target.postReversalOrderCancellationSafe !== true
+    || !target.postReversalOrderCancellationPredecessorGlobalId
+    || !AUTHORIZATION_GLOBAL_ID.test(
+      target.postReversalOrderCancellationPredecessorGlobalId,
+    )
+  ) {
+    return 'This order is not eligible for cancellation after fulfillment reversal'
+  }
+  return null
 }
 
 function assertReconciliationTarget(
@@ -306,6 +376,7 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     shippingAddress: null,
     tags: [],
     lines: [],
+    fulfillments: [],
   }
 }
 
@@ -366,9 +437,17 @@ function publicState(input: {
     input.grantedScopes,
     'write_orders',
   )
+  const readOrders = hasEffectiveShopifyScope(
+    input.grantedScopes,
+    'read_orders',
+  )
   const writeOrderEdits = hasEffectiveShopifyScope(
     input.grantedScopes,
     'write_order_edits',
+  )
+  const writeMerchantManagedFulfillmentOrders = hasEffectiveShopifyScope(
+    input.grantedScopes,
+    'write_merchant_managed_fulfillment_orders',
   )
   const addTagReason = writeReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
@@ -376,6 +455,59 @@ function publicState(input: {
   const ordinarySaveReason = writeReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
+  const fulfillmentBaseReason = baseReason
+    || fulfillmentReversalTargetBlocker(input.target)
+    || (!readOrders
+      ? 'The Shopify connection is missing read_orders'
+      : null)
+    || (!writeOrders
+      ? 'The Shopify connection is missing write_orders'
+      : null)
+    || (!writeMerchantManagedFulfillmentOrders
+      ? 'The Shopify connection is missing write_merchant_managed_fulfillment_orders'
+      : null)
+    || (!input.preview.test
+      ? 'Fulfillment reversal is limited to Shopify test orders'
+      : null)
+    || (input.preview.cancelledAt !== null
+      ? 'The Shopify order is cancelled'
+      : null)
+    || (input.preview.closed ? 'The Shopify order is closed' : null)
+    || (input.preview.returnStatus !== 'NO_RETURN'
+      ? 'The Shopify order has return activity'
+      : null)
+  const reversedFulfillment = input.target.reversibleExternalFulfillmentGid
+    ? input.preview.fulfillments.find((fulfillment) => (
+        fulfillment.id === input.target.reversibleExternalFulfillmentGid
+      ))
+    : undefined
+  const postReversalCancellationReason = baseReason
+    || postReversalOrderCancellationTargetBlocker(input.target)
+    || (!writeOrders
+      ? 'The Shopify connection is missing write_orders'
+      : null)
+    || (reversedFulfillment?.status !== 'CANCELLED'
+      ? 'The exact predecessor fulfillment is not cancelled in Shopify'
+      : null)
+    || (!input.preview.test
+      ? 'Order cancellation is limited to Shopify test orders'
+      : null)
+    || (input.preview.cancelledAt !== null
+      ? 'The Shopify order is already cancelled'
+      : null)
+    || (input.preview.closed ? 'The Shopify order is closed' : null)
+    || (input.preview.capturable
+      ? 'Release or capture the payment authorization before cancelling this order'
+      : null)
+    || (input.preview.returnStatus !== 'NO_RETURN'
+      ? 'The Shopify order has return activity'
+      : null)
+    || (!whollyUnfulfilled(input.preview)
+      ? 'The order must remain wholly unfulfilled after fulfillment reversal'
+      : null)
+    || (!input.preview.unpaid
+      ? 'Paid-order cancellation requires refund settings before it can be submitted'
+      : null)
   const destructiveCurrent = exactCurrentSource(input.target)
     && Boolean(input.target.acceptedProviderUpdatedAt)
     && input.target.acceptedProviderUpdatedAt === input.preview.updatedAt
@@ -433,7 +565,7 @@ function publicState(input: {
 
   return Object.freeze({
     runtimeAvailable: input.runtimeAvailable,
-    blockerCode: baseReason || targetReason,
+    blockerCode: baseReason,
     accountLabel: input.target.accountDisplayName,
     shopDomain: input.target.shopDomain || 'unavailable.myshopify.com',
     order: Object.freeze({
@@ -465,6 +597,23 @@ function publicState(input: {
           line.currentQuantity - line.unfulfilledQuantity,
         ),
       }))),
+      fulfillments: Object.freeze(input.preview.fulfillments.map(
+        (fulfillment) => Object.freeze({
+          fulfillmentId: fulfillment.id,
+          name: fulfillment.name,
+          status: fulfillment.status,
+          displayStatus: fulfillment.displayStatus,
+          updatedAt: fulfillment.updatedAt,
+          deliveredAt: fulfillment.deliveredAt,
+          quantity: fulfillment.totalQuantity,
+          tracking: Object.freeze(fulfillment.tracking.map((tracking) =>
+            Object.freeze({
+              company: tracking.company,
+              number: tracking.number,
+              url: tracking.url,
+            }))),
+        }),
+      )),
     }),
     eligibility: Object.freeze({
       addTag: Object.freeze({ allowed: addTagReason === null, reason: addTagReason }),
@@ -476,6 +625,50 @@ function publicState(input: {
         allowed: cancellationReason === null,
         reason: cancellationReason,
       }),
+      cancelAfterFulfillmentReversal: Object.freeze({
+        allowed: postReversalCancellationReason === null,
+        reason: postReversalCancellationReason,
+        predecessorAuthorizationGlobalId:
+          input.target.postReversalOrderCancellationPredecessorGlobalId,
+      }),
+      fulfillments: Object.freeze(input.preview.fulfillments.map(
+        (fulfillment) => {
+          const reason = fulfillmentBaseReason
+            || (
+              input.target.reversibleExternalFulfillmentGid
+                !== fulfillment.id
+              || input.target.reversibleExternalFulfillmentUpdatedAt
+                !== fulfillment.updatedAt
+              ? 'This fulfillment does not match the exact reconciled external fulfillment'
+              : null)
+            || (fulfillment.deliveredAt !== null
+              ? 'Delivered fulfillments require a return'
+              : null)
+            || (fulfillment.status === 'CANCELLED'
+              ? 'This Shopify fulfillment is already reversed'
+              : null)
+            || (
+              fulfillment.status !== 'SUCCESS'
+              || fulfillment.displayStatus !== 'FULFILLED'
+              ? 'Only a successful, fulfilled Shopify fulfillment can be reversed'
+              : null)
+            || (fulfillment.fulfillmentOrders.length < 1
+              || fulfillment.fulfillmentOrders.some((order) => (
+                order.assignedLocation.location === null
+              ))
+              ? 'Shopify did not return the assigned fulfillment location'
+              : null)
+            || (fulfillment.totalQuantity < 1
+              ? 'This Shopify fulfillment has no items to reverse'
+              : null)
+          return Object.freeze({
+            fulfillmentId: fulfillment.id,
+            expectedUpdatedAt: fulfillment.updatedAt,
+            allowed: reason === null,
+            reason,
+          })
+        },
+      )),
       lineEdits: Object.freeze(input.preview.lines.map((line) => {
         const reason = lineBaseReason || (!line.merchantEditable
           ? 'Shopify does not allow this line to be edited'
@@ -512,6 +705,8 @@ async function inspect(input: {
       orderName: input.target.orderNumber,
     },
     requiredActions: input.requiredActions,
+    fulfillmentGid:
+      input.target.reversibleExternalFulfillmentGid || undefined,
     jobGid: input.jobGid,
   })
   return { credential, observedAt, inspected }
@@ -532,7 +727,17 @@ export async function readShopifyOrderManagementState(input: {
       blockerCode,
     })
   }
-  const live = await inspect({ organizationId: input.organizationId, target })
+  const requiredActions: ShopifyOrderManagementAction['type'][] =
+    target.postReversalOrderCancellationPredecessorGlobalId
+      ? ['cancel_order_after_fulfillment_reversal']
+      : target.reversibleExternalFulfillmentGid
+        ? ['cancel_fulfillment']
+        : []
+  const live = await inspect({
+    organizationId: input.organizationId,
+    target,
+    requiredActions,
+  })
   return publicState({
     target,
     preview: live.inspected.preview,
@@ -567,6 +772,42 @@ function assertPreparedMutation(input: {
       fail(
         'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
         input.management.eligibility.cancel.reason || 'Shopify cancellation is unavailable',
+      )
+    }
+    return
+  }
+  if (input.mutation.kind === 'cancel_order_after_fulfillment_reversal') {
+    const eligibility =
+      input.management.eligibility.cancelAfterFulfillmentReversal
+    if (
+      !eligibility.allowed
+      || eligibility.predecessorAuthorizationGlobalId
+        !== input.mutation.predecessorAuthorizationGlobalId
+    ) {
+      fail(
+        'SHOPIFY_ORDER_POST_REVERSAL_CANCEL_NOT_ELIGIBLE',
+        eligibility.reason
+          || 'The exact fulfillment-reversal predecessor changed',
+      )
+    }
+    return
+  }
+  if (input.mutation.kind === 'cancel_fulfillment') {
+    const mutation = input.mutation
+    const eligibility = input.management.eligibility.fulfillments.find(
+      (fulfillment) => (
+        fulfillment.fulfillmentId === mutation.fulfillmentId
+      ),
+    )
+    if (
+      !eligibility?.allowed
+      || eligibility.expectedUpdatedAt
+        !== mutation.expectedFulfillmentUpdatedAt
+    ) {
+      fail(
+        'SHOPIFY_FULFILLMENT_CANCEL_NOT_ELIGIBLE',
+        eligibility?.reason
+          || 'The exact Shopify fulfillment is unavailable or changed',
       )
     }
     return
@@ -704,6 +945,11 @@ export async function prepareShopifyOrderManagementCommand(input: {
       orderTest: live.inspected.preview.test,
       orderUpdatedAt: live.inspected.preview.updatedAt,
       action: authorization.action,
+      fulfillmentId: authorization.fulfillmentGid,
+      expectedFulfillmentUpdatedAt:
+        authorization.expectedFulfillmentUpdatedAt,
+      predecessorAuthorizationGlobalId:
+        authorization.predecessorAuthorizationGlobalId,
       lineItemId: authorization.lineItemGid,
       previousQuantity: authorization.expectedLineQuantity,
       requestedQuantity: authorization.requestedQuantity,
@@ -716,6 +962,12 @@ export async function prepareShopifyOrderManagementCommand(input: {
 
 function automaticSaveReason(mutation: ShopifyOrderManagementMutation) {
   if (mutation.kind === 'add_tag') return 'Saved Shopify order tag in ClawPilot'
+  if (mutation.kind === 'cancel_fulfillment') {
+    return 'Reversed Shopify fulfillment in ClawPilot'
+  }
+  if (mutation.kind === 'cancel_order_after_fulfillment_reversal') {
+    return 'Cancelled Shopify order after fulfillment reversal in ClawPilot'
+  }
   if (mutation.kind === 'cancel') return 'Saved Shopify order cancellation in ClawPilot'
   if (mutation.kind === 'save_order') return 'Saved Shopify order changes in ClawPilot'
   return 'Saved Shopify order line quantity in ClawPilot'
@@ -759,6 +1011,20 @@ function actionMatchesMutation(
   }
   if (action.type === 'cancel') {
     return authorization.cancelReason === action.reason
+      && authorization.staffNoteHash === shopifyOrderManagementEvidenceHash({
+        schema: 'shopify-order-management-staff-note-v1',
+        staffNote: action.staffNote,
+      })
+  }
+  if (action.type === 'cancel_fulfillment') {
+    return authorization.fulfillmentGid === action.fulfillmentGid
+      && authorization.expectedFulfillmentUpdatedAt
+        === action.expectedFulfillmentUpdatedAt
+  }
+  if (action.type === 'cancel_order_after_fulfillment_reversal') {
+    return authorization.predecessorAuthorizationGlobalId
+        === action.predecessorAuthorizationGlobalId
+      && authorization.cancelReason === action.reason
       && authorization.staffNoteHash === shopifyOrderManagementEvidenceHash({
         schema: 'shopify-order-management-staff-note-v1',
         staffNote: action.staffNote,
@@ -916,6 +1182,21 @@ export async function executeShopifyOrderManagementCommand(input: {
   })
   let executed: Awaited<ReturnType<typeof executeShopifyOrderManagementAction>>
   try {
+    const actionInput = claimed.actionInput.type
+      === 'cancel_order_after_fulfillment_reversal'
+      ? (() => {
+          if (!claimed.predecessorFulfillmentGid) {
+            fail(
+              'SHOPIFY_ORDER_POST_REVERSAL_PREDECESSOR_MISSING',
+              'The exact predecessor fulfillment is unavailable',
+            )
+          }
+          return {
+            ...claimed.actionInput,
+            reversedFulfillmentGid: claimed.predecessorFulfillmentGid,
+          }
+        })()
+      : claimed.actionInput
     executed = await executeShopifyOrderManagementAction({
       credential,
       expected: {
@@ -925,7 +1206,7 @@ export async function executeShopifyOrderManagementCommand(input: {
         orderName: claimed.orderNumber,
         updatedAt: claimed.providerOrderUpdatedAt,
       },
-      action: claimed.actionInput,
+      action: actionInput,
     })
   } catch (error) {
     const errorCode = error instanceof Error && 'code' in error
@@ -971,6 +1252,8 @@ export async function executeShopifyOrderManagementCommand(input: {
     evidence: {
       schema: 'shopify-order-management-execution-v1',
       action: executed.action,
+      predecessorAuthorizationGlobalId:
+        claimed.predecessorAuthorizationGlobalId,
       attemptHash: claimed.attemptHash,
       beforeUpdatedAt: executed.before.updatedAt,
       afterUpdatedAt: executed.after?.updatedAt || null,
@@ -1065,7 +1348,9 @@ export async function reconcileShopifyOrderManagementCommand(input: {
     orderGlobalId: authorization.orderGlobalId,
   })
   assertReconciliationTarget(target, authorization)
-  const jobGid = authorization.action === 'cancel'
+  const jobGid = [
+    'cancel', 'cancel_order_after_fulfillment_reversal',
+  ].includes(authorization.action)
     && authorization.providerReference
     && JOB_GID.test(authorization.providerReference)
       ? authorization.providerReference
@@ -1091,8 +1376,18 @@ export async function reconcileShopifyOrderManagementCommand(input: {
       === authorization.requestedProjectionHash
   ) {
     resolution = 'applied'
-  } else if (authorization.action === 'cancel') {
+  } else if ([
+    'cancel', 'cancel_order_after_fulfillment_reversal',
+  ].includes(authorization.action)) {
     if (live.inspected.preview.cancelledAt) resolution = 'applied'
+  } else if (
+    authorization.action === 'cancel_fulfillment'
+    && authorization.fulfillmentGid
+  ) {
+    const fulfillment = live.inspected.preview.fulfillments.find(
+      (candidate) => candidate.id === authorization.fulfillmentGid,
+    )
+    if (fulfillment?.status === 'CANCELLED') resolution = 'applied'
   } else if (
     authorization.action === 'set_line_quantity'
     && authorization.lineItemGid
@@ -1133,8 +1428,18 @@ export async function reconcileShopifyOrderManagementCommand(input: {
     evidence: {
       schema: 'shopify-order-management-read-reconciliation-v1',
       action: authorization.action,
+      predecessorAuthorizationGlobalId:
+        authorization.predecessorAuthorizationGlobalId,
       providerOrderUpdatedAt: live.inspected.preview.updatedAt,
       cancelledAt: live.inspected.preview.cancelledAt,
+      fulfillmentId: authorization.fulfillmentGid,
+      observedFulfillmentStatus: authorization.fulfillmentGid
+        ? live.inspected.preview.fulfillments.find(
+            (fulfillment) => (
+              fulfillment.id === authorization.fulfillmentGid
+            ),
+          )?.status ?? null
+        : null,
       requestedQuantity: authorization.requestedQuantity,
       requestedProjectionHash: authorization.requestedProjectionHash,
       observedProjectionHash: authorization.action === 'save_order'

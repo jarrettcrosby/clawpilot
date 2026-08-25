@@ -5754,22 +5754,14 @@ export async function GET() {
                       )
                     )
                   )
-                  AND (
-                    NOT EXISTS (
-                      SELECT 1
-                      FROM public.schema_migrations
-                      WHERE filename =
-                        '0325_operations_shopify_fulfillment_reversal.sql'
-                    )
-                    OR (
-                      EXISTS (
-                        SELECT 1
-                        FROM public.schema_migrations
-                        WHERE filename =
-                          '0325_operations_shopify_fulfillment_reversal.sql'
-                          AND checksum =
-                            'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
-                      )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM public.schema_migrations
+                    WHERE filename =
+                      '0325_operations_shopify_fulfillment_reversal.sql'
+                      AND checksum =
+                        'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
+                  )
                   AND (
                     SELECT pg_catalog.count(*) = 6
                       AND pg_catalog.encode(public.digest(
@@ -5804,16 +5796,16 @@ export async function GET() {
                           'expected_fulfillment_updated_at'
                         ),
                         (
+                          'operations_shopify_order_management_authorizations',
+                          'predecessor_authorization_id'
+                        ),
+                        (
                           'operations_shopify_order_management_attempts',
                           'fulfillment_gid'
                         ),
                         (
                           'operations_shopify_order_management_attempts',
                           'expected_fulfillment_updated_at'
-                        ),
-                        (
-                          'operations_shopify_order_management_authorizations',
-                          'predecessor_authorization_id'
                         ),
                         (
                           'operations_shopify_order_management_attempts',
@@ -5851,16 +5843,16 @@ export async function GET() {
                         'ops_shopify_order_mgmt_auth_action_valid'
                       ),
                       (
+                        'operations_shopify_order_management_authorizations',
+                        'ops_shopify_order_mgmt_auth_predecessor_fkey'
+                      ),
+                      (
                         'operations_shopify_order_management_attempts',
                         'operations_shopify_order_management_attempts_action_check'
                       ),
                       (
                         'operations_shopify_order_management_attempts',
                         'ops_shopify_order_mgmt_attempt_identity_valid'
-                      ),
-                      (
-                        'operations_shopify_order_management_authorizations',
-                        'ops_shopify_order_mgmt_auth_predecessor_fkey'
                       ),
                       (
                         'operations_shopify_order_management_attempts',
@@ -5920,10 +5912,10 @@ export async function GET() {
                         'protect_shopify_fulfillment_reversal_authorization_insert()'
                       ),
                       (
-                        'protect_shopify_fulfillment_reversal_attempt_insert()'
+                        'protect_shopify_post_reversal_order_cancel_authorization_insert()'
                       ),
                       (
-                        'protect_shopify_post_reversal_order_cancel_authorization_insert()'
+                        'protect_shopify_fulfillment_reversal_attempt_insert()'
                       ),
                       (
                         'protect_shopify_post_reversal_order_cancel_attempt_insert()'
@@ -6047,36 +6039,8 @@ export async function GET() {
                         'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99'
                     FROM (VALUES
                       (
-                        'operations_fulfillment_plans',
-                        'protect_shopify_order_management_plan_race'
-                      ),
-                      (
-                        'operations_reservations',
-                        'protect_shopify_order_management_reservation_race'
-                      ),
-                      (
-                        'operations_waves',
-                        'protect_shopify_order_management_wave_race'
-                      ),
-                      (
-                        'operations_pick_tasks',
-                        'protect_shopify_order_management_pick_race'
-                      ),
-                      (
-                        'operations_packaging_material_claims',
-                        'protect_shopify_order_management_packaging_claim_race'
-                      ),
-                      (
-                        'operations_packages',
-                        'protect_shopify_order_management_package_race'
-                      ),
-                      (
-                        'operations_labels',
-                        'protect_shopify_order_management_label_race'
-                      ),
-                      (
-                        'operations_shipments',
-                        'protect_shopify_order_management_shipment_race'
+                        'operations_active_fulfillment_executions',
+                        'protect_shopify_order_management_active_execution_race'
                       ),
                       (
                         'operations_commerce_fulfillment_exports',
@@ -6087,20 +6051,48 @@ export async function GET() {
                         'protect_shopify_order_management_execution_race'
                       ),
                       (
-                        'operations_active_fulfillment_executions',
-                        'protect_shopify_order_management_active_execution_race'
+                        'operations_fulfillment_plans',
+                        'protect_shopify_order_management_plan_race'
                       ),
                       (
                         'operations_label_attempts',
                         'protect_shopify_order_management_label_attempt_race'
                       ),
                       (
-                        'operations_shipment_groups',
-                        'protect_shopify_order_management_shipment_group_race'
+                        'operations_labels',
+                        'protect_shopify_order_management_label_race'
+                      ),
+                      (
+                        'operations_packages',
+                        'protect_shopify_order_management_package_race'
+                      ),
+                      (
+                        'operations_packaging_material_claims',
+                        'protect_shopify_order_management_packaging_claim_race'
+                      ),
+                      (
+                        'operations_pick_tasks',
+                        'protect_shopify_order_management_pick_race'
                       ),
                       (
                         'operations_production_fulfillment_rerate_runs',
                         'protect_shopify_order_management_rerate_race'
+                      ),
+                      (
+                        'operations_reservations',
+                        'protect_shopify_order_management_reservation_race'
+                      ),
+                      (
+                        'operations_shipment_groups',
+                        'protect_shopify_order_management_shipment_group_race'
+                      ),
+                      (
+                        'operations_shipments',
+                        'protect_shopify_order_management_shipment_race'
+                      ),
+                      (
+                        'operations_waves',
+                        'protect_shopify_order_management_wave_race'
                       )
                     ) required(table_name, trigger_name)
                     LEFT JOIN pg_catalog.pg_class table_row
@@ -6116,8 +6108,6 @@ export async function GET() {
                       ON trigger_function.oid = installed.tgfoid
                     LEFT JOIN pg_catalog.pg_namespace function_namespace
                       ON function_namespace.oid = trigger_function.pronamespace
-                  )
-                    )
                   )
                   AND (
                     SELECT pg_catalog.count(installed.oid) = 15
