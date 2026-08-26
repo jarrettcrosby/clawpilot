@@ -13,7 +13,10 @@ const expectedMigrations = new Map([
   ['0329_career_site_submissions.sql', '57025eaa8a87a1b2b78b97bd700b633355c8f2bc56308923abf6c4210efd8045'],
   ['0330_career_site_mail_outbox.sql', '2812f40dd0d8e11529021276e37eac963a303ab60016c862b3425457d144915d'],
 ])
-const expectedCatalogChecksum = '30019d0ed5517100279548d01924571b1c6d30326e81dfaffbd88105687fdecf'
+const expectedCatalogChecksums = new Map([
+  ['16', '30019d0ed5517100279548d01924571b1c6d30326e81dfaffbd88105687fdecf'],
+  ['18', '0ea6bb819d3357a4190e54654859636cf74f7d1c06211cc85f944cd07d88f99b'],
+])
 const tableNames = [
   'career_site_submissions',
   'career_site_submission_outbox',
@@ -171,11 +174,20 @@ try {
     constraints: catalogConstraints.rows,
     indexes: catalogIndexes.rows,
   })
+  const versionResult = await pool.query('SHOW server_version_num')
+  const versionNumber = Number(versionResult.rows[0]?.server_version_num)
+  const majorVersion = String(Math.floor(versionNumber / 10_000))
+  const expectedCatalogChecksum = expectedCatalogChecksums.get(majorVersion)
+  if (!expectedCatalogChecksum) {
+    fail(`PostgreSQL ${majorVersion || 'unknown'} does not have a frozen catalog attestation`)
+  }
   const catalogChecksum = createHash('sha256').update(catalog).digest('hex')
   if (catalogChecksum !== expectedCatalogChecksum) {
-    fail(`exact catalog checksum mismatch (actual ${catalogChecksum})`)
+    fail(`exact PostgreSQL ${majorVersion} catalog checksum mismatch (actual ${catalogChecksum})`)
   }
-  console.log('Career-site migrations 0329/0330 and exact post-apply catalog verified')
+  console.log(
+    `Career-site migrations 0329/0330 and exact PostgreSQL ${majorVersion} post-apply catalog verified`,
+  )
   }
 } finally {
   await pool.end()
