@@ -193,7 +193,7 @@ The Google Workspace integration in **Settings > Integrations > Google Workspace
 
 ## Operational checks
 
-1. Keep the feature disabled while the migration and private Sheet are prepared. Run `npm run career-site:migrations:verify -- --pre-apply`, which requires both ledger rows and all three tables to be absent; then run `npm run db:migrate` and `npm run career-site:migrations:verify -- --post-apply` to verify exact checksums and the full column/constraint/index catalog.
+1. Keep the feature disabled while the migration and private Sheet are prepared. Run `npm run career-site:migrations:verify -- --pre-apply`, which requires both ledger rows and all three tables to be absent; then run `npm run db:migrate` and `npm run career-site:migrations:verify -- --post-apply` to verify exact checksums and the full column/constraint/index catalog. PostgreSQL 16 and 18 have separately frozen catalog digests because their catalog rendering differs; an unverified major version fails closed. The focused migration-verifier test rebuilds the same schema on both supported majors.
 2. Verify the Google Workspace integration, share only the Sheet with the displayed service-account email as writer, and disable editor resharing.
 3. Verify the `info@suburbiasandwichco.com` alias with Gmail `settings/sendAs`, configure the four career mail values, then enable intake and deploy through the normal `dev` to `main` release path.
 4. Submit one contact test with a unique UUID and confirm Postgres returns `201` without returning PII.
