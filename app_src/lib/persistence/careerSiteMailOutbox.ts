@@ -3,16 +3,24 @@ import type { QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import {
   CareerSiteMailRequestError,
-  careerSiteMailPayloadHash,
   type NormalizedCareerSiteMailRequest,
 } from '@/lib/careerSiteMailContract'
+import {
+  careerSiteMailPayloadFingerprint,
+  careerSiteMailEncryptionKeyReadiness,
+  decryptCareerSiteMailPayload,
+  encryptCareerSiteMailPayload,
+  type EncryptedCareerSiteMailPayload,
+} from '@/lib/careerSiteMailCrypto'
 import { careerSiteRfcMessageId } from '@/lib/careerSiteMailDelivery'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
 const MAIL_WORKER_HEARTBEAT_KEY = 'career_site.mail.outbox.worker.heartbeat'
+const CAREER_SITE_SOURCE_APP = 'jarrett-career-site'
+const CAREER_SITE_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
 export const CAREER_SITE_MAIL_MIGRATION_FILENAME = '0330_career_site_mail_outbox.sql'
-export const CAREER_SITE_MAIL_MIGRATION_CHECKSUM = 'd2ed980456eb4e0da6e58d1c8bc2fcff6dfe7430cc8a78ef22257f471a1cd350'
+export const CAREER_SITE_MAIL_MIGRATION_CHECKSUM = '2812f40dd0d8e11529021276e37eac963a303ab60016c862b3425457d144915d'
 
 type CareerSiteMailActor = {
   ownerEmail: string
@@ -29,13 +37,20 @@ type CareerSiteMailRow = QueryResultRow & {
   owner_email: string
   workspace_organization_id: string
   message_type: NormalizedCareerSiteMailRequest['messageType']
-  payload: NormalizedCareerSiteMailRequest
+  payload_ciphertext: Buffer | null
+  payload_iv: Buffer | null
+  payload_tag: Buffer | null
+  payload_key_id: string | null
+  payload_encryption_version: number | null
+  payload_purged_at: string | null
   payload_hash: string
   rfc_message_id: string
   status: CareerSiteMailStatus
   attempts: number
+  draft_creation_started_at: string | null
   draft_id: string | null
   provider_message_id: string | null
+  requeue_count: number
   lock_token: string | null
   created_at: string
   updated_at: string
@@ -44,7 +59,10 @@ type CareerSiteMailRow = QueryResultRow & {
 export type CareerSiteMailOutboxItem = {
   id: string
   actor: CareerSiteMailActor
-  request: NormalizedCareerSiteMailRequest
+  messageType: NormalizedCareerSiteMailRequest['messageType']
+  idempotencyKey: string
+  payloadHash: string
+  encryptedPayload: EncryptedCareerSiteMailPayload
   rfcMessageId: string
   status: CareerSiteMailStatus
   attempts: number
@@ -62,6 +80,12 @@ export type CareerSiteMailOperationalHealth = {
     applied: boolean
     checksumMatches: boolean
     tablePresent: boolean
+  }
+  encryption: {
+    ready: boolean
+    activeKeyId: string
+    referencedKeyIds: readonly string[]
+    missingReferencedKeyIds: readonly string[]
   }
   queue: {
     queued: number
@@ -92,6 +116,17 @@ export class CareerSiteMailPersistenceConflictError extends Error {
   }
 }
 
+export class CareerSiteMailRequeueError extends Error {
+  constructor(
+    message: string,
+    readonly status: 404 | 409,
+    readonly code: string,
+  ) {
+    super(message)
+    this.name = 'CareerSiteMailRequeueError'
+  }
+}
+
 function requirePostgres() {
   if (!isPostgresStorageEnabled()) {
     throw new CareerSiteMailRequestError(
@@ -109,20 +144,29 @@ const RETURNING = `
   owner_email,
   workspace_organization_id::text,
   message_type,
-  payload,
+  payload_ciphertext,
+  payload_iv,
+  payload_tag,
+  payload_key_id,
+  payload_encryption_version,
+  payload_purged_at::text,
   payload_hash,
   rfc_message_id,
   status,
   attempts,
+  draft_creation_started_at::text,
   draft_id,
   provider_message_id,
+  requeue_count,
   lock_token,
   created_at::text,
   updated_at::text
 `
 
-function deliveryStatus(status: CareerSiteMailStatus): 'queued' | 'sent' {
-  return status === 'succeeded' ? 'sent' : 'queued'
+function deliveryStatus(status: CareerSiteMailStatus): 'queued' | 'sent' | 'dead' {
+  if (status === 'succeeded') return 'sent'
+  if (status === 'dead') return 'dead'
+  return 'queued'
 }
 
 export async function createCareerSiteMailInPostgres(input: {
@@ -130,17 +174,26 @@ export async function createCareerSiteMailInPostgres(input: {
   request: NormalizedCareerSiteMailRequest
 }) {
   requirePostgres()
-  const payloadHash = careerSiteMailPayloadHash(input.request)
+  const payloadHash = careerSiteMailPayloadFingerprint(input.request)
   const rfcMessageId = careerSiteRfcMessageId(input.request.idempotencyKey)
+  const encryptedPayload = encryptCareerSiteMailPayload(input.request, {
+    sourceApp: input.actor.sourceApp,
+    ownerEmail: input.actor.ownerEmail,
+    organizationId: input.actor.organizationId,
+    payloadHash,
+  })
   return withTransaction(async (client) => {
     const inserted = await client.query<CareerSiteMailRow>(
       `INSERT INTO career_site_mail_outbox (
          idempotency_key, source_app, owner_email, workspace_organization_id,
-         message_type, payload, payload_hash, rfc_message_id, status,
+         message_type, payload_ciphertext, payload_iv, payload_tag,
+         payload_key_id, payload_encryption_version, payload_hash,
+         rfc_message_id, status,
          attempts, available_at, created_at, updated_at
        ) VALUES (
-         $1::text, $2::text, $3::text, $4::uuid, $5::text, $6::jsonb,
-         $7::text, $8::text, 'queued', 0, now(), now(), now()
+         $1::text, $2::text, $3::text, $4::uuid, $5::text, $6::bytea,
+         $7::bytea, $8::bytea, $9::text, $10::integer, $11::text,
+         $12::text, 'queued', 0, now(), now(), now()
        )
        ON CONFLICT (source_app, idempotency_key) DO NOTHING
        RETURNING ${RETURNING}`,
@@ -150,7 +203,11 @@ export async function createCareerSiteMailInPostgres(input: {
         input.actor.ownerEmail,
         input.actor.organizationId,
         input.request.messageType,
-        JSON.stringify(input.request),
+        encryptedPayload.ciphertext,
+        encryptedPayload.iv,
+        encryptedPayload.tag,
+        encryptedPayload.keyId,
+        encryptedPayload.encryptionVersion,
         payloadHash,
         rfcMessageId,
       ],
@@ -202,6 +259,7 @@ export async function createCareerSiteMailInPostgres(input: {
 export async function claimCareerSiteMailOutboxInPostgres(input: {
   sourceApp: string
   ownerEmail: string
+  organizationId: string
   maxAttempts?: number
   leaseSeconds?: number
 }): Promise<CareerSiteMailOutboxItem[]> {
@@ -220,9 +278,10 @@ export async function claimCareerSiteMailOutboxInPostgres(input: {
            updated_at = now()
        WHERE source_app = $3
          AND owner_email = $4
+         AND workspace_organization_id = $5::uuid
          AND status = 'processing'
          AND (locked_at IS NULL OR locked_at < now() - ($2::text || ' seconds')::interval)`,
-      [maxAttempts, leaseSeconds, input.sourceApp, input.ownerEmail],
+      [maxAttempts, leaseSeconds, input.sourceApp, input.ownerEmail, input.organizationId],
     )
     const result = await client.query<CareerSiteMailRow>(
        `WITH candidate AS (
@@ -230,6 +289,7 @@ export async function claimCareerSiteMailOutboxInPostgres(input: {
          FROM career_site_mail_outbox
          WHERE source_app = $3
            AND owner_email = $4
+           AND workspace_organization_id = $5::uuid
            AND status IN ('queued', 'failed')
            AND attempts < $1
            AND available_at <= now()
@@ -246,7 +306,7 @@ export async function claimCareerSiteMailOutboxInPostgres(input: {
        FROM candidate
        WHERE outbox.id = candidate.candidate_id
        RETURNING ${RETURNING}`,
-      [maxAttempts, lockToken, input.sourceApp, input.ownerEmail],
+      [maxAttempts, lockToken, input.sourceApp, input.ownerEmail, input.organizationId],
     )
     return result.rows.map((row) => ({
       id: row.id,
@@ -255,7 +315,16 @@ export async function claimCareerSiteMailOutboxInPostgres(input: {
         organizationId: row.workspace_organization_id,
         sourceApp: row.source_app,
       },
-      request: row.payload,
+      messageType: row.message_type,
+      idempotencyKey: row.idempotency_key,
+      payloadHash: row.payload_hash,
+      encryptedPayload: {
+        ciphertext: row.payload_ciphertext || Buffer.alloc(0),
+        iv: row.payload_iv || Buffer.alloc(0),
+        tag: row.payload_tag || Buffer.alloc(0),
+        keyId: row.payload_key_id || '',
+        encryptionVersion: row.payload_encryption_version as 1,
+      },
       rfcMessageId: row.rfc_message_id,
       status: row.status,
       attempts: row.attempts,
@@ -263,6 +332,17 @@ export async function claimCareerSiteMailOutboxInPostgres(input: {
       providerMessageId: row.provider_message_id,
       lockToken: row.lock_token || '',
     }))
+  })
+}
+
+export function decryptCareerSiteMailOutboxRequest(item: CareerSiteMailOutboxItem) {
+  return decryptCareerSiteMailPayload(item.encryptedPayload, {
+    sourceApp: item.actor.sourceApp,
+    ownerEmail: item.actor.ownerEmail,
+    organizationId: item.actor.organizationId,
+    messageType: item.messageType,
+    idempotencyKey: item.idempotencyKey,
+    payloadHash: item.payloadHash,
   })
 }
 
@@ -284,7 +364,10 @@ export async function saveCareerSiteMailDraftInPostgres(input: {
 }) {
   const result = await query<{ draft_id: string }>(
     `UPDATE career_site_mail_outbox
-     SET draft_id = COALESCE(draft_id, $3), locked_at = now(), updated_at = now()
+     SET draft_creation_started_at = COALESCE(draft_creation_started_at, now()),
+         draft_id = COALESCE(draft_id, $3),
+         locked_at = now(),
+         updated_at = now()
      WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
      RETURNING draft_id`,
     [input.item.id, input.item.lockToken, input.draftId],
@@ -292,6 +375,32 @@ export async function saveCareerSiteMailDraftInPostgres(input: {
   const draftId = result.rows[0]?.draft_id
   if (!draftId) throw new Error(`Career-site mail outbox lease lost for ${input.item.id}`)
   return draftId
+}
+
+export async function reserveCareerSiteMailDraftCreationInPostgres(
+  item: Pick<CareerSiteMailOutboxItem, 'id' | 'lockToken'>,
+) {
+  const result = await query<{ reserved: boolean }>(
+    `WITH current AS (
+       SELECT id, draft_creation_started_at
+       FROM career_site_mail_outbox
+       WHERE id = $1::uuid AND status = 'processing' AND lock_token = $2
+       FOR UPDATE
+     )
+     UPDATE career_site_mail_outbox outbox
+     SET draft_creation_started_at = COALESCE(outbox.draft_creation_started_at, now()),
+         locked_at = now(),
+         updated_at = now()
+     FROM current
+     WHERE outbox.id = current.id
+     RETURNING (current.draft_creation_started_at IS NULL) AS reserved`,
+    [item.id, item.lockToken],
+  )
+  const reserved = result.rows[0]?.reserved
+  if (typeof reserved !== 'boolean') {
+    throw new Error(`Career-site mail outbox lease lost for ${item.id}`)
+  }
+  return reserved
 }
 
 export async function completeCareerSiteMailOutboxInPostgres(input: {
@@ -302,6 +411,12 @@ export async function completeCareerSiteMailOutboxInPostgres(input: {
     `UPDATE career_site_mail_outbox
      SET status = 'succeeded',
          provider_message_id = $3,
+         payload_ciphertext = NULL,
+         payload_iv = NULL,
+         payload_tag = NULL,
+         payload_key_id = NULL,
+         payload_encryption_version = NULL,
+         payload_purged_at = now(),
          last_error = NULL,
          delivered_at = now(),
          locked_at = NULL,
@@ -338,6 +453,157 @@ export async function failCareerSiteMailOutboxInPostgres(input: {
   return status
 }
 
+export async function requeueDeadCareerSiteMailInPostgres(input: {
+  actorEmail: string
+  organizationId: string
+  idempotencyKey: string
+  expectedGeneration: number
+  reason: string
+}) {
+  requirePostgres()
+  if (input.actorEmail !== CAREER_SITE_OWNER_EMAIL) {
+    throw new CareerSiteMailRequeueError('Career-site mail delivery was not found', 404, 'CAREER_SITE_MAIL_NOT_FOUND')
+  }
+  return withTransaction(async (client) => {
+    const updated = await client.query<CareerSiteMailRow>(
+      `UPDATE career_site_mail_outbox
+       SET status = 'queued',
+           attempts = 0,
+           draft_creation_started_at = CASE
+             WHEN draft_id IS NULL THEN NULL
+             ELSE draft_creation_started_at
+           END,
+           requeue_count = requeue_count + 1,
+           last_requeued_at = now(),
+           last_requeued_by = $1,
+           last_requeue_reason = $4,
+           last_error = NULL,
+           available_at = now(),
+           locked_at = NULL,
+           lock_token = NULL,
+           updated_at = now()
+       WHERE source_app = $2
+         AND owner_email = $1
+         AND workspace_organization_id = $3::uuid
+         AND idempotency_key = $5
+         AND status = 'dead'
+         AND requeue_count < 3
+         AND requeue_count = $6
+         AND payload_ciphertext IS NOT NULL
+         AND payload_purged_at IS NULL
+       RETURNING ${RETURNING}`,
+      [
+        input.actorEmail,
+        CAREER_SITE_SOURCE_APP,
+        input.organizationId,
+        input.reason,
+        input.idempotencyKey,
+        input.expectedGeneration,
+      ],
+    )
+    const row = updated.rows[0]
+    if (!row) {
+      const existing = (await client.query<{
+        status: CareerSiteMailStatus
+        requeue_count: number
+        payload_purged_at: string | null
+      }>(
+        `SELECT status, requeue_count, payload_purged_at::text
+         FROM career_site_mail_outbox
+         WHERE source_app = $1
+           AND owner_email = $2
+           AND workspace_organization_id = $3::uuid
+           AND idempotency_key = $4
+         LIMIT 1
+         FOR SHARE`,
+        [CAREER_SITE_SOURCE_APP, input.actorEmail, input.organizationId, input.idempotencyKey],
+      )).rows[0]
+      if (!existing) {
+        throw new CareerSiteMailRequeueError(
+          'Career-site mail delivery was not found',
+          404,
+          'CAREER_SITE_MAIL_NOT_FOUND',
+        )
+      }
+      if (existing.requeue_count !== input.expectedGeneration) {
+        throw new CareerSiteMailRequeueError(
+          'Career-site mail recovery generation changed; refresh before retrying',
+          409,
+          'CAREER_SITE_MAIL_REQUEUE_GENERATION_MISMATCH',
+        )
+      }
+      if (existing.status !== 'dead') {
+        throw new CareerSiteMailRequeueError(
+          'Only terminal career-site mail delivery can be requeued',
+          409,
+          'CAREER_SITE_MAIL_NOT_DEAD',
+        )
+      }
+      if (existing.requeue_count >= 3) {
+        throw new CareerSiteMailRequeueError(
+          'Career-site mail recovery limit reached',
+          409,
+          'CAREER_SITE_MAIL_REQUEUE_LIMIT',
+        )
+      }
+      throw new CareerSiteMailRequeueError(
+        'Career-site mail payload retention expired',
+        409,
+        'CAREER_SITE_MAIL_PAYLOAD_PURGED',
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      subject: input.actorEmail,
+      eventType: 'career_site.mail.requeued',
+      aggregateType: 'career_site_mail',
+      aggregateId: row.id,
+      eventKey: `career-site-mail-requeue:${row.id}:${row.requeue_count}`,
+      organizationId: input.organizationId,
+      payload: {
+        sourceApp: CAREER_SITE_SOURCE_APP,
+        generation: row.requeue_count,
+        reason: input.reason,
+      },
+    }, client)
+    return {
+      id: row.id,
+      idempotencyKey: row.idempotency_key,
+      status: 'queued' as const,
+      generation: row.requeue_count,
+    }
+  })
+}
+
+export async function purgeExpiredCareerSiteMailDeadPayloadsInPostgres(input: {
+  sourceApp: string
+  ownerEmail: string
+  organizationId: string
+  retentionDays?: number
+}) {
+  requirePostgres()
+  const retentionDays = Math.max(1, Math.min(Math.trunc(Number(input.retentionDays) || 30), 365))
+  const result = await query(
+    `UPDATE career_site_mail_outbox
+     SET payload_ciphertext = NULL,
+         payload_iv = NULL,
+         payload_tag = NULL,
+         payload_key_id = NULL,
+         payload_encryption_version = NULL,
+         payload_purged_at = now(),
+         updated_at = now()
+     WHERE source_app = $1
+       AND owner_email = $2
+       AND workspace_organization_id = $4::uuid
+       AND status = 'dead'
+       AND payload_ciphertext IS NOT NULL
+       AND payload_purged_at IS NULL
+       AND updated_at < now() - ($3::text || ' days')::interval`,
+    [input.sourceApp, input.ownerEmail, retentionDays, input.organizationId],
+  )
+  return result.rowCount || 0
+}
+
 export async function recordCareerSiteMailWorkerHeartbeatInPostgres(input: {
   phase: 'started' | 'completed' | 'degraded' | 'failed'
   workerId: string
@@ -359,6 +625,7 @@ export async function recordCareerSiteMailWorkerHeartbeatInPostgres(input: {
 export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
   sourceApp: string
   ownerEmail: string
+  organizationId: string
   pollMs?: number
   leaseSeconds?: number
 }): Promise<CareerSiteMailOperationalHealth> {
@@ -391,6 +658,12 @@ export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
     outOfScopePending: 0,
     oldestPendingAt: null,
   }
+  const unavailableEncryption = {
+    ready: false,
+    activeKeyId: '',
+    referencedKeyIds: [] as readonly string[],
+    missingReferencedKeyIds: [] as readonly string[],
+  }
   const missingWorker = {
     phase: 'missing' as const,
     checkedAt: null,
@@ -403,6 +676,7 @@ export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
       healthy: false,
       status: 'unhealthy',
       migration: migrationState,
+      encryption: unavailableEncryption,
       queue: emptyQueue,
       worker: missingWorker,
       checkedAt,
@@ -417,30 +691,43 @@ export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
     stale_processing: string
     out_of_scope_pending: string
     oldest_pending_at: string | null
+    payload_key_ids: string[] | null
     worker_heartbeat: unknown
   }>(
     `SELECT
-       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND status = 'queued')::text AS queued,
-       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND status = 'processing')::text AS processing,
-       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND status = 'succeeded')::text AS succeeded,
-       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND status = 'failed')::text AS failed,
-       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND status = 'dead')::text AS dead,
+       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'queued')::text AS queued,
+       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'processing')::text AS processing,
+       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'succeeded')::text AS succeeded,
+       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'failed')::text AS failed,
+       count(*) FILTER (WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'dead')::text AS dead,
        count(*) FILTER (
-         WHERE source_app = $1 AND owner_email = $2 AND status = 'processing'
+         WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status = 'processing'
            AND (locked_at IS NULL OR locked_at < now() - ($3::text || ' seconds')::interval)
        )::text AS stale_processing,
        count(*) FILTER (
          WHERE status IN ('queued', 'failed', 'processing')
-           AND NOT (source_app = $1 AND owner_email = $2)
+           AND NOT (source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid)
        )::text AS out_of_scope_pending,
        min(created_at) FILTER (
-         WHERE source_app = $1 AND owner_email = $2 AND status IN ('queued', 'failed', 'processing')
+         WHERE source_app = $1 AND owner_email = $2 AND workspace_organization_id = $5::uuid AND status IN ('queued', 'failed', 'processing')
        )::text AS oldest_pending_at,
+       array_agg(DISTINCT payload_key_id) FILTER (
+         WHERE payload_ciphertext IS NOT NULL AND payload_key_id IS NOT NULL
+       ) AS payload_key_ids,
        (SELECT value FROM app_settings WHERE key = $4) AS worker_heartbeat
      FROM career_site_mail_outbox`,
-    [input.sourceApp, input.ownerEmail, leaseSeconds, MAIL_WORKER_HEARTBEAT_KEY],
+    [input.sourceApp, input.ownerEmail, leaseSeconds, MAIL_WORKER_HEARTBEAT_KEY, input.organizationId],
   )
   const row = result.rows[0]
+  const encryptionSummary = careerSiteMailEncryptionKeyReadiness(
+    Array.isArray(row?.payload_key_ids) ? row.payload_key_ids : [],
+  )
+  const encryption = {
+    ready: encryptionSummary.ready,
+    activeKeyId: encryptionSummary.activeKeyId,
+    referencedKeyIds: encryptionSummary.referencedKeyIds,
+    missingReferencedKeyIds: encryptionSummary.missingReferencedKeyIds,
+  }
   const count = (value: string | undefined) => {
     const parsed = Number(value || 0)
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
@@ -474,7 +761,8 @@ export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
     ageSeconds,
     stale,
   }
-  const unhealthy = queue.dead > 0
+  const unhealthy = !encryption.ready
+    || queue.dead > 0
     || queue.staleProcessing > 0
     || queue.outOfScopePending > 0
     || worker.phase === 'missing'
@@ -485,9 +773,10 @@ export async function readCareerSiteMailOperationalHealthFromPostgres(input: {
   const status = unhealthy ? 'unhealthy' : degraded ? 'degraded' : 'healthy'
   return {
     enabled: true,
-    healthy: status === 'healthy',
+    healthy: status !== 'unhealthy',
     status,
     migration: migrationState,
+    encryption,
     queue,
     worker,
     checkedAt,

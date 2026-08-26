@@ -34,6 +34,13 @@ export type WorkspaceMembership = {
   updatedAt: string
 }
 
+export class WorkspaceAccessError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'WorkspaceAccessError'
+  }
+}
+
 type WorkspaceMembershipRow = {
   organization_id: string
   organization_reference_code: string
@@ -199,7 +206,7 @@ export async function requireWorkspaceAppUser(
 ): Promise<AppUser> {
   const email = normalizeUserEmail(emailValue)
   const user = await getAppUser(email)
-  if (!user || user.status !== 'active') throw new Error('User access is not active')
+  if (!user || user.status !== 'active') throw new WorkspaceAccessError('User access is not active')
   const organizationId = String(organizationIdValue || '').trim()
   const result = await query<WorkspaceMembershipRow>(
     `${MEMBERSHIP_SELECT}
@@ -211,7 +218,7 @@ export async function requireWorkspaceAppUser(
     organizationId ? [email, organizationId] : [email],
   )
   const membership = result.rows[0] ? toWorkspaceMembership(result.rows[0]) : null
-  if (!membership) throw new Error('Active workspace access is not available')
+  if (!membership) throw new WorkspaceAccessError('Active workspace access is not available')
   return {
     ...user,
     organizationId: membership.organizationId,

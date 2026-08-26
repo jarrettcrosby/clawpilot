@@ -15,7 +15,7 @@ const ts = requireFromApp('typescript')
 const migrationFilename = '0329_career_site_submissions.sql'
 const migration = readFileSync(resolve(root, 'db/migrations', migrationFilename), 'utf8')
 const migrationChecksum = createHash('sha256').update(migration).digest('hex')
-const expectedChecksum = '0f66211b10bf21e3d6e61b093d99b460f469635055af294f4d6b3f7d97fe2e78'
+const expectedChecksum = '57025eaa8a87a1b2b78b97bd700b633355c8f2bc56308923abf6c4210efd8045'
 const ownerEmail = 'jarrett@suburbiasandwichco.com'
 const otherOwnerEmail = 'other@suburbiasandwichco.com'
 const sourceApp = 'jarrett-career-site'
@@ -184,9 +184,19 @@ async function acceptance(databaseUrl) {
     organizationId,
     requesterEmail: 'scoped@example.com',
   })
+  await assert.rejects(
+    pool.query(
+      `UPDATE career_site_submission_outbox
+       SET requeue_count = 1, last_requeued_at = now()
+       WHERE id = $1::uuid`,
+      [scoped.outboxId],
+    ),
+    /career_site_submission_outbox_requeue_audit_valid|check constraint/i,
+  )
   const wrongScope = await persistence.claimCareerSiteSubmissionOutboxInPostgres({
     sourceApp,
     ownerEmail: otherOwnerEmail,
+    organizationId,
     limit: 50,
   })
   assert.equal(wrongScope.length, 0, 'Wrong owner must not claim or consume attempts')
@@ -199,6 +209,7 @@ async function acceptance(databaseUrl) {
   const claimed = await persistence.claimCareerSiteSubmissionOutboxInPostgres({
     sourceApp,
     ownerEmail,
+    organizationId,
     limit: 50,
     leaseSeconds: 900,
   })
@@ -230,6 +241,7 @@ async function acceptance(databaseUrl) {
   const oneAtATime = await persistence.claimCareerSiteSubmissionOutboxInPostgres({
     sourceApp,
     ownerEmail,
+    organizationId,
     limit: 50,
   })
   assert.equal(oneAtATime.length, 1)
@@ -244,6 +256,7 @@ async function acceptance(databaseUrl) {
   const remaining = await persistence.claimCareerSiteSubmissionOutboxInPostgres({
     sourceApp,
     ownerEmail,
+    organizationId,
   })
   assert.equal(remaining.length, 1)
   await persistence.completeCareerSiteSubmissionOutboxInPostgres(remaining[0])
@@ -272,6 +285,7 @@ async function acceptance(databaseUrl) {
   let health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({
     sourceApp,
     ownerEmail,
+    organizationId,
     pollMs: 10_000,
     leaseSeconds: 900,
   })
@@ -291,9 +305,10 @@ async function acceptance(databaseUrl) {
      WHERE id = $1::uuid`,
     [retryable.outboxId],
   )
-  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail })
+  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail, organizationId })
   assert.equal(health.status, 'degraded')
   assert.equal(health.queue.failed, 1)
+  assert.equal(health.healthy, true)
   await pool.query('DELETE FROM career_site_submissions WHERE id = $1::uuid', [retryable.id])
 
   const outOfScope = await seedSubmission(pool, {
@@ -301,7 +316,7 @@ async function acceptance(databaseUrl) {
     organizationId,
     requesterEmail: 'other@example.com',
   })
-  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail })
+  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail, organizationId })
   assert.equal(health.healthy, false)
   assert.equal(health.queue.outOfScopePending, 1)
   await pool.query('DELETE FROM career_site_submissions WHERE id = $1::uuid', [outOfScope.id])
@@ -317,16 +332,68 @@ async function acceptance(databaseUrl) {
      WHERE id = $1::uuid`,
     [dead.outboxId],
   )
-  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail })
+  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail, organizationId })
   assert.equal(health.status, 'unhealthy')
   assert.equal(health.queue.dead, 1)
+  const immutableBefore = await pool.query(
+    `SELECT requester_email, payload_hash FROM career_site_submissions WHERE id = $1::uuid`,
+    [dead.id],
+  )
+  for (let generation = 1; generation <= 3; generation += 1) {
+    const requeued = await persistence.requeueDeadCareerSiteSubmissionInPostgres({
+      actorEmail: ownerEmail,
+      organizationId,
+      submissionId: dead.submissionId,
+      expectedGeneration: generation - 1,
+      reason: `Operator Sheet recovery generation ${generation}`,
+    })
+    assert.equal(requeued.generation, generation)
+    await pool.query(
+      `UPDATE career_site_submission_outbox
+       SET status = 'dead', attempts = 8, processed_at = now()
+       WHERE id = $1::uuid`,
+      [dead.outboxId],
+    )
+    if (generation === 1) {
+      await assert.rejects(
+        persistence.requeueDeadCareerSiteSubmissionInPostgres({
+          actorEmail: ownerEmail,
+          organizationId,
+          submissionId: dead.submissionId,
+          expectedGeneration: 0,
+          reason: 'Replay after a lost recovery response must not spend another generation',
+        }),
+        (error) => error?.code === 'CAREER_SITE_SUBMISSION_REQUEUE_GENERATION_MISMATCH',
+      )
+      const replayState = await pool.query(
+        'SELECT status, requeue_count FROM career_site_submission_outbox WHERE id = $1::uuid',
+        [dead.outboxId],
+      )
+      assert.deepEqual(replayState.rows[0], { status: 'dead', requeue_count: 1 })
+    }
+  }
+  await assert.rejects(
+    persistence.requeueDeadCareerSiteSubmissionInPostgres({
+      actorEmail: ownerEmail,
+      organizationId,
+      submissionId: dead.submissionId,
+      expectedGeneration: 3,
+      reason: 'A fourth Sheet recovery must be rejected',
+    }),
+    (error) => error?.code === 'CAREER_SITE_SUBMISSION_REQUEUE_LIMIT',
+  )
+  const immutableAfter = await pool.query(
+    `SELECT requester_email, payload_hash FROM career_site_submissions WHERE id = $1::uuid`,
+    [dead.id],
+  )
+  assert.deepEqual(immutableAfter.rows[0], immutableBefore.rows[0])
   await pool.query('DELETE FROM career_site_submissions WHERE id = $1::uuid', [dead.id])
 
   await pool.query(
     'UPDATE schema_migrations SET checksum = repeat($2, 64) WHERE filename = $1',
     [migrationFilename, 'f'],
   )
-  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail })
+  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail, organizationId })
   assert.equal(health.healthy, false)
   assert.equal(health.migration.checksumMatches, false)
   await pool.query(
@@ -342,6 +409,7 @@ async function acceptance(databaseUrl) {
   health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({
     sourceApp,
     ownerEmail,
+    organizationId,
     pollMs: 10_000,
   })
   assert.equal(health.worker.stale, true)
@@ -355,7 +423,7 @@ async function acceptance(databaseUrl) {
     failed: 1,
     dead: 0,
   })
-  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail })
+  health = await persistence.readCareerSiteSubmissionOperationalHealthFromPostgres({ sourceApp, ownerEmail, organizationId })
   assert.equal(health.worker.phase, 'failed')
   assert.equal(health.healthy, false)
 

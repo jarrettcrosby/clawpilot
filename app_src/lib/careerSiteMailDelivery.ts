@@ -320,18 +320,72 @@ export async function createCareerSiteMailDraft(input: {
     envelope,
     rfcMessageId: input.rfcMessageId,
   }))
-  const response = await matonPlatformMailFetch(GMAIL_DRAFTS_PATH, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: { raw } }),
-  })
+  let response: Response
+  try {
+    response = await matonPlatformMailFetch(GMAIL_DRAFTS_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: { raw } }),
+    })
+  } catch {
+    throw new CareerSiteMailProviderError(
+      'Career-site email draft creation status is ambiguous',
+      null,
+      true,
+    )
+  }
   if (!response.ok) {
-    throw new CareerSiteMailProviderError('Career-site email draft was rejected', response.status, false)
+    throw new CareerSiteMailProviderError(
+      'Career-site email draft was rejected',
+      response.status,
+      response.status >= 500,
+    )
   }
   const data = await response.json().catch(() => ({})) as { id?: unknown; message?: { id?: unknown } }
+  try {
+    return {
+      draftId: providerId(data.id, 'Gmail draft ID'),
+      draftMessageId: data.message?.id ? providerId(data.message.id, 'Gmail draft message ID') : null,
+    }
+  } catch {
+    throw new CareerSiteMailProviderError(
+      'Career-site email draft creation status is ambiguous',
+      response.status,
+      true,
+    )
+  }
+}
+
+export async function findCareerSiteMailDraft(rfcMessageId: string) {
+  const query = new URLSearchParams({
+    q: `in:drafts rfc822msgid:${rfcMessageId}`,
+    maxResults: '2',
+  })
+  const response = await matonPlatformMailFetch(
+    `${GMAIL_DRAFTS_PATH}?${query.toString()}`,
+    { headers: { Accept: 'application/json' } },
+  )
+  if (!response.ok) {
+    throw new CareerSiteMailProviderError('Career-site draft lookup failed', response.status, false)
+  }
+  const data = await response.json().catch(() => ({})) as {
+    drafts?: Array<{ id?: unknown; message?: { id?: unknown } }>
+  }
+  const drafts = Array.isArray(data.drafts) ? data.drafts : []
+  if (drafts.length > 1) {
+    throw new CareerSiteMailProviderError(
+      'Multiple drafts matched the career-site Message-ID',
+      409,
+      false,
+    )
+  }
+  const draft = drafts[0]
+  if (!draft) return null
   return {
-    draftId: providerId(data.id, 'Gmail draft ID'),
-    draftMessageId: data.message?.id ? providerId(data.message.id, 'Gmail draft message ID') : null,
+    draftId: providerId(draft.id, 'Gmail draft ID'),
+    draftMessageId: draft.message?.id
+      ? providerId(draft.message.id, 'Gmail draft message ID')
+      : null,
   }
 }
 
@@ -350,7 +404,15 @@ export async function findSentCareerSiteMail(rfcMessageId: string) {
   const data = await response.json().catch(() => ({})) as {
     messages?: Array<{ id?: unknown }>
   }
-  const id = data.messages?.[0]?.id
+  const messages = Array.isArray(data.messages) ? data.messages : []
+  if (messages.length > 1) {
+    throw new CareerSiteMailProviderError(
+      'Multiple sent messages matched the career-site Message-ID',
+      409,
+      false,
+    )
+  }
+  const id = messages[0]?.id
   return id ? providerId(id, 'Gmail sent message ID') : null
 }
 

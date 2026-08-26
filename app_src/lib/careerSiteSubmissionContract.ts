@@ -7,6 +7,7 @@ const OWNER_EMAIL_MAX_LENGTH = 254
 const REQUESTER_EMAIL_MAX_LENGTH = 160
 const CAREER_SITE_SOURCE_APP = 'jarrett-career-site'
 const CAREER_SITE_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
+const CAREER_SITE_ORGANIZATION_ID = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
 const CAREER_SITE_PUBLIC_ORIGIN = 'https://jarrett.suburbiasandwichco.com'
 
 const CONTACT_INTERESTS = new Set([
@@ -60,6 +61,7 @@ export type CareerSiteSubmissionConfiguration = {
   enabled: boolean
   sourceApp: typeof CAREER_SITE_SOURCE_APP
   ownerEmail: string | null
+  organizationId: string | null
   sheetId: string | null
   sheetTab: string
   sheetHeaderRow: number
@@ -82,6 +84,7 @@ export type CareerSiteGoogleDrivePermission = {
   emailAddress?: unknown
   deleted?: unknown
   pendingOwner?: unknown
+  view?: unknown
 }
 
 export class CareerSiteSubmissionRequestError extends Error {
@@ -458,6 +461,13 @@ export function assertPrivateCareerSiteSheetBoundary(input: {
   }
 
   const activePermissions = input.permissions.filter((permission) => permission.deleted !== true)
+  if (activePermissions.some((permission) => (
+    permission.view === 'published' || permission.role === 'publishedReader'
+  ))) {
+    throw new CareerSiteSubmissionSheetBoundaryError(
+      'Career-site Sheet must not be published to the web',
+    )
+  }
   if (activePermissions.length !== 2) {
     throw new CareerSiteSubmissionSheetBoundaryError(
       'Career-site Sheet must be shared only with its owner and the configured service account',
@@ -521,6 +531,7 @@ export function resolveCareerSiteSubmissionConfiguration(
       enabled: false,
       sourceApp: CAREER_SITE_SOURCE_APP,
       ownerEmail: null,
+      organizationId: null,
       sheetId: null,
       sheetTab,
       sheetHeaderRow,
@@ -544,6 +555,14 @@ export function resolveCareerSiteSubmissionConfiguration(
       'CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be the Jarrett career-site owner identity',
     )
   }
+  const organizationId = String(
+    environment.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+  ).trim().toLowerCase()
+  if (organizationId !== CAREER_SITE_ORGANIZATION_ID) {
+    throw new CareerSiteSubmissionConfigurationError(
+      `CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID must be ${CAREER_SITE_ORGANIZATION_ID}`,
+    )
+  }
   const sheetId = String(environment.CAREER_SITE_SUBMISSIONS_SHEET_ID || '').trim()
   if (!GOOGLE_RESOURCE_ID_PATTERN.test(sheetId)) {
     throw new CareerSiteSubmissionConfigurationError(
@@ -554,6 +573,7 @@ export function resolveCareerSiteSubmissionConfiguration(
     enabled: true,
     sourceApp: CAREER_SITE_SOURCE_APP,
     ownerEmail,
+    organizationId,
     sheetId,
     sheetTab,
     sheetHeaderRow,

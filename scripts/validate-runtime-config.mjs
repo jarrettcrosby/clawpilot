@@ -8,6 +8,8 @@ import {
 const sourcePattern = /^[a-z][a-z0-9-]{1,39}$/
 const ownerDomainPattern = /^[a-z0-9.-]+$/
 const emailPattern = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const careerSiteOrganizationId = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
 let serviceClientSources = []
 let serviceClients = []
 
@@ -48,13 +50,15 @@ function validateServiceClients() {
       const secret = String(client?.secret || '')
       const ownerDomain = String(client?.ownerDomain || '').trim().toLowerCase()
       const ownerEmail = String(client?.ownerEmail || '').trim().toLowerCase()
+      const organizationId = String(client?.organizationId || '').trim().toLowerCase()
       if (
         !sourcePattern.test(sourceApp)
         || secret.length < 32
         || (ownerDomain && !ownerDomainPattern.test(ownerDomain))
         || (ownerEmail && (!emailPattern.test(ownerEmail) || ownerEmail.split('@')[1] !== ownerDomain))
+        || (organizationId && !uuidPattern.test(organizationId))
       ) {
-        fail('Each short-link service client needs a valid sourceApp, 32-character secret, and optional matching ownerDomain/ownerEmail')
+        fail('Each short-link service client needs a valid sourceApp, 32-character secret, and optional matching ownerDomain/ownerEmail/organizationId')
       }
       if (sources.has(sourceApp)) fail(`Short-link service source ${sourceApp} is duplicated`)
       sources.add(sourceApp)
@@ -65,6 +69,7 @@ function validateServiceClients() {
       secret: String(client.secret),
       ownerDomain: String(client.ownerDomain || '').trim().toLowerCase(),
       ownerEmail: String(client.ownerEmail || '').trim().toLowerCase(),
+      organizationId: String(client.organizationId || '').trim().toLowerCase(),
     }))
     return clients.length
   }
@@ -80,6 +85,7 @@ function validateServiceClients() {
     secret,
     ownerDomain: String(process.env.SHORTLINK_SERVICE_ALLOWED_OWNER_DOMAIN || '').trim().toLowerCase(),
     ownerEmail: '',
+    organizationId: '',
   }]
   return 1
 }
@@ -99,14 +105,21 @@ function validateCareerSiteSubmissionsConfiguration() {
   if (ownerEmail !== 'jarrett@suburbiasandwichco.com') {
     fail('CAREER_SITE_SUBMISSIONS_OWNER_EMAIL must be the exact Jarrett career-site owner identity')
   }
+  const organizationId = String(
+    process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+  ).trim().toLowerCase()
+  if (organizationId !== careerSiteOrganizationId) {
+    fail(`CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID must be ${careerSiteOrganizationId}`)
+  }
   const careerClient = serviceClients.find((client) => client.sourceApp === 'jarrett-career-site')
   if (
     !serviceClientSources.includes('jarrett-career-site')
     || !careerClient
     || careerClient.ownerDomain !== 'suburbiasandwichco.com'
     || careerClient.ownerEmail !== ownerEmail
+    || careerClient.organizationId !== organizationId
   ) {
-    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires the exact jarrett-career-site source, ownerDomain, and ownerEmail identity')
+    fail('CAREER_SITE_SUBMISSIONS_ENABLED requires the exact jarrett-career-site source, ownerDomain, ownerEmail, and organizationId identity')
   }
   if (serviceClients.some((client) => client !== careerClient && client.secret === careerClient.secret)) {
     fail('The jarrett-career-site short-link service secret must not be reused by another source')
@@ -147,6 +160,40 @@ function validateCareerSiteSubmissionsConfiguration() {
   const mailApprovalTo = String(process.env.CAREER_SITE_MAIL_APPROVAL_TO || '').trim().toLowerCase()
   if (mailApprovalTo !== 'jarrettcrosby@gmail.com') {
     fail('CAREER_SITE_MAIL_APPROVAL_TO must be JarrettCrosby@gmail.com')
+  }
+  let approvalOrigins
+  try {
+    approvalOrigins = JSON.parse(String(process.env.CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON || ''))
+  } catch {
+    fail('CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must be valid JSON')
+  }
+  if (!Array.isArray(approvalOrigins) || approvalOrigins.length < 1 || approvalOrigins.length > 10) {
+    fail('CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must contain 1-10 exact HTTPS origins')
+  }
+  const normalizedApprovalOrigins = approvalOrigins.map((value) => {
+    const configured = String(value || '')
+    try {
+      const parsed = new URL(configured)
+      if (
+        parsed.protocol !== 'https:'
+        || parsed.username
+        || parsed.password
+        || parsed.port
+        || parsed.pathname !== '/'
+        || parsed.search
+        || parsed.hash
+        || configured !== parsed.origin
+      ) throw new Error('invalid exact origin')
+      return parsed.origin
+    } catch {
+      fail('CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON contains an invalid origin')
+    }
+  })
+  if (
+    new Set(normalizedApprovalOrigins).size !== normalizedApprovalOrigins.length
+    || !normalizedApprovalOrigins.includes('https://jarrett.suburbiasandwichco.com')
+  ) {
+    fail('CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must contain the exact production origin without duplicates')
   }
   return 'enabled'
 }

@@ -7,6 +7,7 @@ import {
 import {
   CareerSiteMailProviderError,
   createCareerSiteMailDraft,
+  findCareerSiteMailDraft,
   findSentCareerSiteMail,
   sendCareerSiteMailDraft,
   verifyCareerSiteMailSender,
@@ -14,7 +15,10 @@ import {
 import {
   claimCareerSiteMailOutboxInPostgres,
   completeCareerSiteMailOutboxInPostgres,
+  decryptCareerSiteMailOutboxRequest,
   failCareerSiteMailOutboxInPostgres,
+  purgeExpiredCareerSiteMailDeadPayloadsInPostgres,
+  reserveCareerSiteMailDraftCreationInPostgres,
   renewCareerSiteMailOutboxLeaseInPostgres,
   saveCareerSiteMailDraftInPostgres,
   type CareerSiteMailOutboxItem,
@@ -40,14 +44,20 @@ export async function processCareerSiteMailOutbox(input: {
   maxAttempts?: number
 } = {}) {
   const configuration = resolveCareerSiteMailConfiguration()
-  if (!configuration.enabled || !configuration.ownerEmail) {
+  if (!configuration.enabled || !configuration.ownerEmail || !configuration.organizationId) {
     return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
   }
+  await purgeExpiredCareerSiteMailDeadPayloadsInPostgres({
+    sourceApp: configuration.sourceApp,
+    ownerEmail: configuration.ownerEmail,
+    organizationId: configuration.organizationId,
+  })
   await verifyCareerSiteMailSender(configuration)
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 8), 20))
   const items = await claimCareerSiteMailOutboxInPostgres({
     sourceApp: configuration.sourceApp,
     ownerEmail: configuration.ownerEmail,
+    organizationId: configuration.organizationId,
     maxAttempts,
     leaseSeconds: 900,
   })
@@ -55,7 +65,13 @@ export async function processCareerSiteMailOutbox(input: {
   if (!item) return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
 
   try {
-    item.request = parseCareerSiteMailRequest(item.request)
+    if (!configuration.shortLinkOrigin || !configuration.approvalOrigins) {
+      throw new CareerSiteMailConfigurationError('Career-site mail origins are unavailable')
+    }
+    const request = parseCareerSiteMailRequest(decryptCareerSiteMailOutboxRequest(item), {
+      shortLinkOrigin: configuration.shortLinkOrigin,
+      approvalOrigins: configuration.approvalOrigins,
+    })
     const existingMessageId = await findAlreadySent(item)
     if (existingMessageId) {
       await completeCareerSiteMailOutboxInPostgres({ item, providerMessageId: existingMessageId })
@@ -71,11 +87,29 @@ export async function processCareerSiteMailOutbox(input: {
     let draftId = item.draftId
     if (!draftId) {
       await renewCareerSiteMailOutboxLeaseInPostgres(item)
-      const draft = await createCareerSiteMailDraft({
-        configuration,
-        request: item.request,
-        rfcMessageId: item.rfcMessageId,
-      })
+      let draft = await findCareerSiteMailDraft(item.rfcMessageId)
+      if (!draft) {
+        const reserved = await reserveCareerSiteMailDraftCreationInPostgres(item)
+        if (!reserved) {
+          throw new CareerSiteMailProviderError(
+            'Career-site draft creation remains ambiguous; no new draft was created',
+            409,
+            false,
+          )
+        }
+        try {
+          draft = await createCareerSiteMailDraft({
+            configuration,
+            request,
+            rfcMessageId: item.rfcMessageId,
+          })
+        } catch (error) {
+          if (error instanceof CareerSiteMailProviderError && error.ambiguous) {
+            draft = await findCareerSiteMailDraft(item.rfcMessageId)
+          }
+          if (!draft) throw error
+        }
+      }
       draftId = await saveCareerSiteMailDraftInPostgres({ item, draftId: draft.draftId })
     }
 

@@ -6,13 +6,15 @@ import { getStorageDriver } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { requireRequestUser } from '@/lib/requestUser'
 import { effectiveAuthorizationRole, effectiveUserPermissions, normalizeUserEmail } from '@/lib/users'
-import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
+import { requireWorkspaceAppUser, WorkspaceAccessError } from '@/lib/workspaceMemberships'
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/
 const CRM_REFERENCE_PREFIXES = ['ga', 'gc', 'gi', 'gk', 'gl', 'gm', 'go', 'gp']
 const CRM_REFERENCE_SLUG_PATTERN = globalIdPattern(CRM_REFERENCE_PREFIXES)
 const CRM_ACTION_SLUG_PATTERN = new RegExp(`^mail-${globalIdFragment(['ga', 'gc'])}$`)
 const SOURCE_PATTERN = /^[a-z][a-z0-9-]{1,39}$/
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const CAREER_SITE_ORGANIZATION_ID = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
 const SLUG_ALPHABET = '23456789abcdefghjkmnpqrstuvwxyz'
 const RESERVED_SLUGS = new Set(['admin', 'api', 'app', 'auth', 'new', 'privacy', 'settings'])
 const MAX_TAGS = 20
@@ -69,6 +71,7 @@ type ShortLinkServiceClient = {
   secret: string
   ownerDomain: string | null
   ownerEmail: string | null
+  organizationId: string | null
 }
 
 export class ShortLinkRequestError extends Error {
@@ -190,12 +193,18 @@ function configuredServiceClients(): ShortLinkServiceClient[] {
         const ownerEmail = record.ownerEmail === undefined || record.ownerEmail === null || record.ownerEmail === ''
           ? null
           : normalizeUserEmail(record.ownerEmail)
+        const organizationId = record.organizationId === undefined
+          || record.organizationId === null
+          || record.organizationId === ''
+          ? null
+          : String(record.organizationId).trim().toLowerCase()
         if (
           secret.length < 32
           || (ownerDomain && !/^[a-z0-9.-]+$/.test(ownerDomain))
           || (ownerEmail && ownerDomain && ownerEmail.split('@')[1] !== ownerDomain)
+          || (organizationId && !UUID_PATTERN.test(organizationId))
         ) throw new Error()
-        return { sourceApp, secret, ownerDomain, ownerEmail }
+        return { sourceApp, secret, ownerDomain, ownerEmail, organizationId }
       })
     } catch {
       throw new ShortLinkRequestError('Short-link service authentication is misconfigured', 503)
@@ -209,6 +218,7 @@ function configuredServiceClients(): ShortLinkServiceClient[] {
     secret,
     ownerDomain: String(process.env.SHORTLINK_SERVICE_ALLOWED_OWNER_DOMAIN || '').trim().toLowerCase() || null,
     ownerEmail: null,
+    organizationId: null,
   }]
 }
 
@@ -230,11 +240,18 @@ export function validateShortLinkConfiguration(options: { requireServiceClient?:
       throw new Error('Career-site submissions require an isolated JSON short-link service client')
     }
     const expectedOwner = normalizeUserEmail(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL)
+    const expectedOrganizationId = String(
+      process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+    ).trim().toLowerCase()
+    if (expectedOrganizationId !== CAREER_SITE_ORGANIZATION_ID) {
+      throw new Error('Career-site organization identity is not configured')
+    }
     const careerClient = clients.find((client) => client.sourceApp === 'jarrett-career-site')
     if (
       !careerClient
       || careerClient.ownerDomain !== 'suburbiasandwichco.com'
       || careerClient.ownerEmail !== expectedOwner
+      || careerClient.organizationId !== expectedOrganizationId
     ) {
       throw new Error('Career-site short-link service identity is not exact')
     }
@@ -282,11 +299,25 @@ export async function resolveShortLinkActor(req: NextRequest): Promise<ShortLink
       throw new ShortLinkRequestError('Authenticated user is not allowed for this service client', 403)
     }
     let organizationId: string
+    const requestedOrganizationId = String(
+      req.headers.get('x-shortlink-organization') || '',
+    ).trim().toLowerCase()
+    if (client.organizationId && requestedOrganizationId !== client.organizationId) {
+      throw new ShortLinkRequestError('Authenticated organization is not allowed for this service client', 403)
+    }
+    if (requestedOrganizationId && !UUID_PATTERN.test(requestedOrganizationId)) {
+      throw new ShortLinkRequestError('Authenticated organization is not allowed for this service client', 403)
+    }
     try {
-      const requestedOrganizationId = String(req.headers.get('x-shortlink-organization') || '').trim()
-      organizationId = (await requireWorkspaceAppUser(ownerEmail, requestedOrganizationId || undefined)).organizationId || ''
-      if (!organizationId) throw new Error('Workspace unavailable')
-    } catch {
+      organizationId = (await requireWorkspaceAppUser(
+        ownerEmail,
+        requestedOrganizationId || undefined,
+      )).organizationId || ''
+      if (!organizationId) throw new WorkspaceAccessError('Workspace unavailable')
+    } catch (error) {
+      if (!(error instanceof WorkspaceAccessError)) {
+        throw new ShortLinkRequestError('Short-link authentication is temporarily unavailable', 503)
+      }
       throw new ShortLinkRequestError('Authenticated user has no active ClawPilot organization', 403)
     }
     return {

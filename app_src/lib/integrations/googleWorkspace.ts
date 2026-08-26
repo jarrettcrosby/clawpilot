@@ -406,6 +406,39 @@ export async function resolveGoogleWorkspaceProvisioningRuntime() {
   }
 }
 
+export async function resolveGoogleWorkspacePrivateFileRuntime() {
+  try {
+    const current = await readGoogleWorkspaceIntegrationRecordInPostgres()
+    if (!current.apiKeySecret) {
+      throw new GoogleWorkspaceRequestError(
+        'Configure the Google API key before using private Google Workspace files',
+        409,
+        'GOOGLE_API_KEY_REQUIRED',
+      )
+    }
+    if (!current.serviceAccountSecret) {
+      throw new GoogleWorkspaceRequestError(
+        'Upload and validate a Google service-account credential before using private Google Workspace files',
+        409,
+        'GOOGLE_SERVICE_ACCOUNT_REQUIRED',
+      )
+    }
+    if (!current.verifiedAt) {
+      throw new GoogleWorkspaceRequestError(
+        'Test the Google Workspace integration before using private Google Workspace files',
+        409,
+        'GOOGLE_WORKSPACE_VALIDATION_REQUIRED',
+      )
+    }
+    const resolvedRuntime = await configuredRuntime(current)
+    resolvedRuntime.sharedDriveId = null
+    resolvedRuntime.sharedDriveName = null
+    return resolvedRuntime
+  } catch (error) {
+    throw requestError(error)
+  }
+}
+
 export async function resolveGoogleWorkspaceProvisioningBinding() {
   try {
     const current = await readGoogleWorkspaceIntegrationRecordInPostgres()

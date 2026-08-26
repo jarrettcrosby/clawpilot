@@ -16,6 +16,7 @@ import {
 const contactId = '11111111-1111-4111-8111-111111111111'
 const resumeId = '22222222-2222-4222-8222-222222222222'
 const newsletterId = '33333333-3333-4333-8333-333333333333'
+const organizationId = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
 
 test('normalizes a bounded contact submission without adding consent', () => {
   const submission = parseCareerSiteSubmission({
@@ -139,6 +140,13 @@ test('requires an exact private My Drive owner and service-account permission bo
       permissions: valid.permissions.map((permission) => (
         permission.role === 'writer' ? { ...permission, role: 'reader' } : permission
       )),
+    },
+    {
+      ...valid,
+      permissions: [
+        ...valid.permissions,
+        { id: 'published-permission', type: 'anyone', role: 'publishedReader', view: 'published' },
+      ],
     },
   ]
   for (const boundary of invalidBoundaries) {
@@ -311,6 +319,7 @@ test('configuration is disabled by default and fails closed when enabled incompl
     enabled: false,
     sourceApp: 'jarrett-career-site',
     ownerEmail: null,
+    organizationId: null,
     sheetId: null,
     sheetTab: 'Submissions',
     sheetHeaderRow: 4,
@@ -322,11 +331,13 @@ test('configuration is disabled by default and fails closed when enabled incompl
   assert.deepEqual(resolveCareerSiteSubmissionConfiguration({
     CAREER_SITE_SUBMISSIONS_ENABLED: '1',
     CAREER_SITE_SUBMISSIONS_OWNER_EMAIL: 'Jarrett@SuburbiaSandwichCo.com',
+    CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID: organizationId,
     CAREER_SITE_SUBMISSIONS_SHEET_ID: '1abc_DEF-234',
   }), {
     enabled: true,
     sourceApp: 'jarrett-career-site',
     ownerEmail: 'jarrett@suburbiasandwichco.com',
+    organizationId,
     sheetId: '1abc_DEF-234',
     sheetTab: 'Submissions',
     sheetHeaderRow: 4,
@@ -341,6 +352,7 @@ test('configuration is disabled by default and fails closed when enabled incompl
     () => resolveCareerSiteSubmissionConfiguration({
       CAREER_SITE_SUBMISSIONS_ENABLED: '1',
       CAREER_SITE_SUBMISSIONS_OWNER_EMAIL: 'other@suburbiasandwichco.com',
+      CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID: organizationId,
       CAREER_SITE_SUBMISSIONS_SHEET_ID: '1abc_DEF-234',
     }),
     CareerSiteSubmissionConfigurationError,
