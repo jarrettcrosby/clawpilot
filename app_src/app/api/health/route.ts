@@ -3,9 +3,13 @@ import fs from 'fs'
 import { getAgentRuntime } from '@/lib/agents/provider'
 import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerConfig'
 import { getPrintAgentReleaseConfiguration } from '@/lib/operations/printAgentReleaseConfig'
+import { resolveCareerSiteSubmissionConfiguration } from '@/lib/careerSiteSubmissionContract'
+import { resolveCareerSiteMailConfiguration } from '@/lib/careerSiteMailContract'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
+import { readCareerSiteSubmissionOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteSubmissions'
+import { readCareerSiteMailOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteMailOutbox'
 import {
   OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY,
 } from '@/lib/persistence/operationsCommandReceiptHealth'
@@ -2896,6 +2900,16 @@ export async function GET() {
       )
     }
     let database: Record<string, unknown> = { status: 'not-configured' }
+    let careerSiteSubmissions: Record<string, unknown> = {
+      enabled: false,
+      healthy: true,
+      status: 'disabled',
+    }
+    let careerSiteMail: Record<string, unknown> = {
+      enabled: false,
+      healthy: true,
+      status: 'disabled',
+    }
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
@@ -9874,6 +9888,57 @@ export async function GET() {
       errors.push('Hosted runtime database is not configured.')
     }
 
+    if (process.env.CAREER_SITE_SUBMISSIONS_ENABLED === '1') {
+      try {
+        const configuration = resolveCareerSiteSubmissionConfiguration()
+        if (!configuration.ownerEmail) throw new Error('career-site owner identity is missing')
+        careerSiteSubmissions = await readCareerSiteSubmissionOperationalHealthFromPostgres({
+          sourceApp: configuration.sourceApp,
+          ownerEmail: configuration.ownerEmail,
+          organizationId: configuration.organizationId!,
+          pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
+          leaseSeconds: 900,
+        })
+        if (careerSiteSubmissions.healthy !== true) {
+          errors.push('Career-site submission delivery is unhealthy.')
+        }
+      } catch (error) {
+        careerSiteSubmissions = {
+          enabled: true,
+          healthy: false,
+          status: 'unhealthy',
+        }
+        console.error('[health] Career-site submission delivery health check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career-site submission delivery health could not be verified.')
+      }
+      try {
+        const mailConfiguration = resolveCareerSiteMailConfiguration()
+        if (!mailConfiguration.ownerEmail) throw new Error('career-site mail owner identity is missing')
+        careerSiteMail = await readCareerSiteMailOperationalHealthFromPostgres({
+          sourceApp: mailConfiguration.sourceApp,
+          ownerEmail: mailConfiguration.ownerEmail,
+          organizationId: mailConfiguration.organizationId!,
+          pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
+          leaseSeconds: 900,
+        })
+        if (careerSiteMail.healthy !== true) {
+          errors.push('Career-site email delivery is unhealthy.')
+        }
+      } catch (error) {
+        careerSiteMail = {
+          enabled: true,
+          healthy: false,
+          status: 'unhealthy',
+        }
+        console.error('[health] Career-site email delivery health check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career-site email delivery health could not be verified.')
+      }
+    }
+
     return NextResponse.json({
       status: errors.length > 0 ? 'error' : 'ok',
       errors,
@@ -9882,6 +9947,8 @@ export async function GET() {
       environment: process.env.RAILWAY_ENVIRONMENT_NAME || process.env.VERCEL_ENV || null,
       storage,
       database,
+      careerSiteSubmissions,
+      careerSiteMail,
       credentialStore,
       worker,
       agentWorker,
