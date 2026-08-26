@@ -68,6 +68,7 @@ export async function GET() {
       careerSiteSubmissions = await readCareerSiteSubmissionOperationalHealthFromPostgres({
         sourceApp: configuration.sourceApp,
         ownerEmail: configuration.ownerEmail,
+        organizationId: configuration.organizationId!,
         pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
         leaseSeconds: 900,
       })
@@ -90,6 +91,7 @@ export async function GET() {
       careerSiteMail = await readCareerSiteMailOperationalHealthFromPostgres({
         sourceApp: mailConfiguration.sourceApp,
         ownerEmail: mailConfiguration.ownerEmail,
+        organizationId: mailConfiguration.organizationId!,
         pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
         leaseSeconds: 900,
       })

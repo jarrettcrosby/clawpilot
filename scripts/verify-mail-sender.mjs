@@ -6,6 +6,29 @@ function required(name, minimumLength = 1) {
   return value
 }
 
+function resolveMatonGatewayBaseUrl(value = process.env.MATON_BASE_URL) {
+  const configured = String(value || 'https://gateway.maton.ai').trim()
+  try {
+    const url = new URL(configured)
+    const allowedHost = url.hostname === 'gateway.maton.ai' || url.hostname.endsWith('.gateway.maton.ai')
+    if (
+      url.protocol !== 'https:'
+      || !allowedHost
+      || url.port
+      || url.username
+      || url.password
+      || (url.pathname !== '/' && url.pathname !== '')
+      || url.search
+      || url.hash
+    ) {
+      throw new Error('invalid gateway origin')
+    }
+    return url.origin
+  } catch {
+    throw new Error('MATON_BASE_URL is not configured safely')
+  }
+}
+
 const apiKey = required('MATON_API_KEY', 16)
 const connectionId = required('MATON_GMAIL_CONNECTION_ID', 8)
 const sender = required('CLAWPILOT_MAIL_FROM', 5).toLowerCase()
@@ -18,7 +41,7 @@ if (String(process.env.CAREER_SITE_SUBMISSIONS_ENABLED || '0') === '1') {
   }
   if (!senders.includes(careerSender)) senders.push(careerSender)
 }
-const base = String(process.env.MATON_BASE_URL || 'https://gateway.maton.ai').replace(/\/$/, '')
+const base = resolveMatonGatewayBaseUrl()
 
 async function verifySender(candidate) {
   const url = `${base}/google-mail/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(candidate)}`
@@ -32,6 +55,8 @@ async function verifySender(candidate) {
           'Maton-Connection': connectionId,
         },
         signal: AbortSignal.timeout(10000),
+        redirect: 'error',
+        cache: 'no-store',
       })
       if (!response.ok) throw new Error(`sender lookup returned status ${response.status}`)
       const data = await response.json()

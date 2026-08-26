@@ -8,6 +8,8 @@ const CAREER_SITE_MAIL_FROM = 'info@suburbiasandwichco.com'
 const CAREER_SITE_MAIL_FROM_NAME = 'Jarrett Crosby'
 const CAREER_SITE_MAIL_REPLY_TO = 'jarrettcrosby@gmail.com'
 const CAREER_SITE_MAIL_APPROVAL_TO = 'jarrettcrosby@gmail.com'
+const CAREER_SITE_PRODUCTION_ORIGIN = 'https://jarrett.suburbiasandwichco.com'
+const CAREER_SITE_ORGANIZATION_ID = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
 
 const MESSAGE_TYPES = new Set([
   'contact-notification',
@@ -74,10 +76,13 @@ export type CareerSiteMailConfiguration = {
   enabled: boolean
   sourceApp: typeof CAREER_SITE_SOURCE_APP
   ownerEmail: typeof CAREER_SITE_OWNER_EMAIL | null
+  organizationId: string | null
   from: typeof CAREER_SITE_MAIL_FROM | null
   fromName: typeof CAREER_SITE_MAIL_FROM_NAME | null
   replyTo: typeof CAREER_SITE_MAIL_REPLY_TO | null
   approvalTo: typeof CAREER_SITE_MAIL_APPROVAL_TO | null
+  shortLinkOrigin: string | null
+  approvalOrigins: readonly string[] | null
 }
 
 export class CareerSiteMailRequestError extends Error {
@@ -193,21 +198,19 @@ function selection<T extends string>(value: unknown, allowed: ReadonlySet<string
   return normalized as T
 }
 
-function approvalUrl(value: unknown) {
+function approvalUrl(value: unknown, allowedOrigins: readonly string[]) {
   const raw = typeof value === 'string' ? value.trim() : ''
-  if (!raw || raw.length > 4096) throw new CareerSiteMailRequestError('approvalUrl is invalid')
+  if (!raw || raw.length > 12_000) throw new CareerSiteMailRequestError('approvalUrl is invalid')
   let url: URL
   try {
     url = new URL(raw)
   } catch {
     throw new CareerSiteMailRequestError('approvalUrl is invalid')
   }
-  const production = url.hostname === 'jarrett.suburbiasandwichco.com'
-  const preview = /^jarrett-suburbia(?:-[a-z0-9-]+)?\.vercel\.app$/.test(url.hostname)
   const token = url.searchParams.get('token') || ''
   if (
     url.protocol !== 'https:'
-    || (!production && !preview)
+    || !allowedOrigins.includes(url.origin)
     || url.port
     || url.username
     || url.password
@@ -216,7 +219,7 @@ function approvalUrl(value: unknown) {
     || [...url.searchParams.keys()].some((key) => key !== 'token')
     || url.searchParams.getAll('token').length !== 1
     || token.length < 32
-    || token.length > 3072
+    || token.length > 12_000
     || /[\u0000-\u0020\u007f]/.test(token)
   ) {
     throw new CareerSiteMailRequestError('approvalUrl is invalid')
@@ -224,7 +227,7 @@ function approvalUrl(value: unknown) {
   return url.toString()
 }
 
-function shortUrl(value: unknown) {
+function shortUrl(value: unknown, shortLinkOrigin: string, requestId: string) {
   const raw = typeof value === 'string' ? value.trim() : ''
   if (!raw || raw.length > 500) throw new CareerSiteMailRequestError('shortUrl is invalid')
   let url: URL
@@ -233,13 +236,12 @@ function shortUrl(value: unknown) {
   } catch {
     throw new CareerSiteMailRequestError('shortUrl is invalid')
   }
+  const expectedPath = `/s/jc-${createHash('sha256').update(requestId, 'utf8').digest('hex').slice(0, 16)}`
   if (
-    url.protocol !== 'https:'
-    || url.hostname !== 'aiapp.eigenracing.com'
-    || url.port
+    url.origin !== shortLinkOrigin
     || url.username
     || url.password
-    || !/^\/s\/jc-[0-9a-f]{16}$/.test(url.pathname)
+    || url.pathname !== expectedPath
     || url.search
     || url.hash
   ) {
@@ -282,7 +284,10 @@ function parseNewsletter(dataValue: unknown): NewsletterRequestData {
   }
 }
 
-function parseResumeApproval(dataValue: unknown): ResumeApprovalRequestData {
+function parseResumeApproval(
+  dataValue: unknown,
+  approvalOrigins: readonly string[],
+): ResumeApprovalRequestData {
   const data = record(dataValue, 'data')
   exactFields(data, new Set([
     'requestId', 'name', 'email', 'organization', 'context', 'networkInterest',
@@ -297,21 +302,22 @@ function parseResumeApproval(dataValue: unknown): ResumeApprovalRequestData {
     networkInterest: boolean(data.networkInterest, 'networkInterest'),
     roleFit: boolean(data.roleFit, 'roleFit'),
     variant: selection(data.variant, RESUME_VARIANTS, 'variant'),
-    approvalUrl: approvalUrl(data.approvalUrl),
+    approvalUrl: approvalUrl(data.approvalUrl, approvalOrigins),
   }
 }
 
-function parseApprovedResume(dataValue: unknown): ApprovedResumeLinkData {
+function parseApprovedResume(dataValue: unknown, shortLinkOrigin: string): ApprovedResumeLinkData {
   const data = record(dataValue, 'data')
   exactFields(data, new Set([
     'requestId', 'name', 'email', 'shortUrl', 'variant', 'documentStyle',
     'accessMode', 'expiresAt',
   ]), 'approved resume data')
+  const requestId = uuid(data.requestId, 'requestId')
   return {
-    requestId: uuid(data.requestId, 'requestId'),
+    requestId,
     name: singleLine(data.name, 'name', { required: true, min: 2, max: 100 })!,
     email: email(data.email, 'email'),
-    shortUrl: shortUrl(data.shortUrl),
+    shortUrl: shortUrl(data.shortUrl, shortLinkOrigin, requestId),
     variant: selection(data.variant, RESUME_VARIANTS, 'variant'),
     documentStyle: selection(data.documentStyle, DOCUMENT_STYLES, 'documentStyle'),
     accessMode: selection(data.accessMode, ACCESS_MODES, 'accessMode'),
@@ -319,7 +325,10 @@ function parseApprovedResume(dataValue: unknown): ApprovedResumeLinkData {
   }
 }
 
-export function parseCareerSiteMailRequest(value: unknown): NormalizedCareerSiteMailRequest {
+export function parseCareerSiteMailRequest(
+  value: unknown,
+  options: { shortLinkOrigin?: string; approvalOrigins?: readonly string[] } = {},
+): NormalizedCareerSiteMailRequest {
   const input = record(value, 'request')
   exactFields(input, TOP_LEVEL_FIELDS, 'career-site mail')
   const messageType = selection<CareerSiteMailMessageType>(input.messageType, MESSAGE_TYPES, 'messageType')
@@ -351,17 +360,18 @@ export function parseCareerSiteMailRequest(value: unknown): NormalizedCareerSite
     return { messageType, idempotencyKey, data }
   }
   if (messageType === 'resume-approval-request') {
-    const data = parseResumeApproval(input.data)
+    const approvalOrigins = options.approvalOrigins
+      || resolveCareerSiteMailApprovalOrigins(process.env.CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON)
+    const data = parseResumeApproval(input.data, approvalOrigins)
     assertExpectedKey(`resume-request/${data.requestId}`)
     return { messageType, idempotencyKey, data }
   }
-  const data = parseApprovedResume(input.data)
+  const allowedShortLinkOrigin = resolveCareerSiteShortLinkOrigin(
+    options.shortLinkOrigin ?? process.env.SHORTLINK_PUBLIC_ORIGIN,
+  )
+  const data = parseApprovedResume(input.data, allowedShortLinkOrigin)
   assertExpectedKey(`resume-approved/${data.requestId}`)
   return { messageType, idempotencyKey, data }
-}
-
-export function careerSiteMailPayloadHash(request: NormalizedCareerSiteMailRequest) {
-  return createHash('sha256').update(JSON.stringify(request), 'utf8').digest('hex')
 }
 
 function exactConfiguredEmail<T extends string>(value: unknown, expected: T, label: string): T {
@@ -370,6 +380,76 @@ function exactConfiguredEmail<T extends string>(value: unknown, expected: T, lab
     throw new CareerSiteMailConfigurationError(`${label} must be ${expected}`)
   }
   return normalized as T
+}
+
+export function resolveCareerSiteShortLinkOrigin(value: unknown) {
+  const configured = typeof value === 'string' ? value.trim() : ''
+  try {
+    const url = new URL(configured)
+    const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1'
+    if (
+      (url.protocol !== 'https:' && !(local && url.protocol === 'http:'))
+      || url.username
+      || url.password
+      || url.pathname !== '/'
+      || url.search
+      || url.hash
+    ) {
+      throw new Error('invalid short-link origin')
+    }
+    return url.origin
+  } catch {
+    throw new CareerSiteMailConfigurationError(
+      'SHORTLINK_PUBLIC_ORIGIN must be a valid exact HTTPS origin',
+    )
+  }
+}
+
+function exactHttpsOrigin(value: unknown, label: string) {
+  const configured = typeof value === 'string' ? value.trim() : ''
+  try {
+    const url = new URL(configured)
+    if (
+      url.protocol !== 'https:'
+      || url.username
+      || url.password
+      || url.port
+      || url.pathname !== '/'
+      || url.search
+      || url.hash
+    ) {
+      throw new Error('invalid exact origin')
+    }
+    return url.origin
+  } catch {
+    throw new CareerSiteMailConfigurationError(`${label} must contain exact HTTPS origins`)
+  }
+}
+
+export function resolveCareerSiteMailApprovalOrigins(value: unknown): readonly string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(typeof value === 'string' ? value : '')
+  } catch {
+    throw new CareerSiteMailConfigurationError(
+      'CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must be a JSON array of exact HTTPS origins',
+    )
+  }
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > 10) {
+    throw new CareerSiteMailConfigurationError(
+      'CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must contain 1-10 exact HTTPS origins',
+    )
+  }
+  const origins = parsed.map((origin) => exactHttpsOrigin(
+    origin,
+    'CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON',
+  ))
+  if (new Set(origins).size !== origins.length || !origins.includes(CAREER_SITE_PRODUCTION_ORIGIN)) {
+    throw new CareerSiteMailConfigurationError(
+      `CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON must contain ${CAREER_SITE_PRODUCTION_ORIGIN} without duplicates`,
+    )
+  }
+  return Object.freeze(origins)
 }
 
 export function resolveCareerSiteMailConfiguration(
@@ -381,10 +461,13 @@ export function resolveCareerSiteMailConfiguration(
       enabled: false,
       sourceApp: CAREER_SITE_SOURCE_APP,
       ownerEmail: null,
+      organizationId: null,
       from: null,
       fromName: null,
       replyTo: null,
       approvalTo: null,
+      shortLinkOrigin: null,
+      approvalOrigins: null,
     }
   }
   const ownerEmail = exactConfiguredEmail(
@@ -392,6 +475,14 @@ export function resolveCareerSiteMailConfiguration(
     CAREER_SITE_OWNER_EMAIL,
     'CAREER_SITE_SUBMISSIONS_OWNER_EMAIL',
   )
+  const organizationId = String(
+    environment.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+  ).trim().toLowerCase()
+  if (organizationId !== CAREER_SITE_ORGANIZATION_ID) {
+    throw new CareerSiteMailConfigurationError(
+      `CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID must be ${CAREER_SITE_ORGANIZATION_ID}`,
+    )
+  }
   const from = exactConfiguredEmail(environment.CAREER_SITE_MAIL_FROM, CAREER_SITE_MAIL_FROM, 'CAREER_SITE_MAIL_FROM')
   const replyTo = exactConfiguredEmail(
     environment.CAREER_SITE_MAIL_REPLY_TO,
@@ -407,13 +498,20 @@ export function resolveCareerSiteMailConfiguration(
   if (fromName !== CAREER_SITE_MAIL_FROM_NAME || /[\r\n]/.test(fromName)) {
     throw new CareerSiteMailConfigurationError(`CAREER_SITE_MAIL_FROM_NAME must be ${CAREER_SITE_MAIL_FROM_NAME}`)
   }
+  const shortLinkOrigin = resolveCareerSiteShortLinkOrigin(environment.SHORTLINK_PUBLIC_ORIGIN)
+  const approvalOrigins = resolveCareerSiteMailApprovalOrigins(
+    environment.CAREER_SITE_MAIL_APPROVAL_ORIGINS_JSON,
+  )
   return {
     enabled: true,
     sourceApp: CAREER_SITE_SOURCE_APP,
     ownerEmail,
+    organizationId,
     from,
     fromName: CAREER_SITE_MAIL_FROM_NAME,
     replyTo,
     approvalTo,
+    shortLinkOrigin,
+    approvalOrigins,
   }
 }

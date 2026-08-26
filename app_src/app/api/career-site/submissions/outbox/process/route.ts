@@ -119,8 +119,14 @@ export async function POST(req: NextRequest) {
     const mailResult = mailProcessing.status === 'fulfilled'
       ? mailProcessing.value
       : { claimed: 0, succeeded: 0, failed: 1, dead: 0, items: [] }
-    const phase = result.dead > 0 ? 'failed' : result.failed > 0 ? 'degraded' : 'completed'
-    const mailPhase = mailResult.dead > 0 ? 'failed' : mailResult.failed > 0 ? 'degraded' : 'completed'
+    const submissionWorkerRejected = submissionProcessing.status === 'rejected'
+    const mailWorkerRejected = mailProcessing.status === 'rejected'
+    const phase = submissionWorkerRejected || result.dead > 0
+      ? 'failed'
+      : result.failed > 0 ? 'degraded' : 'completed'
+    const mailPhase = mailWorkerRejected || mailResult.dead > 0
+      ? 'failed'
+      : mailResult.failed > 0 ? 'degraded' : 'completed'
     const heartbeat = await recordCareerSiteSubmissionWorkerHeartbeatInPostgres({
       phase,
       workerId,
@@ -140,12 +146,14 @@ export async function POST(req: NextRequest) {
     const health = await readCareerSiteSubmissionOperationalHealthFromPostgres({
       sourceApp: configuration.sourceApp,
       ownerEmail: configuration.ownerEmail!,
+      organizationId: configuration.organizationId!,
       pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
       leaseSeconds: 900,
     })
     const mailHealth = await readCareerSiteMailOperationalHealthFromPostgres({
       sourceApp: mailConfiguration.sourceApp,
       ownerEmail: mailConfiguration.ownerEmail!,
+      organizationId: mailConfiguration.organizationId!,
       pollMs: Number(process.env.CAREER_SITE_SUBMISSIONS_POLL_MS) || undefined,
       leaseSeconds: 900,
     })

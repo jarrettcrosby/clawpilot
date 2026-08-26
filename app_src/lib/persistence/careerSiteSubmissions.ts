@@ -11,8 +11,10 @@ import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 
 const OUTBOX_WORKER_HEARTBEAT_KEY = 'career_site.submissions.outbox.worker.heartbeat'
+const CAREER_SITE_SOURCE_APP = 'jarrett-career-site'
+const CAREER_SITE_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
 export const CAREER_SITE_SUBMISSIONS_MIGRATION_FILENAME = '0329_career_site_submissions.sql'
-export const CAREER_SITE_SUBMISSIONS_MIGRATION_CHECKSUM = '0f66211b10bf21e3d6e61b093d99b460f469635055af294f4d6b3f7d97fe2e78'
+export const CAREER_SITE_SUBMISSIONS_MIGRATION_CHECKSUM = '57025eaa8a87a1b2b78b97bd700b633355c8f2bc56308923abf6c4210efd8045'
 
 type CareerSiteSubmissionActor = {
   ownerEmail: string
@@ -94,6 +96,17 @@ export class CareerSiteSubmissionPersistenceConflictError extends Error {
   constructor() {
     super('submissionId was already used for different submission data')
     this.name = 'CareerSiteSubmissionPersistenceConflictError'
+  }
+}
+
+export class CareerSiteSubmissionRequeueError extends Error {
+  constructor(
+    message: string,
+    readonly status: 404 | 409,
+    readonly code: string,
+  ) {
+    super(message)
+    this.name = 'CareerSiteSubmissionRequeueError'
   }
 }
 
@@ -290,6 +303,7 @@ export async function createCareerSiteSubmissionInPostgres(input: {
 export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
   sourceApp: string
   ownerEmail: string
+  organizationId: string
   limit?: number
   maxAttempts?: number
   leaseSeconds?: number
@@ -314,9 +328,10 @@ export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
        WHERE outbox.submission_id = submission.id
          AND submission.source_app = $3
          AND submission.owner_email = $4
+         AND submission.workspace_organization_id = $5::uuid
          AND outbox.status = 'processing'
          AND (outbox.locked_at IS NULL OR outbox.locked_at < now() - ($2::text || ' seconds')::interval)`,
-      [maxAttempts, leaseSeconds, input.sourceApp, input.ownerEmail],
+      [maxAttempts, leaseSeconds, input.sourceApp, input.ownerEmail, input.organizationId],
     )
 
     const result = await client.query<CareerSiteSubmissionClaimRow>(
@@ -326,6 +341,7 @@ export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
          JOIN career_site_submissions submission ON submission.id = outbox.submission_id
          WHERE submission.source_app = $4
            AND submission.owner_email = $5
+           AND submission.workspace_organization_id = $6::uuid
            AND outbox.status IN ('queued', 'failed')
            AND outbox.attempts < $2
            AND outbox.available_at <= now()
@@ -352,7 +368,7 @@ export async function claimCareerSiteSubmissionOutboxInPostgres(input: {
        FROM claimed
        JOIN career_site_submissions submission ON submission.id = claimed.submission_id
        ORDER BY submission.created_at ASC, submission.id ASC`,
-      [limit, maxAttempts, lockToken, input.sourceApp, input.ownerEmail],
+      [limit, maxAttempts, lockToken, input.sourceApp, input.ownerEmail, input.organizationId],
     )
 
     return result.rows.map((row) => ({
@@ -443,6 +459,130 @@ export async function failCareerSiteSubmissionOutboxInPostgres(input: {
   return status
 }
 
+export async function requeueDeadCareerSiteSubmissionInPostgres(input: {
+  actorEmail: string
+  organizationId: string
+  submissionId: string
+  expectedGeneration: number
+  reason: string
+}) {
+  requirePostgres()
+  if (input.actorEmail !== CAREER_SITE_OWNER_EMAIL) {
+    throw new CareerSiteSubmissionRequeueError(
+      'Career-site submission delivery was not found',
+      404,
+      'CAREER_SITE_SUBMISSION_NOT_FOUND',
+    )
+  }
+  return withTransaction(async (client) => {
+    const updated = await client.query<{
+      outbox_id: string
+      submission_id: string
+      external_submission_id: string
+      requeue_count: number
+    }>(
+      `UPDATE career_site_submission_outbox outbox
+       SET status = 'queued',
+           attempts = 0,
+           requeue_count = outbox.requeue_count + 1,
+           last_requeued_at = now(),
+           last_requeued_by = $1,
+           last_requeue_reason = $5,
+           last_error = NULL,
+           available_at = now(),
+           processed_at = NULL,
+           locked_at = NULL,
+           lock_token = NULL,
+           updated_at = now()
+       FROM career_site_submissions submission
+       WHERE outbox.submission_id = submission.id
+         AND submission.source_app = $2
+         AND submission.owner_email = $1
+         AND submission.workspace_organization_id = $3::uuid
+         AND submission.external_submission_id = $4::uuid
+         AND outbox.status = 'dead'
+         AND outbox.requeue_count < 3
+         AND outbox.requeue_count = $6
+       RETURNING outbox.id::text AS outbox_id,
+         submission.id::text AS submission_id,
+         submission.external_submission_id::text,
+         outbox.requeue_count`,
+      [
+        input.actorEmail,
+        CAREER_SITE_SOURCE_APP,
+        input.organizationId,
+        input.submissionId,
+        input.reason,
+        input.expectedGeneration,
+      ],
+    )
+    const row = updated.rows[0]
+    if (!row) {
+      const existing = (await client.query<{
+        status: CareerSiteSubmissionOutboxStatus
+        requeue_count: number
+      }>(
+        `SELECT outbox.status, outbox.requeue_count
+         FROM career_site_submission_outbox outbox
+         JOIN career_site_submissions submission ON submission.id = outbox.submission_id
+         WHERE submission.source_app = $1
+           AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $3::uuid
+           AND submission.external_submission_id = $4::uuid
+         LIMIT 1
+         FOR SHARE OF outbox, submission`,
+        [CAREER_SITE_SOURCE_APP, input.actorEmail, input.organizationId, input.submissionId],
+      )).rows[0]
+      if (!existing) {
+        throw new CareerSiteSubmissionRequeueError(
+          'Career-site submission delivery was not found',
+          404,
+          'CAREER_SITE_SUBMISSION_NOT_FOUND',
+        )
+      }
+      if (existing.requeue_count !== input.expectedGeneration) {
+        throw new CareerSiteSubmissionRequeueError(
+          'Career-site submission recovery generation changed; refresh before retrying',
+          409,
+          'CAREER_SITE_SUBMISSION_REQUEUE_GENERATION_MISMATCH',
+        )
+      }
+      if (existing.status !== 'dead') {
+        throw new CareerSiteSubmissionRequeueError(
+          'Only terminal career-site submission delivery can be requeued',
+          409,
+          'CAREER_SITE_SUBMISSION_NOT_DEAD',
+        )
+      }
+      throw new CareerSiteSubmissionRequeueError(
+        'Career-site submission recovery limit reached',
+        409,
+        'CAREER_SITE_SUBMISSION_REQUEUE_LIMIT',
+      )
+    }
+    await recordAuditEvent({
+      actor: input.actorEmail,
+      subject: input.actorEmail,
+      eventType: 'career_site.submission.requeued',
+      aggregateType: 'career_site_submission',
+      aggregateId: row.submission_id,
+      eventKey: `career-site-submission-requeue:${row.submission_id}:${row.requeue_count}`,
+      organizationId: input.organizationId,
+      payload: {
+        sourceApp: CAREER_SITE_SOURCE_APP,
+        outboxId: row.outbox_id,
+        generation: row.requeue_count,
+        reason: input.reason,
+      },
+    }, client)
+    return {
+      submissionId: row.external_submission_id,
+      status: 'queued' as const,
+      generation: row.requeue_count,
+    }
+  })
+}
+
 export async function recordCareerSiteSubmissionWorkerHeartbeatInPostgres(input: {
   phase: 'started' | 'completed' | 'degraded' | 'failed'
   workerId: string
@@ -464,6 +604,7 @@ export async function recordCareerSiteSubmissionWorkerHeartbeatInPostgres(input:
 export async function readCareerSiteSubmissionOperationalHealthFromPostgres(input: {
   sourceApp: string
   ownerEmail: string
+  organizationId: string
   pollMs?: number
   leaseSeconds?: number
 }): Promise<CareerSiteSubmissionOperationalHealth> {
@@ -539,47 +680,58 @@ export async function readCareerSiteSubmissionOperationalHealthFromPostgres(inpu
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'queued'
        )::text AS queued,
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'processing'
        )::text AS processing,
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'succeeded'
        )::text AS succeeded,
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'failed'
        )::text AS failed,
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'dead'
        )::text AS dead,
        count(*) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status = 'processing'
            AND (outbox.locked_at IS NULL OR outbox.locked_at < now() - ($3::text || ' seconds')::interval)
        )::text AS stale_processing,
        count(*) FILTER (
          WHERE outbox.status IN ('queued', 'failed', 'processing')
-           AND NOT (submission.source_app = $1 AND submission.owner_email = $2)
+           AND NOT (
+             submission.source_app = $1
+             AND submission.owner_email = $2
+             AND submission.workspace_organization_id = $5::uuid
+           )
        )::text AS out_of_scope_pending,
        min(outbox.created_at) FILTER (
          WHERE submission.source_app = $1
            AND submission.owner_email = $2
+           AND submission.workspace_organization_id = $5::uuid
            AND outbox.status IN ('queued', 'failed', 'processing')
        )::text AS oldest_pending_at,
        (SELECT value FROM app_settings WHERE key = $4) AS worker_heartbeat
      FROM career_site_submission_outbox outbox
      JOIN career_site_submissions submission ON submission.id = outbox.submission_id`,
-    [input.sourceApp, input.ownerEmail, leaseSeconds, OUTBOX_WORKER_HEARTBEAT_KEY],
+    [input.sourceApp, input.ownerEmail, leaseSeconds, OUTBOX_WORKER_HEARTBEAT_KEY, input.organizationId],
   )
   const row = result.rows[0]
   const count = (value: string | undefined) => {
@@ -630,7 +782,7 @@ export async function readCareerSiteSubmissionOperationalHealthFromPostgres(inpu
   const status = unhealthy ? 'unhealthy' : degraded ? 'degraded' : 'healthy'
   return {
     enabled: true,
-    healthy: status === 'healthy',
+    healthy: status !== 'unhealthy',
     status,
     migration: migrationState,
     queue,

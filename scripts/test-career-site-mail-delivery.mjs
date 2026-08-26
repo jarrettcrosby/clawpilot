@@ -10,6 +10,9 @@ const root = process.cwd()
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
 const calls = []
+let sentLookupMessages = [{ id: 'sent_message_001' }]
+let draftLookupDrafts = [{ id: 'draft_001', message: { id: 'draft_message_001' } }]
+let draftCreateFailure = null
 
 function response(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -55,14 +58,18 @@ function loadDelivery() {
                 verificationStatus: 'accepted',
               })
             }
+            if (pathname.startsWith('/google-mail/gmail/v1/users/me/drafts?')) {
+              return response({ drafts: draftLookupDrafts })
+            }
             if (pathname === '/google-mail/gmail/v1/users/me/drafts') {
+              if (draftCreateFailure) throw draftCreateFailure
               return response({ id: 'draft_001', message: { id: 'draft_message_001' } })
             }
             if (pathname === '/google-mail/gmail/v1/users/me/drafts/send') {
               return response({ id: 'sent_message_001' })
             }
             if (pathname.startsWith('/google-mail/gmail/v1/users/me/messages?')) {
-              return response({ messages: [{ id: 'sent_message_001' }] })
+              return response({ messages: sentLookupMessages })
             }
             throw new Error(`Unexpected Maton path: ${pathname}`)
           },
@@ -79,10 +86,13 @@ const configuration = {
   enabled: true,
   sourceApp: 'jarrett-career-site',
   ownerEmail: 'jarrett@suburbiasandwichco.com',
+  organizationId: '405bb919-0364-4a88-8a62-b4c9da42cd8f',
   from: 'info@suburbiasandwichco.com',
   fromName: 'Jarrett Crosby',
   replyTo: 'jarrettcrosby@gmail.com',
   approvalTo: 'jarrettcrosby@gmail.com',
+  shortLinkOrigin: 'https://eigenracing.com',
+  approvalOrigins: ['https://jarrett.suburbiasandwichco.com'],
 }
 const requestId = '0b43bb55-f85e-4492-ab4a-7f22582137e5'
 const request = {
@@ -92,7 +102,7 @@ const request = {
     requestId,
     name: 'Morgan <Hiring Manager>',
     email: 'morgan@example.com',
-    shortUrl: 'https://aiapp.eigenracing.com/s/jc-0123456789abcdef',
+    shortUrl: 'https://eigenracing.com/s/jc-e932dd582ff22890',
     variant: 'executive',
     documentStyle: 'ats',
     accessMode: 'view-only',
@@ -131,11 +141,44 @@ assert.match(raw, /^To: <morgan@example\.com>/m)
 assert.match(raw, new RegExp(`^Message-ID: <${rfcMessageId}>$`, 'm'))
 assert.doesNotMatch(raw, /stewards@eigenracing\.com/)
 
+const recoveredDraft = await delivery.findCareerSiteMailDraft(rfcMessageId)
+assert.equal(recoveredDraft.draftId, 'draft_001')
+assert.equal(recoveredDraft.draftMessageId, 'draft_message_001')
+const draftLookup = calls.find((call) => call.pathname.includes('/drafts?'))
+const draftLookupQuery = new URL(`https://test.invalid${draftLookup.pathname}`).searchParams.get('q')
+assert.match(draftLookupQuery, /in:drafts rfc822msgid:career-site-/)
+draftLookupDrafts = [
+  { id: 'draft_001', message: { id: 'draft_message_001' } },
+  { id: 'draft_002', message: { id: 'draft_message_002' } },
+]
+await assert.rejects(
+  delivery.findCareerSiteMailDraft(rfcMessageId),
+  (error) => error?.name === 'CareerSiteMailProviderError'
+    && error?.status === 409
+    && /Multiple drafts matched/.test(error?.message || ''),
+)
+draftCreateFailure = new Error('simulated response loss after Gmail created the draft')
+await assert.rejects(
+  delivery.createCareerSiteMailDraft({ configuration, request, rfcMessageId }),
+  (error) => error?.name === 'CareerSiteMailProviderError'
+    && error?.ambiguous === true
+    && !String(error?.message || '').includes('simulated response loss'),
+)
+draftCreateFailure = null
+
 const found = await delivery.findSentCareerSiteMail(rfcMessageId)
 assert.equal(found, 'sent_message_001')
 const lookup = calls.find((call) => call.pathname.includes('/messages?'))
 const lookupQuery = new URL(`https://test.invalid${lookup.pathname}`).searchParams.get('q')
 assert.match(lookupQuery, /in:sent rfc822msgid:career-site-/)
+sentLookupMessages = [{ id: 'sent_message_001' }, { id: 'sent_message_002' }]
+await assert.rejects(
+  delivery.findSentCareerSiteMail(rfcMessageId),
+  (error) => error?.name === 'CareerSiteMailProviderError'
+    && error?.status === 409
+    && error?.ambiguous === false
+    && /Multiple sent messages matched/.test(error?.message || ''),
+)
 assert.equal(await delivery.sendCareerSiteMailDraft(draft.draftId), 'sent_message_001')
 const sendCall = calls.find((call) => call.pathname.endsWith('/drafts/send'))
 assert.deepEqual(JSON.parse(sendCall.init.body), { id: 'draft_001' })

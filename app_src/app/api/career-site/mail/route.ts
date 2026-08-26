@@ -97,6 +97,7 @@ export async function POST(req: NextRequest) {
       !actor.service
       || actor.sourceApp !== configuration.sourceApp
       || actor.ownerEmail !== configuration.ownerEmail
+      || actor.organizationId !== configuration.organizationId
     ) {
       throw new CareerSiteMailRequestError(
         'Career-site mail client is not authorized',
@@ -104,7 +105,13 @@ export async function POST(req: NextRequest) {
         'CAREER_SITE_MAIL_FORBIDDEN',
       )
     }
-    const request = parseCareerSiteMailRequest(await requestBody(req))
+    if (!configuration.shortLinkOrigin || !configuration.approvalOrigins) {
+      throw new CareerSiteMailConfigurationError('Career-site mail origins are unavailable')
+    }
+    const request = parseCareerSiteMailRequest(await requestBody(req), {
+      shortLinkOrigin: configuration.shortLinkOrigin,
+      approvalOrigins: configuration.approvalOrigins,
+    })
     const headerIdempotencyKey = String(req.headers.get('idempotency-key') || '').trim()
     if (!headerIdempotencyKey || headerIdempotencyKey !== request.idempotencyKey) {
       throw new CareerSiteMailRequestError(
@@ -114,6 +121,18 @@ export async function POST(req: NextRequest) {
       )
     }
     const result = await createCareerSiteMailInPostgres({ actor, request })
+    if (result.status === 'dead') {
+      return json({
+        ok: false,
+        error: 'Career-site email delivery reached its retry limit',
+        code: 'CAREER_SITE_MAIL_DEAD',
+        delivery: {
+          idempotencyKey: result.idempotencyKey,
+          status: 'dead',
+          duplicate: result.duplicate,
+        },
+      }, 503)
+    }
     return json({
       ok: true,
       delivery: {

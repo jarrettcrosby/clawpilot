@@ -9,7 +9,7 @@ import {
 } from '@/lib/careerSiteSubmissionContract'
 import {
   GoogleWorkspaceRequestError,
-  resolveGoogleWorkspaceProvisioningRuntime,
+  resolveGoogleWorkspacePrivateFileRuntime,
 } from '@/lib/integrations/googleWorkspace'
 import {
   GoogleWorkspaceClientError,
@@ -86,13 +86,15 @@ async function verifyPrivateSheetBoundary(input: {
     emailAddress?: unknown
     deleted?: unknown
     pendingOwner?: unknown
+    view?: unknown
   }> = []
   let pageToken = ''
   for (let page = 0; page < 10; page += 1) {
     const permissionParameters = new URLSearchParams({
       supportsAllDrives: 'true',
+      includePermissionsForView: 'published',
       pageSize: '100',
-      fields: 'nextPageToken,permissions(id,type,role,emailAddress,deleted,pendingOwner)',
+      fields: 'nextPageToken,permissions(id,type,role,emailAddress,deleted,pendingOwner,view)',
     })
     if (pageToken) permissionParameters.set('pageToken', pageToken)
     const response = await googleDriveJson<{
@@ -172,22 +174,22 @@ async function prepareSheet(input: {
       `Configured career-site Google Sheet exceeded its ${MAX_SHEET_DATA_ROWS}-row data limit`,
     )
   }
-  const existingSubmissionIds = new Set<string>()
-  for (const row of existingRows) {
+  const existingSubmissionRows = new Map<string, number>()
+  for (const [index, row] of existingRows.entries()) {
     const id = String(row[0] || '').trim().toLowerCase()
-    if (!UUID_PATTERN.test(id) || existingSubmissionIds.has(id)) {
+    if (!UUID_PATTERN.test(id) || existingSubmissionRows.has(id)) {
       throw new CareerSiteSubmissionSheetContractError(
         'Configured career-site Google Sheet contains a missing, invalid, or duplicate submission ID',
       )
     }
-    existingSubmissionIds.add(id)
+    existingSubmissionRows.set(id, firstDataRow + index)
   }
   return {
     firstDataRow,
     nextDataRow: firstDataRow + existingRows.length,
     atCapacity: existingRows.length >= MAX_SHEET_DATA_ROWS,
     quotedTab,
-    existingSubmissionIds,
+    existingSubmissionRows,
   }
 }
 
@@ -237,17 +239,24 @@ export async function processCareerSiteSubmissionOutbox(input: {
   maxAttempts?: number
 } = {}) {
   const configuration = resolveCareerSiteSubmissionConfiguration()
-  if (!configuration.enabled || !configuration.sheetId || !configuration.ownerEmail) {
+  if (
+    !configuration.enabled
+    || !configuration.sheetId
+    || !configuration.ownerEmail
+    || !configuration.organizationId
+  ) {
     return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
   }
   const sheetId = configuration.sheetId
   const ownerEmail = configuration.ownerEmail
+  const organizationId = configuration.organizationId
 
   const maxAttempts = Math.max(1, Math.min(Math.trunc(Number(input.maxAttempts) || 8), 20))
   const locked = await withCareerSiteSubmissionSheetLock(sheetId, async () => {
     const items = await claimCareerSiteSubmissionOutboxInPostgres({
       sourceApp: configuration.sourceApp,
       ownerEmail,
+      organizationId,
       limit: input.limit,
       maxAttempts,
       leaseSeconds: 900,
@@ -257,7 +266,7 @@ export async function processCareerSiteSubmissionOutbox(input: {
       return { claimed: 0, succeeded: 0, failed: 0, dead: 0, items: [] }
     }
     try {
-      const runtime = await resolveGoogleWorkspaceProvisioningRuntime()
+      const runtime = await resolveGoogleWorkspacePrivateFileRuntime()
       const sheet = await prepareSheet({
         runtime,
         sheetId,
@@ -265,7 +274,17 @@ export async function processCareerSiteSubmissionOutbox(input: {
         sheetTab: configuration.sheetTab,
         sheetHeaderRow: configuration.sheetHeaderRow,
       })
-      if (!sheet.existingSubmissionIds.has(item.externalSubmissionId)) {
+      const existingRowNumber = sheet.existingSubmissionRows.get(item.externalSubmissionId)
+      if (existingRowNumber !== undefined) {
+        const existingRange = `${sheet.quotedTab}!A${existingRowNumber}:S${existingRowNumber}`
+        const existing = await readValues(runtime, sheetId, existingRange)
+        const expected = careerSiteSubmissionSheetRow(item)
+        if (existing.length !== 1 || !exactRow(existing[0], expected)) {
+          throw new CareerSiteSubmissionSheetContractError(
+            'Existing career-site Sheet submission row does not match the durable record',
+          )
+        }
+      } else {
         if (sheet.atCapacity) {
           throw new CareerSiteSubmissionSheetContractError(
             `Configured career-site Google Sheet reached its ${MAX_SHEET_DATA_ROWS}-row data limit`,

@@ -97,6 +97,7 @@ export async function POST(req: NextRequest) {
       !actor.service
       || actor.sourceApp !== configuration.sourceApp
       || actor.ownerEmail !== configuration.ownerEmail
+      || actor.organizationId !== configuration.organizationId
     ) {
       throw new CareerSiteSubmissionRequestError(
         'Career-site submission client is not authorized',
