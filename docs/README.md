@@ -50,6 +50,7 @@ Current product behavior is defined by active module and operating contracts. Op
 - [Agents and execution](modules/agents-and-execution.md)
 - [Knowledge, releases, and checkpoints](modules/knowledge-releases-and-checkpoints.md)
 - [Shared short links](modules/short-links.md)
+- [Career-site submissions](modules/career-site-submissions.md)
 
 ### Operations
 

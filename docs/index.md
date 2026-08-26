@@ -46,6 +46,7 @@ This repository is the canonical source for ClawPilot product, engineering, and 
 - [Agents and execution](modules/agents-and-execution.md)
 - [Knowledge, releases, and checkpoints](modules/knowledge-releases-and-checkpoints.md)
 - [Shared short links](modules/short-links.md)
+- [Career-site submissions](modules/career-site-submissions.md)
 
 ## Distributed Operations Design
 
