@@ -24,6 +24,19 @@ BEGIN
       WHEN line.line_snapshot ->> 'snapshotVersion'
         = 'shopify-checkout-line-pack-evidence-v1'
         THEN 'product_pack'
+      WHEN NOT (line.line_snapshot ? 'snapshotVersion')
+       AND NOT (line.line_snapshot ? 'cartonizationAuthority')
+       AND jsonb_typeof(
+         line.line_snapshot -> 'packMappingGlobalId'
+       ) = 'string'
+       AND line.line_snapshot ->> 'packMappingGlobalId'
+         ~ '^gcvm(?:[0-9]{7}|[0-9a-v]{12})$'
+       AND jsonb_typeof(
+         line.line_snapshot -> 'packProfileVersionGlobalId'
+       ) = 'string'
+       AND line.line_snapshot ->> 'packProfileVersionGlobalId'
+         ~ '^gppv(?:[0-9]{7}|[0-9a-v]{12})$'
+        THEN 'product_pack'
       ELSE NULL
     END
   INTO target_planning_method, target_cartonization_authority
@@ -83,6 +96,19 @@ BEGIN
           WHEN line.line_snapshot ->> 'snapshotVersion'
             = 'shopify-checkout-line-pack-evidence-v1'
             THEN 'product_pack'
+          WHEN NOT (line.line_snapshot ? 'snapshotVersion')
+           AND NOT (line.line_snapshot ? 'cartonizationAuthority')
+           AND jsonb_typeof(
+             line.line_snapshot -> 'packMappingGlobalId'
+           ) = 'string'
+           AND line.line_snapshot ->> 'packMappingGlobalId'
+             ~ '^gcvm(?:[0-9]{7}|[0-9a-v]{12})$'
+           AND jsonb_typeof(
+             line.line_snapshot -> 'packProfileVersionGlobalId'
+           ) = 'string'
+           AND line.line_snapshot ->> 'packProfileVersionGlobalId'
+             ~ '^gppv(?:[0-9]{7}|[0-9a-v]{12})$'
+            THEN 'product_pack'
           ELSE NULL
         END AS cartonization_authority
       FROM operations_shopify_checkout_rate_receipt_allocations allocation
@@ -109,4 +135,4 @@ $$;
 
 COMMENT ON FUNCTION
   validate_operations_shopify_checkout_unit_material_allocation() IS
-  'Binds each package planning method to the allocated receipt-line cartonization authority and preserves one-unit package cardinality.';
+  'Binds each package planning method to the allocated receipt-line cartonization authority, preserves pre-versioned product-pack evidence compatibility, and enforces one-unit package cardinality.';
