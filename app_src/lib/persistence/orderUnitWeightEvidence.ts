@@ -823,7 +823,7 @@ export async function recordOrderUnitWeightsInPostgres(input: {
              supersedes_fact_id, unit_weight_grams, reason, request_hash, fact_hash,
              command_receipt_id, recorded_by
            )
-           SELECT $1, line.organization_id, line.integration_account_id,
+           SELECT $1::text, line.organization_id, line.integration_account_id,
                   line.pipeline_id, line.order_candidate_id,
                   $2::bigint, candidate.canonical_order_id,
                   line.canonical_order_line_id, line.id, line.global_id,
@@ -833,7 +833,7 @@ export async function recordOrderUnitWeightsInPostgres(input: {
                   encode(digest(convert_to(jsonb_build_object(
                     'candidateGlobalId', candidate.global_id,
                     'candidateRowVersion', $2::bigint,
-                    'factGlobalId', $1,
+                    'factGlobalId', $1::text,
                     'factVersion', $12::integer,
                     'lineGlobalId', line.global_id,
                     'lineSourceHash', line.source_hash,

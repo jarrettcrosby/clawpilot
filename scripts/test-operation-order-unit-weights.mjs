@@ -78,6 +78,11 @@ assert.match(
   /candidate_row_version,[\s\S]*input\.expectedCandidateRowVersion/,
   'Candidate row version remains recorded as optimistic-concurrency context',
 )
+assert.match(
+  persistence,
+  /SELECT \$1::text,[\s\S]*'factGlobalId', \$1::text/,
+  'The allocated fact global ID must be typed explicitly for PostgreSQL 18',
+)
 
 const hybrid = read('app_src/lib/persistence/hybridCartonization.ts')
 for (const fragment of [
