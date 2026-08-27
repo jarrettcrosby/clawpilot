@@ -1672,6 +1672,12 @@ async function verify(databaseUrl) {
         expectedSourceHash: reversalFixture.fulfilledSourceHash,
         ...snapshot(true, reversalEvidence.providerOrderUpdatedAt),
         action: postReversalCancelAction,
+        cancellationPaymentEvidence: {
+          schema: 'shopify-order-cancel-payment-evidence-v1',
+          transactionsCount: 0,
+          authorizationTransactionId: null,
+          authorizationAmount: null,
+        },
         reason: postReversalCancelReason,
         idempotencyKey: 'shopify-order-cancel-after-reversal-exact',
       })

@@ -73,6 +73,16 @@ export type ShopifyOrderManagementStatus =
   | 'reconciled'
   | 'expired'
 
+export type ShopifyOrderCancellationPaymentEvidenceBinding = Readonly<{
+  schema: 'shopify-order-cancel-payment-evidence-v1'
+  transactionsCount: number
+  authorizationTransactionId: string | null
+  authorizationAmount: Readonly<{
+    amount: string
+    currencyCode: string
+  }> | null
+}>
+
 export type ShopifyOrderManagementAuthorization = {
   authorizationGlobalId: string
   organizationId: string
@@ -195,6 +205,7 @@ export type PrepareShopifyOrderManagementInput = {
   providerOrderObservedAt: unknown
   providerOrderTest: unknown
   action: unknown
+  cancellationPaymentEvidence?: unknown
   expectedLineQuantity?: unknown
   requestedProjectionHash?: unknown
   reason: unknown
@@ -389,10 +400,14 @@ const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHOPIFY_LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/
 const SHOPIFY_FULFILLMENT_GID =
   /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]{0,20}$/
+const SHOPIFY_ORDER_TRANSACTION_GID =
+  /^gid:\/\/shopify\/OrderTransaction\/[A-Za-z0-9][A-Za-z0-9-]*$/
 const SHA256 = /^[a-f0-9]{64}$/
 const ERROR_CODE = /^[A-Z][A-Z0-9_]{1,127}$/
 const SAFE_TEXT = /^[^\u0000-\u001f\u007f]+$/
 const COUNTRY_CODE = /^[A-Z]{2}$/
+const CURRENCY_CODE = /^(?:[A-Z]{3}|USDC)$/
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/
 const SHIPPING_ADDRESS_FIELDS = [
   'firstName',
   'lastName',
@@ -518,6 +533,120 @@ function integer(value: unknown, label: string, minimum = 0) {
     )
   }
   return normalized
+}
+
+function canonicalPositiveDecimal(value: unknown): string | null {
+  if (typeof value !== 'string' || !NONNEGATIVE_DECIMAL.test(value)) {
+    return null
+  }
+  const [whole, fraction = ''] = value.split('.')
+  const normalizedFraction = fraction.replace(/0+$/u, '')
+  const normalized = normalizedFraction
+    ? `${whole}.${normalizedFraction}`
+    : whole
+  return normalized === '0' ? null : normalized
+}
+
+function normalizeCancellationPaymentEvidence(
+  value: unknown,
+  required: boolean,
+): ShopifyOrderCancellationPaymentEvidenceBinding | null {
+  if (!required) {
+    if (value === undefined || value === null) return null
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Cancellation payment evidence applies only to cancellation actions',
+      400,
+    )
+  }
+  if (value === undefined || value === null) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Exact cancellation payment evidence is required',
+      400,
+    )
+  }
+  if (
+    typeof value !== 'object'
+    || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Cancellation payment evidence is invalid',
+      400,
+    )
+  }
+  const source = value as Record<string, unknown>
+  const expectedKeys = [
+    'authorizationAmount',
+    'authorizationTransactionId',
+    'schema',
+    'transactionsCount',
+  ]
+  if (
+    Object.keys(source).sort().join(',') !== expectedKeys.join(',')
+    || source.schema !== 'shopify-order-cancel-payment-evidence-v1'
+    || !Number.isSafeInteger(source.transactionsCount)
+    || Number(source.transactionsCount) < 0
+    || Number(source.transactionsCount) > 25
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Cancellation payment evidence is invalid',
+      400,
+    )
+  }
+  const transactionsCount = Number(source.transactionsCount)
+  const authorizationTransactionId = source.authorizationTransactionId
+  const amountSource = source.authorizationAmount
+  if (authorizationTransactionId === null && amountSource === null) {
+    return Object.freeze({
+      schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+      transactionsCount,
+      authorizationTransactionId: null,
+      authorizationAmount: null,
+    })
+  }
+  if (
+    typeof authorizationTransactionId !== 'string'
+    || !SHOPIFY_ORDER_TRANSACTION_GID.test(authorizationTransactionId)
+    || typeof amountSource !== 'object'
+    || amountSource === null
+    || Array.isArray(amountSource)
+    || Object.getPrototypeOf(amountSource) !== Object.prototype
+    || Object.keys(amountSource).sort().join(',') !== 'amount,currencyCode'
+    || transactionsCount < 1
+    || transactionsCount >= 25
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Cancellation authorization evidence is invalid',
+      400,
+    )
+  }
+  const rawAmount = amountSource as Record<string, unknown>
+  const amount = canonicalPositiveDecimal(rawAmount.amount)
+  if (
+    !amount
+    || typeof rawAmount.currencyCode !== 'string'
+    || !CURRENCY_CODE.test(rawAmount.currencyCode)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+      'Cancellation authorization amount evidence is invalid',
+      400,
+    )
+  }
+  return Object.freeze({
+    schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+    transactionsCount,
+    authorizationTransactionId,
+    authorizationAmount: Object.freeze({
+      amount,
+      currencyCode: rawAmount.currencyCode,
+    }),
+  })
 }
 
 function sourceHash(value: unknown) {
@@ -1014,6 +1143,96 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
   }
 }
 
+type ShopifyOrderManagementProviderSnapshotInput = Readonly<{
+  orderGlobalId: string
+  expectedSourceHash: string
+  providerOrderUpdatedAt: string
+  providerOrderObservedAt: string
+  providerOrderTest: boolean
+  action: ShopifyOrderManagementAction['type']
+  fulfillmentGid: string | null
+  expectedFulfillmentUpdatedAt: string | null
+  predecessorAuthorizationGlobalId: string | null
+  expectedLineQuantity: number | null
+  requestedProjectionHash: string | null
+  requiresOrderEdits: boolean
+  cancellationPaymentEvidence:
+    ShopifyOrderCancellationPaymentEvidenceBinding | null
+}>
+
+function providerSnapshotHash(
+  input: ShopifyOrderManagementProviderSnapshotInput,
+) {
+  const cancellation = input.action === 'cancel'
+    || input.action === 'cancel_order_after_fulfillment_reversal'
+  return shopifyOrderManagementEvidenceHash({
+    schema: cancellation
+      ? 'shopify-order-management-provider-snapshot-v2'
+      : 'shopify-order-management-provider-snapshot-v1',
+    orderGlobalId: input.orderGlobalId,
+    expectedSourceHash: input.expectedSourceHash,
+    providerOrderUpdatedAt: input.providerOrderUpdatedAt,
+    providerOrderObservedAt: input.providerOrderObservedAt,
+    providerOrderTest: input.providerOrderTest,
+    ...(input.action === 'cancel_fulfillment'
+      ? {
+          fulfillmentGid: input.fulfillmentGid,
+          expectedFulfillmentUpdatedAt:
+            input.expectedFulfillmentUpdatedAt,
+        }
+      : {}),
+    ...(input.action === 'cancel_order_after_fulfillment_reversal'
+      ? {
+          predecessorAuthorizationGlobalId:
+            input.predecessorAuthorizationGlobalId,
+        }
+      : {}),
+    ...(cancellation
+      ? { cancellationPaymentEvidence: input.cancellationPaymentEvidence }
+      : {}),
+    expectedLineQuantity: input.expectedLineQuantity,
+    requestedProjectionHash: input.requestedProjectionHash,
+    requiresOrderEdits: input.requiresOrderEdits,
+  })
+}
+
+export function shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot(
+  authorization: ShopifyOrderManagementAuthorization,
+  evidence: unknown,
+) {
+  if (
+    authorization.action !== 'cancel'
+    && authorization.action !== 'cancel_order_after_fulfillment_reversal'
+  ) {
+    return false
+  }
+  try {
+    const cancellationPaymentEvidence =
+      normalizeCancellationPaymentEvidence(evidence, true)
+    if (!cancellationPaymentEvidence) return false
+    return providerSnapshotHash({
+      orderGlobalId: authorization.orderGlobalId,
+      expectedSourceHash: authorization.expectedSourceHash,
+      providerOrderUpdatedAt: authorization.providerOrderUpdatedAt,
+      providerOrderObservedAt: authorization.providerOrderObservedAt,
+      providerOrderTest: authorization.providerOrderTest,
+      action: authorization.action,
+      fulfillmentGid: authorization.fulfillmentGid,
+      expectedFulfillmentUpdatedAt:
+        authorization.expectedFulfillmentUpdatedAt,
+      predecessorAuthorizationGlobalId:
+        authorization.predecessorAuthorizationGlobalId,
+      expectedLineQuantity: authorization.expectedLineQuantity,
+      requestedProjectionHash: authorization.requestedProjectionHash,
+      requiresOrderEdits: authorization.requiresOrderEdits,
+      cancellationPaymentEvidence,
+    }) === authorization.providerSnapshotHash
+  } catch (error) {
+    if (error instanceof ShopifyOrderManagementPersistenceError) return false
+    throw error
+  }
+}
+
 function projectionHash(value: unknown, required: boolean) {
   if (!required && (value === undefined || value === null || value === '')) {
     return null
@@ -1504,6 +1723,12 @@ export async function prepareShopifyOrderManagementInPostgres(
   )
   const expectedSourceHash = sourceHash(input.expectedSourceHash)
   const action = normalizeShopifyOrderManagementAction(input.action)
+  const cancellation = action.type === 'cancel'
+    || action.type === 'cancel_order_after_fulfillment_reversal'
+  const cancellationPaymentEvidence = normalizeCancellationPaymentEvidence(
+    input.cancellationPaymentEvidence,
+    cancellation,
+  )
   const requestedProjectionHash = projectionHash(
     input.requestedProjectionHash,
     action.type === 'save_order',
@@ -1530,15 +1755,18 @@ export async function prepareShopifyOrderManagementInPostgres(
     expectedLineQuantityValue,
   )
   const requestHash = shopifyOrderManagementEvidenceHash({
-    schema: 'shopify-order-management-preparation-request-v1',
+    schema: cancellation
+      ? 'shopify-order-management-preparation-request-v2'
+      : 'shopify-order-management-preparation-request-v1',
     organizationId: scopedOrganizationId,
     actorEmail: authorizedBy,
     accountGlobalId,
     orderGlobalId,
     expectedOrderRowVersion,
-      expectedSourceHash,
-      intentHash: exactIntentHash,
-      requestedProjectionHash,
+    expectedSourceHash,
+    intentHash: exactIntentHash,
+    requestedProjectionHash,
+    ...(cancellation ? { cancellationPaymentEvidence } : {}),
   })
 
   return withTransaction(async (client) => {
@@ -1600,29 +1828,22 @@ export async function prepareShopifyOrderManagementInPostgres(
         409,
       )
     }
-    const providerSnapshotHash = shopifyOrderManagementEvidenceHash({
-      schema: 'shopify-order-management-provider-snapshot-v1',
+    const providerSnapshotHashValue = providerSnapshotHash({
       orderGlobalId,
       expectedSourceHash,
       providerOrderUpdatedAt,
       providerOrderObservedAt,
       providerOrderTest,
-      ...(action.type === 'cancel_fulfillment'
-        ? {
-            fulfillmentGid: actionFacts.fulfillmentGid,
-            expectedFulfillmentUpdatedAt:
-              actionFacts.expectedFulfillmentUpdatedAt,
-          }
-        : {}),
-      ...(action.type === 'cancel_order_after_fulfillment_reversal'
-        ? {
-            predecessorAuthorizationGlobalId:
-              actionFacts.predecessorAuthorizationGlobalId,
-          }
-        : {}),
+      action: action.type,
+      fulfillmentGid: actionFacts.fulfillmentGid,
+      expectedFulfillmentUpdatedAt:
+        actionFacts.expectedFulfillmentUpdatedAt,
+      predecessorAuthorizationGlobalId:
+        actionFacts.predecessorAuthorizationGlobalId,
       expectedLineQuantity: expectedLineQuantityValue,
       requestedProjectionHash,
       requiresOrderEdits,
+      cancellationPaymentEvidence,
     })
 
     await acquireTransactionAdvisoryLock(
@@ -1728,7 +1949,7 @@ export async function prepareShopifyOrderManagementInPostgres(
         providerOrderUpdatedAt,
         providerOrderObservedAt,
         providerOrderTest,
-        providerSnapshotHash,
+        providerSnapshotHashValue,
         actionFacts.action,
         actionFacts.fulfillmentGid,
         actionFacts.expectedFulfillmentUpdatedAt,
@@ -1773,7 +1994,7 @@ export async function prepareShopifyOrderManagementInPostgres(
         expectedSourceHash,
         acceptedObservationId,
         acceptedProviderOrderUpdatedAt,
-        providerSnapshotHash,
+        providerSnapshotHash: providerSnapshotHashValue,
         intentHash: exactIntentHash,
         authorizationReason: reason,
         expectedLineQuantity: expectedLineQuantityValue,

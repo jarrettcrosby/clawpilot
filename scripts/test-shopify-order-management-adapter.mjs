@@ -304,6 +304,10 @@ function input(action, overrides = {}) {
     },
     expected: expected(),
     action,
+    ...(['cancel', 'cancel_order_after_fulfillment_reversal']
+      .includes(action.type)
+      ? { cancellationPaymentEvidenceMatches: () => true }
+      : {}),
     clientOptions: { timeoutMs: 5_000 },
     ...overrides,
   }
@@ -1643,6 +1647,63 @@ for (const fulfillment of [
   assert.equal(h.calls.graphql.length, 2)
 }
 
+// The fresh pre-write authorization must match the durable preparation
+// binding. A same-revision payment change fails before orderCancel.
+{
+  const h = harness([{
+    operation: 'ClawPilotShopifyOrderManagementPreview',
+    response: previewResponse(authorizedProviderOrder()),
+  }])
+  const {
+    cancellationPaymentEvidenceMatches: omittedBinding,
+    ...unboundInput
+  } = input({ type: 'cancel' })
+  assert.equal(typeof omittedBinding, 'function')
+  await assert.rejects(
+    adapter.executeShopifyOrderManagementAction(
+      unboundInput,
+      h.dependencies,
+    ),
+    (error) => (
+      error.code === 'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_BINDING_REQUIRED'
+    ),
+  )
+  assert.deepEqual(
+    h.calls.graphql.map((call) => call.request.operationName),
+    ['ClawPilotShopifyOrderManagementPreview'],
+  )
+}
+
+{
+  const h = harness([{
+    operation: 'ClawPilotShopifyOrderManagementPreview',
+    response: previewResponse(authorizedProviderOrder()),
+  }])
+  let observedEvidence = null
+  await assert.rejects(
+    adapter.executeShopifyOrderManagementAction({
+      ...input({ type: 'cancel' }),
+      cancellationPaymentEvidenceMatches(evidence) {
+        observedEvidence = plain(evidence)
+        return false
+      },
+    }, h.dependencies),
+    (error) => (
+      error.code === 'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_CHANGED'
+    ),
+  )
+  assert.deepEqual(observedEvidence, {
+    schema: 'shopify-order-cancel-payment-evidence-v1',
+    transactionsCount: 1,
+    authorizationTransactionId: authorizationTransactionGid,
+    authorizationAmount: { amount: '150.00', currencyCode: 'USD' },
+  })
+  assert.deepEqual(
+    h.calls.graphql.map((call) => call.request.operationName),
+    ['ClawPilotShopifyOrderManagementPreview'],
+  )
+}
+
 // A PENDING order display status is eligible when the transaction itself is a
 // bounded successful test AUTHORIZATION, no money was received, and the exact
 // capturable balance matches. orderCancel is the only provider mutation and
@@ -1741,6 +1802,151 @@ for (const fulfillment of [
     h.calls.graphql[1].request.query,
     /transactionVoid|transactionCapture|refundCreate/,
   )
+}
+
+// Cancellation is not proven when the exact pre-write authorization vanishes,
+// even if a same-count VOID row and every aggregate otherwise look released.
+{
+  const before = authorizedProviderOrder()
+  const after = providerOrder({
+    updatedAt: afterUpdatedAt,
+    cancelledAt: afterUpdatedAt,
+    transactions: [providerTransaction({
+      id: voidTransactionGid,
+      kind: 'VOID',
+      manuallyCapturable: false,
+      totalUnsettledSet: null,
+    })],
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyTestOrderCancel',
+      response: {
+        orderCancel: {
+          job: { id: cancellationJobGid, done: true },
+          orderCancelUserErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({ type: 'cancel' }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'outcomeUnknown')
+  assert.equal(result.errorCode, 'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH')
+  assert.equal(result.providerWrites, 1)
+  assert.deepEqual(
+    h.calls.graphql.map((call) => call.request.operationName),
+    [
+      'ClawPilotShopifyOrderManagementPreview',
+      'ClawPilotShopifyTestOrderCancel',
+      'ClawPilotShopifyOrderManagementPreview',
+    ],
+  )
+}
+
+// The exact authorization amount is part of release identity. Reusing the GID
+// with a changed amount cannot satisfy immediate readback.
+{
+  const before = authorizedProviderOrder()
+  const after = providerOrder({
+    updatedAt: afterUpdatedAt,
+    cancelledAt: afterUpdatedAt,
+    transactions: [providerTransaction({
+      amountSet: {
+        shopMoney: { amount: '149.00', currencyCode: 'USD' },
+      },
+      manuallyCapturable: false,
+      totalUnsettledSet: null,
+    })],
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyTestOrderCancel',
+      response: {
+        orderCancel: {
+          job: { id: cancellationJobGid, done: true },
+          orderCancelUserErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({ type: 'cancel' }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'outcomeUnknown')
+  assert.equal(result.errorCode, 'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH')
+  assert.equal(result.providerWrites, 1)
+  assert.equal(h.calls.graphql.length, 3)
+}
+
+// Historical transaction evidence may not regress after dispatch. Keeping the
+// original authorization inert is insufficient when the exact count shrinks.
+{
+  const historicalFailure = providerTransaction({
+    id: 'gid://shopify/OrderTransaction/6600000550',
+    status: 'FAILURE',
+    manuallyCapturable: false,
+    totalUnsettledSet: null,
+  })
+  const before = authorizedProviderOrder({
+    transactions: [providerTransaction(), historicalFailure],
+  })
+  const after = providerOrder({
+    updatedAt: afterUpdatedAt,
+    cancelledAt: afterUpdatedAt,
+    transactions: [providerTransaction({
+      manuallyCapturable: false,
+      totalUnsettledSet: null,
+    })],
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyTestOrderCancel',
+      response: {
+        orderCancel: {
+          job: { id: cancellationJobGid, done: true },
+          orderCancelUserErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({ type: 'cancel' }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'outcomeUnknown')
+  assert.equal(result.errorCode, 'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH')
+  assert.equal(result.providerWrites, 1)
+  assert.equal(result.before.transactionsCount, 2)
+  assert.equal(result.after, null)
+  assert.equal(h.calls.graphql.length, 3)
 }
 
 // A 25-row pre-write projection cannot safely prove the additional VOID row

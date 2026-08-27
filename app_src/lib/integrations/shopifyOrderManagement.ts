@@ -295,6 +295,13 @@ export type ShopifyOrderCancellationPaymentEligibility = Readonly<{
   releasesAuthorization: boolean
 }>
 
+export type ShopifyOrderCancellationPaymentEvidence = Readonly<{
+  schema: 'shopify-order-cancel-payment-evidence-v1'
+  transactionsCount: number
+  authorizationTransactionId: string | null
+  authorizationAmount: Readonly<ShopifyOrderManagementMoney> | null
+}>
+
 export type ShopifyOrderEditCommitResult = {
   orderGid: string
   orderName: string
@@ -364,6 +371,9 @@ export type ExecuteShopifyOrderManagementInput = {
   credential: ShopifyClientCredentials
   expected: ShopifyOrderManagementExpectedIdentity
   action: ShopifyOrderManagementAction
+  cancellationPaymentEvidenceMatches?: (
+    evidence: ShopifyOrderCancellationPaymentEvidence,
+  ) => boolean
   clientOptions?: ShopifyCommerceClientOptions
 }
 
@@ -698,7 +708,10 @@ const UNRESOLVED_TRANSACTION_STATUSES = new Set([
 export function shopifyOrderCancellationPaymentEligibility(
   preview: ShopifyOrderManagementPreview,
 ): ShopifyOrderCancellationPaymentEligibility {
-  if (!preview.paymentEvidenceComplete) {
+  if (
+    !preview.paymentEvidenceComplete
+    || preview.transactionsCount === null
+  ) {
     return Object.freeze({
       allowed: false,
       reason: 'Shopify payment transaction evidence is not bounded and exhaustive',
@@ -815,14 +828,73 @@ export function shopifyOrderCancellationPaymentEligibility(
   })
 }
 
+export function shopifyOrderCancellationPaymentEvidence(
+  preview: ShopifyOrderManagementPreview,
+): ShopifyOrderCancellationPaymentEvidence | null {
+  const eligibility = shopifyOrderCancellationPaymentEligibility(preview)
+  if (!eligibility.allowed || preview.transactionsCount === null) return null
+  const authorization = eligibility.releasesAuthorization
+    ? preview.transactions.find((transaction) => (
+        transaction.kind === 'AUTHORIZATION'
+        && transaction.status === 'SUCCESS'
+        && transaction.test
+        && (
+          transaction.manuallyCapturable
+          || positiveMoney(transaction.totalUnsettled)
+        )
+      )) || null
+    : null
+  if (eligibility.releasesAuthorization && !authorization) return null
+  return Object.freeze({
+    schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+    transactionsCount: preview.transactionsCount,
+    authorizationTransactionId: authorization?.id || null,
+    authorizationAmount: authorization
+      ? Object.freeze({ ...authorization.amount })
+      : null,
+  })
+}
+
 export function shopifyOrderCancellationPaymentReleased(
   preview: ShopifyOrderManagementPreview,
+  expected: ShopifyOrderCancellationPaymentEvidence,
 ) {
-  return preview.paymentEvidenceComplete
+  const expectedAuthorization = expected.authorizationTransactionId
+    ? preview.transactions.find((transaction) => (
+        transaction.id === expected.authorizationTransactionId
+      )) || null
+    : null
+  const authorizationReleased = expected.authorizationTransactionId === null
+    ? expected.authorizationAmount === null
+    : expected.authorizationAmount !== null
+      && expectedAuthorization !== null
+      && expectedAuthorization.kind === 'AUTHORIZATION'
+      && expectedAuthorization.status === 'SUCCESS'
+      && expectedAuthorization.test
+      && expectedAuthorization.amount.currencyCode
+        === expected.authorizationAmount.currencyCode
+      && compareDecimalAmounts(
+        expectedAuthorization.amount.amount,
+        expected.authorizationAmount.amount,
+      ) === 0
+      && !expectedAuthorization.manuallyCapturable
+      && (
+        expectedAuthorization.totalUnsettled === null
+        || (
+          expectedAuthorization.totalUnsettled.currencyCode
+            === expected.authorizationAmount.currencyCode
+          && zeroMoney(expectedAuthorization.totalUnsettled)
+        )
+      )
+  return expected.schema === 'shopify-order-cancel-payment-evidence-v1'
+    && preview.paymentEvidenceComplete
+    && preview.transactionsCount !== null
+    && preview.transactionsCount >= expected.transactionsCount
     && preview.unpaid
     && zeroMoney(preview.totalReceived)
     && !preview.capturable
     && zeroMoney(preview.totalCapturable)
+    && authorizationReleased
     && !preview.transactions.some((transaction) => (
       UNRESOLVED_TRANSACTION_STATUSES.has(transaction.status)
       || transaction.manuallyCapturable
@@ -3856,6 +3928,28 @@ export async function executeShopifyOrderManagementAction(
     } else {
       assertCancellationEligible(before)
     }
+    const cancellationPaymentEvidence =
+      shopifyOrderCancellationPaymentEvidence(before)
+    if (!cancellationPaymentEvidence) {
+      fail(
+        'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_INVALID',
+        'Shopify cancellation payment evidence could not be bound before the provider write',
+      )
+    }
+    if (!input.cancellationPaymentEvidenceMatches) {
+      fail(
+        'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_BINDING_REQUIRED',
+        'Shopify cancellation requires an exact durable payment-evidence binding',
+      )
+    }
+    if (!input.cancellationPaymentEvidenceMatches(
+      cancellationPaymentEvidence,
+    )) {
+      fail(
+        'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_CHANGED',
+        'Shopify cancellation payment evidence changed after authorization',
+      )
+    }
     let mutation: ShopifyOrderCancelMutationResult
     try {
       mutation = await cancelShopifyTestOrder(
@@ -3908,7 +4002,10 @@ export async function executeShopifyOrderManagementAction(
         after.id !== before.id
         || after.name !== before.name
         || !after.cancelledAt
-        || !shopifyOrderCancellationPaymentReleased(after)
+        || !shopifyOrderCancellationPaymentReleased(
+          after,
+          cancellationPaymentEvidence,
+        )
       ) {
         fail(
           'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH',
