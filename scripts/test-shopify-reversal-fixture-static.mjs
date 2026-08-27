@@ -24,6 +24,8 @@ const profileV3MigrationPath =
   'db/migrations/0330_operations_shopify_reversal_fixture_profile_v3.sql'
 const profileV4MigrationPath =
   'db/migrations/0332_operations_shopify_reversal_fixture_profile_v4.sql'
+const profileV5MigrationPath =
+  'db/migrations/0333_operations_shopify_reversal_fixture_profile_v5.sql'
 const healthPath =
   'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'
 const healthRoutePath = 'app_src/app/api/health/route.ts'
@@ -47,6 +49,10 @@ const profileV3Migration = readFileSync(
 )
 const profileV4Migration = readFileSync(
   resolve(root, profileV4MigrationPath),
+  'utf8',
+)
+const profileV5Migration = readFileSync(
+  resolve(root, profileV5MigrationPath),
   'utf8',
 )
 const checksum = createHash('sha256').update(migration).digest('hex')
@@ -124,8 +130,14 @@ for (const fragment of [
   profileV4MigrationPath.split('/').at(-1),
   createHash('sha256').update(profileV4Migration).digest('hex'),
   'profile_v4_migration_current',
+  'SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION',
+  profileV5MigrationPath.split('/').at(-1),
+  createHash('sha256').update(profileV5Migration).digest('hex'),
+  'profile_v5_migration_current',
   'provider_error_column',
   'provider_error_constraint',
+  'provider_error_message_column',
+  'provider_error_message_constraint',
   'profile_version_constraint',
   'provider_error_view_columns',
 ]) {
@@ -194,12 +206,41 @@ assert.doesNotMatch(
   '0332 must use the migrator transaction',
 )
 for (const fragment of [
+  'shopify_reversal_fixture_commands_profile_version_valid',
+  "'shopify-reversal-fixture-v1'",
+  "'shopify-reversal-fixture-v2'",
+  "'shopify-reversal-fixture-v3'",
+  "'shopify-reversal-fixture-v4'",
+  "'shopify-reversal-fixture-v5'",
+  'ADD COLUMN provider_error_message text',
+  "outcome_state = 'rejected'",
+  'provider_mutation_attempted = true',
+  'provider_writes = 0',
+  'pg_catalog.char_length(provider_error_message) BETWEEN 1 AND 240',
+  "provider_error_message !~ '[[:cntrl:]]'",
+  "provider_error_message ~ '^[ -~]+$'",
+  'initial_outcome.provider_error_message',
+]) {
+  assert.ok(
+    profileV5Migration.includes(fragment),
+    `0333 must include ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  profileV5Migration,
+  /^\s*(?:BEGIN|COMMIT);\s*$/imu,
+  '0333 must use the migrator transaction',
+)
+for (const fragment of [
   'providerErrorSummary?: string | null',
+  'providerErrorMessage?: string | null',
   'provider_order_updated_at, error_code, provider_error_summary',
   'provider_error_code: string | null',
   'provider_error_summary: string | null',
+  'provider_error_message: string | null',
   'providerErrorCode: row.provider_error_code',
   'providerErrorSummary: row.provider_error_summary',
+  'providerErrorMessage: row.provider_error_message',
 ]) {
   assert.ok(
     persistenceSource.includes(fragment),
@@ -232,6 +273,9 @@ assert.doesNotMatch(
   /error\.message/u,
   'durable provider evidence must never derive from the raw provider message',
 )
+assert.match(safeSummarySource, /error\.providerErrorMessage/u)
+assert.match(safeSummarySource, /message\.length > 240/u)
+assert.match(safeSummarySource, /error\.outcomeUnknown/u)
 
 const output = ts.transpileModule(healthSource, {
   compilerOptions: {
@@ -267,17 +311,30 @@ vm.runInNewContext(output, {
             values[5],
             createHash('sha256').update(profileV3Migration).digest('hex'),
           )
+          assert.equal(values[6], profileV4MigrationPath.split('/').at(-1))
+          assert.equal(
+            values[7],
+            createHash('sha256').update(profileV4Migration).digest('hex'),
+          )
+          assert.equal(values[8], profileV5MigrationPath.split('/').at(-1))
+          assert.equal(
+            values[9],
+            createHash('sha256').update(profileV5Migration).digest('hex'),
+          )
           return { rows: [{
             migration_current: structureCurrent,
             provider_error_migration_current: structureCurrent,
             profile_v3_migration_current: structureCurrent,
             profile_v4_migration_current: structureCurrent,
+            profile_v5_migration_current: structureCurrent,
             command_table: structureCurrent,
             approval_table: structureCurrent,
             attempt_table: structureCurrent,
             outcome_table: structureCurrent,
             provider_error_column: structureCurrent,
             provider_error_constraint: structureCurrent,
+            provider_error_message_column: structureCurrent,
+            provider_error_message_constraint: structureCurrent,
             profile_version_constraint: structureCurrent,
             provider_error_view_columns: structureCurrent,
             state_view: structureCurrent,
@@ -374,11 +431,37 @@ assert.match(
 assert.match(orderProviderSource, /userErrors \{ code field message \}/u)
 assert.match(
   orderProviderSource,
-  /const errorSummary = providerRejectionSummary\(errors\)[\s\S]*true,[\s\S]*false,[\s\S]*errorSummary,/u,
+  /const errorSummary = providerRejectionSummary\(errors\)[\s\S]*const errorMessage = providerRejectionMessage\(errors\)[\s\S]*true,[\s\S]*false,[\s\S]*errorSummary,[\s\S]*errorMessage,/u,
 )
 assert.match(
   orderProviderSource,
-  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v3'[\s\S]*variables/u,
+  /financialStatus: 'PENDING'[\s\S]*currency: 'USD'[\s\S]*priceSet:[\s\S]*transactions:[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v5'[\s\S]*variables/u,
+)
+for (const fragment of [
+  "proof: 'immediate' | 'reconciliation'",
+  "proof === 'immediate'",
+  "'immediate'",
+  "}, 'reconciliation')",
+  "'[redacted-phone]'",
+  "'[redacted-account]'",
+  "'[redacted-number]'",
+  'transactions(first: 10)',
+  'orders(first: 2',
+  'source_identifier:${JSON.stringify(sourceIdentifier)}',
+  'AND tag:${uniqueTag} AND test:true',
+]) {
+  assert.ok(
+    orderProviderSource.includes(fragment),
+    `v5 lifecycle and sanitizer contract must include ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  persistenceSource.slice(
+    persistenceSource.indexOf("eventType: 'operations.shopify_reversal_fixture.outcome_recorded'"),
+    persistenceSource.indexOf('return Object.freeze({', persistenceSource.indexOf("eventType: 'operations.shopify_reversal_fixture.outcome_recorded'")),
+  ),
+  /providerErrorMessage/u,
+  'sanitized provider messages must remain worker-status evidence, not broad audit payloads',
 )
 assert.match(
   persistenceSource,

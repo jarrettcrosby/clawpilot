@@ -16,6 +16,10 @@ export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION =
   '0332_operations_shopify_reversal_fixture_profile_v4.sql' as const
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM =
   'c54ec1a30b9c5d8b24d50a429f9e8e83d238c0fb3810484ec960ea4737a33ec6' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION =
+  '0333_operations_shopify_reversal_fixture_profile_v5.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION_CHECKSUM =
+  '058fe337553cd19676f0bb4b6f82104a80591bef724a7070784f3462676b2ad5' as const
 
 export async function readShopifyReversalFixtureHealthInPostgres() {
   const structural = await query<{
@@ -23,12 +27,15 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
     provider_error_migration_current: boolean
     profile_v3_migration_current: boolean
     profile_v4_migration_current: boolean
+    profile_v5_migration_current: boolean
     command_table: boolean
     approval_table: boolean
     attempt_table: boolean
     outcome_table: boolean
     provider_error_column: boolean
     provider_error_constraint: boolean
+    provider_error_message_column: boolean
+    provider_error_message_constraint: boolean
     profile_version_constraint: boolean
     provider_error_view_columns: boolean
     state_view: boolean
@@ -63,6 +70,11 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
          WHERE migration.filename = $7
            AND migration.checksum = $8
        ) AS profile_v4_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $9
+           AND migration.checksum = $10
+       ) AS profile_v5_migration_current,
        to_regclass('public.operations_shopify_reversal_fixture_commands')
          IS NOT NULL AS command_table,
        to_regclass('public.operations_shopify_reversal_fixture_approvals')
@@ -94,6 +106,27 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
        ) AS provider_error_constraint,
        EXISTS (
          SELECT 1
+         FROM pg_catalog.pg_attribute column_definition
+         WHERE column_definition.attrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND column_definition.attname = 'provider_error_message'
+           AND column_definition.atttypid = 'pg_catalog.text'::regtype
+           AND NOT column_definition.attnotnull
+           AND NOT column_definition.attisdropped
+       ) AS provider_error_message_column,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_constraint constraint_definition
+         WHERE constraint_definition.conrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND constraint_definition.conname =
+             'shopify_reversal_fixture_outcomes_provider_error_message_valid'
+           AND constraint_definition.convalidated
+       ) AS provider_error_message_constraint,
+       EXISTS (
+         SELECT 1
          FROM pg_catalog.pg_constraint constraint_definition
          WHERE constraint_definition.conrelid = to_regclass(
            'public.operations_shopify_reversal_fixture_commands'
@@ -102,16 +135,17 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
              'shopify_reversal_fixture_commands_profile_version_valid'
            AND constraint_definition.convalidated
            AND pg_catalog.pg_get_constraintdef(constraint_definition.oid)
-             LIKE '%shopify-reversal-fixture-v4%'
+             LIKE '%shopify-reversal-fixture-v5%'
        ) AS profile_version_constraint,
        (
-         SELECT count(*) = 2
+         SELECT count(*) = 3
          FROM pg_catalog.pg_attribute column_definition
          WHERE column_definition.attrelid = to_regclass(
            'public.operations_shopify_reversal_fixture_command_state'
          )
            AND column_definition.attname IN (
-             'provider_error_code', 'provider_error_summary'
+             'provider_error_code', 'provider_error_summary',
+             'provider_error_message'
            )
            AND NOT column_definition.attisdropped
        ) AS provider_error_view_columns,
@@ -178,6 +212,8 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
       SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM,
       SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION,
       SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION_CHECKSUM,
     ],
   )
   const row = structural.rows[0]
@@ -186,12 +222,15 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
     && row.provider_error_migration_current
     && row.profile_v3_migration_current
     && row.profile_v4_migration_current
+    && row.profile_v5_migration_current
     && row.command_table
     && row.approval_table
     && row.attempt_table
     && row.outcome_table
     && row.provider_error_column
     && row.provider_error_constraint
+    && row.provider_error_message_column
+    && row.provider_error_message_constraint
     && row.profile_version_constraint
     && row.provider_error_view_columns
     && row.state_view

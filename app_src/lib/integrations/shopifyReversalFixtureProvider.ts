@@ -15,6 +15,8 @@ import {
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_LINE_ITEM_GID =
   /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/u
+const SHOPIFY_ORDER_TRANSACTION_GID =
+  /^gid:\/\/shopify\/OrderTransaction\/[1-9][0-9]{0,20}$/u
 const SOURCE_IDENTIFIER =
   /^clawpilot-reversal-fixture:gsfc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const UNIQUE_TAG = /^clawpilot-reversal-[a-f0-9]{24}$/u
@@ -30,7 +32,7 @@ const ORDER_CREATE_ERROR_CODES = new Set([
 ])
 
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION =
-  'shopify-reversal-fixture-v4' as const
+  'shopify-reversal-fixture-v5' as const
 export const SHOPIFY_REVERSAL_FIXTURE_BASE_TAG =
   'clawpilot-reversal-fixture' as const
 
@@ -38,6 +40,16 @@ export const SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE = Object.freeze({
   version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
   test: true as const,
   expectedFinancialStatus: 'PENDING' as const,
+  currencyCode: 'USD' as const,
+  unitPrice: '10.00' as const,
+  taxable: false as const,
+  transaction: Object.freeze({
+    kind: 'AUTHORIZATION' as const,
+    status: 'SUCCESS' as const,
+    test: true as const,
+    amount: '10.00' as const,
+    currencyCode: 'USD' as const,
+  }),
   marketingConsent: 'UNSET' as const,
   sendReceipt: false as const,
   sendFulfillmentReceipt: false as const,
@@ -63,18 +75,45 @@ const ORDER_FIELDS = `
   sourceIdentifier
   createdAt
   updatedAt
+  currencyCode
+  presentmentCurrencyCode
+  totalPriceSet {
+    shopMoney { amount currencyCode }
+    presentmentMoney { amount currencyCode }
+  }
+  capturable
+  totalCapturableSet {
+    shopMoney { amount currencyCode }
+    presentmentMoney { amount currencyCode }
+  }
   displayFinancialStatus
   displayFulfillmentStatus
   tags
   lineItems(first: 2) {
     nodes {
       id
+      quantity
       currentQuantity
       unfulfilledQuantity
+      taxable
       requiresShipping
       variant { id }
+      originalUnitPriceSet {
+        shopMoney { amount currencyCode }
+        presentmentMoney { amount currencyCode }
+      }
     }
     pageInfo { hasNextPage }
+  }
+  transactions(first: 10) {
+    id
+    kind
+    status
+    test
+    amountSet {
+      shopMoney { amount currencyCode }
+      presentmentMoney { amount currencyCode }
+    }
   }
 `
 
@@ -91,7 +130,7 @@ const ORDER_CREATE_MUTATION = `mutation ClawPilotReversalFixtureOrderCreate(
 const ORDER_RECONCILIATION_QUERY = `query ClawPilotReversalFixtureOrderRead(
   $query: String!
 ) {
-  orders(first: 3, query: $query, sortKey: CREATED_AT, reverse: true) {
+  orders(first: 2, query: $query, sortKey: CREATED_AT, reverse: true) {
     nodes { ${ORDER_FIELDS} }
     pageInfo { hasNextPage }
   }
@@ -108,8 +147,15 @@ export type ShopifyReversalFixtureOrder = Readonly<{
   variantId: typeof SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID
   quantity: 1
   test: true
-  displayFinancialStatus: 'PENDING'
-  displayFulfillmentStatus: 'UNFULFILLED'
+  currencyCode: 'USD'
+  unitPrice: '10.00'
+  taxable: false
+  transactionId: string
+  transactionKind: 'AUTHORIZATION'
+  transactionStatus: 'SUCCESS'
+  transactionTest: true
+  transactionAmount: '10.00'
+  transactionCurrencyCode: 'USD'
 }>
 
 export class ShopifyReversalFixtureProviderError extends Error {
@@ -120,6 +166,7 @@ export class ShopifyReversalFixtureProviderError extends Error {
     readonly providerMutationAttempted = false,
     readonly outcomeUnknown = false,
     readonly providerErrorSummary: string | null = null,
+    readonly providerErrorMessage: string | null = null,
   ) {
     super(message)
     this.name = 'ShopifyReversalFixtureProviderError'
@@ -224,9 +271,8 @@ function exactOrderProviderPayload(input: {
   const variables = Object.freeze({
     order: Object.freeze({
       test: true as const,
-      // Shopify derives the unpaid state when this fixed fixture has no
-      // transactions. The response must still prove PENDING before ClawPilot
-      // accepts the provider outcome.
+      financialStatus: 'PENDING' as const,
+      currency: 'USD' as const,
       // The fixture has no customer or email, so marketing consent must remain
       // unset in Shopify. Receipt and fulfillment notifications remain off.
       sourceIdentifier,
@@ -235,6 +281,24 @@ function exactOrderProviderPayload(input: {
         variantId: SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
         quantity: 1 as const,
         requiresShipping: true as const,
+        taxable: false as const,
+        priceSet: Object.freeze({
+          shopMoney: Object.freeze({
+            amount: '10.00' as const,
+            currencyCode: 'USD' as const,
+          }),
+        }),
+      })]),
+      transactions: Object.freeze([Object.freeze({
+        kind: 'AUTHORIZATION' as const,
+        status: 'SUCCESS' as const,
+        test: true as const,
+        amountSet: Object.freeze({
+          shopMoney: Object.freeze({
+            amount: '10.00' as const,
+            currencyCode: 'USD' as const,
+          }),
+        }),
       })]),
       shippingAddress: SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE.shippingAddress,
     }),
@@ -245,7 +309,7 @@ function exactOrderProviderPayload(input: {
     }),
   })
   const providerPayloadHash = createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v3',
+    version: 'shopify-reversal-fixture-order-provider-payload-v5',
     shopDomain,
     variables,
   })).digest('hex')
@@ -268,6 +332,7 @@ export function shopifyReversalFixtureOrderProviderPayloadHash(input: {
 function normalizeFixtureOrder(
   value: unknown,
   expected: { sourceIdentifier: string; uniqueTag: string },
+  proof: 'immediate' | 'reconciliation',
 ): ShopifyReversalFixtureOrder {
   const order = record(value, 'order')
   const id = text(order.id, 'order ID', 128)
@@ -281,8 +346,15 @@ function normalizeFixtureOrder(
   if (
     order.test !== true
     || order.sourceIdentifier !== expected.sourceIdentifier
-    || order.displayFinancialStatus !== 'PENDING'
-    || order.displayFulfillmentStatus !== 'UNFULFILLED'
+    || order.currencyCode !== 'USD'
+    || order.presentmentCurrencyCode !== 'USD'
+    || (
+      proof === 'immediate'
+      && (
+        order.displayFinancialStatus !== 'PENDING'
+        || order.displayFulfillmentStatus !== 'UNFULFILLED'
+      )
+    )
   ) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
@@ -302,13 +374,36 @@ function normalizeFixtureOrder(
     SHOPIFY_REVERSAL_FIXTURE_BASE_TAG,
     expected.uniqueTag,
   ].sort()
-  if (JSON.stringify(tags) !== JSON.stringify(expectedTags)) {
+  const tagsMatch = proof === 'immediate'
+    ? JSON.stringify(tags) === JSON.stringify(expectedTags)
+    : expectedTags.every((tag) => tags.includes(tag))
+  if (!tagsMatch) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
       'Shopify order tags do not match the exact fixture fingerprint',
     )
   }
   const lineItems = record(order.lineItems, 'order lines')
+  if (proof === 'immediate') {
+    const totalPrice = normalizedUsdMoneyBag(
+      order.totalPriceSet,
+      'order total price',
+    )
+    const totalCapturable = normalizedUsdMoneyBag(
+      order.totalCapturableSet,
+      'order total capturable amount',
+    )
+    if (
+      order.capturable !== true
+      || !isExactFixtureAmount(totalPrice)
+      || !isExactFixtureAmount(totalCapturable)
+    ) {
+      fail(
+        'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
+        'The fixed authorized USD order total changed',
+      )
+    }
+  }
   const pageInfo = record(lineItems.pageInfo, 'order line page information')
   if (pageInfo.hasNextPage !== false || !Array.isArray(lineItems.nodes)) {
     fail(
@@ -317,27 +412,101 @@ function normalizeFixtureOrder(
       502,
     )
   }
-  if (lineItems.nodes.length !== 1) {
+  if (
+    lineItems.nodes.length < 1
+    || (proof === 'immediate' && lineItems.nodes.length !== 1)
+  ) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
       'The fixed fixture must contain exactly one order line',
     )
   }
-  const line = record(lineItems.nodes[0], 'order line')
-  const variant = record(line.variant, 'order line variant')
-  const lineItemId = text(line.id, 'order line ID', 128)
-  if (
-    !SHOPIFY_LINE_ITEM_GID.test(lineItemId)
-    || variant.id !== SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID
-    || line.currentQuantity !== 1
-    || line.unfulfilledQuantity !== 1
-    || line.requiresShipping !== true
-  ) {
+  const matchingLines = lineItems.nodes.map((value, index) => {
+    const line = record(value, `order line ${index}`)
+    const variantId = line.variant === null
+      ? null
+      : record(line.variant, `order line ${index} variant`).id
+    const linePrice = normalizedUsdMoneyBag(
+      line.originalUnitPriceSet,
+      `order line ${index} original unit price`,
+    )
+    const lineItemId = text(line.id, `order line ${index} ID`, 128)
+    if (!SHOPIFY_LINE_ITEM_GID.test(lineItemId)) {
+      fail(
+        'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+        'Shopify returned an invalid order line ID',
+        502,
+      )
+    }
+    const matches = (
+      variantId === SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID
+      && line.quantity === 1
+      && line.taxable === false
+      && line.requiresShipping === true
+      && isExactFixtureAmount(linePrice)
+      && (
+        proof !== 'immediate'
+        || (
+          line.currentQuantity === 1
+          && line.unfulfilledQuantity === 1
+        )
+      )
+    )
+    return matches ? Object.freeze({ lineItemId }) : null
+  }).filter((line): line is Readonly<{ lineItemId: string }> => line !== null)
+  if (matchingLines.length !== 1) {
     fail(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
       'The fixed shippable one-unit fixture line changed',
     )
   }
+  const lineItemId = matchingLines[0].lineItemId
+  if (
+    !Array.isArray(order.transactions)
+    || order.transactions.length < 1
+    || order.transactions.length >= 10
+    || (proof === 'immediate' && order.transactions.length !== 1)
+  ) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
+      'The fixed fixture authorization transaction set is not bounded',
+    )
+  }
+  const matchingTransactions = order.transactions.map((value, index) => {
+    const transaction = record(value, `order transaction ${index}`)
+    const transactionId = text(
+      transaction.id,
+      `order transaction ${index} ID`,
+      128,
+    )
+    if (!SHOPIFY_ORDER_TRANSACTION_GID.test(transactionId)) {
+      fail(
+        'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+        'Shopify returned an invalid order transaction ID',
+        502,
+      )
+    }
+    const transactionAmount = normalizedUsdMoneyBag(
+      transaction.amountSet,
+      `order transaction ${index} amount`,
+    )
+    const matches = (
+      transaction.kind === 'AUTHORIZATION'
+      && transaction.status === 'SUCCESS'
+      && transaction.test === true
+      && isExactFixtureAmount(transactionAmount)
+    )
+    return matches ? Object.freeze({ transactionId }) : null
+  }).filter((transaction): transaction is Readonly<{
+    transactionId: string
+  }> => transaction !== null)
+  if (matchingTransactions.length !== 1) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
+      'The fixed test authorization transaction changed',
+    )
+  }
+  const transactionId = matchingTransactions[0].transactionId
   return Object.freeze({
     id,
     name: text(order.name, 'order name'),
@@ -349,9 +518,80 @@ function normalizeFixtureOrder(
     variantId: SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
     quantity: 1 as const,
     test: true as const,
-    displayFinancialStatus: 'PENDING' as const,
-    displayFulfillmentStatus: 'UNFULFILLED' as const,
+    currencyCode: 'USD' as const,
+    unitPrice: '10.00' as const,
+    taxable: false as const,
+    transactionId,
+    transactionKind: 'AUTHORIZATION' as const,
+    transactionStatus: 'SUCCESS' as const,
+    transactionTest: true as const,
+    transactionAmount: '10.00' as const,
+    transactionCurrencyCode: 'USD' as const,
   })
+}
+
+function normalizedUsdMoneyBag(value: unknown, label: string) {
+  const moneyBag = record(value, label)
+  const shopMoney = record(moneyBag.shopMoney, `${label} shop money`)
+  const presentmentMoney = record(
+    moneyBag.presentmentMoney,
+    `${label} presentment money`,
+  )
+  const shopAmount = text(shopMoney.amount, `${label} shop amount`, 64)
+  const presentmentAmount = text(
+    presentmentMoney.amount,
+    `${label} presentment amount`,
+    64,
+  )
+  if (
+    shopMoney.currencyCode !== 'USD'
+    || presentmentMoney.currencyCode !== 'USD'
+    || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/u.test(shopAmount)
+    || !/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/u.test(presentmentAmount)
+  ) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_ORDER_SHAPE_CHANGED',
+      `Shopify returned malformed USD ${label}`,
+    )
+  }
+  return Object.freeze({ shopAmount, presentmentAmount })
+}
+
+function isExactFixtureAmount(value: Readonly<{
+  shopAmount: string
+  presentmentAmount: string
+}>) {
+  return /^10(?:\.0+)?$/u.test(value.shopAmount)
+    && /^10(?:\.0+)?$/u.test(value.presentmentAmount)
+}
+
+export function sanitizeShopifyReversalFixtureProviderErrorMessage(
+  value: unknown,
+) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 4096) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_PROVIDER_RESPONSE_INVALID',
+      'Shopify returned a malformed order-create error message',
+      502,
+    )
+  }
+  const sanitized = value
+    .normalize('NFKC')
+    .replace(/\bhttps?:\/\/[^\s]+|\bwww\.[^\s]+/giu, '[redacted-url]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu, '[redacted-email]')
+    .replace(/gid:\/\/shopify\/[A-Za-z][A-Za-z0-9_]*\/[^\s,;]+/gu, '[redacted-gid]')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/giu, '[redacted-uuid]')
+    .replace(/\b(?:account|card|payment)(?:\s+(?:number|id|ending(?:\s+in)?))?\s*[:#-]?\s*(?:\*{2,}[ -]*)*\d(?:[ -]?\d){3,}\b/giu, '[redacted-account]')
+    .replace(/\b\d{7,}\b/gu, '[redacted-number]')
+    .replace(/(?:\+?1[\s.-]*)?(?:\(\d{3}\)|\d{3})[\s.-]*\d{3}[\s.-]*\d{4}\b/gu, '[redacted-phone]')
+    .replace(/\b\d(?:[ -]?\d){6,}\b/gu, '[redacted-number]')
+    .replace(/\b(?=[A-Za-z0-9_-]{24,}\b)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]+\b/gu, '[redacted-token]')
+    .replace(/\b(?=[A-Za-z0-9_-]{16,}\b)(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]+\b/gu, '[redacted-token]')
+    .replace(/\d{7,}/gu, '[redacted-number]')
+    .replace(/[^\x20-\x7e]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  return (sanitized || '[redacted]').slice(0, 240).trimEnd()
 }
 
 function normalizeUserErrors(value: unknown) {
@@ -364,7 +604,9 @@ function normalizeUserErrors(value: unknown) {
   }
   return value.map((entry) => {
     const error = record(entry, 'order-create error')
-    text(error.message, 'order-create error message', 500)
+    const message = sanitizeShopifyReversalFixtureProviderErrorMessage(
+      error.message,
+    )
     const code = error.code === null
       ? null
       : text(error.code, 'order-create error code', 64)
@@ -401,7 +643,7 @@ function normalizeUserErrors(value: unknown) {
         )
       }
     }
-    return Object.freeze({ code, fieldPath })
+    return Object.freeze({ code, fieldPath, message })
   })
 }
 
@@ -422,6 +664,22 @@ function providerRejectionSummary(
     details = candidate
   }
   return `${prefix}${details}${suffix}`
+}
+
+function providerRejectionMessage(
+  errors: ReadonlyArray<Readonly<{ message: string }>>,
+) {
+  const evidence = [...new Set(errors.map((error) => error.message))]
+  let result = ''
+  for (const message of evidence) {
+    const candidate = result ? `${result}; ${message}` : message
+    if (candidate.length > 240) {
+      if (!result) result = candidate.slice(0, 240).trimEnd()
+      break
+    }
+    result = candidate
+  }
+  return result || '[redacted]'
 }
 
 export async function createShopifyReversalFixtureOrder(
@@ -494,6 +752,7 @@ export async function createShopifyReversalFixtureOrder(
   let errors: ReadonlyArray<Readonly<{
     code: string | null
     fieldPath: string | null
+    message: string
   }>>
   try {
     errors = normalizeUserErrors(payload.userErrors)
@@ -508,6 +767,7 @@ export async function createShopifyReversalFixtureOrder(
   }
   if (errors.length > 0) {
     const errorSummary = providerRejectionSummary(errors)
+    const errorMessage = providerRejectionMessage(errors)
     throw new ShopifyReversalFixtureProviderError(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',
       errorSummary,
@@ -515,6 +775,7 @@ export async function createShopifyReversalFixtureOrder(
       true,
       false,
       errorSummary,
+      errorMessage,
     )
   }
   if (!payload.order) {
@@ -527,7 +788,11 @@ export async function createShopifyReversalFixtureOrder(
     )
   }
   try {
-    return normalizeFixtureOrder(payload.order, { sourceIdentifier, uniqueTag })
+    return normalizeFixtureOrder(
+      payload.order,
+      { sourceIdentifier, uniqueTag },
+      'immediate',
+    )
   } catch {
     throw new ShopifyReversalFixtureProviderError(
       'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN',
@@ -557,7 +822,9 @@ export async function reconcileShopifyReversalFixtureOrder(
   }>(credential, {
     query: ORDER_RECONCILIATION_QUERY,
     operationName: 'ClawPilotReversalFixtureOrderRead',
-    variables: { query: `tag:${uniqueTag}` },
+    variables: {
+      query: `source_identifier:${JSON.stringify(sourceIdentifier)} AND tag:${uniqueTag} AND test:true`,
+    },
   }, options)
   const connection = record(data.orders, 'order search')
   const pageInfo = record(connection.pageInfo, 'order search page information')
@@ -591,7 +858,7 @@ export async function reconcileShopifyReversalFixtureOrder(
     order = normalizeFixtureOrder(connection.nodes[0], {
       sourceIdentifier,
       uniqueTag,
-    })
+    }, 'reconciliation')
   } catch {
     const evidenceHash = createHash('sha256').update(JSON.stringify({
       version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,

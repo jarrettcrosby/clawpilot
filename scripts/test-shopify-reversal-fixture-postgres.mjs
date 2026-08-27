@@ -282,7 +282,7 @@ async function insertOrderCommand(pool, fixture, options = {}) {
        source_identifier, unique_tag, tag_fingerprint, expires_at
      ) VALUES (
        $1, $2::uuid, $3::uuid,
-       'create_order', 'shopify-reversal-fixture-v4', $4, $5,
+       'create_order', 'shopify-reversal-fixture-v5', $4, $5,
        $6, $7, $8,
        $9,
        $10::bigint, 1, $11, 'gid://shopify/Shop/95083757815',
@@ -363,6 +363,7 @@ async function insertOutcome(
   state,
   evidence = 'a'.repeat(64),
   providerErrorSummary = null,
+  providerErrorMessage = null,
 ) {
   const reconciled = state.startsWith('reconciled_')
   const unknown = state === 'unknown'
@@ -372,10 +373,11 @@ async function insertOutcome(
     `INSERT INTO operations_shopify_reversal_fixture_outcomes (
        organization_id, command_id, attempt_id, outcome_state,
        provider_mutation_attempted, provider_writes, error_code,
-       provider_error_summary, evidence_hash, recorded_by
+       provider_error_summary, provider_error_message, evidence_hash,
+       recorded_by
      ) VALUES (
        $1::uuid, $2::uuid, $3::uuid, $4,
-       $5, $6::integer, $7, $8, $9, $10
+       $5, $6::integer, $7, $8, $9, $10, $11
      ) RETURNING id::text, global_id, outcome_state`,
     [
       fixture.organizationId,
@@ -390,6 +392,7 @@ async function insertOutcome(
           ? 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
           : null,
       providerErrorSummary,
+      providerErrorMessage,
       unknown ? null : evidence,
       fixture.owner,
     ],
@@ -793,6 +796,8 @@ async function exercise(pool) {
     await unknownClient.query('BEGIN')
     const safeProviderErrorSummary =
       'Shopify rejected order creation (INVALID at order.lineItems.0.variantId)'
+    const safeProviderErrorMessage =
+      'Line price must match the fixed authorization [redacted-gid]'
     await unknownClient.query('SAVEPOINT fixture_valid_rejected_summary')
     await insertOutcome(
       unknownClient,
@@ -802,9 +807,11 @@ async function exercise(pool) {
       'rejected',
       'e'.repeat(64),
       safeProviderErrorSummary,
+      safeProviderErrorMessage,
     )
     const rejectedState = await unknownClient.query(
-      `SELECT provider_error_code, provider_error_summary
+      `SELECT provider_error_code, provider_error_summary,
+              provider_error_message
        FROM operations_shopify_reversal_fixture_command_state
        WHERE organization_id = $1::uuid AND command_id = $2::uuid`,
       [fixture.organizationId, prepared.id],
@@ -816,6 +823,10 @@ async function exercise(pool) {
     assert.equal(
       rejectedState.rows[0].provider_error_summary,
       safeProviderErrorSummary,
+    )
+    assert.equal(
+      rejectedState.rows[0].provider_error_message,
+      safeProviderErrorMessage,
     )
     await unknownClient.query('ROLLBACK TO SAVEPOINT fixture_valid_rejected_summary')
     await unknownClient.query('RELEASE SAVEPOINT fixture_valid_rejected_summary')
@@ -889,6 +900,51 @@ async function exercise(pool) {
       /shopify_reversal_fixture_outcomes_provider_error_summary_valid/iu,
       'provider error summaries are bounded to 500 characters',
     )
+    await rejectedInSavepoint(
+      unknownClient,
+      () => insertOutcome(
+        unknownClient,
+        fixture,
+        prepared,
+        attemptId,
+        'unknown',
+        'e'.repeat(64),
+        null,
+        safeProviderErrorMessage,
+      ),
+      /shopify_reversal_fixture_outcomes_provider_error_message_valid/iu,
+      'unknown outcomes cannot retain sanitized provider messages',
+    )
+    await rejectedInSavepoint(
+      unknownClient,
+      () => insertOutcome(
+        unknownClient,
+        fixture,
+        prepared,
+        attemptId,
+        'rejected',
+        'e'.repeat(64),
+        null,
+        `${safeProviderErrorMessage}\nunsafe`,
+      ),
+      /shopify_reversal_fixture_outcomes_provider_error_message_valid/iu,
+      'provider messages must be printable single-line ASCII evidence',
+    )
+    await rejectedInSavepoint(
+      unknownClient,
+      () => insertOutcome(
+        unknownClient,
+        fixture,
+        prepared,
+        attemptId,
+        'rejected',
+        'e'.repeat(64),
+        null,
+        'x'.repeat(241),
+      ),
+      /shopify_reversal_fixture_outcomes_provider_error_message_valid/iu,
+      'provider messages are bounded to 240 characters',
+    )
     await insertOutcome(
       unknownClient,
       fixture,
@@ -936,7 +992,8 @@ async function exercise(pool) {
     )
     const state = await unknownClient.query(
       `SELECT state, attempt_global_id, reconciliation_outcome_global_id,
-              provider_error_code, provider_error_summary
+              provider_error_code, provider_error_summary,
+              provider_error_message
        FROM operations_shopify_reversal_fixture_command_state
        WHERE organization_id = $1::uuid AND command_id = $2::uuid`,
       [fixture.organizationId, prepared.id],
@@ -952,6 +1009,7 @@ async function exercise(pool) {
       state.rows[0].provider_error_summary,
       safeProviderErrorSummary,
     )
+    assert.equal(state.rows[0].provider_error_message, null)
     await unknownClient.query('ROLLBACK')
   } finally {
     unknownClient.release()

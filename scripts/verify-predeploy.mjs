@@ -57,6 +57,11 @@ const shopifyReversalFixtureProfileV4Migration = [
   'c54ec1a30b9c5d8b24d50a429f9e8e83d238c0fb3810484ec960ea4737a33ec6',
 ]
 
+const shopifyReversalFixtureProfileV5Migration = [
+  'db/migrations/0333_operations_shopify_reversal_fixture_profile_v5.sql',
+  '058fe337553cd19676f0bb4b6f82104a80591bef724a7070784f3462676b2ad5',
+]
+
 const legacyUnitMeasurementMigration = [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
@@ -273,10 +278,28 @@ if (
 ) {
   fail('Shopify reversal fixture v4 migration checksum drifted')
 }
+const [shopifyReversalFixtureProfileV5MigrationPath,
+  shopifyReversalFixtureProfileV5MigrationChecksum] =
+  shopifyReversalFixtureProfileV5Migration
+if (!existsSync(resolve(root, shopifyReversalFixtureProfileV5MigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture v5 migration: ${shopifyReversalFixtureProfileV5MigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyReversalFixtureProfileV5MigrationPath),
+    ))
+    .digest('hex') !== shopifyReversalFixtureProfileV5MigrationChecksum
+) {
+  fail('Shopify reversal fixture v5 migration checksum drifted')
+}
 const shopifyReversalFixtureRequiredFiles = [
   shopifyReversalFixtureProviderErrorsMigrationPath,
   shopifyReversalFixtureProfileV3MigrationPath,
   shopifyReversalFixtureProfileV4MigrationPath,
+  shopifyReversalFixtureProfileV5MigrationPath,
   'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
   'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
@@ -362,6 +385,9 @@ if (
   )
   || !shopifyReversalFixtureHealthSource.includes(
     shopifyReversalFixtureProfileV4MigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProfileV5MigrationChecksum,
   )
   || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
   || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')

@@ -83,6 +83,8 @@ let fulfillmentMode = 'success'
 let outcomePersistenceMode = null
 const rawProviderMessageSentinel =
   'RAW_SHOPIFY_USER_ERROR_MESSAGE_MUST_NOT_BE_RETAINED'
+const sanitizedProviderErrorMessage =
+  'Line price must match the test authorization [redacted-gid]'
 
 class FixtureProviderError extends Error {
   constructor(code, outcomeUnknown = false, options = {}) {
@@ -95,6 +97,7 @@ class FixtureProviderError extends Error {
         : options.providerMutationAttempted
     this.outcomeUnknown = outcomeUnknown
     this.providerErrorSummary = options.providerErrorSummary ?? null
+    this.providerErrorMessage = options.providerErrorMessage ?? null
   }
 }
 class FulfillmentError extends Error {
@@ -271,6 +274,16 @@ vm.runInNewContext(output, {
         SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE: {
           test: true,
           expectedFinancialStatus: 'PENDING',
+          currencyCode: 'USD',
+          unitPrice: '10.00',
+          taxable: false,
+          transaction: {
+            kind: 'AUTHORIZATION',
+            status: 'SUCCESS',
+            test: true,
+            amount: '10.00',
+            currencyCode: 'USD',
+          },
           marketingConsent: 'UNSET',
           sendReceipt: false,
           sendFulfillmentReceipt: false,
@@ -280,7 +293,7 @@ vm.runInNewContext(output, {
           requiresShipping: true,
         },
         SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION:
-          'shopify-reversal-fixture-v4',
+          'shopify-reversal-fixture-v5',
         shopifyReversalFixtureTagFingerprint: (tag) => (
           createHash('sha256').update(tag).digest('hex')
         ),
@@ -310,6 +323,7 @@ vm.runInNewContext(output, {
                 message: rawProviderMessageSentinel,
                 providerErrorSummary:
                   'Shopify rejected order creation (INVALID at order.lineItems.0.variantId)',
+                providerErrorMessage: sanitizedProviderErrorMessage,
               },
             )
           }
@@ -332,6 +346,7 @@ vm.runInNewContext(output, {
                 providerMutationAttempted: false,
                 providerErrorSummary:
                   'Shopify rejected order creation (INVALID at order.test)',
+                providerErrorMessage: sanitizedProviderErrorMessage,
               },
             )
           }
@@ -548,6 +563,7 @@ await commands.executeShopifyReversalFixtureCommand({
 assert.equal(calls.outcomes.at(-1).outcomeState, 'unknown')
 assert.equal(calls.outcomes.at(-1).providerWrites, null)
 assert.equal(calls.outcomes.at(-1).providerErrorSummary, undefined)
+assert.equal(calls.outcomes.at(-1).providerErrorMessage, undefined)
 assert.doesNotMatch(
   JSON.stringify(calls.outcomes.at(-1)),
   new RegExp(rawProviderMessageSentinel, 'u'),
@@ -567,6 +583,10 @@ assert.equal(
   calls.outcomes.at(-1).providerErrorSummary,
   'Shopify rejected order creation (INVALID at order.lineItems.0.variantId)',
 )
+assert.equal(
+  calls.outcomes.at(-1).providerErrorMessage,
+  sanitizedProviderErrorMessage,
+)
 assert.doesNotMatch(
   JSON.stringify(calls.outcomes.at(-1)),
   new RegExp(rawProviderMessageSentinel, 'u'),
@@ -581,6 +601,7 @@ await commands.executeShopifyReversalFixtureCommand({
 })
 assert.equal(calls.outcomes.at(-1).providerMutationAttempted, true)
 assert.equal(calls.outcomes.at(-1).providerErrorSummary, undefined)
+assert.equal(calls.outcomes.at(-1).providerErrorMessage, undefined)
 assert.doesNotMatch(
   JSON.stringify(calls.outcomes.at(-1)),
   new RegExp(rawProviderMessageSentinel, 'u'),
@@ -595,6 +616,7 @@ await commands.executeShopifyReversalFixtureCommand({
 })
 assert.equal(calls.outcomes.at(-1).providerMutationAttempted, false)
 assert.equal(calls.outcomes.at(-1).providerErrorSummary, undefined)
+assert.equal(calls.outcomes.at(-1).providerErrorMessage, undefined)
 createOrderMode = 'success'
 
 claimed = { command: { phase: 'create_fulfillment' } }
@@ -653,6 +675,7 @@ assert.equal(calls.outcomes.at(-1).outcomeState, 'rejected')
 assert.equal(calls.outcomes.at(-1).providerMutationAttempted, true)
 assert.equal(calls.outcomes.at(-1).providerWrites, 0)
 assert.equal(calls.outcomes.at(-1).providerErrorSummary, undefined)
+assert.equal(calls.outcomes.at(-1).providerErrorMessage, undefined)
 
 fulfillmentMode = 'unknown'
 await commands.executeShopifyReversalFixtureCommand({
@@ -666,6 +689,7 @@ assert.equal(calls.outcomes.at(-1).outcomeState, 'unknown')
 assert.equal(calls.outcomes.at(-1).providerMutationAttempted, true)
 assert.equal(calls.outcomes.at(-1).providerWrites, null)
 assert.equal(calls.outcomes.at(-1).providerErrorSummary, undefined)
+assert.equal(calls.outcomes.at(-1).providerErrorMessage, undefined)
 fulfillmentMode = 'success'
 
 const assertCurrentBeforeReplay = calls.assertCurrent
