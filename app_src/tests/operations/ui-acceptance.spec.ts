@@ -1324,8 +1324,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
           expectedRowVersion: 0,
           confirmationStatement:
             SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
-          reason:
-            'Authorized end-to-end validation for Shopify test order #6600',
+          reason: 'Enable test fulfillment for Shopify order #6600',
           lifetimeMinutes: 120,
         })
         authorized = true
@@ -2178,13 +2177,12 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await expect(prepareOrder).toHaveCount(0)
   await authorizeOrder.click()
   await expect(
-    page.getByRole('heading', { name: 'Authorize verified Shopify test order' }),
+    page.getByRole('heading', { name: 'Enable test fulfillment' }),
   ).toBeVisible()
-  await page.getByTestId('shopify-test-store-authorization-statement')
-    .fill(SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION)
+  await page.getByTestId('sandbox-commerce-e2e-confirmation').check()
   await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
   await expect(page.getByTestId('sandbox-commerce-e2e-authorization-active'))
-    .toContainText('gsea7654321')
+    .toContainText('Enabled')
   await prepareOrder.click()
   await expect(
     page.getByRole('heading', { name: 'Prepare and plan imported order' }),
