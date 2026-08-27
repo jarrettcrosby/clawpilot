@@ -3,10 +3,12 @@ import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
   planOperationalUnitMaterialPackages,
+  planShopifyCheckoutUnitMaterialPackages,
 } from '../../lib/operations/operationalUnitMaterialCartonization.ts'
 import type {
   HybridCartonizationLine,
   HybridCartonizationMaterial,
+  HybridRecipePackage,
 } from '../../lib/operations/hybridCartonization.ts'
 
 const line: HybridCartonizationLine = {
@@ -70,10 +72,41 @@ const inventory = (available = 3) => [{
   providerCommittedQuantity: available,
   activeReservedQuantity: 0,
   effectiveAvailableQuantity: available,
-  sourceLevelGlobalIds: ['gcil0000001'],
+  sourceLevelGlobalIds: ['giil0000001'],
   sourcePositionGlobalIds: ['gpos0000001'],
   sourcePositionVersion: 1,
 }]
+
+const retainedRecipePackage: HybridRecipePackage = {
+  packageKey: 'recipe-package-1',
+  sequence: 1,
+  planningMethod: 'approved_recipe',
+  packagingMaterialGlobalId: 'gmat0000001',
+  packagingMaterialRowVersion: 2,
+  materialEvidence: {
+    innerDimensionsMm: { length: 500, width: 300, height: 200 },
+    dimensionBasis: 'inner',
+    dimensionEvidenceType: 'measured',
+    dimensionEvidenceReference: 'warehouse measurement',
+    dimensionConfirmedAt: '2026-08-24T00:00:00.000Z',
+  },
+  contentCompatibilityKey: null,
+  mixedProducts: false,
+  maximumInputQuantity: 1,
+  minimumInputQuantity: 1,
+  minimumBasis: 'approved_recipe',
+  lineAllocations: [],
+  totalInputQuantity: 1,
+  contentWeightGrams: 500,
+  rateReadiness: {
+    status: 'ready',
+    ratedOuterDimensionsMm: { length: 510, width: 310, height: 210 },
+    tareWeightGrams: 100,
+    ratedWeightGrams: 600,
+    blockers: [],
+  },
+  recipeEvidence: [],
+}
 
 const baseInput = {
   provider: 'shopify' as const,
@@ -173,6 +206,85 @@ test('unit-material planning fails closed when provider inventory is short', () 
   const result = planOperationalUnitMaterialPackages({
     ...baseInput,
     inventoryProducts: inventory(2),
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_INVENTORY_REQUIRED',
+  )
+})
+
+test('checkout unit-material planning retains quote-only availability authority', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    materials: baseInput.materials.map((item) => ({
+      ...item,
+      unitCostMinor: null,
+      currency: null,
+    })),
+    inventoryProducts: [{
+      productGlobalId: line.productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot',
+      effectiveAvailableQuantity: 3,
+      sourceLevelGlobalIds: ['giil0000001', 'giil0000002'],
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 3)
+  assert.equal(
+    result.evidence.inventoryAuthority,
+    'shopify_checkout_available_snapshot',
+  )
+  assert.equal(
+    result.evidence.materialAuthority,
+    'selected_material_stock_snapshot',
+  )
+  assert.ok(result.packages.every((item) => (
+    item.allocations.length === 1
+    && item.allocations[0].quantity === 1
+  )))
+})
+
+test('checkout unit planning counts recipe packages against unclaimed stock', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, quantity: 1 }],
+    fallbackLines: [{
+      ...baseInput.fallbackLines[0],
+      quantity: 1,
+    }],
+    recipePackages: [retainedRecipePackage],
+    materials: [{
+      ...material({
+        globalId: 'gmat0000001',
+        inner: { length: 500, width: 300, height: 200 },
+        available: 1,
+      }),
+      stockOnHandQuantity: 5,
+      activeClaimedQuantity: 4,
+      availableQuantity: 1,
+    }],
+    inventoryProducts: [{
+      productGlobalId: line.productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot',
+      effectiveAvailableQuantity: 1,
+      sourceLevelGlobalIds: ['giil0000001'],
+    }],
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_STOCK_REQUIRED',
+  )
+})
+
+test('checkout unit-material planning rejects order-commitment authority substitution', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    inventoryProducts: inventory(),
   })
   assert.equal(result.status, 'blocked')
   if (result.status !== 'blocked') return

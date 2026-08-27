@@ -282,7 +282,7 @@ async function insertOrderCommand(pool, fixture, options = {}) {
        source_identifier, unique_tag, tag_fingerprint, expires_at
      ) VALUES (
        $1, $2::uuid, $3::uuid,
-       'create_order', 'shopify-reversal-fixture-v2', $4, $5,
+       'create_order', 'shopify-reversal-fixture-v3', $4, $5,
        $6, $7, $8,
        $9,
        $10::bigint, 1, $11, 'gid://shopify/Shop/95083757815',

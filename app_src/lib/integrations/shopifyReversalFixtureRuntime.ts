@@ -12,7 +12,7 @@ export const SHOPIFY_REVERSAL_FIXTURE_SHOP_GID =
 export const SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN =
   'test-pro-bakery-bites.myshopify.com' as const
 export const SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID =
-  'gid://shopify/ProductVariant/51028106379511' as const
+  'gid://shopify/ProductVariant/51028106608887' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_PROJECT_ID =
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270' as const
 export const SHOPIFY_REVERSAL_FIXTURE_RAILWAY_SERVICE_ID =

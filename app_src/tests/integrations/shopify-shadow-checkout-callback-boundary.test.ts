@@ -199,6 +199,8 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
   namedExports: {
     SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION:
       'shopify-checkout-line-pack-evidence-v1',
+    SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT:
+      'shopify-checkout-line-pack-evidence-v2',
     async lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres() {
       const policy = {
         organizationId: account.organizationId,

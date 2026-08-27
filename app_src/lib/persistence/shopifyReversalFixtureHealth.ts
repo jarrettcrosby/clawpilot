@@ -8,11 +8,16 @@ export const SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION =
   '0328_operations_shopify_reversal_fixture_provider_errors.sql' as const
 export const SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION_CHECKSUM =
   'a08b02ab69b6cedf34087a7baee7d16f50a7717a7a9c32d0901944a7ca1e32aa' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION =
+  '0330_operations_shopify_reversal_fixture_profile_v3.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM =
+  '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e' as const
 
 export async function readShopifyReversalFixtureHealthInPostgres() {
   const structural = await query<{
     migration_current: boolean
     provider_error_migration_current: boolean
+    profile_v3_migration_current: boolean
     command_table: boolean
     approval_table: boolean
     attempt_table: boolean
@@ -43,6 +48,11 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
          WHERE migration.filename = $3
            AND migration.checksum = $4
        ) AS provider_error_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $5
+           AND migration.checksum = $6
+       ) AS profile_v3_migration_current,
        to_regclass('public.operations_shopify_reversal_fixture_commands')
          IS NOT NULL AS command_table,
        to_regclass('public.operations_shopify_reversal_fixture_approvals')
@@ -81,6 +91,8 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
            AND constraint_definition.conname =
              'shopify_reversal_fixture_commands_profile_version_valid'
            AND constraint_definition.convalidated
+           AND pg_catalog.pg_get_constraintdef(constraint_definition.oid)
+             LIKE '%shopify-reversal-fixture-v3%'
        ) AS profile_version_constraint,
        (
          SELECT count(*) = 2
@@ -152,12 +164,15 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
       SHOPIFY_REVERSAL_FIXTURE_MIGRATION_CHECKSUM,
       SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION,
       SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM,
     ],
   )
   const row = structural.rows[0]
   const structureCurrent = Boolean(
     row?.migration_current
     && row.provider_error_migration_current
+    && row.profile_v3_migration_current
     && row.command_table
     && row.approval_table
     && row.attempt_table

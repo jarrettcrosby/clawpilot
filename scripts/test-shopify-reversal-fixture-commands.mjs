@@ -275,12 +275,12 @@ vm.runInNewContext(output, {
           sendReceipt: false,
           sendFulfillmentReceipt: false,
           inventoryBehaviour: 'BYPASS',
-          variantId: 'gid://shopify/ProductVariant/51028106379511',
+          variantId: 'gid://shopify/ProductVariant/51028106608887',
           quantity: 1,
           requiresShipping: true,
         },
         SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION:
-          'shopify-reversal-fixture-v2',
+          'shopify-reversal-fixture-v3',
         shopifyReversalFixtureTagFingerprint: (tag) => (
           createHash('sha256').update(tag).digest('hex')
         ),

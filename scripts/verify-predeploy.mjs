@@ -47,9 +47,24 @@ const shopifyReversalFixtureProviderErrorsMigration = [
   'a08b02ab69b6cedf34087a7baee7d16f50a7717a7a9c32d0901944a7ca1e32aa',
 ]
 
+const shopifyReversalFixtureProfileV3Migration = [
+  'db/migrations/0330_operations_shopify_reversal_fixture_profile_v3.sql',
+  '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e',
+]
+
 const legacyUnitMeasurementMigration = [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
+]
+
+const shopifyCheckoutUnitMaterialMigration = [
+  'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
+  'e5a480092b91a3b84cbdde09ab5205590014e6169f55715a654cf8eff8632873',
+]
+
+const shopifyCheckoutLineAuthorityMigration = [
+  'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
+  '7eb6341111e3dd1789eb213d05193ea6bf91f46229ce47bdba6c1eae87420323',
 ]
 
 function fail(message) {
@@ -86,6 +101,8 @@ if (!existsSync(resolve(root, 'package.json'))) {
 if (!existsSync(resolve(root, 'app_src/package.json'))) {
   fail('missing app_src/package.json')
 }
+
+const rootPackage = readJson('package.json')
 
 for (const [relativePath, expectedChecksum] of orderEditingReleaseMigrations) {
   if (!existsSync(resolve(root, relativePath))) {
@@ -127,6 +144,48 @@ for (const requiredFragment of [
     fail(`order-editing release health is missing ${requiredFragment}`)
   }
 }
+const [shopifyCheckoutUnitMaterialMigrationPath,
+  shopifyCheckoutUnitMaterialMigrationChecksum] =
+  shopifyCheckoutUnitMaterialMigration
+if (!existsSync(resolve(root, shopifyCheckoutUnitMaterialMigrationPath))) {
+  fail(
+    `missing Shopify checkout unit-material migration: ${shopifyCheckoutUnitMaterialMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyCheckoutUnitMaterialMigrationPath),
+    ))
+    .digest('hex') !== shopifyCheckoutUnitMaterialMigrationChecksum
+) {
+  fail('Shopify checkout unit-material migration checksum drifted')
+}
+if (
+  !String(rootPackage?.scripts?.['test:shopify-carrier-service-postgres'] || '')
+    .includes('node scripts/test-shopify-checkout-unit-material-postgres.mjs')
+) {
+  fail(
+    'test:shopify-carrier-service-postgres must run checkout unit-material acceptance',
+  )
+}
+const [shopifyCheckoutLineAuthorityMigrationPath,
+  shopifyCheckoutLineAuthorityMigrationChecksum] =
+  shopifyCheckoutLineAuthorityMigration
+if (!existsSync(resolve(root, shopifyCheckoutLineAuthorityMigrationPath))) {
+  fail(
+    `missing Shopify checkout line-authority migration: ${shopifyCheckoutLineAuthorityMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyCheckoutLineAuthorityMigrationPath),
+    ))
+    .digest('hex') !== shopifyCheckoutLineAuthorityMigrationChecksum
+) {
+  fail('Shopify checkout line-authority migration checksum drifted')
+}
 
 const healthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
@@ -144,7 +203,6 @@ for (const requiredFragment of [
   }
 }
 
-const rootPackage = readJson('package.json')
 const [shopifyReversalFixtureMigrationPath,
   shopifyReversalFixtureMigrationChecksum] = shopifyReversalFixtureMigration
 if (!existsSync(resolve(root, shopifyReversalFixtureMigrationPath))) {
@@ -176,8 +234,26 @@ if (
 ) {
   fail('Shopify reversal fixture provider-error migration checksum drifted')
 }
+const [shopifyReversalFixtureProfileV3MigrationPath,
+  shopifyReversalFixtureProfileV3MigrationChecksum] =
+  shopifyReversalFixtureProfileV3Migration
+if (!existsSync(resolve(root, shopifyReversalFixtureProfileV3MigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture v3 migration: ${shopifyReversalFixtureProfileV3MigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyReversalFixtureProfileV3MigrationPath),
+    ))
+    .digest('hex') !== shopifyReversalFixtureProfileV3MigrationChecksum
+) {
+  fail('Shopify reversal fixture v3 migration checksum drifted')
+}
 const shopifyReversalFixtureRequiredFiles = [
   shopifyReversalFixtureProviderErrorsMigrationPath,
+  shopifyReversalFixtureProfileV3MigrationPath,
   'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
   'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
@@ -234,7 +310,7 @@ for (const fragment of [
   'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
   'gid://shopify/Shop/95083757815',
   'test-pro-bakery-bites.myshopify.com',
-  'gid://shopify/ProductVariant/51028106379511',
+  'gid://shopify/ProductVariant/51028106608887',
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
   'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
   'e4abd95f-825c-4242-b37b-825a92597e98',
@@ -254,6 +330,12 @@ const shopifyReversalFixtureHealthSource = readFileSync(
 if (
   !shopifyReversalFixtureHealthSource.includes(
     shopifyReversalFixtureMigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProviderErrorsMigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProfileV3MigrationChecksum,
   )
   || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
   || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')
@@ -390,6 +472,13 @@ if (
   )
 }
 const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+if (
+  !ciWorkflow.includes(
+    'run: node scripts/test-shopify-checkout-unit-material-postgres.mjs',
+  )
+) {
+  fail('CI must run the Shopify checkout unit cartonization PostgreSQL acceptance')
+}
 if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
   fail('CI must run the Store sync disposable PostgreSQL acceptance')
 }
@@ -599,6 +688,8 @@ for (const requiredPath of [
   'db/migrations/0324_operations_external_fulfillment_label_artifacts.sql',
   'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
+  'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
+  'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
@@ -677,6 +768,7 @@ for (const requiredPath of [
   'scripts/test-shopify-order-management-api.mjs',
   'scripts/test-shopify-order-management-ui.mjs',
   'scripts/test-shopify-order-management-health.mjs',
+  'scripts/test-shopify-checkout-unit-material-postgres.mjs',
   'scripts/test-operations-order-editing-release-health-postgres.mjs',
   'scripts/test-carrier-shipping-account-diagnostics.mjs',
   'scripts/test-carrier-shipping-diagnostic-actions.mjs',

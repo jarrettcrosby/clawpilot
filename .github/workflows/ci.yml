@@ -58,6 +58,9 @@ jobs:
       - name: Shopify test-store canonical E2E contract
         run: npm run test:shopify-test-store-canonical-e2e
 
+      - name: Shopify checkout unit cartonization PostgreSQL acceptance
+        run: node scripts/test-shopify-checkout-unit-material-postgres.mjs
+
       - name: Store sync PostgreSQL acceptance
         run: npm run test:commerce-store-sync
 

@@ -6,6 +6,9 @@ import type {
   HybridCartonizationMaterial,
   HybridCartonizationRecipe,
 } from '@/lib/operations/hybridCartonization'
+import type {
+  OperationalUnitMaterialInventoryProductEvidence,
+} from '@/lib/operations/operationalUnitMaterialCartonization'
 import {
   isShopifyRatingCheckoutChannelEligible,
 } from '@/lib/integrations/shopifyCheckoutChannelEligibility'
@@ -29,16 +32,21 @@ export type ShopifyCheckoutContextResult = {
   inventorySnapshotAt: string
   inventorySnapshotHash: string
   input: HybridCartonizationInput
+  inventoryProducts: OperationalUnitMaterialInventoryProductEvidence[]
   lines: Array<{
     lineKey: string
     productGid: string
     variantGid: string
     productGlobalId: string
-    packMappingGlobalId: string
-    packMappingRowVersion: number
-    packEvidenceHash: string
-    packProfileVersionGlobalId: string
-    packProfileVersionRowVersion: number
+    productMappingGlobalId: string
+    cartonizationAuthority: 'product_pack' | 'unit_material_selection'
+    channelSourceRevision: string
+    channelSourceHash: string
+    packMappingGlobalId: string | null
+    packMappingRowVersion: number | null
+    packEvidenceHash: string | null
+    packProfileVersionGlobalId: string | null
+    packProfileVersionRowVersion: number | null
     packageLevel: 'each' | 'inner_pack' | 'case' | 'pallet'
     baseEachQuantity: number
     shipsAsOwnPackage: boolean
@@ -55,6 +63,8 @@ export type ShopifyCheckoutContextResult = {
     stockRowVersion: number
     maxWeightGrams: number
     stockOnHandQuantity: number
+    activeClaimedQuantity: number
+    availableQuantity: number
     unitCostMinor: number
     currency: string
   }>
@@ -107,6 +117,7 @@ type LineRow = QueryResultRow & {
   variant_gid: string
   product_id: string
   product_global_id: string
+  product_mapping_global_id: string
   product_title: string
   provider_variant_title: string | null
   provider_sku: string | null
@@ -119,32 +130,33 @@ type LineRow = QueryResultRow & {
   state_source_revision: string
   state_source_hash: string
   state_pack_evidence_hash: string
-  pack_mapping_global_id: string
-  pack_mapping_row_version: string | number
-  pack_mapping_projection_state: string
-  pack_mapping_provider_lifecycle_state: string
+  pack_mapping_global_id: string | null
+  pack_mapping_row_version: string | number | null
+  pack_mapping_projection_state: string | null
+  pack_mapping_provider_lifecycle_state: string | null
+  pack_mapping_purpose: 'catalog' | 'shopify_checkout' | null
   pack_mapping_source_revision: string | null
   pack_mapping_source_hash: string | null
   pack_mapping_pack_evidence_hash: string | null
-  profile_version_id: string
-  profile_version_global_id: string
-  profile_version_row_version: string | number
-  profile_version_is_current: boolean
+  profile_version_id: string | null
+  profile_version_global_id: string | null
+  profile_version_row_version: string | number | null
+  profile_version_is_current: boolean | null
   profile_version_lifecycle_state:
-    HybridCartonizationLine['profile']['lifecycleState']
-  profile_package_level: 'each' | 'inner_pack' | 'case' | 'pallet'
-  profile_base_each_quantity: number
+    HybridCartonizationLine['profile']['lifecycleState'] | null
+  profile_package_level: 'each' | 'inner_pack' | 'case' | 'pallet' | null
+  profile_base_each_quantity: number | null
   profile_length_mm: number | null
   profile_width_mm: number | null
   profile_height_mm: number | null
-  profile_dimension_basis: 'inner' | 'outer' | 'unspecified'
-  profile_ships_as_own_package: boolean
-  profile_fit_model: HybridCartonizationLine['profile']['fitModel']
-  profile_evidence_type: HybridCartonizationLine['profile']['evidenceType']
+  profile_dimension_basis: 'inner' | 'outer' | 'unspecified' | null
+  profile_ships_as_own_package: boolean | null
+  profile_fit_model: HybridCartonizationLine['profile']['fitModel'] | null
+  profile_evidence_type: HybridCartonizationLine['profile']['evidenceType'] | null
   profile_evidence_reference: string | null
   profile_confirmed_at: Date | string | null
   profile_gross_weight_grams: number | null
-  profile_status: string
+  profile_status: string | null
 }
 
 type MaterialRow = QueryResultRow & {
@@ -176,6 +188,7 @@ type MaterialRow = QueryResultRow & {
   stock_row_version: string | number
   stock_is_available: boolean | null
   stock_on_hand_quantity: number | null
+  active_claimed_quantity: string | number
 }
 
 type RecipeRow = QueryResultRow & {
@@ -201,7 +214,6 @@ type RecipeRow = QueryResultRow & {
 }
 
 type InventoryRow = QueryResultRow & {
-  variant_gid: string
   external_inventory_item_id: string
   operational_available_quantity: string | number
   source_level_global_ids: string[]
@@ -225,8 +237,9 @@ async function readLines(
        requested.line_key,
        requested.product_gid,
        requested.variant_gid,
-       mapping.product_id::text,
+       product_mapping.product_id::text,
        product.reference_code AS product_global_id,
+       product_mapping.global_id AS product_mapping_global_id,
        product.name AS product_title,
        state.provider_variant_title,
        state.provider_sku,
@@ -244,6 +257,7 @@ async function readLines(
        mapping.projection_state AS pack_mapping_projection_state,
        mapping.provider_lifecycle_state
          AS pack_mapping_provider_lifecycle_state,
+       mapping.mapping_purpose AS pack_mapping_purpose,
        mapping.source_revision AS pack_mapping_source_revision,
        mapping.source_hash AS pack_mapping_source_hash,
        mapping.pack_evidence_hash AS pack_mapping_pack_evidence_hash,
@@ -266,31 +280,47 @@ async function readLines(
        version.gross_weight_grams AS profile_gross_weight_grams,
        profile.status AS profile_status
      FROM requested
-     JOIN operations_commerce_variant_pack_mappings mapping
-       ON mapping.organization_id = $1::uuid
-      AND mapping.integration_account_id = $2::uuid
-      AND mapping.provider = 'shopify'
-      AND mapping.external_product_id = requested.product_gid
-      AND mapping.external_variant_id = requested.variant_gid
-      AND mapping.mapping_purpose = 'shopify_checkout'
-      AND mapping.is_current = true
+     JOIN operations_product_mappings product_mapping
+       ON product_mapping.organization_id = $1::uuid
+      AND product_mapping.integration_account_id = $2::uuid
+      AND product_mapping.external_product_id = requested.product_gid
+      AND product_mapping.external_variant_id = requested.variant_gid
+      AND product_mapping.active = true
      JOIN operations_product_channel_states state
-       ON state.organization_id = mapping.organization_id
-      AND state.integration_account_id = mapping.integration_account_id
-      AND state.provider = mapping.provider
-      AND state.external_product_id = mapping.external_product_id
-      AND state.external_variant_id = mapping.external_variant_id
-      AND state.pipeline_id = mapping.pipeline_id
-      AND state.product_id = mapping.product_id
+       ON state.organization_id = product_mapping.organization_id
+      AND state.integration_account_id = product_mapping.integration_account_id
+      AND state.provider = 'shopify'
+      AND state.external_product_id = product_mapping.external_product_id
+      AND state.external_variant_id = product_mapping.external_variant_id
+      AND state.pipeline_id = product_mapping.pipeline_id
+      AND state.product_id = product_mapping.product_id
+      AND state.product_mapping_id = product_mapping.id
      JOIN crm_products product
-       ON product.pipeline_id = mapping.pipeline_id
-      AND product.id = mapping.product_id
-     JOIN operations_product_pack_profile_versions version
+       ON product.pipeline_id = product_mapping.pipeline_id
+      AND product.id = product_mapping.product_id
+     LEFT JOIN LATERAL (
+       SELECT candidate.*
+       FROM operations_commerce_variant_pack_mappings candidate
+       WHERE candidate.organization_id = product_mapping.organization_id
+         AND candidate.integration_account_id =
+               product_mapping.integration_account_id
+         AND candidate.pipeline_id = product_mapping.pipeline_id
+         AND candidate.product_id = product_mapping.product_id
+         AND candidate.provider = 'shopify'
+         AND candidate.external_product_id = requested.product_gid
+         AND candidate.external_variant_id = requested.variant_gid
+         AND candidate.is_current = true
+       ORDER BY
+         (candidate.mapping_purpose = 'shopify_checkout') DESC,
+         candidate.global_id
+       LIMIT 1
+     ) mapping ON true
+     LEFT JOIN operations_product_pack_profile_versions version
        ON version.organization_id = mapping.organization_id
       AND version.pipeline_id = mapping.pipeline_id
       AND version.product_id = mapping.product_id
       AND version.id = mapping.default_pack_profile_version_id
-     JOIN operations_product_pack_profiles profile
+     LEFT JOIN operations_product_pack_profiles profile
        ON profile.organization_id = version.organization_id
       AND profile.pipeline_id = version.pipeline_id
       AND profile.product_id = version.product_id
@@ -328,8 +358,7 @@ function mapLines(
         'Checkout line evidence did not match the request',
       )
     }
-    if (
-      !isShopifyRatingCheckoutChannelEligible({
+    if (!isShopifyRatingCheckoutChannelEligible({
         provider: 'shopify',
         accountEnvironment: account.environment,
         providerStatusRaw: row.state_provider_status_raw,
@@ -338,25 +367,18 @@ function mapLines(
         requiresShipping: row.state_requires_shipping,
         weightGrams: row.state_weight_grams,
       })
-      || row.pack_mapping_projection_state !== 'current'
-      || row.pack_mapping_provider_lifecycle_state
-        !== row.state_normalized_status
-      || !row.pack_mapping_pack_evidence_hash
-      || row.pack_mapping_pack_evidence_hash
-        !== row.state_pack_evidence_hash
-      || row.profile_version_is_current !== true
-      || row.profile_version_lifecycle_state !== 'active'
-      || row.profile_status !== 'active'
-      || row.profile_evidence_type === 'unknown'
-      || !row.profile_evidence_reference
-      || row.profile_confirmed_at === null
       || !row.external_inventory_item_id
+      || !row.state_source_revision?.trim()
     ) {
       fail(
         'SHOPIFY_CHECKOUT_VARIANT_EVIDENCE_NOT_READY',
         'A requested Shopify variant has stale or incomplete operational evidence',
       )
     }
+    const channelSourceHash = sha256(
+      row.state_source_hash,
+      `${row.variant_gid} channel source hash`,
+    )
     const providerWeight = integer(
       row.state_weight_grams,
       `${row.variant_gid} provider weight`,
@@ -364,14 +386,98 @@ function mapLines(
     )
     if (
       providerWeight !== input.grams
-      || (
-        row.profile_gross_weight_grams !== null
-        && row.profile_gross_weight_grams !== providerWeight
-      )
+      || (row.profile_gross_weight_grams !== null
+        && row.profile_gross_weight_grams !== providerWeight)
     ) {
       fail(
         'SHOPIFY_CHECKOUT_VARIANT_WEIGHT_CONFLICT',
         'A requested Shopify variant weight differs from current retained evidence',
+      )
+    }
+    const title = row.provider_variant_title?.trim()
+      && row.provider_variant_title.trim().toLowerCase() !== 'default title'
+      ? `${row.product_title} · ${row.provider_variant_title.trim()}`
+      : row.product_title
+    const commonEvidence = {
+      lineKey: input.lineKey,
+      productGid: input.productGid,
+      variantGid: input.variantGid,
+      productGlobalId: row.product_global_id,
+      productMappingGlobalId: row.product_mapping_global_id,
+      channelSourceRevision: row.state_source_revision,
+      channelSourceHash,
+      inventoryLevelGlobalIds: [] as string[],
+      quantity: input.quantity,
+      unitWeightGrams: providerWeight,
+      sku: input.sku,
+      requiresShipping: true as const,
+    }
+    if (!row.pack_mapping_global_id) {
+      return {
+        productId: row.product_id,
+        profileVersionId: null,
+        inventoryItemId: row.external_inventory_item_id,
+        line: {
+          lineGlobalId: input.lineKey,
+          productGlobalId: row.product_global_id,
+          title,
+          quantity: input.quantity,
+          unitWeightGrams: providerWeight,
+          profile: {
+            versionGlobalId: `unit-item:${input.lineKey}`,
+            capturedRowVersion: 0,
+            currentRowVersion: 0,
+            isCurrent: true,
+            lifecycleState: 'active',
+            fitModel: 'unconstrained_unit',
+            evidenceType: 'provider',
+            evidenceReference: row.state_source_revision,
+            confirmedAt: null,
+            packageLevel: 'each',
+            baseEachQuantity: 1,
+            shipsAsOwnPackage: false,
+            outerDimensionsMm: null,
+            grossWeightGrams: providerWeight,
+          },
+        } satisfies HybridCartonizationLine,
+        evidence: {
+          ...commonEvidence,
+          cartonizationAuthority: 'unit_material_selection' as const,
+          packMappingGlobalId: null,
+          packMappingRowVersion: null,
+          packEvidenceHash: null,
+          packProfileVersionGlobalId: null,
+          packProfileVersionRowVersion: null,
+          packageLevel: 'each' as const,
+          baseEachQuantity: 1,
+          shipsAsOwnPackage: false,
+        },
+      }
+    }
+    if (
+      row.pack_mapping_purpose !== 'shopify_checkout'
+      || row.pack_mapping_projection_state !== 'current'
+      || row.pack_mapping_provider_lifecycle_state
+        !== row.state_normalized_status
+      || !row.pack_mapping_pack_evidence_hash
+      || row.pack_mapping_pack_evidence_hash
+        !== row.state_pack_evidence_hash
+      || !row.profile_version_id
+      || !row.profile_version_global_id
+      || row.profile_version_is_current !== true
+      || row.profile_version_lifecycle_state !== 'active'
+      || row.profile_status !== 'active'
+      || !row.profile_fit_model
+      || !row.profile_evidence_type
+      || row.profile_evidence_type === 'unknown'
+      || !row.profile_evidence_reference
+      || row.profile_confirmed_at === null
+      || !row.profile_package_level
+      || row.profile_ships_as_own_package === null
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_ASSIGNED_PACK_NOT_READY',
+        'An assigned Product pack is not ready for Shopify checkout rating',
       )
     }
     const rowVersion = integer(
@@ -415,10 +521,6 @@ function mapLines(
           ),
         }
       : null
-    const title = row.provider_variant_title?.trim()
-      && row.provider_variant_title.trim().toLowerCase() !== 'default title'
-      ? `${row.product_title} · ${row.provider_variant_title.trim()}`
-      : row.product_title
     return {
       productId: row.product_id,
       profileVersionId: row.profile_version_id,
@@ -450,10 +552,8 @@ function mapLines(
         },
       } satisfies HybridCartonizationLine,
       evidence: {
-        lineKey: input.lineKey,
-        productGid: input.productGid,
-        variantGid: input.variantGid,
-        productGlobalId: row.product_global_id,
+        ...commonEvidence,
+        cartonizationAuthority: 'product_pack' as const,
         packMappingGlobalId: row.pack_mapping_global_id,
         packMappingRowVersion: mappingRowVersion,
         packEvidenceHash,
@@ -462,11 +562,6 @@ function mapLines(
         packageLevel: row.profile_package_level,
         baseEachQuantity,
         shipsAsOwnPackage: row.profile_ships_as_own_package,
-        inventoryLevelGlobalIds: [] as string[],
-        quantity: input.quantity,
-        unitWeightGrams: providerWeight,
-        sku: input.sku,
-        requiresShipping: true,
       },
     }
   })
@@ -501,7 +596,9 @@ async function readMaterials(
        stock.global_id AS stock_global_id,
        stock.row_version::text AS stock_row_version,
        stock.is_available AS stock_is_available,
-       stock.on_hand_quantity AS stock_on_hand_quantity
+       stock.on_hand_quantity AS stock_on_hand_quantity,
+       COALESCE(claims.active_claimed_quantity, 0)::text
+         AS active_claimed_quantity
      FROM operations_shopify_carrier_service_configs config
      JOIN operations_shopify_carrier_service_config_materials selected
        ON selected.organization_id = config.organization_id
@@ -513,6 +610,15 @@ async function readMaterials(
        ON stock.organization_id = material.organization_id
       AND stock.packaging_material_id = material.id
       AND stock.warehouse_id = config.warehouse_id
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(sum(claim.quantity), 0)
+         AS active_claimed_quantity
+       FROM operations_packaging_material_claims claim
+       WHERE claim.organization_id = material.organization_id
+         AND claim.packaging_material_id = material.id
+         AND claim.warehouse_id = config.warehouse_id
+         AND claim.status = 'active'
+     ) claims ON true
      WHERE config.organization_id = $1::uuid
        AND config.global_id = $2
        AND config.row_version = $3
@@ -546,6 +652,15 @@ function mapMaterials(rows: MaterialRow[]) {
       row.current_row_version,
       `${row.material_global_id} current row version`,
     )
+    const stockOnHandQuantity = integer(
+      row.stock_on_hand_quantity,
+      `${row.material_global_id} stock`,
+    )
+    const activeClaimedQuantity = integer(
+      row.active_claimed_quantity,
+      `${row.material_global_id} active claimed stock`,
+    )
+    const availableQuantity = stockOnHandQuantity - activeClaimedQuantity
     if (
       expected !== current
       || row.status !== 'active'
@@ -560,10 +675,8 @@ function mapMaterials(rows: MaterialRow[]) {
       || row.unit_cost_minor === null
       || !row.currency
       || !/^[A-Z]{3}$/.test(row.currency)
-      || integer(
-        row.stock_on_hand_quantity,
-        `${row.material_global_id} stock`,
-      ) < 1
+      || !Number.isSafeInteger(availableQuantity)
+      || availableQuantity < 1
     ) {
       fail(
         'SHOPIFY_CHECKOUT_MATERIAL_EVIDENCE_NOT_READY',
@@ -619,11 +732,6 @@ function mapMaterials(rows: MaterialRow[]) {
       `${row.material_global_id} unit cost`,
       1,
     )
-    const stockOnHandQuantity = integer(
-      row.stock_on_hand_quantity,
-      `${row.material_global_id} stock`,
-      1,
-    )
     const stockRowVersion = integer(
       row.stock_row_version,
       `${row.material_global_id} stock row version`,
@@ -645,8 +753,13 @@ function mapMaterials(rows: MaterialRow[]) {
           `${row.material_global_id} dimension confirmation`,
         ),
         tareWeightGrams,
+        unitCostMinor,
+        currency: row.currency,
+        stockRowVersion,
+        stockOnHandQuantity,
+        activeClaimedQuantity,
+        availableQuantity,
         maximumGrossWeightGrams: maxWeightGrams,
-        availableQuantity: stockOnHandQuantity,
         ratedOuterDimensionsMm: ratedOuter,
       } satisfies HybridCartonizationMaterial,
       evidence: {
@@ -656,6 +769,8 @@ function mapMaterials(rows: MaterialRow[]) {
         stockRowVersion,
         maxWeightGrams,
         stockOnHandQuantity,
+        activeClaimedQuantity,
+        availableQuantity,
         unitCostMinor,
         currency: row.currency,
       },
@@ -666,9 +781,15 @@ function mapMaterials(rows: MaterialRow[]) {
 async function readRecipes(
   client: PoolClient,
   account: ShopifyCheckoutRatingAccount,
-  lines: Array<{ productId: string; profileVersionId: string }>,
+  lines: Array<{ productId: string; profileVersionId: string | null }>,
   materialIds: string[],
 ): Promise<RecipeRow[]> {
+  const mappedProfileLines = lines.filter(
+    (line): line is { productId: string; profileVersionId: string } => (
+      line.profileVersionId !== null
+    ),
+  )
+  if (!mappedProfileLines.length) return []
   const result = await client.query<RecipeRow>(
     `SELECT
        recipe.global_id,
@@ -712,11 +833,11 @@ async function readRecipes(
      ORDER BY product.reference_code, material.global_id, recipe.global_id`,
     [
       account.organizationId,
-      [...new Set(lines.map((line) => line.productId))],
+      [...new Set(mappedProfileLines.map((line) => line.productId))],
       materialIds,
     ],
   )
-  const pairs = new Set(lines.map(
+  const pairs = new Set(mappedProfileLines.map(
     (line) => `${line.productId}:${line.profileVersionId}`,
   ))
   return result.rows.filter(
@@ -838,17 +959,54 @@ async function readLatestInventory(
       'The retained Shopify inventory snapshot is too old for checkout rating',
     )
   }
+  const identityByInventoryItem = new Map<string, {
+    variantGid: string
+    productId: string
+    productGlobalId: string
+  }>()
+  const inventoryItemByVariant = new Map<string, string>()
+  for (const line of mappedLines) {
+    const existingVariantItem = inventoryItemByVariant.get(
+      line.evidence.variantGid,
+    )
+    const existingItemIdentity = identityByInventoryItem.get(
+      line.inventoryItemId,
+    )
+    if (
+      (existingVariantItem
+        && existingVariantItem !== line.inventoryItemId)
+      || (existingItemIdentity
+        && (
+          existingItemIdentity.variantGid !== line.evidence.variantGid
+          || existingItemIdentity.productId !== line.productId
+          || existingItemIdentity.productGlobalId
+            !== line.evidence.productGlobalId
+        ))
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_INVENTORY_IDENTITY_CONFLICT',
+        'Shopify variant and inventory-item identity evidence conflicts',
+      )
+    }
+    inventoryItemByVariant.set(
+      line.evidence.variantGid,
+      line.inventoryItemId,
+    )
+    identityByInventoryItem.set(line.inventoryItemId, {
+      variantGid: line.evidence.variantGid,
+      productId: line.productId,
+      productGlobalId: line.evidence.productGlobalId,
+    })
+  }
   const inventoryResult = await client.query<InventoryRow>(
     `WITH requested AS (
        SELECT *
        FROM jsonb_to_recordset($5::jsonb) AS item(
-         variant_gid text,
          product_id uuid,
          external_inventory_item_id text
        )
      )
      SELECT
-       requested.variant_gid,
        requested.external_inventory_item_id,
        sum(level.operational_available_quantity)::text
          AS operational_available_quantity,
@@ -866,44 +1024,49 @@ async function readLatestInventory(
       AND level.mapping_state = 'mapped'
       AND level.projection_state = 'projected'
      GROUP BY
-       requested.variant_gid,
        requested.external_inventory_item_id
-     ORDER BY requested.variant_gid`,
+     ORDER BY requested.external_inventory_item_id`,
     [
       account.organizationId,
       account.integrationAccountId,
       account.warehouseId,
       run.id,
       JSON.stringify(
-        [...new Map(mappedLines.map((line) => [
-          line.evidence.variantGid,
-          {
-            variant_gid: line.evidence.variantGid,
-            product_id: line.productId,
-            external_inventory_item_id: line.inventoryItemId,
-          },
-        ])).values()],
+        [...identityByInventoryItem].map(([
+          externalInventoryItemId,
+          identity,
+        ]) => ({
+          product_id: identity.productId,
+          external_inventory_item_id: externalInventoryItemId,
+        })),
       ),
     ],
   )
-  const inventoryByVariant = new Map(
-    inventoryResult.rows.map((row) => [row.variant_gid, row]),
+  const inventoryByItem = new Map(
+    inventoryResult.rows.map((row) => [
+      row.external_inventory_item_id,
+      row,
+    ]),
   )
-  const requiredByVariant = new Map<string, number>()
+  const requiredByItem = new Map<string, number>()
   for (const line of mappedLines) {
-    requiredByVariant.set(
-      line.evidence.variantGid,
-      (requiredByVariant.get(line.evidence.variantGid) || 0)
-        + line.line.quantity,
-    )
+    const required = (requiredByItem.get(line.inventoryItemId) || 0)
+      + line.line.quantity
+    if (!Number.isSafeInteger(required)) {
+      fail(
+        'SHOPIFY_CHECKOUT_EVIDENCE_CORRUPT',
+        'Checkout inventory demand exceeds the supported exact range',
+      )
+    }
+    requiredByItem.set(line.inventoryItemId, required)
   }
-  for (const [variantGid, required] of requiredByVariant) {
-    const inventory = inventoryByVariant.get(variantGid)
+  for (const [inventoryItemId, required] of requiredByItem) {
+    const inventory = inventoryByItem.get(inventoryItemId)
     if (
       !inventory
       || integer(
         inventory.operational_available_quantity,
-        `${variantGid} operational availability`,
+        `${inventoryItemId} operational availability`,
       ) < required
     ) {
       fail(
@@ -914,25 +1077,65 @@ async function readLatestInventory(
   }
   for (const line of mappedLines) {
     line.evidence.inventoryLevelGlobalIds =
-      inventoryByVariant.get(line.evidence.variantGid)
+      inventoryByItem.get(line.inventoryItemId)
         ?.source_level_global_ids || []
   }
   const inventorySnapshotHash = createHash('sha256')
     .update(JSON.stringify({
       fetchedAt,
       syncRunGlobalId: run.global_id,
-      variants: [...inventoryByVariant.entries()]
+      inventoryItems: [...inventoryByItem.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([variantGid, row]) => ({
-          variantGid,
+        .map(([inventoryItemId, row]) => ({
           inventoryItemId: row.external_inventory_item_id,
+          variantGid: identityByInventoryItem.get(inventoryItemId)
+            ?.variantGid,
           operationalAvailableQuantity:
             String(row.operational_available_quantity),
           sourceLevelGlobalIds: row.source_level_global_ids,
         })),
     }))
     .digest('hex')
-  return { fetchedAt, inventorySnapshotHash }
+  const productAvailability = new Map<string, {
+    effectiveAvailableQuantity: number
+    sourceLevelGlobalIds: Set<string>
+  }>()
+  for (const [inventoryItemId, row] of inventoryByItem) {
+    const identity = identityByInventoryItem.get(inventoryItemId)
+    const productGlobalId = identity?.productGlobalId
+    if (!productGlobalId) continue
+    const current = productAvailability.get(productGlobalId) || {
+      effectiveAvailableQuantity: 0,
+      sourceLevelGlobalIds: new Set<string>(),
+    }
+    const nextAvailability = current.effectiveAvailableQuantity + integer(
+      row.operational_available_quantity,
+      `${inventoryItemId} operational availability`,
+    )
+    if (!Number.isSafeInteger(nextAvailability)) {
+      fail(
+        'SHOPIFY_CHECKOUT_EVIDENCE_CORRUPT',
+        'Checkout product availability exceeds the supported exact range',
+      )
+    }
+    current.effectiveAvailableQuantity = nextAvailability
+    row.source_level_global_ids.forEach((globalId) => (
+      current.sourceLevelGlobalIds.add(globalId)
+    ))
+    productAvailability.set(productGlobalId, current)
+  }
+  const inventoryProducts:
+    OperationalUnitMaterialInventoryProductEvidence[] = [
+      ...productAvailability,
+    ].map(([productGlobalId, evidence]) => ({
+      productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot' as const,
+      effectiveAvailableQuantity: evidence.effectiveAvailableQuantity,
+      sourceLevelGlobalIds: [...evidence.sourceLevelGlobalIds].sort(),
+    })).sort((left, right) => (
+      left.productGlobalId.localeCompare(right.productGlobalId)
+    ))
+  return { fetchedAt, inventorySnapshotHash, inventoryProducts }
 }
 
 /**
@@ -986,6 +1189,7 @@ export async function readShopifyCheckoutContextFromPostgres(input: {
       readAt: timestamp(readResult.rows[0]?.read_at, 'Checkout read timestamp'),
       inventorySnapshotAt: inventorySnapshot.fetchedAt,
       inventorySnapshotHash: inventorySnapshot.inventorySnapshotHash,
+      inventoryProducts: inventorySnapshot.inventoryProducts,
       input: {
         mode: 'production',
         lines: mappedLines.map((line) => line.line),
