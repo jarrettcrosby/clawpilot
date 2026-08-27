@@ -40,7 +40,9 @@ The claimed provider mutation contains one fixed profile only:
 - exactly one test transaction with `kind: AUTHORIZATION`, `status: SUCCESS`, and an exact `10.00 USD` shop-money `amountSet` matching the line price;
 - the approved synthetic John Doe address at 101 Academy Drive, Buzzards Bay, Massachusetts 02532, US;
 - `inventoryBehaviour: BYPASS`, `sendReceipt: false`, and `sendFulfillmentReceipt: false`; and
-- a command-specific `sourceIdentifier` plus unique tag fingerprint.
+- a command-specific `sourceIdentifier` plus unique tag fingerprint, encoded
+  with the full 24-hex command digest under a Shopify-safe 37-character order
+  tag so the provider's 40-character order-tag limit is never exceeded.
 
 It contains no customer, email, phone, billing address, discount, tax line, shipping line, or notification input. It intentionally omits input `presentmentMoney`; Shopify's `MoneyBagInput` then uses shop money for presentment, avoiding the separate `presentmentCurrency` requirement. Shopify must immediately return exactly one matching pending, unfulfilled, shippable, nontaxable `10.00 USD` line and exactly one successful test authorization for the same shop and presentment amount. The returned order must also be capturable for exactly `10.00 USD`. The staff-supported fixture deliberately combines explicit `PENDING` with a successful authorization. Shopify may later change display, fulfillment, quantity, total, and capturable fields and append transactions. Delayed reconciliation therefore proves the immutable creation fingerprint instead of reusing immediate lifecycle assertions. Immediate create success remains strict.
 

@@ -447,8 +447,10 @@ for (const fragment of [
   "'[redacted-number]'",
   'transactions(first: 10)',
   'orders(first: 2',
+  "const SHOPIFY_ORDER_TAG_MAX_LENGTH = 40",
+  'exactShopifyProviderTag(uniqueTag)',
   'source_identifier:${JSON.stringify(sourceIdentifier)}',
-  'AND tag:${uniqueTag} AND test:true',
+  'AND tag:${providerTag} AND test:true',
 ]) {
   assert.ok(
     orderProviderSource.includes(fragment),
