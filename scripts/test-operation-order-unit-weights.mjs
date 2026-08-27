@@ -201,6 +201,21 @@ for (const fragment of [
   )
 }
 
+for (const harnessPath of [
+  'scripts/test-distributed-operations.mjs',
+  'scripts/test-commerce-intake-staging-postgres.mjs',
+  'scripts/test-operation-order-replanning-corrections-postgres.mjs',
+  'scripts/test-operation-shipment-completion.mjs',
+  'scripts/test-canonical-fulfillment-planning-postgres.mjs',
+]) {
+  assert.ok(
+    read(harnessPath).includes(
+      "'@/lib/persistence/orderUnitWeightEvidence'",
+    ),
+    `${harnessPath} must map the operations unit-weight runtime alias`,
+  )
+}
+
 const health = read(
   'app_src/lib/persistence/operationsOrderUnitWeightHealth.ts',
 )
