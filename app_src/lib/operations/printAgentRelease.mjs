@@ -5,6 +5,9 @@ const SHA256 = /^[0-9a-f]{64}$/
 const COMMIT = /^[0-9a-f]{40}$/
 const MAX_INDEX_BYTES = 128 * 1024
 const MAX_GITHUB_ASSET_REDIRECT_LIFETIME_MS = 60 * 60_000
+// GitHub rounds signed release-asset expirations, and the verifier clock may
+// trail GitHub slightly. Keep that allowance to one additional minute.
+const GITHUB_ASSET_REDIRECT_EXPIRATION_TOLERANCE_MS = 60_000
 const TOP_LEVEL_FIELDS = [
   'artifacts',
   'customerReleaseReady',
@@ -382,7 +385,9 @@ export function validateGitHubAssetRedirect(location, nowMs = Date.now()) {
   }
   if (!Number.isFinite(expiresAt)
     || expiresAt <= nowMs
-    || expiresAt > nowMs + MAX_GITHUB_ASSET_REDIRECT_LIFETIME_MS) {
+    || expiresAt > nowMs
+      + MAX_GITHUB_ASSET_REDIRECT_LIFETIME_MS
+      + GITHUB_ASSET_REDIRECT_EXPIRATION_TOLERANCE_MS) {
     fail('PRINT_AGENT_RELEASE_REDIRECT_INVALID', 'GitHub asset redirect is expired or not short-lived')
   }
   return location
