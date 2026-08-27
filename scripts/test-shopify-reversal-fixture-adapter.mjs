@@ -135,9 +135,9 @@ const exactOrder = {
 assert.deepEqual(
   JSON.parse(JSON.stringify(adapter.SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE)),
   {
-    version: 'shopify-reversal-fixture-v3',
+    version: 'shopify-reversal-fixture-v4',
     test: true,
-    financialStatus: 'PENDING',
+    expectedFinancialStatus: 'PENDING',
     marketingConsent: 'UNSET',
     sendReceipt: false,
     sendFulfillmentReceipt: false,
@@ -175,7 +175,6 @@ assert.equal(calls[0].operationName, 'ClawPilotReversalFixtureOrderCreate')
 assert.deepEqual(calls[0].variables, {
   order: {
     test: true,
-    financialStatus: 'PENDING',
     sourceIdentifier,
     tags: ['clawpilot-reversal-fixture', uniqueTag],
     lineItems: [{
@@ -200,7 +199,7 @@ assert.deepEqual(calls[0].variables, {
   },
 })
 const exactEmittedPayloadHash = createHash('sha256').update(JSON.stringify({
-  version: 'shopify-reversal-fixture-order-provider-payload-v2',
+  version: 'shopify-reversal-fixture-order-provider-payload-v3',
   shopDomain: credential.shopDomain,
   variables: calls[0].variables,
 })).digest('hex')
@@ -213,7 +212,7 @@ const changedBaseTagVariables = structuredClone(calls[0].variables)
 changedBaseTagVariables.order.tags[0] = 'changed-fixture-base-tag'
 assert.notEqual(
   createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v2',
+    version: 'shopify-reversal-fixture-order-provider-payload-v3',
     shopDomain: credential.shopDomain,
     variables: changedBaseTagVariables,
   })).digest('hex'),
@@ -222,7 +221,8 @@ assert.notEqual(
 )
 const serializedWrite = JSON.stringify(calls[0].variables)
 for (const forbidden of [
-  'email', 'phone', 'customer', 'buyerAcceptsMarketing', 'billingAddress', 'transactions',
+  'email', 'phone', 'customer', 'buyerAcceptsMarketing', 'billingAddress',
+  'financialStatus', 'transactions',
   'discount', 'tax', 'shippingLine', 'payment', 'notifyCustomer',
 ]) {
   assert.equal(

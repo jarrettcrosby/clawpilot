@@ -35,7 +35,7 @@ Production, Vercel, local development, a different Railway project or environmen
 
 The claimed provider mutation contains one fixed profile only:
 
-- `test: true`, `financialStatus: PENDING`, and no customer or marketing-consent input;
+- `test: true`, no explicit financial-status input, and no customer or marketing-consent input; Shopify must derive and return `PENDING` from the transactionless unpaid order;
 - fixed variant `gid://shopify/ProductVariant/51028106608887`, quantity `1`, and `requiresShipping: true`;
 - the approved synthetic John Doe address at 101 Academy Drive, Buzzards Bay, Massachusetts 02532, US;
 - `inventoryBehaviour: BYPASS`, `sendReceipt: false`, and `sendFulfillmentReceipt: false`; and
@@ -104,7 +104,7 @@ After the two fixture phases, use the existing ClawPilot reconciliation, reversa
 
 ## Durable Evidence and Readiness
 
-Migration `0326_operations_shopify_reversal_test_fixture.sql` creates four append-only ledgers: commands, authenticated human approvals, provider attempts, and outcomes. Preparation is serialized per organization, account, and phase. Each command has at most one approval and one attempt. An unclaimed command may be superseded only after expiry, but its immutable approval cannot be replaced. Any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
+Migration `0326_operations_shopify_reversal_test_fixture.sql` creates four append-only ledgers: commands, authenticated human approvals, provider attempts, and outcomes. Migration `0332_operations_shopify_reversal_fixture_profile_v4.sql` preserves historical v1-v3 commands while authorizing only new v4 commands whose provider payload omits the redundant explicit financial status. Preparation is serialized per organization, account, and phase. Each command has at most one approval and one attempt. An unclaimed command may be superseded only after expiry, but its immutable approval cannot be replaced. Any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
 
 `/api/health` reports the fixture runtime, exact migration checksum, ledger structures, database identity, and awaiting-approval, prepared, processing, unknown, and terminal counts. When the fixture runtime flag is enabled, migration or database-identity drift makes health fail. Unresolved unknown outcomes are a warning.
 
