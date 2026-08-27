@@ -126,7 +126,14 @@ import ShadowOrderTrainingPanel, {
 } from '@/components/operations/ShadowOrderTrainingPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
-import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
+import {
+  displayWeightToGrams,
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  measurementUnits,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 import {
   commerceActiveInitialSelection,
   type CommerceActiveContinuation,
@@ -272,6 +279,46 @@ type PlanningEvidencePayload = {
     globalId: string
     status: 'succeeded' | 'partial' | 'failed'
   }
+}
+
+type OrderUnitWeightLine = {
+  lineGlobalId: string
+  productTitle: string
+  variantTitle: string | null
+  quantity: number
+  unitWeightGrams: number | null
+  weightSource: 'provider_order' | 'provider_catalog' | 'order_specific' | null
+  factGlobalId: string | null
+  factVersion: number | null
+}
+
+type OrderUnitWeightWorkspace = {
+  accountGlobalId: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  orderGlobalId: string
+  missingLines: OrderUnitWeightLine[]
+  effectiveLines: OrderUnitWeightLine[]
+}
+
+type OrderUnitWeightPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  workspace?: OrderUnitWeightWorkspace
+  result?: {
+    workspace: OrderUnitWeightWorkspace | null
+  }
+}
+
+function orderUnitWeightDraftValue(
+  unitWeightGrams: number,
+  system: MeasurementSystem,
+) {
+  return String(Number(gramsToDisplayWeight(
+    unitWeightGrams,
+    system,
+  ).toFixed(system === 'metric' ? 3 : 4)))
 }
 
 type ShopifyPlanningAssignment = {
@@ -2988,6 +3035,7 @@ export default function OperationsSection({
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
+  const { measurementSystem } = useMeasurementSystem()
   const [workspace, setWorkspace] = useState<OperationsWorkspace | null>(null)
   const [commerceFulfillmentRecoveryEnabled, setCommerceFulfillmentRecoveryEnabled] =
     useState(false)
@@ -3055,6 +3103,16 @@ export default function OperationsSection({
   const [planPreparationLoading, setPlanPreparationLoading] = useState(false)
   const [planPackagingWorkspace, setPlanPackagingWorkspace] =
     useState<PackagingMaterialsWorkspace | null>(null)
+  const [planUnitWeightWorkspace, setPlanUnitWeightWorkspace] =
+    useState<OrderUnitWeightWorkspace | null>(null)
+  const [planUnitWeightDrafts, setPlanUnitWeightDrafts] =
+    useState<Record<string, string>>({})
+  const [planUnitWeightDraftMeasurementSystem, setPlanUnitWeightDraftMeasurementSystem] =
+    useState<MeasurementSystem>(measurementSystem)
+  const [planUnitWeightReason, setPlanUnitWeightReason] = useState('')
+  const [planUnitWeightIdempotencyKey, setPlanUnitWeightIdempotencyKey] =
+    useState('')
+  const [savingPlanUnitWeights, setSavingPlanUnitWeights] = useState(false)
   const [planShopifyAssignment, setPlanShopifyAssignment] =
     useState<ShopifyPlanningAssignment | null>(null)
   const [planWarehouseGlobalId, setPlanWarehouseGlobalId] = useState('')
@@ -3071,6 +3129,7 @@ export default function OperationsSection({
   const [planIdempotencyKey, setPlanIdempotencyKey] = useState('')
   const [planError, setPlanError] = useState('')
   const [planningOrder, setPlanningOrder] = useState(false)
+  const planPreparationAbortController = useRef<AbortController | null>(null)
   const [releaseOpen, setReleaseOpen] = useState(false)
   const [releaseReason, setReleaseReason] = useState('Release the reviewed plan to warehouse execution')
   const [releaseIdempotencyKey, setReleaseIdempotencyKey] = useState('')
@@ -3265,6 +3324,7 @@ export default function OperationsSection({
       }
       setOneOffExecutionState(payload.state)
     } catch (caught) {
+      if (signal?.aborted) return
       if (caught instanceof DOMException && caught.name === 'AbortError') return
       setOneOffExecutionError(caught instanceof Error
         ? caught.message
@@ -3732,6 +3792,7 @@ export default function OperationsSection({
   const loadPlanPreparation = async (
     order: OperationsOrderDetail,
     localTraining = false,
+    signal?: AbortSignal,
   ) => {
     if (!order.planningPreparation) {
       setPlanError(
@@ -3743,6 +3804,7 @@ export default function OperationsSection({
     try {
       const packagingRequest = fetch('/api/operations/packaging-materials', {
         cache: 'no-store',
+        signal,
       })
       const assignmentRequest = order.sourceProvider === 'shopify'
         && !localTraining
@@ -3751,6 +3813,7 @@ export default function OperationsSection({
             {
               method: 'POST',
               cache: 'no-store',
+              signal,
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'inspect',
@@ -3762,10 +3825,23 @@ export default function OperationsSection({
             },
           )
         : null
-      const [response, assignmentResponse] = await Promise.all([
-        packagingRequest,
-        assignmentRequest,
-      ])
+      const unitWeightParams = new URLSearchParams({
+        accountGlobalId: order.planningPreparation.accountGlobalId,
+        candidateGlobalId: order.planningPreparation.candidateGlobalId,
+        candidateRowVersion: String(
+          order.planningPreparation.candidateRowVersion,
+        ),
+      })
+      const unitWeightRequest = fetch(
+        `/api/operations/order-unit-weights?${unitWeightParams.toString()}`,
+        { cache: 'no-store', signal },
+      )
+      const [response, assignmentResponse, unitWeightResponse] =
+        await Promise.all([
+          packagingRequest,
+          assignmentRequest,
+          unitWeightRequest,
+        ])
       const payload = await response.json().catch(() => ({})) as
         PackagingMaterialsPayload
       if (!response.ok || !payload.ok || !payload.packagingMaterials) {
@@ -3774,6 +3850,20 @@ export default function OperationsSection({
         )
       }
       const packaging = payload.packagingMaterials
+      const unitWeightPayload = await unitWeightResponse.json()
+        .catch(() => ({})) as OrderUnitWeightPayload
+      if (signal?.aborted) return
+      if (
+        !unitWeightResponse.ok
+        || !unitWeightPayload.ok
+        || !unitWeightPayload.workspace
+      ) {
+        throw new Error(
+          `${unitWeightPayload.error || 'Order unit weights could not be loaded'}${
+            unitWeightPayload.code ? ` [${unitWeightPayload.code}]` : ''
+          }`,
+        )
+      }
       let assignment: ShopifyPlanningAssignment | null = null
       if (assignmentResponse) {
         const assignmentPayload = await assignmentResponse.json()
@@ -3788,6 +3878,7 @@ export default function OperationsSection({
         }
         assignment = assignmentPayload.assignment
       }
+      if (signal?.aborted) return
       const warehouseGlobalId = assignment?.status === 'ready'
         ? assignment.selectedWarehouse?.globalId || ''
         : packaging.warehouses.find(
@@ -3804,6 +3895,24 @@ export default function OperationsSection({
           ))
         : []
       setPlanPackagingWorkspace(packaging)
+      setPlanUnitWeightWorkspace(unitWeightPayload.workspace)
+      setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+      setPlanUnitWeightDrafts(Object.fromEntries(
+        [
+          ...unitWeightPayload.workspace.missingLines,
+          ...unitWeightPayload.workspace.effectiveLines.filter(
+            (line) => line.weightSource === 'order_specific',
+          ),
+        ].map((line) => [
+          line.lineGlobalId,
+          line.unitWeightGrams === null
+            ? ''
+            : orderUnitWeightDraftValue(
+                line.unitWeightGrams,
+                measurementSystem,
+              ),
+        ]),
+      ))
       setPlanShopifyAssignment(assignment)
       setPlanWarehouseGlobalId(warehouseGlobalId)
       setPlanMaterialGlobalIds(
@@ -3842,23 +3951,37 @@ export default function OperationsSection({
         )
       }
     } catch (caught) {
+      if (signal?.aborted) return
+      if (caught instanceof DOMException && caught.name === 'AbortError') return
       setPlanError(
         caught instanceof Error
           ? caught.message
           : 'Packaging materials could not be loaded',
       )
     } finally {
-      setPlanPreparationLoading(false)
+      if (planPreparationAbortController.current?.signal === signal) {
+        setPlanPreparationLoading(false)
+      }
     }
   }
 
   const openPlan = (trainingTarget?: ShadowTrainingPlanTarget) => {
+    planPreparationAbortController.current?.abort()
+    planPreparationAbortController.current = null
     const sealedTrainingEvidence = (
       trainingTarget?.cartonizationEvidenceGlobalId || ''
     ).trim().toLowerCase()
     setShadowTrainingPlanTarget(trainingTarget || null)
     setPlanCartonizationEvidenceGlobalId(sealedTrainingEvidence)
     setPlanPackagingWorkspace(null)
+    setPlanUnitWeightWorkspace(null)
+    setPlanUnitWeightDrafts({})
+    setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+    setPlanUnitWeightReason('')
+    setPlanUnitWeightIdempotencyKey(
+      `operations-unit-weight:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setSavingPlanUnitWeights(false)
     setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
@@ -3875,14 +3998,26 @@ export default function OperationsSection({
     setPlanError('')
     setPlanOpen(true)
     if (detail && !sealedTrainingEvidence) {
-      void loadPlanPreparation(detail, Boolean(trainingTarget))
+      const controller = new AbortController()
+      planPreparationAbortController.current = controller
+      void loadPlanPreparation(
+        detail,
+        Boolean(trainingTarget),
+        controller.signal,
+      )
     }
   }
 
   const closePlan = () => {
-    if (planningOrder || creatingPlanEvidence) return
+    if (planningOrder || creatingPlanEvidence || savingPlanUnitWeights) return
+    planPreparationAbortController.current?.abort()
+    planPreparationAbortController.current = null
+    setPlanPreparationLoading(false)
     setPlanOpen(false)
     setPlanPackagingWorkspace(null)
+    setPlanUnitWeightWorkspace(null)
+    setPlanUnitWeightDrafts({})
+    setPlanUnitWeightIdempotencyKey('')
     setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
@@ -3893,6 +4028,121 @@ export default function OperationsSection({
     setPlanError('')
   }
 
+  const savePlanUnitWeights = async () => {
+    if (shadowTrainingPlanTarget) {
+      setPlanError('Order unit weights cannot be changed in training.')
+      return
+    }
+    const preparation = detail?.planningPreparation
+    const missingLines = planUnitWeightWorkspace?.missingLines || []
+    const existingOrderSpecificLines =
+      planUnitWeightWorkspace?.effectiveLines.filter(
+        (line) => line.weightSource === 'order_specific',
+      ) || []
+    const editableLines = [...missingLines, ...existingOrderSpecificLines]
+    if (
+      !preparation
+      || !editableLines.length
+      || !planUnitWeightIdempotencyKey
+    ) return
+    const lines = editableLines.flatMap((line) => {
+      const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+      const unitWeightGrams = Number.isFinite(displayWeight)
+        && displayWeight > 0
+        ? displayWeightToGrams(
+            displayWeight,
+            planUnitWeightDraftMeasurementSystem,
+          )
+        : 0
+      if (
+        line.unitWeightGrams !== null
+        && line.unitWeightGrams === unitWeightGrams
+      ) return []
+      return [{
+        lineGlobalId: line.lineGlobalId,
+        unitWeightGrams,
+        expectedFactVersion: line.factVersion,
+      }]
+    })
+    if (lines.some((line) => line.unitWeightGrams < 1)) {
+      setPlanError('Enter a positive unit weight for each missing line.')
+      return
+    }
+    if (!lines.length) {
+      setPlanError('Change at least one order-specific unit weight.')
+      return
+    }
+    if (planUnitWeightReason.trim().length < 8) {
+      setPlanError('Enter a short audit reason for these unit weights.')
+      return
+    }
+    setSavingPlanUnitWeights(true)
+    setPlanError('')
+    try {
+      const response = await fetch('/api/operations/order-unit-weights', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': planUnitWeightIdempotencyKey,
+        },
+        body: JSON.stringify({
+          accountGlobalId: preparation.accountGlobalId,
+          candidateGlobalId: preparation.candidateGlobalId,
+          candidateRowVersion: preparation.candidateRowVersion,
+          lines,
+          reason: planUnitWeightReason.trim(),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        OrderUnitWeightPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        throw new Error(
+          `${payload.error || 'Unit weights could not be saved'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      if (!payload.result.workspace) {
+        setPlanUnitWeightWorkspace(null)
+        setPlanUnitWeightDrafts({})
+        setPlanUnitWeightReason('')
+        setPlanCartonizationEvidenceGlobalId('')
+        setPlanEvidenceIdempotencyKey('')
+        setPlanError('Unit weights were saved. Reopen Prepare order to refresh.')
+        return
+      }
+      setPlanUnitWeightWorkspace(payload.result.workspace)
+      setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+      setPlanUnitWeightReason('')
+      setPlanUnitWeightDrafts(Object.fromEntries(
+        payload.result.workspace.effectiveLines
+          .filter((line) => line.weightSource === 'order_specific')
+          .map((line) => [
+            line.lineGlobalId,
+            orderUnitWeightDraftValue(
+              line.unitWeightGrams || 0,
+              measurementSystem,
+            ),
+          ]),
+      ))
+      setPlanCartonizationEvidenceGlobalId('')
+      setPlanEvidenceIdempotencyKey(
+        `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+      )
+      setPlanUnitWeightIdempotencyKey(
+        `operations-unit-weight:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+      )
+    } catch (caught) {
+      setPlanError(
+        caught instanceof Error
+          ? caught.message
+          : 'Unit weights could not be saved',
+      )
+    } finally {
+      setSavingPlanUnitWeights(false)
+    }
+  }
+
   const createPlanEvidence = async () => {
     const preparation = detail?.planningPreparation
     const selectedMaterials = planPackagingWorkspace?.materials.filter(
@@ -3901,7 +4151,9 @@ export default function OperationsSection({
     if (
       !detail
       || !preparation
+      || planUnitWeightWorkspaceBlocked
       || !planWarehouseGlobalId
+      || Boolean(planUnitWeightWorkspace?.missingLines.length)
       || selectedMaterials.length < 1
       || selectedMaterials.length > 8
       || !planEvidenceIdempotencyKey
@@ -3988,6 +4240,7 @@ export default function OperationsSection({
     const evidenceGlobalId = planCartonizationEvidenceGlobalId.trim().toLowerCase()
     if (
       !detail
+      || planUnitWeightWorkspaceBlocked
       || !CARTONIZATION_EVIDENCE_GLOBAL_ID.test(evidenceGlobalId)
       || !planReason.trim()
       || !planIdempotencyKey
@@ -6145,6 +6398,73 @@ export default function OperationsSection({
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
+  const planEditableUnitWeightLines = [
+    ...(planUnitWeightWorkspace?.missingLines || []),
+    ...(planUnitWeightWorkspace?.effectiveLines.filter(
+      (line) => line.weightSource === 'order_specific',
+    ) || []),
+  ]
+  const planUnitWeightEditingAllowed = !shadowTrainingPlanTarget
+  const planUnitWeightHasInvalidDraft = planEditableUnitWeightLines.some((line) => {
+    const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+    return !Number.isFinite(displayWeight) || displayWeight <= 0
+  })
+  const planUnitWeightHasUnsavedChanges = planEditableUnitWeightLines.some((line) => {
+    const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+    if (!Number.isFinite(displayWeight) || displayWeight <= 0) {
+      return line.unitWeightGrams !== null
+    }
+    const grams = displayWeightToGrams(
+      displayWeight,
+      planUnitWeightDraftMeasurementSystem,
+    )
+    return line.unitWeightGrams === null || line.unitWeightGrams !== grams
+  })
+  const planUnitWeightWorkspaceRequired = (
+    !shadowTrainingPlanTarget
+    || planPackagingWorkspace !== null
+  )
+  const planUnitWeightWorkspaceBlocked = (
+    planUnitWeightWorkspaceRequired
+    && (
+      planUnitWeightWorkspace === null
+      || planUnitWeightHasUnsavedChanges
+      || planUnitWeightWorkspace.missingLines.length > 0
+    )
+  )
+  useEffect(() => {
+    if (
+      !planOpen
+      || planUnitWeightDraftMeasurementSystem === measurementSystem
+    ) return
+    const entries = Object.entries(planUnitWeightDrafts)
+    if (entries.some(([, value]) => {
+      if (!value.trim()) return false
+      const numeric = Number(value)
+      return !Number.isFinite(numeric) || numeric <= 0
+    })) return
+    setPlanUnitWeightDrafts(Object.fromEntries(entries.map(([lineId, value]) => {
+      if (!value.trim()) return [lineId, value]
+      const grams = displayWeightToGrams(
+        Number(value),
+        planUnitWeightDraftMeasurementSystem,
+      )
+      return [lineId, orderUnitWeightDraftValue(grams, measurementSystem)]
+    })))
+    setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+    if (entries.length) {
+      setPlanCartonizationEvidenceGlobalId('')
+      setPlanEvidenceIdempotencyKey(
+        `operations-rate-plan:${selectedGlobalId || 'order'}:${crypto.randomUUID()}`,
+      )
+    }
+  }, [
+    measurementSystem,
+    planOpen,
+    planUnitWeightDraftMeasurementSystem,
+    planUnitWeightDrafts,
+    selectedGlobalId,
+  ])
   const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
   const detailCreateLabelPackage = detail?.packages.find(
     (item) => item.globalId === createLabelPackageGlobalId,
@@ -7497,6 +7817,117 @@ export default function OperationsSection({
                               : 'Shopify has no untouched open fulfillment assignment for this order.'}
                     </Alert>
                   ) : null}
+                  {planEditableUnitWeightLines.length ? (
+                    <Box
+                      data-testid="order-planning-missing-unit-weights"
+                      sx={{
+                        border: 1,
+                        borderColor: 'divider',
+                        borderRadius: 1.5,
+                        p: 2,
+                      }}
+                    >
+                      <Stack spacing={1.5}>
+                        <Typography fontWeight={700}>
+                          {planUnitWeightWorkspace?.missingLines.length
+                            ? 'Missing unit weights'
+                            : 'Order unit weights'}
+                        </Typography>
+                        {planEditableUnitWeightLines.map((line) => (
+                          <Stack
+                            key={line.lineGlobalId}
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1.5}
+                            alignItems={{ sm: 'center' }}
+                          >
+                            <Box sx={{ flex: 1, minWidth: 0 }}>
+                              <Typography fontWeight={600} noWrap>
+                                {line.productTitle}
+                              </Typography>
+                              <Typography variant="body2" color="text.secondary">
+                                {line.variantTitle
+                                  && line.variantTitle.toLowerCase() !== 'default title'
+                                  ? `${line.variantTitle} · `
+                                  : ''}
+                                Quantity {line.quantity}
+                              </Typography>
+                            </Box>
+                            <TextField
+                              size="small"
+                              type="number"
+                              required
+                              label={`Unit weight (${measurementUnits(
+                                planUnitWeightDraftMeasurementSystem,
+                              ).weight})`}
+                              value={planUnitWeightDrafts[line.lineGlobalId] || ''}
+                              disabled={
+                                savingPlanUnitWeights
+                                || !planUnitWeightEditingAllowed
+                              }
+                              onChange={(event) => {
+                                setPlanUnitWeightDrafts((current) => ({
+                                  ...current,
+                                  [line.lineGlobalId]: event.target.value,
+                                }))
+                                setPlanCartonizationEvidenceGlobalId('')
+                                setPlanEvidenceIdempotencyKey(
+                                  `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+                                )
+                                setPlanError('')
+                              }}
+                              inputProps={{
+                                min: planUnitWeightDraftMeasurementSystem === 'metric'
+                                  ? 0.001
+                                  : 0.0001,
+                                step: planUnitWeightDraftMeasurementSystem === 'metric'
+                                  ? 0.001
+                                  : 0.0001,
+                              }}
+                              sx={{ width: { sm: 190 } }}
+                            />
+                          </Stack>
+                        ))}
+                        {planUnitWeightEditingAllowed ? (
+                          <>
+                            <TextField
+                              size="small"
+                              required={planUnitWeightHasUnsavedChanges}
+                              label="Audit reason"
+                              value={planUnitWeightReason}
+                              disabled={savingPlanUnitWeights}
+                              onChange={(event) => {
+                                setPlanUnitWeightReason(event.target.value)
+                                setPlanError('')
+                              }}
+                              inputProps={{ maxLength: 500 }}
+                            />
+                            <Button
+                              type="button"
+                              variant="outlined"
+                              disabled={
+                                savingPlanUnitWeights
+                                || planUnitWeightHasInvalidDraft
+                                || !planUnitWeightHasUnsavedChanges
+                                || planUnitWeightReason.trim().length < 8
+                              }
+                              startIcon={savingPlanUnitWeights
+                                ? <CircularProgress size={16} />
+                                : undefined}
+                              onClick={() => void savePlanUnitWeights()}
+                            >
+                              {savingPlanUnitWeights
+                                ? 'Saving unit weights'
+                                : 'Save unit weights'}
+                            </Button>
+                          </>
+                        ) : (
+                          <Typography variant="body2" color="text.secondary">
+                            Order unit weights are read-only in training.
+                          </Typography>
+                        )}
+                      </Stack>
+                    </Box>
+                  ) : null}
                   <Typography variant="overline" color="text.secondary">
                     Step 1 · Choose fulfillment facts
                   </Typography>
@@ -7509,6 +7940,7 @@ export default function OperationsSection({
                       value={planWarehouseGlobalId}
                       disabled={
                         creatingPlanEvidence
+                        || savingPlanUnitWeights
                         || planEvidenceValid
                         || Boolean(
                           planShopifyAssignment && !shadowTrainingPlanTarget
@@ -7563,7 +7995,11 @@ export default function OperationsSection({
                       multiple
                       label="Packaging materials (1–8)"
                       value={planMaterialGlobalIds}
-                      disabled={creatingPlanEvidence || planEvidenceValid}
+                      disabled={
+                        creatingPlanEvidence
+                        || savingPlanUnitWeights
+                        || planEvidenceValid
+                      }
                       onChange={(event) => {
                         const values = typeof event.target.value === 'string'
                           ? event.target.value.split(',')
@@ -7625,6 +8061,8 @@ export default function OperationsSection({
                         : <ScienceRounded />}
                       disabled={
                         creatingPlanEvidence
+                        || savingPlanUnitWeights
+                        || planUnitWeightWorkspaceBlocked
                         || !planWarehouseGlobalId
                         || planMaterialGlobalIds.length < 1
                         || planMaterialGlobalIds.length > 8
@@ -7679,7 +8117,11 @@ export default function OperationsSection({
           <DialogActions>
             <Button
               onClick={closePlan}
-              disabled={planningOrder || creatingPlanEvidence}
+              disabled={
+                planningOrder
+                || creatingPlanEvidence
+                || savingPlanUnitWeights
+              }
             >
               Cancel
             </Button>
@@ -7689,6 +8131,8 @@ export default function OperationsSection({
               disabled={
                 planningOrder
                 || creatingPlanEvidence
+                || savingPlanUnitWeights
+                || planUnitWeightWorkspaceBlocked
                 || !planEvidenceValid
                 || !planReason.trim()
               }

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
+import { assertCurrentOrderUnitWeightEvidence } from '@/lib/persistence/orderUnitWeightEvidence'
 import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
 import { readCommerceOrderWorkbenchFromPostgres } from '@/lib/persistence/commerceOrderWorkbench'
 import {
@@ -11861,6 +11862,15 @@ export async function planOperationsOrderFromPostgres(input: {
         client,
         `operations:order:${organizationId}:${orderGlobalId}`,
       )
+      await acquireTransactionAdvisoryLock(
+        client,
+        `operations:order-unit-weight:${organizationId}:${evidence.candidateGlobalId}`,
+      )
+      await assertCurrentOrderUnitWeightEvidence(client, {
+        organizationId,
+        candidateGlobalId: evidence.candidateGlobalId,
+        planSnapshot: evidence.planSnapshot,
+      })
 
       type PlanningOrderRow = OrderIdentityRow & {
         pipeline_id: string

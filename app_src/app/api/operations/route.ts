@@ -29,6 +29,9 @@ import {
   OperationsOrderShipmentAddressError,
 } from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
+  OperationsOrderUnitWeightError,
+} from '@/lib/persistence/orderUnitWeightEvidence'
+import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
   consumeCommerceActiveTransitionAuthorizationInPostgres,
@@ -994,6 +997,9 @@ function errorResponse(error: unknown) {
     return json({ ok: false, error: 'Select an active organization first', code: error.message }, 409)
   }
   if (error instanceof OperationsRequestError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
+  if (error instanceof OperationsOrderUnitWeightError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
   if (

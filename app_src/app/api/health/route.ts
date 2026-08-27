@@ -95,6 +95,9 @@ import {
   OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL,
 } from '@/lib/persistence/operationsLegacyUnitMeasurementHealth'
 import {
+  OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL,
+} from '@/lib/persistence/operationsOrderUnitWeightHealth'
+import {
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
 } from '@/lib/persistence/operationsOrderEditingReleaseHealth'
 import {
@@ -3307,6 +3310,7 @@ export async function GET() {
           operations_order_editing_release_applied: boolean
           operations_measured_packaging_evidence_applied: boolean
           operations_legacy_unit_measurement_applied: boolean
+          operations_order_unit_weight_applied: boolean
           operations_commerce_store_sync_controls_applied: boolean
           operations_commerce_store_sync_authority_contract: string | null
           operations_shopify_order_webhook_reconciliation_applied: boolean
@@ -6427,6 +6431,9 @@ export async function GET() {
               (
                 ${OPERATIONS_LEGACY_UNIT_MEASUREMENT_HEALTH_SQL}
               ) AS operations_legacy_unit_measurement_applied,
+              (
+                ${OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}
+              ) AS operations_order_unit_weight_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8027,6 +8034,7 @@ export async function GET() {
             && row?.operations_order_editing_release_applied
             && row?.operations_measured_packaging_evidence_applied
             && row?.operations_legacy_unit_measurement_applied
+            && row?.operations_order_unit_weight_applied
             && row?.operations_commerce_store_sync_controls_applied
             && row?.operations_shopify_order_webhook_reconciliation_applied
             && row?.migration_checksums_present
@@ -8573,6 +8581,7 @@ export async function GET() {
           || !row?.operations_order_editing_release_applied
           || !row?.operations_measured_packaging_evidence_applied
           || !row?.operations_legacy_unit_measurement_applied
+          || !row?.operations_order_unit_weight_applied
           || !row?.operations_commerce_store_sync_controls_applied
           || !row?.operations_shopify_order_webhook_reconciliation_applied
           || !row?.migration_checksums_present

@@ -121,6 +121,9 @@ function persistenceFor(pool) {
     '@/lib/persistence/commerceStoreSync': {
       readCommerceStoreSyncControlsFromPostgres: async () => [],
     },
+    '@/lib/persistence/orderUnitWeightEvidence': {
+      assertCurrentOrderUnitWeightEvidence: noOp,
+    },
     '@/lib/persistence/operationPrintDelivery': {},
     '@/lib/persistence/operationShadowFulfillmentPreparation': {
       readShadowFulfillmentPreparation: async () => null,

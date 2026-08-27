@@ -1393,6 +1393,9 @@ async function verifyShipmentCompletion(databaseUrl) {
         '@/lib/persistence/commerceOrderWorkbench': {
           readCommerceOrderWorkbenchFromPostgres: async () => [],
         },
+        '@/lib/persistence/orderUnitWeightEvidence': {
+          assertCurrentOrderUnitWeightEvidence: async () => {},
+        },
         '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
         '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/operationsOrderShipmentAddress':

@@ -1118,6 +1118,9 @@ function loadOperationalWarehouseServices(pool) {
         ),
       },
       '@/lib/persistence/operationsOrderShipmentAddress': shipmentAddress,
+      '@/lib/persistence/orderUnitWeightEvidence': {
+        assertCurrentOrderUnitWeightEvidence: async () => {},
+      },
       '@/lib/persistence/commerceOrderRevisions': {
         async assertCommerceOrderRevisionExecutionCurrent() {},
         CommerceOrderRevisionGateError: class extends Error {},
