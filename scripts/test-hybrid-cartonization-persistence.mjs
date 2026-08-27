@@ -303,10 +303,14 @@ const matchedCheckoutLineage = {
 }
 const checkoutPackBaseline = {
   snapshotVersion: 'shopify-checkout-line-pack-evidence-v1',
+  cartonizationAuthority: 'product_pack',
+  productMappingGlobalId: null,
   packEvidenceHash: 'a'.repeat(64),
   providerProductId: 'gid://shopify/Product/10',
   providerVariantId: 'gid://shopify/ProductVariant/20',
   productGlobalId: 'gp0000001',
+  channelSourceRevision: null,
+  channelSourceHash: null,
   mappingGlobalId: 'gcvm0000001',
   mappingRowVersion: 4,
   profileVersionGlobalId: 'gppv0000001',
@@ -426,6 +430,109 @@ for (const missingField of [
         === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
     ),
     `Versioned checkout snapshots must retain ${missingField}`,
+  )
+}
+
+const matchedUnitMaterialCheckoutLineage = {
+  ...matchedCheckoutLineage,
+  candidateProductMappingGlobalId: 'gpm0000001',
+  candidateChannelSourceRevision: 'channel-revision-a',
+  candidateChannelSourceHash: 'channel-hash-a',
+  receiptLine: withReceiptLineHash({
+    ...matchedCheckoutLineage.receiptLine,
+    line_snapshot: {
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+      cartonizationAuthority: 'unit_material_selection',
+      productGid: 'gid://shopify/Product/10',
+      variantGid: 'gid://shopify/ProductVariant/20',
+      productGlobalId: 'gp0000001',
+      productMappingGlobalId: 'gpm0000001',
+      channelSourceRevision: 'channel-revision-a',
+      channelSourceHash: 'channel-hash-a',
+      packMappingGlobalId: null,
+      packMappingRowVersion: null,
+      packEvidenceHash: null,
+      packProfileVersionGlobalId: null,
+      packProfileVersionRowVersion: null,
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      shipsAsOwnPackage: false,
+      inventoryLevelGlobalIds: ['giil0000001'],
+      quantity: 50,
+      unitWeightGrams: 170,
+    },
+  }),
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(assertMatchedShopifyCheckoutPackLineage(
+    matchedUnitMaterialCheckoutLineage,
+  ))),
+  {
+    ...checkoutPackBaseline,
+    snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+    cartonizationAuthority: 'unit_material_selection',
+    productMappingGlobalId: 'gpm0000001',
+    packEvidenceHash: null,
+    channelSourceRevision: 'channel-revision-a',
+    channelSourceHash: 'channel-hash-a',
+    mappingGlobalId: null,
+    mappingRowVersion: null,
+    profileVersionGlobalId: null,
+    profileRowVersion: null,
+  },
+  'V2 unit-material checkout lineage remains usable without inventing a Product pack',
+)
+const matchedV2ProductPackLineage = {
+  ...matchedCheckoutLineage,
+  candidateProductMappingGlobalId: 'gpm0000001',
+  candidateChannelSourceRevision: 'channel-revision-a',
+  candidateChannelSourceHash: 'channel-hash-a',
+  receiptLine: withReceiptLineHash({
+    ...matchedCheckoutLineage.receiptLine,
+    line_snapshot: {
+      ...matchedCheckoutLineage.receiptLine.line_snapshot,
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+      cartonizationAuthority: 'product_pack',
+      productMappingGlobalId: 'gpm0000001',
+      channelSourceRevision: 'channel-revision-a',
+      channelSourceHash: 'channel-hash-a',
+    },
+  }),
+}
+assert.equal(
+  assertMatchedShopifyCheckoutPackLineage(
+    matchedV2ProductPackLineage,
+  ).mappingGlobalId,
+  'gcvm0000001',
+  'V2 product-pack authority retains strict exact pack mapping lineage',
+)
+for (const [field, value] of [
+  ['productMappingGlobalId', 'gpm-drifted'],
+  ['productGid', 'gid://shopify/Product/99'],
+  ['variantGid', 'gid://shopify/ProductVariant/99'],
+  ['channelSourceRevision', 'channel-revision-b'],
+  ['channelSourceHash', 'channel-hash-b'],
+  ['unitWeightGrams', 171],
+  ['inventoryLevelGlobalIds', undefined],
+  ['packMappingGlobalId', 'gcvm0000001'],
+]) {
+  assert.throws(
+    () => assertMatchedShopifyCheckoutPackLineage({
+      ...matchedUnitMaterialCheckoutLineage,
+      receiptLine: withReceiptLineHash({
+        ...matchedUnitMaterialCheckoutLineage.receiptLine,
+        line_snapshot: {
+          ...matchedUnitMaterialCheckoutLineage.receiptLine.line_snapshot,
+          [field]: value,
+        },
+      }),
+    }),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+    ),
+    `V2 unit-material lineage must fail closed on ${field} drift`,
   )
 }
 
