@@ -115,29 +115,66 @@ const exactOrder = {
   sourceIdentifier,
   createdAt: '2026-08-25T12:00:00.000Z',
   updatedAt: '2026-08-25T12:00:01.000Z',
+  currencyCode: 'USD',
+  presentmentCurrencyCode: 'USD',
+  totalPriceSet: {
+    shopMoney: { amount: '10.0', currencyCode: 'USD' },
+    presentmentMoney: { amount: '10.00', currencyCode: 'USD' },
+  },
+  capturable: true,
+  totalCapturableSet: {
+    shopMoney: { amount: '10.00', currencyCode: 'USD' },
+    presentmentMoney: { amount: '10', currencyCode: 'USD' },
+  },
   displayFinancialStatus: 'PENDING',
   displayFulfillmentStatus: 'UNFULFILLED',
   tags: ['clawpilot-reversal-fixture', uniqueTag],
   lineItems: {
     nodes: [{
       id: 'gid://shopify/LineItem/987654321',
+      quantity: 1,
       currentQuantity: 1,
       unfulfilledQuantity: 1,
+      taxable: false,
       requiresShipping: true,
       variant: {
         id: 'gid://shopify/ProductVariant/51028106608887',
       },
+      originalUnitPriceSet: {
+        shopMoney: { amount: '10.00', currencyCode: 'USD' },
+        presentmentMoney: { amount: '10.0', currencyCode: 'USD' },
+      },
     }],
     pageInfo: { hasNextPage: false },
   },
+  transactions: [{
+    id: 'gid://shopify/OrderTransaction/246813579',
+    kind: 'AUTHORIZATION',
+    status: 'SUCCESS',
+    test: true,
+    amountSet: {
+      shopMoney: { amount: '10.00', currencyCode: 'USD' },
+      presentmentMoney: { amount: '10', currencyCode: 'USD' },
+    },
+  }],
 }
 
 assert.deepEqual(
   JSON.parse(JSON.stringify(adapter.SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE)),
   {
-    version: 'shopify-reversal-fixture-v4',
+    version: 'shopify-reversal-fixture-v5',
     test: true,
     expectedFinancialStatus: 'PENDING',
+    currencyCode: 'USD',
+    unitPrice: '10.00',
+    taxable: false,
+    transaction: {
+      kind: 'AUTHORIZATION',
+      status: 'SUCCESS',
+      test: true,
+      amount: '10.00',
+      currencyCode: 'USD',
+    },
     marketingConsent: 'UNSET',
     sendReceipt: false,
     sendFulfillmentReceipt: false,
@@ -157,6 +194,36 @@ assert.deepEqual(
   },
 )
 
+assert.equal(
+  adapter.sanitizeShopifyReversalFixtureProviderErrorMessage(
+    `Ｆａｉｌ\n${'A'.repeat(32)} customer@example.test `
+      + 'gid://shopify/ProductVariant/51028106608887',
+  ),
+  'Fail [redacted-token] [redacted-email] [redacted-gid]',
+)
+const boundedProviderMessage =
+  adapter.sanitizeShopifyReversalFixtureProviderErrorMessage(
+    'safe provider detail '.repeat(40),
+  )
+assert.equal(boundedProviderMessage.length, 240)
+assert.equal(boundedProviderMessage, boundedProviderMessage.trim())
+assert.match(boundedProviderMessage, /^[ -~]+$/u)
+const sensitiveNumberMessage =
+  adapter.sanitizeShopifyReversalFixtureProviderErrorMessage(
+    'Call +1 (555) 123-4567 card 4111 1111 1111 1111 '
+      + 'account ID 1234-5678-9012 reference 123456789012 line 0',
+  )
+assert.equal(
+  sensitiveNumberMessage,
+  'Call [redacted-phone] [redacted-account] [redacted-account] '
+    + 'reference [redacted-number] line 0',
+)
+for (const sensitiveDigits of [
+  '555', '4567', '4111', '1234', '9012', '123456789012',
+]) {
+  assert.equal(sensitiveNumberMessage.includes(sensitiveDigits), false)
+}
+
 providerResponse = {
   orderCreate: { order: exactOrder, userErrors: [] },
 }
@@ -175,12 +242,26 @@ assert.equal(calls[0].operationName, 'ClawPilotReversalFixtureOrderCreate')
 assert.deepEqual(calls[0].variables, {
   order: {
     test: true,
+    financialStatus: 'PENDING',
+    currency: 'USD',
     sourceIdentifier,
     tags: ['clawpilot-reversal-fixture', uniqueTag],
     lineItems: [{
       variantId: 'gid://shopify/ProductVariant/51028106608887',
       quantity: 1,
       requiresShipping: true,
+      taxable: false,
+      priceSet: {
+        shopMoney: { amount: '10.00', currencyCode: 'USD' },
+      },
+    }],
+    transactions: [{
+      kind: 'AUTHORIZATION',
+      status: 'SUCCESS',
+      test: true,
+      amountSet: {
+        shopMoney: { amount: '10.00', currencyCode: 'USD' },
+      },
     }],
     shippingAddress: {
       firstName: 'John',
@@ -199,7 +280,7 @@ assert.deepEqual(calls[0].variables, {
   },
 })
 const exactEmittedPayloadHash = createHash('sha256').update(JSON.stringify({
-  version: 'shopify-reversal-fixture-order-provider-payload-v3',
+  version: 'shopify-reversal-fixture-order-provider-payload-v5',
   shopDomain: credential.shopDomain,
   variables: calls[0].variables,
 })).digest('hex')
@@ -212,7 +293,7 @@ const changedBaseTagVariables = structuredClone(calls[0].variables)
 changedBaseTagVariables.order.tags[0] = 'changed-fixture-base-tag'
 assert.notEqual(
   createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v3',
+    version: 'shopify-reversal-fixture-order-provider-payload-v5',
     shopDomain: credential.shopDomain,
     variables: changedBaseTagVariables,
   })).digest('hex'),
@@ -222,8 +303,8 @@ assert.notEqual(
 const serializedWrite = JSON.stringify(calls[0].variables)
 for (const forbidden of [
   'email', 'phone', 'customer', 'buyerAcceptsMarketing', 'billingAddress',
-  'financialStatus', 'transactions',
-  'discount', 'tax', 'shippingLine', 'payment', 'notifyCustomer',
+  'presentmentCurrency', 'presentmentMoney',
+  'discount', 'taxLines', 'shippingLine', 'payment', 'notifyCustomer',
 ]) {
   assert.equal(
     serializedWrite.includes(`\"${forbidden}\"`),
@@ -238,7 +319,10 @@ providerResponse = {
     userErrors: [{
       code: 'INVALID',
       field: ['order', 'lineItems', '0', 'variantId'],
-      message: 'Rejected exactly and must never be retained',
+      message: 'Rejected owner@example.test at https://shopify.test/fail '
+        + 'gid://shopify/Order/123456789 '
+        + '11111111-1111-4111-8111-111111111111 '
+        + 'token_A1B2C3D4E5F6G7H8 123456789',
     }],
   },
 }
@@ -252,7 +336,10 @@ await assert.rejects(
     && error.message
       === 'Shopify rejected order creation (INVALID at order.lineItems.0.variantId)'
     && error.providerErrorSummary === error.message
-    && !error.message.includes('must never be retained')
+    && error.providerErrorMessage
+      === 'Rejected [redacted-email] at [redacted-url] [redacted-gid] '
+        + '[redacted-uuid] [redacted-token] [redacted-number]'
+    && !error.providerErrorMessage.includes('owner@example.test')
     && error.providerMutationAttempted === true
     && error.outcomeUnknown === false,
 )
@@ -283,6 +370,7 @@ for (const invalidProviderError of [
       && error.providerMutationAttempted === true
       && error.outcomeUnknown === true
       && error.providerErrorSummary === null
+      && error.providerErrorMessage === null
     ),
     'unrecognized provider error evidence must fail closed without retention',
   )
@@ -300,6 +388,35 @@ await assert.rejects(
     && error.outcomeUnknown === true,
 )
 providerError = null
+
+providerResponse = {
+  orderCreate: {
+    order: null,
+    userErrors: [{
+      code: 'INVALID',
+      field: ['order'],
+      message: 'First duplicate',
+    }, {
+      code: 'INVALID',
+      field: ['order'],
+      message: 'First duplicate',
+    }, {
+      code: 'INVALID',
+      field: ['order', 'transactions'],
+      message: 'Second detail',
+    }],
+  },
+}
+await assert.rejects(
+  () => adapter.createShopifyReversalFixtureOrder(credential, {
+    sourceIdentifier,
+    uniqueTag,
+    claim: exactClaim,
+  }),
+  (error) => error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
+    && error.providerErrorMessage === 'First duplicate; Second detail',
+  'provider error message evidence must be de-duplicated deterministically',
+)
 
 for (const malformedUserErrors of [undefined, null, { message: 'invalid' }]) {
   providerResponse = {
@@ -324,6 +441,78 @@ for (const malformedUserErrors of [undefined, null, { message: 'invalid' }]) {
     'malformed post-dispatch userErrors must remain unknown',
   )
 }
+
+providerResponse = {
+  orderCreate: {
+    order: { ...exactOrder, transactions: [] },
+    userErrors: [],
+  },
+}
+await assert.rejects(
+  () => adapter.createShopifyReversalFixtureOrder(credential, {
+    sourceIdentifier,
+    uniqueTag,
+    claim: exactClaim,
+  }),
+  (error) => error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN'
+    && error.providerMutationAttempted === true
+    && error.outcomeUnknown === true,
+  'a returned order without the exact authorization must remain unknown',
+)
+
+const lifecycleAdvancedOrder = {
+  ...exactOrder,
+  displayFinancialStatus: 'PAID',
+  displayFulfillmentStatus: 'FULFILLED',
+  capturable: false,
+  tags: [...exactOrder.tags, 'operator-added-tag'],
+  totalCapturableSet: {
+    shopMoney: { amount: '0.00', currencyCode: 'USD' },
+    presentmentMoney: { amount: '0', currencyCode: 'USD' },
+  },
+  lineItems: {
+    nodes: [{
+      ...exactOrder.lineItems.nodes[0],
+      currentQuantity: 0,
+      unfulfilledQuantity: 0,
+    }, {
+      id: 'gid://shopify/LineItem/987654322',
+      quantity: 2,
+      currentQuantity: 2,
+      unfulfilledQuantity: 0,
+      taxable: true,
+      requiresShipping: false,
+      variant: null,
+      originalUnitPriceSet: {
+        shopMoney: { amount: '2.00', currencyCode: 'USD' },
+        presentmentMoney: { amount: '2.00', currencyCode: 'USD' },
+      },
+    }],
+    pageInfo: { hasNextPage: false },
+  },
+  transactions: [...exactOrder.transactions, {
+    id: 'gid://shopify/OrderTransaction/246813580',
+    kind: 'CAPTURE',
+    status: 'SUCCESS',
+    test: true,
+    amountSet: {
+      shopMoney: { amount: '10.00', currencyCode: 'USD' },
+      presentmentMoney: { amount: '10.00', currencyCode: 'USD' },
+    },
+  }],
+}
+providerResponse = {
+  orderCreate: { order: lifecycleAdvancedOrder, userErrors: [] },
+}
+await assert.rejects(
+  () => adapter.createShopifyReversalFixtureOrder(credential, {
+    sourceIdentifier,
+    uniqueTag,
+    claim: exactClaim,
+  }),
+  (error) => error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_OUTCOME_UNKNOWN',
+  'the immediate mutation response must still prove PENDING and capturable',
+)
 
 const claimChecksBeforeWrongStore = claimChecks
 const providerCallsBeforeWrongStore = calls.length
@@ -386,7 +575,95 @@ const reconciled = await adapter.reconcileShopifyReversalFixtureOrder(
 assert.equal(reconciled.resolution, 'applied')
 assert.equal(reconciled.order.id, exactOrder.id)
 assert.match(reconciled.evidenceHash, /^[a-f0-9]{64}$/u)
-assert.deepEqual(calls.at(-1).variables, { query: `tag:${uniqueTag}` })
+const exactReconciliationSearch =
+  `source_identifier:${JSON.stringify(sourceIdentifier)} `
+  + `AND tag:${uniqueTag} AND test:true`
+assert.deepEqual(calls.at(-1).variables, {
+  query: exactReconciliationSearch,
+})
+
+providerResponse = {
+  orders: {
+    nodes: [lifecycleAdvancedOrder],
+    pageInfo: { hasNextPage: false },
+  },
+}
+const lifecycleReconciliation =
+  await adapter.reconcileShopifyReversalFixtureOrder(
+    credential,
+    { sourceIdentifier, uniqueTag },
+  )
+assert.equal(lifecycleReconciliation.resolution, 'applied')
+assert.equal(lifecycleReconciliation.order.id, exactOrder.id)
+
+providerResponse = {
+  orders: {
+    nodes: [{
+      ...lifecycleAdvancedOrder,
+      transactions: [{
+        ...lifecycleAdvancedOrder.transactions[0],
+        amountSet: {
+          shopMoney: { amount: '9.00', currencyCode: 'USD' },
+          presentmentMoney: { amount: '9.00', currencyCode: 'USD' },
+        },
+      }],
+    }],
+    pageInfo: { hasNextPage: false },
+  },
+}
+assert.equal(
+  (await adapter.reconcileShopifyReversalFixtureOrder(
+    credential,
+    { sourceIdentifier, uniqueTag },
+  )).resolution,
+  'ambiguous',
+  'transaction drift cannot be accepted as the exact applied fixture',
+)
+
+providerResponse = {
+  orders: {
+    nodes: [{
+      ...lifecycleAdvancedOrder,
+      sourceIdentifier: 'clawpilot-reversal-fixture:gsfc7654321',
+    }],
+    pageInfo: { hasNextPage: false },
+  },
+}
+assert.equal(
+  (await adapter.reconcileShopifyReversalFixtureOrder(
+    credential,
+    { sourceIdentifier, uniqueTag },
+  )).resolution,
+  'ambiguous',
+  'command-specific source identity drift cannot be accepted',
+)
+
+providerResponse = {
+  orders: {
+    nodes: [{
+      ...lifecycleAdvancedOrder,
+      transactions: Array.from({ length: 10 }, (_, index) => ({
+        id: `gid://shopify/OrderTransaction/${246813600 + index}`,
+        kind: index === 0 ? 'AUTHORIZATION' : 'CAPTURE',
+        status: 'SUCCESS',
+        test: true,
+        amountSet: {
+          shopMoney: { amount: '10.00', currencyCode: 'USD' },
+          presentmentMoney: { amount: '10.00', currencyCode: 'USD' },
+        },
+      })),
+    }],
+    pageInfo: { hasNextPage: false },
+  },
+}
+assert.equal(
+  (await adapter.reconcileShopifyReversalFixtureOrder(
+    credential,
+    { sourceIdentifier, uniqueTag },
+  )).resolution,
+  'ambiguous',
+  'a full bounded transaction window cannot prove exhaustive identity',
+)
 
 providerResponse = {
   orders: { nodes: [], pageInfo: { hasNextPage: false } },

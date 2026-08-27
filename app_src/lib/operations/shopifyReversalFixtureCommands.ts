@@ -530,6 +530,27 @@ function safeProviderErrorSummary(
   return summary
 }
 
+function safeProviderErrorMessage(
+  error: unknown,
+  providerMutationAttempted: boolean,
+) {
+  if (
+    !providerMutationAttempted
+    || !(error instanceof ShopifyReversalFixtureProviderError)
+    || error.outcomeUnknown
+    || error.code !== 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
+    || typeof error.providerErrorMessage !== 'string'
+  ) return null
+  const message = error.providerErrorMessage
+  if (
+    message.length < 1
+    || message.length > 240
+    || message !== message.trim()
+    || /[^\x20-\x7e]/u.test(message)
+  ) return null
+  return message
+}
+
 async function recordOutcomeConservatively(
   input: Parameters<typeof recordShopifyReversalFixtureOutcomeInPostgres>[0],
 ) {
@@ -600,6 +621,10 @@ async function executeOrder(
       error,
       providerMutationAttempted,
     )
+    const providerErrorMessage = safeProviderErrorMessage(
+      error,
+      providerMutationAttempted,
+    )
     outcomeInput = {
       command,
       attemptId: claimed.attemptId,
@@ -613,6 +638,7 @@ async function executeOrder(
           : 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED',
       ),
       ...(providerErrorSummary ? { providerErrorSummary } : {}),
+      ...(providerErrorMessage ? { providerErrorMessage } : {}),
     }
   }
   const outcome = await recordOutcomeConservatively(outcomeInput)

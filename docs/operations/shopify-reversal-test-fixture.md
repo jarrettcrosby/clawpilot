@@ -35,13 +35,16 @@ Production, Vercel, local development, a different Railway project or environmen
 
 The claimed provider mutation contains one fixed profile only:
 
-- `test: true`, no explicit financial-status input, and no customer or marketing-consent input; Shopify must derive and return `PENDING` from the transactionless unpaid order;
-- fixed variant `gid://shopify/ProductVariant/51028106608887`, quantity `1`, and `requiresShipping: true`;
+- `test: true`, explicit `financialStatus: PENDING`, order currency `USD`, and no customer or marketing-consent input;
+- fixed variant `gid://shopify/ProductVariant/51028106608887`, quantity `1`, `requiresShipping: true`, `taxable: false`, and a fixed `10.00 USD` shop-money `priceSet`;
+- exactly one test transaction with `kind: AUTHORIZATION`, `status: SUCCESS`, and an exact `10.00 USD` shop-money `amountSet` matching the line price;
 - the approved synthetic John Doe address at 101 Academy Drive, Buzzards Bay, Massachusetts 02532, US;
 - `inventoryBehaviour: BYPASS`, `sendReceipt: false`, and `sendFulfillmentReceipt: false`; and
 - a command-specific `sourceIdentifier` plus unique tag fingerprint.
 
-It contains no customer, email, phone, billing address, transaction, discount, tax, shipping-line, or payment input. Shopify must return exactly one matching pending, unfulfilled, shippable test-order line. An explicit Shopify user error becomes a rejected terminal outcome. A timeout, transport failure, malformed response, or unverifiable returned order becomes `unknown`; never execute that command again.
+It contains no customer, email, phone, billing address, discount, tax line, shipping line, or notification input. It intentionally omits input `presentmentMoney`; Shopify's `MoneyBagInput` then uses shop money for presentment, avoiding the separate `presentmentCurrency` requirement. Shopify must immediately return exactly one matching pending, unfulfilled, shippable, nontaxable `10.00 USD` line and exactly one successful test authorization for the same shop and presentment amount. The returned order must also be capturable for exactly `10.00 USD`. The staff-supported fixture deliberately combines explicit `PENDING` with a successful authorization. Shopify may later change display, fulfillment, quantity, total, and capturable fields and append transactions. Delayed reconciliation therefore proves the immutable creation fingerprint instead of reusing immediate lifecycle assertions. Immediate create success remains strict.
+
+An explicit Shopify user error becomes a rejected terminal outcome. Its code-and-field summary remains tightly allowlisted. A separate worker-secret status field may retain only a deterministic NFKC-normalized, whitespace-collapsed, redacted printable-ASCII message of at most 240 characters. Emails, URLs, Shopify GIDs, UUIDs, formatted phone numbers, payment/account/card-like digit groups, long digit runs, and token-like strings are replaced before persistence. This message is nullable, permitted only for an attempted rejected write with zero provider writes, and is not copied into broad audit events or logs. A timeout, transport failure, malformed response, or unverifiable returned order becomes `unknown`; never execute that command again.
 
 Prepare and execute are separate commands:
 
@@ -63,7 +66,7 @@ node scripts/shopify-test-fixture.mjs execute \
   --confirmation='<returned-confirmation-statement>'
 ```
 
-For an `unknown` outcome, run the separate read-only reconciliation once. Phase 1 searches by the exact unique tag and accepts an applied result only when the source identifier, full tag set, test/payment/fulfillment state, fixed variant, quantity, and shipping requirement also match.
+For an `unknown` outcome, run the separate read-only reconciliation once. Phase 1 conjoins the exact source identifier, unique tag, and `test:true` in a two-order bounded search. An applied result requires the command-specific source identifier and unique tag, base tag, test flag, USD currencies, and exactly one matching fixed-variant, original-quantity-one, nontaxable, shippable `10.00 USD` creation line. Line pagination must prove the bounded result exhaustive. Shopify transactions are append-only, so additional later transactions are allowed, but exactly one original `AUTHORIZATION`/`SUCCESS`/test/`10.00 USD` event must remain in a less-than-ten bounded transaction window; a full window is ambiguous because the list has no page information. Reconciliation deliberately ignores mutable current/unfulfilled quantities, display statuses, capturable flags, and derived totals. Added tags and nonmatching edited lines do not erase the creation fingerprint. A zero-result search remains absent evidence even if Shopify tag indexing lagged. Every reconciliation result is evidence only and never authorizes a retry.
 
 ```sh
 node scripts/shopify-test-fixture.mjs reconcile \
@@ -104,7 +107,7 @@ After the two fixture phases, use the existing ClawPilot reconciliation, reversa
 
 ## Durable Evidence and Readiness
 
-Migration `0326_operations_shopify_reversal_test_fixture.sql` creates four append-only ledgers: commands, authenticated human approvals, provider attempts, and outcomes. Migration `0332_operations_shopify_reversal_fixture_profile_v4.sql` preserves historical v1-v3 commands while authorizing only new v4 commands whose provider payload omits the redundant explicit financial status. Preparation is serialized per organization, account, and phase. Each command has at most one approval and one attempt. An unclaimed command may be superseded only after expiry, but its immutable approval cannot be replaced. Any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
+Migration `0326_operations_shopify_reversal_test_fixture.sql` creates four append-only ledgers: commands, authenticated human approvals, provider attempts, and outcomes. Migration `0333_operations_shopify_reversal_fixture_profile_v5.sql` preserves historical v1-v4 commands while authorizing new v5 commands and adds the nullable, rejected-only sanitized provider-message evidence column. Preparation is serialized per organization, account, and phase. Each command has at most one approval and one attempt. An unclaimed command may be superseded only after expiry, but its immutable approval cannot be replaced. Any unknown outcome permanently prevents another fixture write for that account and phase even after an absent or ambiguous reconciliation.
 
 `/api/health` reports the fixture runtime, exact migration checksum, ledger structures, database identity, and awaiting-approval, prepared, processing, unknown, and terminal counts. When the fixture runtime flag is enabled, migration or database-identity drift makes health fail. Unresolved unknown outcomes are a warning.
 
