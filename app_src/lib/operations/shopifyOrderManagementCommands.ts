@@ -6,8 +6,12 @@ import {
   executeShopifyOrderManagementAction,
   inspectShopifyOrderManagementTarget,
   requestedShopifyOrderSaveProjectionHash,
+  shopifyOrderCancellationPaymentEvidence,
+  shopifyOrderCancellationPaymentEligibility,
+  shopifyOrderCancellationPaymentReleased,
   shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
+  type ShopifyOrderCancellationPaymentEvidence,
   type ShopifyOrderManagementPreview,
   type ShopifyOrderShippingAddress,
 } from '@/lib/integrations/shopifyOrderManagement'
@@ -24,6 +28,7 @@ import {
   recoverStaleShopifyOrderManagementAttemptInPostgres,
   reconcileShopifyOrderManagementOutcomeInPostgres,
   recordShopifyOrderManagementOutcomeInPostgres,
+  shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot,
   shopifyOrderManagementEvidenceHash,
   type ShopifyOrderManagementAuthorization,
   type ShopifyOrderManagementTarget,
@@ -33,6 +38,52 @@ import { readCommerceRuntimeCredentialFromPostgres } from '@/lib/persistence/com
 const SHA256 = /^[a-f0-9]{64}$/u
 const JOB_GID = /^gid:\/\/shopify\/Job\/[A-Za-z0-9][A-Za-z0-9-]*$/u
 const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/u
+
+function boundCancellationPaymentEvidence(
+  authorization: ShopifyOrderManagementAuthorization,
+  preview: ShopifyOrderManagementPreview,
+): ShopifyOrderCancellationPaymentEvidence | null {
+  if (
+    !preview.paymentEvidenceComplete
+    || preview.transactionsCount === null
+  ) {
+    return null
+  }
+  const authorizationCandidates = preview.transactions.filter(
+    (transaction) => (
+      transaction.kind === 'AUTHORIZATION'
+      && transaction.status === 'SUCCESS'
+      && transaction.test
+    ),
+  )
+  const candidates: ShopifyOrderCancellationPaymentEvidence[] = []
+  for (let transactionsCount = 0;
+    transactionsCount <= preview.transactionsCount;
+    transactionsCount += 1) {
+    candidates.push(Object.freeze({
+      schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+      transactionsCount,
+      authorizationTransactionId: null,
+      authorizationAmount: null,
+    }))
+    if (transactionsCount < 1 || transactionsCount >= 25) continue
+    for (const transaction of authorizationCandidates) {
+      candidates.push(Object.freeze({
+        schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+        transactionsCount,
+        authorizationTransactionId: transaction.id,
+        authorizationAmount: Object.freeze({ ...transaction.amount }),
+      }))
+    }
+  }
+  const matches = candidates.filter((candidate) => (
+    shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot(
+      authorization,
+      candidate,
+    )
+  ))
+  return matches.length === 1 ? matches[0] : null
+}
 
 export type ShopifyOrderManagementMutation =
   | Readonly<{ kind: 'add_tag'; tag: string }>
@@ -369,6 +420,11 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     orderCurrencyCode: 'XXX',
     currentTotalPrice: { amount: '0.00', currencyCode: 'XXX' },
     totalOutstanding: { amount: '0.00', currencyCode: 'XXX' },
+    totalReceived: { amount: '0.00', currencyCode: 'XXX' },
+    totalCapturable: { amount: '0.00', currencyCode: 'XXX' },
+    transactionsCount: null,
+    paymentEvidenceComplete: false,
+    transactions: [],
     email: null,
     phone: null,
     poNumber: null,
@@ -481,6 +537,9 @@ function publicState(input: {
         fulfillment.id === input.target.reversibleExternalFulfillmentGid
       ))
     : undefined
+  const cancellationPayment = shopifyOrderCancellationPaymentEligibility(
+    input.preview,
+  )
   const postReversalCancellationReason = baseReason
     || postReversalOrderCancellationTargetBlocker(input.target)
     || (!writeOrders
@@ -496,17 +555,12 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || (input.preview.capturable
-      ? 'Release or capture the payment authorization before cancelling this order'
-      : null)
+    || cancellationPayment.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
       ? 'The order must remain wholly unfulfilled after fulfillment reversal'
-      : null)
-    || (!input.preview.unpaid
-      ? 'Paid-order cancellation requires refund settings before it can be submitted'
       : null)
   const destructiveCurrent = exactCurrentSource(input.target)
     && Boolean(input.target.acceptedProviderUpdatedAt)
@@ -517,17 +571,12 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || (input.preview.capturable
-      ? 'Release or capture the payment authorization before cancelling this order'
-      : null)
+    || cancellationPayment.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
       ? 'This order has fulfillment activity. Cancel or return that fulfillment before cancelling the order'
-      : null)
-    || (!input.preview.unpaid
-      ? 'Paid-order cancellation requires refund settings before it can be submitted'
       : null)
     || (!input.preview.test
       ? 'Cancellation is limited to Shopify test orders'
@@ -624,10 +673,14 @@ function publicState(input: {
       cancel: Object.freeze({
         allowed: cancellationReason === null,
         reason: cancellationReason,
+        releasesAuthorization: cancellationReason === null
+          && cancellationPayment.releasesAuthorization,
       }),
       cancelAfterFulfillmentReversal: Object.freeze({
         allowed: postReversalCancellationReason === null,
         reason: postReversalCancellationReason,
+        releasesAuthorization: postReversalCancellationReason === null
+          && cancellationPayment.releasesAuthorization,
         predecessorAuthorizationGlobalId:
           input.target.postReversalOrderCancellationPredecessorGlobalId,
       }),
@@ -917,6 +970,17 @@ export async function prepareShopifyOrderManagementCommand(input: {
         action,
       )
     : undefined
+  const cancellation = action.type === 'cancel'
+    || action.type === 'cancel_order_after_fulfillment_reversal'
+  const cancellationPaymentEvidence = cancellation
+    ? shopifyOrderCancellationPaymentEvidence(live.inspected.preview)
+    : undefined
+  if (cancellation && !cancellationPaymentEvidence) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_CANCELLATION_PAYMENT_EVIDENCE_INVALID',
+      'Exact bounded Shopify cancellation payment evidence is required',
+    )
+  }
   const authorization = await prepareShopifyOrderManagementInPostgres({
     organizationId: input.organizationId,
     actorEmail: input.actorEmail,
@@ -927,6 +991,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
     providerOrderUpdatedAt: live.inspected.preview.updatedAt,
     providerOrderObservedAt: live.observedAt,
     providerOrderTest: live.inspected.preview.test,
+    cancellationPaymentEvidence,
     expectedLineQuantity,
     requestedProjectionHash,
     action,
@@ -1207,6 +1272,16 @@ export async function executeShopifyOrderManagementCommand(input: {
         updatedAt: claimed.providerOrderUpdatedAt,
       },
       action: actionInput,
+      cancellationPaymentEvidenceMatches: [
+        'cancel', 'cancel_order_after_fulfillment_reversal',
+      ].includes(claimed.action)
+        ? (evidence) => (
+            shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot(
+              claimed,
+              evidence,
+            )
+          )
+        : undefined,
     })
   } catch (error) {
     const errorCode = error instanceof Error && 'code' in error
@@ -1379,7 +1454,20 @@ export async function reconcileShopifyOrderManagementCommand(input: {
   } else if ([
     'cancel', 'cancel_order_after_fulfillment_reversal',
   ].includes(authorization.action)) {
-    if (live.inspected.preview.cancelledAt) resolution = 'applied'
+    const paymentEvidence = boundCancellationPaymentEvidence(
+      authorization,
+      live.inspected.preview,
+    )
+    if (
+      paymentEvidence
+      && live.inspected.preview.cancelledAt
+      && shopifyOrderCancellationPaymentReleased(
+        live.inspected.preview,
+        paymentEvidence,
+      )
+    ) {
+      resolution = 'applied'
+    }
   } else if (
     authorization.action === 'cancel_fulfillment'
     && authorization.fulfillmentGid

@@ -20,6 +20,9 @@ const SHOPIFY_ORDER_TRANSACTION_GID =
 const SOURCE_IDENTIFIER =
   /^clawpilot-reversal-fixture:gsfc(?:[0-9]{7}|[0-9a-v]{12})$/u
 const UNIQUE_TAG = /^clawpilot-reversal-[a-f0-9]{24}$/u
+const UNIQUE_TAG_PREFIX = 'clawpilot-reversal-'
+const SHOPIFY_PROVIDER_TAG_PREFIX = 'clawpilot-rv-'
+const SHOPIFY_ORDER_TAG_MAX_LENGTH = 40
 const ORDER_CREATE_ERROR_FIELD_TOKEN = /^[A-Za-z0-9_]{1,64}$/u
 const ORDER_CREATE_ERROR_CODES = new Set([
   'FULFILLMENT_SERVICE_INVALID',
@@ -248,6 +251,23 @@ function exactUniqueTag(value: unknown) {
   return uniqueTag
 }
 
+function exactShopifyProviderTag(value: unknown) {
+  const uniqueTag = exactUniqueTag(value)
+  // Keep the immutable ledger identity while encoding its full digest under
+  // Shopify's 40-character order-tag limit.
+  const providerTag = `${SHOPIFY_PROVIDER_TAG_PREFIX}${uniqueTag.slice(
+    UNIQUE_TAG_PREFIX.length,
+  )}`
+  if (providerTag.length > SHOPIFY_ORDER_TAG_MAX_LENGTH) {
+    fail(
+      'SHOPIFY_REVERSAL_FIXTURE_TAG_INVALID',
+      'The exact fixed fixture provider tag is invalid',
+      400,
+    )
+  }
+  return providerTag
+}
+
 export function shopifyReversalFixtureTagFingerprint(value: unknown) {
   const uniqueTag = exactUniqueTag(value)
   return createHash('sha256').update(uniqueTag).digest('hex')
@@ -268,6 +288,7 @@ function exactOrderProviderPayload(input: {
   }
   const sourceIdentifier = exactSourceIdentifier(input.sourceIdentifier)
   const uniqueTag = exactUniqueTag(input.uniqueTag)
+  const providerTag = exactShopifyProviderTag(uniqueTag)
   const variables = Object.freeze({
     order: Object.freeze({
       test: true as const,
@@ -276,7 +297,7 @@ function exactOrderProviderPayload(input: {
       // The fixture has no customer or email, so marketing consent must remain
       // unset in Shopify. Receipt and fulfillment notifications remain off.
       sourceIdentifier,
-      tags: Object.freeze([SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag]),
+      tags: Object.freeze([SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, providerTag]),
       lineItems: Object.freeze([Object.freeze({
         variantId: SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID,
         quantity: 1 as const,
@@ -372,7 +393,7 @@ function normalizeFixtureOrder(
     .sort()
   const expectedTags = [
     SHOPIFY_REVERSAL_FIXTURE_BASE_TAG,
-    expected.uniqueTag,
+    exactShopifyProviderTag(expected.uniqueTag),
   ].sort()
   const tagsMatch = proof === 'immediate'
     ? JSON.stringify(tags) === JSON.stringify(expectedTags)
@@ -817,13 +838,14 @@ export async function reconcileShopifyReversalFixtureOrder(
 ): Promise<ShopifyReversalFixtureOrderReconciliation> {
   const sourceIdentifier = exactSourceIdentifier(input.sourceIdentifier)
   const uniqueTag = exactUniqueTag(input.uniqueTag)
+  const providerTag = exactShopifyProviderTag(uniqueTag)
   const data = await shopifyAdminGraphql<{
     orders?: unknown
   }>(credential, {
     query: ORDER_RECONCILIATION_QUERY,
     operationName: 'ClawPilotReversalFixtureOrderRead',
     variables: {
-      query: `source_identifier:${JSON.stringify(sourceIdentifier)} AND tag:${uniqueTag} AND test:true`,
+      query: `source_identifier:${JSON.stringify(sourceIdentifier)} AND tag:${providerTag} AND test:true`,
     },
   }, options)
   const connection = record(data.orders, 'order search')

@@ -102,6 +102,7 @@ const exactClaim = {
 }
 const sourceIdentifier = 'clawpilot-reversal-fixture:gsfc1234567'
 const uniqueTag = 'clawpilot-reversal-0123456789abcdef01234567'
+const providerTag = 'clawpilot-rv-0123456789abcdef01234567'
 expectedProviderPayloadHash =
   adapter.shopifyReversalFixtureOrderProviderPayloadHash({
     shopDomain: credential.shopDomain,
@@ -128,7 +129,7 @@ const exactOrder = {
   },
   displayFinancialStatus: 'PENDING',
   displayFulfillmentStatus: 'UNFULFILLED',
-  tags: ['clawpilot-reversal-fixture', uniqueTag],
+  tags: ['clawpilot-reversal-fixture', providerTag],
   lineItems: {
     nodes: [{
       id: 'gid://shopify/LineItem/987654321',
@@ -245,7 +246,7 @@ assert.deepEqual(calls[0].variables, {
     financialStatus: 'PENDING',
     currency: 'USD',
     sourceIdentifier,
-    tags: ['clawpilot-reversal-fixture', uniqueTag],
+    tags: ['clawpilot-reversal-fixture', providerTag],
     lineItems: [{
       variantId: 'gid://shopify/ProductVariant/51028106608887',
       quantity: 1,
@@ -279,6 +280,17 @@ assert.deepEqual(calls[0].variables, {
     sendFulfillmentReceipt: false,
   },
 })
+assert.equal(providerTag.length <= 40, true)
+assert.deepEqual(
+  calls[0].variables.order.tags,
+  ['clawpilot-reversal-fixture', providerTag],
+  'orderCreate must retain both fixed fingerprints as valid Shopify tags',
+)
+assert.equal(
+  calls[0].variables.order.tags.every((tag) => tag.length <= 40),
+  true,
+  'Shopify order tags must not exceed the provider 40-character limit',
+)
 const exactEmittedPayloadHash = createHash('sha256').update(JSON.stringify({
   version: 'shopify-reversal-fixture-order-provider-payload-v5',
   shopDomain: credential.shopDomain,
@@ -342,6 +354,29 @@ await assert.rejects(
     && !error.providerErrorMessage.includes('owner@example.test')
     && error.providerMutationAttempted === true
     && error.outcomeUnknown === false,
+)
+
+providerResponse = {
+  orderCreate: {
+    order: null,
+    userErrors: [{
+      code: 'INVALID',
+      field: ['order'],
+      message: 'Order Order tags is invalid',
+    }],
+  },
+}
+await assert.rejects(
+  () => adapter.createShopifyReversalFixtureOrder(credential, {
+    sourceIdentifier,
+    uniqueTag,
+    claim: exactClaim,
+  }),
+  (error) => error.code === 'SHOPIFY_REVERSAL_FIXTURE_ORDER_REJECTED'
+    && error.providerErrorSummary
+      === 'Shopify rejected order creation (INVALID at order)'
+    && error.providerErrorMessage === 'Order Order tags is invalid',
+  'the exact provider tag rejection must remain sanitized terminal evidence',
 )
 
 for (const invalidProviderError of [
@@ -577,7 +612,7 @@ assert.equal(reconciled.order.id, exactOrder.id)
 assert.match(reconciled.evidenceHash, /^[a-f0-9]{64}$/u)
 const exactReconciliationSearch =
   `source_identifier:${JSON.stringify(sourceIdentifier)} `
-  + `AND tag:${uniqueTag} AND test:true`
+  + `AND tag:${providerTag} AND test:true`
 assert.deepEqual(calls.at(-1).variables, {
   query: exactReconciliationSearch,
 })
