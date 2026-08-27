@@ -9,6 +9,11 @@ const migrationPath =
 const migration = read(migrationPath)
 const expectedChecksum =
   '15a98ccbcde18418f795d319726521340b444c1cbb9d693ac5f8460cb90cfa2b'
+const nullSafeMigrationPath =
+  'db/migrations/0335_operations_order_unit_weight_null_safe_validation.sql'
+const nullSafeMigration = read(nullSafeMigrationPath)
+const expectedNullSafeChecksum =
+  'e4deac2b38f157194483ee47eeb6bf32b20c158e9c330624889cbdf4419f69e6'
 
 assert.equal(
   createHash('sha256').update(migration).digest('hex'),
@@ -40,6 +45,27 @@ assert.doesNotMatch(
   migration,
   /UPDATE\s+public\.operations_commerce_order_candidate_lines/iu,
   'Order-specific weight evidence must not mutate imported packaging fields',
+)
+assert.equal(
+  createHash('sha256').update(nullSafeMigration).digest('hex'),
+  expectedNullSafeChecksum,
+  'The null-safe trigger repair must be checksum-pinned',
+)
+for (const fragment of [
+  'CREATE OR REPLACE FUNCTION public.validate_operations_order_unit_weight_fact()',
+  "line.packaging_weight_source IS DISTINCT FROM 'provider_order'",
+  'COALESCE(line.weight_grams, 0) <= 0',
+  'COALESCE(channel_state.weight_grams, 0) = 0',
+]) {
+  assert.ok(
+    nullSafeMigration.includes(fragment),
+    `Null-safe migration must retain ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  nullSafeMigration,
+  /NOT\s*\(\s*line\.packaging_weight_source\s*=\s*'provider_order'/iu,
+  'A missing provider weight source must not collapse the eligibility fence to NULL',
 )
 
 const persistence = read(
@@ -224,7 +250,7 @@ for (const harnessPath of [
 const health = read(
   'app_src/lib/persistence/operationsOrderUnitWeightHealth.ts',
 )
-assert.ok(health.includes(expectedChecksum))
+assert.ok(health.includes(expectedNullSafeChecksum))
 assert.ok(health.includes('OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL'))
 const healthRoute = read('app_src/app/api/health/route.ts')
 assert.ok(healthRoute.includes('${OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}'))

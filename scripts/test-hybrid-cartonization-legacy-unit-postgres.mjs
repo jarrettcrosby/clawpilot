@@ -21,6 +21,10 @@ const requireFromApp = createRequire(
 const { Pool } = requireFromApp('pg')
 const migrationName =
   '0327_operations_legacy_unit_pack_compatibility.sql'
+const firstPostLegacyMigration =
+  '0328_operations_shopify_reversal_fixture_provider_errors.sql'
+const orderUnitWeightRepairMigration =
+  '0335_operations_order_unit_weight_null_safe_validation.sql'
 const exactLineGlobalId = 'gcol1vbvhkqodkjl'
 const exactCandidateGlobalId = 'gcocq1570l31rv1l'
 const exactLineSourceRevision = '2026-08-15T00:14:33.000Z'
@@ -35,6 +39,90 @@ function hash(value) {
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value))
+}
+
+async function createProcessingUnitWeightReceipt(client, fixture, marker) {
+  const idempotencyKey = `legacy-unit-weight-${marker}-${randomUUID()}`
+  const requestHash = hash(idempotencyKey)
+  const result = await client.query(
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, status, correlation_id, target_global_id
+     ) VALUES (
+       $1::uuid, 'operations.record_order_unit_weights', $2, $3,
+       $4, 'processing', $5::uuid, $6
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      idempotencyKey,
+      requestHash,
+      fixture.actorEmail,
+      randomUUID(),
+      exactCandidateGlobalId,
+    ],
+  )
+  return { id: result.rows[0].id, requestHash }
+}
+
+async function insertFirstUnitWeightFact(
+  client,
+  fixture,
+  receipt,
+  unitWeightGrams,
+) {
+  const allocated = await client.query(
+    `SELECT allocate_global_reference('gouw') AS global_id`,
+  )
+  const globalId = allocated.rows[0].global_id
+  return client.query(
+    `INSERT INTO operations_order_unit_weight_facts (
+       global_id, organization_id, integration_account_id, pipeline_id,
+       candidate_id, candidate_row_version, order_id, order_line_id,
+       planning_line_id, planning_line_global_id,
+       candidate_line_id, revision_application_line_id,
+       line_source_revision, line_source_hash, fact_version,
+       supersedes_fact_id, unit_weight_grams, reason, request_hash, fact_hash,
+       command_receipt_id, recorded_by
+     )
+     SELECT $1::text, line.organization_id, line.integration_account_id,
+            line.pipeline_id, line.order_candidate_id, candidate.row_version,
+            candidate.canonical_order_id, line.canonical_order_line_id,
+            line.id, line.global_id, line.id, NULL,
+            line.source_revision, line.source_hash, 1, NULL,
+            $2::integer, $3, $4,
+            encode(digest(convert_to(jsonb_build_object(
+              'candidateGlobalId', candidate.global_id,
+              'candidateRowVersion', candidate.row_version,
+              'factGlobalId', $1::text,
+              'factVersion', 1,
+              'lineGlobalId', line.global_id,
+              'lineSourceHash', line.source_hash,
+              'lineSourceRevision', line.source_revision,
+              'unitWeightGrams', $2::integer
+            )::text, 'UTF8'), 'sha256'), 'hex'),
+            $5::uuid, $6
+     FROM operations_commerce_current_planning_lines line
+     JOIN operations_commerce_order_candidates candidate
+       ON candidate.organization_id = line.organization_id
+      AND candidate.id = line.order_candidate_id
+     WHERE line.organization_id = $7::uuid
+       AND line.global_id = $8
+       AND candidate.global_id = $9
+       AND candidate.accepted_revision_application_id IS NULL
+     RETURNING id::text, global_id, fact_version, unit_weight_grams,
+               candidate_line_id::text, revision_application_line_id::text`,
+    [
+      globalId,
+      unitWeightGrams,
+      'Measured for null-safe unit-weight trigger regression',
+      receipt.requestHash,
+      receipt.id,
+      fixture.actorEmail,
+      fixture.organizationId,
+      exactLineGlobalId,
+      exactCandidateGlobalId,
+    ],
+  )
 }
 
 function runtimeModules() {
@@ -599,6 +687,7 @@ async function seedLegacyFixture(pool) {
   return {
     accountEnvironment: 'sandbox',
     accountId,
+    actorEmail,
     approvedProfileLine,
     candidateId,
     channelSourceHash,
@@ -1154,6 +1243,161 @@ async function verify(databaseUrl) {
       'Existing resolution-decision protection must preserve the exact manual decision',
     )
 
+    const migrationFiles = migrations()
+    const firstPostLegacyIndex = migrationFiles.indexOf(
+      firstPostLegacyMigration,
+    )
+    const orderUnitWeightRepairIndex = migrationFiles.indexOf(
+      orderUnitWeightRepairMigration,
+    )
+    assert.ok(
+      firstPostLegacyIndex > migrationFiles.indexOf(migrationName),
+      `${firstPostLegacyMigration} must follow ${migrationName}`,
+    )
+    assert.ok(
+      orderUnitWeightRepairIndex >= firstPostLegacyIndex,
+      `${orderUnitWeightRepairMigration} must follow ${firstPostLegacyMigration}`,
+    )
+    const migrationClient = await pool.connect()
+    try {
+      for (const file of migrationFiles.slice(
+        firstPostLegacyIndex,
+        orderUnitWeightRepairIndex + 1,
+      )) {
+        await applyMigration(migrationClient, file)
+      }
+    } finally {
+      migrationClient.release()
+    }
+
+    const unitWeightHealth = loadTypeScriptModule(
+      'app_src/lib/persistence/operationsOrderUnitWeightHealth.ts',
+    )
+    const unitWeightHealthResult = await pool.query(
+      `SELECT (
+         ${unitWeightHealth.OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}
+       ) AS applied`,
+    )
+    assert.equal(
+      unitWeightHealthResult.rows[0]?.applied,
+      true,
+      'Hosted health must require the null-safe unit-weight trigger repair',
+    )
+
+    const ordinaryUnitContext = await pool.query(
+      `SELECT line.packaging_state, line.packaging_source,
+              line.packaging_weight_source, line.weight_grams,
+              channel.weight_grams AS channel_weight_grams
+       FROM operations_commerce_current_planning_lines line
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = line.organization_id
+        AND candidate.id = line.order_candidate_id
+       LEFT JOIN operations_product_channel_states channel
+         ON channel.organization_id = line.organization_id
+        AND channel.integration_account_id = line.integration_account_id
+        AND channel.pipeline_id = line.pipeline_id
+        AND channel.provider = line.provider
+        AND channel.external_product_id = line.external_product_id
+        AND channel.external_variant_id = line.external_variant_id
+        AND channel.product_id = line.product_id
+        AND channel.product_mapping_id = line.product_mapping_id
+       WHERE candidate.global_id = $1
+         AND line.global_id = $2`,
+      [exactCandidateGlobalId, exactLineGlobalId],
+    )
+    assert.deepEqual(plain(ordinaryUnitContext.rows[0]), {
+      packaging_state: 'not_required',
+      packaging_source: 'none',
+      packaging_weight_source: null,
+      weight_grams: 2268,
+      channel_weight_grams: null,
+    }, 'The regression fixture must retain a NULL provider-weight source')
+
+    const acceptedReceipt = await createProcessingUnitWeightReceipt(
+      pool,
+      fixture,
+      'accepted',
+    )
+    const acceptedFact = await insertFirstUnitWeightFact(
+      pool,
+      fixture,
+      acceptedReceipt,
+      3000,
+    )
+    assert.equal(
+      acceptedFact.rowCount,
+      1,
+      'A NULL provider-weight source must permit the first operator fact',
+    )
+    assert.deepEqual(plain(acceptedFact.rows[0]), {
+      id: acceptedFact.rows[0].id,
+      global_id: acceptedFact.rows[0].global_id,
+      fact_version: 1,
+      unit_weight_grams: 3000,
+      candidate_line_id: fixture.exactLine.id,
+      revision_application_line_id: null,
+    })
+
+    const rejectionClient = await pool.connect()
+    try {
+      await rejectionClient.query('BEGIN')
+      try {
+        await rejectionClient.query(
+          `SET LOCAL session_replication_role = replica`,
+        )
+        await rejectionClient.query(
+          `DELETE FROM operations_order_unit_weight_facts
+           WHERE id = $1::uuid`,
+          [acceptedFact.rows[0].id],
+        )
+        await rejectionClient.query(
+          `UPDATE operations_commerce_order_candidate_lines
+           SET packaging_weight_source = 'provider_order',
+               weight_grams = 2268
+           WHERE id = $1::uuid`,
+          [fixture.exactLine.id],
+        )
+        await rejectionClient.query(
+          `SET LOCAL session_replication_role = origin`,
+        )
+        const rejectedReceipt = await createProcessingUnitWeightReceipt(
+          rejectionClient,
+          fixture,
+          'provider-order-rejected',
+        )
+        await assert.rejects(
+          insertFirstUnitWeightFact(
+            rejectionClient,
+            fixture,
+            rejectedReceipt,
+            3000,
+          ),
+          /Order unit weight requires one current exact ordinary-unit line/,
+          'A positive provider-order weight must remain read-only',
+        )
+      } finally {
+        await rejectionClient.query('ROLLBACK')
+      }
+    } finally {
+      rejectionClient.release()
+    }
+
+    const restoredUnitWeightState = await pool.query(
+      `SELECT line.packaging_weight_source,
+              count(fact.id)::integer AS fact_count
+       FROM operations_commerce_order_candidate_lines line
+       LEFT JOIN operations_order_unit_weight_facts fact
+         ON fact.organization_id = line.organization_id
+        AND fact.candidate_line_id = line.id
+       WHERE line.id = $1::uuid
+       GROUP BY line.id`,
+      [fixture.exactLine.id],
+    )
+    assert.deepEqual(plain(restoredUnitWeightState.rows[0]), {
+      packaging_weight_source: null,
+      fact_count: 1,
+    }, 'The rejection probe must roll back without changing the accepted fact')
+
     const runtimeRows = await pool.query(
       `SELECT
          line.global_id, line.provider,
@@ -1433,7 +1677,7 @@ async function main() {
     })
   }
   console.log(
-    'Legacy #1001 one-each migration and material-cartonization PostgreSQL acceptance passed',
+    'Legacy #1001 material cartonization and unit-weight trigger PostgreSQL acceptance passed',
   )
 }
 
