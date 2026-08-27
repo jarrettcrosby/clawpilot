@@ -62,6 +62,11 @@ const shopifyCheckoutUnitMaterialMigration = [
   'e5a480092b91a3b84cbdde09ab5205590014e6169f55715a654cf8eff8632873',
 ]
 
+const shopifyCheckoutLineAuthorityMigration = [
+  'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
+  '7eb6341111e3dd1789eb213d05193ea6bf91f46229ce47bdba6c1eae87420323',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -163,6 +168,23 @@ if (
   fail(
     'test:shopify-carrier-service-postgres must run checkout unit-material acceptance',
   )
+}
+const [shopifyCheckoutLineAuthorityMigrationPath,
+  shopifyCheckoutLineAuthorityMigrationChecksum] =
+  shopifyCheckoutLineAuthorityMigration
+if (!existsSync(resolve(root, shopifyCheckoutLineAuthorityMigrationPath))) {
+  fail(
+    `missing Shopify checkout line-authority migration: ${shopifyCheckoutLineAuthorityMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyCheckoutLineAuthorityMigrationPath),
+    ))
+    .digest('hex') !== shopifyCheckoutLineAuthorityMigrationChecksum
+) {
+  fail('Shopify checkout line-authority migration checksum drifted')
 }
 
 const healthRoute = readFileSync(
@@ -450,6 +472,13 @@ if (
   )
 }
 const ciWorkflow = readFileSync(resolve(root, '.github/workflows/ci.yml'), 'utf8')
+if (
+  !ciWorkflow.includes(
+    'run: node scripts/test-shopify-checkout-unit-material-postgres.mjs',
+  )
+) {
+  fail('CI must run the Shopify checkout unit cartonization PostgreSQL acceptance')
+}
 if (!ciWorkflow.includes('run: npm run test:commerce-store-sync')) {
   fail('CI must run the Store sync disposable PostgreSQL acceptance')
 }
@@ -660,6 +689,7 @@ for (const requiredPath of [
   'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
+  'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',

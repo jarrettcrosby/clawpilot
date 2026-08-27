@@ -63,6 +63,8 @@ export type ShopifyCheckoutContextResult = {
     stockRowVersion: number
     maxWeightGrams: number
     stockOnHandQuantity: number
+    activeClaimedQuantity: number
+    availableQuantity: number
     unitCostMinor: number
     currency: string
   }>
@@ -186,6 +188,7 @@ type MaterialRow = QueryResultRow & {
   stock_row_version: string | number
   stock_is_available: boolean | null
   stock_on_hand_quantity: number | null
+  active_claimed_quantity: string | number
 }
 
 type RecipeRow = QueryResultRow & {
@@ -593,7 +596,9 @@ async function readMaterials(
        stock.global_id AS stock_global_id,
        stock.row_version::text AS stock_row_version,
        stock.is_available AS stock_is_available,
-       stock.on_hand_quantity AS stock_on_hand_quantity
+       stock.on_hand_quantity AS stock_on_hand_quantity,
+       COALESCE(claims.active_claimed_quantity, 0)::text
+         AS active_claimed_quantity
      FROM operations_shopify_carrier_service_configs config
      JOIN operations_shopify_carrier_service_config_materials selected
        ON selected.organization_id = config.organization_id
@@ -605,6 +610,15 @@ async function readMaterials(
        ON stock.organization_id = material.organization_id
       AND stock.packaging_material_id = material.id
       AND stock.warehouse_id = config.warehouse_id
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(sum(claim.quantity), 0)
+         AS active_claimed_quantity
+       FROM operations_packaging_material_claims claim
+       WHERE claim.organization_id = material.organization_id
+         AND claim.packaging_material_id = material.id
+         AND claim.warehouse_id = config.warehouse_id
+         AND claim.status = 'active'
+     ) claims ON true
      WHERE config.organization_id = $1::uuid
        AND config.global_id = $2
        AND config.row_version = $3
@@ -638,6 +652,15 @@ function mapMaterials(rows: MaterialRow[]) {
       row.current_row_version,
       `${row.material_global_id} current row version`,
     )
+    const stockOnHandQuantity = integer(
+      row.stock_on_hand_quantity,
+      `${row.material_global_id} stock`,
+    )
+    const activeClaimedQuantity = integer(
+      row.active_claimed_quantity,
+      `${row.material_global_id} active claimed stock`,
+    )
+    const availableQuantity = stockOnHandQuantity - activeClaimedQuantity
     if (
       expected !== current
       || row.status !== 'active'
@@ -652,10 +675,8 @@ function mapMaterials(rows: MaterialRow[]) {
       || row.unit_cost_minor === null
       || !row.currency
       || !/^[A-Z]{3}$/.test(row.currency)
-      || integer(
-        row.stock_on_hand_quantity,
-        `${row.material_global_id} stock`,
-      ) < 1
+      || !Number.isSafeInteger(availableQuantity)
+      || availableQuantity < 1
     ) {
       fail(
         'SHOPIFY_CHECKOUT_MATERIAL_EVIDENCE_NOT_READY',
@@ -711,11 +732,6 @@ function mapMaterials(rows: MaterialRow[]) {
       `${row.material_global_id} unit cost`,
       1,
     )
-    const stockOnHandQuantity = integer(
-      row.stock_on_hand_quantity,
-      `${row.material_global_id} stock`,
-      1,
-    )
     const stockRowVersion = integer(
       row.stock_row_version,
       `${row.material_global_id} stock row version`,
@@ -741,8 +757,9 @@ function mapMaterials(rows: MaterialRow[]) {
         currency: row.currency,
         stockRowVersion,
         stockOnHandQuantity,
+        activeClaimedQuantity,
+        availableQuantity,
         maximumGrossWeightGrams: maxWeightGrams,
-        availableQuantity: stockOnHandQuantity,
         ratedOuterDimensionsMm: ratedOuter,
       } satisfies HybridCartonizationMaterial,
       evidence: {
@@ -752,6 +769,8 @@ function mapMaterials(rows: MaterialRow[]) {
         stockRowVersion,
         maxWeightGrams,
         stockOnHandQuantity,
+        activeClaimedQuantity,
+        availableQuantity,
         unitCostMinor,
         currency: row.currency,
       },

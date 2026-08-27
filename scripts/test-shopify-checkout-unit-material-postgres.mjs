@@ -17,7 +17,7 @@ const requireFromApp = createRequire(
 )
 const { Pool } = requireFromApp('pg')
 const targetMigration =
-  '0329_operations_shopify_checkout_unit_material_cartonization.sql'
+  '0331_operations_shopify_checkout_line_authority.sql'
 const organizationId = '32900000-0000-4000-8000-000000000001'
 const accountId = '32900000-0000-4000-8000-000000000010'
 const warehouseId = '32900000-0000-4000-8000-000000000020'
@@ -175,7 +175,7 @@ async function seedFixture(client) {
          repeat('3', 64), repeat('4', 64), repeat('5', 64), '{}'::jsonb,
          'USD', 'checkout-unit-material-postgres', 'processing',
          gen_random_uuid(), now() + interval '5 minutes',
-         'test:checkout-unit-material', 1, repeat('6', 64), now(),
+         'test:checkout-unit-material', 4, repeat('6', 64), now(),
          86400, now() + interval '1 day', now(), now()
        )`,
       [receiptId, organizationId, accountId, configId, warehouseId],
@@ -209,6 +209,60 @@ async function seedFixture(client) {
            "inventoryLevelGlobalIds":["giilh00000000001"],
            "quantity":1,
            "unitWeightGrams":200
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-2',
+         'gid://shopify/ProductVariant/2', 'PACK-2', 1, 300, true,
+         repeat('8', 64),
+         '{
+           "snapshotVersion":"shopify-checkout-line-pack-evidence-v2",
+           "cartonizationAuthority":"product_pack",
+           "productGid":"gid://shopify/Product/2",
+           "variantGid":"gid://shopify/ProductVariant/2",
+           "productGlobalId":"gph00000000002",
+           "productMappingGlobalId":"gpmh00000000002",
+           "channelSourceRevision":"fixture-2",
+           "channelSourceHash":"9999999999999999999999999999999999999999999999999999999999999999",
+           "packMappingGlobalId":"gcvmh00000000001",
+           "packMappingRowVersion":1,
+           "packEvidenceHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+           "packProfileVersionGlobalId":"gppvh00000000001",
+           "packProfileVersionRowVersion":1,
+           "packageLevel":"each",
+           "baseEachQuantity":1,
+           "shipsAsOwnPackage":false,
+           "inventoryLevelGlobalIds":["giilh00000000002"],
+           "quantity":1,
+           "unitWeightGrams":300
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-3',
+         'gid://shopify/ProductVariant/3', 'PACK-V1-3', 1, 400, true,
+         repeat('9', 64),
+         '{
+           "snapshotVersion":"shopify-checkout-line-pack-evidence-v1",
+           "productGid":"gid://shopify/Product/3",
+           "variantGid":"gid://shopify/ProductVariant/3",
+           "productGlobalId":"gph00000000003",
+           "packMappingGlobalId":"gcvmh00000000002",
+           "packMappingRowVersion":1,
+           "packEvidenceHash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+           "packProfileVersionGlobalId":"gppvh00000000002",
+           "packProfileVersionRowVersion":1,
+           "packageLevel":"each",
+           "baseEachQuantity":1,
+           "shipsAsOwnPackage":false,
+           "inventoryLevelGlobalIds":["giilh00000000003"],
+           "quantity":1,
+           "unitWeightGrams":400
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-4',
+         'gid://shopify/ProductVariant/4', 'UNKNOWN-4', 1, 500, true,
+         repeat('a', 64),
+         '{
+           "snapshotVersion":"shopify-checkout-line-pack-evidence-v99",
+           "cartonizationAuthority":"product_pack"
          }'::jsonb
        )`,
       [organizationId, receiptId],
@@ -316,6 +370,14 @@ async function verify(databaseUrl) {
       schema.rows[0].package_guard,
       /approved_recipe.*unit_material_selection/s,
     )
+    assert.match(
+      await client.query(
+        `SELECT pg_get_functiondef(
+           'validate_operations_shopify_checkout_unit_material_allocation()'::regprocedure
+         ) AS value`,
+      ).then((result) => result.rows[0].value),
+      /package method conflicts with retained line authority/,
+    )
 
     const parcel = await client.query(
       `SELECT operations_shopify_checkout_carrier_request_parcel_snapshot(
@@ -340,6 +402,52 @@ async function verify(databaseUrl) {
          1, repeat('b', 64)
        )`,
       [organizationId, receiptId],
+    )
+    await expectRejected(
+      client,
+      'v1-product-pack-line-in-unit-package',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'unit-package-8',
+          packageSequence: 8,
+          planningMethod: 'unit_material_selection',
+          hashDigit: '9',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'unit-package-8', 'line-3',
+             1, repeat('a', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /package method conflicts with retained line authority/,
+    )
+    await expectRejected(
+      client,
+      'unknown-line-version',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'recipe-package-9',
+          packageSequence: 9,
+          planningMethod: 'approved_recipe',
+          hashDigit: 'b',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'recipe-package-9', 'line-4',
+             1, repeat('c', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /lacks valid retained line authority/,
     )
     await expectRejected(
       client,
@@ -409,6 +517,70 @@ async function verify(databaseUrl) {
       planningMethod: 'approved_recipe',
       hashDigit: '2',
     })
+    await expectRejected(
+      client,
+      'unit-line-in-recipe-package',
+      () => client.query(
+        `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+           organization_id, receipt_id, package_key, line_key,
+           quantity, allocation_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, 'recipe-package-5', 'line-1',
+           1, repeat('3', 64)
+         )`,
+        [organizationId, receiptId],
+      ),
+      /package method conflicts with retained line authority/,
+    )
+    await client.query(
+      `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+         organization_id, receipt_id, package_key, line_key,
+         quantity, allocation_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'recipe-package-5', 'line-2',
+         1, repeat('4', 64)
+       )`,
+      [organizationId, receiptId],
+    )
+    await expectRejected(
+      client,
+      'product-pack-line-in-unit-package',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'unit-package-6',
+          packageSequence: 6,
+          planningMethod: 'unit_material_selection',
+          hashDigit: '5',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'unit-package-6', 'line-2',
+             1, repeat('6', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /package method conflicts with retained line authority/,
+    )
+    await insertPackage(client, {
+      packageKey: 'recipe-package-7',
+      packageSequence: 7,
+      planningMethod: 'approved_recipe',
+      hashDigit: '7',
+    })
+    await client.query(
+      `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+         organization_id, receipt_id, package_key, line_key,
+         quantity, allocation_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'recipe-package-7', 'line-3',
+         1, repeat('8', 64)
+       )`,
+      [organizationId, receiptId],
+    )
     const retained = await client.query(
       `SELECT planning_method, allocation_count
        FROM operations_shopify_checkout_rate_receipt_packages
@@ -419,6 +591,7 @@ async function verify(databaseUrl) {
     assert.deepEqual(retained.rows, [
       { planning_method: 'unit_material_selection', allocation_count: 1 },
       { planning_method: 'unit_material_selection', allocation_count: 1 },
+      { planning_method: 'approved_recipe', allocation_count: 1 },
       { planning_method: 'approved_recipe', allocation_count: 1 },
     ])
     await client.query('ROLLBACK')

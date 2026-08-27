@@ -396,7 +396,7 @@ function checkoutExecutionFenceHash(
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v7',
+      version: 'shopify-checkout-execution-fence-v8',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
@@ -447,6 +447,8 @@ function checkoutExecutionFenceHash(
           stockGlobalId: material.stockGlobalId,
           stockRowVersion: material.stockRowVersion,
           stockOnHandQuantity: material.stockOnHandQuantity,
+          activeClaimedQuantity: material.activeClaimedQuantity,
+          availableQuantity: material.availableQuantity,
           unitCostMinor: material.unitCostMinor,
           currency: material.currency,
         })),
@@ -611,7 +613,7 @@ function feasibleRateCandidate(
   }
   if ([...requiredByMaterial].some(
     ([materialGlobalId, required]) => (
-      (materialEvidence.get(materialGlobalId)?.stockOnHandQuantity || 0)
+      (materialEvidence.get(materialGlobalId)?.availableQuantity || 0)
         < required
     ),
   )) {
@@ -1058,7 +1060,7 @@ function responseFromTypedReceipt(
   }
   if ([...requiredByMaterial].some(
     ([materialGlobalId, quantity]) => (
-      (materialByGlobalId.get(materialGlobalId)?.stockOnHandQuantity || 0)
+      (materialByGlobalId.get(materialGlobalId)?.availableQuantity || 0)
         < quantity
     ),
   )) {

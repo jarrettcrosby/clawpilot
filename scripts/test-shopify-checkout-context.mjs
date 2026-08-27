@@ -61,6 +61,8 @@ let mappingMode = 'none'
 let lineScenario = 'single'
 let inventoryQueryCount = 0
 let inventoryAvailableQuantity = '25'
+let activeClaimedQuantity = '0'
+let inventoryItemsPayload = null
 
 function lineRow(overrides = {}) {
   const hasMapping = mappingMode !== 'none'
@@ -144,11 +146,12 @@ const materialRow = {
   stock_row_version: 6,
   stock_is_available: true,
   stock_on_hand_quantity: 50,
+  active_claimed_quantity: '0',
 }
 
 function fakeClient() {
   return {
-    async query(sql) {
+    async query(sql, params = []) {
       if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql)) return { rows: [] }
       if (sql.includes('transaction_timestamp()')) {
         return { rows: [{ read_at: now }] }
@@ -173,7 +176,10 @@ function fakeClient() {
         return { rows: [lineRow()] }
       }
       if (sql.includes('operations_shopify_carrier_service_configs config')) {
-        return { rows: [materialRow] }
+        return { rows: [{
+          ...materialRow,
+          active_claimed_quantity: activeClaimedQuantity,
+        }] }
       }
       if (sql.includes('operations_approved_pack_recipes recipe')) {
         return { rows: [{
@@ -205,12 +211,13 @@ function fakeClient() {
       if (sql.includes('operations_commerce_inventory_sync_runs')) {
         return { rows: [{
           id: '44444444-4444-4444-8444-444444444444',
-          global_id: 'gcisr0000001',
+          global_id: 'gisr0000001',
           provider_fetched_at: now,
         }] }
       }
       if (sql.includes('operations_commerce_inventory_levels level')) {
         inventoryQueryCount += 1
+        inventoryItemsPayload = JSON.parse(params[4])
         return { rows: [{
           external_inventory_item_id: '3000000001',
           operational_available_quantity: inventoryAvailableQuantity,
@@ -237,7 +244,7 @@ const account = {
   organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   integrationAccountId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
   warehouseId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-  configGlobalId: 'gscs0000001',
+  configGlobalId: 'gscf0000001',
   configRowVersion: 5,
   inventoryMaxAgeSeconds: 600,
   environment: 'sandbox',
@@ -317,6 +324,7 @@ assert.equal(
 lineScenario = 'split_variant'
 inventoryAvailableQuantity = '10'
 inventoryQueryCount = 0
+inventoryItemsPayload = null
 const splitVariantContext = await contextModule
   .readShopifyCheckoutContextFromPostgres({
     account,
@@ -326,6 +334,10 @@ const splitVariantContext = await contextModule
     ],
   })
 assert.equal(inventoryQueryCount, 1)
+assert.deepEqual(inventoryItemsPayload, [{
+  product_id: '11111111-1111-4111-8111-111111111111',
+  external_inventory_item_id: '3000000001',
+}], 'the $5 inventory payload must deduplicate split cart lines by item')
 assert.equal(splitVariantContext.inventoryProducts[0]
   .effectiveAvailableQuantity, 10)
 assert.deepEqual(
@@ -334,6 +346,24 @@ assert.deepEqual(
   )))),
   [['giil0000001'], ['giil0000001']],
   'split cart lines for one variant must share one retained level identity',
+)
+
+lineScenario = 'single'
+activeClaimedQuantity = '49'
+const nearlyClaimedContext = await contextModule
+  .readShopifyCheckoutContextFromPostgres({ account, lines })
+assert.equal(nearlyClaimedContext.materials[0].activeClaimedQuantity, 49)
+assert.equal(nearlyClaimedContext.materials[0].availableQuantity, 1)
+assert.equal(nearlyClaimedContext.input.materials[0].availableQuantity, 1)
+
+activeClaimedQuantity = '50'
+await assert.rejects(
+  () => contextModule.readShopifyCheckoutContextFromPostgres({
+    account,
+    lines,
+  }),
+  (error) => error.code === 'SHOPIFY_CHECKOUT_MATERIAL_EVIDENCE_NOT_READY',
+  'fully claimed packaging stock must not be offered to checkout cartonization',
 )
 
 console.log('Shopify checkout context unit-material contracts passed.')

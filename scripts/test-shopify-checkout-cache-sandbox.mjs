@@ -103,7 +103,7 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v7'",
+  "version: 'shopify-checkout-execution-fence-v8'",
   'return account.checkoutRateControl.rateSource',
   'checkoutRateControl: account.checkoutRateControl',
   'checkoutRuntimeCarrierBindings(account)',
@@ -115,6 +115,8 @@ includes(callback, [
   'materialRowVersion: material.rowVersion',
   'stockRowVersion: material.stockRowVersion',
   'stockOnHandQuantity: material.stockOnHandQuantity',
+  'activeClaimedQuantity: material.activeClaimedQuantity',
+  'availableQuantity: material.availableQuantity',
   'unitCostMinor: material.unitCostMinor',
   'currency: material.currency',
   'credentialVersion: carrier.credentialVersion',
@@ -150,7 +152,7 @@ includes(typedResponse, [
   'shopifyCheckoutPackagePlanHash({ packages: receipt.packages })',
   'receipt.offers.map((offer)',
   'parcel.materialRowVersion !== material.rowVersion',
-  'stockOnHandQuantity || 0',
+  'availableQuantity || 0',
   'carrier.credentialVersion !== offer.credentialVersion',
   'offer.packageCount !== receipt.packages.length',
   'offer.packagePlanHash !== receipt.packagePlanHash',

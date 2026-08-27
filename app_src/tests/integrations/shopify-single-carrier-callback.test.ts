@@ -284,7 +284,7 @@ const context = {
     channelSourceHash: createHash('sha256')
       .update('channel-source')
       .digest('hex'),
-    packMappingGlobalId: 'gcpm0000001',
+    packMappingGlobalId: 'gcvm0000001',
     packMappingRowVersion: 1,
     packEvidenceHash: createHash('sha256')
       .update('pack-evidence')
@@ -294,7 +294,7 @@ const context = {
     packageLevel: 'case',
     baseEachQuantity: 2,
     shipsAsOwnPackage: true,
-    inventoryLevelGlobalIds: ['gcil0000001'],
+    inventoryLevelGlobalIds: ['giil0000001'],
     quantity: 1,
     unitWeightGrams: 170,
     sku: 'CLAWPILOT-TEST-6OZ',

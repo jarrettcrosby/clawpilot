@@ -240,6 +240,9 @@ const quoteMatchFamiliesMigration = read(
 const unitMaterialCheckoutMigration = read(
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
 )
+const checkoutLineAuthorityMigration = read(
+  'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -290,6 +293,19 @@ includes(unitMaterialCheckoutMigration, [
   "WHEN 'unit_material_selection'",
   "THEN 'ClawPilot carton '",
 ], 'Unit-material checkout receipt persistence')
+includes(checkoutLineAuthorityMigration, [
+  'validate_operations_shopify_checkout_unit_material_allocation()',
+  "line.line_snapshot ->> 'snapshotVersion'",
+  "line.line_snapshot ->> 'cartonizationAuthority'",
+  "'shopify-checkout-line-pack-evidence-v2'",
+  "'shopify-checkout-line-pack-evidence-v1'",
+  'ELSE NULL',
+  "'product_pack', 'unit_material_selection'",
+  "target_planning_method = 'unit_material_selection'",
+  "target_cartonization_authority = 'unit_material_selection'",
+  'Shopify checkout package method conflicts with retained line authority',
+  'Existing Shopify checkout allocation conflicts with retained line authority',
+], 'Checkout line-to-package authority persistence')
 includes(offerParcelEvidenceMigration, [
   'operations_shopify_checkout_carrier_request_parcel_snapshot',
   "WHEN 'self_package'",
