@@ -3926,6 +3926,7 @@ async function readOrderDetail(
     customerGlobalId: row.customer_global_id,
     sourceProvider: row.source_provider,
     status: row.status,
+    externallyFulfilled: Boolean(externalFulfillmentRow),
     currency: row.currency,
     rowVersion: Number(row.row_version),
     oneOffShippingMode: row.one_off_shipping_mode,
@@ -4331,6 +4332,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       customer_global_id: string
       source_provider: string
       status: OperationsOrderStatus
+      externally_fulfilled: boolean
       warehouse_name: string | null
       promised_delivery_at: Date | null
       line_count: string
@@ -4343,7 +4345,15 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     }>(
       `SELECT orders.id::text, orders.global_id, orders.order_number,
               customer.name AS customer_name, customer.reference_code AS customer_global_id,
-              orders.source_provider, orders.status, warehouse.name AS warehouse_name,
+              orders.source_provider, orders.status,
+              EXISTS (
+                SELECT 1
+                FROM operations_shopify_external_fulfillment_reconciliations
+                       external_fulfillment
+                WHERE external_fulfillment.organization_id = orders.organization_id
+                  AND external_fulfillment.order_id = orders.id
+              ) AS externally_fulfilled,
+              warehouse.name AS warehouse_name,
               orders.promised_delivery_at,
               (SELECT count(*) FROM operations_current_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
               (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
@@ -4726,6 +4736,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     customerGlobalId: row.customer_global_id,
     sourceProvider: row.source_provider,
     status: row.status,
+    externallyFulfilled: row.externally_fulfilled,
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
     lineCount: Number(row.line_count),

@@ -131,6 +131,11 @@ assert.match(ui, /sent no customer notification/)
 assert.match(persistence, /externalFulfillmentTracking/)
 assert.match(persistence, /provider_fulfillment_created_at/)
 assert.match(ui, /order-external-fulfillment-evidence/)
+assert.match(ui, /orderDisplayStatus/)
+assert.match(ui, /Fulfilled externally/)
+assert.match(ui, /order-derived-fulfillment-status/)
+assert.match(persistence, /AS externally_fulfilled/)
+assert.match(persistence, /externallyFulfilled: Boolean\(externalFulfillmentRow\)/)
 assert.match(ui, /Shopify did not supply tracking details/)
 assert.match(ui, /ClawPilot will not buy replacement postage automatically/)
 assert.match(externalLabelMigration, /clawpilot-external-label/)
@@ -151,6 +156,10 @@ assert.match(printRoute, /enqueue-external-label-artifact/)
 assert.match(ui, /Upload original label/)
 assert.match(ui, /onPrintExternalLabel/)
 assert.match(ui, /No postage was purchased and Shopify was not changed/)
+assert.match(ui, /const bundledAgentCompatible = artifact\?\.format === 'ZPL'/)
+assert.match(ui, /artifact && bundledAgentCompatible/)
+assert.match(ui, /bundled print agent accepts ZPL labels only/)
+assert.match(ui, /Download label/)
 
 class OperationsRequestError extends Error {
   constructor(code, message, status = 400) {
@@ -190,6 +199,17 @@ assert.doesNotThrow(() => validateLabel({
 }))
 assert.throws(
   () => validateLabel({ format: 'PDF', payload: Buffer.from('^XA^XZ') }),
+  (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_PAYLOAD_INVALID',
+)
+assert.throws(
+  () => validateLabel({
+    format: 'ZPL',
+    payload: Buffer.from('^XA\u0000^FO20,20^FDunsafe^FS^XZ'),
+  }),
+  (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_PAYLOAD_INVALID',
+)
+assert.throws(
+  () => validateLabel({ format: 'PNG', payload: Buffer.from('%PDF-1.7\n%%EOF\n') }),
   (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_PAYLOAD_INVALID',
 )
 
