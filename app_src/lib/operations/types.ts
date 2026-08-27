@@ -651,6 +651,7 @@ export type OperationsOrderListItem = {
   customerGlobalId: string
   sourceProvider: string
   status: OperationsOrderStatus
+  externallyFulfilled: boolean
   warehouseName: string | null
   promisedDeliveryAt: string | null
   lineCount: number

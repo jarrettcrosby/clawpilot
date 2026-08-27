@@ -559,6 +559,18 @@ function displayStatus(status: string) {
   return status.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
+function orderDisplayStatus(
+  order: Pick<OperationsOrderListItem, 'status' | 'externallyFulfilled'>,
+) {
+  return order.externallyFulfilled ? 'Fulfilled externally' : displayStatus(order.status)
+}
+
+function orderStatusColor(
+  order: Pick<OperationsOrderListItem, 'status' | 'externallyFulfilled'>,
+) {
+  return statusColor(order.externallyFulfilled ? 'shipped' : order.status)
+}
+
 function commerceActiveUnavailableLabel(
   option: CommerceActiveAccountOption['capabilities'][number],
 ) {
@@ -1376,7 +1388,12 @@ function OrderDetailDrawer({
           {order && (
             <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 0.75, flexWrap: 'wrap', rowGap: 0.75 }}>
               <Chip size="small" label={order.globalId} variant="outlined" />
-              <Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} />
+              <Chip
+                size="small"
+                label={orderDisplayStatus(order)}
+                color={orderStatusColor(order)}
+                data-testid="order-derived-fulfillment-status"
+              />
             </Stack>
           )}
         </Box>
@@ -2178,6 +2195,7 @@ function OrderDetailDrawer({
                                 const busyKey = artifact?.globalId
                                   || `external-upload:${tracking.number || index}`
                                 const busyLabel = labelPrintBusyGlobalId === busyKey
+                                const bundledAgentCompatible = artifact?.format === 'ZPL'
                                 const printBlockedReason = !canExecute
                                   ? 'Warehouse execution access is required to print labels.'
                                   : !order.warehouseId
@@ -2235,10 +2253,10 @@ function OrderDetailDrawer({
                                           variant="outlined"
                                           startIcon={<OpenInNewRounded />}
                                         >
-                                          Open label
+                                          Download label
                                         </Button>
                                       )}
-                                      {artifact ? (
+                                      {artifact && bundledAgentCompatible ? (
                                         <Tooltip title={printBlockedReason || (
                                           deliveredJob
                                             ? 'Create an audited reprint from these exact retained bytes'
@@ -2289,7 +2307,7 @@ function OrderDetailDrawer({
                                             </Button>
                                           </span>
                                         </Tooltip>
-                                      ) : tracking.number ? (
+                                      ) : !artifact && tracking.number ? (
                                         <Tooltip title={!canManage || !canExecute
                                           ? 'Operations management and warehouse execution access are required.'
                                           : 'Retain the exact original label file without purchasing postage or writing to Shopify'}>
@@ -2319,6 +2337,16 @@ function OrderDetailDrawer({
                                         </Tooltip>
                                       ) : null}
                                     </Stack>
+                                    {artifact && !bundledAgentCompatible && (
+                                      <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                        data-testid={`order-external-label-manual-${artifact.globalId}`}
+                                        sx={{ gridColumn: '1 / -1', textAlign: 'right' }}
+                                      >
+                                        {artifact.format} is available for download and manual printing. The bundled print agent accepts ZPL labels only.
+                                      </Typography>
+                                    )}
                                   </Box>
                                 )
                               })}
@@ -6782,7 +6810,7 @@ export default function OperationsSection({
                     <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
                     <Typography variant="body2" color="text.secondary" noWrap>{order.customerName}</Typography>
                   </Box>
-                  <Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} />
+                  <Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} />
                 </Stack>
                 <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                   <Box sx={{ minWidth: 0 }}>
@@ -6848,7 +6876,7 @@ export default function OperationsSection({
                   <TableRow key={order.globalId} hover onClick={() => chooseOrder(order)} sx={{ cursor: 'pointer' }}>
                     <TableCell><Typography fontWeight={600}>{order.orderNumber}</Typography><Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography></TableCell>
                     <TableCell><Typography>{order.customerName}</Typography><Typography variant="caption" color="text.secondary">{order.customerGlobalId}</Typography></TableCell>
-                    <TableCell><Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} /></TableCell>
+                    <TableCell><Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} /></TableCell>
                     <TableCell>{order.warehouseName || '—'}</TableCell>
                     <TableCell>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: '—' })}</TableCell>
                     <TableCell align="right">{order.lineCount}</TableCell>
