@@ -244,6 +244,7 @@ const context = {
   inventorySnapshotHash: createHash('sha256')
     .update('inventory')
     .digest('hex'),
+  inventoryProducts: [],
   input: {
     mode: 'production',
     lines: [{
@@ -277,6 +278,12 @@ const context = {
     productGid: 'gid://shopify/Product/48447225880',
     variantGid: 'gid://shopify/ProductVariant/258644705304',
     productGlobalId,
+    productMappingGlobalId: 'gpm0000001',
+    cartonizationAuthority: 'product_pack',
+    channelSourceRevision: 'single-carrier-callback-test-1',
+    channelSourceHash: createHash('sha256')
+      .update('channel-source')
+      .digest('hex'),
     packMappingGlobalId: 'gcpm0000001',
     packMappingRowVersion: 1,
     packEvidenceHash: createHash('sha256')
@@ -362,6 +369,8 @@ mock.module('@/lib/persistence/shopifyCheckoutRating', {
   namedExports: {
     SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION:
       'shopify-checkout-line-pack-evidence-v1',
+    SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT:
+      'shopify-checkout-line-pack-evidence-v2',
     async lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres() {
       return {
         organizationId: account.organizationId,

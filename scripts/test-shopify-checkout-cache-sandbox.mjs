@@ -103,7 +103,7 @@ includes(persistence, [
 
 includes(callback, [
   "version: 'shopify-checkout-idempotency-v2'",
-  "version: 'shopify-checkout-execution-fence-v6'",
+  "version: 'shopify-checkout-execution-fence-v7'",
   'return account.checkoutRateControl.rateSource',
   'checkoutRateControl: account.checkoutRateControl',
   'checkoutRuntimeCarrierBindings(account)',

@@ -52,6 +52,11 @@ const legacyUnitMeasurementMigration = [
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
 ]
 
+const shopifyCheckoutUnitMaterialMigration = [
+  'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
+  'e5a480092b91a3b84cbdde09ab5205590014e6169f55715a654cf8eff8632873',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -86,6 +91,8 @@ if (!existsSync(resolve(root, 'package.json'))) {
 if (!existsSync(resolve(root, 'app_src/package.json'))) {
   fail('missing app_src/package.json')
 }
+
+const rootPackage = readJson('package.json')
 
 for (const [relativePath, expectedChecksum] of orderEditingReleaseMigrations) {
   if (!existsSync(resolve(root, relativePath))) {
@@ -127,6 +134,31 @@ for (const requiredFragment of [
     fail(`order-editing release health is missing ${requiredFragment}`)
   }
 }
+const [shopifyCheckoutUnitMaterialMigrationPath,
+  shopifyCheckoutUnitMaterialMigrationChecksum] =
+  shopifyCheckoutUnitMaterialMigration
+if (!existsSync(resolve(root, shopifyCheckoutUnitMaterialMigrationPath))) {
+  fail(
+    `missing Shopify checkout unit-material migration: ${shopifyCheckoutUnitMaterialMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyCheckoutUnitMaterialMigrationPath),
+    ))
+    .digest('hex') !== shopifyCheckoutUnitMaterialMigrationChecksum
+) {
+  fail('Shopify checkout unit-material migration checksum drifted')
+}
+if (
+  !String(rootPackage?.scripts?.['test:shopify-carrier-service-postgres'] || '')
+    .includes('node scripts/test-shopify-checkout-unit-material-postgres.mjs')
+) {
+  fail(
+    'test:shopify-carrier-service-postgres must run checkout unit-material acceptance',
+  )
+}
 
 const healthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
@@ -144,7 +176,6 @@ for (const requiredFragment of [
   }
 }
 
-const rootPackage = readJson('package.json')
 const [shopifyReversalFixtureMigrationPath,
   shopifyReversalFixtureMigrationChecksum] = shopifyReversalFixtureMigration
 if (!existsSync(resolve(root, shopifyReversalFixtureMigrationPath))) {
@@ -599,6 +630,7 @@ for (const requiredPath of [
   'db/migrations/0324_operations_external_fulfillment_label_artifacts.sql',
   'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
+  'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',
@@ -677,6 +709,7 @@ for (const requiredPath of [
   'scripts/test-shopify-order-management-api.mjs',
   'scripts/test-shopify-order-management-ui.mjs',
   'scripts/test-shopify-order-management-health.mjs',
+  'scripts/test-shopify-checkout-unit-material-postgres.mjs',
   'scripts/test-operations-order-editing-release-health-postgres.mjs',
   'scripts/test-carrier-shipping-account-diagnostics.mjs',
   'scripts/test-carrier-shipping-diagnostic-actions.mjs',

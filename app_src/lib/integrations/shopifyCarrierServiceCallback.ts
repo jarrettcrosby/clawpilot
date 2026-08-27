@@ -54,7 +54,7 @@ import {
   lookupShopifyCarrierServiceCallbackPolicyByGlobalIdInPostgres,
   lookupShopifyCheckoutRatingAccountByGlobalIdInPostgres,
   readCachedShopifyCheckoutRateReceiptInPostgres,
-  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
   shopifyCheckoutPackagePlanHash,
   shopifyCheckoutRatingHash,
   type ShopifyCheckoutPackageInput,
@@ -396,7 +396,7 @@ function checkoutExecutionFenceHash(
   )
   return createHash('sha256')
     .update(JSON.stringify({
-      version: 'shopify-checkout-execution-fence-v6',
+      version: 'shopify-checkout-execution-fence-v7',
       accountEnvironment: account.environment,
       storeEntityName: normalizeShopifyStoreEntityName(
         account.storeEntityName,
@@ -417,6 +417,8 @@ function checkoutExecutionFenceHash(
       }),
       planRatePolicy,
       cartonizationInputHash: shopifyCheckoutRatingHash(context.input),
+      inventorySnapshotHash: context.inventorySnapshotHash,
+      inventoryProducts: context.inventoryProducts,
       packLines: [...context.lines]
         .sort((left, right) => left.lineKey.localeCompare(right.lineKey))
         .map((line) => ({
@@ -424,6 +426,10 @@ function checkoutExecutionFenceHash(
           productGid: line.productGid,
           variantGid: line.variantGid,
           productGlobalId: line.productGlobalId,
+          productMappingGlobalId: line.productMappingGlobalId,
+          cartonizationAuthority: line.cartonizationAuthority,
+          channelSourceRevision: line.channelSourceRevision,
+          channelSourceHash: line.channelSourceHash,
           packMappingGlobalId: line.packMappingGlobalId,
           packMappingRowVersion: line.packMappingRowVersion,
           packEvidenceHash: line.packEvidenceHash,
@@ -547,13 +553,26 @@ function feasibleRateCandidate(
   ))
   const requiredByMaterial = new Map<string, number>()
   let materialCostMinor = 0
-  for (const recipePackage of candidate.plan.recipePackages) {
+  const materialPackages = [
+    ...candidate.plan.recipePackages.map((plannedPackage) => ({
+      materialGlobalId: plannedPackage.packagingMaterialGlobalId,
+      materialRowVersion: plannedPackage.packagingMaterialRowVersion,
+      grossWeightGrams: plannedPackage.rateReadiness.ratedWeightGrams,
+    })),
+    ...(candidate.unitMaterialPlan?.packages ?? []).map((plannedPackage) => ({
+      materialGlobalId: plannedPackage.packagingMaterialGlobalId,
+      materialRowVersion: plannedPackage.materialRowVersion,
+      grossWeightGrams: plannedPackage.ratedGrossWeightGrams,
+    })),
+  ]
+  for (const plannedPackage of materialPackages) {
     const evidence = materialEvidence.get(
-      recipePackage.packagingMaterialGlobalId,
+      plannedPackage.materialGlobalId,
     )
-    const gross = recipePackage.rateReadiness.ratedWeightGrams
+    const gross = plannedPackage.grossWeightGrams
     if (
       !evidence
+      || evidence.rowVersion !== plannedPackage.materialRowVersion
       || !gross
     ) {
       return {
@@ -582,10 +601,10 @@ function feasibleRateCandidate(
     }
     materialCostMinor = nextCost
     requiredByMaterial.set(
-      recipePackage.packagingMaterialGlobalId,
+      plannedPackage.materialGlobalId,
       (
         requiredByMaterial.get(
-          recipePackage.packagingMaterialGlobalId,
+          plannedPackage.materialGlobalId,
         ) || 0
       ) + 1,
     )
@@ -696,6 +715,43 @@ function candidatePlanEvidence(
         materialEvidence: plannedPackage.materialEvidence,
       }
     }),
+    ...(candidate.unitMaterialPlan?.packages ?? []).map((plannedPackage) => {
+      const evidence = materialEvidence.get(
+        plannedPackage.packagingMaterialGlobalId,
+      )
+      return {
+        packageKey: plannedPackage.packageKey,
+        sequence: plannedPackage.packageSequence,
+        planningMethod: plannedPackage.planningMethod,
+        materialGlobalId: plannedPackage.packagingMaterialGlobalId,
+        materialRowVersion: plannedPackage.materialRowVersion,
+        materialStockGlobalId: evidence?.stockGlobalId ?? null,
+        materialStockRowVersion: evidence?.stockRowVersion ?? null,
+        materialStockOnHandQuantity:
+          evidence?.stockOnHandQuantity ?? null,
+        materialMaximumGrossWeightGrams:
+          evidence?.maxWeightGrams ?? null,
+        materialUnitCostMinor: evidence?.unitCostMinor ?? null,
+        materialCurrency: evidence?.currency ?? null,
+        packProfileVersionGlobalId: null,
+        packProfileVersionRowVersion: null,
+        ratedOuterDimensionsMm: plannedPackage.ratedOuterDimensionsMm,
+        contentWeightGrams: plannedPackage.contentWeightGrams,
+        tareWeightGrams: plannedPackage.tareWeightGrams,
+        ratedWeightGrams: plannedPackage.ratedGrossWeightGrams,
+        allocations: plannedPackage.allocations.map((allocation) => ({
+          lineGlobalId: allocation.lineGlobalId,
+          productGlobalId: allocation.productGlobalId,
+          quantity: allocation.quantity,
+          unitWeightGrams: plannedPackage.contentWeightGrams,
+          contentWeightGrams: plannedPackage.contentWeightGrams,
+        })),
+        recipeEvidence: [],
+        materialEvidence: {
+          unitMaterialEvidence: plannedPackage.unitMaterialEvidence,
+        },
+      }
+    }),
   ].sort((left, right) => (
     left.sequence - right.sequence
     || left.packageKey.localeCompare(right.packageKey)
@@ -718,6 +774,7 @@ function candidatePlanEvidence(
     unusedCubeMm3: candidate.unusedCubeMm3,
     cubeBasis: candidate.cubeBasis,
     assumptions: candidate.plan.assumptions,
+    unitMaterialEvidence: candidate.unitMaterialPlan?.evidence ?? null,
     packages,
   }
 }
@@ -1662,10 +1719,14 @@ export async function executeShopifyCarrierServiceCallback(input: {
           requiresShipping: true,
           lineSnapshot: {
             snapshotVersion:
-              SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
+              SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
+            cartonizationAuthority: line.cartonizationAuthority,
             productGid: line.productGid,
             variantGid: line.variantGid,
             productGlobalId: line.productGlobalId,
+            productMappingGlobalId: line.productMappingGlobalId,
+            channelSourceRevision: line.channelSourceRevision,
+            channelSourceHash: line.channelSourceHash,
             packMappingGlobalId: line.packMappingGlobalId,
             packMappingRowVersion: line.packMappingRowVersion,
             packEvidenceHash: line.packEvidenceHash,
@@ -1738,6 +1799,8 @@ export async function executeShopifyCarrierServiceCallback(input: {
           currencyContext,
           planRatePolicy,
         ),
+        unitMaterialInventoryProducts:
+          currencyContext.inventoryProducts,
       },
     )
     const plannedCandidateByKey = new Map(
@@ -1889,7 +1952,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     if (!selectedPlannedCandidate) {
       throw new Error('Selected carton plan evidence is unavailable')
     }
-    const { plan } = selectedPlannedCandidate
+    const { plan, unitMaterialPlan } = selectedPlannedCandidate
     const rateAttemptByKey = new Map(
       optimized.candidateAttempts.map((attempt) => [
         attempt.candidate.candidateKey,
@@ -2013,6 +2076,52 @@ export async function executeShopifyCarrierServiceCallback(input: {
           },
         }
       })
+    const unitMaterialPackages: ShopifyCheckoutPackageInput[] =
+      (unitMaterialPlan?.packages ?? []).map((unitPackage) => {
+        const materialEvidence = context.materials.find(
+          (material) => (
+            material.materialGlobalId
+              === unitPackage.packagingMaterialGlobalId
+          ),
+        )
+        if (
+          !materialEvidence
+          || materialEvidence.rowVersion !== unitPackage.materialRowVersion
+        ) {
+          throw new Error(
+            'Unit-material plan lacks retained material evidence',
+          )
+        }
+        return {
+          planningMethod: 'unit_material_selection',
+          packageKey: unitPackage.packageKey,
+          packageSequence: unitPackage.packageSequence,
+          materialGlobalId: unitPackage.packagingMaterialGlobalId,
+          materialRowVersion: unitPackage.materialRowVersion,
+          materialStockGlobalId: materialEvidence.stockGlobalId,
+          materialStockRowVersion: materialEvidence.stockRowVersion,
+          materialStockOnHandQuantity:
+            materialEvidence.stockOnHandQuantity,
+          ratedOuterDimensionsMm: unitPackage.ratedOuterDimensionsMm,
+          contentWeightGrams: unitPackage.contentWeightGrams,
+          tareWeightGrams: unitPackage.tareWeightGrams,
+          allocations: unitPackage.allocations.map((allocation) => ({
+            lineKey: allocation.lineGlobalId,
+            quantity: allocation.quantity,
+          })),
+          packageSnapshot: {
+            planningMethod: unitPackage.planningMethod,
+            materialGlobalId: unitPackage.packagingMaterialGlobalId,
+            materialRowVersion: unitPackage.materialRowVersion,
+            ratedOuterDimensionsMm: unitPackage.ratedOuterDimensionsMm,
+            contentWeightGrams: unitPackage.contentWeightGrams,
+            tareWeightGrams: unitPackage.tareWeightGrams,
+            allocations: unitPackage.allocations,
+            unitMaterialEvidence: unitPackage.unitMaterialEvidence,
+            planEvidence: unitMaterialPlan?.evidence ?? null,
+          },
+        }
+      })
     const selfPackages: ShopifyCheckoutPackageInput[] =
       plan.selfPackages.map((selfPackage) => {
         const allocation = selfPackage.lineAllocations[0]
@@ -2065,6 +2174,7 @@ export async function executeShopifyCarrierServiceCallback(input: {
     const packages: ShopifyCheckoutPackageInput[] = [
       ...selfPackages,
       ...recipePackages,
+      ...unitMaterialPackages,
     ].sort((left, right) => (
       left.packageSequence - right.packageSequence
       || left.packageKey.localeCompare(right.packageKey)
