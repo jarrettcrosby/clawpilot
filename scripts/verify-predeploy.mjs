@@ -67,6 +67,11 @@ const legacyUnitMeasurementMigration = [
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
 ]
 
+const orderUnitWeightMigration = [
+  'db/migrations/0334_operations_order_unit_weight_evidence.sql',
+  '15a98ccbcde18418f795d319726521340b444c1cbb9d693ac5f8460cb90cfa2b',
+]
+
 const shopifyCheckoutUnitMaterialMigration = [
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
   'e5a480092b91a3b84cbdde09ab5205590014e6169f55715a654cf8eff8632873',
@@ -170,6 +175,48 @@ if (
     .digest('hex') !== shopifyCheckoutUnitMaterialMigrationChecksum
 ) {
   fail('Shopify checkout unit-material migration checksum drifted')
+}
+
+const [orderUnitWeightMigrationPath, orderUnitWeightMigrationChecksum] =
+  orderUnitWeightMigration
+if (!existsSync(resolve(root, orderUnitWeightMigrationPath))) {
+  fail(`missing order unit-weight migration: ${orderUnitWeightMigrationPath}`)
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, orderUnitWeightMigrationPath)))
+    .digest('hex') !== orderUnitWeightMigrationChecksum
+) {
+  fail('Order unit-weight migration checksum drifted')
+}
+const orderUnitWeightHealthPath =
+  'app_src/lib/persistence/operationsOrderUnitWeightHealth.ts'
+const orderUnitWeightHealthSource = readFileSync(
+  resolve(root, orderUnitWeightHealthPath),
+  'utf8',
+)
+for (const requiredFragment of [
+  orderUnitWeightMigrationChecksum,
+  'OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL',
+  'operations_order_unit_weight_facts',
+  'protect_operations_order_unit_weight_receipt',
+]) {
+  if (!orderUnitWeightHealthSource.includes(requiredFragment)) {
+    fail(`order unit-weight health is missing ${requiredFragment}`)
+  }
+}
+const healthRouteSource = readFileSync(
+  resolve(root, 'app_src/app/api/health/route.ts'),
+  'utf8',
+)
+for (const requiredFragment of [
+  'OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL',
+  'operations_order_unit_weight_applied',
+  '${OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}',
+]) {
+  if (!healthRouteSource.includes(requiredFragment)) {
+    fail(`health route is missing order unit-weight wiring: ${requiredFragment}`)
+  }
 }
 if (
   !String(rootPackage?.scripts?.['test:shopify-carrier-service-postgres'] || '')

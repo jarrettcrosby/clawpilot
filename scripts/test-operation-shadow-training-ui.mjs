@@ -68,9 +68,23 @@ for (const fragment of [
   'This evidence is reused exactly as sealed',
   'store writes',
   'const primaryAction = canPlanImportedOrder',
+  'Order unit weights are read-only in training.',
+  'Order unit weights cannot be changed in training.',
 ]) {
   assert.ok(operations.includes(fragment), `Operations training integration is missing ${fragment}`)
 }
+const unitWeightSaveStart = operations.indexOf(
+  'const savePlanUnitWeights = async () =>',
+)
+const unitWeightSaveRequest = operations.indexOf(
+  "fetch('/api/operations/order-unit-weights'",
+  unitWeightSaveStart,
+)
+assert.match(
+  operations.slice(unitWeightSaveStart, unitWeightSaveRequest),
+  /if \(shadowTrainingPlanTarget\)/,
+  'local training must fail before any canonical unit-weight write',
+)
 assert.doesNotMatch(
   operations,
   /order\.sourceProvider === 'shopify' && activationState !== 'shadow'/,

@@ -686,6 +686,64 @@ assert.throws(
   'A one-each line without a Product pack must still fail closed on weight',
 )
 
+const orderSpecificUnitCandidate = {
+  ...unconstrainedUnitCandidate,
+  channel_weight_grams: null,
+  order_unit_weight_fact_global_id: 'gouw1vbvhkqodkjl',
+  order_unit_weight_fact_version: 1,
+  order_unit_weight_grams: 907,
+  order_unit_weight_line_source_revision:
+    unconstrainedUnitCandidate.line_source_revision,
+  order_unit_weight_line_source_hash:
+    unconstrainedUnitCandidate.line_source_hash,
+  order_unit_weight_request_hash: '7'.repeat(64),
+  order_unit_weight_fact_hash: '6'.repeat(64),
+  order_unit_weight_recorded_at: '2026-08-27T16:00:00.000Z',
+}
+const mappedOrderSpecificUnit = mapCandidateLines(
+  { mode: 'production' },
+  [orderSpecificUnitCandidate],
+)[0]
+assert.equal(
+  mappedOrderSpecificUnit.packProfileVersionId,
+  null,
+  'Order-specific weight evidence must not create a Product-pack assignment',
+)
+assert.equal(
+  mappedOrderSpecificUnit.line.unitWeightGrams,
+  907,
+  'An exact order-specific fact must supply the missing ordinary-unit weight',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightSource,
+  'order_specific',
+  'The retained source must distinguish operator order evidence from provider data',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightEvidenceReference,
+  orderSpecificUnitCandidate.order_unit_weight_fact_global_id,
+  'Cartonization must retain the exact append-only fact identity',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightEvidenceHash,
+  orderSpecificUnitCandidate.order_unit_weight_fact_hash,
+  'Cartonization must retain the deterministic fact-scoped hash',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{
+      ...orderSpecificUnitCandidate,
+      order_unit_weight_line_source_hash: '5'.repeat(64),
+    }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_UNIT_ORDER_EVIDENCE_INVALID'
+  ),
+  'Order-specific weight evidence must fail closed when exact source lineage differs',
+)
+
 const legacyOrderSpecificUnitCandidate = {
   ...unconstrainedUnitCandidate,
   global_id: 'gcol1vbvhkqodkjl',

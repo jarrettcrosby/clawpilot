@@ -997,7 +997,10 @@ async function installImportedWorkbenchRoutes(
   return capture
 }
 
-async function installImportedOrderPreparationRoutes(page: Page) {
+async function installImportedOrderPreparationRoutes(
+  page: Page,
+  options: { missingUnitWeight?: boolean } = {},
+) {
   const authorizationIssuedAt = Date.now()
   const canonicalAuthorization = {
     authorizationGlobalId: 'gsea7654321',
@@ -1160,6 +1163,33 @@ async function installImportedOrderPreparationRoutes(page: Page) {
   }
   let planned = false
   let authorized = false
+  let orderUnitWeightGrams = options.missingUnitWeight ? null : 170
+  let orderUnitWeightFactVersion: number | null = null
+  const unitWeightRequests: Array<Record<string, unknown>> = []
+  const orderUnitWeightWorkspace = () => {
+    const line = {
+      lineGlobalId: 'gcol7654321',
+      productTitle: 'Test Product',
+      variantTitle: 'Vanilla',
+      quantity: 1,
+      unitWeightGrams: orderUnitWeightGrams,
+      weightSource: orderUnitWeightFactVersion === null
+        ? (orderUnitWeightGrams === null ? null : 'provider_catalog')
+        : 'order_specific',
+      factGlobalId: orderUnitWeightFactVersion === null
+        ? null
+        : 'gouw7654321',
+      factVersion: orderUnitWeightFactVersion,
+    }
+    return {
+      accountGlobalId: 'gia9286799',
+      candidateGlobalId: 'gcoc35vrs9qjtmee',
+      candidateRowVersion: 10,
+      orderGlobalId: 'gor7654321',
+      missingLines: orderUnitWeightGrams === null ? [line] : [],
+      effectiveLines: orderUnitWeightGrams === null ? [] : [line],
+    }
+  }
 
   await page.route((url) => url.pathname === '/api/operations/training', async (route) => {
     await route.fulfill({
@@ -1219,6 +1249,52 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             providerWrites: 0,
           },
         },
+      })
+    },
+  )
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-unit-weights',
+    async (route) => {
+      if (route.request().method() === 'POST') {
+        const request = route.request().postDataJSON() as Record<string, unknown>
+        unitWeightRequests.push(request)
+        const lines = request.lines as Array<{
+          expectedFactVersion: number | null
+          lineGlobalId: string
+          unitWeightGrams: number
+        }>
+        expect(route.request().headers()['idempotency-key'])
+          .toMatch(/^operations-unit-weight:/)
+        expect(request).toMatchObject({
+          accountGlobalId: 'gia9286799',
+          candidateGlobalId: 'gcoc35vrs9qjtmee',
+          candidateRowVersion: 10,
+        })
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toMatchObject({
+          expectedFactVersion: orderUnitWeightFactVersion,
+          lineGlobalId: 'gcol7654321',
+        })
+        orderUnitWeightGrams = lines[0].unitWeightGrams
+        orderUnitWeightFactVersion = (orderUnitWeightFactVersion || 0) + 1
+        return route.fulfill({
+          json: {
+            ok: true,
+            result: {
+              replayed: false,
+              candidateGlobalId: 'gcoc35vrs9qjtmee',
+              orderGlobalId: 'gor7654321',
+              providerWriteCount: 0,
+              factGlobalIds: ['gouw7654321'],
+              workspace: orderUnitWeightWorkspace(),
+            },
+          },
+        })
+      }
+      expect(route.request().url()).toContain('candidateRowVersion=10')
+      return route.fulfill({
+        json: { ok: true, workspace: orderUnitWeightWorkspace() },
       })
     },
   )
@@ -1416,6 +1492,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
       },
     })
   })
+  return { unitWeightRequests }
 }
 
 async function installOperationsNavigationRoute(page: Page) {
@@ -2203,6 +2280,48 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await expect(page.getByText(/was planned from gcte7654321/)).toBeVisible()
   await expect(page.getByRole('button', { name: 'Release to warehouse' })).toBeVisible()
   await expect(page.getByText('Not Released')).toBeVisible()
+})
+
+test('ordinary-unit weights save and invalidate stale cartonization before planning', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installImportedOrderPreparationRoutes(page, {
+    missingUnitWeight: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#6600/ }).click()
+  await page.getByTestId('authorize-shopify-test-store-canonical-e2e').click()
+  await page.getByTestId('sandbox-commerce-e2e-confirmation').check()
+  await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
+  await page.getByRole('button', { name: 'Prepare order' }).click()
+
+  await expect(page.getByText('Missing unit weights')).toBeVisible()
+  await expect(page.getByText('Vanilla · Quantity 1')).toBeVisible()
+  const unitWeight = page.getByLabel(/^Unit weight/)
+  const runCartonization = page.getByRole('button', {
+    name: 'Run cartonization and compare rates',
+  })
+  const saveUnitWeights = page.getByRole('button', { name: 'Save unit weights' })
+  await expect(runCartonization).toBeDisabled()
+  await expect(saveUnitWeights).toBeDisabled()
+  await unitWeight.fill('1')
+  await page.getByLabel('Audit reason').fill('Measured on the receiving scale')
+  await saveUnitWeights.click()
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(1)
+  await expect(page.getByText('Order unit weights')).toBeVisible()
+  await expect(runCartonization).toBeEnabled()
+
+  await runCartonization.click()
+  await expect(page.getByText('UPS · UPS Ground')).toBeVisible()
+  await unitWeight.fill('1.25')
+  await expect(page.getByText('UPS · UPS Ground')).toHaveCount(0)
+  await expect(runCartonization).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Confirm warehouse plan' }))
+    .toBeDisabled()
+  await page.getByLabel('Audit reason').fill('Corrected after scale verification')
+  await saveUnitWeights.click()
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(2)
+  await expect(runCartonization).toBeEnabled()
 })
 
 test('operations tabs support touch navigation without portrait or landscape overflow', async ({ page }) => {
