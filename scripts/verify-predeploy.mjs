@@ -52,6 +52,11 @@ const shopifyReversalFixtureProfileV3Migration = [
   '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e',
 ]
 
+const shopifyReversalFixtureProfileV4Migration = [
+  'db/migrations/0332_operations_shopify_reversal_fixture_profile_v4.sql',
+  'c54ec1a30b9c5d8b24d50a429f9e8e83d238c0fb3810484ec960ea4737a33ec6',
+]
+
 const legacyUnitMeasurementMigration = [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
@@ -251,9 +256,27 @@ if (
 ) {
   fail('Shopify reversal fixture v3 migration checksum drifted')
 }
+const [shopifyReversalFixtureProfileV4MigrationPath,
+  shopifyReversalFixtureProfileV4MigrationChecksum] =
+  shopifyReversalFixtureProfileV4Migration
+if (!existsSync(resolve(root, shopifyReversalFixtureProfileV4MigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture v4 migration: ${shopifyReversalFixtureProfileV4MigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyReversalFixtureProfileV4MigrationPath),
+    ))
+    .digest('hex') !== shopifyReversalFixtureProfileV4MigrationChecksum
+) {
+  fail('Shopify reversal fixture v4 migration checksum drifted')
+}
 const shopifyReversalFixtureRequiredFiles = [
   shopifyReversalFixtureProviderErrorsMigrationPath,
   shopifyReversalFixtureProfileV3MigrationPath,
+  shopifyReversalFixtureProfileV4MigrationPath,
   'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
   'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
@@ -336,6 +359,9 @@ if (
   )
   || !shopifyReversalFixtureHealthSource.includes(
     shopifyReversalFixtureProfileV3MigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProfileV4MigrationChecksum,
   )
   || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
   || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')

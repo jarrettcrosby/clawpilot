@@ -30,14 +30,14 @@ const ORDER_CREATE_ERROR_CODES = new Set([
 ])
 
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION =
-  'shopify-reversal-fixture-v3' as const
+  'shopify-reversal-fixture-v4' as const
 export const SHOPIFY_REVERSAL_FIXTURE_BASE_TAG =
   'clawpilot-reversal-fixture' as const
 
 export const SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE = Object.freeze({
   version: SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION,
   test: true as const,
-  financialStatus: 'PENDING' as const,
+  expectedFinancialStatus: 'PENDING' as const,
   marketingConsent: 'UNSET' as const,
   sendReceipt: false as const,
   sendFulfillmentReceipt: false as const,
@@ -224,7 +224,9 @@ function exactOrderProviderPayload(input: {
   const variables = Object.freeze({
     order: Object.freeze({
       test: true as const,
-      financialStatus: 'PENDING' as const,
+      // Shopify derives the unpaid state when this fixed fixture has no
+      // transactions. The response must still prove PENDING before ClawPilot
+      // accepts the provider outcome.
       // The fixture has no customer or email, so marketing consent must remain
       // unset in Shopify. Receipt and fulfillment notifications remain off.
       sourceIdentifier,
@@ -243,7 +245,7 @@ function exactOrderProviderPayload(input: {
     }),
   })
   const providerPayloadHash = createHash('sha256').update(JSON.stringify({
-    version: 'shopify-reversal-fixture-order-provider-payload-v2',
+    version: 'shopify-reversal-fixture-order-provider-payload-v3',
     shopDomain,
     variables,
   })).digest('hex')

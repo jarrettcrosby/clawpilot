@@ -12,12 +12,17 @@ export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION =
   '0330_operations_shopify_reversal_fixture_profile_v3.sql' as const
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM =
   '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION =
+  '0332_operations_shopify_reversal_fixture_profile_v4.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM =
+  'c54ec1a30b9c5d8b24d50a429f9e8e83d238c0fb3810484ec960ea4737a33ec6' as const
 
 export async function readShopifyReversalFixtureHealthInPostgres() {
   const structural = await query<{
     migration_current: boolean
     provider_error_migration_current: boolean
     profile_v3_migration_current: boolean
+    profile_v4_migration_current: boolean
     command_table: boolean
     approval_table: boolean
     attempt_table: boolean
@@ -53,6 +58,11 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
          WHERE migration.filename = $5
            AND migration.checksum = $6
        ) AS profile_v3_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $7
+           AND migration.checksum = $8
+       ) AS profile_v4_migration_current,
        to_regclass('public.operations_shopify_reversal_fixture_commands')
          IS NOT NULL AS command_table,
        to_regclass('public.operations_shopify_reversal_fixture_approvals')
@@ -92,7 +102,7 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
              'shopify_reversal_fixture_commands_profile_version_valid'
            AND constraint_definition.convalidated
            AND pg_catalog.pg_get_constraintdef(constraint_definition.oid)
-             LIKE '%shopify-reversal-fixture-v3%'
+             LIKE '%shopify-reversal-fixture-v4%'
        ) AS profile_version_constraint,
        (
          SELECT count(*) = 2
@@ -166,6 +176,8 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
       SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION_CHECKSUM,
       SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION,
       SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM,
     ],
   )
   const row = structural.rows[0]
@@ -173,6 +185,7 @@ export async function readShopifyReversalFixtureHealthInPostgres() {
     row?.migration_current
     && row.provider_error_migration_current
     && row.profile_v3_migration_current
+    && row.profile_v4_migration_current
     && row.command_table
     && row.approval_table
     && row.attempt_table

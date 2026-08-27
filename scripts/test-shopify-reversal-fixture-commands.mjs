@@ -270,7 +270,7 @@ vm.runInNewContext(output, {
       return {
         SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE: {
           test: true,
-          financialStatus: 'PENDING',
+          expectedFinancialStatus: 'PENDING',
           marketingConsent: 'UNSET',
           sendReceipt: false,
           sendFulfillmentReceipt: false,
@@ -280,7 +280,7 @@ vm.runInNewContext(output, {
           requiresShipping: true,
         },
         SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION:
-          'shopify-reversal-fixture-v3',
+          'shopify-reversal-fixture-v4',
         shopifyReversalFixtureTagFingerprint: (tag) => (
           createHash('sha256').update(tag).digest('hex')
         ),

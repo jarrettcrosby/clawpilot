@@ -22,6 +22,8 @@ const providerErrorMigrationPath =
   'db/migrations/0328_operations_shopify_reversal_fixture_provider_errors.sql'
 const profileV3MigrationPath =
   'db/migrations/0330_operations_shopify_reversal_fixture_profile_v3.sql'
+const profileV4MigrationPath =
+  'db/migrations/0332_operations_shopify_reversal_fixture_profile_v4.sql'
 const healthPath =
   'app_src/lib/persistence/shopifyReversalFixtureHealth.ts'
 const healthRoutePath = 'app_src/app/api/health/route.ts'
@@ -41,6 +43,10 @@ const providerErrorMigration = readFileSync(
 )
 const profileV3Migration = readFileSync(
   resolve(root, profileV3MigrationPath),
+  'utf8',
+)
+const profileV4Migration = readFileSync(
+  resolve(root, profileV4MigrationPath),
   'utf8',
 )
 const checksum = createHash('sha256').update(migration).digest('hex')
@@ -114,6 +120,10 @@ for (const fragment of [
   profileV3MigrationPath.split('/').at(-1),
   createHash('sha256').update(profileV3Migration).digest('hex'),
   'profile_v3_migration_current',
+  'SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION',
+  profileV4MigrationPath.split('/').at(-1),
+  createHash('sha256').update(profileV4Migration).digest('hex'),
+  'profile_v4_migration_current',
   'provider_error_column',
   'provider_error_constraint',
   'profile_version_constraint',
@@ -165,6 +175,23 @@ assert.doesNotMatch(
   profileV3Migration,
   /^\s*(?:BEGIN|COMMIT);\s*$/imu,
   '0330 must use the migrator transaction',
+)
+for (const fragment of [
+  'shopify_reversal_fixture_commands_profile_version_valid',
+  "'shopify-reversal-fixture-v1'",
+  "'shopify-reversal-fixture-v2'",
+  "'shopify-reversal-fixture-v3'",
+  "'shopify-reversal-fixture-v4'",
+]) {
+  assert.ok(
+    profileV4Migration.includes(fragment),
+    `0332 must include ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  profileV4Migration,
+  /^\s*(?:BEGIN|COMMIT);\s*$/imu,
+  '0332 must use the migrator transaction',
 )
 for (const fragment of [
   'providerErrorSummary?: string | null',
@@ -244,6 +271,7 @@ vm.runInNewContext(output, {
             migration_current: structureCurrent,
             provider_error_migration_current: structureCurrent,
             profile_v3_migration_current: structureCurrent,
+            profile_v4_migration_current: structureCurrent,
             command_table: structureCurrent,
             approval_table: structureCurrent,
             attempt_table: structureCurrent,
@@ -350,7 +378,7 @@ assert.match(
 )
 assert.match(
   orderProviderSource,
-  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v2'[\s\S]*variables/u,
+  /tags: Object\.freeze\(\[SHOPIFY_REVERSAL_FIXTURE_BASE_TAG, uniqueTag\]\)[\s\S]*version: 'shopify-reversal-fixture-order-provider-payload-v3'[\s\S]*variables/u,
 )
 assert.match(
   persistenceSource,
