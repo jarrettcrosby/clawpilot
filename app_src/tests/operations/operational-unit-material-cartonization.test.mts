@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
   planOperationalUnitMaterialPackages,
+  planShopifyCheckoutUnitMaterialPackages,
 } from '../../lib/operations/operationalUnitMaterialCartonization.ts'
 import type {
   HybridCartonizationLine,
@@ -173,6 +174,51 @@ test('unit-material planning fails closed when provider inventory is short', () 
   const result = planOperationalUnitMaterialPackages({
     ...baseInput,
     inventoryProducts: inventory(2),
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_INVENTORY_REQUIRED',
+  )
+})
+
+test('checkout unit-material planning retains quote-only availability authority', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    materials: baseInput.materials.map((item) => ({
+      ...item,
+      unitCostMinor: null,
+      currency: null,
+    })),
+    inventoryProducts: [{
+      productGlobalId: line.productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot',
+      effectiveAvailableQuantity: 3,
+      sourceLevelGlobalIds: ['gcil0000001', 'gcil0000002'],
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 3)
+  assert.equal(
+    result.evidence.inventoryAuthority,
+    'shopify_checkout_available_snapshot',
+  )
+  assert.equal(
+    result.evidence.materialAuthority,
+    'selected_material_stock_snapshot',
+  )
+  assert.ok(result.packages.every((item) => (
+    item.allocations.length === 1
+    && item.allocations[0].quantity === 1
+  )))
+})
+
+test('checkout unit-material planning rejects order-commitment authority substitution', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    inventoryProducts: inventory(),
   })
   assert.equal(result.status, 'blocked')
   if (result.status !== 'blocked') return

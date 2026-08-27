@@ -30,14 +30,15 @@ function canonicalUnitMaterialHash(value: unknown) {
     .digest('hex')
 }
 
-type InventoryProductEvidence = {
+export type OperationalUnitMaterialInventoryProductEvidence = {
   productGlobalId: string
   availabilityAuthority:
     | 'operational_available'
     | 'shopify_provider_commitment'
+    | 'shopify_checkout_available_snapshot'
     | 'shadow_training_simulated'
-  providerCommittedQuantity: number
-  activeReservedQuantity: number
+  providerCommittedQuantity?: number
+  activeReservedQuantity?: number
   effectiveAvailableQuantity: number
   sourceLevelGlobalIds: string[]
   sourcePositionGlobalIds?: string[]
@@ -95,8 +96,10 @@ export type OperationalUnitMaterialPlan =
         unitWeightAuthority: 'provider_or_order_specific'
         materialAuthority:
           'current_active_material_and_unclaimed_warehouse_stock'
+          | 'selected_material_stock_snapshot'
         inventoryAuthority:
           'shopify_provider_commitment_less_active_reservations'
+          | 'shopify_checkout_available_snapshot'
           | 'shadow_training_simulated'
         transformationHash: string
       }
@@ -160,19 +163,28 @@ function recipeProductUsage(packages: HybridRecipePackage[]) {
  * No fit or unit-combination claim is made; current provider/order weight,
  * material capacity, stock, and inventory authority remain fail-closed.
  */
-export function planOperationalUnitMaterialPackages(input: {
+export type OperationalUnitMaterialPlanInput = {
   provider: 'shopify' | 'faire'
   lines: HybridCartonizationLine[]
   fallbackLines: HybridCartonizationResult['geometryFallbackLines']
   recipePackages: HybridRecipePackage[]
   materials: HybridCartonizationMaterial[]
-  inventoryProducts: InventoryProductEvidence[]
-  availabilityMode?: 'operational' | 'shadow_training_simulated'
+  inventoryProducts: OperationalUnitMaterialInventoryProductEvidence[]
+  availabilityMode?:
+    | 'operational'
+    | 'shopify_checkout_available_snapshot'
+    | 'shadow_training_simulated'
   startingSequence: number
   maximumPackages: number
-}): OperationalUnitMaterialPlan {
+}
+
+export function planOperationalUnitMaterialPackages(
+  input: OperationalUnitMaterialPlanInput,
+): OperationalUnitMaterialPlan {
   const shadowTraining =
     input.availabilityMode === 'shadow_training_simulated'
+  const checkoutAvailable =
+    input.availabilityMode === 'shopify_checkout_available_snapshot'
   if (input.provider !== 'shopify' && !shadowTraining) {
     return blocked(
       'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVIDER_UNSUPPORTED',
@@ -235,7 +247,14 @@ export function planOperationalUnitMaterialPackages(input: {
     const validShadow = shadowTraining
       && inventory?.availabilityAuthority === 'shadow_training_simulated'
       && available >= demand
+    const validCheckout = checkoutAvailable
+      && inventory?.availabilityAuthority
+        === 'shopify_checkout_available_snapshot'
+      && inventory.sourceLevelGlobalIds.length > 0
+      && nonnegativeInteger(inventory.effectiveAvailableQuantity)
+      && available >= demand
     const validOperational = !shadowTraining
+      && !checkoutAvailable
       && inventory?.availabilityAuthority === 'shopify_provider_commitment'
       && inventory.sourceLevelGlobalIds.length === 1
       && (inventory.sourcePositionGlobalIds || []).length === 1
@@ -245,7 +264,7 @@ export function planOperationalUnitMaterialPackages(input: {
       && inventory.providerCommittedQuantity - inventory.activeReservedQuantity
         === inventory.effectiveAvailableQuantity
       && available >= demand
-    if (!validShadow && !validOperational) {
+    if (!validShadow && !validCheckout && !validOperational) {
       return blocked(
         'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_INVENTORY_REQUIRED',
         `Unit item ${productGlobalId} lacks exact available inventory authority for ${demand} unit(s).`,
@@ -273,8 +292,13 @@ export function planOperationalUnitMaterialPackages(input: {
       || outer.height < inner.height
       || !positiveInteger(material.tareWeightGrams)
       || !positiveInteger(material.maximumGrossWeightGrams)
-      || !positiveInteger(material.unitCostMinor)
-      || !material.currency
+      || (
+        !checkoutAvailable
+        && (
+          !positiveInteger(material.unitCostMinor)
+          || !material.currency
+        )
+      )
       || !positiveInteger(available)
     ) return []
     materialRemaining.set(material.materialGlobalId, available)
@@ -368,12 +392,33 @@ export function planOperationalUnitMaterialPackages(input: {
         'largest_selected_factual_container_with_available_stock',
       unitsPerPackage: 1,
       unitWeightAuthority: 'provider_or_order_specific',
-      materialAuthority:
-        'current_active_material_and_unclaimed_warehouse_stock',
+      materialAuthority: checkoutAvailable
+        ? 'selected_material_stock_snapshot'
+        : 'current_active_material_and_unclaimed_warehouse_stock',
       inventoryAuthority: shadowTraining
         ? 'shadow_training_simulated'
-        : 'shopify_provider_commitment_less_active_reservations',
+        : checkoutAvailable
+          ? 'shopify_checkout_available_snapshot'
+          : 'shopify_provider_commitment_less_active_reservations',
       transformationHash: canonicalUnitMaterialHash(packages),
     },
   }
+}
+
+/**
+ * Checkout rating uses a fresh, read-only Shopify availability snapshot. It
+ * does not imply provider commitment, reserve product inventory, or claim
+ * packaging stock. The returned cartons are quote candidates only.
+ */
+export function planShopifyCheckoutUnitMaterialPackages(
+  input: Omit<
+    OperationalUnitMaterialPlanInput,
+    'provider' | 'availabilityMode'
+  >,
+): OperationalUnitMaterialPlan {
+  return planOperationalUnitMaterialPackages({
+    ...input,
+    provider: 'shopify',
+    availabilityMode: 'shopify_checkout_available_snapshot',
+  })
 }
