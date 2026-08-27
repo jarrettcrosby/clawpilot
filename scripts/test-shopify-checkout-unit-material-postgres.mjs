@@ -175,7 +175,7 @@ async function seedFixture(client) {
          repeat('3', 64), repeat('4', 64), repeat('5', 64), '{}'::jsonb,
          'USD', 'checkout-unit-material-postgres', 'processing',
          gen_random_uuid(), now() + interval '5 minutes',
-         'test:checkout-unit-material', 4, repeat('6', 64), now(),
+         'test:checkout-unit-material', 8, repeat('6', 64), now(),
          86400, now() + interval '1 day', now(), now()
        )`,
       [receiptId, organizationId, accountId, configId, warehouseId],
@@ -262,7 +262,69 @@ async function seedFixture(client) {
          repeat('a', 64),
          '{
            "snapshotVersion":"shopify-checkout-line-pack-evidence-v99",
-           "cartonizationAuthority":"product_pack"
+           "cartonizationAuthority":"product_pack",
+           "packMappingGlobalId":"gcvmh00000000004",
+           "packProfileVersionGlobalId":"gppvh00000000004"
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-5',
+         'gid://shopify/ProductVariant/5', 'LEGACY-PACK-5', 1, 600, true,
+         repeat('b', 64),
+         '{
+           "productGid":"gid://shopify/Product/5",
+           "variantGid":"gid://shopify/ProductVariant/5",
+           "productGlobalId":"gph00000000005",
+           "packMappingGlobalId":"gcvmh00000000005",
+           "packProfileVersionGlobalId":"gppvh00000000005",
+           "packProfileVersionRowVersion":1,
+           "packageLevel":"each",
+           "baseEachQuantity":1,
+           "shipsAsOwnPackage":false,
+           "inventoryLevelGlobalIds":["giilh00000000005"],
+           "quantity":1,
+           "unitWeightGrams":600
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-6',
+         'gid://shopify/ProductVariant/6', 'MALFORMED-LEGACY-6', 1, 700, true,
+         repeat('c', 64),
+         '{
+           "productGid":"gid://shopify/Product/6",
+           "variantGid":"gid://shopify/ProductVariant/6",
+           "packMappingGlobalId":"gcvmh00000000006",
+           "quantity":1,
+           "unitWeightGrams":700
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-7',
+         'gid://shopify/ProductVariant/7', 'NULL-VERSION-7', 1, 800, true,
+         repeat('d', 64),
+         '{
+           "snapshotVersion":null,
+           "productGid":"gid://shopify/Product/7",
+           "variantGid":"gid://shopify/ProductVariant/7",
+           "packMappingGlobalId":"gcvmh00000000007",
+           "packProfileVersionGlobalId":"gppvh00000000007",
+           "quantity":1,
+           "unitWeightGrams":800
+         }'::jsonb
+       ), (
+         $1::uuid, $2::uuid, 'line-8',
+         'gid://shopify/ProductVariant/8', 'LEGACY-PACK-8', 1, 900, true,
+         repeat('e', 64),
+         '{
+           "productGid":"gid://shopify/Product/8",
+           "variantGid":"gid://shopify/ProductVariant/8",
+           "productGlobalId":"gph00000000008",
+           "packMappingGlobalId":"gcvmh00000000008",
+           "packProfileVersionGlobalId":"gppvh00000000008",
+           "packProfileVersionRowVersion":1,
+           "packageLevel":"each",
+           "baseEachQuantity":1,
+           "shipsAsOwnPackage":false,
+           "inventoryLevelGlobalIds":["giilh00000000008"],
+           "quantity":1,
+           "unitWeightGrams":900
          }'::jsonb
        )`,
       [organizationId, receiptId],
@@ -307,6 +369,25 @@ async function insertPackage(client, input) {
   ])
 }
 
+async function seedLegacyAllocationBeforeMigration(client) {
+  await insertPackage(client, {
+    packageKey: 'legacy-package-0',
+    packageSequence: 11,
+    planningMethod: 'approved_recipe',
+    hashDigit: '0',
+  })
+  await client.query(
+    `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+       organization_id, receipt_id, package_key, line_key,
+       quantity, allocation_hash
+     ) VALUES (
+       $1::uuid, $2::uuid, 'legacy-package-0', 'line-5',
+       1, repeat('0', 64)
+     )`,
+    [organizationId, receiptId],
+  )
+}
+
 async function expectRejected(
   client,
   label,
@@ -333,7 +414,6 @@ async function verify(databaseUrl) {
   const pool = new Pool({ connectionString: databaseUrl, max: 1 })
   const client = await pool.connect()
   try {
-    await seedFixture(client)
     const schema = await client.query(
       `SELECT
          pg_get_constraintdef(
@@ -377,6 +457,19 @@ async function verify(databaseUrl) {
          ) AS value`,
       ).then((result) => result.rows[0].value),
       /package method conflicts with retained line authority/,
+    )
+    assert.equal(
+      await client.query(
+        `SELECT count(*)::int AS value
+         FROM operations_shopify_checkout_rate_receipt_allocations
+         WHERE organization_id = $1::uuid
+           AND receipt_id = $2::uuid
+           AND package_key = 'legacy-package-0'
+           AND line_key = 'line-5'`,
+        [organizationId, receiptId],
+      ).then((result) => result.rows[0].value),
+      1,
+      'migration must accept retained pre-versioned product-pack evidence',
     )
 
     const parcel = await client.query(
@@ -426,6 +519,45 @@ async function verify(databaseUrl) {
       },
       /package method conflicts with retained line authority/,
     )
+    await insertPackage(client, {
+      packageKey: 'legacy-recipe-package-13',
+      packageSequence: 13,
+      planningMethod: 'approved_recipe',
+      hashDigit: 'f',
+    })
+    await client.query(
+      `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+         organization_id, receipt_id, package_key, line_key,
+         quantity, allocation_hash
+       ) VALUES (
+         $1::uuid, $2::uuid, 'legacy-recipe-package-13', 'line-8',
+         1, repeat('f', 64)
+       )`,
+      [organizationId, receiptId],
+    )
+    await expectRejected(
+      client,
+      'legacy-product-pack-line-in-unit-package',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'unit-package-14',
+          packageSequence: 14,
+          planningMethod: 'unit_material_selection',
+          hashDigit: 'a',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'unit-package-14', 'line-8',
+             1, repeat('a', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /package method conflicts with retained line authority/,
+    )
     await expectRejected(
       client,
       'unknown-line-version',
@@ -443,6 +575,52 @@ async function verify(databaseUrl) {
            ) VALUES (
              $1::uuid, $2::uuid, 'recipe-package-9', 'line-4',
              1, repeat('c', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /lacks valid retained line authority/,
+    )
+    await expectRejected(
+      client,
+      'unversioned-line-without-product-pack-evidence',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'recipe-package-10',
+          packageSequence: 10,
+          planningMethod: 'approved_recipe',
+          hashDigit: 'd',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'recipe-package-10', 'line-6',
+             1, repeat('d', 64)
+           )`,
+          [organizationId, receiptId],
+        )
+      },
+      /lacks valid retained line authority/,
+    )
+    await expectRejected(
+      client,
+      'explicit-null-line-version',
+      async () => {
+        await insertPackage(client, {
+          packageKey: 'recipe-package-12',
+          packageSequence: 12,
+          planningMethod: 'approved_recipe',
+          hashDigit: 'e',
+        })
+        await client.query(
+          `INSERT INTO operations_shopify_checkout_rate_receipt_allocations (
+             organization_id, receipt_id, package_key, line_key,
+             quantity, allocation_hash
+           ) VALUES (
+             $1::uuid, $2::uuid, 'recipe-package-12', 'line-7',
+             1, repeat('e', 64)
            )`,
           [organizationId, receiptId],
         )
@@ -593,6 +771,8 @@ async function verify(databaseUrl) {
       { planning_method: 'unit_material_selection', allocation_count: 1 },
       { planning_method: 'approved_recipe', allocation_count: 1 },
       { planning_method: 'approved_recipe', allocation_count: 1 },
+      { planning_method: 'approved_recipe', allocation_count: 1 },
+      { planning_method: 'approved_recipe', allocation_count: 1 },
     ])
     await client.query('ROLLBACK')
   } catch (error) {
@@ -628,9 +808,12 @@ async function main() {
       const files = migrations()
       const migrationIndex = files.indexOf(targetMigration)
       assert.ok(migrationIndex > 0, `${targetMigration} is missing`)
-      for (const file of files.slice(0, migrationIndex + 1)) {
+      for (const file of files.slice(0, migrationIndex)) {
         await applyMigration(client, file)
       }
+      await seedFixture(client)
+      await seedLegacyAllocationBeforeMigration(client)
+      await applyMigration(client, targetMigration)
     } finally {
       client.release()
       await pool.end()

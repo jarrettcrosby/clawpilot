@@ -64,7 +64,7 @@ const shopifyCheckoutUnitMaterialMigration = [
 
 const shopifyCheckoutLineAuthorityMigration = [
   'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
-  '7eb6341111e3dd1789eb213d05193ea6bf91f46229ce47bdba6c1eae87420323',
+  '3997653966815d60a96ccaf252215e11fa603ca721ec7904298e71bce370c984',
 ]
 
 function fail(message) {
