@@ -1361,6 +1361,15 @@ async function verifyRouteBehavior() {
           }
         },
       },
+      '@/lib/persistence/orderUnitWeightEvidence': {
+        OperationsOrderUnitWeightError: class extends Error {
+          constructor(code, message, status = 409) {
+            super(message)
+            this.code = code
+            this.status = status
+          }
+        },
+      },
       '@/lib/persistence/operationsOrderShipmentAddress': {
         OperationsOrderShipmentAddressError: class extends Error {
           constructor(code, message, status = 409) {
@@ -4153,6 +4162,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/persistence/operationShadowTraining': {
           assertNoOpenOperationsShadowTrainingRunsForActivation:
             async () => {},
+        },
+        '@/lib/persistence/orderUnitWeightEvidence': {
+          assertCurrentOrderUnitWeightEvidence: async () => {},
         },
         '@/lib/persistence/operationsOrderShipmentAddress':
           operationsOrderShipmentAddress,
