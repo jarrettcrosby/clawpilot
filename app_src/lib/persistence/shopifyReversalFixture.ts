@@ -700,7 +700,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
          expires_at
        ) VALUES (
          $1, $2::uuid, $3::uuid,
-         $4, 'shopify-reversal-fixture-v2', $5, $6,
+         $4, 'shopify-reversal-fixture-v3', $5, $6,
          $7, $8, $9, $10,
          $11::bigint, $12::integer, $13, $14, $15,
          $16, $17, $18,
@@ -763,7 +763,7 @@ export async function insertShopifyReversalFixtureCommandInPostgres(input: {
         phase: command.phase,
         intentHash: command.intentHash,
         accountGlobalId: SHOPIFY_REVERSAL_FIXTURE_ACCOUNT_GLOBAL_ID,
-        fixtureProfileVersion: 'shopify-reversal-fixture-v2',
+        fixtureProfileVersion: 'shopify-reversal-fixture-v3',
         normalUiAvailable: false,
         providerWrites: 0,
         requestedApprover: command.actorEmail,

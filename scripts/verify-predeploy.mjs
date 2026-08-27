@@ -47,6 +47,11 @@ const shopifyReversalFixtureProviderErrorsMigration = [
   'a08b02ab69b6cedf34087a7baee7d16f50a7717a7a9c32d0901944a7ca1e32aa',
 ]
 
+const shopifyReversalFixtureProfileV3Migration = [
+  'db/migrations/0330_operations_shopify_reversal_fixture_profile_v3.sql',
+  '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e',
+]
+
 const legacyUnitMeasurementMigration = [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   '602992b59ef3edd186a5df06f483488181886cc0cc225671d631d1862bc554ea',
@@ -207,8 +212,26 @@ if (
 ) {
   fail('Shopify reversal fixture provider-error migration checksum drifted')
 }
+const [shopifyReversalFixtureProfileV3MigrationPath,
+  shopifyReversalFixtureProfileV3MigrationChecksum] =
+  shopifyReversalFixtureProfileV3Migration
+if (!existsSync(resolve(root, shopifyReversalFixtureProfileV3MigrationPath))) {
+  fail(
+    `missing Shopify reversal fixture v3 migration: ${shopifyReversalFixtureProfileV3MigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, shopifyReversalFixtureProfileV3MigrationPath),
+    ))
+    .digest('hex') !== shopifyReversalFixtureProfileV3MigrationChecksum
+) {
+  fail('Shopify reversal fixture v3 migration checksum drifted')
+}
 const shopifyReversalFixtureRequiredFiles = [
   shopifyReversalFixtureProviderErrorsMigrationPath,
+  shopifyReversalFixtureProfileV3MigrationPath,
   'app_src/lib/integrations/shopifyReversalFixtureRuntime.ts',
   'app_src/lib/integrations/shopifyReversalFixtureProvider.ts',
   'app_src/lib/integrations/shopifyFulfillmentWriteback.ts',
@@ -265,7 +288,7 @@ for (const fragment of [
   'c6c8e6e7-fffa-4969-9526-e99da0ab2754',
   'gid://shopify/Shop/95083757815',
   'test-pro-bakery-bites.myshopify.com',
-  'gid://shopify/ProductVariant/51028106379511',
+  'gid://shopify/ProductVariant/51028106608887',
   'b5169ebd-8166-4b96-9a81-7cc8adaa9270',
   'f3fdf47c-6645-42ff-9a28-52843f8e4da2',
   'e4abd95f-825c-4242-b37b-825a92597e98',
@@ -285,6 +308,12 @@ const shopifyReversalFixtureHealthSource = readFileSync(
 if (
   !shopifyReversalFixtureHealthSource.includes(
     shopifyReversalFixtureMigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProviderErrorsMigrationChecksum,
+  )
+  || !shopifyReversalFixtureHealthSource.includes(
+    shopifyReversalFixtureProfileV3MigrationChecksum,
   )
   || !healthRoute.includes('readShopifyReversalFixtureHealthInPostgres')
   || !healthRoute.includes('shopifyReversalFixtureRuntimeState.available')

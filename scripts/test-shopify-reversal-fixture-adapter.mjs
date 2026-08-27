@@ -57,7 +57,7 @@ vm.runInNewContext(output, {
         SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
           'test-pro-bakery-bites.myshopify.com',
         SHOPIFY_REVERSAL_FIXTURE_VARIANT_GID:
-          'gid://shopify/ProductVariant/51028106379511',
+          'gid://shopify/ProductVariant/51028106608887',
       }
     }
     if (specifier === '@/lib/persistence/shopifyReversalFixture') {
@@ -125,7 +125,7 @@ const exactOrder = {
       unfulfilledQuantity: 1,
       requiresShipping: true,
       variant: {
-        id: 'gid://shopify/ProductVariant/51028106379511',
+        id: 'gid://shopify/ProductVariant/51028106608887',
       },
     }],
     pageInfo: { hasNextPage: false },
@@ -135,14 +135,14 @@ const exactOrder = {
 assert.deepEqual(
   JSON.parse(JSON.stringify(adapter.SHOPIFY_REVERSAL_FIXTURE_ORDER_PROFILE)),
   {
-    version: 'shopify-reversal-fixture-v2',
+    version: 'shopify-reversal-fixture-v3',
     test: true,
     financialStatus: 'PENDING',
     marketingConsent: 'UNSET',
     sendReceipt: false,
     sendFulfillmentReceipt: false,
     inventoryBehaviour: 'BYPASS',
-    variantId: 'gid://shopify/ProductVariant/51028106379511',
+    variantId: 'gid://shopify/ProductVariant/51028106608887',
     quantity: 1,
     requiresShipping: true,
     shippingAddress: {
@@ -179,7 +179,7 @@ assert.deepEqual(calls[0].variables, {
     sourceIdentifier,
     tags: ['clawpilot-reversal-fixture', uniqueTag],
     lineItems: [{
-      variantId: 'gid://shopify/ProductVariant/51028106379511',
+      variantId: 'gid://shopify/ProductVariant/51028106608887',
       quantity: 1,
       requiresShipping: true,
     }],

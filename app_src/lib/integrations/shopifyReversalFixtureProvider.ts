@@ -30,7 +30,7 @@ const ORDER_CREATE_ERROR_CODES = new Set([
 ])
 
 export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_VERSION =
-  'shopify-reversal-fixture-v2' as const
+  'shopify-reversal-fixture-v3' as const
 export const SHOPIFY_REVERSAL_FIXTURE_BASE_TAG =
   'clawpilot-reversal-fixture' as const
 
