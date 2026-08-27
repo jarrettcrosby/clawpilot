@@ -36,8 +36,18 @@ export const MAX_SHOPIFY_CHECKOUT_OFFERS = 100
 export const MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS = 8
 export const MAX_SHOPIFY_CHECKOUT_CONFIGURED_CARRIER_ACCOUNTS =
   MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS * 2
-export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION =
+export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1 =
   'shopify-checkout-line-pack-evidence-v1' as const
+export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION =
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1
+export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2 =
+  'shopify-checkout-line-pack-evidence-v2' as const
+export const SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT =
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2
+export const SHOPIFY_CHECKOUT_RECEIPT_LINE_CARTONIZATION_AUTHORITIES = [
+  'product_pack',
+  'unit_material_selection',
+] as const
 export const SHOPIFY_CHECKOUT_RECEIPT_PACKAGE_LEVELS = [
   'each',
   'inner_pack',
@@ -392,6 +402,34 @@ export type ShopifyCheckoutReceiptLineSnapshotV1 = {
   unitWeightGrams: number
 }
 
+export type ShopifyCheckoutReceiptLineSnapshotV2 = {
+  snapshotVersion:
+    typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2
+  cartonizationAuthority:
+    typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_CARTONIZATION_AUTHORITIES[number]
+  productGid: string
+  variantGid: string
+  productGlobalId: string
+  productMappingGlobalId: string
+  channelSourceRevision: string
+  channelSourceHash: string
+  packMappingGlobalId: string | null
+  packMappingRowVersion: number | null
+  packEvidenceHash: string | null
+  packProfileVersionGlobalId: string | null
+  packProfileVersionRowVersion: number | null
+  packageLevel: typeof SHOPIFY_CHECKOUT_RECEIPT_PACKAGE_LEVELS[number]
+  baseEachQuantity: number
+  shipsAsOwnPackage: boolean
+  inventoryLevelGlobalIds: string[]
+  quantity: number
+  unitWeightGrams: number
+}
+
+export type ShopifyCheckoutReceiptLineSnapshot =
+  | ShopifyCheckoutReceiptLineSnapshotV1
+  | ShopifyCheckoutReceiptLineSnapshotV2
+
 export type ShopifyCheckoutReceiptLineInput = {
   lineKey: string
   providerVariantId: string
@@ -399,7 +437,7 @@ export type ShopifyCheckoutReceiptLineInput = {
   quantity: number
   unitWeightGrams: number
   requiresShipping: boolean
-  lineSnapshot: ShopifyCheckoutReceiptLineSnapshotV1
+  lineSnapshot: ShopifyCheckoutReceiptLineSnapshot
 }
 
 export type ShopifyCheckoutReceiptClaimInput = {
@@ -472,6 +510,17 @@ export type ShopifyCheckoutPackageInput =
       selfPackageLineKey?: never
     }
   | ShopifyCheckoutPackageInputBase & {
+      planningMethod: 'unit_material_selection'
+      materialGlobalId: string
+      materialRowVersion: number
+      materialStockGlobalId: string
+      materialStockRowVersion: number
+      materialStockOnHandQuantity: number
+      packProfileVersionGlobalId?: never
+      packProfileVersionRowVersion?: never
+      selfPackageLineKey?: never
+    }
+  | ShopifyCheckoutPackageInputBase & {
       planningMethod: 'self_package'
       materialGlobalId?: never
       materialRowVersion?: never
@@ -530,7 +579,12 @@ export type ShopifyCheckoutRateReceiptLine = {
   lineHash: string
   lineSnapshot: Record<string, unknown>
   snapshotVersion:
-    typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION | null
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2
+    | null
+  cartonizationAuthority:
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_CARTONIZATION_AUTHORITIES[number]
+    | null
   packEvidenceHash: string | null
 }
 
@@ -558,6 +612,17 @@ type ShopifyCheckoutRateReceiptPackageBase = {
 export type ShopifyCheckoutRateReceiptPackage =
   | ShopifyCheckoutRateReceiptPackageBase & {
       planningMethod: 'approved_recipe'
+      materialGlobalId: string
+      materialRowVersion: number
+      materialStockGlobalId: string
+      materialStockRowVersion: number
+      materialStockOnHandQuantity: number
+      packProfileVersionGlobalId: null
+      packProfileVersionRowVersion: null
+      selfPackageLineKey: null
+    }
+  | ShopifyCheckoutRateReceiptPackageBase & {
+      planningMethod: 'unit_material_selection'
       materialGlobalId: string
       materialRowVersion: number
       materialStockGlobalId: string
@@ -897,6 +962,7 @@ const WAREHOUSE_GLOBAL_ID = /^gwh(?:[0-9]{7}|[0-9a-v]{12})$/
 const MATERIAL_GLOBAL_ID = /^gmat(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACKAGING_STOCK_GLOBAL_ID = /^gmas(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/
+const PRODUCT_MAPPING_GLOBAL_ID = /^gpm(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACK_MAPPING_GLOBAL_ID = /^gcvm(?:[0-9]{7}|[0-9a-v]{12})$/
 const PACK_PROFILE_VERSION_GLOBAL_ID = /^gppv(?:[0-9]{7}|[0-9a-v]{12})$/
 const INVENTORY_LEVEL_GLOBAL_ID = /^giil(?:[0-9]{7}|[0-9a-v]{12})$/
@@ -1578,27 +1644,274 @@ export function normalizeShopifyCheckoutReceiptLineSnapshotV1(
   }
 }
 
+export function normalizeShopifyCheckoutReceiptLineSnapshotV2(
+  value: unknown,
+  label = 'Checkout line snapshot',
+): ShopifyCheckoutReceiptLineSnapshotV2 {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} must be an object`,
+    )
+  }
+  const snapshot = value as Record<string, unknown>
+  assertShopifyCheckoutCustomerNeutralEvidence(snapshot, label)
+  if (
+    snapshot.snapshotVersion
+      !== SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_VERSION_INVALID',
+      `${label} version is unsupported`,
+    )
+  }
+  const cartonizationAuthority = textValue(
+    snapshot.cartonizationAuthority,
+    `${label} cartonization authority`,
+    64,
+  )
+  if (!SHOPIFY_CHECKOUT_RECEIPT_LINE_CARTONIZATION_AUTHORITIES.includes(
+    cartonizationAuthority as ShopifyCheckoutReceiptLineSnapshotV2[
+      'cartonizationAuthority'
+    ],
+  )) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} cartonization authority is unsupported`,
+    )
+  }
+  const packageLevel = textValue(
+    snapshot.packageLevel,
+    `${label} package level`,
+    32,
+  )
+  if (!SHOPIFY_CHECKOUT_RECEIPT_PACKAGE_LEVELS.includes(
+    packageLevel as typeof SHOPIFY_CHECKOUT_RECEIPT_PACKAGE_LEVELS[number],
+  )) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} package level is unsupported`,
+    )
+  }
+  if (typeof snapshot.shipsAsOwnPackage !== 'boolean') {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} own-package flag must be boolean`,
+    )
+  }
+  if (
+    !Array.isArray(snapshot.inventoryLevelGlobalIds)
+    || snapshot.inventoryLevelGlobalIds.length < 1
+    || snapshot.inventoryLevelGlobalIds.length > 500
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} must retain 1-500 inventory-level Global IDs`,
+    )
+  }
+  const inventoryLevelGlobalIds = snapshot.inventoryLevelGlobalIds
+    .map((globalId, index) => matchValue(
+      globalId,
+      INVENTORY_LEVEL_GLOBAL_ID,
+      `${label} inventory-level Global ID ${index + 1}`,
+    ))
+    .sort((left, right) => left.localeCompare(right))
+  if (new Set(inventoryLevelGlobalIds).size !== inventoryLevelGlobalIds.length) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} inventory-level Global IDs must be unique`,
+    )
+  }
+  const nullableMatch = (
+    candidate: unknown,
+    pattern: RegExp,
+    fieldLabel: string,
+  ) => candidate === null ? null : matchValue(candidate, pattern, fieldLabel)
+  const nullableInteger = (
+    candidate: unknown,
+    fieldLabel: string,
+  ) => candidate === null
+    ? null
+    : integer(candidate, fieldLabel, 0, Number.MAX_SAFE_INTEGER)
+  const packMappingGlobalId = nullableMatch(
+    snapshot.packMappingGlobalId,
+    PACK_MAPPING_GLOBAL_ID,
+    `${label} pack mapping Global ID`,
+  )
+  const packMappingRowVersion = nullableInteger(
+    snapshot.packMappingRowVersion,
+    `${label} pack mapping row version`,
+  )
+  const packEvidenceHash = nullableMatch(
+    snapshot.packEvidenceHash,
+    SHA256,
+    `${label} pack evidence hash`,
+  )
+  const packProfileVersionGlobalId = nullableMatch(
+    snapshot.packProfileVersionGlobalId,
+    PACK_PROFILE_VERSION_GLOBAL_ID,
+    `${label} pack profile version Global ID`,
+  )
+  const packProfileVersionRowVersion = nullableInteger(
+    snapshot.packProfileVersionRowVersion,
+    `${label} pack profile version row version`,
+  )
+  const authority = cartonizationAuthority as
+    ShopifyCheckoutReceiptLineSnapshotV2['cartonizationAuthority']
+  const hasCompleteProductPackEvidence = (
+    packMappingGlobalId !== null
+    && packMappingRowVersion !== null
+    && packEvidenceHash !== null
+    && packProfileVersionGlobalId !== null
+    && packProfileVersionRowVersion !== null
+  )
+  const hasAnyProductPackEvidence = (
+    packMappingGlobalId !== null
+    || packMappingRowVersion !== null
+    || packEvidenceHash !== null
+    || packProfileVersionGlobalId !== null
+    || packProfileVersionRowVersion !== null
+  )
+  const baseEachQuantity = integer(
+    snapshot.baseEachQuantity,
+    `${label} base-each quantity`,
+    1,
+    100000,
+  )
+  if (
+    (authority === 'product_pack' && !hasCompleteProductPackEvidence)
+    || (authority === 'unit_material_selection' && hasAnyProductPackEvidence)
+    || (
+      authority === 'unit_material_selection'
+      && (
+        packageLevel !== 'each'
+        || baseEachQuantity !== 1
+        || snapshot.shipsAsOwnPackage
+      )
+    )
+  ) {
+    fail(
+      'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID',
+      `${label} cartonization evidence does not match its authority`,
+    )
+  }
+  return {
+    snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
+    cartonizationAuthority: authority,
+    productGid: matchValue(
+      snapshot.productGid,
+      SHOPIFY_PRODUCT_GID,
+      `${label} provider product GID`,
+    ),
+    variantGid: matchValue(
+      snapshot.variantGid,
+      SHOPIFY_PRODUCT_VARIANT_GID,
+      `${label} provider variant GID`,
+    ),
+    productGlobalId: matchValue(
+      snapshot.productGlobalId,
+      PRODUCT_GLOBAL_ID,
+      `${label} product Global ID`,
+    ),
+    productMappingGlobalId: matchValue(
+      snapshot.productMappingGlobalId,
+      PRODUCT_MAPPING_GLOBAL_ID,
+      `${label} product mapping Global ID`,
+    ),
+    channelSourceRevision: textValue(
+      snapshot.channelSourceRevision,
+      `${label} channel source revision`,
+      512,
+    ),
+    channelSourceHash: matchValue(
+      snapshot.channelSourceHash,
+      SHA256,
+      `${label} channel source hash`,
+    ),
+    packMappingGlobalId,
+    packMappingRowVersion,
+    packEvidenceHash,
+    packProfileVersionGlobalId,
+    packProfileVersionRowVersion,
+    packageLevel:
+      packageLevel as ShopifyCheckoutReceiptLineSnapshotV2['packageLevel'],
+    baseEachQuantity,
+    shipsAsOwnPackage: snapshot.shipsAsOwnPackage,
+    inventoryLevelGlobalIds,
+    quantity: integer(
+      snapshot.quantity,
+      `${label} quantity`,
+      1,
+      100000,
+    ),
+    unitWeightGrams: integer(
+      snapshot.unitWeightGrams,
+      `${label} unit weight`,
+      1,
+      1000000,
+    ),
+  }
+}
+
+export function normalizeShopifyCheckoutReceiptLineSnapshot(
+  value: unknown,
+  label = 'Checkout line snapshot',
+): ShopifyCheckoutReceiptLineSnapshot {
+  const version = value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>).snapshotVersion
+    : null
+  if (version === SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1) {
+    return normalizeShopifyCheckoutReceiptLineSnapshotV1(value, label)
+  }
+  if (version === SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2) {
+    return normalizeShopifyCheckoutReceiptLineSnapshotV2(value, label)
+  }
+  fail(
+    'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_VERSION_INVALID',
+    `${label} version is unsupported`,
+  )
+}
+
 export function readShopifyCheckoutReceiptLineSnapshotEvidence(
   value: unknown,
 ): {
   snapshotVersion:
-    typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION | null
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2
+    | null
+  cartonizationAuthority:
+    | typeof SHOPIFY_CHECKOUT_RECEIPT_LINE_CARTONIZATION_AUTHORITIES[number]
+    | null
   packEvidenceHash: string | null
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return { snapshotVersion: null, packEvidenceHash: null }
+    return {
+      snapshotVersion: null,
+      cartonizationAuthority: null,
+      packEvidenceHash: null,
+    }
   }
   const snapshot = value as Record<string, unknown>
-  if (
-    snapshot.snapshotVersion
-      !== SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION
-  ) {
-    return { snapshotVersion: null, packEvidenceHash: null }
+  if (snapshot.snapshotVersion === SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1) {
+    const normalized = normalizeShopifyCheckoutReceiptLineSnapshotV1(snapshot)
+    return {
+      snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V1,
+      cartonizationAuthority: 'product_pack',
+      packEvidenceHash: normalized.packEvidenceHash,
+    }
   }
-  const normalized = normalizeShopifyCheckoutReceiptLineSnapshotV1(snapshot)
+  if (snapshot.snapshotVersion === SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2) {
+    const normalized = normalizeShopifyCheckoutReceiptLineSnapshotV2(snapshot)
+    return {
+      snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
+      cartonizationAuthority: normalized.cartonizationAuthority,
+      packEvidenceHash: normalized.packEvidenceHash,
+    }
+  }
   return {
-    snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
-    packEvidenceHash: normalized.packEvidenceHash,
+    snapshotVersion: null,
+    cartonizationAuthority: null,
+    packEvidenceHash: null,
   }
 }
 
@@ -1634,7 +1947,7 @@ export function hydrateShopifyCheckoutRateReceiptLine(
     readShopifyCheckoutReceiptLineSnapshotEvidence(input.lineSnapshot)
   const lineSnapshot = snapshotEvidence.snapshotVersion === null
     ? input.lineSnapshot
-    : normalizeShopifyCheckoutReceiptLineSnapshotV1(
+    : normalizeShopifyCheckoutReceiptLineSnapshot(
         input.lineSnapshot,
         `Stored checkout line ${input.lineKey} snapshot`,
       )
@@ -1657,6 +1970,7 @@ export function hydrateShopifyCheckoutRateReceiptLine(
     lineHash: input.lineHash,
     lineSnapshot,
     snapshotVersion: snapshotEvidence.snapshotVersion,
+    cartonizationAuthority: snapshotEvidence.cartonizationAuthority,
     packEvidenceHash: snapshotEvidence.packEvidenceHash,
   }
 }
@@ -1936,7 +2250,7 @@ export function normalizeShopifyCheckoutReceiptClaimInput(
       ),
       requiresShipping: true,
     }
-    const lineSnapshot = normalizeShopifyCheckoutReceiptLineSnapshotV1(
+    const lineSnapshot = normalizeShopifyCheckoutReceiptLineSnapshot(
       line.lineSnapshot,
       `Line ${lineKey} snapshot`,
     )
@@ -2075,7 +2389,10 @@ export function shopifyCheckoutPackagePlanHash(input: {
   packages: Array<{
     packageKey: string
     packageSequence: number
-    planningMethod?: 'approved_recipe' | 'self_package'
+    planningMethod?:
+      | 'approved_recipe'
+      | 'self_package'
+      | 'unit_material_selection'
     materialGlobalId?: string | null
     materialRowVersion?: number | null
     materialStockGlobalId?: string | null
@@ -5132,7 +5449,10 @@ async function readReceiptChildren(
       () => run<QueryResultRow & {
         package_key: string
         package_sequence: number
-        planning_method: 'approved_recipe' | 'self_package'
+        planning_method:
+          | 'approved_recipe'
+          | 'self_package'
+          | 'unit_material_selection'
         material_global_id: string | null
         packaging_material_row_version: string | number | null
         material_stock_global_id: string | null
@@ -5351,17 +5671,22 @@ async function readReceiptChildren(
         }
       }
       if (
+        ![
+          'approved_recipe',
+          'unit_material_selection',
+        ].includes(row.planning_method)
+        ||
         !row.material_global_id
         || row.packaging_material_row_version === null
         || !row.material_stock_global_id
         || row.packaging_material_stock_row_version === null
         || row.packaging_material_stock_on_hand_quantity === null
       ) {
-        throw new Error('Stored approved-recipe package evidence is incomplete')
+        throw new Error('Stored material-backed package evidence is incomplete')
       }
       return {
         ...common,
-        planningMethod: 'approved_recipe',
+        planningMethod: row.planning_method,
         materialGlobalId: row.material_global_id,
         materialRowVersion: Number(row.packaging_material_row_version),
         materialStockGlobalId: row.material_stock_global_id,
@@ -6047,6 +6372,16 @@ function normalizeCompletion(
       `Package ${packageKey} snapshot`,
     )
     const planningMethod = item.planningMethod ?? 'approved_recipe'
+    if (![
+      'approved_recipe',
+      'self_package',
+      'unit_material_selection',
+    ].includes(planningMethod)) {
+      fail(
+        'SHOPIFY_CHECKOUT_PACKAGE_PLANNING_METHOD_INVALID',
+        'Checkout package planning method is unsupported',
+      )
+    }
     const common = {
       packageKey,
       packageSequence,
@@ -6113,7 +6448,9 @@ function normalizeCompletion(
         }
       : {
           ...common,
-          planningMethod: 'approved_recipe' as const,
+          planningMethod: planningMethod as
+            | 'approved_recipe'
+            | 'unit_material_selection',
           materialGlobalId: matchValue(
             item.materialGlobalId,
             MATERIAL_GLOBAL_ID,
@@ -6158,6 +6495,18 @@ function normalizeCompletion(
       fail(
         'SHOPIFY_CHECKOUT_SELF_PACKAGE_SHAPE_INVALID',
         'Each self-packaged sell unit must be one zero-tare parcel allocated to exactly one line unit',
+      )
+    }
+    if (
+      planningMethod === 'unit_material_selection'
+      && (
+        allocations.length !== 1
+        || allocations[0].quantity !== 1
+      )
+    ) {
+      fail(
+        'SHOPIFY_CHECKOUT_UNIT_MATERIAL_SHAPE_INVALID',
+        'Each unit-material package must allocate exactly one line unit',
       )
     }
     return {
@@ -6610,7 +6959,9 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
        LEFT JOIN operations_packaging_materials material
          ON material.organization_id = $1::uuid
         AND material.global_id = package.material_global_id
-        AND package.planning_method = 'approved_recipe'
+        AND package.planning_method IN (
+              'approved_recipe', 'unit_material_selection'
+            )
        JOIN operations_shopify_checkout_rate_receipts receipt
          ON receipt.organization_id = $1::uuid
         AND receipt.id = $2::uuid
@@ -6619,7 +6970,9 @@ export async function completeShopifyCheckoutRateReceiptInPostgres(
         AND stock.global_id = package.material_stock_global_id
         AND stock.packaging_material_id = material.id
         AND stock.warehouse_id = receipt.warehouse_id
-        AND package.planning_method = 'approved_recipe'
+        AND package.planning_method IN (
+              'approved_recipe', 'unit_material_selection'
+            )
        LEFT JOIN operations_product_pack_profile_versions profile_version
          ON profile_version.organization_id = $1::uuid
         AND profile_version.global_id =

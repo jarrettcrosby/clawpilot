@@ -237,6 +237,9 @@ const rateWarmPolicyMigration = read(
 const quoteMatchFamiliesMigration = read(
   'db/migrations/0189_operations_shopify_checkout_quote_match_families.sql',
 )
+const unitMaterialCheckoutMigration = read(
+  'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
+)
 const persistenceSource = read(
   'app_src/lib/persistence/shopifyCheckoutRating.ts',
 )
@@ -266,6 +269,27 @@ includes(packHardeningMigration, [
   'NEW.quantity <> 1',
   'Shopify checkout self-package receipt evidence is incomplete',
 ], 'Self-package checkout receipt hardening')
+includes(unitMaterialCheckoutMigration, [
+  "'unit_material_selection'",
+  'op_shopify_rate_packages_planning_method_valid',
+  'op_shopify_rate_packages_profile_version_valid',
+  "planning_method <> 'unit_material_selection'",
+  'OR allocation_count = 1',
+  "planning_method = 'self_package'",
+  'pack_profile_version_id IS NOT NULL',
+  'tare_weight_grams = 0',
+  'protect_operations_shopify_checkout_rate_receipt_package()',
+  "NEW.planning_method IN (",
+  'mapping.pack_evidence_hash = state.pack_evidence_hash',
+  'validate_operations_shopify_checkout_unit_material_allocation()',
+  'NEW.quantity <> 1 OR retained_allocation_count <> 0',
+  'validate_operations_shopify_checkout_unit_material_finalize()',
+  "package.planning_method = 'unit_material_selection'",
+  'count(allocation.line_key) <> 1',
+  'sum(allocation.quantity) <> 1',
+  "WHEN 'unit_material_selection'",
+  "THEN 'ClawPilot carton '",
+], 'Unit-material checkout receipt persistence')
 includes(offerParcelEvidenceMigration, [
   'operations_shopify_checkout_carrier_request_parcel_snapshot',
   "WHEN 'self_package'",
@@ -667,6 +691,9 @@ includes(completionNormalization, [
   '> MAX_SHOPIFY_CHECKOUT_CARRIER_ACCOUNTS',
   'Checkout provider attempts must use unique carrier accounts',
   "attempt.status === 'degraded' && matchingOffers.length > 0",
+  "planningMethod === 'unit_material_selection'",
+  "'SHOPIFY_CHECKOUT_UNIT_MATERIAL_SHAPE_INVALID'",
+  'Each unit-material package must allocate exactly one line unit',
 ], 'account-keyed bounded carrier attempt completion')
 assert.equal(
   completionNormalization.includes(
@@ -830,11 +857,14 @@ assert.ok(
 const {
   ShopifyCheckoutRatingPersistenceError,
   SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
   executeShopifyCheckoutReceiptClaimWithRetry,
   hydrateShopifyCheckoutRateReceiptLine,
   normalizeShopifyCarrierServiceConfigInput,
   normalizeShopifyCheckoutReceiptClaimInput,
   normalizeShopifyCheckoutReceiptLineSnapshotV1,
+  normalizeShopifyCheckoutReceiptLineSnapshotV2,
   readShopifyCheckoutReceiptLineSnapshotEvidence,
   classifyShopifyCheckoutRateReconciliationOutcome,
   reconcileShopifyCheckoutRateForOrderCandidateWithClient,
@@ -1845,6 +1875,7 @@ assert.deepEqual(
   )),
   {
     snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
+    cartonizationAuthority: 'product_pack',
     packEvidenceHash: '1'.repeat(64),
   },
   'Known receipt line snapshots expose their immutable pack fingerprint',
@@ -1862,23 +1893,150 @@ assert.deepEqual(
   },
   'Known v1 snapshots normalize their complete callback evidence shape',
 )
+assert.equal(
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
+  'The explicit current snapshot alias points to V2 without changing the V1 compatibility export',
+)
+const validV2ProductPackSnapshot = {
+  snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
+  cartonizationAuthority: 'product_pack',
+  productGid: 'gid://shopify/Product/1',
+  variantGid: 'gid://shopify/ProductVariant/1',
+  productGlobalId: 'gp0000001',
+  productMappingGlobalId: 'gpm0000001',
+  channelSourceRevision: '2026-08-26T12:00:00.000Z',
+  channelSourceHash: '4'.repeat(64),
+  packMappingGlobalId: 'gcvm0000001',
+  packMappingRowVersion: 2,
+  packEvidenceHash: '1'.repeat(64),
+  packProfileVersionGlobalId: 'gppv0000001',
+  packProfileVersionRowVersion: 4,
+  packageLevel: 'inner_pack',
+  baseEachQuantity: 12,
+  shipsAsOwnPackage: false,
+  inventoryLevelGlobalIds: ['giil0000003', 'giil0000001'],
+  quantity: 3,
+  unitWeightGrams: 100,
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    normalizeShopifyCheckoutReceiptLineSnapshotV2(
+      validV2ProductPackSnapshot,
+    ),
+  )),
+  {
+    ...validV2ProductPackSnapshot,
+    inventoryLevelGlobalIds: ['giil0000001', 'giil0000003'],
+  },
+  'V2 product-pack snapshots retain exact mapping and channel evidence',
+)
+const validV2UnitMaterialSnapshot = {
+  snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_CURRENT,
+  cartonizationAuthority: 'unit_material_selection',
+  productGid: 'gid://shopify/Product/2',
+  variantGid: 'gid://shopify/ProductVariant/2',
+  productGlobalId: 'gp0000002',
+  productMappingGlobalId: 'gpm0000002',
+  channelSourceRevision: '2026-08-26T12:01:00.000Z',
+  channelSourceHash: '5'.repeat(64),
+  packMappingGlobalId: null,
+  packMappingRowVersion: null,
+  packEvidenceHash: null,
+  packProfileVersionGlobalId: null,
+  packProfileVersionRowVersion: null,
+  packageLevel: 'each',
+  baseEachQuantity: 1,
+  shipsAsOwnPackage: false,
+  inventoryLevelGlobalIds: ['giil0000002'],
+  quantity: 1,
+  unitWeightGrams: 200,
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    readShopifyCheckoutReceiptLineSnapshotEvidence(
+      validV2UnitMaterialSnapshot,
+    ),
+  )),
+  {
+    snapshotVersion: SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
+    cartonizationAuthority: 'unit_material_selection',
+    packEvidenceHash: null,
+  },
+  'V2 unit-material snapshots remain readable without Product-pack evidence',
+)
+const normalizedV2UnitClaim = normalizeShopifyCheckoutReceiptClaimInput({
+  ...validClaim,
+  lines: [{
+    ...validClaim.lines[0],
+    lineSnapshot: validV2UnitMaterialSnapshot,
+  }],
+})
+assert.equal(
+  normalizedV2UnitClaim.lines[0].lineSnapshot.cartonizationAuthority,
+  'unit_material_selection',
+  'New receipt claims accept the current V2 unit-material authority',
+)
+for (const requiredV2Field of [
+  'productMappingGlobalId',
+  'channelSourceRevision',
+  'channelSourceHash',
+]) {
+  const incompleteSnapshot = { ...validV2UnitMaterialSnapshot }
+  delete incompleteSnapshot[requiredV2Field]
+  assert.throws(
+    () => normalizeShopifyCheckoutReceiptLineSnapshotV2(incompleteSnapshot),
+    (error) => error instanceof ShopifyCheckoutRatingPersistenceError,
+    `V2 snapshots reject a missing ${requiredV2Field}`,
+  )
+}
+assert.throws(
+  () => normalizeShopifyCheckoutReceiptLineSnapshotV2({
+    ...validV2UnitMaterialSnapshot,
+    packEvidenceHash: '6'.repeat(64),
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID'
+  ),
+  'Unit-material authority rejects partial or invented Product-pack evidence',
+)
+assert.throws(
+  () => normalizeShopifyCheckoutReceiptLineSnapshotV2({
+    ...validV2ProductPackSnapshot,
+    packProfileVersionGlobalId: null,
+  }),
+  (error) => (
+    error instanceof ShopifyCheckoutRatingPersistenceError
+    && error.code === 'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_INVALID'
+  ),
+  'Product-pack authority requires the complete exact Product-pack evidence set',
+)
 assert.deepEqual(
   JSON.parse(JSON.stringify(
     readShopifyCheckoutReceiptLineSnapshotEvidence({
       merchandiseKey: 'legacy-variant',
     }),
   )),
-  { snapshotVersion: null, packEvidenceHash: null },
+  {
+    snapshotVersion: null,
+    cartonizationAuthority: null,
+    packEvidenceHash: null,
+  },
   'Historical receipts without snapshot metadata remain readable as unknown',
 )
 assert.deepEqual(
   JSON.parse(JSON.stringify(
     readShopifyCheckoutReceiptLineSnapshotEvidence({
-      snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v3',
       packEvidenceHash: 'a'.repeat(64),
     }),
   )),
-  { snapshotVersion: null, packEvidenceHash: null },
+  {
+    snapshotVersion: null,
+    cartonizationAuthority: null,
+    packEvidenceHash: null,
+  },
   'Unknown future snapshot versions are not interpreted using current rules',
 )
 assert.throws(
@@ -1900,6 +2058,7 @@ assert.equal(
   hydratedLine.snapshotVersion,
   SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION,
 )
+assert.equal(hydratedLine.cartonizationAuthority, 'product_pack')
 assert.equal(hydratedLine.packEvidenceHash, '1'.repeat(64))
 assert.deepEqual(
   JSON.parse(JSON.stringify(hydratedLine.lineSnapshot)),
@@ -1935,12 +2094,35 @@ const historicalHydratedLine = hydrateShopifyCheckoutRateReceiptLine({
   lineHash: shopifyCheckoutRatingHash(historicalRetainedLine),
 })
 assert.equal(historicalHydratedLine.snapshotVersion, null)
+assert.equal(historicalHydratedLine.cartonizationAuthority, null)
 assert.equal(historicalHydratedLine.packEvidenceHash, null)
 assert.deepEqual(
   JSON.parse(JSON.stringify(historicalHydratedLine.lineSnapshot)),
   historicalLineSnapshot,
   'Historical snapshots without a known version and hash hydrate as unknown',
 )
+const v2UnitRetainedLine = {
+  lineKey: 'unit-material-line',
+  providerVariantId: validV2UnitMaterialSnapshot.variantGid,
+  sku: null,
+  quantity: validV2UnitMaterialSnapshot.quantity,
+  unitWeightGrams: validV2UnitMaterialSnapshot.unitWeightGrams,
+  requiresShipping: true,
+  lineSnapshot: validV2UnitMaterialSnapshot,
+}
+const v2UnitHydratedLine = hydrateShopifyCheckoutRateReceiptLine({
+  ...v2UnitRetainedLine,
+  lineHash: shopifyCheckoutRatingHash(v2UnitRetainedLine),
+})
+assert.equal(
+  v2UnitHydratedLine.snapshotVersion,
+  SHOPIFY_CHECKOUT_RECEIPT_LINE_SNAPSHOT_VERSION_V2,
+)
+assert.equal(
+  v2UnitHydratedLine.cartonizationAuthority,
+  'unit_material_selection',
+)
+assert.equal(v2UnitHydratedLine.packEvidenceHash, null)
 assert.match(normalizedClaim.requestEvidenceHash, /^[a-f0-9]{64}$/)
 assert.match(normalizedClaim.lineQuantityFingerprint, /^[a-f0-9]{64}$/)
 assert.notEqual(
@@ -2054,7 +2236,7 @@ assert.throws(
       ...validClaim.lines[0],
       lineSnapshot: {
         ...validClaim.lines[0].lineSnapshot,
-        snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+        snapshotVersion: 'shopify-checkout-line-pack-evidence-v3',
       },
     }],
   }),
@@ -2062,7 +2244,7 @@ assert.throws(
     error instanceof ShopifyCheckoutRatingPersistenceError
     && error.code === 'SHOPIFY_CHECKOUT_LINE_SNAPSHOT_VERSION_INVALID'
   ),
-  'New receipt claims reject unknown line snapshot versions',
+  'New receipt claims reject future line snapshot versions',
 )
 assert.throws(
   () => normalizeShopifyCheckoutReceiptClaimInput({
@@ -2188,10 +2370,30 @@ const selfPackage = {
   allocations: [{ lineKey: 'line-a', quantity: 1 }],
   packageSnapshot: { planningMethod: 'self_package' },
 }
+const unitMaterialPackage = {
+  packageKey: 'unit-material-1',
+  packageSequence: 1,
+  planningMethod: 'unit_material_selection',
+  materialGlobalId: 'gmat0000001',
+  materialRowVersion: 5,
+  materialStockGlobalId: 'gmas0000001',
+  materialStockRowVersion: 9,
+  materialStockOnHandQuantity: 25,
+  ratedOuterDimensionsMm: { length: 279, width: 229, height: 178 },
+  contentWeightGrams: 200,
+  tareWeightGrams: 100,
+  allocations: [{ lineKey: 'line-b', quantity: 1 }],
+  packageSnapshot: { planningMethod: 'unit_material_selection' },
+}
 assert.notEqual(
   shopifyCheckoutPackagePlanHash({ packages: [packageOne] }),
   shopifyCheckoutPackagePlanHash({ packages: [selfPackage] }),
   'Package-plan hashing must retain the self-package planning method and profile',
+)
+assert.notEqual(
+  shopifyCheckoutPackagePlanHash({ packages: [packageOne] }),
+  shopifyCheckoutPackagePlanHash({ packages: [unitMaterialPackage] }),
+  'Package-plan hashing must retain unit-material planner provenance',
 )
 assert.equal(
   shopifyCheckoutPackagePlanHash({ packages: [packageOne] }),
