@@ -97,7 +97,16 @@ assert.doesNotMatch(
 )
 assert.match(
   source.panel,
-  /when Shopify reports the order is eligible\./,
+  /when Shopify reports the order is\s+eligible\./,
+)
+assert.match(source.panel, /releasesAuthorization: boolean/)
+assert.match(
+  source.panel,
+  /Shopify will release the successful test payment authorization\./,
+)
+assert.match(
+  source.panel,
+  /No refund, restock, or customer\s+notification is requested\./,
 )
 
 assert.match(
@@ -207,7 +216,10 @@ assert.match(
   source.panel,
   /This is a separate Shopify order cancellation after the fulfillment '/,
 )
-assert.match(source.panel, /It does not issue a refund\./)
+assert.match(
+  source.panel,
+  /It does not issue a refund, restock inventory, or notify '/,
+)
 assert.match(
   source.panel,
   /onClick=\{\(\) => void cancelAfterFulfillmentReversal\(\)\}/,

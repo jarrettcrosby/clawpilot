@@ -6,6 +6,8 @@ import {
   executeShopifyOrderManagementAction,
   inspectShopifyOrderManagementTarget,
   requestedShopifyOrderSaveProjectionHash,
+  shopifyOrderCancellationPaymentEligibility,
+  shopifyOrderCancellationPaymentReleased,
   shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
   type ShopifyOrderManagementPreview,
@@ -369,6 +371,11 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     orderCurrencyCode: 'XXX',
     currentTotalPrice: { amount: '0.00', currencyCode: 'XXX' },
     totalOutstanding: { amount: '0.00', currencyCode: 'XXX' },
+    totalReceived: { amount: '0.00', currencyCode: 'XXX' },
+    totalCapturable: { amount: '0.00', currencyCode: 'XXX' },
+    transactionsCount: null,
+    paymentEvidenceComplete: false,
+    transactions: [],
     email: null,
     phone: null,
     poNumber: null,
@@ -481,6 +488,9 @@ function publicState(input: {
         fulfillment.id === input.target.reversibleExternalFulfillmentGid
       ))
     : undefined
+  const cancellationPayment = shopifyOrderCancellationPaymentEligibility(
+    input.preview,
+  )
   const postReversalCancellationReason = baseReason
     || postReversalOrderCancellationTargetBlocker(input.target)
     || (!writeOrders
@@ -496,17 +506,12 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || (input.preview.capturable
-      ? 'Release or capture the payment authorization before cancelling this order'
-      : null)
+    || cancellationPayment.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
       ? 'The order must remain wholly unfulfilled after fulfillment reversal'
-      : null)
-    || (!input.preview.unpaid
-      ? 'Paid-order cancellation requires refund settings before it can be submitted'
       : null)
   const destructiveCurrent = exactCurrentSource(input.target)
     && Boolean(input.target.acceptedProviderUpdatedAt)
@@ -517,17 +522,12 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || (input.preview.capturable
-      ? 'Release or capture the payment authorization before cancelling this order'
-      : null)
+    || cancellationPayment.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
       ? 'This order has fulfillment activity. Cancel or return that fulfillment before cancelling the order'
-      : null)
-    || (!input.preview.unpaid
-      ? 'Paid-order cancellation requires refund settings before it can be submitted'
       : null)
     || (!input.preview.test
       ? 'Cancellation is limited to Shopify test orders'
@@ -624,10 +624,14 @@ function publicState(input: {
       cancel: Object.freeze({
         allowed: cancellationReason === null,
         reason: cancellationReason,
+        releasesAuthorization: cancellationReason === null
+          && cancellationPayment.releasesAuthorization,
       }),
       cancelAfterFulfillmentReversal: Object.freeze({
         allowed: postReversalCancellationReason === null,
         reason: postReversalCancellationReason,
+        releasesAuthorization: postReversalCancellationReason === null
+          && cancellationPayment.releasesAuthorization,
         predecessorAuthorizationGlobalId:
           input.target.postReversalOrderCancellationPredecessorGlobalId,
       }),
@@ -1379,7 +1383,12 @@ export async function reconcileShopifyOrderManagementCommand(input: {
   } else if ([
     'cancel', 'cancel_order_after_fulfillment_reversal',
   ].includes(authorization.action)) {
-    if (live.inspected.preview.cancelledAt) resolution = 'applied'
+    if (
+      live.inspected.preview.cancelledAt
+      && shopifyOrderCancellationPaymentReleased(live.inspected.preview)
+    ) {
+      resolution = 'applied'
+    }
   } else if (
     authorization.action === 'cancel_fulfillment'
     && authorization.fulfillmentGid

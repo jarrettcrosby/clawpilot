@@ -61,9 +61,15 @@ type FulfillmentEligibility = Readonly<{
   allowed: boolean
   reason: string | null
 }>
+type CancellationEligibility = Readonly<{
+  allowed: boolean
+  reason: string | null
+  releasesAuthorization: boolean
+}>
 type PostReversalCancellationEligibility = Readonly<{
   allowed: boolean
   reason: string | null
+  releasesAuthorization: boolean
   predecessorAuthorizationGlobalId: string | null
 }>
 type ShopifyShippingAddress = Readonly<{
@@ -130,7 +136,7 @@ type ShopifyManagement = Readonly<{
   eligibility: Readonly<{
     addTag: Readonly<{ allowed: boolean; reason: string | null }>
     ordinarySave: Readonly<{ allowed: boolean; reason: string | null }>
-    cancel: Readonly<{ allowed: boolean; reason: string | null }>
+    cancel: CancellationEligibility
     cancelAfterFulfillmentReversal: PostReversalCancellationEligibility
     fulfillments: FulfillmentEligibility[]
     lineEdits: LineEligibility[]
@@ -416,8 +422,11 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && optionalText(eligibility.ordinarySave.reason)
     && typeof eligibility?.cancel?.allowed === 'boolean'
     && optionalText(eligibility.cancel.reason)
+    && typeof eligibility.cancel.releasesAuthorization === 'boolean'
     && typeof eligibility?.cancelAfterFulfillmentReversal?.allowed === 'boolean'
     && optionalText(eligibility.cancelAfterFulfillmentReversal.reason)
+    && typeof eligibility.cancelAfterFulfillmentReversal
+      .releasesAuthorization === 'boolean'
     && (
       eligibility.cancelAfterFulfillmentReversal
         .predecessorAuthorizationGlobalId === null
@@ -812,7 +821,11 @@ export default function ShopifyOrderManagementPanel({
     const confirmed = window.confirm(
       `Cancel ${currentState.order.name} in Shopify?\n\n`
       + 'This is a separate Shopify order cancellation after the fulfillment '
-      + 'reversal. It does not issue a refund.',
+      + 'reversal. It does not issue a refund, restock inventory, or notify '
+      + 'the customer.'
+      + (eligibility.releasesAuthorization
+        ? ' Shopify will release the successful test payment authorization.'
+        : ''),
     )
     if (!confirmed) return
     setCancellingAfterReversal(true)
@@ -1383,7 +1396,12 @@ export default function ShopifyOrderManagementPanel({
                 </Stack>
                 <Typography variant="body2" color="text.secondary">
                   The fulfillment reversal is complete. Order cancellation is
-                  a separate Shopify action.
+                  a separate Shopify action. No refund, restock, or customer
+                  notification is requested.
+                  {state.eligibility.cancelAfterFulfillmentReversal
+                    .releasesAuthorization
+                    ? ' Shopify will release the successful test payment authorization.'
+                    : ''}
                 </Typography>
                 <Tooltip title={blocker
                   || state.eligibility.cancelAfterFulfillmentReversal.reason
@@ -1428,7 +1446,12 @@ export default function ShopifyOrderManagementPanel({
                 <Typography fontWeight={700}>Cancel order</Typography>
               </Stack>
               <Typography variant="body2" color="text.secondary">
-                Cancels {state.order.name} when Shopify reports the order is eligible.
+                Cancels {state.order.name} when Shopify reports the order is
+                eligible. No refund, restock, or customer notification is
+                requested.
+                {state.eligibility.cancel.releasesAuthorization
+                  ? ' Shopify will release the successful test payment authorization.'
+                  : ''}
               </Typography>
               <Tooltip title={blocker || state.eligibility.cancel.reason || ''}>
                 <Box component="span" sx={{ display: 'block' }}>

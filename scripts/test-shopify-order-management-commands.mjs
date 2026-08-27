@@ -132,6 +132,19 @@ function postReversalCancellationTargetFixture(overrides = {}) {
   })
 }
 
+function transactionFixture(overrides = {}) {
+  return {
+    id: 'gid://shopify/OrderTransaction/789',
+    kind: 'AUTHORIZATION',
+    status: 'SUCCESS',
+    test: true,
+    manuallyCapturable: true,
+    amount: { amount: '40.00', currencyCode: 'USD' },
+    totalUnsettled: { amount: '40.00', currencyCode: 'USD' },
+    ...overrides,
+  }
+}
+
 function previewFixture(overrides = {}) {
   return {
     id: externalOrderId,
@@ -153,6 +166,11 @@ function previewFixture(overrides = {}) {
     orderCurrencyCode: 'USD',
     currentTotalPrice: { amount: '40.00', currencyCode: 'USD' },
     totalOutstanding: { amount: '40.00', currencyCode: 'USD' },
+    totalReceived: { amount: '0.00', currencyCode: 'USD' },
+    totalCapturable: { amount: '0.00', currencyCode: 'USD' },
+    transactionsCount: 0,
+    paymentEvidenceComplete: true,
+    transactions: [],
     email: 'buyer@example.com',
     phone: '+15555550100',
     poNumber: 'PO-6600',
@@ -171,6 +189,16 @@ function previewFixture(overrides = {}) {
     fulfillments: [],
     ...overrides,
   }
+}
+
+function authorizedPreviewFixture(overrides = {}) {
+  return previewFixture({
+    capturable: true,
+    totalCapturable: { amount: '40.00', currencyCode: 'USD' },
+    transactionsCount: 1,
+    transactions: [transactionFixture()],
+    ...overrides,
+  })
 }
 
 function fulfillmentFixture(overrides = {}) {
@@ -390,6 +418,88 @@ let lastRecoveryInput = null
 let recoverAsUnknown = false
 let revokeAfterCredentialRead = false
 let providerExecutionCount = 0
+let paymentEligibilityCallCount = 0
+
+function cancellationPaymentEligibility(preview) {
+  paymentEligibilityCallCount += 1
+  if (!preview.paymentEvidenceComplete) {
+    return {
+      allowed: false,
+      reason: 'Shopify payment transaction evidence is not bounded and exhaustive',
+      releasesAuthorization: false,
+    }
+  }
+  if (!preview.unpaid || Number(preview.totalReceived.amount) !== 0) {
+    return {
+      allowed: false,
+      reason: 'Paid or captured orders require an explicit refund workflow',
+      releasesAuthorization: false,
+    }
+  }
+  if (preview.transactions.some((transaction) => (
+    ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN'].includes(transaction.status)
+  ))) {
+    return {
+      allowed: false,
+      reason: 'A Shopify payment transaction is still pending or unresolved',
+      releasesAuthorization: false,
+    }
+  }
+  if (preview.capturable) {
+    if (preview.transactionsCount === null || preview.transactionsCount >= 25) {
+      return {
+        allowed: false,
+        reason: 'Shopify payment evidence has no bounded room to prove authorization release',
+        releasesAuthorization: false,
+      }
+    }
+    const authorizations = preview.transactions.filter((transaction) => (
+      transaction.kind === 'AUTHORIZATION'
+      && transaction.status === 'SUCCESS'
+      && transaction.test
+      && Number(transaction.totalUnsettled?.amount) > 0
+    ))
+    const liveTransactions = preview.transactions.filter((transaction) => (
+      transaction.manuallyCapturable
+      || Number(transaction.totalUnsettled?.amount || 0) > 0
+    ))
+    if (
+      Number(preview.totalCapturable.amount) <= 0
+      || authorizations.length !== 1
+      || liveTransactions.length !== 1
+      || liveTransactions[0].id !== authorizations[0].id
+      || Number(authorizations[0].amount.amount)
+        !== Number(preview.totalCapturable.amount)
+      || Number(authorizations[0].totalUnsettled.amount)
+        !== Number(preview.totalCapturable.amount)
+    ) {
+      return {
+        allowed: false,
+        reason: 'The capturable balance is not one bounded successful test authorization',
+        releasesAuthorization: false,
+      }
+    }
+    return { allowed: true, reason: null, releasesAuthorization: true }
+  }
+  return { allowed: true, reason: null, releasesAuthorization: false }
+}
+
+function cancellationPaymentReleased(preview) {
+  return preview.paymentEvidenceComplete
+    && preview.unpaid
+    && Number(preview.totalReceived.amount) === 0
+    && !preview.capturable
+    && Number(preview.totalCapturable.amount) === 0
+    && !preview.transactions.some((transaction) => (
+      ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN'].includes(transaction.status)
+      || transaction.manuallyCapturable
+      || Number(transaction.totalUnsettled?.amount || 0) > 0
+      || (
+        transaction.status === 'SUCCESS'
+        && ['CAPTURE', 'SALE'].includes(transaction.kind)
+      )
+    ))
+}
 
 function reset() {
   events = []
@@ -408,6 +518,7 @@ function reset() {
   recoverAsUnknown = false
   revokeAfterCredentialRead = false
   providerExecutionCount = 0
+  paymentEligibilityCallCount = 0
 }
 
 function loadCommands() {
@@ -490,6 +601,10 @@ function loadCommands() {
           shopifyOrderManagementProjectionHash() {
             return '9'.repeat(64)
           },
+          shopifyOrderCancellationPaymentEligibility:
+            cancellationPaymentEligibility,
+          shopifyOrderCancellationPaymentReleased:
+            cancellationPaymentReleased,
           async inspectShopifyOrderManagementTarget(input) {
             events.push(['inspect', input])
             return inspection
@@ -926,6 +1041,66 @@ assert.equal(management.eligibility.cancel.allowed, true)
 assert.equal(management.eligibility.lineEdits[0].allowed, false)
 assert.match(management.eligibility.lineEdits[0].reason, /currencies to match/i)
 
+// Public eligibility uses the same payment decision as provider execution.
+// Order display PENDING does not block a successful test AUTHORIZATION, while
+// transaction PENDING and received/captured money fail closed.
+reset()
+inspection = inspectionFixture(authorizedPreviewFixture())
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(management.order.financialStatus, 'PENDING')
+assert.deepEqual(plain(management.eligibility.cancel), {
+  allowed: true,
+  reason: null,
+  releasesAuthorization: true,
+})
+assert.equal(paymentEligibilityCallCount, 1)
+
+reset()
+inspection = inspectionFixture(authorizedPreviewFixture({
+  transactions: [transactionFixture({ status: 'PENDING' })],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.match(management.eligibility.cancel.reason, /pending or unresolved/i)
+assert.equal(management.eligibility.addTag.allowed, true)
+
+reset()
+inspection = inspectionFixture(previewFixture({
+  transactionsCount: 26,
+  paymentEvidenceComplete: false,
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.match(management.eligibility.cancel.reason, /bounded and exhaustive/i)
+assert.equal(management.eligibility.addTag.allowed, true)
+
+reset()
+inspection = inspectionFixture(previewFixture({
+  unpaid: false,
+  totalReceived: { amount: '40.00', currencyCode: 'USD' },
+  transactionsCount: 1,
+  transactions: [transactionFixture({
+    kind: 'CAPTURE',
+    manuallyCapturable: false,
+    totalUnsettled: null,
+  })],
+}))
+management = await commands.readShopifyOrderManagementState({
+  organizationId,
+  orderGlobalId,
+})
+assert.equal(management.eligibility.cancel.allowed, false)
+assert.match(management.eligibility.cancel.reason, /refund workflow/i)
+
 // Warehouse history must not hide the current Shopify facts. A shipped order
 // remains ineligible, but the UI receives the real fulfillment reason instead
 // of the internal unstarted-order write fence.
@@ -1210,6 +1385,7 @@ assert.deepEqual(
   {
     allowed: true,
     reason: null,
+    releasesAuthorization: false,
     predecessorAuthorizationGlobalId,
   },
 )
@@ -1259,6 +1435,7 @@ assert.deepEqual(
   {
     allowed: true,
     reason: null,
+    releasesAuthorization: false,
     predecessorAuthorizationGlobalId,
   },
 )
@@ -1326,8 +1503,11 @@ for (const fixture of [
     reason: /closed/i,
   },
   {
-    preview: postReversalPreviewFixture({ capturable: true }),
-    reason: /payment authorization/i,
+    preview: postReversalPreviewFixture({
+      capturable: true,
+      totalCapturable: { amount: '40.00', currencyCode: 'USD' },
+    }),
+    reason: /authorization/i,
   },
   {
     preview: postReversalPreviewFixture({ returnStatus: 'RETURNED' }),
@@ -1344,7 +1524,7 @@ for (const fixture of [
   },
   {
     preview: postReversalPreviewFixture({ unpaid: false }),
-    reason: /refund settings/i,
+    reason: /refund workflow/i,
   },
 ]) {
   reset()
@@ -1904,7 +2084,8 @@ for (const [field, value] of [
 // A completed Shopify cancellation Job does not by itself prove that the
 // order was cancelled or that the mutation was not applied. Because the
 // inspector reads the order before the Job, a completion race must remain
-// unknown unless the exact order preview affirmatively shows cancelledAt.
+// unknown unless the exact order preview proves both cancellation and release
+// of the payment authorization.
 reset()
 const cancellationJobGid = 'gid://shopify/Job/cancel-6600'
 currentAuthorization = authorizationFixture({
@@ -1927,6 +2108,64 @@ result = await commands.reconcileShopifyOrderManagementCommand({
 assert.equal(result.state, 'unknown')
 assert.equal(result.providerReads, 3)
 assert.equal(lastReconcileInput, null)
+
+// cancelledAt alone is insufficient when Shopify still reports the authorized
+// test payment as capturable. Reconciliation must preserve the unknown fence.
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel'),
+  status: 'unknown',
+  providerAttemptGlobalId: attemptGlobalId,
+  providerWriteCount: 1,
+  providerReference: cancellationJobGid,
+})
+inspection = inspectionFixture(authorizedPreviewFixture({
+  cancelledAt: providerUpdatedAt,
+}), {
+  job: { jobGid: cancellationJobGid, done: true },
+  providerReads: 3,
+})
+result = await commands.reconcileShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  attemptGlobalId,
+  idempotencyKey: 'shopify-cancel-live-auth-reconcile-unknown-0001',
+})
+assert.equal(result.state, 'unknown')
+assert.equal(result.providerReads, 3)
+assert.equal(lastReconcileInput, null)
+
+// A terminal authorization row with no unsettled or capturable balance is
+// affirmative release evidence and can reconcile the accepted cancel.
+reset()
+currentAuthorization = authorizationFixture({
+  action: actionFixture('cancel'),
+  status: 'unknown',
+  providerAttemptGlobalId: attemptGlobalId,
+  providerWriteCount: 1,
+  providerReference: cancellationJobGid,
+})
+inspection = inspectionFixture(previewFixture({
+  cancelledAt: providerUpdatedAt,
+  transactionsCount: 1,
+  transactions: [transactionFixture({
+    manuallyCapturable: false,
+    totalUnsettled: null,
+  })],
+}), {
+  job: { jobGid: cancellationJobGid, done: true },
+  providerReads: 3,
+})
+result = await commands.reconcileShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  attemptGlobalId,
+  idempotencyKey: 'shopify-cancel-released-auth-reconcile-applied-0001',
+})
+assert.equal(result.state, 'reconciled')
+assert.equal(result.providerReads, 3)
+assert.equal(lastReconcileInput.resolution, 'applied')
+assert.equal(providerExecutionCount, 0)
 
 // Fulfillment-reversal reconciliation is affirmative-only: the exact
 // fulfillment must still be present and report CANCELLED. SUCCESS or a

@@ -80,10 +80,15 @@ function managementFixture(globalId = 'gor1234567') {
     eligibility: {
       addTag: { allowed: true, reason: null },
       ordinarySave: { allowed: true, reason: null },
-      cancel: { allowed: true, reason: null },
+      cancel: {
+        allowed: true,
+        reason: null,
+        releasesAuthorization: true,
+      },
       cancelAfterFulfillmentReversal: {
         allowed: false,
         reason: 'No completed fulfillment reversal is available',
+        releasesAuthorization: false,
         predecessorAuthorizationGlobalId: null,
       },
       fulfillments: [{
@@ -425,6 +430,10 @@ assert.deepEqual(
   managementFixture(orderGlobalId).eligibility
     .cancelAfterFulfillmentReversal,
 )
+assert.deepEqual(
+  result.payload.management.eligibility.cancel,
+  managementFixture(orderGlobalId).eligibility.cancel,
+)
 
 result = await get(orderGlobalId, `&organizationId=${organizationA}`)
 assert.equal(result.status, 400)
@@ -762,6 +771,7 @@ readImpl = async (input) => {
   fixture.eligibility.cancelAfterFulfillmentReversal = {
     allowed: true,
     reason: null,
+    releasesAuthorization: false,
     predecessorAuthorizationGlobalId: null,
   }
   return fixture

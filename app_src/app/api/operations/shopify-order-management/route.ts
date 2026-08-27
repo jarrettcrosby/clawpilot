@@ -546,7 +546,9 @@ function publicManagement(value: unknown) {
     || typeof addTag.allowed !== 'boolean'
     || typeof ordinarySave.allowed !== 'boolean'
     || typeof cancel.allowed !== 'boolean'
+    || typeof cancel.releasesAuthorization !== 'boolean'
     || typeof cancelAfterFulfillmentReversal.allowed !== 'boolean'
+    || typeof cancelAfterFulfillmentReversal.releasesAuthorization !== 'boolean'
     || !Array.isArray(order.tags)
     || order.tags.length > 250
     || !Array.isArray(order.lines)
@@ -686,6 +688,7 @@ function publicManagement(value: unknown) {
       cancel: Object.freeze({
         allowed: cancel.allowed,
         reason: resultNullableText(cancel.reason, 512),
+        releasesAuthorization: cancel.releasesAuthorization,
       }),
       cancelAfterFulfillmentReversal: Object.freeze({
         allowed: cancelAfterFulfillmentReversal.allowed,
@@ -693,6 +696,8 @@ function publicManagement(value: unknown) {
           cancelAfterFulfillmentReversal.reason,
           512,
         ),
+        releasesAuthorization:
+          cancelAfterFulfillmentReversal.releasesAuthorization,
         predecessorAuthorizationGlobalId: postReversalPredecessor,
       }),
       fulfillments: Object.freeze(fulfillmentEligibility),

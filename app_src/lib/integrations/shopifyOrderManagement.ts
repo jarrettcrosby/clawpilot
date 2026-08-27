@@ -16,6 +16,8 @@ import {
 } from '@/lib/integrations/shopifyCommerceClient'
 
 const ORDER_GID_PATTERN = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
+const ORDER_TRANSACTION_GID_PATTERN =
+  /^gid:\/\/shopify\/OrderTransaction\/[A-Za-z0-9][A-Za-z0-9-]*$/
 const SHOP_GID_PATTERN = /^gid:\/\/shopify\/Shop\/[1-9][0-9]*$/
 const LINE_ITEM_GID_PATTERN = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]*$/
 const FULFILLMENT_GID_PATTERN =
@@ -36,6 +38,7 @@ const CURRENCY_CODE_PATTERN = /^(?:[A-Z]{3}|USDC)$/
 const DECIMAL_AMOUNT_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/
 const MAX_ORDER_LINES = 250
 const MAX_ORDER_FULFILLMENTS = 10
+const MAX_ORDER_TRANSACTIONS = 25
 const MAX_FULFILLMENT_ORDERS = 10
 const MAX_FULFILLMENT_TRACKING_ENTRIES = 10
 const MAX_GID_LENGTH = 255
@@ -54,10 +57,28 @@ const MAX_ADDRESS_PROVINCE_CODE_LENGTH = 64
 const MAX_ADDRESS_POSTAL_CODE_LENGTH = 64
 const MAX_USER_ERRORS = 50
 const COUNTRY_CODE_PATTERN = /^[A-Z]{2}$/
+const ORDER_TRANSACTION_KINDS = new Set([
+  'AUTHORIZATION',
+  'CAPTURE',
+  'CHANGE',
+  'EMV_AUTHORIZATION',
+  'REFUND',
+  'SALE',
+  'SUGGESTED_REFUND',
+  'VOID',
+])
+const ORDER_TRANSACTION_STATUSES = new Set([
+  'AWAITING_RESPONSE',
+  'ERROR',
+  'FAILURE',
+  'PENDING',
+  'SUCCESS',
+  'UNKNOWN',
+])
 
 export const SHOPIFY_ORDER_MANAGEMENT_API_VERSION = SHOPIFY_ADMIN_API_VERSION
 export const SHOPIFY_ORDER_MANAGEMENT_ADAPTER_VERSION =
-  'shopify-graphql-2026-07-order-management-v3'
+  'shopify-graphql-2026-07-order-management-v4'
 
 if (SHOPIFY_ORDER_MANAGEMENT_API_VERSION !== '2026-07') {
   throw new Error('Shopify order management requires Admin API 2026-07')
@@ -166,6 +187,16 @@ export type ShopifyOrderManagementFulfillment = {
   fulfillmentOrders: ShopifyOrderManagementFulfillmentOrder[]
 }
 
+export type ShopifyOrderManagementTransaction = {
+  id: string
+  kind: string
+  status: string
+  test: boolean
+  manuallyCapturable: boolean
+  amount: ShopifyOrderManagementMoney
+  totalUnsettled: ShopifyOrderManagementMoney | null
+}
+
 export type ShopifyOrderManagementPreview = {
   id: string
   legacyResourceId: string
@@ -186,6 +217,11 @@ export type ShopifyOrderManagementPreview = {
   orderCurrencyCode: string
   currentTotalPrice: ShopifyOrderManagementMoney
   totalOutstanding: ShopifyOrderManagementMoney
+  totalReceived: ShopifyOrderManagementMoney
+  totalCapturable: ShopifyOrderManagementMoney
+  transactionsCount: number | null
+  paymentEvidenceComplete: boolean
+  transactions: ShopifyOrderManagementTransaction[]
   email: string | null
   phone: string | null
   poNumber: string | null
@@ -252,6 +288,12 @@ export type ShopifyOrderManagementMoney = {
   amount: string
   currencyCode: string
 }
+
+export type ShopifyOrderCancellationPaymentEligibility = Readonly<{
+  allowed: boolean
+  reason: string | null
+  releasesAuthorization: boolean
+}>
 
 export type ShopifyOrderEditCommitResult = {
   orderGid: string
@@ -631,6 +673,165 @@ function compareDecimalAmounts(left: string, right: string): -1 | 0 | 1 {
         : 0
   })()
   return leftParts.negative ? (magnitude * -1) as -1 | 0 | 1 : magnitude
+}
+
+function zeroMoney(value: ShopifyOrderManagementMoney): boolean {
+  return compareDecimalAmounts(value.amount, '0') === 0
+}
+
+function positiveMoney(value: ShopifyOrderManagementMoney | null): boolean {
+  return value !== null && compareDecimalAmounts(value.amount, '0') > 0
+}
+
+const UNRESOLVED_TRANSACTION_STATUSES = new Set([
+  'AWAITING_RESPONSE',
+  'PENDING',
+  'UNKNOWN',
+])
+
+/**
+ * Payment eligibility is shared by the public command state and the provider
+ * execution assertion. Shopify's order-level displayFinancialStatus is never
+ * used here: a PENDING order display status is distinct from a PENDING payment
+ * transaction. The bounded, exhaustive transaction projection is authoritative.
+ */
+export function shopifyOrderCancellationPaymentEligibility(
+  preview: ShopifyOrderManagementPreview,
+): ShopifyOrderCancellationPaymentEligibility {
+  if (!preview.paymentEvidenceComplete) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify payment transaction evidence is not bounded and exhaustive',
+      releasesAuthorization: false,
+    })
+  }
+  if (!preview.unpaid || !zeroMoney(preview.totalReceived)) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Paid or captured orders require an explicit refund workflow',
+      releasesAuthorization: false,
+    })
+  }
+  if (preview.transactions.some((transaction) => (
+    UNRESOLVED_TRANSACTION_STATUSES.has(transaction.status)
+  ))) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'A Shopify payment transaction is still pending or unresolved',
+      releasesAuthorization: false,
+    })
+  }
+  if (preview.transactions.some((transaction) => (
+    transaction.status === 'SUCCESS'
+    && ['CAPTURE', 'SALE'].includes(transaction.kind)
+  ))) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify reports a successful captured payment transaction',
+      releasesAuthorization: false,
+    })
+  }
+
+  const successfulAuthorizations = preview.transactions.filter(
+    (transaction) => (
+      transaction.kind === 'AUTHORIZATION'
+      && transaction.status === 'SUCCESS'
+    ),
+  )
+  if (successfulAuthorizations.some((transaction) => !transaction.test)) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify returned a non-test payment authorization',
+      releasesAuthorization: false,
+    })
+  }
+  const liveTransactions = preview.transactions.filter((transaction) => (
+    transaction.manuallyCapturable
+    || positiveMoney(transaction.totalUnsettled)
+  ))
+  const capturableAmountPositive = positiveMoney(preview.totalCapturable)
+  if (preview.capturable !== capturableAmountPositive) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify returned inconsistent capturable payment evidence',
+      releasesAuthorization: false,
+    })
+  }
+
+  if (preview.capturable) {
+    if (
+      preview.transactionsCount === null
+      || preview.transactionsCount >= MAX_ORDER_TRANSACTIONS
+    ) {
+      return Object.freeze({
+        allowed: false,
+        reason: 'Shopify payment evidence has no bounded room to prove authorization release',
+        releasesAuthorization: false,
+      })
+    }
+    const authorization = successfulAuthorizations.length === 1
+      ? successfulAuthorizations[0]
+      : null
+    if (
+      !authorization
+      || !authorization.test
+      || liveTransactions.length !== 1
+      || liveTransactions[0].id !== authorization.id
+      || !positiveMoney(authorization.amount)
+      || !positiveMoney(authorization.totalUnsettled)
+      || compareDecimalAmounts(
+        authorization.amount.amount,
+        preview.totalCapturable.amount,
+      ) !== 0
+      || compareDecimalAmounts(
+        authorization.totalUnsettled!.amount,
+        preview.totalCapturable.amount,
+      ) !== 0
+    ) {
+      return Object.freeze({
+        allowed: false,
+        reason: 'The capturable balance is not one bounded successful test authorization',
+        releasesAuthorization: false,
+      })
+    }
+    return Object.freeze({
+      allowed: true,
+      reason: null,
+      releasesAuthorization: true,
+    })
+  }
+
+  if (liveTransactions.length > 0) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify still reports a live payment authorization',
+      releasesAuthorization: false,
+    })
+  }
+  return Object.freeze({
+    allowed: true,
+    reason: null,
+    releasesAuthorization: false,
+  })
+}
+
+export function shopifyOrderCancellationPaymentReleased(
+  preview: ShopifyOrderManagementPreview,
+) {
+  return preview.paymentEvidenceComplete
+    && preview.unpaid
+    && zeroMoney(preview.totalReceived)
+    && !preview.capturable
+    && zeroMoney(preview.totalCapturable)
+    && !preview.transactions.some((transaction) => (
+      UNRESOLVED_TRANSACTION_STATUSES.has(transaction.status)
+      || transaction.manuallyCapturable
+      || positiveMoney(transaction.totalUnsettled)
+      || (
+        transaction.status === 'SUCCESS'
+        && ['CAPTURE', 'SALE'].includes(transaction.kind)
+      )
+    ))
 }
 
 function isoDate(value: unknown, label: string): string {
@@ -1179,6 +1380,64 @@ function parseFulfillment(value: unknown): ShopifyOrderManagementFulfillment {
   }
 }
 
+function parseOrderTransaction(
+  value: unknown,
+  shopCurrencyCode: string,
+): ShopifyOrderManagementTransaction {
+  const transaction = safeRecord(value)
+  if (!transaction) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid payment transaction evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  const kind = strictText(transaction.kind, 'payment transaction kind', 64)
+  const status = strictText(
+    transaction.status,
+    'payment transaction status',
+    64,
+  )
+  if (
+    !ORDER_TRANSACTION_KINDS.has(kind)
+    || !ORDER_TRANSACTION_STATUSES.has(status)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid payment transaction state',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  return {
+    id: strictGid(
+      transaction.id,
+      'payment transaction identity',
+      ORDER_TRANSACTION_GID_PATTERN,
+    ),
+    kind,
+    status,
+    test: strictBoolean(transaction.test, 'payment transaction test state'),
+    manuallyCapturable: strictBoolean(
+      transaction.manuallyCapturable,
+      'payment transaction capturable state',
+    ),
+    amount: strictPreviewMoney(
+      transaction.amountSet,
+      'payment transaction amount',
+      shopCurrencyCode,
+    ),
+    totalUnsettled: transaction.totalUnsettledSet === null
+      ? null
+      : strictPreviewMoney(
+          transaction.totalUnsettledSet,
+          'payment transaction unsettled amount',
+          shopCurrencyCode,
+        ),
+  }
+}
+
 function parsePreview(
   value: unknown,
   shopCurrencyInput: unknown,
@@ -1258,6 +1517,58 @@ function parsePreview(
     order.currencyCode,
     'order currency',
   )
+  if (!Array.isArray(order.transactions)) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid payment transaction evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  const transactionCount = order.transactionsCount === null
+    ? null
+    : safeRecord(order.transactionsCount)
+  if (
+    order.transactions.length > MAX_ORDER_TRANSACTIONS
+    || (order.transactionsCount !== null && !transactionCount)
+    || (
+      transactionCount
+      && (
+        !['AT_LEAST', 'EXACT'].includes(String(transactionCount.precision))
+        || !Number.isSafeInteger(transactionCount.count)
+        || Number(transactionCount.count) < 0
+        || Number(transactionCount.count) > 2_147_483_647
+      )
+    )
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned invalid payment transaction count evidence',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
+  const normalizedTransactionCount = transactionCount
+    ? Number(transactionCount.count)
+    : null
+  const paymentEvidenceComplete = transactionCount?.precision === 'EXACT'
+    && normalizedTransactionCount !== null
+    && normalizedTransactionCount <= MAX_ORDER_TRANSACTIONS
+    && order.transactions.length === normalizedTransactionCount
+  const transactions = order.transactions.map((transaction) => (
+    parseOrderTransaction(transaction, shopCurrencyCode)
+  ))
+  if (
+    new Set(transactions.map((transaction) => transaction.id)).size
+      !== transactions.length
+  ) {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_RESPONSE_INVALID',
+      'Shopify returned duplicate payment transactions',
+      502,
+      { stage: 'provider_preview' },
+    )
+  }
   return {
     id: strictGid(order.id, 'order identity', ORDER_GID_PATTERN),
     legacyResourceId: strictText(
@@ -1299,6 +1610,19 @@ function parsePreview(
       shopCurrencyCode,
       { allowNegative: true },
     ),
+    totalReceived: strictPreviewMoney(
+      order.totalReceivedSet,
+      'order total received',
+      shopCurrencyCode,
+    ),
+    totalCapturable: strictPreviewMoney(
+      order.totalCapturableSet,
+      'order total capturable',
+      shopCurrencyCode,
+    ),
+    transactionsCount: normalizedTransactionCount,
+    paymentEvidenceComplete,
+    transactions,
     email: nullableResponseText(
       order.email,
       'order email',
@@ -1369,6 +1693,26 @@ const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
       }
       totalOutstandingSet {
         shopMoney { amount currencyCode }
+      }
+      totalReceivedSet {
+        shopMoney { amount currencyCode }
+      }
+      totalCapturableSet {
+        shopMoney { amount currencyCode }
+      }
+      transactionsCount { count precision }
+      transactions(first: 25) {
+        id
+        kind
+        status
+        test
+        manuallyCapturable
+        amountSet {
+          shopMoney { amount currencyCode }
+        }
+        totalUnsettledSet {
+          shopMoney { amount currencyCode }
+        }
       }
       email
       phone
@@ -2701,14 +3045,21 @@ function assertCancellationEligible(preview: ShopifyOrderManagementPreview) {
   if (
     preview.cancelledAt !== null
     || preview.closed
-    || !preview.unpaid
-    || preview.capturable
     || preview.returnStatus !== 'NO_RETURN'
     || !whollyUnfulfilled(preview)
   ) {
     fail(
       'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
-      'The test order is not an unpaid, wholly unfulfilled order without returns or payment authorization',
+      'The test order is not open, wholly unfulfilled, and without returns',
+      409,
+      { stage: 'eligibility' },
+    )
+  }
+  const payment = shopifyOrderCancellationPaymentEligibility(preview)
+  if (!payment.allowed) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
+      payment.reason || 'The test order payment state is not eligible for cancellation',
       409,
       { stage: 'eligibility' },
     )
@@ -3553,10 +3904,15 @@ export async function executeShopifyOrderManagementAction(
           ? action.reversedFulfillmentGid
           : undefined,
       )
-      if (after.id !== before.id || after.name !== before.name || !after.cancelledAt) {
+      if (
+        after.id !== before.id
+        || after.name !== before.name
+        || !after.cancelledAt
+        || !shopifyOrderCancellationPaymentReleased(after)
+      ) {
         fail(
           'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH',
-          'Shopify cancellation readback did not show a cancelled order',
+          'Shopify cancellation readback did not prove cancellation and payment-authorization release',
           502,
           { stage: 'cancel_readback' },
         )
