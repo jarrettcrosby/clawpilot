@@ -232,6 +232,7 @@ function loadOperationalFaireRoute(
     zeroMaterialStock = false,
   } = {},
 ) {
+  const mixedOperational = operationalGeometry && operationalUnitMaterial
   const path =
     'app_src/app/api/integrations/commerce/intake/cartonization-rate-evidence/route.ts'
   const output = ts.transpileModule(read(path), {
@@ -302,7 +303,12 @@ function loadOperationalFaireRoute(
         productGlobalId: 'gpr0000001',
         requiredQuantity: 1,
         assumedCommittedQuantity: 0,
-      }],
+      }, ...(mixedOperational ? [{
+        lineGlobalId: 'gcol0000002',
+        productGlobalId: 'gpr0000002',
+        requiredQuantity: 1,
+        assumedCommittedQuantity: 0,
+      }] : [])],
       products: [{
         productGlobalId: 'gpr0000001',
         requiredQuantity: 1,
@@ -315,7 +321,19 @@ function loadOperationalFaireRoute(
         sourceLevelGlobalIds: [],
         sourcePositionGlobalIds: shadowTraining ? [] : ['giv0000001'],
         sourceProjectionStates: shadowTraining ? [] : ['projected'],
-      }],
+      }, ...(mixedOperational ? [{
+        productGlobalId: 'gpr0000002',
+        requiredQuantity: 1,
+        availabilityAuthority: 'operational_available',
+        operationalAvailableQuantity: shadowTraining ? 0 : 3,
+        providerCommittedQuantity: 0,
+        activeReservedQuantity: 0,
+        assumedCommittedQuantity: 0,
+        effectiveAvailableQuantity: shadowTraining ? 0 : 3,
+        sourceLevelGlobalIds: [],
+        sourcePositionGlobalIds: shadowTraining ? [] : ['giv0000002'],
+        sourceProjectionStates: shadowTraining ? [] : ['projected'],
+      }] : [])],
     },
     materialEvidence: [],
     recipeEvidence: [],
@@ -371,7 +389,10 @@ function loadOperationalFaireRoute(
       lines: [{
         lineGlobalId: 'gcol0000001',
         quantity: 1,
-      }],
+      }, ...(mixedOperational ? [{
+        lineGlobalId: 'gcol0000002',
+        quantity: 1,
+      }] : [])],
       recipes: [],
       materials: [{
         materialGlobalId: 'gmat0000001',
@@ -417,7 +438,12 @@ function loadOperationalFaireRoute(
       fitModel: operationalUnitMaterial
         ? 'unconstrained_unit'
         : 'rigid_3d',
-    }],
+    }, ...(mixedOperational ? [{
+      lineGlobalId: 'gcol0000002',
+      productGlobalId: 'gpr0000002',
+      quantity: 1,
+      fitModel: 'rigid_3d',
+    }] : [])],
     assumptions: [],
     blockers: [],
   } : {
@@ -563,14 +589,14 @@ function loadOperationalFaireRoute(
       planHybridCartonization: () => plan,
     },
     '@/lib/operations/operationalGeometryCartonization': {
-      planOperationalGeometryRatePackages: async () => {
+      planOperationalGeometryRatePackages: async (input) => {
         if (operationalGeometry) {
           observed.geometryCalls = (observed.geometryCalls || 0) + 1
           return {
             status: 'ready',
             packages: [{
               packageKey: 'geometry-package-1',
-              packageSequence: 1,
+              packageSequence: input.startingSequence,
               planningMethod: 'or_tools',
               packagingMaterialGlobalId: 'gmat0000001',
               materialRowVersion: 2,
@@ -591,8 +617,12 @@ function loadOperationalFaireRoute(
               ratedGrossWeightGrams: 520,
               maxWeightGrams: 5000,
               allocations: [{
-                lineGlobalId: 'gcol0000001',
-                productGlobalId: 'gpr0000001',
+                lineGlobalId: mixedOperational
+                  ? 'gcol0000002'
+                  : 'gcol0000001',
+                productGlobalId: mixedOperational
+                  ? 'gpr0000002'
+                  : 'gpr0000001',
                 title: 'Shopify training product',
                 quantity: 1,
               }],
@@ -604,8 +634,66 @@ function loadOperationalFaireRoute(
         )
       },
     },
+    '@/lib/operations/operationalMixedMaterialCartonization': {
+      reconcileOperationalMixedMaterialPlans: async (input) => {
+        if (mixedOperational) {
+          observed.mixedMaterialCalls =
+            (observed.mixedMaterialCalls || 0) + 1
+          observed.mixedMaterialInput = input
+          const unitPlan = input.planUnit({
+            reservedMaterialUsage: [],
+            maximumPackages: input.maximumPackages,
+          })
+          const geometryPlan = await input.planGeometry({
+            reservedMaterialUsage: [{
+              materialGlobalId: 'gmat0000001',
+              quantity: 1,
+            }],
+            maximumPackages:
+              input.maximumPackages - unitPlan.packages.length,
+            precedingUnitPackageCount: unitPlan.packages.length,
+            optimizerDeadlineMs: 1_000,
+          })
+          return {
+            status: 'ready',
+            unitPlan,
+            geometryPlan,
+            evidence: {
+              policyVersion:
+                'operational-mixed-material-conflict-backtracking-v1',
+              solver:
+                'bounded_geometry_material_conflict_backtracking',
+              backtrackStateLimit: 32,
+              backtrackStatesEvaluated: 1,
+              geometryPlansEvaluated: 2,
+              ordinaryReservationMaterialUsage: [{
+                materialGlobalId: 'gmat0000001',
+                quantity: 1,
+              }],
+              unitMaterialUsage: [{
+                materialGlobalId: 'gmat0000001',
+                quantity: 1,
+              }],
+              geometryMaterialUsage: [{
+                materialGlobalId: 'gmat0000001',
+                quantity: 1,
+              }],
+              combinedMaterialUsage: [{
+                materialGlobalId: 'gmat0000001',
+                quantity: 2,
+              }],
+              materialCapacities: input.materialCapacities,
+              decisionHash: 'd'.repeat(64),
+            },
+          }
+        }
+        throw new Error(
+          'Mixed operational reconciliation is outside this route fixture',
+        )
+      },
+    },
     '@/lib/operations/operationalUnitMaterialCartonization': {
-      planOperationalUnitMaterialPackages: () => {
+      planOperationalUnitMaterialPackages: (input) => {
         if (!operationalUnitMaterial) {
           throw new Error(
             'Unit-material planning is outside this route fixture',
@@ -616,11 +704,28 @@ function loadOperationalFaireRoute(
         return {
           status: 'ready',
           evidence: {
-            policyVersion: 'operational-unit-material-one-each-v1',
+            policyVersion: 'operational-unit-material-shared-stock-v3',
+            productPackConstraint: 'not_required_for_ordinary_unit',
+            packageSelectionPolicies: {
+              dimensioned:
+                'fewest_packages_then_material_cost_then_inner_cube',
+              undimensioned:
+                'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+              boundedFallback:
+                'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
+            },
+            sharedStockSolver: 'exact_bounded_search',
+            combinationPolicy: 'same_line_fixed_axis_only',
+            unitWeightAuthority: 'provider_or_order_specific',
+            unitDimensionsAuthority:
+              'order_specific_or_one_each_without_fit_claim',
+            rotationAllowed: false,
+            dimensionedLineCount: 0,
+            oneEachUndimensionedLineCount: 1,
           },
           packages: [{
             packageKey: 'unit-material-package-1',
-            packageSequence: 1,
+            packageSequence: input.startingSequence,
             planningMethod: 'unit_material_selection',
             packagingMaterialGlobalId: 'gmat0000001',
             materialRowVersion: 2,
@@ -646,6 +751,24 @@ function loadOperationalFaireRoute(
               title: 'Shopify unit item',
               quantity: 1,
             }],
+            unitMaterialEvidence: {
+              policyVersion: 'operational-unit-material-shared-stock-v3',
+              productPackConstraint: 'not_required_for_ordinary_unit',
+              packageSelectionBasis:
+                'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+              sharedStockSolver: 'exact_bounded_search',
+              unitsPerPackage: 1,
+              unitWeightGrams: 400,
+              unitWeightAuthority: 'provider_or_order_specific',
+              unitDimensionsAuthority: 'unavailable',
+              fitModel: 'one_each_without_fit_claim',
+              rotationAllowed: false,
+              unitDimensionsMm: null,
+              axisCounts: null,
+              spatialCapacityUnits: null,
+              weightCapacityUnits: 12,
+              effectiveCapacityUnits: 1,
+            },
           }],
         }
       },
@@ -805,7 +928,7 @@ const orToolsProfileMigration = read(
   'db/migrations/0261_operations_cartonization_or_tools_profile_evidence.sql',
 )
 const unitMaterialMigration = read(
-  'db/migrations/0323_operations_unit_material_cartonization.sql',
+  'db/migrations/0336_operations_order_unit_physical_facts.sql',
 )
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
@@ -949,12 +1072,14 @@ assertIncludes(orToolsProfileMigration, [
   'profile_version.is_current = true',
 ], 'Operational OR-Tools profile evidence migration')
 assertIncludes(unitMaterialMigration, [
-  "'unit_material_selection'",
-  'ops_cart_rate_pkg_planning_method_check',
   'validate_operations_cartonization_unit_material_package()',
-  'DEFERRABLE INITIALLY DEFERRED',
-  "evidence.evidence_mode = 'operational'",
-  'jsonb_array_length(NEW.allocations) <> 1',
+  'operational-unit-material-shared-stock-v3',
+  'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+  'min_cost_max_flow_one_carton_per_unit_fallback',
+  'same_line_fixed_axis_only',
+  'fixed_axis_regular_grid',
+  'one_each_without_fit_claim',
+  'allocation_quantity <> 1',
   'cannot retain recipe or Product-pack profile edges',
 ], 'Operational unit-material planner provenance migration')
 
@@ -1107,6 +1232,13 @@ const operationalGeometryFence = section(
 )
 assertIncludes(operationalGeometryFence, [
   'configuredOrToolsFulfillmentOptimizer()',
+  'reservedMaterialUsage: input.reservedMaterialUsage',
+  'reconcileOperationalMixedMaterialPlans({',
+  'materialCapacities: mixedMaterialCapacities',
+  'geometrySearchDeadlineAtMs:',
+  'Date.now() + MIXED_MATERIAL_GEOMETRY_SEARCH_BUDGET_MS',
+  'deadlineMs: input.optimizerDeadlineMs',
+  'operationalMixedMaterialAllocation = reconciled.evidence',
   'planOperationalGeometryRatePackages({',
   'optimizer,',
   "operationalGeometryRatePlan.status === 'blocked'",
@@ -1126,7 +1258,7 @@ assertIncludes(unitMaterialFence, [
   "line.fitModel === 'unconstrained_unit'",
   'planOperationalUnitMaterialPackages({',
   'inventoryProducts: read.inventory.products',
-  "operationalUnitMaterialPlan.status === 'blocked'",
+  'reservedMaterialUsage: input.reservedMaterialUsage',
 ], 'Unit items must use fail-closed factual material selection')
 const sandboxGeometrySection = section(
   route,
@@ -1305,11 +1437,194 @@ const {
   assertCartonizationRateEvidenceMaterialAssumptions,
   assertCartonizationRateEvidenceOperationalGeometryProvenance,
   assertCartonizationRateEvidenceOrToolsProfiles,
+  assertCartonizationRateEvidenceUnitMaterialProvenance,
   cartonizationRateEvidenceHash,
   cartonizationRateEvidenceRequestHash,
   cartonizationShipmentRateContextHash,
   CartonizationRateEvidencePersistenceError,
 } = loadPersistence()
+
+const unitAllocation = {
+  lineGlobalId: 'gcol0000001',
+  productGlobalId: 'gp0000001',
+  title: 'Measured ordinary item',
+  quantity: 3,
+}
+const unitRetainedPackage = {
+  packageKey: 'ump-fixed-axis-1',
+  packageSequence: 1,
+  planningMethod: 'unit_material_selection',
+  packagingMaterialGlobalId: 'gmat0000001',
+  materialRowVersion: 2,
+  recipes: [],
+  orToolsProfiles: [],
+  innerDimensionsMm: { length: 300, width: 200, height: 100 },
+  ratedOuterDimensionsMm: { length: 310, width: 210, height: 110 },
+  contentWeightGrams: 1500,
+  tareWeightGrams: 100,
+  ratedGrossWeightGrams: 1600,
+  maxWeightGrams: 5000,
+  allocations: [unitAllocation],
+  unitMaterialEvidence: {
+    policyVersion: 'operational-unit-material-shared-stock-v3',
+    productPackConstraint: 'not_required_for_ordinary_unit',
+    packageSelectionBasis:
+      'fewest_packages_then_material_cost_then_inner_cube',
+    sharedStockSolver: 'exact_bounded_search',
+    unitsPerPackage: 3,
+    unitWeightGrams: 500,
+    unitWeightAuthority: 'provider_or_order_specific',
+    unitDimensionsAuthority: 'order_specific',
+    fitModel: 'fixed_axis_regular_grid',
+    rotationAllowed: false,
+    unitDimensionsMm: { length: 100, width: 100, height: 50 },
+    axisCounts: { length: 3, width: 2, height: 2 },
+    spatialCapacityUnits: 12,
+    weightCapacityUnits: 9,
+    effectiveCapacityUnits: 9,
+  },
+}
+const unitPackageInput = {
+  ...unitRetainedPackage,
+  carrierParcel: {
+    description: 'Measured ordinary-item carton',
+    length: 12.2,
+    width: 8.3,
+    height: 4.3,
+    dimensionUnit: 'IN',
+    weight: 3.53,
+    weightUnit: 'LB',
+  },
+  packageHash: 'a'.repeat(64),
+}
+const unitPlanEvidence = {
+  policyVersion: 'operational-unit-material-shared-stock-v3',
+  productPackConstraint: 'not_required_for_ordinary_unit',
+  packageSelectionPolicies: {
+    dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
+    undimensioned:
+      'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+    boundedFallback:
+      'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
+  },
+  sharedStockSolver: 'exact_bounded_search',
+  combinationPolicy: 'same_line_fixed_axis_only',
+  unitWeightAuthority: 'provider_or_order_specific',
+  unitDimensionsAuthority:
+    'order_specific_or_one_each_without_fit_claim',
+  rotationAllowed: false,
+  dimensionedLineCount: 1,
+  oneEachUndimensionedLineCount: 0,
+  materialAuthority:
+    'current_active_material_and_unclaimed_warehouse_stock',
+  inventoryAuthority:
+    'shopify_provider_commitment_less_active_reservations',
+  transformationHash:
+    fulfillmentOptimizerContract.canonicalOptimizerHash(
+      [unitRetainedPackage],
+    ),
+}
+assert.doesNotThrow(() => (
+  assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: unitPlanEvidence,
+        packages: [unitRetainedPackage],
+      },
+    },
+  })
+), 'Three ordinary units with exact fixed-axis evidence must validate')
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [{
+      ...unitPackageInput,
+      allocations: [{ ...unitAllocation, quantity: 4 }],
+    }],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: unitPlanEvidence,
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Persisted allocation drift must fail closed',
+)
+const tamperedFitPackage = {
+  ...unitRetainedPackage,
+  unitMaterialEvidence: {
+    ...unitRetainedPackage.unitMaterialEvidence,
+    axisCounts: { length: 4, width: 2, height: 2 },
+    spatialCapacityUnits: 16,
+  },
+}
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [{
+      ...tamperedFitPackage,
+      carrierParcel: unitPackageInput.carrierParcel,
+      packageHash: unitPackageInput.packageHash,
+    }],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          transformationHash:
+            fulfillmentOptimizerContract.canonicalOptimizerHash(
+              [tamperedFitPackage],
+            ),
+        },
+        packages: [tamperedFitPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Fixed-axis counts must be recomputed from exact item and carton dimensions',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          dimensionedLineCount: 0,
+          oneEachUndimensionedLineCount: 1,
+        },
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Ordinary-unit line counts must be derived from package fit provenance',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          sharedStockSolver:
+            'min_cost_max_flow_one_carton_per_unit_fallback',
+        },
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Package and plan shared-stock solver provenance must match',
+)
 
 const {
   SANDBOX_GEOMETRY_RATE_POLICY_VERSION,
@@ -1552,6 +1867,7 @@ const operationalGeometryInput = {
     fitModel: 'rigid_3d',
   }],
   recipePackages: [],
+  reservedMaterialUsage: [],
   materials: [{
     materialGlobalId: 'gmat0000001',
     materialType: 'carton',
@@ -1584,25 +1900,35 @@ const operationalGeometryInput = {
   maximumPackages: 50,
 }
 function validOperationalOptimizerResult(input, options, method = 'or_tools') {
+  const selectedCarton = input.cartons[0]
+  assert.ok(selectedCarton, 'The optimizer fixture requires an eligible carton')
   const selectedPlan = {
     planId: 'plan-operational-1',
     warehouseGlobalIds: ['gwh0000001'],
     warehouseCount: 1,
     shipmentCount: 1,
     cartonCount: 1,
-    estimatedTotalCostMinor: 55,
-    unusedVolumeMm3: 6_860_000,
+    estimatedTotalCostMinor: selectedCarton.materialCostMinor,
+    unusedVolumeMm3:
+      selectedCarton.innerDimensionsMm.length
+      * selectedCarton.innerDimensionsMm.width
+      * selectedCarton.innerDimensionsMm.height
+      - 640_000,
     packages: [{
       packageKey: 'package-operational-1',
       warehouseGlobalId: 'gwh0000001',
-      cartonGlobalId: 'gmat0000001',
-      innerDimensionsMm: { length: 250, width: 200, height: 150 },
-      maxWeightGrams: 10_000,
-      emptyWeightGrams: 120,
-      totalWeightGrams: 520,
+      cartonGlobalId: selectedCarton.cartonGlobalId,
+      innerDimensionsMm: selectedCarton.innerDimensionsMm,
+      maxWeightGrams: selectedCarton.maxWeightGrams,
+      emptyWeightGrams: selectedCarton.emptyWeightGrams,
+      totalWeightGrams: selectedCarton.emptyWeightGrams + 400,
       usedVolumeMm3: 640_000,
-      unusedVolumeMm3: 6_860_000,
-      estimatedCostMinor: 55,
+      unusedVolumeMm3:
+        selectedCarton.innerDimensionsMm.length
+        * selectedCarton.innerDimensionsMm.width
+        * selectedCarton.innerDimensionsMm.height
+        - 640_000,
+      estimatedCostMinor: selectedCarton.materialCostMinor,
       allocations: [{
         lineGlobalId: 'gcol0000001',
         productGlobalId: 'gp0000001',
@@ -1663,6 +1989,43 @@ assert.equal(
   operationalGeometryReady.optimizerInput.cartons[0].availableQuantity,
   4,
   'Operational optimizer material stock must subtract active package claims',
+)
+const scarcePreferredMaterial = {
+  ...operationalGeometryInput.materials[0],
+  stockOnHandQuantity: 1,
+  activeClaimedQuantity: 0,
+  availableQuantity: 1,
+}
+const alternateGeometryMaterial = {
+  ...scarcePreferredMaterial,
+  materialGlobalId: 'gmat0000002',
+  unitCostMinor: 65,
+}
+const mixedUnitGeometryReady = await planOperationalGeometryRatePackages({
+  ...operationalGeometryInput,
+  materials: [scarcePreferredMaterial, alternateGeometryMaterial],
+  reservedMaterialUsage: [{
+    materialGlobalId: scarcePreferredMaterial.materialGlobalId,
+    quantity: 1,
+  }],
+  optimizer: {
+    async optimize(input, options) {
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(input.cartons.map((carton) => (
+          carton.cartonGlobalId
+        )))),
+        [alternateGeometryMaterial.materialGlobalId],
+        'Geometry planning must receive residual stock after ordinary-unit packages',
+      )
+      return validOperationalOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(mixedUnitGeometryReady.status, 'ready')
+assert.equal(
+  mixedUnitGeometryReady.packages[0].packagingMaterialGlobalId,
+  alternateGeometryMaterial.materialGlobalId,
+  'A mixed ordinary-plus-rigid order must use a feasible alternate carton instead of double-claiming scarce stock',
 )
 const fullyRecipeConsumedMaterial = {
   ...operationalGeometryInput.materials[0],
@@ -2677,6 +3040,71 @@ assert.equal(
   unitMaterialObserved.write.planSnapshot
     .operationalUnitMaterialPlan.packages.length,
   1,
+)
+
+const mixedMaterialObserved = {
+  carrierReads: [],
+  readInput: null,
+  write: null,
+  mixedMaterialCalls: 0,
+}
+const mixedMaterialRoute = loadOperationalFaireRoute(
+  mixedMaterialObserved,
+  {
+    providers: ['ups_rest'],
+    sourceProvider: 'shopify',
+    operationalGeometry: true,
+    operationalUnitMaterial: true,
+  },
+)
+const mixedMaterialResponse = await mixedMaterialRoute.POST(new Request(
+  'http://localhost/api/integrations/commerce/intake/cartonization-rate-evidence',
+  {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      accountGlobalId: 'gia0000001',
+      candidateGlobalId: 'gcoc0000001',
+      expectedCandidateRowVersion: 1,
+      warehouseGlobalId: 'gwh0000001',
+      idempotencyKey: 'shopify-mixed-material-route-acceptance',
+      evidenceMode: 'operational',
+      selectedMaterials: [{
+        materialGlobalId: 'gmat0000001',
+        expectedRowVersion: 2,
+      }],
+    }),
+  },
+))
+const mixedMaterialPayload = await mixedMaterialResponse.json()
+assert.equal(
+  mixedMaterialResponse.status,
+  200,
+  JSON.stringify({
+    payload: mixedMaterialPayload,
+    observed: mixedMaterialObserved,
+  }),
+)
+assert.equal(mixedMaterialObserved.mixedMaterialCalls, 1)
+assert.equal(mixedMaterialObserved.unitMaterialCalls, 1)
+assert.equal(mixedMaterialObserved.geometryCalls, 1)
+assert.equal(mixedMaterialObserved.write.packages.length, 2)
+assert.deepEqual(
+  Array.from(
+    mixedMaterialObserved.write.packages,
+    (item) => item.packageSequence,
+  ),
+  [1, 2],
+)
+assert.equal(
+  mixedMaterialObserved.write.planSnapshot
+    .operationalMixedMaterialAllocation.combinedMaterialUsage[0].quantity,
+  2,
+)
+assert.equal(
+  mixedMaterialObserved.write.planSnapshot
+    .operationalMixedMaterialAllocation.decisionHash,
+  'd'.repeat(64),
 )
 
 const sandboxRouteObserved = {

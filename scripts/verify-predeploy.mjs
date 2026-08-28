@@ -68,8 +68,8 @@ const legacyUnitMeasurementMigration = [
 ]
 
 const orderUnitWeightMigration = [
-  'db/migrations/0335_operations_order_unit_weight_null_safe_validation.sql',
-  'e4deac2b38f157194483ee47eeb6bf32b20c158e9c330624889cbdf4419f69e6',
+  'db/migrations/0336_operations_order_unit_physical_facts.sql',
+  '37620c5cdac39bbea692deadc8a152ee55ffc050117b53864a0455ae16a7a971',
 ]
 
 const shopifyCheckoutUnitMaterialMigration = [

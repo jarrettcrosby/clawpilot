@@ -835,11 +835,12 @@ export default function CartonizationRateEvidencePanel({
                     ) : item.planningMethod
                       === 'unit_material_selection' ? (
                       <Alert severity="info">
-                        This one-each item does not require a Product pack
-                        assignment. ClawPilot retained the provider or
-                        order-specific unit weight and placed one unit in the
-                        selected factual carton. No product-geometry fit or
-                        multi-unit combination is claimed.
+                        Ordinary items do not require a Product pack assignment.
+                        ClawPilot used retained unit weight and, when available,
+                        order-specific item dimensions to prove a conservative
+                        fixed-axis fit for same-line units in this factual carton.
+                        Without item dimensions it keeps the truthful one-unit
+                        fallback; no rotation or mixed-item fit is claimed.
                       </Alert>
                     ) : (
                       <Alert severity="info">

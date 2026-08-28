@@ -133,7 +133,12 @@ function requestBodyLines(value: unknown) {
     const line = record(entry, `Unit weight ${index + 1}`)
     exactFields(
       line,
-      ['expectedFactVersion', 'lineGlobalId', 'unitWeightGrams'],
+      [
+        'expectedFactVersion',
+        'lineGlobalId',
+        'unitDimensionsMm',
+        'unitWeightGrams',
+      ],
       `Unit weight ${index + 1}`,
     )
     const lineGlobalId = String(line.lineGlobalId || '').trim()
@@ -141,6 +146,19 @@ function requestBodyLines(value: unknown) {
     const expectedFactVersion = line.expectedFactVersion === null
       ? null
       : line.expectedFactVersion
+    const dimensions = line.unitDimensionsMm === null
+      ? null
+      : record(
+          line.unitDimensionsMm,
+          `Unit facts ${index + 1} dimensions`,
+        )
+    if (dimensions) {
+      exactFields(
+        dimensions,
+        ['height', 'length', 'width'],
+        `Unit facts ${index + 1} dimensions`,
+      )
+    }
     if (!LINE_GLOBAL_ID.test(lineGlobalId)) {
       fail(
         'OPERATIONS_ORDER_UNIT_WEIGHT_LINE_INVALID',
@@ -171,7 +189,31 @@ function requestBodyLines(value: unknown) {
         `Unit weight ${index + 1} has an invalid evidence version`,
       )
     }
-    return { lineGlobalId, unitWeightGrams, expectedFactVersion }
+    const unitDimensionsMm = dimensions
+      ? Object.fromEntries(
+          ['length', 'width', 'height'].map((axis) => {
+            const millimeters = dimensions[axis]
+            if (
+              typeof millimeters !== 'number'
+              || !Number.isSafeInteger(millimeters)
+              || millimeters < 1
+              || millimeters > 1_000_000
+            ) {
+              fail(
+                'OPERATIONS_ORDER_UNIT_DIMENSIONS_INVALID',
+                `Unit facts ${index + 1} ${axis} must be positive whole-number millimeters`,
+              )
+            }
+            return [axis, millimeters]
+          }),
+      ) as { length: number; width: number; height: number }
+      : null
+    return {
+      lineGlobalId,
+      unitWeightGrams,
+      unitDimensionsMm,
+      expectedFactVersion,
+    }
   })
 }
 

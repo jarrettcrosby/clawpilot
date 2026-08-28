@@ -68,8 +68,8 @@ for (const fragment of [
   'This evidence is reused exactly as sealed',
   'store writes',
   'const primaryAction = canPlanImportedOrder',
-  'Order unit weights are read-only in training.',
-  'Order unit weights cannot be changed in training.',
+  'Order unit facts are read-only in training.',
+  'Order unit facts cannot be changed in training.',
 ]) {
   assert.ok(operations.includes(fragment), `Operations training integration is missing ${fragment}`)
 }
