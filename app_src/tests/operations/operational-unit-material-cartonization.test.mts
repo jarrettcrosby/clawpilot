@@ -404,6 +404,67 @@ test('global shared-stock search preserves the only feasible allocation independ
   }
 })
 
+test('exact search stays bounded with ten materials and fifty packages', () => {
+  const startedAt = performance.now()
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, quantity: 50 }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 50 }],
+    inventoryProducts: inventory(50),
+    materials: Array.from({ length: 10 }, (_, index) => material({
+      globalId: `gmat-perf-${String(index).padStart(2, '0')}`,
+      inner: { length: 100, width: 100, height: 50 },
+      available: 50,
+      unitCostMinor: index + 1,
+    })),
+    maximumPackages: 50,
+  })
+  const elapsedMs = performance.now() - startedAt
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 50)
+  assert.ok(elapsedMs < 1_000, `bounded search took ${elapsedMs}ms`)
+})
+
+test('shared-stock search fails closed at its explicit state bound', () => {
+  const lines = Array.from({ length: 4 }, (_, index) => ({
+    ...line,
+    lineGlobalId: `gcol-bound-${index}`,
+    productGlobalId: `gp-bound-${index}`,
+    quantity: 50,
+  }))
+  const startedAt = performance.now()
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines,
+    fallbackLines: lines.map((item) => ({
+      lineGlobalId: item.lineGlobalId,
+      productGlobalId: item.productGlobalId,
+      quantity: item.quantity,
+      fitModel: 'unconstrained_unit' as const,
+    })),
+    inventoryProducts: lines.map((item) => ({
+      ...inventory(50)[0],
+      productGlobalId: item.productGlobalId,
+    })),
+    materials: Array.from({ length: 10 }, (_, index) => material({
+      globalId: `gmat-bound-${index}`,
+      inner: { length: 100, width: 100, height: 50 },
+      available: 50,
+      unitCostMinor: index + 1,
+    })),
+    maximumPackages: 50,
+  })
+  const elapsedMs = performance.now() - startedAt
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_GLOBAL_SEARCH_BOUND_EXCEEDED',
+  )
+  assert.ok(elapsedMs < 1_000, `bounded failure took ${elapsedMs}ms`)
+})
+
 test('fixed-axis fit blocks volume-only false positives', () => {
   const result = planOperationalUnitMaterialPackages({
     ...baseInput,

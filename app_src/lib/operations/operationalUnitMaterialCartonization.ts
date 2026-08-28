@@ -189,54 +189,59 @@ function enumerateMaterialCounts(input: {
   quantity: number
   maximumPackages: number
   options: MaterialOption[]
+  preserveMaterialIds: Set<string>
+  stateBudget: { remaining: number }
 }) {
-  const selections: MaterialSelection[] = []
-  const counts = input.options.map(() => 0)
-  const visit = (
-    optionIndex: number,
-    packageCount: number,
-    coveredUnits: number,
-    materialCostMinor: number,
-    innerCubeMm3: number,
-  ) => {
-    if (optionIndex === input.options.length) {
-      if (
-        coveredUnits >= input.quantity
-        && packageCount <= input.quantity
-      ) {
-        selections.push({
-          packageCount,
-          coveredUnits: input.quantity,
-          materialCostMinor,
-          innerCubeMm3,
-          counts: [...counts],
-        })
-      }
-      return
-    }
+  let states = new Map<string, MaterialSelection>([['0:0:', {
+    packageCount: 0,
+    coveredUnits: 0,
+    materialCostMinor: 0,
+    innerCubeMm3: 0,
+    counts: input.options.map(() => 0),
+  }]])
+  for (let optionIndex = 0; optionIndex < input.options.length; optionIndex += 1) {
     const option = input.options[optionIndex]
-    const maximumUse = Math.min(
-      option.availableQuantity,
-      input.maximumPackages - packageCount,
-      input.quantity - packageCount,
-    )
-    for (let use = 0; use <= maximumUse; use += 1) {
-      counts[optionIndex] = use
-      visit(
-        optionIndex + 1,
-        packageCount + use,
-        Math.min(
-          input.quantity,
-          coveredUnits + use * option.effectiveCapacityUnits,
-        ),
-        materialCostMinor + use * option.unitCostMinor,
-        innerCubeMm3 + use * option.innerCubeMm3,
+    const next = new Map<string, MaterialSelection>()
+    for (const state of states.values()) {
+      const maximumUse = Math.min(
+        option.availableQuantity,
+        input.maximumPackages - state.packageCount,
+        input.quantity - state.packageCount,
       )
+      for (let use = 0; use <= maximumUse; use += 1) {
+        input.stateBudget.remaining -= 1
+        if (input.stateBudget.remaining < 0) return null
+        const counts = [...state.counts]
+        counts[optionIndex] = use
+        const candidate: MaterialSelection = {
+          packageCount: state.packageCount + use,
+          coveredUnits: Math.min(
+            input.quantity,
+            state.coveredUnits + use * option.effectiveCapacityUnits,
+          ),
+          materialCostMinor:
+            state.materialCostMinor + use * option.unitCostMinor,
+          innerCubeMm3: state.innerCubeMm3 + use * option.innerCubeMm3,
+          counts,
+        }
+        const preservedCounts = input.options.flatMap((candidateOption, index) => (
+          input.preserveMaterialIds.has(
+            candidateOption.material.materialGlobalId,
+          ) ? [counts[index]] : []
+        )).join(',')
+        const key = `${candidate.packageCount}:${candidate.coveredUnits}:${preservedCounts}`
+        const retained = next.get(key)
+        if (!retained || compareSelection(candidate, retained) < 0) {
+          next.set(key, candidate)
+        }
+      }
     }
-    counts[optionIndex] = 0
+    states = next
   }
-  visit(0, 0, 0, 0, 0)
-  return selections.sort((left, right) => (
+  return [...states.values()].filter((selection) => (
+    selection.coveredUnits >= input.quantity
+    && selection.packageCount <= input.quantity
+  )).sort((left, right) => (
     left.packageCount - right.packageCount
     || compareSelection(left, right)
   ))
@@ -251,6 +256,7 @@ function selectGlobalDimensionedMaterialCounts(input: {
   maximumPackages: number
   materialRemaining: Map<string, number>
 }) {
+  const stateBudget = { remaining: 100_000 }
   const ordered = [...input.lines].sort((left, right) => (
     left.lineGlobalId.localeCompare(right.lineGlobalId)
   ))
@@ -261,6 +267,7 @@ function selectGlobalDimensionedMaterialCounts(input: {
     byLine: Map<string, MaterialSelection>
   }
   let best: GlobalSelection | null = null
+  let exceeded = false
   const visit = (
     lineIndex: number,
     packageCount: number,
@@ -269,6 +276,11 @@ function selectGlobalDimensionedMaterialCounts(input: {
     remaining: Map<string, number>,
     byLine: Map<string, MaterialSelection>,
   ) => {
+    stateBudget.remaining -= 1
+    if (stateBudget.remaining < 0) {
+      exceeded = true
+      return
+    }
     if (best && packageCount > best.packageCount) return
     if (lineIndex === ordered.length) {
       const candidate = {
@@ -304,7 +316,17 @@ function selectGlobalDimensionedMaterialCounts(input: {
       quantity: entry.quantity,
       maximumPackages: input.maximumPackages - packageCount,
       options,
+      preserveMaterialIds: new Set(ordered.slice(lineIndex + 1).flatMap(
+        (future) => future.options.map(
+          (option) => option.material.materialGlobalId,
+        ),
+      )),
+      stateBudget,
     })
+    if (!candidates) {
+      exceeded = true
+      return
+    }
     for (const selection of candidates) {
       const nextRemaining = new Map(remaining)
       selection.counts.forEach((count, optionIndex) => {
@@ -328,7 +350,10 @@ function selectGlobalDimensionedMaterialCounts(input: {
   }
   visit(0, 0, 0, 0, new Map(input.materialRemaining), new Map())
   const retained = best as GlobalSelection | null
-  return retained ? retained.byLine : null
+  return {
+    selections: retained ? retained.byLine : null,
+    exceeded,
+  }
 }
 
 function materialOptions(input: {
@@ -609,11 +634,18 @@ export function planOperationalUnitMaterialPackages(
       }),
     }]
   })
-  const globalDimensionedSelections = selectGlobalDimensionedMaterialCounts({
+  const globalDimensionedResult = selectGlobalDimensionedMaterialCounts({
     lines: dimensionedEntries,
     maximumPackages: input.maximumPackages,
     materialRemaining,
   })
+  if (globalDimensionedResult.exceeded) {
+    return blocked(
+      'CARTONIZATION_RATE_EVIDENCE_GLOBAL_SEARCH_BOUND_EXCEEDED',
+      'Exact shared-stock cartonization exceeded its 100000-state safety bound.',
+    )
+  }
+  const globalDimensionedSelections = globalDimensionedResult.selections
   const dimensionedOptionsByLine = new Map(dimensionedEntries.map((entry) => (
     [entry.lineGlobalId, entry.options]
   )))
