@@ -6,9 +6,11 @@ import Box from '@mui/material/Box'
 import ButtonBase from '@mui/material/ButtonBase'
 import Chip from '@mui/material/Chip'
 import Stack from '@mui/material/Stack'
+import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import EventBusyRounded from '@mui/icons-material/EventBusyRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
+import type { PipelineSnapshot } from '@/components/pipeline/usePipelineReport'
 import { summarizePipeline } from '@/lib/pipeline/analytics.mjs'
 
 export type PipelineInsightDeal = {
@@ -26,18 +28,12 @@ export type PipelineInsightDeal = {
 
 type Props = {
   deals: PipelineInsightDeal[]
+  snapshot: PipelineSnapshot | null
   stages: string[]
   onOpenDeal: (deal: PipelineInsightDeal) => void
 }
 
 type PipelineInsightSummary = {
-  activeValue: number
-  weightedActiveValue: number
-  activeCount: number
-  onHoldCount: number
-  wonCount: number
-  winRate: number
-  needsAttentionCount: number
   active: PipelineInsightDeal[]
   lifecycleConflicts: PipelineInsightDeal[]
   overdue: PipelineInsightDeal[]
@@ -55,33 +51,13 @@ type ValueGroup = {
 const currency = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
-  maximumFractionDigits: 0,
+  maximumFractionDigits: 2,
 })
 
 const percent = new Intl.NumberFormat('en-US', {
   style: 'percent',
   maximumFractionDigits: 1,
 })
-
-function valueGroups(deals: PipelineInsightDeal[], keyFor: (deal: PipelineInsightDeal) => string) {
-  const groups = new Map<string, ValueGroup>()
-  deals.forEach((deal) => {
-    const label = keyFor(deal) || 'Unspecified'
-    const group = groups.get(label) || { label, count: 0, value: 0, weighted: 0 }
-    group.count += 1
-    group.value += Number(deal.value || 0)
-    group.weighted += Number(deal.value || 0) * (Number(deal.probability || 0) / 100)
-    groups.set(label, group)
-  })
-  return [...groups.values()]
-}
-
-function quarterLabel(value: string) {
-  const date = new Date(value)
-  if (!value || !Number.isFinite(date.getTime())) return 'No close date'
-  const quarter = Math.floor(date.getMonth() / 3) + 1
-  return `Q${quarter} ${date.getFullYear()}`
-}
 
 function Metric({ label, value, tone = 'default' }: { label: string; value: string | number; tone?: 'default' | 'positive' | 'warning' }) {
   return (
@@ -120,8 +96,32 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
                   {group.count} · {currency.format(value)}
                 </Typography>
               </Stack>
-              <Box sx={{ mt: 0.65, height: 6, backgroundColor: 'rgba(255,255,255,0.07)', borderRadius: 1, overflow: 'hidden' }}>
-                <Box sx={{ height: '100%', width: `${Math.max(2, (value / max) * 100)}%`, backgroundColor: weighted ? '#A8C7FA' : '#66BB6A', borderRadius: 1 }} />
+              <Box sx={{ mt: 0.65, height: 6, backgroundColor: 'rgba(255,255,255,0.07)', borderRadius: 1 }}>
+                <Tooltip
+                  title={`${group.label} · ${weighted ? 'Weighted value' : 'Active value'}: ${currency.format(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
+                  arrow
+                  describeChild
+                  enterTouchDelay={0}
+                  leaveTouchDelay={3500}
+                >
+                  <Box
+                    data-chart-mark
+                    tabIndex={0}
+                    role="img"
+                    aria-label={`${group.label}: ${currency.format(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
+                    sx={{
+                      height: '100%',
+                      width: `${Math.max(2, (value / max) * 100)}%`,
+                      backgroundColor: weighted ? '#A8C7FA' : '#66BB6A',
+                      borderRadius: 1,
+                      '&:focus-visible': {
+                        outline: '2px solid #E9ECF4',
+                        outlineOffset: '2px',
+                        filter: 'brightness(1.18)',
+                      },
+                    }}
+                  />
+                </Tooltip>
               </Box>
             </Box>
           )
@@ -131,31 +131,24 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
   )
 }
 
-export default function PipelineInsights({ deals, stages, onOpenDeal }: Props) {
-  const summary = useMemo(() => summarizePipeline(deals) as unknown as PipelineInsightSummary, [deals])
-  const stageRank = useMemo(() => new Map(stages.map((stage, index) => [stage, index])), [stages])
-  const stageGroups = useMemo(() => valueGroups(summary.active, (deal) => deal.stage)
-    .sort((left, right) => (stageRank.get(left.label) ?? 999) - (stageRank.get(right.label) ?? 999)), [stageRank, summary.active])
-  const forecastGroups = useMemo(() => valueGroups(summary.active, (deal) => quarterLabel(deal.closeDate))
-    .sort((left, right) => {
-      if (left.label === 'No close date') return 1
-      if (right.label === 'No close date') return -1
-      const [, leftQuarter, leftYear] = /Q(\d) (\d{4})/.exec(left.label) || []
-      const [, rightQuarter, rightYear] = /Q(\d) (\d{4})/.exec(right.label) || []
-      return (Number(leftYear) * 4 + Number(leftQuarter)) - (Number(rightYear) * 4 + Number(rightQuarter))
-    }), [summary.active])
-  const topDeals = useMemo(() => [...summary.active]
+export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }: Props) {
+  const detailSummary = useMemo(() => summarizePipeline(deals) as unknown as PipelineInsightSummary, [deals])
+  const stageRank = useMemo(() => new Map(stages.map((stage, index) => [stage.trim().toLowerCase(), index])), [stages])
+  const stageGroups = useMemo(() => [...(snapshot?.activeByStage || [])]
+    .sort((left, right) => (stageRank.get(left.label.trim().toLowerCase()) ?? 999) - (stageRank.get(right.label.trim().toLowerCase()) ?? 999)), [snapshot?.activeByStage, stageRank])
+  const forecastGroups = snapshot?.activeByCloseQuarter || []
+  const topDeals = useMemo(() => [...detailSummary.active]
     .sort((left, right) => Number(right.value || 0) - Number(left.value || 0))
-    .slice(0, 5), [summary.active])
+    .slice(0, 5), [detailSummary.active])
   const attentionDeals = useMemo(() => {
     const byId = new Map<string, PipelineInsightDeal>()
-    ;[...summary.lifecycleConflicts, ...summary.overdue, ...summary.missingCloseDate, ...summary.invalidProbability]
+    ;[...detailSummary.lifecycleConflicts, ...detailSummary.overdue, ...detailSummary.missingCloseDate, ...detailSummary.invalidProbability]
       .forEach((deal) => byId.set(deal.id, deal))
     return [...byId.values()].slice(0, 8)
-  }, [summary])
-  const conflictIds = useMemo(() => new Set(summary.lifecycleConflicts.map((deal) => deal.id)), [summary.lifecycleConflicts])
-  const overdueIds = useMemo(() => new Set(summary.overdue.map((deal) => deal.id)), [summary.overdue])
-  const missingDateIds = useMemo(() => new Set(summary.missingCloseDate.map((deal) => deal.id)), [summary.missingCloseDate])
+  }, [detailSummary])
+  const conflictIds = useMemo(() => new Set(detailSummary.lifecycleConflicts.map((deal) => deal.id)), [detailSummary.lifecycleConflicts])
+  const overdueIds = useMemo(() => new Set(detailSummary.overdue.map((deal) => deal.id)), [detailSummary.overdue])
+  const missingDateIds = useMemo(() => new Set(detailSummary.missingCloseDate.map((deal) => deal.id)), [detailSummary.missingCloseDate])
 
   return (
     <Box sx={{ width: '100%', maxWidth: 1400, mx: 'auto' }}>
@@ -168,23 +161,26 @@ export default function PipelineInsights({ deals, stages, onOpenDeal }: Props) {
           mb: 3,
         }}
       >
-        <Metric label="Active pipeline" value={currency.format(summary.activeValue)} tone="positive" />
-        <Metric label="Weighted pipeline" value={currency.format(summary.weightedActiveValue)} />
-        <Metric label="Active" value={summary.activeCount} />
-        <Metric label="On hold" value={summary.onHoldCount} tone={summary.onHoldCount > 0 ? 'warning' : 'default'} />
-        <Metric label="Won" value={summary.wonCount} tone="positive" />
-        <Metric label="Win rate" value={percent.format(summary.winRate / 100)} />
+        <Metric label="Active pipeline · current snapshot" value={snapshot ? currency.format(snapshot.activePipelineValue) : '—'} tone="positive" />
+        <Metric label="Weighted pipeline · current snapshot" value={snapshot ? currency.format(snapshot.weightedPipelineValue) : '—'} />
+        <Metric label="Active · current snapshot" value={snapshot?.activeOpportunities ?? '—'} />
+        <Metric label="On hold · current snapshot" value={snapshot?.onHoldOpportunities ?? '—'} tone={snapshot && snapshot.onHoldOpportunities > 0 ? 'warning' : 'default'} />
+        <Metric label="Lifetime won" value={snapshot?.wonOpportunities ?? '—'} tone="positive" />
+        <Metric label="Lifetime win rate" value={snapshot ? percent.format(snapshot.lifetimeWinRate / 100) : '—'} />
       </Box>
 
-      {summary.needsAttentionCount > 0 ? (
+      {snapshot && snapshot.attention.total > 0 ? (
         <Alert
           severity="warning"
           icon={<WarningAmberRounded />}
           sx={{ mb: 3, borderRadius: 1, alignItems: 'flex-start' }}
         >
-          <Typography variant="subtitle2" fontWeight={700}>{summary.needsAttentionCount} opportunities need attention</Typography>
+          <Typography variant="subtitle2" fontWeight={700}>{snapshot.attention.total} opportunities need attention</Typography>
           <Typography variant="caption" color="text.secondary">
-            {summary.lifecycleConflicts.length} status/stage conflicts · {summary.overdue.length} past expected close · {summary.missingCloseDate.length} missing expected close
+            {snapshot.attention.lifecycleConflicts} status/stage conflicts · {snapshot.attention.overdue} past expected close · {snapshot.attention.missingCloseDate} missing expected close · {snapshot.attention.invalidProbability} invalid probability
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+            Counts cover the full pipeline. Detail links below come from up to 1,000 recently updated opportunity rows.
           </Typography>
           <Box sx={{ mt: 1.25, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
             {attentionDeals.map((deal) => {
@@ -217,8 +213,8 @@ export default function PipelineInsights({ deals, stages, onOpenDeal }: Props) {
 
       <Box component="section" sx={{ mt: 4, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
         <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ py: 1.5 }}>
-          <Typography variant="subtitle2" fontWeight={700}>Largest active opportunities</Typography>
-          <Chip size="small" label={`${topDeals.length} shown`} sx={{ borderRadius: 1 }} />
+          <Typography variant="subtitle2" fontWeight={700}>Largest among loaded opportunity details</Typography>
+          <Chip size="small" label={`${topDeals.length} shown · ${deals.length} loaded`} sx={{ borderRadius: 1 }} />
         </Stack>
         {topDeals.map((deal) => (
           <ButtonBase
@@ -232,7 +228,7 @@ export default function PipelineInsights({ deals, stages, onOpenDeal }: Props) {
             </Box>
             <Box sx={{ textAlign: 'right', flexShrink: 0, pl: 2 }}>
               <Typography variant="body2" fontWeight={700} color="#66BB6A">{currency.format(Number(deal.value || 0))}</Typography>
-              <Typography variant="caption" color="text.secondary">{Number(deal.probability || 0).toFixed(0)}%</Typography>
+              <Typography variant="caption" color="text.secondary">{Number(deal.probability || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}%</Typography>
             </Box>
           </ButtonBase>
         ))}

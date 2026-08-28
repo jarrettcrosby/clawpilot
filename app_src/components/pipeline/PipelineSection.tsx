@@ -42,6 +42,7 @@ import useMediaQuery from '@mui/material/useMediaQuery'
 import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import PipelineInsights from '@/components/pipeline/PipelineInsights'
 import PipelineDashboard from '@/components/pipeline/PipelineDashboard'
+import { usePipelineReport } from '@/components/pipeline/usePipelineReport'
 import PipelineCatalogDialog, {
   type PipelineCatalogPerson,
   type PipelineCatalogProduct,
@@ -49,8 +50,13 @@ import PipelineCatalogDialog, {
 } from '@/components/pipeline/PipelineCatalogDialog'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
 import { formatUserDateTime, type UserDateTimeSettings } from '@/lib/userDateTime'
-import { isActivePipelineStatus, summarizePipeline } from '@/lib/pipeline/analytics.mjs'
+import { isActivePipelineStatus } from '@/lib/pipeline/analytics.mjs'
 import { BASE_PIPELINE_WORKFLOW } from '@/lib/pipeline/baseTemplate.mjs'
+import {
+  commitNumericDraft,
+  numericDraftFromValue,
+  sanitizeNumericDraft,
+} from '@/lib/pipeline/numericDraft.mjs'
 
 type Contact = {
   id: string
@@ -105,14 +111,6 @@ type Deal = {
   contactTitle?: string
 }
 
-type PipelineSummary = {
-  activeCount: number
-  wonCount: number
-  activeValue: number
-  weightedActiveValue: number
-  active: Deal[]
-}
-
 type LooseRecord = Record<string, unknown>
 type DropdownOption = { active?: boolean; sort_order?: number; label?: string; value?: string }
 type PipelineProvisioningStatus = 'not_requested' | 'queued' | 'provisioning' | 'ready' | 'failed'
@@ -146,8 +144,8 @@ type DateInputWithPicker = HTMLInputElement & { showPicker?: () => void }
 function normalizeDeal(d: Deal): Deal {
   return {
     ...d,
-    value: Math.round(Number(d.value || 0)),
-    probability: Math.round(Number(d.probability || 0) * 10) / 10,
+    value: Number.isFinite(Number(d.value)) ? Number(d.value) : 0,
+    probability: Number.isFinite(Number(d.probability)) ? Number(d.probability) : 0,
   }
 }
 
@@ -171,7 +169,19 @@ const PRIORITY_SORT_WEIGHT: Record<string, number> = {
 
 function fmt$(n: number) {
   if (!n) return '—'
-  return '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
+  const value = Number(n || 0)
+  return '$' + value.toLocaleString('en-US', {
+    minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+function fmtSnapshotCurrency(n: number | null) {
+  if (n === null || !Number.isFinite(n)) return '—'
+  return '$' + n.toLocaleString('en-US', {
+    minimumFractionDigits: Number.isInteger(n) ? 0 : 2,
+    maximumFractionDigits: 2,
+  })
 }
 
 function compareDealsForPriority(a: Deal, b: Deal) {
@@ -203,10 +213,6 @@ function fmtSyncTime(iso: string | null, settings: UserDateTimeSettings) {
   return formatUserDateTime(iso, settings, {
     year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: 'Unknown',
   })
-}
-
-function fmtIntInput(n: number) {
-  return Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
 }
 
 function toInputDate(value: string | undefined) {
@@ -284,9 +290,9 @@ function dealFromLooseShape(row: LooseRecord, index = 0): Deal {
     stage: String(row.stage || ''),
     lossReason: String(row.lossReason || ''),
     source: String(row.source || ''),
-    value: Math.round(Number(row.value || 0)),
+    value: Number.isFinite(Number(row.value)) ? Number(row.value) : 0,
     valueRaw: String(row.valueRaw || ''),
-    probability: Math.round(Number(row.probability || 0) * 10) / 10,
+    probability: Number.isFinite(Number(row.probability)) ? Number(row.probability) : 0,
     closeDate: toInputDate(String(row.closeDate || row.expectedClose || '')),
     notes: String(row.notes || ''),
     updatedAt: typeof row.updatedAt === 'string' ? row.updatedAt : undefined,
@@ -393,10 +399,16 @@ function DealDrawer({
   const [saving, setSaving] = useState(false)
   const [comment, setComment] = useState('')
   const [error, setError] = useState('')
+  const [numericDrafts, setNumericDrafts] = useState({ value: '0', probability: '0' })
   const closeDateRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
-    setForm(deal ? normalizeDeal(deal) : null)
+    const normalized = deal ? normalizeDeal(deal) : null
+    setForm(normalized)
+    setNumericDrafts({
+      value: numericDraftFromValue(normalized?.value),
+      probability: numericDraftFromValue(normalized?.probability),
+    })
     setComment('')
     setError('')
   }, [deal])
@@ -537,11 +549,15 @@ function DealDrawer({
             disabled={readOnly}
             size="small"
             type="text"
-            value={fmtIntInput(form.value || 0)}
+            inputMode="decimal"
+            value={numericDrafts.value}
             onChange={e => {
-              const raw = String(e.target.value || '').replace(/[^0-9.-]/g, '')
-              const n = Math.round(Number(raw || 0))
-              setForm({ ...form, value: Number.isFinite(n) ? n : 0 })
+              setNumericDrafts(current => ({ ...current, value: sanitizeNumericDraft(e.target.value) }))
+            }}
+            onBlur={e => {
+              const committed = commitNumericDraft(e.target.value, { minimum: 0, fallback: 0 })
+              setNumericDrafts(current => ({ ...current, value: committed.draft }))
+              setForm(current => current ? { ...current, value: committed.value } : current)
             }}
             slotProps={{ input: { startAdornment: <InputAdornment position="start">$</InputAdornment> } }}
           />
@@ -550,12 +566,15 @@ function DealDrawer({
             disabled={readOnly}
             size="small"
             type="text"
-            value={Number(form.probability || 0).toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })}
+            inputMode="decimal"
+            value={numericDrafts.probability}
             onChange={e => {
-              const raw = String(e.target.value || '').replace(/[^0-9.-]/g, '')
-              const n = Number(raw || 0)
-              const rounded = Math.round(n * 10) / 10
-              setForm({ ...form, probability: Number.isFinite(rounded) ? rounded : 0 })
+              setNumericDrafts(current => ({ ...current, probability: sanitizeNumericDraft(e.target.value) }))
+            }}
+            onBlur={e => {
+              const committed = commitNumericDraft(e.target.value, { minimum: 0, maximum: 100, fallback: 0 })
+              setNumericDrafts(current => ({ ...current, probability: committed.draft }))
+              setForm(current => current ? { ...current, probability: committed.value } : current)
             }}
             slotProps={{ input: { endAdornment: <InputAdornment position="end">%</InputAdornment> } }}
           />
@@ -690,7 +709,12 @@ function DealDrawer({
             try {
               setSaving(true)
               setError('')
-              await onSave(form)
+              const value = commitNumericDraft(numericDrafts.value, { minimum: 0, fallback: 0 })
+              const probability = commitNumericDraft(numericDrafts.probability, { minimum: 0, maximum: 100, fallback: 0 })
+              const committedForm = { ...form, value: value.value, probability: probability.value }
+              setNumericDrafts({ value: value.draft, probability: probability.draft })
+              setForm(committedForm)
+              await onSave(committedForm)
             } catch (error: unknown) {
               setError(String(error instanceof Error ? error.message : error))
             } finally {
@@ -776,6 +800,24 @@ export default function PipelineSection() {
   const canEdit = pipelineAccess === 'owner' || pipelineAccess === 'editor'
   const ownerOptions = useMemo(() => catalogPeople.filter((person) => person.active), [catalogPeople])
   const productOptions = useMemo(() => catalogProducts.filter((product) => product.active), [catalogProducts])
+  const dashboardReportRevision = useMemo(() => JSON.stringify({
+    pipelineId,
+    deals: deals.map((deal) => [
+      deal.id,
+      deal.updatedAt || '',
+      deal.value,
+      deal.probability,
+      deal.status,
+      deal.stage,
+      deal.closeDate,
+    ]),
+  }), [deals, pipelineId])
+  const pipelineReporting = usePipelineReport({
+    enabled: Boolean(pipelineId),
+    reportRevision: dashboardReportRevision,
+    syncRevision: syncSurface.lastSyncedAt || '',
+    syncState: syncSurface.state,
+  })
 
   const applyCatalog = useCallback((catalog: PipelineCatalogSnapshot) => {
     setCatalogPeople(catalog.people)
@@ -947,12 +989,6 @@ export default function PipelineSection() {
 
     return [...scoped].sort(compareDealsForPriority)
   }, [deals, filterStatus])
-
-  const pipelineSummary = useMemo(() => summarizePipeline(deals) as unknown as PipelineSummary, [deals])
-  const highPriorityActiveDeals = useMemo(
-    () => pipelineSummary.active.filter((deal: Deal) => ['A+', 'A'].includes((deal.priority || '').trim())),
-    [pipelineSummary.active],
-  )
 
   const moveDealStage = async (deal: Deal, direction: -1 | 1) => {
     if (!canEdit) return
@@ -1173,15 +1209,15 @@ export default function PipelineSection() {
         >
           {view !== 'dashboard' ? (
             <>
-              <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmt$(pipelineSummary.activeValue)}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Active Pipeline</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#66BB6A">{fmtSnapshotCurrency(pipelineReporting.snapshot?.activePipelineValue ?? null)}</Typography></Box>
               <Box>
                 <Typography variant="caption" color="text.disabled">Weighted Value</Typography>
-                <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmt$(pipelineSummary.weightedActiveValue)}</Typography>
+                <Typography variant="h6" fontWeight={700} lineHeight={1.15} color="#A8C7FA">{fmtSnapshotCurrency(pipelineReporting.snapshot?.weightedPipelineValue ?? null)}</Typography>
                 {!compactLandscapeBoard && <Typography variant="caption" color="text.secondary">Σ(value × win probability)</Typography>}
               </Box>
-              <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.activeCount}</Typography></Box>
-              <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{highPriorityActiveDeals.length}</Typography></Box>
-              <Box><Typography variant="caption" color="text.disabled">Won</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineSummary.wonCount}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Active</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineReporting.snapshot?.activeOpportunities ?? '—'}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">High Priority</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineReporting.snapshot?.highPriorityActiveOpportunities ?? '—'}</Typography></Box>
+              <Box><Typography variant="caption" color="text.disabled">Won</Typography><Typography variant="h6" fontWeight={700} lineHeight={1.15}>{pipelineReporting.snapshot?.wonOpportunities ?? '—'}</Typography></Box>
             </>
           ) : null}
 
@@ -1367,14 +1403,16 @@ export default function PipelineSection() {
       >
         {view === 'dashboard' ? (
           <PipelineDashboard
-            deals={deals}
             stages={stageOptions}
+            totalContacts={typeof syncSurface.summary?.contacts === 'number' ? syncSurface.summary.contacts : null}
             lastSyncedLabel={fmtSyncTime(syncSurface.lastSyncedAt, dateTimeSettings)}
+            reporting={pipelineReporting}
             syncState={syncSurface.state}
           />
         ) : view === 'insights' ? (
           <PipelineInsights
             deals={deals}
+            snapshot={pipelineReporting.snapshot}
             stages={stageOptions}
             onOpenDeal={(deal) => setSelectedDeal(deals.find((candidate) => candidate.id === deal.id) || null)}
           />
@@ -1719,8 +1757,8 @@ export default function PipelineSection() {
             owner: deal.owner,
             ownerContactId: deal.ownerContactId || null,
             closeDate: fromInputDate(deal.closeDate),
-            value: Math.round(Number(deal.value || 0)),
-            probability: Math.round(Number(deal.probability || 0) * 10) / 10,
+            value: Number.isFinite(Number(deal.value)) ? Number(deal.value) : 0,
+            probability: Number.isFinite(Number(deal.probability)) ? Number(deal.probability) : 0,
             source: deal.source,
             lossReason: deal.lossReason,
             contactIds: deal.contactIds || [],
