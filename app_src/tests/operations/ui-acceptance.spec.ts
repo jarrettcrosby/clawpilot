@@ -1164,6 +1164,9 @@ async function installImportedOrderPreparationRoutes(
   let planned = false
   let authorized = false
   let orderUnitWeightGrams = options.missingUnitWeight ? null : 170
+  let orderUnitDimensionsMm = options.missingUnitWeight
+    ? null
+    : { length: 100, width: 80, height: 40 }
   let orderUnitWeightFactVersion: number | null = null
   const unitWeightRequests: Array<Record<string, unknown>> = []
   const orderUnitWeightWorkspace = () => {
@@ -1176,6 +1179,8 @@ async function installImportedOrderPreparationRoutes(
       weightSource: orderUnitWeightFactVersion === null
         ? (orderUnitWeightGrams === null ? null : 'provider_catalog')
         : 'order_specific',
+      unitDimensionsMm: orderUnitDimensionsMm,
+      dimensionSource: orderUnitDimensionsMm ? 'order_specific' : null,
       factGlobalId: orderUnitWeightFactVersion === null
         ? null
         : 'gouw7654321',
@@ -1187,7 +1192,11 @@ async function installImportedOrderPreparationRoutes(
       candidateRowVersion: 10,
       orderGlobalId: 'gor7654321',
       missingLines: orderUnitWeightGrams === null ? [line] : [],
-      effectiveLines: orderUnitWeightGrams === null ? [] : [line],
+      dimensionMissingLines:
+        orderUnitWeightGrams !== null && orderUnitDimensionsMm === null
+          ? [line]
+          : [],
+      effectiveLines: orderUnitWeightGrams !== null ? [line] : [],
     }
   }
 
@@ -1263,6 +1272,11 @@ async function installImportedOrderPreparationRoutes(
           expectedFactVersion: number | null
           lineGlobalId: string
           unitWeightGrams: number
+          unitDimensionsMm: {
+            length: number
+            width: number
+            height: number
+          } | null
         }>
         expect(route.request().headers()['idempotency-key'])
           .toMatch(/^operations-unit-weight:/)
@@ -1277,6 +1291,7 @@ async function installImportedOrderPreparationRoutes(
           lineGlobalId: 'gcol7654321',
         })
         orderUnitWeightGrams = lines[0].unitWeightGrams
+        orderUnitDimensionsMm = lines[0].unitDimensionsMm
         orderUnitWeightFactVersion = (orderUnitWeightFactVersion || 0) + 1
         return route.fulfill({
           json: {
@@ -2282,7 +2297,7 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await expect(page.getByText('Not Released')).toBeVisible()
 })
 
-test('ordinary-unit weights save and invalidate stale cartonization before planning', async ({ page }) => {
+test('ordinary-unit facts save and invalidate stale cartonization before planning', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installImportedOrderPreparationRoutes(page, {
     missingUnitWeight: true,
@@ -2301,14 +2316,23 @@ test('ordinary-unit weights save and invalidate stale cartonization before plann
   const runCartonization = page.getByRole('button', {
     name: 'Run cartonization and compare rates',
   })
-  const saveUnitWeights = page.getByRole('button', { name: 'Save unit weights' })
+  const saveUnitWeights = page.getByRole('button', { name: 'Save unit facts' })
   await expect(runCartonization).toBeDisabled()
   await expect(saveUnitWeights).toBeDisabled()
   await unitWeight.fill('1')
   await page.getByLabel('Audit reason').fill('Measured on the receiving scale')
   await saveUnitWeights.click()
   await expect.poll(() => capture.unitWeightRequests.length).toBe(1)
-  await expect(page.getByText('Order unit weights')).toBeVisible()
+  await expect(page.getByText('Item dimensions for cartonization')).toBeVisible()
+  await expect(runCartonization).toBeEnabled()
+
+  await page.getByLabel(/^Length/).fill('10')
+  await page.getByLabel(/^Width/).fill('8')
+  await page.getByLabel(/^Height/).fill('4')
+  await page.getByLabel('Audit reason').fill('Added exact item dimensions')
+  await saveUnitWeights.click()
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(2)
+  await expect(page.getByText('Order unit facts')).toBeVisible()
   await expect(runCartonization).toBeEnabled()
 
   await runCartonization.click()
@@ -2320,7 +2344,7 @@ test('ordinary-unit weights save and invalidate stale cartonization before plann
     .toBeDisabled()
   await page.getByLabel('Audit reason').fill('Corrected after scale verification')
   await saveUnitWeights.click()
-  await expect.poll(() => capture.unitWeightRequests.length).toBe(2)
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(3)
   await expect(runCartonization).toBeEnabled()
 })
 

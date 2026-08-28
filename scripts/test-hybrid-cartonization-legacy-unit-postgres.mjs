@@ -24,7 +24,7 @@ const migrationName =
 const firstPostLegacyMigration =
   '0328_operations_shopify_reversal_fixture_provider_errors.sql'
 const orderUnitWeightRepairMigration =
-  '0335_operations_order_unit_weight_null_safe_validation.sql'
+  '0336_operations_order_unit_physical_facts.sql'
 const exactLineGlobalId = 'gcol1vbvhkqodkjl'
 const exactCandidateGlobalId = 'gcocq1570l31rv1l'
 const exactLineSourceRevision = '2026-08-15T00:14:33.000Z'
@@ -69,6 +69,7 @@ async function insertFirstUnitWeightFact(
   fixture,
   receipt,
   unitWeightGrams,
+  unitDimensionsMm = { length: 100, width: 100, height: 50 },
 ) {
   const allocated = await client.query(
     `SELECT allocate_global_reference('gouw') AS global_id`,
@@ -81,7 +82,10 @@ async function insertFirstUnitWeightFact(
        planning_line_id, planning_line_global_id,
        candidate_line_id, revision_application_line_id,
        line_source_revision, line_source_hash, fact_version,
-       supersedes_fact_id, unit_weight_grams, reason, request_hash, fact_hash,
+       supersedes_fact_id, unit_weight_grams,
+       unit_length_mm, unit_width_mm, unit_height_mm,
+       dimension_evidence_basis,
+       reason, request_hash, fact_hash,
        command_receipt_id, recorded_by
      )
      SELECT $1::text, line.organization_id, line.integration_account_id,
@@ -89,7 +93,10 @@ async function insertFirstUnitWeightFact(
             candidate.canonical_order_id, line.canonical_order_line_id,
             line.id, line.global_id, line.id, NULL,
             line.source_revision, line.source_hash, 1, NULL,
-            $2::integer, $3, $4,
+            $2::integer, $7::integer, $8::integer, $9::integer,
+            CASE WHEN $7::integer IS NULL THEN NULL
+              ELSE 'operator_recorded_order_dimensions'
+            END, $3, $4,
             encode(digest(convert_to(jsonb_build_object(
               'candidateGlobalId', candidate.global_id,
               'candidateRowVersion', candidate.row_version,
@@ -98,6 +105,14 @@ async function insertFirstUnitWeightFact(
               'lineGlobalId', line.global_id,
               'lineSourceHash', line.source_hash,
               'lineSourceRevision', line.source_revision,
+              'unitDimensionsMm', CASE
+                WHEN $7::integer IS NULL THEN NULL
+                ELSE jsonb_build_object(
+                  'height', $9::integer,
+                  'length', $7::integer,
+                  'width', $8::integer
+                )
+              END,
               'unitWeightGrams', $2::integer
             )::text, 'UTF8'), 'sha256'), 'hex'),
             $5::uuid, $6
@@ -105,11 +120,13 @@ async function insertFirstUnitWeightFact(
      JOIN operations_commerce_order_candidates candidate
        ON candidate.organization_id = line.organization_id
       AND candidate.id = line.order_candidate_id
-     WHERE line.organization_id = $7::uuid
-       AND line.global_id = $8
-       AND candidate.global_id = $9
+     WHERE line.organization_id = $10::uuid
+       AND line.global_id = $11
+       AND candidate.global_id = $12
        AND candidate.accepted_revision_application_id IS NULL
      RETURNING id::text, global_id, fact_version, unit_weight_grams,
+               unit_length_mm, unit_width_mm, unit_height_mm,
+               request_hash, fact_hash,
                candidate_line_id::text, revision_application_line_id::text`,
     [
       globalId,
@@ -118,6 +135,9 @@ async function insertFirstUnitWeightFact(
       receipt.requestHash,
       receipt.id,
       fixture.actorEmail,
+      unitDimensionsMm?.length ?? null,
+      unitDimensionsMm?.width ?? null,
+      unitDimensionsMm?.height ?? null,
       fixture.organizationId,
       exactLineGlobalId,
       exactCandidateGlobalId,
@@ -1281,7 +1301,7 @@ async function verify(databaseUrl) {
     assert.equal(
       unitWeightHealthResult.rows[0]?.applied,
       true,
-      'Hosted health must require the null-safe unit-weight trigger repair',
+      'Hosted health must require order-specific ordinary-item physical facts',
     )
 
     const ordinaryUnitContext = await pool.query(
@@ -1313,6 +1333,43 @@ async function verify(databaseUrl) {
       channel_weight_grams: null,
     }, 'The regression fixture must retain a NULL provider-weight source')
 
+    const weightOnlyClient = await pool.connect()
+    try {
+      await weightOnlyClient.query('BEGIN')
+      const weightOnlyReceipt = await createProcessingUnitWeightReceipt(
+        weightOnlyClient,
+        fixture,
+        'weight-only-fallback',
+      )
+      const weightOnlyFact = await insertFirstUnitWeightFact(
+        weightOnlyClient,
+        fixture,
+        weightOnlyReceipt,
+        3000,
+        null,
+      )
+      assert.deepEqual(
+        plain(weightOnlyFact.rows[0]),
+        {
+          id: weightOnlyFact.rows[0].id,
+          global_id: weightOnlyFact.rows[0].global_id,
+          fact_version: 1,
+          unit_weight_grams: 3000,
+          unit_length_mm: null,
+          unit_width_mm: null,
+          unit_height_mm: null,
+          request_hash: weightOnlyReceipt.requestHash,
+          fact_hash: weightOnlyFact.rows[0].fact_hash,
+          candidate_line_id: fixture.exactLine.id,
+          revision_application_line_id: null,
+        },
+        'Weight-only evidence must remain available for truthful one-unit fallback',
+      )
+    } finally {
+      await weightOnlyClient.query('ROLLBACK')
+      weightOnlyClient.release()
+    }
+
     const acceptedReceipt = await createProcessingUnitWeightReceipt(
       pool,
       fixture,
@@ -1334,6 +1391,11 @@ async function verify(databaseUrl) {
       global_id: acceptedFact.rows[0].global_id,
       fact_version: 1,
       unit_weight_grams: 3000,
+      unit_length_mm: 100,
+      unit_width_mm: 100,
+      unit_height_mm: 50,
+      request_hash: acceptedReceipt.requestHash,
+      fact_hash: acceptedFact.rows[0].fact_hash,
       candidate_line_id: fixture.exactLine.id,
       revision_application_line_id: null,
     })
@@ -1360,6 +1422,33 @@ async function verify(databaseUrl) {
         await rejectionClient.query(
           `SET LOCAL session_replication_role = origin`,
         )
+        const providerReceipt = await createProcessingUnitWeightReceipt(
+          rejectionClient,
+          fixture,
+          'provider-order-dimensions-accepted',
+        )
+        const providerFact = await insertFirstUnitWeightFact(
+          rejectionClient,
+          fixture,
+          providerReceipt,
+          2268,
+        )
+        assert.equal(
+          providerFact.rowCount,
+          1,
+          'An unchanged provider weight must allow separate item dimensions',
+        )
+        await rejectionClient.query(
+          `SET LOCAL session_replication_role = replica`,
+        )
+        await rejectionClient.query(
+          `DELETE FROM operations_order_unit_weight_facts
+           WHERE id = $1::uuid`,
+          [providerFact.rows[0].id],
+        )
+        await rejectionClient.query(
+          `SET LOCAL session_replication_role = origin`,
+        )
         const rejectedReceipt = await createProcessingUnitWeightReceipt(
           rejectionClient,
           fixture,
@@ -1372,7 +1461,7 @@ async function verify(databaseUrl) {
             rejectedReceipt,
             3000,
           ),
-          /Order unit weight requires one current exact ordinary-unit line/,
+          /Order unit facts require one current exact ordinary-unit line/,
           'A positive provider-order weight must remain read-only',
         )
       } finally {
@@ -1430,6 +1519,19 @@ async function verify(databaseUrl) {
            AS manual_measurement_decision_global_id,
          manual_decision.created_at
            AS manual_measurement_decision_created_at,
+         order_unit_weight.global_id AS order_unit_weight_fact_global_id,
+         order_unit_weight.fact_version AS order_unit_weight_fact_version,
+         order_unit_weight.unit_weight_grams AS order_unit_weight_grams,
+         order_unit_weight.unit_length_mm AS order_unit_length_mm,
+         order_unit_weight.unit_width_mm AS order_unit_width_mm,
+         order_unit_weight.unit_height_mm AS order_unit_height_mm,
+         order_unit_weight.line_source_revision
+           AS order_unit_weight_line_source_revision,
+         order_unit_weight.line_source_hash
+           AS order_unit_weight_line_source_hash,
+         order_unit_weight.request_hash AS order_unit_weight_request_hash,
+         order_unit_weight.fact_hash AS order_unit_weight_fact_hash,
+         order_unit_weight.recorded_at AS order_unit_weight_recorded_at,
          channel.source_revision AS channel_source_revision,
          channel.source_hash AS channel_source_hash,
          channel.weight_grams AS channel_weight_grams,
@@ -1452,6 +1554,21 @@ async function verify(databaseUrl) {
          ON manual_decision.organization_id =
               manual_measurement.organization_id
         AND manual_decision.id = manual_measurement.resolution_decision_id
+       LEFT JOIN LATERAL (
+         SELECT fact.global_id, fact.fact_version, fact.unit_weight_grams,
+                fact.unit_length_mm, fact.unit_width_mm, fact.unit_height_mm,
+                fact.line_source_revision, fact.line_source_hash,
+                fact.request_hash, fact.fact_hash, fact.recorded_at
+         FROM operations_order_unit_weight_facts fact
+         WHERE fact.organization_id = line.organization_id
+           AND fact.candidate_id = line.order_candidate_id
+           AND fact.planning_line_id = line.id
+           AND fact.planning_line_global_id = line.global_id
+           AND fact.line_source_revision = line.source_revision
+           AND fact.line_source_hash = line.source_hash
+         ORDER BY fact.fact_version DESC, fact.id DESC
+         LIMIT 1
+       ) order_unit_weight ON true
        LEFT JOIN operations_product_channel_states channel
          ON channel.organization_id = line.organization_id
         AND channel.integration_account_id = line.integration_account_id
@@ -1518,6 +1635,25 @@ async function verify(databaseUrl) {
       { mode: 'production' },
       [mappedInput(runtimeById.get(exactLineGlobalId))],
     )[0]
+    const orderFactRow = {
+      ...runtimeById.get(exactLineGlobalId),
+      manual_measurement_evidence_id: null,
+      manual_measurement_source: null,
+      manual_measurement_weight_grams: null,
+      manual_measurement_length_mm: null,
+      manual_measurement_width_mm: null,
+      manual_measurement_height_mm: null,
+      manual_measurement_line_source_revision: null,
+      manual_measurement_line_source_hash: null,
+      manual_measurement_request_hash: null,
+      manual_measurement_result_payload_hash: null,
+      manual_measurement_decision_global_id: null,
+      manual_measurement_decision_created_at: null,
+    }
+    const factMapped = persistence.mapCandidateLines(
+      { mode: 'production' },
+      [mappedInput(orderFactRow)],
+    )[0]
     assert.throws(
       () => persistence.mapCandidateLines(
         { mode: 'production' },
@@ -1557,28 +1693,91 @@ async function verify(databaseUrl) {
       mapped.evidence.weightEvidenceRequestHash,
       evidence.request_hash,
     )
+    assert.equal(factMapped.evidence.weightSource, 'order_specific')
+    assert.equal(factMapped.evidence.dimensionSource, 'order_specific')
+    assert.deepEqual(plain(factMapped.line.unitDimensionsMm), {
+      length: 100,
+      width: 100,
+      height: 50,
+    })
+    assert.equal(
+      factMapped.evidence.dimensionEvidenceHash,
+      acceptedFact.rows[0].fact_hash,
+    )
+
+    const packageFixtureSuffix = randomUUID().slice(0, 8).toUpperCase()
+    const packageWarehouse = (await pool.query(
+      `INSERT INTO operations_warehouses (
+         organization_id, code, name, timezone, address, status,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2, 'Ordinary-unit cartonization acceptance',
+         'America/New_York', $3::jsonb, 'active', $4, $4
+       ) RETURNING id::text, global_id`,
+      [
+        fixture.organizationId,
+        `UNIT-${packageFixtureSuffix}`,
+        JSON.stringify({
+          name: 'Ordinary-unit cartonization acceptance',
+          line1: '35 Saxony Drive',
+          city: 'Trumbull',
+          region: 'CT',
+          postalCode: '06611',
+          country: 'US',
+        }),
+        fixture.actorEmail,
+      ],
+    )).rows[0]
+    const packageMaterial = (await pool.query(
+      `INSERT INTO operations_packaging_materials (
+         organization_id, code, name, material_type,
+         inner_length_mm, inner_width_mm, inner_height_mm,
+         tare_weight_grams, max_weight_grams, unit_cost_minor,
+         currency, status, source, dimension_basis,
+         dimension_evidence_type, dimension_evidence_reference,
+         dimension_confirmed_at, dimension_confirmed_by,
+         rated_outer_length_mm, rated_outer_width_mm,
+         rated_outer_height_mm, rated_outer_dimension_evidence_type,
+         rated_outer_dimension_evidence_reference,
+         rated_outer_dimension_confirmed_at,
+         rated_outer_dimension_confirmed_by, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2, 'Ordinary-unit acceptance carton', 'carton',
+         1600, 350, 350, 200, 10000, 125,
+         'USD', 'active', 'manual', 'inner',
+         'measured', $3, now(), $4,
+         1620, 370, 370, 'measured', $3, now(), $4, $4, $4
+       ) RETURNING id::text, global_id, row_version::text`,
+      [
+        fixture.organizationId,
+        `UNIT-BOX-${packageFixtureSuffix}`,
+        `ordinary-unit-measurement-${packageFixtureSuffix}`,
+        fixture.actorEmail,
+      ],
+    )).rows[0]
 
     const hybridPlan = hybrid.planHybridCartonization({
       mode: 'production',
-      lines: [mapped.line],
+      lines: [{ ...factMapped.line, quantity: 3 }],
       recipes: [],
       materials: [],
     })
     assert.deepEqual(plain(hybridPlan.geometryFallbackLines), [{
       lineGlobalId: exactLineGlobalId,
       productGlobalId: fixture.productGlobalId,
-      quantity: 1,
+      quantity: 3,
       fitModel: 'unconstrained_unit',
     }])
     const materialPlan = unitMaterial.planOperationalUnitMaterialPackages({
       provider: 'shopify',
-      lines: [mapped.line],
+      lines: [{ ...factMapped.line, quantity: 3 }],
       fallbackLines: hybridPlan.geometryFallbackLines,
       recipePackages: [],
       materials: [{
-        materialGlobalId: 'gpmat1vbvhkqodkj',
-        capturedRowVersion: 2,
-        currentRowVersion: 2,
+        materialGlobalId: packageMaterial.global_id,
+        materialType: 'carton',
+        capturedRowVersion: Number(packageMaterial.row_version),
+        currentRowVersion: Number(packageMaterial.row_version),
         isCurrent: true,
         status: 'active',
         innerDimensionsMm: { length: 1600, width: 350, height: 350 },
@@ -1589,7 +1788,7 @@ async function verify(databaseUrl) {
         tareWeightGrams: 200,
         unitCostMinor: 125,
         currency: 'USD',
-        maximumGrossWeightGrams: 5000,
+        maximumGrossWeightGrams: 10000,
         availableQuantity: 1,
         ratedOuterDimensionsMm: {
           length: 1620,
@@ -1600,9 +1799,9 @@ async function verify(databaseUrl) {
       inventoryProducts: [{
         productGlobalId: fixture.productGlobalId,
         availabilityAuthority: 'shopify_provider_commitment',
-        providerCommittedQuantity: 1,
+        providerCommittedQuantity: 3,
         activeReservedQuantity: 0,
-        effectiveAvailableQuantity: 1,
+        effectiveAvailableQuantity: 3,
         sourceLevelGlobalIds: ['gcil1vbvhkqodkj'],
         sourcePositionGlobalIds: ['gip1vbvhkqodkjl'],
         sourcePositionVersion: 0,
@@ -1612,7 +1811,12 @@ async function verify(databaseUrl) {
     })
     assert.equal(materialPlan.status, 'ready')
     assert.equal(materialPlan.packages.length, 1)
-    assert.equal(materialPlan.packages[0].contentWeightGrams, 2268)
+    assert.equal(materialPlan.packages[0].allocations[0].quantity, 3)
+    assert.equal(materialPlan.packages[0].contentWeightGrams, 9000)
+    assert.equal(
+      materialPlan.packages[0].unitMaterialEvidence.fitModel,
+      'fixed_axis_regular_grid',
+    )
     assert.deepEqual(
       plain(materialPlan.packages[0].innerDimensionsMm),
       { length: 1600, width: 350, height: 350 },
@@ -1632,6 +1836,110 @@ async function verify(databaseUrl) {
       materialPlan.packages[0].planningMethod,
       'unit_material_selection',
     )
+
+    const packageEvidenceClient = await pool.connect()
+    try {
+      await packageEvidenceClient.query('BEGIN')
+      const writeToken = `unit-material-evidence-${randomUUID()}`
+      await packageEvidenceClient.query(
+        `SELECT set_config(
+           'clawpilot.cartonization_evidence_write_token', $1, true
+         )`,
+        [writeToken],
+      )
+      const evidence = (await packageEvidenceClient.query(
+        `INSERT INTO operations_cartonization_rate_evidence (
+           organization_id, integration_account_id, order_candidate_id,
+           candidate_row_version, candidate_source_hash,
+           destination_fingerprint, warehouse_id, inventory_sync_run_id,
+           evidence_mode, policy_version, algorithm_version,
+           request_hash, plan_input_hash, plan_result_hash,
+           plan_snapshot, assumption_snapshot, status,
+           idempotency_key, actor_email, write_token_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid,
+           10, $4, $5, $6::uuid, NULL,
+           'operational', 'ordinary-unit-postgres-acceptance-v1',
+           'operational-unit-material-fixed-axis-v2',
+           $7, $8, $9, $10::jsonb, '{}'::jsonb, 'succeeded',
+           $11, $12, $13
+         ) RETURNING id::text`,
+        [
+          fixture.organizationId,
+          fixture.accountId,
+          fixture.candidateId,
+          exactCandidateSourceHash,
+          hash(`unit-material-destination-${packageFixtureSuffix}`),
+          packageWarehouse.id,
+          hash(`unit-material-request-${packageFixtureSuffix}`),
+          hash(`unit-material-input-${packageFixtureSuffix}`),
+          hash(`unit-material-result-${packageFixtureSuffix}`),
+          JSON.stringify({ operationalUnitMaterialPlan: materialPlan }),
+          `unit-material-evidence-${packageFixtureSuffix}`,
+          fixture.actorEmail,
+          hash(writeToken),
+        ],
+      )).rows[0]
+      const retainedPackage = materialPlan.packages[0]
+      await packageEvidenceClient.query(
+        `INSERT INTO operations_cartonization_rate_evidence_packages (
+           organization_id, evidence_id, package_key, package_sequence,
+           planning_method, packaging_material_id, material_row_version,
+           inner_dimensions_mm, rated_outer_dimensions_mm,
+           content_weight_grams, tare_weight_grams,
+           rated_gross_weight_grams, max_weight_grams,
+           allocations, carrier_parcel_snapshot, package_hash
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4,
+           'unit_material_selection', $5::uuid, $6,
+           $7::jsonb, $8::jsonb, $9, $10, $11, $12,
+           $13::jsonb, $14::jsonb, $15
+         )`,
+        [
+          fixture.organizationId,
+          evidence.id,
+          retainedPackage.packageKey,
+          retainedPackage.packageSequence,
+          packageMaterial.id,
+          Number(packageMaterial.row_version),
+          JSON.stringify(retainedPackage.innerDimensionsMm),
+          JSON.stringify(retainedPackage.ratedOuterDimensionsMm),
+          retainedPackage.contentWeightGrams,
+          retainedPackage.tareWeightGrams,
+          retainedPackage.ratedGrossWeightGrams,
+          retainedPackage.maxWeightGrams,
+          JSON.stringify(retainedPackage.allocations),
+          JSON.stringify({
+            description: 'Ordinary-unit acceptance carton',
+            dimensionUnit: 'IN',
+            length: 63.78,
+            width: 14.57,
+            height: 14.57,
+            weight: 20.28,
+            weightUnit: 'LB',
+          }),
+          hash(JSON.stringify(retainedPackage)),
+        ],
+      )
+      await packageEvidenceClient.query(
+        `SET CONSTRAINTS
+           validate_operations_cartonization_unit_material_package IMMEDIATE`,
+      )
+      const retained = await packageEvidenceClient.query(
+        `SELECT allocations, content_weight_grams
+         FROM operations_cartonization_rate_evidence_packages
+         WHERE organization_id = $1::uuid
+           AND evidence_id = $2::uuid
+           AND package_key = $3`,
+        [fixture.organizationId, evidence.id, retainedPackage.packageKey],
+      )
+      assert.equal(retained.rowCount, 1)
+      assert.equal(retained.rows[0].allocations[0].quantity, 3)
+      assert.equal(retained.rows[0].content_weight_grams, 9000)
+    } finally {
+      await packageEvidenceClient.query('ROLLBACK')
+      packageEvidenceClient.release()
+    }
   } finally {
     await pool.end()
   }

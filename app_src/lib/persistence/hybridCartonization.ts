@@ -158,6 +158,15 @@ export type HybridCartonizationReadResult = {
     weightEvidenceReference: string
     weightEvidenceHash: string | null
     weightEvidenceRequestHash: string | null
+    unitDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    } | null
+    dimensionSource: 'order_specific' | null
+    dimensionEvidenceReference: string | null
+    dimensionEvidenceHash: string | null
+    dimensionEvidenceRequestHash: string | null
     channelSourceRevision: string
     channelSourceHash: string
     packLineageSource:
@@ -353,6 +362,9 @@ type CandidateLineRow = {
   order_unit_weight_fact_global_id: string | null
   order_unit_weight_fact_version: number | null
   order_unit_weight_grams: number | null
+  order_unit_length_mm: number | null
+  order_unit_width_mm: number | null
+  order_unit_height_mm: number | null
   order_unit_weight_line_source_revision: string | null
   order_unit_weight_line_source_hash: string | null
   order_unit_weight_request_hash: string | null
@@ -2407,6 +2419,9 @@ async function readCandidateLines(
        order_unit_weight.global_id AS order_unit_weight_fact_global_id,
        order_unit_weight.fact_version AS order_unit_weight_fact_version,
        order_unit_weight.unit_weight_grams AS order_unit_weight_grams,
+       order_unit_weight.unit_length_mm AS order_unit_length_mm,
+       order_unit_weight.unit_width_mm AS order_unit_width_mm,
+       order_unit_weight.unit_height_mm AS order_unit_height_mm,
        order_unit_weight.line_source_revision
          AS order_unit_weight_line_source_revision,
        order_unit_weight.line_source_hash
@@ -2504,6 +2519,7 @@ async function readCandidateLines(
       AND manual_decision.id = manual_measurement.resolution_decision_id
      LEFT JOIN LATERAL (
        SELECT fact.global_id, fact.fact_version, fact.unit_weight_grams,
+              fact.unit_length_mm, fact.unit_width_mm, fact.unit_height_mm,
               fact.line_source_revision, fact.line_source_hash,
               fact.request_hash, fact.fact_hash, fact.recorded_at
        FROM operations_order_unit_weight_facts fact
@@ -2721,9 +2737,24 @@ export function mapCandidateLines(
       && /^[a-f0-9]{64}$/.test(row.order_unit_weight_fact_hash || '')
       && row.order_unit_weight_recorded_at !== null
     )
+    const orderSpecificDimensionsMatch = Boolean(
+      orderSpecificMeasurementMatches
+      && Number.isSafeInteger(row.order_unit_length_mm)
+      && Number(row.order_unit_length_mm) > 0
+      && Number.isSafeInteger(row.order_unit_width_mm)
+      && Number(row.order_unit_width_mm) > 0
+      && Number.isSafeInteger(row.order_unit_height_mm)
+      && Number(row.order_unit_height_mm) > 0
+    )
+    const partialOrderSpecificDimensions = [
+      row.order_unit_length_mm,
+      row.order_unit_width_mm,
+      row.order_unit_height_mm,
+    ].some((value) => value !== null && value !== undefined)
+      && !orderSpecificDimensionsMatch
     if (
       orderSpecificMeasurementPresent
-      && !orderSpecificMeasurementMatches
+      && (!orderSpecificMeasurementMatches || partialOrderSpecificDimensions)
     ) {
       fail(
         `${row.product_title_snapshot} has invalid order-specific unit-weight evidence`,
@@ -2735,14 +2766,22 @@ export function mapCandidateLines(
       const providerOrderWeight = (
         !manualResolutionUnit
         && row.packaging_weight_source === 'provider_order'
+        && Number(row.weight_grams) > 0
+      )
+      const providerCatalogWeight = (
+        !manualResolutionUnit
+        && !providerOrderWeight
+        && Number(row.channel_weight_grams) > 0
       )
       const unitWeight = manualResolutionUnit
         ? row.manual_measurement_weight_grams
-        : orderSpecificMeasurementMatches
-          ? row.order_unit_weight_grams
         : providerOrderWeight
           ? row.weight_grams
-          : row.channel_weight_grams
+          : providerCatalogWeight
+            ? row.channel_weight_grams
+            : orderSpecificMeasurementMatches
+              ? row.order_unit_weight_grams
+              : null
       if (!Number.isSafeInteger(unitWeight) || Number(unitWeight) < 1) {
         fail(
           `${row.product_title_snapshot} needs a positive provider or order-specific unit weight; a Product pack assignment is not required`,
@@ -2773,29 +2812,36 @@ export function mapCandidateLines(
         : row.product_title_snapshot
       const weightSource = manualResolutionUnit
         ? 'manual_resolution' as const
-        : orderSpecificMeasurementMatches
-          ? 'order_specific' as const
         : providerOrderWeight
           ? 'provider_order' as const
-          : 'provider_catalog' as const
+          : providerCatalogWeight
+            ? 'provider_catalog' as const
+            : 'order_specific' as const
       const weightEvidenceReference = manualResolutionUnit
         ? row.manual_measurement_decision_global_id!
-        : orderSpecificMeasurementMatches
-          ? row.order_unit_weight_fact_global_id!
         : providerOrderWeight
           ? row.line_source_revision
-          : row.channel_source_revision
+          : providerCatalogWeight
+            ? row.channel_source_revision
+            : row.order_unit_weight_fact_global_id!
       const weightEvidenceHash = manualResolutionUnit
         ? row.manual_measurement_result_payload_hash
-        : orderSpecificMeasurementMatches
-          ? row.order_unit_weight_fact_hash
         : providerOrderWeight
           ? row.line_source_hash
-          : row.channel_source_hash
+          : providerCatalogWeight
+            ? row.channel_source_hash
+            : row.order_unit_weight_fact_hash
       const weightEvidenceRequestHash = manualResolutionUnit
         ? row.manual_measurement_request_hash
-        : orderSpecificMeasurementMatches
+        : weightSource === 'order_specific'
           ? row.order_unit_weight_request_hash
+          : null
+      const unitDimensionsMm = orderSpecificDimensionsMatch
+        ? {
+            length: Number(row.order_unit_length_mm),
+            width: Number(row.order_unit_width_mm),
+            height: Number(row.order_unit_height_mm),
+          }
         : null
       return {
         productId: row.product_id!,
@@ -2806,6 +2852,10 @@ export function mapCandidateLines(
           title,
           quantity,
           unitWeightGrams: Number(unitWeight),
+          unitDimensionsMm,
+          unitDimensionsAuthority: unitDimensionsMm
+            ? 'order_specific'
+            : null,
           profile: {
             // This is explicit non-profile lineage, not a fabricated Product
             // pack Global ID. The dedicated fit model prevents it from
@@ -2818,7 +2868,7 @@ export function mapCandidateLines(
             fitModel: 'unconstrained_unit',
             evidenceType: manualResolutionUnit
               ? 'legacy'
-              : orderSpecificMeasurementMatches
+              : weightSource === 'order_specific'
                 ? 'measured'
                 : 'provider',
             evidenceReference: weightEvidenceReference,
@@ -2827,7 +2877,7 @@ export function mapCandidateLines(
                   row.manual_measurement_decision_created_at,
                   `${row.global_id} manual unit-measurement decision`,
                 )
-              : orderSpecificMeasurementMatches
+              : weightSource === 'order_specific'
                 ? timestamp(
                     row.order_unit_weight_recorded_at,
                     `${row.global_id} order-specific unit weight`,
@@ -2857,6 +2907,17 @@ export function mapCandidateLines(
           weightEvidenceReference,
           weightEvidenceHash,
           weightEvidenceRequestHash,
+          unitDimensionsMm,
+          dimensionSource: unitDimensionsMm ? 'order_specific' : null,
+          dimensionEvidenceReference: unitDimensionsMm
+            ? row.order_unit_weight_fact_global_id
+            : null,
+          dimensionEvidenceHash: unitDimensionsMm
+            ? row.order_unit_weight_fact_hash
+            : null,
+          dimensionEvidenceRequestHash: unitDimensionsMm
+            ? row.order_unit_weight_request_hash
+            : null,
           channelSourceRevision: row.channel_source_revision,
           channelSourceHash: row.channel_source_hash,
           packLineageSource: row.pack_lineage_source,
@@ -3150,6 +3211,11 @@ export function mapCandidateLines(
             ? row.channel_source_hash
             : null,
         weightEvidenceRequestHash: null,
+        unitDimensionsMm: null,
+        dimensionSource: null,
+        dimensionEvidenceReference: null,
+        dimensionEvidenceHash: null,
+        dimensionEvidenceRequestHash: null,
         channelSourceRevision: row.channel_source_revision,
         channelSourceHash: row.channel_source_hash,
         packLineageSource: row.pack_lineage_source,

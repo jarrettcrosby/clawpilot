@@ -1,22 +1,22 @@
 export const OPERATIONS_ORDER_UNIT_WEIGHT_MIGRATION =
-  '0335_operations_order_unit_weight_null_safe_validation.sql' as const
+  '0336_operations_order_unit_physical_facts.sql' as const
 export const OPERATIONS_ORDER_UNIT_WEIGHT_MIGRATION_CHECKSUM =
-  'e4deac2b38f157194483ee47eeb6bf32b20c158e9c330624889cbdf4419f69e6' as const
+  '918177c469c3fe4832dfda4b52d12938472fdd202aeaab0513b87cbb62dde894' as const
 
 export const OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL = String.raw`
   EXISTS (
     SELECT 1
     FROM public.schema_migrations migration
     WHERE migration.filename =
-      '0335_operations_order_unit_weight_null_safe_validation.sql'
+      '0336_operations_order_unit_physical_facts.sql'
       AND migration.checksum =
-        'e4deac2b38f157194483ee47eeb6bf32b20c158e9c330624889cbdf4419f69e6'
+        '918177c469c3fe4832dfda4b52d12938472fdd202aeaab0513b87cbb62dde894'
   )
   AND pg_catalog.to_regclass(
     'public.operations_order_unit_weight_facts'
   ) IS NOT NULL
   AND (
-    SELECT pg_catalog.count(*) = 25
+    SELECT pg_catalog.count(*) = 29
     FROM pg_catalog.pg_attribute attribute
     WHERE attribute.attrelid = pg_catalog.to_regclass(
       'public.operations_order_unit_weight_facts'

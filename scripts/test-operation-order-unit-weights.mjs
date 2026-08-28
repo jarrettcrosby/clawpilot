@@ -14,6 +14,11 @@ const nullSafeMigrationPath =
 const nullSafeMigration = read(nullSafeMigrationPath)
 const expectedNullSafeChecksum =
   'e4deac2b38f157194483ee47eeb6bf32b20c158e9c330624889cbdf4419f69e6'
+const physicalFactsMigrationPath =
+  'db/migrations/0336_operations_order_unit_physical_facts.sql'
+const physicalFactsMigration = read(physicalFactsMigrationPath)
+const expectedPhysicalFactsChecksum =
+  '918177c469c3fe4832dfda4b52d12938472fdd202aeaab0513b87cbb62dde894'
 
 assert.equal(
   createHash('sha256').update(migration).digest('hex'),
@@ -46,6 +51,30 @@ assert.doesNotMatch(
   /UPDATE\s+public\.operations_commerce_order_candidate_lines/iu,
   'Order-specific weight evidence must not mutate imported packaging fields',
 )
+assert.equal(
+  createHash('sha256').update(physicalFactsMigration).digest('hex'),
+  expectedPhysicalFactsChecksum,
+  'The order-specific physical-fact migration must be checksum-pinned',
+)
+for (const fragment of [
+  'unit_length_mm',
+  'unit_width_mm',
+  'unit_height_mm',
+  'operator_recorded_order_dimensions',
+  "'unitDimensionsMm', CASE",
+  'pg_catalog.jsonb_build_object(',
+  'operational-unit-material-fixed-axis-v2',
+  'fixed_axis_regular_grid',
+  'one_each_without_fit_claim',
+  "NEW.inner_dimensions_mm->>'length'",
+  "fit_evidence->>'weightCapacityUnits'",
+  'Unit-material packages cannot retain recipe or Product-pack profile edges',
+]) {
+  assert.ok(
+    physicalFactsMigration.includes(fragment),
+    `Physical-fact migration must retain ${fragment}`,
+  )
+}
 assert.equal(
   createHash('sha256').update(nullSafeMigration).digest('hex'),
   expectedNullSafeChecksum,
@@ -85,7 +114,9 @@ for (const fragment of [
   "weightSource: 'provider_order' | 'provider_catalog' | 'order_specific'",
   'workspace: null',
   'correlation_id = $4::uuid',
-  'currentFactVersion === null',
+  'unitDimensionsMm: exactDimensions(',
+  "dimensionSource: 'order_specific' | null",
+  'fact.unit_length_mm',
   '/^(?:gcol|gcal)',
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence must retain ${fragment}`)
@@ -115,7 +146,8 @@ for (const fragment of [
   "| 'order_specific'",
   'order_unit_weight_fact_global_id',
   'order_unit_weight_fact_hash',
-  "? 'order_specific' as const",
+  'order_unit_length_mm',
+  "dimensionSource: unitDimensionsMm ? 'order_specific' : null",
   'HYBRID_CARTONIZATION_UNIT_ORDER_EVIDENCE_INVALID',
   'fact.revision_application_line_id = revision_line.id',
 ]) {
@@ -148,14 +180,18 @@ for (const fragment of [
 
 const ui = read('app_src/components/operations/OperationsSection.tsx')
 for (const fragment of [
-  'order-planning-missing-unit-weights',
+  'order-planning-missing-unit-facts',
   'Missing unit weights',
+  'Item dimensions for cartonization',
+  'dimensionMissingLines',
   'Quantity {line.quantity}',
   'Unit weight (${measurementUnits(',
+  "(['length', 'width', 'height'] as const)",
+  'A Product pack is optional',
   'label="Audit reason"',
-  'Save unit weights',
+  'Save unit facts',
   'Boolean(planUnitWeightWorkspace?.missingLines.length)',
-  'Change at least one order-specific unit weight.',
+  'Change at least one order-specific unit fact.',
   'planUnitWeightHasUnsavedChanges',
   'planUnitWeightWorkspaceBlocked',
   'planUnitWeightWorkspaceRequired',
@@ -167,8 +203,8 @@ for (const fragment of [
   'orderUnitWeightDraftValue',
   'planPreparationAbortController.current?.abort()',
   "line.variantTitle.toLowerCase() !== 'default title'",
-  'Order unit weights are read-only in training.',
-  'Order unit weights cannot be changed in training.',
+  'Order unit facts are read-only in training.',
+  'Order unit facts cannot be changed in training.',
 ]) {
   assert.ok(ui.includes(fragment), `Operations UI must retain ${fragment}`)
 }
@@ -187,7 +223,7 @@ assert.ok(
   'Closing preparation must abort the active request and clear its loading state',
 )
 const unitWeightControl = ui.slice(
-  ui.indexOf('data-testid="order-planning-missing-unit-weights"'),
+  ui.indexOf('data-testid="order-planning-missing-unit-facts"'),
   ui.indexOf('Step 1 · Choose fulfillment facts'),
 )
 assert.ok(
@@ -209,6 +245,7 @@ for (const fragment of [
   "url.pathname === '/api/operations/order-unit-weights'",
   'missingUnitWeight: true',
   'Measured on the receiving scale',
+  "page.getByLabel(/^Length/).fill('10')",
   "page.getByText('Vanilla · Quantity 1')",
   "page.getByText('UPS · UPS Ground')).toHaveCount(0)",
   'capture.unitWeightRequests.length).toBe(2)',
@@ -250,7 +287,7 @@ for (const harnessPath of [
 const health = read(
   'app_src/lib/persistence/operationsOrderUnitWeightHealth.ts',
 )
-assert.ok(health.includes(expectedNullSafeChecksum))
+assert.ok(health.includes(expectedPhysicalFactsChecksum))
 assert.ok(health.includes('OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL'))
 const healthRoute = read('app_src/app/api/health/route.ts')
 assert.ok(healthRoute.includes('${OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}'))

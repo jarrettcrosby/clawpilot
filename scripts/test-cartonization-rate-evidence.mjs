@@ -616,7 +616,17 @@ function loadOperationalFaireRoute(
         return {
           status: 'ready',
           evidence: {
-            policyVersion: 'operational-unit-material-one-each-v1',
+            policyVersion: 'operational-unit-material-fixed-axis-v2',
+            productPackConstraint: 'not_required_for_ordinary_unit',
+            packageSelectionBasis:
+              'fewest_packages_then_material_cost_then_inner_cube',
+            combinationPolicy: 'same_line_fixed_axis_only',
+            unitWeightAuthority: 'provider_or_order_specific',
+            unitDimensionsAuthority:
+              'order_specific_or_one_each_without_fit_claim',
+            rotationAllowed: false,
+            dimensionedLineCount: 0,
+            oneEachUndimensionedLineCount: 1,
           },
           packages: [{
             packageKey: 'unit-material-package-1',
@@ -646,6 +656,23 @@ function loadOperationalFaireRoute(
               title: 'Shopify unit item',
               quantity: 1,
             }],
+            unitMaterialEvidence: {
+              policyVersion: 'operational-unit-material-fixed-axis-v2',
+              productPackConstraint: 'not_required_for_ordinary_unit',
+              packageSelectionBasis:
+                'fewest_packages_then_material_cost_then_inner_cube',
+              unitsPerPackage: 1,
+              unitWeightGrams: 400,
+              unitWeightAuthority: 'provider_or_order_specific',
+              unitDimensionsAuthority: 'unavailable',
+              fitModel: 'one_each_without_fit_claim',
+              rotationAllowed: false,
+              unitDimensionsMm: null,
+              axisCounts: null,
+              spatialCapacityUnits: null,
+              weightCapacityUnits: 12,
+              effectiveCapacityUnits: 1,
+            },
           }],
         }
       },
@@ -805,7 +832,7 @@ const orToolsProfileMigration = read(
   'db/migrations/0261_operations_cartonization_or_tools_profile_evidence.sql',
 )
 const unitMaterialMigration = read(
-  'db/migrations/0323_operations_unit_material_cartonization.sql',
+  'db/migrations/0336_operations_order_unit_physical_facts.sql',
 )
 const persistence = read(
   'app_src/lib/persistence/cartonizationRateEvidence.ts',
@@ -949,12 +976,12 @@ assertIncludes(orToolsProfileMigration, [
   'profile_version.is_current = true',
 ], 'Operational OR-Tools profile evidence migration')
 assertIncludes(unitMaterialMigration, [
-  "'unit_material_selection'",
-  'ops_cart_rate_pkg_planning_method_check',
   'validate_operations_cartonization_unit_material_package()',
-  'DEFERRABLE INITIALLY DEFERRED',
-  "evidence.evidence_mode = 'operational'",
-  'jsonb_array_length(NEW.allocations) <> 1',
+  'operational-unit-material-fixed-axis-v2',
+  'same_line_fixed_axis_only',
+  'fixed_axis_regular_grid',
+  'one_each_without_fit_claim',
+  'allocation_quantity <> 1',
   'cannot retain recipe or Product-pack profile edges',
 ], 'Operational unit-material planner provenance migration')
 
@@ -1305,11 +1332,149 @@ const {
   assertCartonizationRateEvidenceMaterialAssumptions,
   assertCartonizationRateEvidenceOperationalGeometryProvenance,
   assertCartonizationRateEvidenceOrToolsProfiles,
+  assertCartonizationRateEvidenceUnitMaterialProvenance,
   cartonizationRateEvidenceHash,
   cartonizationRateEvidenceRequestHash,
   cartonizationShipmentRateContextHash,
   CartonizationRateEvidencePersistenceError,
 } = loadPersistence()
+
+const unitAllocation = {
+  lineGlobalId: 'gcol0000001',
+  productGlobalId: 'gp0000001',
+  title: 'Measured ordinary item',
+  quantity: 3,
+}
+const unitRetainedPackage = {
+  packageKey: 'ump-fixed-axis-1',
+  packageSequence: 1,
+  planningMethod: 'unit_material_selection',
+  packagingMaterialGlobalId: 'gmat0000001',
+  materialRowVersion: 2,
+  recipes: [],
+  orToolsProfiles: [],
+  innerDimensionsMm: { length: 300, width: 200, height: 100 },
+  ratedOuterDimensionsMm: { length: 310, width: 210, height: 110 },
+  contentWeightGrams: 1500,
+  tareWeightGrams: 100,
+  ratedGrossWeightGrams: 1600,
+  maxWeightGrams: 5000,
+  allocations: [unitAllocation],
+  unitMaterialEvidence: {
+    policyVersion: 'operational-unit-material-fixed-axis-v2',
+    productPackConstraint: 'not_required_for_ordinary_unit',
+    packageSelectionBasis:
+      'fewest_packages_then_material_cost_then_inner_cube',
+    unitsPerPackage: 3,
+    unitWeightGrams: 500,
+    unitWeightAuthority: 'provider_or_order_specific',
+    unitDimensionsAuthority: 'order_specific',
+    fitModel: 'fixed_axis_regular_grid',
+    rotationAllowed: false,
+    unitDimensionsMm: { length: 100, width: 100, height: 50 },
+    axisCounts: { length: 3, width: 2, height: 2 },
+    spatialCapacityUnits: 12,
+    weightCapacityUnits: 9,
+    effectiveCapacityUnits: 9,
+  },
+}
+const unitPackageInput = {
+  ...unitRetainedPackage,
+  carrierParcel: {
+    description: 'Measured ordinary-item carton',
+    length: 12.2,
+    width: 8.3,
+    height: 4.3,
+    dimensionUnit: 'IN',
+    weight: 3.53,
+    weightUnit: 'LB',
+  },
+  packageHash: 'a'.repeat(64),
+}
+const unitPlanEvidence = {
+  policyVersion: 'operational-unit-material-fixed-axis-v2',
+  productPackConstraint: 'not_required_for_ordinary_unit',
+  packageSelectionBasis:
+    'fewest_packages_then_material_cost_then_inner_cube',
+  combinationPolicy: 'same_line_fixed_axis_only',
+  unitWeightAuthority: 'provider_or_order_specific',
+  unitDimensionsAuthority:
+    'order_specific_or_one_each_without_fit_claim',
+  rotationAllowed: false,
+  dimensionedLineCount: 1,
+  oneEachUndimensionedLineCount: 0,
+  materialAuthority:
+    'current_active_material_and_unclaimed_warehouse_stock',
+  inventoryAuthority:
+    'shopify_provider_commitment_less_active_reservations',
+  transformationHash:
+    fulfillmentOptimizerContract.canonicalOptimizerHash(
+      [unitRetainedPackage],
+    ),
+}
+assert.doesNotThrow(() => (
+  assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: unitPlanEvidence,
+        packages: [unitRetainedPackage],
+      },
+    },
+  })
+), 'Three ordinary units with exact fixed-axis evidence must validate')
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [{
+      ...unitPackageInput,
+      allocations: [{ ...unitAllocation, quantity: 4 }],
+    }],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: unitPlanEvidence,
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Persisted allocation drift must fail closed',
+)
+const tamperedFitPackage = {
+  ...unitRetainedPackage,
+  unitMaterialEvidence: {
+    ...unitRetainedPackage.unitMaterialEvidence,
+    axisCounts: { length: 4, width: 2, height: 2 },
+    spatialCapacityUnits: 16,
+  },
+}
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [{
+      ...tamperedFitPackage,
+      carrierParcel: unitPackageInput.carrierParcel,
+      packageHash: unitPackageInput.packageHash,
+    }],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          transformationHash:
+            fulfillmentOptimizerContract.canonicalOptimizerHash(
+              [tamperedFitPackage],
+            ),
+        },
+        packages: [tamperedFitPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Fixed-axis counts must be recomputed from exact item and carton dimensions',
+)
 
 const {
   SANDBOX_GEOMETRY_RATE_POLICY_VERSION,

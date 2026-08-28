@@ -17,6 +17,8 @@ const line: HybridCartonizationLine = {
   title: 'Unit item',
   quantity: 3,
   unitWeightGrams: 500,
+  unitDimensionsMm: { length: 100, width: 100, height: 50 },
+  unitDimensionsAuthority: 'order_specific',
   profile: {
     versionGlobalId: 'unit-item:gcol0000001',
     capturedRowVersion: 0,
@@ -159,33 +161,140 @@ function persistenceCanonicalHash(value: unknown) {
     .digest('hex')
 }
 
-test('unit items use one factual selected material per unit without Product packs', () => {
+test('dimensioned ordinary units combine in one factual carton without Product packs', () => {
   const result = planOperationalUnitMaterialPackages(baseInput)
   assert.equal(result.status, 'ready')
   if (result.status !== 'ready') return
-  assert.equal(result.packages.length, 3)
-  assert.deepEqual(
-    result.packages.map((item) => item.planningMethod),
-    ['unit_material_selection', 'unit_material_selection', 'unit_material_selection'],
+  assert.equal(result.packages.length, 1)
+  assert.equal(result.packages[0].planningMethod, 'unit_material_selection')
+  assert.equal(result.packages[0].packagingMaterialGlobalId, 'gmat0000001')
+  assert.equal(result.packages[0].allocations.length, 1)
+  assert.equal(result.packages[0].allocations[0].quantity, 3)
+  assert.equal(result.packages[0].unitMaterialEvidence.unitWeightGrams, 500)
+  assert.equal(result.packages[0].contentWeightGrams, 1_500)
+  assert.equal(result.packages[0].ratedGrossWeightGrams, 1_600)
+  assert.equal(
+    result.packages[0].unitMaterialEvidence.fitModel,
+    'fixed_axis_regular_grid',
   )
   assert.deepEqual(
-    result.packages.map((item) => item.packagingMaterialGlobalId),
-    ['gmat0000001', 'gmat0000001', 'gmat0000001'],
+    result.packages[0].unitMaterialEvidence.axisCounts,
+    { length: 5, width: 3, height: 4 },
   )
-  assert.ok(result.packages.every((item) => (
-    item.allocations.length === 1
-    && item.allocations[0].quantity === 1
-    && item.recipes.length === 0
-    && item.orToolsProfiles.length === 0
-  )))
+  assert.equal(result.packages[0].unitMaterialEvidence.unitsPerPackage, 3)
+  assert.equal(result.packages[0].recipes.length, 0)
+  assert.equal(result.packages[0].orToolsProfiles.length, 0)
   assert.equal(
     result.evidence.productPackConstraint,
-    'not_required_for_one_each_line',
+    'not_required_for_ordinary_unit',
   )
+  assert.equal(result.evidence.dimensionedLineCount, 1)
+  assert.equal(result.evidence.oneEachUndimensionedLineCount, 0)
   assert.equal(
     result.evidence.transformationHash,
     persistenceCanonicalHash(result.packages),
     'retained unit-material evidence must use the persistence validator hash contract',
+  )
+})
+
+test('operational lines without item dimensions retain a truthful one-each fallback', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{
+      ...line,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 3)
+  assert.ok(result.packages.every((item) => (
+    item.allocations[0].quantity === 1
+    && item.unitMaterialEvidence.fitModel === 'one_each_without_fit_claim'
+    && item.unitMaterialEvidence.unitDimensionsMm === null
+  )))
+  assert.equal(result.evidence.dimensionedLineCount, 0)
+  assert.equal(result.evidence.oneEachUndimensionedLineCount, 1)
+})
+
+test('checkout ignores synthetic dimensions until checkout retains its own item facts', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    materials: baseInput.materials.map((item) => ({
+      ...item,
+      unitCostMinor: null,
+      currency: null,
+    })),
+    inventoryProducts: [{
+      productGlobalId: line.productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot',
+      effectiveAvailableQuantity: 3,
+      sourceLevelGlobalIds: ['giil0000001'],
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 3)
+  assert.ok(result.packages.every((item) => (
+    item.allocations[0].quantity === 1
+    && item.unitMaterialEvidence.fitModel === 'one_each_without_fit_claim'
+  )))
+})
+
+test('fixed-axis and gross-weight capacity both constrain grouping', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, quantity: 7 }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 7 }],
+    inventoryProducts: inventory(7),
+    materials: [{
+      ...material({
+        globalId: 'gmat0000001',
+        inner: { length: 300, width: 200, height: 100 },
+        available: 2,
+      }),
+      maximumGrossWeightGrams: 2_100,
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.deepEqual(
+    result.packages.map((item) => item.allocations[0].quantity),
+    [4, 3],
+  )
+  assert.ok(result.packages.every((item) => (
+    item.ratedGrossWeightGrams <= item.maxWeightGrams
+  )))
+})
+
+test('fixed-axis fit blocks volume-only false positives', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    materials: [material({
+      globalId: 'gmat0000001',
+      inner: { length: 99, width: 1_000, height: 1_000 },
+      available: 3,
+    })],
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_FIT_REQUIRED',
+  )
+})
+
+test('ordinary-item dimensions require explicit order-specific authority', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, unitDimensionsAuthority: null }],
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_UNIT_DIMENSION_AUTHORITY_INVALID',
   )
 })
 
@@ -218,6 +327,11 @@ test('unit-material planning fails closed when provider inventory is short', () 
 test('checkout unit-material planning retains quote-only availability authority', () => {
   const result = planShopifyCheckoutUnitMaterialPackages({
     ...baseInput,
+    lines: [{
+      ...line,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }],
     materials: baseInput.materials.map((item) => ({
       ...item,
       unitCostMinor: null,
@@ -244,6 +358,7 @@ test('checkout unit-material planning retains quote-only availability authority'
   assert.ok(result.packages.every((item) => (
     item.allocations.length === 1
     && item.allocations[0].quantity === 1
+    && item.unitMaterialEvidence.fitModel === 'one_each_without_fit_claim'
   )))
 })
 
