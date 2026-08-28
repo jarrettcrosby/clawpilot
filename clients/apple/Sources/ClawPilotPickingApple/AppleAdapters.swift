@@ -3419,6 +3419,12 @@ public actor PickingAPIClient {
                 )
             }
             if http.statusCode == 401 { throw PickingAPIError.unauthorized }
+            if let envelope {
+                throw PickingAPIError.rejected(
+                    code: "AUTH_FAILED",
+                    message: envelope.error ?? "Authentication failed"
+                )
+            }
             throw PickingAPIError.invalidResponse
         }
         guard let envelope else { throw PickingAPIError.invalidResponse }
