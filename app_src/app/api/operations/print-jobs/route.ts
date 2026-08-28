@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  canUsePhysicalOutputAttestationBrowserSession,
+} from '@/lib/operations/physicalOutputAttestationAuthorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  attestOperationsPrintJobPhysicalOutputInPostgres,
   cancelOperationsPrintJobInPostgres,
   enqueueOperationsPrintJobInPostgres,
   readOperationsPrintJobWorkspaceFromPostgres,
@@ -13,7 +18,13 @@ import {
   type EnqueueOperationsPrintJobInput,
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
-import { requireRequestUser } from '@/lib/requestUser'
+import { appPublicUrl } from '@/lib/publicUrl'
+import {
+  requestSession,
+  requireRequestSession,
+  requireRequestUser,
+} from '@/lib/requestUser'
+import type { AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -49,6 +60,10 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
   'retry-job': new Set(['action', 'jobGlobalId', 'reason']),
   'reprint-job': new Set(['action', 'jobGlobalId', 'reason']),
   'cancel-job': new Set(['action', 'jobGlobalId', 'reason']),
+  'attest-physical-output': new Set([
+    'action', 'jobGlobalId', 'expectedDeliveryAttemptId',
+    'expectedDeliveryAttemptSequenceNumber', 'reason',
+  ]),
 }
 
 function json(payload: Record<string, unknown>, status = 200) {
@@ -75,6 +90,21 @@ function text(value: unknown, label: string, max: number) {
   const parsed = String(value ?? '').trim()
   if (!parsed || parsed.length > max || /[\u0000-\u001f\u007f]/.test(parsed)) {
     fail('OPERATIONS_PRINT_JOB_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return parsed
+}
+
+function physicalOutputReason(value: unknown) {
+  const parsed = String(value ?? '').trim()
+  if (
+    !parsed
+    || parsed.length > 500
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(parsed)
+  ) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_REASON_INVALID',
+      'Physical-output confirmation reason is invalid',
+    )
   }
   return parsed
 }
@@ -158,6 +188,44 @@ function jobGlobalId(value: unknown) {
   return id
 }
 
+function deliveryAttemptId(value: unknown) {
+  const id = text(value, 'Delivered attempt', 36).toLowerCase()
+  if (!UUID.test(id)) {
+    fail('OPERATIONS_PRINT_JOB_REQUEST_INVALID', 'Delivered attempt is invalid')
+  }
+  return id
+}
+
+async function requirePhysicalOutputBrowserSession(
+  req: NextRequest,
+  actor: AppUser,
+  organizationId: string,
+) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_SAME_ORIGIN_REQUIRED',
+      'Confirming physical output requires a same-origin ClawPilot browser request',
+      403,
+    )
+  }
+  const session = await requireRequestSession(req)
+  if (!canUsePhysicalOutputAttestationBrowserSession({
+    session,
+    actor,
+    organizationId,
+  })) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_BROWSER_SESSION_REQUIRED',
+      'Confirming physical output requires the signed-in, non-impersonated operator in the active workspace',
+      403,
+    )
+  }
+}
+
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
@@ -184,11 +252,19 @@ export async function GET(req: NextRequest) {
     requirePostgres()
     const actor = await requireRequestUser(req)
     const capabilities = operationsCapabilities(actor)
+    const organizationId = activeOperationsOrganizationId(actor)
+    const session = await requestSession(req)
     const jobs = await readOperationsPrintJobWorkspaceFromPostgres({
-      organizationId: activeOperationsOrganizationId(actor),
+      organizationId,
       canView: capabilities.canView,
       canManage: capabilities.canManage,
       canExecute: capabilities.canExecute,
+      canVerifyPhysicalOutput: capabilities.canExecute
+        && canUsePhysicalOutputAttestationBrowserSession({
+          session,
+          actor,
+          organizationId,
+        }),
     })
     return json({ ok: true, jobs })
   } catch (error) {
@@ -204,6 +280,33 @@ export async function POST(req: NextRequest) {
     const command = await body(req)
     const organizationId = activeOperationsOrganizationId(actor)
     const key = idempotencyKey(req)
+    if (command.action === 'attest-physical-output') {
+      if (!capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Confirming physical output requires warehouse execution access',
+          code: 'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERIFY_REQUIRED',
+        }, 403)
+      }
+      await requirePhysicalOutputBrowserSession(req, actor, organizationId)
+      const job = await attestOperationsPrintJobPhysicalOutputInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: key,
+        jobGlobalId: jobGlobalId(command.value.jobGlobalId),
+        expectedDeliveryAttemptId: deliveryAttemptId(
+          command.value.expectedDeliveryAttemptId,
+        ),
+        expectedDeliveryAttemptSequenceNumber: positiveInteger(
+          command.value.expectedDeliveryAttemptSequenceNumber,
+          'Delivered attempt sequence',
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        reason: physicalOutputReason(command.value.reason),
+      })
+      return json({ ok: true, job })
+    }
     if (command.action === 'reprint-job') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({

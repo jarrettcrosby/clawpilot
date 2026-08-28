@@ -3663,6 +3663,12 @@ async function readOrderDetail(
       reprint_of_job_global_id: string | null
       created_at: Date
       delivered_at: Date | null
+      delivered_attempt_id: string | null
+      delivered_attempt_sequence_number: number | null
+      physical_output_delivered_at: Date | null
+      physical_output_verified_at: Date | null
+      physical_output_verified_by: string | null
+      physical_output_reason: string | null
       last_error: string | null
     }>(
       `SELECT job.global_id,
@@ -3670,7 +3676,15 @@ async function readOrderDetail(
               artifact.global_id AS source_artifact_global_id,
               job.status,
               original.global_id AS reprint_of_job_global_id,
-              job.created_at, job.delivered_at, job.last_error
+              job.created_at, job.delivered_at,
+              delivered_attempt.id::text AS delivered_attempt_id,
+              delivered_attempt.sequence_number
+                AS delivered_attempt_sequence_number,
+              physical_output.delivered_at AS physical_output_delivered_at,
+              physical_output.verified_at AS physical_output_verified_at,
+              physical_output.verified_by AS physical_output_verified_by,
+              physical_output.reason AS physical_output_reason,
+              job.last_error
        FROM operations_print_jobs job
        JOIN operations_print_artifacts artifact
          ON artifact.organization_id = job.organization_id
@@ -3681,6 +3695,19 @@ async function readOrderDetail(
        LEFT JOIN operations_print_jobs original
          ON original.organization_id = job.organization_id
         AND original.id = job.reprint_of_job_id
+       LEFT JOIN LATERAL (
+         SELECT attempt.id, attempt.sequence_number
+         FROM operations_print_delivery_attempts attempt
+         WHERE attempt.organization_id = job.organization_id
+           AND attempt.print_job_id = job.id
+           AND attempt.state = 'delivered'
+         ORDER BY attempt.sequence_number DESC
+         LIMIT 1
+       ) delivered_attempt ON true
+       LEFT JOIN operations_print_physical_output_attestations physical_output
+         ON physical_output.organization_id = job.organization_id
+        AND physical_output.print_job_id = job.id
+        AND physical_output.delivery_attempt_id = delivered_attempt.id
        WHERE artifact.organization_id = $1::uuid
          AND artifact.source_order_id = $2::uuid
          AND artifact.document_type = 'shipping_label'
@@ -4181,6 +4208,19 @@ async function readOrderDetail(
       reprintOfJobGlobalId: item.reprint_of_job_global_id,
       createdAt: item.created_at.toISOString(),
       deliveredAt: item.delivered_at?.toISOString() || null,
+      deliveredAttemptId: item.delivered_attempt_id,
+      deliveredAttemptSequenceNumber: item.delivered_attempt_sequence_number,
+      physicalOutputAttestation: item.physical_output_verified_at
+        && item.physical_output_verified_by
+        && item.physical_output_reason
+        && item.physical_output_delivered_at
+        ? {
+            deliveredAt: item.physical_output_delivered_at.toISOString(),
+            verifiedAt: item.physical_output_verified_at.toISOString(),
+            verifiedBy: item.physical_output_verified_by,
+            reason: item.physical_output_reason,
+          }
+        : null,
       lastError: item.last_error,
     })),
     commerceExports: commerceExportResult.rows.map((item) => ({
@@ -4212,6 +4252,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
   actorEmail?: string | null
   capabilities: OperationsCapabilities
+  canVerifyPhysicalOutput?: boolean
   canPurchaseLivePostage?: boolean
   search?: string
   status?: string | null
@@ -4756,6 +4797,9 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     capabilities: {
       ...input.capabilities,
       canPurchaseLivePostage: input.canPurchaseLivePostage === true,
+      canVerifyPhysicalOutput:
+        input.capabilities.canExecute
+        && input.canVerifyPhysicalOutput === true,
     },
     dataPipeline: {
       id: activation.data_pipeline_id,

@@ -1182,6 +1182,93 @@ function ShadowFulfillmentPreparationPanel({
   )
 }
 
+function OrderLabelPrintHistory({
+  jobs,
+  canVerify,
+  onConfirmPhysicalOutput,
+}: {
+  jobs: OperationsOrderDetail['labelPrintJobs']
+  canVerify: boolean
+  onConfirmPhysicalOutput: (
+    jobGlobalId: string,
+    expectedDeliveryAttemptId: string,
+    expectedDeliveryAttemptSequenceNumber: number,
+  ) => void
+}) {
+  const dateTime = useUserDateTime()
+  if (!jobs.length) return null
+  return (
+    <Box
+      data-testid="order-label-print-history"
+      sx={{ mt: 1, borderLeft: '2px solid', borderColor: 'divider', pl: 1.25 }}
+    >
+      <Typography variant="caption" color="text.secondary">
+        Print history · each original or reprint needs its own paper-output confirmation
+      </Typography>
+      <Stack spacing={0.75} sx={{ mt: 0.5 }}>
+        {jobs.map((job) => {
+          const canConfirm = canVerify
+            && job.status === 'delivered'
+            && Boolean(job.deliveredAttemptId)
+            && Number.isSafeInteger(job.deliveredAttemptSequenceNumber)
+            && !job.physicalOutputAttestation
+          return (
+            <Box key={job.globalId} data-testid={`order-print-job-${job.globalId}`}>
+              <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
+                <Typography variant="caption" fontWeight={700}>
+                  {job.reprintOfJobGlobalId ? 'Reprint' : 'Original'} {job.globalId}
+                </Typography>
+                <Chip size="small" label={displayStatus(job.status)} variant="outlined" />
+                <Chip
+                  size="small"
+                  label={job.physicalOutputAttestation
+                    ? 'Paper verified'
+                    : 'Paper not verified'}
+                  color={job.physicalOutputAttestation ? 'success' : 'default'}
+                  variant="outlined"
+                />
+                {canConfirm
+                  && job.deliveredAttemptId
+                  && job.deliveredAttemptSequenceNumber && (
+                  <Button
+                    size="small"
+                    startIcon={<TaskAltRounded />}
+                    data-testid={`order-confirm-paper-output-${job.globalId}`}
+                    onClick={() => onConfirmPhysicalOutput(
+                      job.globalId,
+                      job.deliveredAttemptId!,
+                      job.deliveredAttemptSequenceNumber!,
+                    )}
+                  >
+                    Confirm paper output
+                  </Button>
+                )}
+              </Stack>
+              {job.physicalOutputAttestation && (
+                <Typography variant="caption" color="success.light" display="block">
+                  Verified by {job.physicalOutputAttestation.verifiedBy} on{' '}
+                  {formatUserDateTime(
+                    job.physicalOutputAttestation.verifiedAt,
+                    dateTime,
+                    {
+                      year: 'numeric',
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                      fallback: 'Unknown',
+                    },
+                  )}: {job.physicalOutputAttestation.reason}
+                </Typography>
+              )}
+            </Box>
+          )
+        })}
+      </Stack>
+    </Box>
+  )
+}
+
 function OrderDetailDrawer({
   order,
   sandboxCarrierAccounts,
@@ -1190,6 +1277,7 @@ function OrderDetailDrawer({
   canManage,
   canExecute,
   canCancelProviderOrder,
+  canVerifyPhysicalOutput,
   canPurchaseLivePostage,
   canAuthorizeSandboxE2e,
   oneOffExecutionState,
@@ -1213,6 +1301,7 @@ function OrderDetailDrawer({
   onPrintExternalLabel,
   onRetryLabel,
   onReprintLabel,
+  onConfirmPhysicalOutput,
   onConfirmShipment,
   onRetryCommerceExport,
   onAuthorizeSandboxE2e,
@@ -1236,6 +1325,7 @@ function OrderDetailDrawer({
   canManage: boolean
   canExecute: boolean
   canCancelProviderOrder: boolean
+  canVerifyPhysicalOutput: boolean
   canPurchaseLivePostage: boolean
   canAuthorizeSandboxE2e: boolean
   oneOffExecutionState: OneOffShipmentExecutionState | null
@@ -1259,6 +1349,11 @@ function OrderDetailDrawer({
   onPrintExternalLabel: (artifactGlobalId: string) => void
   onRetryLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onReprintLabel: (labelGlobalId: string, printJobGlobalId: string) => void
+  onConfirmPhysicalOutput: (
+    jobGlobalId: string,
+    expectedDeliveryAttemptId: string,
+    expectedDeliveryAttemptSequenceNumber: number,
+  ) => void
   onConfirmShipment: () => void
   onRetryCommerceExport: (
     commerceExportGlobalId: string,
@@ -2303,6 +2398,11 @@ function OrderDetailDrawer({
                                           ? `${artifact.globalId} · Exact original ${artifact.format} retained${jobs[0] ? ` · Latest print ${jobs[0].globalId} (${displayStatus(jobs[0].status)})` : ''}`
                                           : 'Exact original label not yet retained'}
                                       </Typography>
+                                      <OrderLabelPrintHistory
+                                        jobs={jobs}
+                                        canVerify={canVerifyPhysicalOutput}
+                                        onConfirmPhysicalOutput={onConfirmPhysicalOutput}
+                                      />
                                     </Box>
                                     <Stack direction="row" spacing={1} flexWrap="wrap" justifyContent="flex-end">
                                       {tracking.url && (
@@ -2554,6 +2654,11 @@ function OrderDetailDrawer({
                                   <Typography variant="caption" color="text.secondary" display="block">
                                     Reprints reuse this stored label document and never purchase new postage.
                                   </Typography>
+                                  <OrderLabelPrintHistory
+                                    jobs={jobs}
+                                    canVerify={canVerifyPhysicalOutput}
+                                    onConfirmPhysicalOutput={onConfirmPhysicalOutput}
+                                  />
                                 </Box>
                                 <Tooltip title={actionBlockedReason || (
                                   deliveredJob
@@ -3275,6 +3380,13 @@ export default function OperationsSection({
   const [labelReprintJobGlobalId, setLabelReprintJobGlobalId] = useState('')
   const [labelReprintReason, setLabelReprintReason] = useState('')
   const [labelReprintIdempotencyKey, setLabelReprintIdempotencyKey] = useState('')
+  const [physicalOutputOpen, setPhysicalOutputOpen] = useState(false)
+  const [physicalOutputJobGlobalId, setPhysicalOutputJobGlobalId] = useState('')
+  const [physicalOutputDeliveryAttemptId, setPhysicalOutputDeliveryAttemptId] = useState('')
+  const [physicalOutputDeliverySequence, setPhysicalOutputDeliverySequence] = useState<number | null>(null)
+  const [physicalOutputReason, setPhysicalOutputReason] = useState('')
+  const [physicalOutputIdempotencyKey, setPhysicalOutputIdempotencyKey] = useState('')
+  const [confirmingPhysicalOutput, setConfirmingPhysicalOutput] = useState(false)
 
   useEffect(() => {
     const pendingOrderGlobalId = new URL(window.location.href).searchParams
@@ -5312,6 +5424,87 @@ export default function OperationsSection({
       )
     } finally {
       setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const openPhysicalOutputConfirmation = (
+    jobGlobalId: string,
+    expectedDeliveryAttemptId: string,
+    expectedDeliveryAttemptSequenceNumber: number,
+  ) => {
+    setPhysicalOutputJobGlobalId(jobGlobalId)
+    setPhysicalOutputDeliveryAttemptId(expectedDeliveryAttemptId)
+    setPhysicalOutputDeliverySequence(expectedDeliveryAttemptSequenceNumber)
+    setPhysicalOutputReason('')
+    setPhysicalOutputIdempotencyKey(
+      `operations-print-physical-output:${jobGlobalId}:${crypto.randomUUID()}`,
+    )
+    setPhysicalOutputOpen(true)
+  }
+
+  const closePhysicalOutputConfirmation = () => {
+    if (confirmingPhysicalOutput) return
+    setPhysicalOutputOpen(false)
+    setPhysicalOutputJobGlobalId('')
+    setPhysicalOutputDeliveryAttemptId('')
+    setPhysicalOutputDeliverySequence(null)
+    setPhysicalOutputReason('')
+    setPhysicalOutputIdempotencyKey('')
+  }
+
+  const confirmPhysicalOutput = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !physicalOutputJobGlobalId
+      || !physicalOutputDeliveryAttemptId
+      || !physicalOutputDeliverySequence
+      || !physicalOutputReason.trim()
+      || !physicalOutputIdempotencyKey
+      || confirmingPhysicalOutput
+    ) return
+    setConfirmingPhysicalOutput(true)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': physicalOutputIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'attest-physical-output',
+          jobGlobalId: physicalOutputJobGlobalId,
+          expectedDeliveryAttemptId: physicalOutputDeliveryAttemptId,
+          expectedDeliveryAttemptSequenceNumber: physicalOutputDeliverySequence,
+          reason: physicalOutputReason.trim(),
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Physical paper output could not be confirmed')
+      }
+      setNotice(`Physical paper output was confirmed for print job ${payload.job.globalId}.`)
+      setPhysicalOutputOpen(false)
+      setPhysicalOutputJobGlobalId('')
+      setPhysicalOutputDeliveryAttemptId('')
+      setPhysicalOutputDeliverySequence(null)
+      setPhysicalOutputReason('')
+      setPhysicalOutputIdempotencyKey('')
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Physical paper output could not be confirmed',
+      )
+    } finally {
+      setConfirmingPhysicalOutput(false)
     }
   }
 
@@ -7467,6 +7660,9 @@ export default function OperationsSection({
           && capabilities.canManage
           && capabilities.canExecute
         )}
+        canVerifyPhysicalOutput={Boolean(
+          workspace?.capabilities.canVerifyPhysicalOutput,
+        )}
         canPurchaseLivePostage={Boolean(
           workspace?.capabilities.canPurchaseLivePostage,
         )}
@@ -7500,6 +7696,7 @@ export default function OperationsSection({
           || Boolean(generatingPackingSlipPackageId)
           || Boolean(printingPackingSlipArtifactId)
           || Boolean(labelPrintBusyGlobalId)
+          || confirmingPhysicalOutput
         }
         onClose={closeDrawer}
         trainingRefreshToken={shadowTrainingRefreshToken}
@@ -7531,6 +7728,7 @@ export default function OperationsSection({
           void retryShippingLabel(labelGlobalId, printJobGlobalId)
         }}
         onReprintLabel={openLabelReprint}
+        onConfirmPhysicalOutput={openPhysicalOutputConfirmation}
         onConfirmShipment={openConfirmShipment}
         onRetryCommerceExport={openCommerceExportRetry}
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
@@ -8506,6 +8704,63 @@ export default function OperationsSection({
               }
             >
               {labelPrintBusyGlobalId ? 'Queueing' : 'Queue reprint'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={physicalOutputOpen}
+        onClose={closePhysicalOutputConfirmation}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={confirmPhysicalOutput}>
+          <DialogTitle>Confirm physical paper output</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="warning">
+                Confirm only after you personally observed the paper or label exit the printer. The local print agent records device handoff only and can never create this operator attestation.
+              </Alert>
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Exact delivered print job
+                </Typography>
+                <Typography>{physicalOutputJobGlobalId}</Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                  Delivery event {physicalOutputDeliverySequence} · {physicalOutputDeliveryAttemptId}
+                </Typography>
+              </Box>
+              <TextField
+                required
+                autoFocus
+                fullWidth
+                multiline
+                minRows={3}
+                label="What physical output did you observe?"
+                value={physicalOutputReason}
+                onChange={(event) => setPhysicalOutputReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText="Stored with your identity and the exact delivered event; it cannot be edited or deleted"
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button
+              onClick={closePhysicalOutputConfirmation}
+              disabled={confirmingPhysicalOutput}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              startIcon={confirmingPhysicalOutput
+                ? <CircularProgress size={16} />
+                : <TaskAltRounded />}
+              disabled={confirmingPhysicalOutput || !physicalOutputReason.trim()}
+            >
+              {confirmingPhysicalOutput ? 'Confirming' : 'Confirm paper output'}
             </Button>
           </DialogActions>
         </Box>
