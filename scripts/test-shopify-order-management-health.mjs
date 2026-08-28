@@ -28,6 +28,15 @@ const fulfillmentReversalMigration = readFileSync(
 const fulfillmentReversalMigrationChecksum = createHash('sha256')
   .update(fulfillmentReversalMigration)
   .digest('hex')
+const ordinaryCancellationMigrationPath =
+  'db/migrations/0337_operations_shopify_ordinary_order_cancellation.sql'
+const ordinaryCancellationMigration = readFileSync(
+  resolve(root, ordinaryCancellationMigrationPath),
+  'utf8',
+)
+const ordinaryCancellationMigrationChecksum = createHash('sha256')
+  .update(ordinaryCancellationMigration)
+  .digest('hex')
 const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
@@ -180,6 +189,41 @@ for (const fragment of [
     `Fulfillment-reversal migration missing ${fragment}`,
   )
 }
+assert.equal(
+  ordinaryCancellationMigrationChecksum,
+  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f',
+  'health attestation must pin the exact ordinary-cancellation migration',
+)
+for (const fragment of [
+  "account_environment IN ('sandbox', 'production')",
+  'ADD COLUMN cancel_refund_method text',
+  'ADD COLUMN cancel_restock boolean',
+  'ADD COLUMN cancel_notify_customer boolean',
+  'ADD COLUMN cancellation_payment_evidence jsonb',
+  "'shopify-order-cancel-payment-evidence-v2'",
+  "action = 'cancel'",
+  'protect_shopify_order_cancel_intent_insert',
+  'protect_shopify_order_cancel_attempt_insert',
+  "membership.role = 'owner'",
+  "membership.role = 'admin'",
+  "membership.permissions->>'manageOperations'",
+  "membership.permissions->>'executeWarehouse'",
+  'pg_catalog.pg_get_functiondef',
+  "authz.action = ''cancel''",
+  "NEW.action = ''cancel''",
+  'authz.provider_write_control_row_version IS NOT NULL',
+  'NEW.provider_write_control_row_version IS NOT NULL',
+]) {
+  assert.ok(
+    ordinaryCancellationMigration.includes(fragment),
+    `Ordinary-cancellation migration missing ${fragment}`,
+  )
+}
+assert.doesNotMatch(
+  ordinaryCancellationMigration,
+  /action = 'cancel'\s+AND provider_order_test/u,
+  'ordinary cancellation must not be schema-fenced to a Shopify test order',
+)
 for (const fragment of [
   "from '@/lib/persistence/shopifyOrderManagement'",
   'readShopifyOrderManagementHealthFromPostgres',
@@ -229,6 +273,16 @@ for (const fragment of [
   "'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)'",
   "'protect_shopify_fulfillment_reversal_authorization_insert()'",
   "'protect_shopify_fulfillment_reversal_attempt_insert()'",
+  "'0337_operations_shopify_ordinary_order_cancellation.sql'",
+  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f',
+  'f67516c01f44ae9e7fa1733d71f068155f60d1633926716790f1da4eca4587e2',
+  'a169cb9e1693ae47029d22a7c18bd76f1bbaeaf5c34b109adb26cfa7be29445c',
+  "'ops_shopify_order_mgmt_auth_environment_valid'",
+  "'ops_shopify_order_mgmt_cancel_reason_valid'",
+  "'ops_shopify_order_mgmt_cancel_choices_valid'",
+  "'ops_shopify_order_mgmt_attempt_cancel_choices_valid'",
+  "'protect_shopify_order_cancel_intent_insert()'",
+  "'protect_shopify_order_cancel_attempt_insert()'",
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -292,8 +346,8 @@ assert.match(
 )
 assert.match(
   routeSource,
-  /CASE[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
-  'Function attestation must select the exact 0325, 0312, or frozen 0308 aggregate',
+  /CASE[\s\S]{0,300}0337_operations_shopify_ordinary_order_cancellation\.sql[\s\S]{0,300}e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed[\s\S]{0,300}0325_operations_shopify_fulfillment_reversal\.sql[\s\S]{0,300}2ef565c5cd6a53ff7a0bdf2532f33247fcdb89326adce0aa00883581170cfddc[\s\S]{0,300}0312_operations_shopify_order_single_save\.sql[\s\S]{0,300}c00a5184de727bc7a795fc0447086f0feb3cdc2e1b3aea90927900ed16bf61c7[\s\S]{0,180}ELSE[\s\S]{0,180}98cde97780ca536d8538b7814c5499ceee3fe47ff19ef406ad35a45b11610f6b/u,
+  'Function attestation must select the exact 0337, 0325, 0312, or frozen 0308 aggregate',
 )
 assert.match(
   routeSource,
@@ -761,7 +815,9 @@ if (liveDatabaseUrl) {
     'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
     '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
     '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
-    'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+  'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+  'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc',
+  'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed',
   ]) {
     assert.ok(
       providerWriteHealthExpression.includes(requiredPhaseFragment),
@@ -776,6 +832,43 @@ if (liveDatabaseUrl) {
   }
   try {
     assert.equal(await structuralReady(), true)
+
+    await client.query('BEGIN')
+    await client.query(
+      `DELETE FROM public.schema_migrations
+       WHERE filename =
+         '0337_operations_shopify_ordinary_order_cancellation.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `UPDATE public.schema_migrations
+       SET checksum = repeat('0', 64)
+       WHERE filename =
+         '0337_operations_shopify_ordinary_order_cancellation.sql'`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       DROP CONSTRAINT ops_shopify_order_mgmt_cancel_choices_valid`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `ALTER TABLE
+         public.operations_shopify_order_management_authorizations
+       DISABLE TRIGGER protect_shopify_order_cancel_intent_insert`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
 
     await client.query('BEGIN')
     await client.query(

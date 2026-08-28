@@ -5823,7 +5823,16 @@ export async function GET() {
                               ), E'\n' ORDER BY required.table_name,
                                 required.constraint_name
                             ), 'UTF8'), 'sha256'
-                          ), 'hex') = CASE
+                      ), 'hex') = CASE
+                            WHEN EXISTS (
+                              SELECT 1
+                              FROM public.schema_migrations
+                              WHERE filename =
+                                '0337_operations_shopify_ordinary_order_cancellation.sql'
+                                AND checksum =
+                                  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                            ) THEN
+                              'fb382954bb7e3dcfdcd1e0ef1305c364ff516a8f0527259d848f02812142246e'
                             WHEN EXISTS (
                               SELECT 1
                               FROM public.schema_migrations
@@ -5889,6 +5898,170 @@ export async function GET() {
                       '0325_operations_shopify_fulfillment_reversal.sql'
                       AND checksum =
                         'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM public.schema_migrations
+                    WHERE filename =
+                      '0337_operations_shopify_ordinary_order_cancellation.sql'
+                      AND checksum =
+                        '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                  )
+                  AND (
+                    SELECT pg_catalog.count(*) = 8
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            installed.table_schema,
+                            installed.table_name,
+                            installed.column_name,
+                            installed.ordinal_position::text,
+                            installed.data_type,
+                            installed.udt_schema,
+                            installed.udt_name,
+                            installed.is_nullable,
+                            COALESCE(installed.column_default, '')
+                          ), E'\n' ORDER BY installed.table_name,
+                            installed.column_name
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        'f67516c01f44ae9e7fa1733d71f068155f60d1633926716790f1da4eca4587e2'
+                    FROM information_schema.columns installed
+                    WHERE installed.table_schema = 'public'
+                      AND installed.table_name IN (
+                        'operations_shopify_order_management_authorizations',
+                        'operations_shopify_order_management_attempts'
+                      )
+                      AND installed.column_name IN (
+                        'cancel_refund_method',
+                        'cancel_restock',
+                        'cancel_notify_customer',
+                        'cancellation_payment_evidence'
+                      )
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 4
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            table_row.relname,
+                            table_namespace.nspname,
+                            installed.conname,
+                            installed.contype::text,
+                            installed.convalidated::text,
+                            installed.condeferrable::text,
+                            installed.condeferred::text,
+                            pg_catalog.pg_get_constraintdef(
+                              installed.oid, false
+                            )
+                          ), E'\n' ORDER BY table_row.relname,
+                            installed.conname
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        'a169cb9e1693ae47029d22a7c18bd76f1bbaeaf5c34b109adb26cfa7be29445c'
+                    FROM pg_catalog.pg_constraint installed
+                    JOIN pg_catalog.pg_class table_row
+                      ON table_row.oid = installed.conrelid
+                    JOIN pg_catalog.pg_namespace table_namespace
+                      ON table_namespace.oid = table_row.relnamespace
+                    WHERE table_namespace.nspname = 'public'
+                      AND installed.conname IN (
+                        'ops_shopify_order_mgmt_auth_environment_valid',
+                        'ops_shopify_order_mgmt_cancel_reason_valid',
+                        'ops_shopify_order_mgmt_cancel_choices_valid',
+                        'ops_shopify_order_mgmt_attempt_cancel_choices_valid'
+                      )
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 2
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            required.signature,
+                            installed_namespace.nspname,
+                            language.lanname,
+                            installed.prokind::text,
+                            installed.provolatile::text,
+                            installed.proparallel::text,
+                            installed.proisstrict::text,
+                            installed.prosecdef::text,
+                            installed.proleakproof::text,
+                            pg_catalog.format_type(
+                              installed.prorettype, NULL
+                            ),
+                            installed.pronargs::text,
+                            installed.pronargdefaults::text,
+                            COALESCE(pg_catalog.array_to_string(
+                              installed.proconfig, ','
+                            ), ''),
+                            pg_catalog.btrim(pg_catalog.regexp_replace(
+                              installed.prosrc, '[[:space:]]+', ' ', 'g'
+                            ))
+                          ), E'\n' ORDER BY required.signature
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '9156d4559ad7f1aa35838cf0d19198551730f780dde245db3260dabcd9bf4d44'
+                    FROM (VALUES
+                      ('protect_shopify_order_cancel_intent_insert()'),
+                      ('protect_shopify_order_cancel_attempt_insert()')
+                    ) required(signature)
+                    LEFT JOIN pg_catalog.pg_proc installed
+                      ON installed.oid = pg_catalog.to_regprocedure(
+                        'public.' || required.signature
+                      )
+                    LEFT JOIN pg_catalog.pg_namespace installed_namespace
+                      ON installed_namespace.oid = installed.pronamespace
+                    LEFT JOIN pg_catalog.pg_language language
+                      ON language.oid = installed.prolang
+                  )
+                  AND (
+                    SELECT pg_catalog.count(installed.oid) = 2
+                      AND pg_catalog.encode(public.digest(
+                        pg_catalog.convert_to(pg_catalog.string_agg(
+                          pg_catalog.concat_ws('|',
+                            required.table_name,
+                            table_namespace.nspname,
+                            installed.tgname,
+                            installed.tgtype::text,
+                            installed.tgenabled::text,
+                            installed.tgisinternal::text,
+                            function_namespace.nspname || '.' ||
+                              trigger_function.proname || '(' ||
+                              pg_catalog.pg_get_function_identity_arguments(
+                                trigger_function.oid
+                              ) || ')',
+                            pg_catalog.btrim(pg_catalog.regexp_replace(
+                              pg_catalog.pg_get_triggerdef(installed.oid),
+                              '[[:space:]]+', ' ', 'g'
+                            ))
+                          ), E'\n' ORDER BY required.table_name,
+                            required.trigger_name
+                        ), 'UTF8'), 'sha256'
+                      ), 'hex') =
+                        '0fd3737e8ed962e106710753ca7cd3ac71e6323a0e98d8d22c752f1d077ba5e9'
+                    FROM (VALUES
+                      (
+                        'operations_shopify_order_management_authorizations',
+                        'protect_shopify_order_cancel_intent_insert'
+                      ),
+                      (
+                        'operations_shopify_order_management_attempts',
+                        'protect_shopify_order_cancel_attempt_insert'
+                      )
+                    ) required(table_name, trigger_name)
+                    LEFT JOIN pg_catalog.pg_class table_row
+                      ON table_row.oid = pg_catalog.to_regclass(
+                        'public.' || required.table_name
+                      )
+                    LEFT JOIN pg_catalog.pg_namespace table_namespace
+                      ON table_namespace.oid = table_row.relnamespace
+                    LEFT JOIN pg_catalog.pg_trigger installed
+                      ON installed.tgrelid = table_row.oid
+                     AND installed.tgname = required.trigger_name
+                    LEFT JOIN pg_catalog.pg_proc trigger_function
+                      ON trigger_function.oid = installed.tgfoid
+                    LEFT JOIN pg_catalog.pg_namespace function_namespace
+                      ON function_namespace.oid = trigger_function.pronamespace
                   )
                   AND (
                     SELECT pg_catalog.count(*) = 6
@@ -5959,8 +6132,19 @@ export async function GET() {
                           ), E'\n' ORDER BY required.table_name,
                             required.constraint_name
                         ), 'UTF8'), 'sha256'
-                      ), 'hex') =
-                        'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25'
+                      ), 'hex') = CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM public.schema_migrations
+                          WHERE filename =
+                            '0337_operations_shopify_ordinary_order_cancellation.sql'
+                            AND checksum =
+                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                        ) THEN
+                          '2158a97806c878f8f8b04d2e301b041b5c5728b5e1ffd0a96f0019b61ef2027c'
+                        ELSE
+                          'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25'
+                      END
                     FROM (VALUES
                       (
                         'operations_shopify_order_management_authorizations',
@@ -6024,8 +6208,19 @@ export async function GET() {
                             ))
                           ), E'\n' ORDER BY required.signature
                         ), 'UTF8'), 'sha256'
-                      ), 'hex') =
-                        '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052'
+                      ), 'hex') = CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM public.schema_migrations
+                          WHERE filename =
+                            '0337_operations_shopify_ordinary_order_cancellation.sql'
+                            AND checksum =
+                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                        ) THEN
+                          'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc'
+                        ELSE
+                          '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052'
+                      END
                     FROM (VALUES
                       (
                         'operations_shopify_fulfillment_reversal_is_safe(uuid,uuid,text,timestamp with time zone)'
@@ -6390,6 +6585,15 @@ export async function GET() {
                           ), E'\n' ORDER BY required.signature
                         ), 'UTF8'), 'sha256'
                       ), 'hex') = CASE
+                        WHEN EXISTS (
+                          SELECT 1
+                          FROM public.schema_migrations
+                          WHERE filename =
+                            '0337_operations_shopify_ordinary_order_cancellation.sql'
+                            AND checksum =
+                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                        ) THEN
+                          'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed'
                         WHEN EXISTS (
                           SELECT 1
                           FROM public.schema_migrations

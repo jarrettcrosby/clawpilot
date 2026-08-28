@@ -49,7 +49,14 @@ assert.doesNotMatch(
 assert.doesNotMatch(
   source.panel,
   /canExecute: boolean|canActivate: boolean/,
-  'the order editor contract must require canManage only',
+  'the panel must receive one precomputed cancellation authorization instead of raw role capabilities',
+)
+assert.match(source.panel, /canCancel: boolean/)
+assert.match(source.section, /canCancelProviderOrder: boolean/)
+assert.match(
+  source.section,
+  /canCancelProviderOrder=\{Boolean\([\s\S]{0,160}capabilities\?\.canActivate[\s\S]{0,160}capabilities\.canManage[\s\S]{0,160}capabilities\.canExecute/,
+  'ordinary cancellation must require activation, management, and execution authorization',
 )
 
 assert.match(source.panel, />Shopify order</)
@@ -95,19 +102,12 @@ assert.doesNotMatch(
   /if \(!canManage \|\| !canExecute \|\| !canActivate\)/,
   'normal order work must require canManage only',
 )
-assert.match(
-  source.panel,
-  /when Shopify reports the order is\s+eligible\./,
-)
 assert.match(source.panel, /releasesAuthorization: boolean/)
 assert.match(
   source.panel,
-  /Shopify will release the successful test payment authorization\./,
+  /Shopify will void the open payment authorization\./,
 )
-assert.match(
-  source.panel,
-  /No refund, restock, or customer\s+notification is requested\./,
-)
+assert.match(source.panel, /Choose how payment,\s+inventory, and the customer should be handled\./)
 
 assert.match(
   source.panel,
@@ -116,8 +116,8 @@ assert.match(
 )
 assert.equal(
   (source.panel.match(/fetch\('\/api\/operations\/shopify-order-management'/g) || []).length,
-  2,
-  'save and reconcile must both use the isolated route',
+  4,
+  'save, prepare, execute, and reconcile must all use the isolated route',
 )
 assert.doesNotMatch(
   source.panel,
@@ -126,11 +126,13 @@ assert.doesNotMatch(
 )
 assert.equal(
   (source.panel.match(/'Idempotency-Key': key/g) || []).length,
-  2,
+  4,
   'every POST must carry an idempotency key',
 )
 assert.match(source.panel, /shopify-order-management:\$\{action\}:\$\{exactId\}:\$\{nonce\}/)
 assert.match(source.panel, /const saveAttempt = useRef<IdempotencyAttempt \| null>/)
+assert.match(source.panel, /const prepareCancelAttempt = useRef<IdempotencyAttempt \| null>/)
+assert.match(source.panel, /const executeCancelAttempt = useRef<IdempotencyAttempt \| null>/)
 assert.match(source.panel, /const reconcileAttempt = useRef<IdempotencyAttempt \| null>/)
 
 for (const saveField of [
@@ -177,7 +179,11 @@ assert.equal(
 )
 assert.doesNotMatch(source.panel, />\s*Save tag\s*</)
 assert.doesNotMatch(source.panel, />\s*Save quantity\s*</)
-assert.match(source.panel, /save\(\{ kind: 'cancel' \}\)/)
+assert.doesNotMatch(
+  source.panel,
+  /save\(\{ kind: 'cancel'/,
+  'ordinary cancellation must never use the one-click save path',
+)
 assert.match(source.panel, /kind: 'cancel_fulfillment'/)
 assert.match(source.panel, /fulfillmentId: fulfillment\.fulfillmentId/)
 assert.match(
@@ -234,20 +240,44 @@ assert.doesNotMatch(
   'fulfillment reversal must not automatically dispatch order cancellation',
 )
 
-for (const retiredCeremony of [
-  /action: 'prepare'/,
-  /action: 'execute'/,
-  /confirmationStatement/,
-  /Type the exact confirmation/,
-  /Authorization reason/,
-  /<Dialog/,
+for (const cancellationControl of [
+  /'data-testid': 'shopify-cancel-reason-code'/,
+  /'data-testid': 'shopify-cancel-refund-method'/,
+  /data-testid="shopify-cancel-restock"/,
+  /data-testid="shopify-cancel-notify-customer"/,
+  /'data-testid': 'shopify-cancel-operator-reason'/,
+  /data-testid="shopify-cancel-confirmation-statement"/,
+  /'data-testid': 'shopify-cancel-confirmation-input'/,
 ]) {
-  assert.doesNotMatch(
+  assert.match(
     source.panel,
-    retiredCeremony,
-    'the normal workflow must not expose prepare/execute confirmation ceremony',
+    cancellationControl,
+    'ordinary cancellation must expose explicit operator choices and confirmation',
   )
 }
+assert.match(source.panel, /const prepareCancellation = async/)
+assert.match(source.panel, /const executeCancellation = async/)
+assert.match(source.panel, /action: 'prepare' as const/)
+assert.match(source.panel, /action: 'execute' as const/)
+assert.match(source.panel, /confirmationStatement: cancelConfirmation/)
+for (const cancellationField of [
+  'reasonCode: cancelReasonCode',
+  'refundMethod: cancelRefundMethod',
+  'restock: cancelRestock',
+  'notifyCustomer: cancelNotifyCustomer',
+]) {
+  assert.ok(
+    source.panel.includes(cancellationField),
+    `cancel payload is missing ${cancellationField}`,
+  )
+}
+assert.match(source.panel, />\s*Review cancellation\s*</)
+assert.match(source.panel, />\s*Send cancellation to Shopify\s*</)
+assert.match(
+  source.panel,
+  /cancelConfirmation\s*!== preparedCancel\.confirmationStatement/,
+  'execution must require the exact prepared confirmation statement',
+)
 
 assert.match(
   source.panel,

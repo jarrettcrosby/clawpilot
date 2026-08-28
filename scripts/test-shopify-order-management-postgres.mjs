@@ -3374,6 +3374,254 @@ async function verify(databaseUrl) {
       'member cannot fabricate the legacy rolling-runtime shape',
     )
 
+    // 0337 permits a current ordinary Shopify order (test=false) to enter the
+    // same durable prepare/claim/outcome protocol. The exact refund, restock,
+    // notification, reason, and bounded payment evidence must survive on both
+    // the authorization and the provider-attempt row. Cancellation authority
+    // is owner, or admin with both management and execution permissions.
+    const ordinaryCancelAction = {
+      type: 'cancel',
+      reason: 'CUSTOMER',
+      staffNote: 'Customer confirmed cancellation before warehouse release',
+      refundMethod: 'original_payment_methods',
+      restock: true,
+      notifyCustomer: true,
+    }
+    const ordinaryCancelPaymentEvidence = {
+      schema: 'shopify-order-cancel-payment-evidence-v2',
+      transactionsCount: 2,
+      transactionsHash: '6'.repeat(64),
+      totalReceived: { amount: '125', currencyCode: 'USD' },
+      totalRefunded: { amount: '0', currencyCode: 'USD' },
+      totalCapturable: { amount: '0', currencyCode: 'USD' },
+      refundMethod: 'original_payment_methods',
+    }
+    const ordinaryCancelReason =
+      'Customer requested cancellation before any warehouse work began'
+    const ordinaryCancelPreparation = {
+      organizationId: independentFixture.organizationId,
+      accountGlobalId: independentFixture.accountGlobalId,
+      orderGlobalId: independentFixture.current.global_id,
+      expectedOrderRowVersion: Number(independentFixture.current.row_version),
+      expectedSourceHash: independentFixture.currentSourceHash,
+      ...snapshot(
+        false,
+        independentFixture.currentAcceptedProviderUpdatedAt,
+      ),
+      action: ordinaryCancelAction,
+      cancellationPaymentEvidence: ordinaryCancelPaymentEvidence,
+      reason: ordinaryCancelReason,
+    }
+    for (const [actorEmail, key, description] of [
+      [
+        independentFixture.manageOnlyAdminEmail,
+        'shopify-ordinary-cancel-manage-only',
+        'manage-only admin',
+      ],
+      [
+        independentFixture.executeOnlyAdminEmail,
+        'shopify-ordinary-cancel-execute-only',
+        'execute-only admin',
+      ],
+      [
+        independentFixture.legacyMemberEmail,
+        'shopify-ordinary-cancel-member',
+        'member with legacy permission flags',
+      ],
+    ]) {
+      await expectRejected(
+        () => persistence.prepareShopifyOrderManagementInPostgres({
+          ...ordinaryCancelPreparation,
+          actorEmail,
+          idempotencyKey: key,
+        }),
+        'SHOPIFY_ORDER_MANAGEMENT_FORBIDDEN',
+        `${description} must not authorize ordinary cancellation`,
+      )
+    }
+    const ordinaryCancelPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        ...ordinaryCancelPreparation,
+        actorEmail: independentFixture.qualifiedAdminEmail,
+        idempotencyKey: 'shopify-ordinary-cancel-0337',
+      })
+    assert.equal(ordinaryCancelPrepared.authorizedRole, 'admin')
+    assert.equal(ordinaryCancelPrepared.providerOrderTest, false)
+    assert.equal(
+      ordinaryCancelPrepared.cancelRefundMethod,
+      'original_payment_methods',
+    )
+    assert.equal(ordinaryCancelPrepared.cancelRestock, true)
+    assert.equal(ordinaryCancelPrepared.cancelNotifyCustomer, true)
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        ordinaryCancelPrepared.cancellationPaymentEvidence,
+      )),
+      ordinaryCancelPaymentEvidence,
+    )
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.qualifiedAdminEmail,
+        authorizationGlobalId:
+          ordinaryCancelPrepared.authorizationGlobalId,
+        action: { ...ordinaryCancelAction, notifyCustomer: false },
+        reason: ordinaryCancelReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH',
+      'a changed customer-notification choice must not claim the intent',
+    )
+    const ordinaryCancelClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.qualifiedAdminEmail,
+        authorizationGlobalId:
+          ordinaryCancelPrepared.authorizationGlobalId,
+        action: ordinaryCancelAction,
+        reason: ordinaryCancelReason,
+      })
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: independentFixture.organizationId,
+      actorEmail: independentFixture.qualifiedAdminEmail,
+      authorizationGlobalId: ordinaryCancelPrepared.authorizationGlobalId,
+      providerAttemptGlobalId:
+        ordinaryCancelClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: {
+        schema: 'shopify-order-cancel-postgres-acceptance-v1',
+        providerCancelled: true,
+      },
+      providerReference: 'gid://shopify/Job/6600037',
+      providerWriteCount: 1,
+    })
+    const ordinaryCancelStored = await pool.query(
+      `SELECT
+         authz.provider_order_test,
+         authz.cancel_reason AS authorization_reason_code,
+         authz.cancel_refund_method AS authorization_refund_method,
+         authz.cancel_restock AS authorization_restock,
+         authz.cancel_notify_customer AS authorization_notify_customer,
+         authz.cancellation_payment_evidence
+           AS authorization_payment_evidence,
+         attempt.cancel_refund_method AS attempt_refund_method,
+         attempt.cancel_restock AS attempt_restock,
+         attempt.cancel_notify_customer AS attempt_notify_customer,
+         attempt.cancellation_payment_evidence AS attempt_payment_evidence
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+      [
+        independentFixture.organizationId,
+        ordinaryCancelPrepared.authorizationGlobalId,
+      ],
+    )
+    assert.equal(ordinaryCancelStored.rowCount, 1)
+    assert.equal(ordinaryCancelStored.rows[0].provider_order_test, false)
+    assert.equal(
+      ordinaryCancelStored.rows[0].authorization_reason_code,
+      'CUSTOMER',
+    )
+    for (const prefix of ['authorization', 'attempt']) {
+      assert.equal(
+        ordinaryCancelStored.rows[0][`${prefix}_refund_method`],
+        'original_payment_methods',
+      )
+      assert.equal(ordinaryCancelStored.rows[0][`${prefix}_restock`], true)
+      assert.equal(
+        ordinaryCancelStored.rows[0][`${prefix}_notify_customer`],
+        true,
+      )
+      assert.deepEqual(
+        ordinaryCancelStored.rows[0][`${prefix}_payment_evidence`],
+        ordinaryCancelPaymentEvidence,
+      )
+    }
+    assert.equal(
+      JSON.stringify(ordinaryCancelStored.rows).includes(
+        ordinaryCancelAction.staffNote,
+      ),
+      false,
+      'cancellation staff-note plaintext must not be retained',
+    )
+
+    // A verified production account uses the same current Provider-writes
+    // binding, but the database permits only an ordinary cancellation. This
+    // is independent of the runtime allowlist, which remains default-off and
+    // is exercised by the command/runtime contract tests.
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET environment = 'production', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        independentFixture.organizationId,
+        independentFixture.accountGlobalId,
+      ],
+    )
+    const productionCancelPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        ...ordinaryCancelPreparation,
+        actorEmail: independentFixture.ownerEmail,
+        idempotencyKey: 'shopify-production-cancel-0337',
+      })
+    assert.equal(productionCancelPrepared.accountEnvironment, 'production')
+    assert.equal(productionCancelPrepared.action, 'cancel')
+    const productionCancelClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        authorizationGlobalId:
+          productionCancelPrepared.authorizationGlobalId,
+        action: ordinaryCancelAction,
+        reason: ordinaryCancelReason,
+      })
+    assert.equal(productionCancelClaimed.accountEnvironment, 'production')
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: independentFixture.organizationId,
+      actorEmail: independentFixture.ownerEmail,
+      authorizationGlobalId: productionCancelPrepared.authorizationGlobalId,
+      providerAttemptGlobalId:
+        productionCancelClaimed.providerAttemptGlobalId,
+      outcome: 'failed',
+      evidence: {
+        schema: 'shopify-production-cancel-zero-write-test-v1',
+        providerDispatched: false,
+      },
+      errorCode: 'TEST_PRE_DISPATCH_REJECTION',
+      providerWriteCount: 0,
+    })
+    await expectDatabaseRejected(
+      () => persistence.prepareShopifyOrderManagementInPostgres({
+        organizationId: independentFixture.organizationId,
+        actorEmail: independentFixture.ownerEmail,
+        accountGlobalId: independentFixture.accountGlobalId,
+        orderGlobalId: independentFixture.current.global_id,
+        expectedOrderRowVersion: Number(
+          independentFixture.current.row_version,
+        ),
+        expectedSourceHash: independentFixture.currentSourceHash,
+        ...snapshot(
+          false,
+          independentFixture.currentAcceptedProviderUpdatedAt,
+        ),
+        action: { type: 'add_tag', tag: 'production-must-reject-this' },
+        reason: 'Prove production permits cancellation only',
+        idempotencyKey: 'shopify-production-tag-denied-0337',
+      }),
+      /authorization is not current or permitted/i,
+      'production database fence rejects every non-cancellation action',
+    )
+    await pool.query(
+      `UPDATE operations_integration_accounts
+       SET environment = 'sandbox', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND global_id = $2`,
+      [
+        independentFixture.organizationId,
+        independentFixture.accountGlobalId,
+      ],
+    )
+
     // 0312 retains one exact combined ordinary Save without retaining any
     // email, phone, PO, note, source-address, or tag plaintext. The same
     // pre-network claim

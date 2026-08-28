@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -14,7 +15,8 @@ import {
 import { ShopifyOrderManagementError } from '@/lib/integrations/shopifyOrderManagement'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { ShopifyOrderManagementPersistenceError } from '@/lib/persistence/shopifyOrderManagement'
-import { requireRequestUser } from '@/lib/requestUser'
+import { appPublicUrl } from '@/lib/publicUrl'
+import { requestSession, requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -290,8 +292,51 @@ function mutation(value: unknown) {
     })
   }
   if (kind === 'cancel') {
-    exactFields(input, ['kind'])
-    return Object.freeze({ kind })
+    exactFields(input, [
+      'kind', 'reasonCode', 'refundMethod', 'restock', 'notifyCustomer',
+    ])
+    const reasonCode = boundedText(
+      input.reasonCode,
+      'Shopify cancellation reason',
+      16,
+    )
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(reasonCode)) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation reason is invalid',
+      )
+    }
+    const refundMethod = boundedText(
+      input.refundMethod,
+      'Shopify cancellation refund choice',
+      32,
+    )
+    if (refundMethod !== 'none' && refundMethod !== 'original_payment_methods') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation refund choice is invalid',
+      )
+    }
+    if (
+      typeof input.restock !== 'boolean'
+      || typeof input.notifyCustomer !== 'boolean'
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation options are invalid',
+      )
+    }
+    return Object.freeze({
+      kind,
+      reasonCode: reasonCode as
+        | 'CUSTOMER' | 'DECLINED' | 'FRAUD'
+        | 'INVENTORY' | 'OTHER' | 'STAFF',
+      refundMethod: refundMethod as 'none' | 'original_payment_methods',
+      restock: input.restock,
+      notifyCustomer: input.notifyCustomer,
+    })
   }
   if (kind === 'set_line_quantity') {
     exactFields(input, ['kind', 'lineItemId', 'quantity'])
@@ -871,6 +916,63 @@ function requireWriteAuthority(actor: Awaited<ReturnType<typeof requireRequestUs
   return capabilities
 }
 
+function requireCancellationAuthority(
+  capabilities: ReturnType<typeof operationsCapabilities>,
+  parsedMutation: ReturnType<typeof mutation>,
+) {
+  if (
+    parsedMutation.kind === 'cancel'
+    && (!capabilities.canActivate || !capabilities.canExecute)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_AUTHORITY_REQUIRED',
+      'Only an owner or operations administrator with execution permission can cancel a Shopify order',
+      403,
+    )
+  }
+}
+
+async function requireDirectCancellationSession(
+  req: NextRequest,
+  actor: Awaited<ReturnType<typeof requireRequestUser>>,
+  organizationId: string,
+) {
+  const session = await requestSession(req)
+  if (
+    !session
+    || session.legacy === true
+    || !['magic_code', 'google_sso', 'operator_password'].includes(
+      session.authMethod,
+    )
+    || session.impersonating
+    || session.impersonationStartedAt !== null
+    || session.impersonationExpiresAt !== null
+    || session.authenticatedUser !== session.effectiveUser
+    || session.authenticatedUser !== actor.email
+    || session.activeWorkspaceOrganizationId !== organizationId
+  ) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_DIRECT_SESSION_REQUIRED',
+      'Sign in directly as yourself in this workspace before cancelling a Shopify order',
+      403,
+    )
+  }
+}
+
+function requireCancellationSameOrigin(req: NextRequest) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_SAME_ORIGIN_REQUIRED',
+      'Shopify cancellation must be confirmed from this ClawPilot site',
+      403,
+    )
+  }
+}
+
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
@@ -936,7 +1038,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    requireWriteAuthority(actor)
+    const capabilities = requireWriteAuthority(actor)
     requirePostgres()
     const organizationId = activeOperationsOrganizationId(actor)
     const body = await requestBody(req)
@@ -947,6 +1049,13 @@ export async function POST(req: NextRequest) {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation',
       ])
+      const parsedMutation = mutation(body.mutation)
+      if (parsedMutation.kind === 'cancel') {
+        fail(
+          'SHOPIFY_ORDER_CANCEL_CONFIRMATION_REQUIRED',
+          'Prepare and confirm the Shopify cancellation before sending it',
+        )
+      }
       const result = await saveShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -956,7 +1065,7 @@ export async function POST(req: NextRequest) {
           ORDER_GLOBAL_ID,
         ),
         expectedRowVersion: rowVersion(body.expectedRowVersion),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         idempotencyKey: exactKey,
       })
       return json({ ok: true, result: publicResult(result) })
@@ -966,6 +1075,11 @@ export async function POST(req: NextRequest) {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation', 'reason',
       ])
+      const parsedMutation = mutation(body.mutation)
+      requireCancellationAuthority(capabilities, parsedMutation)
+      if (parsedMutation.kind === 'cancel') {
+        await requireDirectCancellationSession(req, actor, organizationId)
+      }
       const result = await prepareShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -975,7 +1089,7 @@ export async function POST(req: NextRequest) {
           ORDER_GLOBAL_ID,
         ),
         expectedRowVersion: rowVersion(body.expectedRowVersion),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         reason: reason(body.reason),
         idempotencyKey: exactKey,
       })
@@ -994,6 +1108,12 @@ export async function POST(req: NextRequest) {
           'Shopify intent hash is invalid',
         )
       }
+      const parsedMutation = mutation(body.mutation)
+      requireCancellationAuthority(capabilities, parsedMutation)
+      if (parsedMutation.kind === 'cancel') {
+        await requireDirectCancellationSession(req, actor, organizationId)
+        requireCancellationSameOrigin(req)
+      }
       const result = await executeShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -1008,7 +1128,7 @@ export async function POST(req: NextRequest) {
           'Shopify confirmation statement',
           512,
         ),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         reason: reason(body.reason),
         idempotencyKey: exactKey,
       })
