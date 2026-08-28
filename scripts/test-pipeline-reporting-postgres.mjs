@@ -154,6 +154,7 @@ async function installReportingSchema(pool) {
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
       organization_id uuid,
+      full_name text,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced'
     );
@@ -178,6 +179,7 @@ async function installReportingSchema(pool) {
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
       organization_id uuid,
+      subject text,
       sync_status text NOT NULL DEFAULT 'synced'
     );
 
@@ -189,6 +191,7 @@ async function installReportingSchema(pool) {
       lead_id uuid,
       opportunity_id uuid,
       meeting_id uuid,
+      campaign_id uuid,
       interaction_type text,
       occurred_at timestamptz,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -199,6 +202,7 @@ async function installReportingSchema(pool) {
     CREATE TABLE crm_campaigns (
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      name text,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
       sync_status text NOT NULL DEFAULT 'synced'
     );
@@ -557,6 +561,10 @@ async function acceptance(databaseUrl) {
     const projectedOrganizationId = '20000000-0000-4000-8000-000000000001'
     const projectedContactId = '30000000-0000-4000-8000-000000000001'
     const projectedInteractionId = '40000000-0000-4000-8000-000000000001'
+    const projectedLeadId = '50000000-0000-4000-8000-000000000001'
+    const projectedMeetingId = '60000000-0000-4000-8000-000000000001'
+    const projectedLeadInteractionId = '40000000-0000-4000-8000-000000000003'
+    const projectedMeetingInteractionId = '40000000-0000-4000-8000-000000000004'
     await pool.query(
       `INSERT INTO crm_organizations (id, pipeline_id, name, source_payload)
        VALUES
@@ -571,13 +579,35 @@ async function acceptance(databaseUrl) {
       [projectedContactId, pipelineC, projectedOrganizationId],
     )
     await pool.query(
+      `INSERT INTO crm_leads (id, pipeline_id, organization_id, full_name)
+       VALUES ($1::uuid, $2::uuid, $3::uuid, 'Projected lead')`,
+      [projectedLeadId, pipelineC, projectedOrganizationId],
+    )
+    await pool.query(
+      `INSERT INTO crm_meetings (id, pipeline_id, organization_id, subject)
+       VALUES ($1::uuid, $2::uuid, $3::uuid, 'Projected meeting')`,
+      [projectedMeetingId, pipelineC, projectedOrganizationId],
+    )
+    await pool.query(
       `INSERT INTO crm_interactions (
-         id, pipeline_id, organization_id, contact_id, interaction_type, source_payload, occurred_at, created_at
+         id, pipeline_id, organization_id, contact_id, lead_id, meeting_id,
+         interaction_type, source_payload, occurred_at, created_at
        ) VALUES
-         ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'Email', '{}'::jsonb, now(), now()),
+         ($1::uuid, $2::uuid, $3::uuid, $4::uuid, NULL, NULL, 'Email', '{}'::jsonb, now(), now()),
          ('40000000-0000-4000-8000-000000000002'::uuid, $2::uuid, $3::uuid, $4::uuid,
-          'Email', '{"archived":true}'::jsonb, now(), now())`,
-      [projectedInteractionId, pipelineC, projectedOrganizationId, projectedContactId],
+          NULL, NULL, 'Email', '{"archived":true}'::jsonb, now(), now()),
+         ($5::uuid, $2::uuid, NULL, NULL, $6::uuid, NULL, 'Call', '{}'::jsonb, now(), now()),
+         ($7::uuid, $2::uuid, NULL, NULL, NULL, $8::uuid, 'Meeting', '{}'::jsonb, now(), now())`,
+      [
+        projectedInteractionId,
+        pipelineC,
+        projectedOrganizationId,
+        projectedContactId,
+        projectedLeadInteractionId,
+        projectedLeadId,
+        projectedMeetingInteractionId,
+        projectedMeetingId,
+      ],
     )
     const workbookSnapshot = plain(await persistence.readCrmWorkbookProjectionSnapshotInPostgres({
       pipelineId: pipelineC,
@@ -586,11 +616,20 @@ async function acceptance(databaseUrl) {
       organizations: 1,
       contacts: 1,
       opportunities: 1005,
-      interactions: 1,
+      interactions: 3,
     })
     assert.equal(workbookSnapshot.organizations[0].id, projectedOrganizationId)
     assert.equal(workbookSnapshot.contacts[0].id, projectedContactId)
     assert.equal(workbookSnapshot.interactions[0].id, projectedInteractionId)
+    const projectedInteractionsById = new Map(
+      workbookSnapshot.interactions.map((interaction) => [interaction.id, interaction]),
+    )
+    assert.equal(projectedInteractionsById.get(projectedLeadInteractionId)?.organizationId, projectedOrganizationId)
+    assert.equal(projectedInteractionsById.get(projectedLeadInteractionId)?.organizationName, 'Projected organization')
+    assert.equal(projectedInteractionsById.get(projectedLeadInteractionId)?.leadName, 'Projected lead')
+    assert.equal(projectedInteractionsById.get(projectedMeetingInteractionId)?.organizationId, projectedOrganizationId)
+    assert.equal(projectedInteractionsById.get(projectedMeetingInteractionId)?.organizationName, 'Projected organization')
+    assert.equal(projectedInteractionsById.get(projectedMeetingInteractionId)?.meetingName, 'Projected meeting')
     assert.equal(workbookSnapshot.opportunities.length, 1005)
     assert.equal(new Set(workbookSnapshot.opportunities.map((record) => record.id)).size, 1005)
     assert.equal(workbookSnapshot.opportunities[0].id, '10000000-0000-4000-8000-000000000001')

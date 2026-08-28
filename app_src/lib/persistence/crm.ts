@@ -5083,8 +5083,8 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
       entity: 'interactions',
       expectedCount: counts.interactions,
       sql: `SELECT interaction.*,
-          COALESCE(interaction.organization_id, contact.organization_id,
-            opportunity.organization_id) AS organization_id,
+          COALESCE(interaction.organization_id, contact.organization_id, lead.organization_id,
+            opportunity.organization_id, meeting.organization_id) AS organization_id,
           organization.name AS organization_name,
           contact.full_name AS contact_name,
           contact.reference_code AS contact_reference_code,
@@ -5092,18 +5092,31 @@ export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
           contact.phone_work AS contact_phone_work,
           contact.phone_mobile AS contact_phone_mobile,
           contact.job_title AS contact_job_title,
-          opportunity.name AS opportunity_name
+          lead.full_name AS lead_name,
+          opportunity.name AS opportunity_name,
+          meeting.subject AS meeting_name,
+          campaign.name AS campaign_name
         FROM crm_interactions interaction
         LEFT JOIN crm_contacts contact
           ON contact.pipeline_id = interaction.pipeline_id
          AND contact.id = interaction.contact_id
+        LEFT JOIN crm_leads lead
+          ON lead.pipeline_id = interaction.pipeline_id
+         AND lead.id = interaction.lead_id
         LEFT JOIN crm_opportunities opportunity
           ON opportunity.pipeline_id = interaction.pipeline_id
          AND opportunity.id = interaction.opportunity_id
+        LEFT JOIN crm_meetings meeting
+          ON meeting.pipeline_id = interaction.pipeline_id
+         AND meeting.id = interaction.meeting_id
+        LEFT JOIN crm_campaigns campaign
+          ON campaign.pipeline_id = interaction.pipeline_id
+         AND campaign.id = interaction.campaign_id
         LEFT JOIN crm_organizations organization
           ON organization.pipeline_id = interaction.pipeline_id
-         AND organization.id = COALESCE(
-           interaction.organization_id, contact.organization_id, opportunity.organization_id
+          AND organization.id = COALESCE(
+           interaction.organization_id, contact.organization_id, lead.organization_id,
+           opportunity.organization_id, meeting.organization_id
          )
         WHERE interaction.pipeline_id = $1::uuid
           AND ${activeCrmRecordSql('interaction')}
