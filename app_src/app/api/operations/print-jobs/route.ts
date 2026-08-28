@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -14,7 +15,9 @@ import {
   type EnqueueOperationsPrintJobInput,
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
-import { requireRequestUser } from '@/lib/requestUser'
+import { appPublicUrl } from '@/lib/publicUrl'
+import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
+import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -80,6 +83,21 @@ function text(value: unknown, label: string, max: number) {
   const parsed = String(value ?? '').trim()
   if (!parsed || parsed.length > max || /[\u0000-\u001f\u007f]/.test(parsed)) {
     fail('OPERATIONS_PRINT_JOB_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return parsed
+}
+
+function physicalOutputReason(value: unknown) {
+  const parsed = String(value ?? '').trim()
+  if (
+    !parsed
+    || parsed.length > 500
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(parsed)
+  ) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_REASON_INVALID',
+      'Physical-output confirmation reason is invalid',
+    )
   }
   return parsed
 }
@@ -171,6 +189,45 @@ function deliveryAttemptId(value: unknown) {
   return id
 }
 
+async function requirePhysicalOutputBrowserSession(
+  req: NextRequest,
+  actor: AppUser,
+  organizationId: string,
+) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_SAME_ORIGIN_REQUIRED',
+      'Confirming physical output requires a same-origin ClawPilot browser request',
+      403,
+    )
+  }
+  const session = await requireRequestSession(req)
+  const role = effectiveAuthorizationRole(actor)
+  if (
+    session.legacy === true
+    || !['magic_code', 'google_sso', 'operator_password'].includes(
+      session.authMethod,
+    )
+    || session.impersonating
+    || session.impersonationStartedAt !== null
+    || session.impersonationExpiresAt !== null
+    || session.authenticatedUser !== session.effectiveUser
+    || session.authenticatedUser !== actor.email
+    || session.activeWorkspaceOrganizationId !== organizationId
+    || session.activeWorkspaceRole !== role
+  ) {
+    fail(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_BROWSER_SESSION_REQUIRED',
+      'Confirming physical output requires the signed-in, non-impersonated operator in the active workspace',
+      403,
+    )
+  }
+}
+
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
@@ -225,6 +282,7 @@ export async function POST(req: NextRequest) {
           code: 'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERIFY_REQUIRED',
         }, 403)
       }
+      await requirePhysicalOutputBrowserSession(req, actor, organizationId)
       const job = await attestOperationsPrintJobPhysicalOutputInPostgres({
         organizationId,
         actorEmail: actor.email,
@@ -239,11 +297,7 @@ export async function POST(req: NextRequest) {
           1,
           Number.MAX_SAFE_INTEGER,
         ),
-        reason: text(
-          command.value.reason,
-          'Physical-output confirmation reason',
-          500,
-        ),
+        reason: physicalOutputReason(command.value.reason),
       })
       return json({ ok: true, job })
     }

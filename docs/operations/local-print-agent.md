@@ -455,9 +455,13 @@ Queue commands accept an existing active carrier label or immutable packing-slip
 The signed-in `POST /api/operations/print-jobs` command
 `attest-physical-output` requires the print-job Global ID, the exact delivered
 attempt UUID, the exact attempt sequence number, a required reason, and a stable
-`Idempotency-Key`. The active organization and signed-in actor come only from
-the authenticated session. A stale delivery version, a mismatched replay, a
-different organization, an ineligible role, or a second attestation is rejected.
+`Idempotency-Key`. It accepts operator-readable tabs and line breaks in the
+reason while rejecting other control characters. The active organization and
+signed-in actor come only from a real same-origin browser session: legacy,
+demo, and impersonated sessions are rejected, and the authenticated user,
+effective user, and evidence actor must be identical. A stale delivery version,
+a mismatched replay, a different organization, an ineligible role, or a second
+attestation is rejected.
 
 Packing-slip enqueue may include the source order and shipment Global IDs. A
 shipment reference is validated against both its order and selected warehouse.

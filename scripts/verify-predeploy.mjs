@@ -78,7 +78,7 @@ const orderUnitWeightMigration = [
 
 const printPhysicalOutputMigration = [
   'db/migrations/0338_operations_print_physical_output_attestation.sql',
-  'de6379a35f682bea29aaea4ede56d65ea66e209324c04150fd89e4c17ec31239',
+  '2ca77442275e87d8b8ee858f974ecc861fb30b0a523ae89092c1be7ab0e4e1cd',
 ]
 
 const shopifyCheckoutUnitMaterialMigration = [
@@ -251,12 +251,22 @@ for (const requiredFragment of [
   printPhysicalOutputMigrationChecksum,
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',
   'operations_print_physical_output_attestations',
-  'validate_operations_print_physical_output_attestation_write',
-  'protect_operations_print_physical_output_attestation_write',
+  'pg_get_constraintdef',
+  'pg_get_indexdef',
+  'procedure_row.prosrc',
+  '3fd4f54c7070a9c1c28082afe360d638621d45b8de7d8acc5db183d45daf30c0',
+  'fd15bac1d42a06fa88bae40902eed8c3f6f4ba5756f2fce1d86199c237feed02',
+  'dcfc0393a532b05606f656ef31ff527ed31981bb314a187e14c2e571336ca787',
 ]) {
   if (!printPhysicalOutputHealthSource.includes(requiredFragment)) {
     fail(`print physical-output health is missing ${requiredFragment}`)
   }
+}
+if (
+  !String(rootPackage?.scripts?.['test:printing'] || '')
+    .includes('node scripts/test-operation-print-physical-output-api.mjs')
+) {
+  fail('test:printing must run physical-output route authority acceptance')
 }
 for (const requiredFragment of [
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',

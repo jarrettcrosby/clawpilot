@@ -2051,7 +2051,10 @@ async function verifyRuntime(connectionString) {
         delivered.deliveredAttemptSequenceNumber,
       actorEmail: verifierEmail,
       idempotencyKey: `physical-output-${fixture.suffix}`,
-      reason: 'Observed one complete, legible packing slip exit the printer',
+      reason: [
+        'Observed one complete, legible packing slip exit the printer.',
+        '\tSecond line confirms the page was not torn or clipped.',
+      ].join('\n'),
     }
     await expectRejected(
       () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres(
@@ -2208,6 +2211,58 @@ async function verifyRuntime(connectionString) {
       table_present: true,
       validation_guard_enabled: true,
       append_only_guard_enabled: true,
+    })
+
+    const exactPhysicalOutputHealth = async () => {
+      const result = await insertReturning(
+        pool,
+        `SELECT (
+           ${physicalOutputHealth.OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL}
+         ) AS ready`,
+      )
+      return result.ready
+    }
+    const assertPhysicalOutputCatalogTamperDetected = async (tamper) => {
+      await pool.query('BEGIN')
+      try {
+        await tamper()
+        assert.equal(await exactPhysicalOutputHealth(), false)
+      } finally {
+        await pool.query('ROLLBACK')
+      }
+      assert.equal(await exactPhysicalOutputHealth(), true)
+    }
+    await assertPhysicalOutputCatalogTamperDetected(() => pool.query(
+      `CREATE OR REPLACE FUNCTION
+         validate_operations_print_physical_output_attestation()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $tamper$
+       BEGIN
+         RETURN NEW;
+       END;
+       $tamper$`,
+    ))
+    await assertPhysicalOutputCatalogTamperDetected(() => pool.query(
+      `CREATE OR REPLACE FUNCTION protect_operations_append_only()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $tamper$
+       BEGIN
+         RETURN OLD;
+       END;
+       $tamper$`,
+    ))
+    await assertPhysicalOutputCatalogTamperDetected(async () => {
+      await pool.query(
+        `ALTER TABLE operations_print_physical_output_attestations
+         DROP CONSTRAINT operations_print_physical_output_reason_valid`,
+      )
+      await pool.query(
+        `ALTER TABLE operations_print_physical_output_attestations
+         ADD CONSTRAINT operations_print_physical_output_reason_valid
+         CHECK (true)`,
+      )
     })
 
     const reprint = await persistence.reprintOperationsPrintJobInPostgres({

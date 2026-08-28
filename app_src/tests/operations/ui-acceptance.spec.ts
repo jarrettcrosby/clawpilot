@@ -2189,7 +2189,10 @@ test('shipped order independently confirms original and reprint paper output', a
   await expect(page.getByText(
     'Delivery event 3 · 99fdcbe7-a2bf-489c-b82b-93499c171304',
   )).toBeVisible()
-  const originalReason = 'Observed one complete, legible 4 x 6 shipping label exit the printer'
+  const originalReason = [
+    'Observed one complete, legible 4 x 6 shipping label exit the printer.',
+    '\tNo tears, clipping, or blank stock were visible.',
+  ].join('\n')
   await page.getByLabel('What physical output did you observe?').fill(originalReason)
   await page.getByRole('button', { name: 'Confirm paper output' }).click()
   await expect(page.getByText(

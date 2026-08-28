@@ -3,19 +3,25 @@
 -- append-only attestation fenced to the exact terminal delivery ledger event.
 
 CREATE TABLE IF NOT EXISTS operations_print_physical_output_attestations (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id uuid NOT NULL
-    REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  organization_id uuid NOT NULL,
   print_job_id uuid NOT NULL,
   delivery_attempt_id uuid NOT NULL,
-  delivery_attempt_sequence_number integer NOT NULL
-    CHECK (delivery_attempt_sequence_number > 0),
+  delivery_attempt_sequence_number integer NOT NULL,
   delivered_at timestamptz NOT NULL,
   verified_at timestamptz NOT NULL DEFAULT now(),
   verified_by text NOT NULL,
   reason text NOT NULL,
   idempotency_key text NOT NULL,
   request_fingerprint text NOT NULL,
+  CONSTRAINT operations_print_physical_output_pkey
+    PRIMARY KEY (id),
+  CONSTRAINT operations_print_physical_output_organization_fkey
+    FOREIGN KEY (organization_id)
+    REFERENCES workspace_organizations(id) ON DELETE RESTRICT,
+  CONSTRAINT operations_print_physical_output_sequence_positive CHECK (
+    delivery_attempt_sequence_number > 0
+  ),
   CONSTRAINT operations_print_physical_output_reason_valid CHECK (
     NULLIF(btrim(reason), '') IS NOT NULL
     AND length(reason) <= 500
