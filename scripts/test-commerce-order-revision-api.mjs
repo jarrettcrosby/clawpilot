@@ -11,6 +11,7 @@ const nodeRequire = createRequire(import.meta.url)
 const requireFromApp = createRequire(new URL('../app_src/package.json', import.meta.url))
 const ts = requireFromApp('typescript')
 const routePath = 'app_src/app/api/operations/order-revisions/route.ts'
+const commandPath = 'app_src/lib/operations/commerceOrderRevisionCommands.ts'
 const routeSource = readFileSync(resolve(root, routePath), 'utf8')
 
 function plain(value) {
@@ -66,11 +67,40 @@ function loadTypeScriptModule(path, { mocks = {}, globals = {} } = {}) {
 }
 
 class CommerceOrderRevisionDispositionError extends Error {
-  constructor(code, message, status = 409) {
+  constructor(
+    code,
+    message,
+    status = 409,
+    retryWithNewIdempotencyKey = false,
+  ) {
     super(message)
     this.name = 'CommerceOrderRevisionDispositionError'
     this.code = code
     this.status = status
+    this.retryWithNewIdempotencyKey = retryWithNewIdempotencyKey
+  }
+}
+
+class ShopifyOrderRevisionError extends Error {
+  constructor(code, message, retryable = false) {
+    super(message)
+    this.code = code
+    this.retryable = retryable
+  }
+}
+
+class FaireOrderRevisionError extends Error {
+  constructor(code, message, retryable = false) {
+    super(message)
+    this.code = code
+    this.retryable = retryable
+  }
+}
+
+class CommerceStoreSyncProviderReadFenceError extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
   }
 }
 
@@ -409,6 +439,33 @@ assert.equal(
 )
 assert.ok(!JSON.stringify(refreshPayload).includes('internal-provider-secret'))
 
+for (const code of [
+  'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED',
+  'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',
+]) {
+  clearCalls()
+  refreshError = new CommerceOrderRevisionDispositionError(
+    code,
+    'The exact provider order refresh failed',
+    502,
+    true,
+  )
+  const terminalFailurePayload = await expectCode(
+    await route.POST(request(
+      'POST',
+      { action: 'refresh-from-provider', orderGlobalId, expectedRowVersion: 7 },
+      { headers: { 'Idempotency-Key': `revision-refresh-${code.toLowerCase()}` } },
+    )),
+    502,
+    code,
+  )
+  assert.equal(
+    terminalFailurePayload.retryWithNewIdempotencyKey,
+    true,
+    `${code} must tell the client to issue a new refresh key`,
+  )
+}
+
 clearCalls()
 refreshResult = {
   replayed: false,
@@ -651,6 +708,11 @@ const dispositionPayload = await expectCode(
   'COMMERCE_ORDER_REVISION_APPLICATION_STALE',
 )
 assert.equal(dispositionPayload.error, 'Refresh the provider revision before applying it')
+assert.equal(
+  Object.hasOwn(dispositionPayload, 'retryWithNewIdempotencyKey'),
+  false,
+  'nonterminal disposition errors must not release an idempotency key',
+)
 
 clearCalls()
 await expectCode(
@@ -740,7 +802,7 @@ console.error = (...values) => logged.push(values)
 try {
   refreshError = new Error('provider secret must never appear in logs: top-secret-value')
   refreshError.name = 'top-secret-error-name'
-  await expectCode(
+  const internalErrorPayload = await expectCode(
     await route.POST(request(
       'POST',
       { action: 'refresh-from-provider', orderGlobalId, expectedRowVersion: 7 },
@@ -748,6 +810,11 @@ try {
     )),
     500,
     'COMMERCE_ORDER_REVISION_INTERNAL_ERROR',
+  )
+  assert.equal(
+    Object.hasOwn(internalErrorPayload, 'retryWithNewIdempotencyKey'),
+    false,
+    'ambiguous internal failures must retain the current refresh key',
   )
 } finally {
   console.error = originalConsoleError
@@ -783,6 +850,109 @@ assert.doesNotMatch(
   routeSource,
   /tenderShipment|createShipment|purchaseLabel|schedulePickup|captureCharge|writeProvider|updateShopify|updateFaire/u,
   'The exact revision API dispatch surface must not expose provider-write actions',
+)
+
+let commandProvider = 'shopify'
+let commandReceiptFailed = true
+const commandFailureCalls = []
+const command = loadTypeScriptModule(commandPath, {
+  mocks: {
+    '@/lib/integrations/faireOrderRevision': {
+      FaireOrderRevisionError,
+      async inspectFaireCanonicalOrderRevision() {
+        throw new FaireOrderRevisionError(
+          'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED',
+          'Faire exact order revision read failed',
+          true,
+        )
+      },
+    },
+    '@/lib/integrations/shopifyOrderRevision': {
+      ShopifyOrderRevisionError,
+      async inspectShopifyCanonicalOrderRevision() {
+        throw new ShopifyOrderRevisionError(
+          'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED',
+          'Shopify exact order revision read failed',
+          true,
+        )
+      },
+    },
+    '@/lib/persistence/commerceOrderRevisions': {
+      CommerceOrderRevisionDispositionError,
+      async prepareManagerCommerceOrderRevisionRefreshInPostgres() {
+        return {
+          replayed: false,
+          commandReceiptId: '33333333-3333-4333-8333-333333333333',
+          claim: {
+            organizationId,
+            integrationAccountId: '44444444-4444-4444-8444-444444444444',
+            targetId: '55555555-5555-4555-8555-555555555555',
+            leaseToken: '66666666-6666-4666-8666-666666666666',
+            provider: commandProvider,
+          },
+        }
+      },
+      async failManagerCommerceOrderRevisionRefreshInPostgres(input) {
+        commandFailureCalls.push(input)
+        return commandReceiptFailed
+      },
+      async captureCommerceOrderRevisionObservationInPostgres() {
+        throw new Error('capture must not run after a provider failure')
+      },
+      async readManagerCommerceOrderRevisionStateFromPostgres() {
+        throw new Error('failed refresh must not return revision state')
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      CommerceStoreSyncProviderReadFenceError,
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({ lease: 'provider-read-test-lease' })
+      },
+    },
+  },
+})
+
+for (const [provider, code] of [
+  ['shopify', 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED'],
+  ['faire', 'FAIRE_ORDER_REVISION_PROVIDER_READ_FAILED'],
+]) {
+  commandProvider = provider
+  commandReceiptFailed = true
+  commandFailureCalls.length = 0
+  await assert.rejects(
+    () => command.refreshCommerceOrderRevisionFromProvider({
+      organizationId,
+      actorEmail,
+      orderGlobalId,
+      expectedRowVersion: 7,
+      idempotencyKey: `command-${provider}-refresh-failure`,
+    }),
+    (error) => {
+      assert.equal(error.code, code)
+      assert.equal(error.status, 502)
+      assert.equal(error.retryWithNewIdempotencyKey, true)
+      return true
+    },
+  )
+  assert.equal(commandFailureCalls.length, 1)
+  assert.equal(commandFailureCalls[0].errorCode, code)
+}
+
+commandProvider = 'shopify'
+commandReceiptFailed = false
+await assert.rejects(
+  () => command.refreshCommerceOrderRevisionFromProvider({
+    organizationId,
+    actorEmail,
+    orderGlobalId,
+    expectedRowVersion: 7,
+    idempotencyKey: 'command-shopify-ambiguous-receipt',
+  }),
+  (error) => {
+    assert.equal(error.code, 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED')
+    assert.equal(error.retryWithNewIdempotencyKey, false)
+    return true
+  },
 )
 
 console.log('Commerce order revision isolated API checks passed.')
