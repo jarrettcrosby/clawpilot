@@ -19,6 +19,11 @@ export type ChatGPTCodexResearchResponse = {
   citations: ChatGPTCodexCitation[]
 }
 
+export type ChatGPTCodexOutputSchema = {
+  name: string
+  schema: Record<string, unknown>
+}
+
 function extractOutputText(payload: Record<string, unknown>): string {
   if (typeof payload.output_text === 'string') return payload.output_text.trim()
   const output = Array.isArray(payload.output) ? payload.output : []
@@ -193,6 +198,7 @@ async function runChatGPTCodexRequest(input: {
   sessionId: string
   signal?: AbortSignal
   webSearch?: boolean
+  outputSchema?: ChatGPTCodexOutputSchema
 }): Promise<ChatGPTCodexResearchResponse> {
   const response = await fetch(CODEX_RESPONSES_URL, {
     method: 'POST',
@@ -211,7 +217,17 @@ async function runChatGPTCodexRequest(input: {
       model: input.model,
       instructions: input.instructions,
       input: [{ role: 'user', content: [{ type: 'input_text', text: input.prompt }] }],
-      text: { verbosity: 'low' },
+      text: input.outputSchema
+        ? {
+            verbosity: 'low',
+            format: {
+              type: 'json_schema',
+              name: input.outputSchema.name,
+              strict: true,
+              schema: input.outputSchema.schema,
+            },
+          }
+        : { verbosity: 'low' },
       ...(input.webSearch ? {
         tools: [{ type: 'web_search', search_context_size: 'medium' }],
         tool_choice: 'required',
@@ -263,4 +279,17 @@ export async function runChatGPTCodexWebResearchResponse(input: {
   signal?: AbortSignal
 }): Promise<ChatGPTCodexResearchResponse> {
   return runChatGPTCodexRequest({ ...input, webSearch: true })
+}
+
+export async function runChatGPTCodexStructuredResponse(input: {
+  credential: ChatGPTCodexCredential
+  model: string
+  instructions: string
+  prompt: string
+  sessionId: string
+  outputSchema: ChatGPTCodexOutputSchema
+  signal?: AbortSignal
+  webSearch?: boolean
+}): Promise<ChatGPTCodexResearchResponse> {
+  return runChatGPTCodexRequest(input)
 }

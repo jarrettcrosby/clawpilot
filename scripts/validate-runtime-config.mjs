@@ -198,6 +198,48 @@ function validateCareerSiteSubmissionsConfiguration() {
   return 'enabled'
 }
 
+function validateCareerSiteAgentsConfiguration() {
+  const enabled = String(process.env.CAREER_SITE_AGENTS_ENABLED || '').trim()
+  if (enabled !== '1') fail('CAREER_SITE_AGENTS_ENABLED must be 1')
+
+  if (!String(process.env.SHORTLINK_SERVICE_CLIENTS_JSON || '').trim()) {
+    fail('CAREER_SITE_AGENTS_ENABLED requires an isolated SHORTLINK_SERVICE_CLIENTS_JSON entry')
+  }
+  const ownerEmail = String(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL || '')
+    .trim()
+    .toLowerCase()
+  if (ownerEmail !== 'jarrett@suburbiasandwichco.com') {
+    fail('CAREER_SITE_AGENTS_ENABLED requires the exact Jarrett Career Desk owner identity')
+  }
+  const organizationId = String(
+    process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+  ).trim().toLowerCase()
+  if (organizationId !== careerSiteOrganizationId) {
+    fail(`CAREER_SITE_AGENTS_ENABLED requires organization ${careerSiteOrganizationId}`)
+  }
+  const agentClient = serviceClients.find(
+    (client) => client.sourceApp === 'jarrett-career-agents',
+  )
+  if (
+    !agentClient
+    || agentClient.ownerDomain !== 'suburbiasandwichco.com'
+    || agentClient.ownerEmail !== ownerEmail
+    || agentClient.organizationId !== organizationId
+  ) {
+    fail('CAREER_SITE_AGENTS_ENABLED requires the exact jarrett-career-agents source, ownerDomain, ownerEmail, and organizationId identity')
+  }
+  if (serviceClients.some((client) => client !== agentClient && client.secret === agentClient.secret)) {
+    fail('The jarrett-career-agents service secret must not be reused by another source')
+  }
+  if ([
+    process.env.SHORTLINK_SERVICE_SECRET,
+    process.env.PIPELINE_OUTBOX_WORKER_SECRET,
+  ].some((secret) => secret && secret === agentClient.secret)) {
+    fail('The jarrett-career-agents service secret must be isolated from worker and legacy credentials')
+  }
+  return 'enabled'
+}
+
 function validateEmbeddingConfiguration() {
   const provider = String(process.env.DOCUMENT_EMBEDDINGS_PROVIDER || 'local').trim().toLowerCase()
   if (!['local', 'openai'].includes(provider)) fail('DOCUMENT_EMBEDDINGS_PROVIDER must be local or openai')
@@ -340,9 +382,10 @@ function validateRevisionEvidenceConfiguration() {
 const origin = validateShortLinkOrigin()
 const clients = validateServiceClients()
 const careerSiteSubmissions = validateCareerSiteSubmissionsConfiguration()
+const careerSiteAgents = validateCareerSiteAgentsConfiguration()
 const embeddingProvider = validateEmbeddingConfiguration()
 const suiteCrm = validateSuiteCrmConfiguration()
 const repositoryRunner = validateRepositoryRunnerConfiguration()
 const printAgentRelease = validatePrintAgentReleaseConfiguration()
 const revisionEvidence = validateRevisionEvidenceConfiguration()
-console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} careerSiteSubmissions=${careerSiteSubmissions} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)
+console.log(`[runtime-config] valid shortLinkOrigin=${origin} clients=${clients} careerSiteSubmissions=${careerSiteSubmissions} careerSiteAgents=${careerSiteAgents} embeddingProvider=${embeddingProvider} suiteCrm=${suiteCrm} repositoryRunner=${repositoryRunner} printAgentRelease=${printAgentRelease} revisionEvidenceActiveKeyId=${revisionEvidence.activeKeyId} revisionEvidenceKeyCount=${revisionEvidence.keyCount}`)

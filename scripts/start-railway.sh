@@ -23,6 +23,8 @@ require_value() {
 [[ "${APP_AUTH_REQUIRED:-}" == "1" ]] || fail "APP_AUTH_REQUIRED must be 1"
 [[ "${CLAWPILOT_EXECUTION_ENABLED:-}" == "0" || "${CLAWPILOT_EXECUTION_ENABLED:-}" == "1" ]] \
   || fail "CLAWPILOT_EXECUTION_ENABLED must be explicitly set to 0 or 1"
+[[ "${CAREER_SITE_AGENTS_ENABLED:-}" == "1" ]] \
+  || fail "CAREER_SITE_AGENTS_ENABLED must be 1"
 
 require_value DATABASE_URL 16
 require_value APP_LOGIN_PASSWORD 16
