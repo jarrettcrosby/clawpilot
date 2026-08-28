@@ -3117,7 +3117,7 @@ export async function GET() {
             )
             careerSiteAgents.connected = connection.connected
             if (!connection.connected) {
-              errors.push('Career Desk ChatGPT connection is not connected.')
+              warnings.push('Career Desk ChatGPT connection is not connected.')
             }
           } catch (error) {
             console.error('[health] Career Desk ChatGPT connection check failed', {
