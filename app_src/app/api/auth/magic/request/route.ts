@@ -2,9 +2,30 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requestAuthMagicCode } from '@/lib/authMagicCode'
 import { recordAuthActivity } from '@/lib/authAudit'
 
+export const dynamic = 'force-dynamic'
+export const revalidate = 0
+export const runtime = 'nodejs'
+
 const WINDOW_MS = 15 * 60 * 1000
 const MAX_REQUESTS = 5
 const GENERIC_MESSAGE = 'If this email is authorized, a six-digit sign-in code is on the way.'
+
+function json(
+  payload: Record<string, unknown>,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
+  return NextResponse.json(payload, {
+    status,
+    headers: {
+      'Cache-Control': 'private, no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      Vary: 'Cookie',
+      ...headers,
+    },
+  })
+}
 
 type RequestAttempt = { count: number; resetAt: number }
 type RequestRateLimitGlobal = typeof globalThis & {
@@ -56,17 +77,36 @@ export async function POST(req: NextRequest) {
   const attempt = recordRequest(clientKey(req), now)
   if (attempt.count > MAX_REQUESTS) {
     const retryAfter = Math.max(1, Math.ceil((attempt.resetAt - now) / 1000))
-    return NextResponse.json(
-      { ok: false, error: 'Too many code requests. Try again later.' },
-      { status: 429, headers: { 'Retry-After': String(retryAfter) } },
+    return json(
+      {
+        ok: false,
+        code: 'AUTH_MAGIC_RATE_LIMITED',
+        error: 'Too many code requests. Try again later.',
+      },
+      429,
+      { 'Retry-After': String(retryAfter) },
     )
   }
 
+  let body: unknown
   try {
-    const body = await req.json()
-    const email = String(body?.email || '').trim().toLowerCase()
+    body = await req.json()
+  } catch {
+    return json({
+      ok: false,
+      code: 'AUTH_MAGIC_REQUEST_INVALID',
+      error: 'The sign-in request is invalid.',
+    }, 400)
+  }
+
+  try {
+    const email = String((body as { email?: unknown } | null)?.email || '').trim().toLowerCase()
     if (!email.includes('@') || email.length > 254) {
-      return NextResponse.json({ ok: false, error: 'Enter a valid email address.' }, { status: 400 })
+      return json({
+        ok: false,
+        code: 'AUTH_MAGIC_EMAIL_INVALID',
+        error: 'Enter a valid email address.',
+      }, 400)
     }
 
     const result = await requestAuthMagicCode({ email })
@@ -78,12 +118,20 @@ export async function POST(req: NextRequest) {
         method: 'magic_code',
         reason: result.status,
       }).catch(() => undefined)
-      return NextResponse.json({ ok: true, message: GENERIC_MESSAGE })
+      return json({ ok: true, message: GENERIC_MESSAGE })
     }
 
-    return NextResponse.json({ ok: false, error: 'Unable to send a sign-in code.' }, { status: 503 })
+    return json({
+      ok: false,
+      code: 'AUTH_MAGIC_DELIVERY_UNAVAILABLE',
+      error: 'Unable to send a sign-in code.',
+    }, 503)
   } catch (error) {
     console.error('[auth] Magic-code request failed', error instanceof Error ? error.message : 'unknown error')
-    return NextResponse.json({ ok: false, error: 'Unable to send a sign-in code.' }, { status: 503 })
+    return json({
+      ok: false,
+      code: 'AUTH_MAGIC_DELIVERY_UNAVAILABLE',
+      error: 'Unable to send a sign-in code.',
+    }, 503)
   }
 }

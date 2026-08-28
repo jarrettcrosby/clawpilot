@@ -11,6 +11,8 @@ const simulatorBuilds = read('clients/apple/run-xcode-simulator-builds.sh')
 const phonePrivacy = read('clients/apple/Apps/iPhone/PrivacyInfo.xcprivacy')
 const watchPrivacy = read('clients/apple/Apps/Watch/PrivacyInfo.xcprivacy')
 const developmentArchiveVerifier = read('clients/apple/verify-development-archive.sh')
+const productionArchiveVerifier = read('clients/apple/verify-production-archive.sh')
+const archiveBuilder = read('clients/apple/archive-apple-app.sh')
 
 for (const fragment of [
   'Development: debug',
@@ -20,6 +22,9 @@ for (const fragment of [
   'ClawPilotPickingWatchDev:',
   'config: Development',
   'config: Production',
+  'CURRENT_PROJECT_VERSION: "16"',
+  'CLAWPILOT_SOURCE_COMMIT: UNSET',
+  'ClawPilotSourceCommit: $(CLAWPILOT_SOURCE_COMMIT)',
 ]) {
   assert.ok(project.includes(fragment), `Xcode project is missing ${fragment}`)
 }
@@ -71,6 +76,19 @@ for (const scheme of [
 ]) {
   assert.ok(simulatorBuilds.includes(scheme), `Simulator gate is missing ${scheme}`)
 }
+for (const fragment of [
+  'source_commit="$(git -C "${repository_root}" rev-parse --verify HEAD)"',
+  'The source checkout must be clean before source-bound simulator builds.',
+  '"CLAWPILOT_SOURCE_COMMIT=${source_commit}"',
+  'ClawPilotSourceCommit',
+  'require_url_schemes_exact',
+  'DevelopmentRelease-watchsimulator/ClawPilotPickingWatch.app',
+  'Production-watchsimulator/ClawPilotPickingWatch.app',
+  '000000000001-dev-build-contract.apps.googleusercontent.com',
+  '000000000002-production-build-contract.apps.googleusercontent.com',
+]) {
+  assert.ok(simulatorBuilds.includes(fragment), `Simulator contract is missing ${fragment}`)
+}
 
 assert.match(
   simulatorBuilds,
@@ -105,6 +123,14 @@ assert.ok(
   (statSync(new URL('../clients/apple/verify-development-archive.sh', import.meta.url)).mode & 0o111) !== 0,
   'Development archive verifier must be executable',
 )
+assert.ok(
+  (statSync(new URL('../clients/apple/verify-production-archive.sh', import.meta.url)).mode & 0o111) !== 0,
+  'Production archive verifier must be executable',
+)
+assert.ok(
+  (statSync(new URL('../clients/apple/archive-apple-app.sh', import.meta.url)).mode & 0o111) !== 0,
+  'Apple archive builder must be executable',
+)
 for (const fragment of [
   'set +x',
   'CLAWPILOT_GOOGLE_DEV_IOS_CLIENT_ID',
@@ -122,28 +148,49 @@ for (const fragment of [
   'GIDServerClientID',
   'MWDAT:MetaAppID',
   'MWDAT:ClientToken',
-  'plist_has_url_scheme',
+  'require_url_schemes_exact',
   'com.eigenracing.ios.picking.dev',
   'com.eigenracing.ios.picking.dev.watch',
   'https://dev.aiapp.eigenracing.com',
   'ApplicationProperties:CFBundleVersion',
-  'CURRENT_PROJECT_VERSION:',
+  'project_value CURRENT_PROJECT_VERSION',
   'the current project build number',
   'ApplicationProperties:CFBundleIdentifier',
   'ClawPilotPickingPhoneDev',
   'codesign --verify --deep --strict',
+  'ClawPilotSourceCommit',
+  'the source checkout is not clean',
+  'Apple Development: ',
+  'Apple Distribution: ',
+  'App Store Connect, and TestFlight readiness were not verified',
+  'CLAWPILOT_GOOGLE_PRODUCTION_IOS_CLIENT_ID',
+  'CLAWPILOT_META_PRODUCTION_APP_ID',
+  'com.eigenracing.ios.picking.watch',
+  'https://aiapp.eigenracing.com',
+  'ClawPilotPickingPhone',
 ]) {
   assert.ok(
     developmentArchiveVerifier.includes(fragment),
     `Development archive verifier is missing ${fragment}`,
   )
 }
+assert.match(productionArchiveVerifier, /production "\$@"/)
+for (const fragment of [
+  'the source checkout must be clean before creating an archive',
+  'CLAWPILOT_SOURCE_COMMIT=${source_commit}',
+  'ClawPilotPickingPhoneDev',
+  'ClawPilotPickingPhone',
+  'DevelopmentRelease',
+  'Production',
+]) {
+  assert.ok(archiveBuilder.includes(fragment), `Archive builder is missing ${fragment}`)
+}
 assert.match(
   developmentArchiveVerifier,
   /require_plist_equal "\$\{phone_plist\}" GIDClientID "\$\{google_client_id\}"/,
   'Signed Google iOS client ID must exactly match the ignored local overlay',
 )
-assert.match(project, /CURRENT_PROJECT_VERSION: "15"/)
+assert.match(project, /CURRENT_PROJECT_VERSION: "16"/)
 assert.match(
   developmentArchiveVerifier,
   /require_plist_equal "\$\{phone_plist\}" GIDServerClientID "\$\{google_server_client_id\}"/,
@@ -151,8 +198,8 @@ assert.match(
 )
 assert.match(
   developmentArchiveVerifier,
-  /plist_has_url_scheme "\$\{phone_plist\}" "\$\{google_callback\}"/,
-  'Signed Google callback must exactly match the ignored local overlay',
+  /require_url_schemes_exact "\$\{phone_plist\}" "\$\{expected_meta_url_scheme\}" "\$\{google_callback\}"/,
+  'Signed callback set must exactly match the selected environment and ignored local overlay',
 )
 assert.match(
   developmentArchiveVerifier,

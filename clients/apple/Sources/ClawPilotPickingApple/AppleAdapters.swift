@@ -463,9 +463,21 @@ public enum PickingAPIError: Error, Equatable, Sendable {
     case unauthorized
     case sessionSuperseded
     case rateLimited(retryAfterSeconds: Int)
+    case serviceUnavailable(statusCode: Int, retryAfterSeconds: Int?)
     case conflict(code: String, message: String)
     case rejected(code: String, message: String)
     case invalidResponse
+
+    public var isInvalidMagicCode: Bool {
+        switch self {
+        case .unauthorized:
+            true
+        case .rejected(let code, _):
+            code == "AUTH_MAGIC_CODE_INVALID"
+        default:
+            false
+        }
+    }
 }
 
 extension PickingAPIError: LocalizedError {
@@ -475,6 +487,12 @@ extension PickingAPIError: LocalizedError {
         case .unauthorized: "Sign in to continue."
         case .sessionSuperseded: "This signed-in operation was cancelled because the session changed."
         case .rateLimited(let seconds): "Too many code requests. Try again in \(seconds) seconds."
+        case .serviceUnavailable(_, let seconds):
+            if let seconds {
+                "ClawPilot is temporarily unavailable. Try again in \(seconds) seconds."
+            } else {
+                "ClawPilot is temporarily unavailable. Try again shortly."
+            }
         case .conflict(_, let message): message
         case .rejected(_, let message): message
         case .invalidResponse: "ClawPilot returned an unexpected response."
@@ -3400,6 +3418,7 @@ public actor PickingAPIClient {
     private func postAuth(path: String, body: [String: String]) async throws {
         var request = URLRequest(url: try endpoint(path))
         request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await authenticatedData(for: request)
@@ -3411,6 +3430,14 @@ public actor PickingAPIClient {
             throw PickingAPIError.rateLimited(retryAfterSeconds: max(1, seconds))
         }
         let envelope = try? decoder.decode(BasicEnvelope.self, from: data)
+        if [502, 503, 504].contains(http.statusCode), envelope == nil {
+            let retryAfter = Int(http.value(forHTTPHeaderField: "Retry-After") ?? "")
+                .map { max(1, $0) }
+            throw PickingAPIError.serviceUnavailable(
+                statusCode: http.statusCode,
+                retryAfterSeconds: retryAfter
+            )
+        }
         guard (200..<300).contains(http.statusCode) else {
             if let envelope, let code = envelope.code {
                 throw PickingAPIError.rejected(

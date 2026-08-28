@@ -7,20 +7,55 @@ import { syncAppUserProfileToOwnedPipelines } from '@/lib/persistence/crm'
 import { ensureDefaultResourcesForUser } from '@/lib/tenancy'
 import { requireWorkspaceAppUser } from '@/lib/workspaceMemberships'
 
+export const dynamic = 'force-dynamic'
+export const revalidate = 0
+export const runtime = 'nodejs'
+
+function json(payload: Record<string, unknown>, status = 200) {
+  return NextResponse.json(payload, {
+    status,
+    headers: {
+      'Cache-Control': 'private, no-store, max-age=0',
+      Pragma: 'no-cache',
+      Expires: '0',
+      Vary: 'Cookie',
+    },
+  })
+}
+
 export async function POST(req: NextRequest) {
+  let body: unknown
   try {
-    const body = await req.json()
-    const email = String(body?.email || '').trim().toLowerCase()
-    const code = String(body?.code || '').trim()
+    body = await req.json()
+  } catch {
+    return json({
+      ok: false,
+      code: 'AUTH_MAGIC_REQUEST_INVALID',
+      error: 'The sign-in request is invalid.',
+    }, 400)
+  }
+
+  try {
+    const fields = body as { email?: unknown; code?: unknown } | null
+    const email = String(fields?.email || '').trim().toLowerCase()
+    const code = String(fields?.code || '').trim()
     if (!email.includes('@') || email.length > 254 || !/^\d{6}$/.test(code)) {
       await recordAuthActivity({ req, email, eventType: 'auth.login.failed', method: 'magic_code', reason: 'invalid_input' }).catch(() => undefined)
-      return NextResponse.json({ ok: false, error: 'The code is invalid or expired.' }, { status: 401 })
+      return json({
+        ok: false,
+        code: 'AUTH_MAGIC_CODE_INVALID',
+        error: 'The code is invalid or expired.',
+      }, 401)
     }
 
     const result = await verifyAuthMagicCode({ email, code })
     if (result.status !== 'verified') {
       await recordAuthActivity({ req, email, eventType: 'auth.login.failed', method: 'magic_code', reason: result.status }).catch(() => undefined)
-      return NextResponse.json({ ok: false, error: 'The code is invalid or expired.' }, { status: 401 })
+      return json({
+        ok: false,
+        code: 'AUTH_MAGIC_CODE_INVALID',
+        error: 'The code is invalid or expired.',
+      }, 401)
     }
 
     const actor = await requireWorkspaceAppUser(result.email, result.organizationId)
@@ -40,7 +75,7 @@ export async function POST(req: NextRequest) {
       headers: req.headers,
       organizationId: actor.organizationId,
     })
-    const response = NextResponse.json({ ok: true })
+    const response = json({ ok: true })
     setBrowserSessionCookie(response, issued)
     await recordAuthActivity({
       req,
@@ -52,6 +87,10 @@ export async function POST(req: NextRequest) {
     return response
   } catch (error) {
     console.error('[auth] Magic-code verification failed', error instanceof Error ? error.message : 'unknown error')
-    return NextResponse.json({ ok: false, error: 'Unable to verify the sign-in code.' }, { status: 503 })
+    return json({
+      ok: false,
+      code: 'AUTH_MAGIC_VERIFICATION_UNAVAILABLE',
+      error: 'Unable to verify the sign-in code.',
+    }, 503)
   }
 }
