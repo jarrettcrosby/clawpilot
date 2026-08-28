@@ -3665,6 +3665,7 @@ async function readOrderDetail(
       delivered_at: Date | null
       delivered_attempt_id: string | null
       delivered_attempt_sequence_number: number | null
+      physical_output_delivered_at: Date | null
       physical_output_verified_at: Date | null
       physical_output_verified_by: string | null
       physical_output_reason: string | null
@@ -3679,6 +3680,7 @@ async function readOrderDetail(
               delivered_attempt.id::text AS delivered_attempt_id,
               delivered_attempt.sequence_number
                 AS delivered_attempt_sequence_number,
+              physical_output.delivered_at AS physical_output_delivered_at,
               physical_output.verified_at AS physical_output_verified_at,
               physical_output.verified_by AS physical_output_verified_by,
               physical_output.reason AS physical_output_reason,
@@ -4211,9 +4213,9 @@ async function readOrderDetail(
       physicalOutputAttestation: item.physical_output_verified_at
         && item.physical_output_verified_by
         && item.physical_output_reason
-        && item.delivered_at
+        && item.physical_output_delivered_at
         ? {
-            deliveredAt: item.delivered_at.toISOString(),
+            deliveredAt: item.physical_output_delivered_at.toISOString(),
             verifiedAt: item.physical_output_verified_at.toISOString(),
             verifiedBy: item.physical_output_verified_by,
             reason: item.physical_output_reason,
@@ -4250,6 +4252,7 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
   actorEmail?: string | null
   capabilities: OperationsCapabilities
+  canVerifyPhysicalOutput?: boolean
   canPurchaseLivePostage?: boolean
   search?: string
   status?: string | null
@@ -4794,6 +4797,9 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     capabilities: {
       ...input.capabilities,
       canPurchaseLivePostage: input.canPurchaseLivePostage === true,
+      canVerifyPhysicalOutput:
+        input.capabilities.canExecute
+        && input.canVerifyPhysicalOutput === true,
     },
     dataPipeline: {
       id: activation.data_pipeline_id,

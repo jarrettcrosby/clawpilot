@@ -9,6 +9,36 @@ const requireFromApp = createRequire(
   new URL('../app_src/package.json', import.meta.url),
 )
 const ts = requireFromApp('typescript')
+const authorizationPath =
+  'app_src/lib/operations/physicalOutputAttestationAuthorization.ts'
+const authorizationOutput = ts.transpileModule(
+  readFileSync(authorizationPath, 'utf8'),
+  {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: authorizationPath,
+  },
+).outputText
+const authorizationModule = { exports: {} }
+vm.runInNewContext(authorizationOutput, {
+  Set,
+  exports: authorizationModule.exports,
+  module: authorizationModule,
+  require(specifier) {
+    if (specifier === '@/lib/users') {
+      return {
+        effectiveAuthorizationRole(value) {
+          return value.organizationRole || value.role
+        },
+      }
+    }
+    return requireFromApp(specifier)
+  },
+}, { filename: authorizationPath })
+const physicalOutputAuthorization = authorizationModule.exports
 const path = 'app_src/app/api/operations/print-jobs/route.ts'
 const output = ts.transpileModule(readFileSync(path, 'utf8'), {
   compilerOptions: {
@@ -54,6 +84,7 @@ let session = { ...baseSession }
 let requireSessionCalls = 0
 const attestationInputs = []
 const reprintInputs = []
+const workspaceInputs = []
 
 const module = { exports: {} }
 vm.runInNewContext(output, {
@@ -113,6 +144,12 @@ vm.runInNewContext(output, {
         },
       }
     }
+    if (
+      specifier
+      === '@/lib/operations/physicalOutputAttestationAuthorization'
+    ) {
+      return physicalOutputAuthorization
+    }
     if (specifier === '@/lib/persistence/config') {
       return { isPostgresStorageEnabled() { return true } }
     }
@@ -132,8 +169,21 @@ vm.runInNewContext(output, {
         async enqueueOperationsPrintJobInPostgres() {
           throw new Error('unexpected enqueue')
         },
-        async readOperationsPrintJobWorkspaceFromPostgres() {
-          throw new Error('unexpected read')
+        async readOperationsPrintJobWorkspaceFromPostgres(input) {
+          workspaceInputs.push(structuredClone(input))
+          return {
+            organizationId: input.organizationId,
+            capabilities: {
+              canView: input.canView,
+              canManage: input.canManage,
+              canExecute: input.canExecute,
+              canReprint: input.canManage && input.canExecute,
+              canVerifyPhysicalOutput: input.canExecute
+                && input.canVerifyPhysicalOutput === true,
+            },
+            jobs: [],
+            generatedAt: '2026-08-28T12:00:00.000Z',
+          }
         },
         async retryOperationsPrintJobInPostgres() {
           throw new Error('unexpected retry')
@@ -148,6 +198,9 @@ vm.runInNewContext(output, {
     }
     if (specifier === '@/lib/requestUser') {
       return {
+        async requestSession() {
+          return session
+        },
         async requireRequestSession() {
           requireSessionCalls += 1
           if (!session) throw new Error('Unauthorized')
@@ -158,9 +211,7 @@ vm.runInNewContext(output, {
         },
       }
     }
-    if (specifier === '@/lib/users') {
-      return { effectiveAuthorizationRole() { return actor.organizationRole } }
-    }
+    if (specifier === '@/lib/users') return {}
     return requireFromApp(specifier)
   },
 }, { filename: path })
@@ -188,6 +239,36 @@ const attestationBody = {
   expectedDeliveryAttemptSequenceNumber: 3,
   reason: 'Observed one complete label exit the printer',
 }
+let response
+
+for (const [candidateSession, expected] of [
+  [{ ...baseSession }, true],
+  [{ ...baseSession, legacy: true, authMethod: 'legacy_upgrade' }, false],
+  [{ ...baseSession, authMethod: 'demo' }, false],
+  [{ ...baseSession, authenticatedUser: 'different@example.test' }, false],
+  [{
+    ...baseSession,
+    authenticatedUser: 'support@example.test',
+    effectiveUser: actorEmail,
+    impersonating: true,
+    impersonationStartedAt: '2026-08-28T12:00:00.000Z',
+    impersonationExpiresAt: '2026-08-28T12:30:00.000Z',
+  }, false],
+  [{
+    ...baseSession,
+    activeWorkspaceOrganizationId:
+      '33333333-3333-4333-8333-333333333333',
+  }, false],
+]) {
+  session = candidateSession
+  response = await route.GET(request({}))
+  assert.equal(response.status, 200)
+  assert.equal(
+    response.payload.jobs.capabilities.canVerifyPhysicalOutput,
+    expected,
+  )
+  assert.equal(workspaceInputs.at(-1).canVerifyPhysicalOutput, expected)
+}
 
 session = {
   ...baseSession,
@@ -197,7 +278,7 @@ session = {
   impersonationStartedAt: '2026-08-28T12:00:00.000Z',
   impersonationExpiresAt: '2026-08-28T12:30:00.000Z',
 }
-let response = await route.POST(request(attestationBody))
+response = await route.POST(request(attestationBody))
 assert.equal(response.status, 403)
 assert.equal(
   response.payload.code,

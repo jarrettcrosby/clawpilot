@@ -1277,6 +1277,7 @@ function OrderDetailDrawer({
   canManage,
   canExecute,
   canCancelProviderOrder,
+  canVerifyPhysicalOutput,
   canPurchaseLivePostage,
   canAuthorizeSandboxE2e,
   oneOffExecutionState,
@@ -1324,6 +1325,7 @@ function OrderDetailDrawer({
   canManage: boolean
   canExecute: boolean
   canCancelProviderOrder: boolean
+  canVerifyPhysicalOutput: boolean
   canPurchaseLivePostage: boolean
   canAuthorizeSandboxE2e: boolean
   oneOffExecutionState: OneOffShipmentExecutionState | null
@@ -2398,7 +2400,7 @@ function OrderDetailDrawer({
                                       </Typography>
                                       <OrderLabelPrintHistory
                                         jobs={jobs}
-                                        canVerify={canExecute}
+                                        canVerify={canVerifyPhysicalOutput}
                                         onConfirmPhysicalOutput={onConfirmPhysicalOutput}
                                       />
                                     </Box>
@@ -2654,7 +2656,7 @@ function OrderDetailDrawer({
                                   </Typography>
                                   <OrderLabelPrintHistory
                                     jobs={jobs}
-                                    canVerify={canExecute}
+                                    canVerify={canVerifyPhysicalOutput}
                                     onConfirmPhysicalOutput={onConfirmPhysicalOutput}
                                   />
                                 </Box>
@@ -7657,6 +7659,9 @@ export default function OperationsSection({
           capabilities?.canActivate
           && capabilities.canManage
           && capabilities.canExecute
+        )}
+        canVerifyPhysicalOutput={Boolean(
+          workspace?.capabilities.canVerifyPhysicalOutput,
         )}
         canPurchaseLivePostage={Boolean(
           workspace?.capabilities.canPurchaseLivePostage,

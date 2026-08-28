@@ -185,6 +185,7 @@ type PrintJobRow = {
   delivered_at: TimestampValue | null
   delivered_attempt_id: string | null
   delivered_attempt_sequence_number: number | null
+  physical_output_delivered_at: TimestampValue | null
   physical_output_verified_at: TimestampValue | null
   physical_output_verified_by: string | null
   physical_output_reason: string | null
@@ -1099,7 +1100,8 @@ function jobItem(row: PrintJobRow): OperationsPrintJobListItem {
     deliveredAt: iso(row.delivered_at),
     deliveredAttemptId: row.delivered_attempt_id,
     deliveredAttemptSequenceNumber: row.delivered_attempt_sequence_number,
-    physicalOutputAttestation: row.physical_output_verified_at
+    physicalOutputAttestation: row.physical_output_delivered_at
+      && row.physical_output_verified_at
       && row.physical_output_verified_by
       && row.physical_output_reason
       && row.delivered_attempt_id
@@ -1107,7 +1109,7 @@ function jobItem(row: PrintJobRow): OperationsPrintJobListItem {
       ? {
           deliveryAttemptId: row.delivered_attempt_id,
           deliveryAttemptSequenceNumber: row.delivered_attempt_sequence_number,
-          deliveredAt: iso(row.delivered_at) as string,
+          deliveredAt: iso(row.physical_output_delivered_at) as string,
           verifiedAt: iso(row.physical_output_verified_at) as string,
           verifiedBy: row.physical_output_verified_by,
           reason: row.physical_output_reason,
@@ -1233,6 +1235,7 @@ const PRINT_JOB_SELECT = `
     job.delivered_at,
     delivered_attempt.id::text AS delivered_attempt_id,
     delivered_attempt.sequence_number AS delivered_attempt_sequence_number,
+    physical_output.delivered_at AS physical_output_delivered_at,
     physical_output.verified_at AS physical_output_verified_at,
     physical_output.verified_by AS physical_output_verified_by,
     physical_output.reason AS physical_output_reason,
@@ -1652,6 +1655,7 @@ export async function readOperationsPrintJobWorkspaceFromPostgres(input: {
   canView: boolean
   canManage: boolean
   canExecute: boolean
+  canVerifyPhysicalOutput?: boolean
   limit?: number
 }): Promise<OperationsPrintJobWorkspace> {
   if (!input.canView) {
@@ -1676,7 +1680,8 @@ export async function readOperationsPrintJobWorkspaceFromPostgres(input: {
       canManage: input.canManage,
       canExecute: input.canExecute,
       canReprint: input.canManage && input.canExecute,
-      canVerifyPhysicalOutput: input.canExecute,
+      canVerifyPhysicalOutput:
+        input.canExecute && input.canVerifyPhysicalOutput === true,
     },
     jobs: result.rows.map(jobItem),
     generatedAt: new Date().toISOString(),

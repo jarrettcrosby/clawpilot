@@ -4,6 +4,9 @@ import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  canUsePhysicalOutputAttestationBrowserSession,
+} from '@/lib/operations/physicalOutputAttestationAuthorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
   attestOperationsPrintJobPhysicalOutputInPostgres,
@@ -16,8 +19,12 @@ import {
 } from '@/lib/persistence/operationPrintDelivery'
 import { OperationsRequestError } from '@/lib/persistence/operations'
 import { appPublicUrl } from '@/lib/publicUrl'
-import { requireRequestSession, requireRequestUser } from '@/lib/requestUser'
-import { effectiveAuthorizationRole, type AppUser } from '@/lib/users'
+import {
+  requestSession,
+  requireRequestSession,
+  requireRequestUser,
+} from '@/lib/requestUser'
+import type { AppUser } from '@/lib/users'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -206,20 +213,11 @@ async function requirePhysicalOutputBrowserSession(
     )
   }
   const session = await requireRequestSession(req)
-  const role = effectiveAuthorizationRole(actor)
-  if (
-    session.legacy === true
-    || !['magic_code', 'google_sso', 'operator_password'].includes(
-      session.authMethod,
-    )
-    || session.impersonating
-    || session.impersonationStartedAt !== null
-    || session.impersonationExpiresAt !== null
-    || session.authenticatedUser !== session.effectiveUser
-    || session.authenticatedUser !== actor.email
-    || session.activeWorkspaceOrganizationId !== organizationId
-    || session.activeWorkspaceRole !== role
-  ) {
+  if (!canUsePhysicalOutputAttestationBrowserSession({
+    session,
+    actor,
+    organizationId,
+  })) {
     fail(
       'OPERATIONS_PRINT_PHYSICAL_OUTPUT_BROWSER_SESSION_REQUIRED',
       'Confirming physical output requires the signed-in, non-impersonated operator in the active workspace',
@@ -254,11 +252,19 @@ export async function GET(req: NextRequest) {
     requirePostgres()
     const actor = await requireRequestUser(req)
     const capabilities = operationsCapabilities(actor)
+    const organizationId = activeOperationsOrganizationId(actor)
+    const session = await requestSession(req)
     const jobs = await readOperationsPrintJobWorkspaceFromPostgres({
-      organizationId: activeOperationsOrganizationId(actor),
+      organizationId,
       canView: capabilities.canView,
       canManage: capabilities.canManage,
       canExecute: capabilities.canExecute,
+      canVerifyPhysicalOutput: capabilities.canExecute
+        && canUsePhysicalOutputAttestationBrowserSession({
+          session,
+          actor,
+          organizationId,
+        }),
     })
     return json({ ok: true, jobs })
   } catch (error) {

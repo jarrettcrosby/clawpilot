@@ -123,6 +123,10 @@ export const OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL = String.raw`
     WHERE constraint_row.conrelid = pg_catalog.to_regclass(
       'public.operations_print_physical_output_attestations'
     )
+      -- PostgreSQL 18 exposes implicit NOT NULL catalog rows as contype = 'n'.
+      -- Column nullability is verified above; keep this digest scoped to the
+      -- eleven explicit, named constraints whose definitions we own.
+      AND constraint_row.contype <> 'n'
   )
   AND NOT EXISTS (
     SELECT 1

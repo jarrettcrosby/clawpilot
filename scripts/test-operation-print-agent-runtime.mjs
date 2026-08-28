@@ -2113,6 +2113,73 @@ async function verifyRuntime(connectionString) {
     )
     assert.equal(attested.physicalOutputAttestation.verifiedBy, verifierEmail)
     assert.equal(attested.physicalOutputAttestation.reason, attestationInput.reason)
+    const immutableAttestationDeliveredAt =
+      attested.physicalOutputAttestation.deliveredAt
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET delivered_at = delivered_at + interval '1 hour'
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [fixture.organizationId, queued.globalId],
+    )
+    const mutatedDeliveryWorkspace = await persistence
+      .readOperationsPrintJobWorkspaceFromPostgres({
+        organizationId: fixture.organizationId,
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canVerifyPhysicalOutput: true,
+      })
+    const mutatedDeliveryJob = mutatedDeliveryWorkspace.jobs.find(
+      (job) => job.globalId === queued.globalId,
+    )
+    assert.ok(mutatedDeliveryJob)
+    assert.notEqual(
+      mutatedDeliveryJob.deliveredAt,
+      immutableAttestationDeliveredAt,
+      'The mutable job delivery projection must differ in this regression fixture',
+    )
+    assert.equal(
+      mutatedDeliveryJob.physicalOutputAttestation?.deliveredAt,
+      immutableAttestationDeliveredAt,
+      'Print workspace attestation must use the immutable attestation timestamp',
+    )
+    const orderWorkflowDeliveryProjection = await insertReturning(
+      pool,
+      `SELECT job.delivered_at AS job_delivered_at,
+              physical_output.delivered_at
+                AS physical_output_delivered_at,
+              physical_output.verified_at,
+              physical_output.verified_by,
+              physical_output.reason
+       FROM operations_print_jobs job
+       JOIN operations_print_physical_output_attestations physical_output
+         ON physical_output.organization_id = job.organization_id
+        AND physical_output.print_job_id = job.id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = $2`,
+      [fixture.organizationId, queued.globalId],
+    )
+    assert.notEqual(
+      new Date(orderWorkflowDeliveryProjection.job_delivered_at).toISOString(),
+      immutableAttestationDeliveredAt,
+    )
+    assert.equal(
+      new Date(
+        orderWorkflowDeliveryProjection.physical_output_delivered_at,
+      ).toISOString(),
+      immutableAttestationDeliveredAt,
+      'Order workflow projection must retain the immutable attestation timestamp',
+    )
+    assert.equal(orderWorkflowDeliveryProjection.verified_by, verifierEmail)
+    assert.equal(orderWorkflowDeliveryProjection.reason, attestationInput.reason)
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET delivered_at = $3::timestamptz
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [fixture.organizationId, queued.globalId, delivered.deliveredAt],
+    )
     await expectRejected(
       () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
         ...attestationInput,

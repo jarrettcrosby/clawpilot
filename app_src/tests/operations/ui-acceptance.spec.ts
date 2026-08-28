@@ -249,7 +249,13 @@ function workspace(exceptionStatus: OperationsExceptionStatus = 'open', lifecycl
   return {
     organizationId: '11111111-1111-4111-8111-111111111111',
     configured: true,
-    capabilities: { canView: true, canManage: true, canExecute: true, canActivate: true },
+    capabilities: {
+      canView: true,
+      canManage: true,
+      canExecute: true,
+      canActivate: true,
+      canVerifyPhysicalOutput: true,
+    },
     dataPipeline: { id: 'pipeline-id', name: 'CRM pipeline' },
     activation: {
       state: 'shadow',
@@ -370,7 +376,10 @@ async function installOperationsRoutes(page: Page) {
 
 async function installOrderLabelPrintRoutes(
   page: Page,
-  options: { initialFailedJob?: boolean } = {},
+  options: {
+    initialFailedJob?: boolean
+    canVerifyPhysicalOutput?: boolean
+  } = {},
 ) {
   const requests: Array<{
     body: Record<string, unknown>
@@ -468,6 +477,11 @@ async function installOrderLabelPrintRoutes(
     const order = shippedOrder()
     return {
       ...base,
+      capabilities: {
+        ...base.capabilities,
+        canVerifyPhysicalOutput:
+          options.canVerifyPhysicalOutput !== false,
+      },
       orders: [order],
       selectedOrder: order,
       exceptions: [],
@@ -2245,6 +2259,24 @@ test('shipped order independently confirms original and reprint paper output', a
   })
   expect(capture.requests[3].idempotencyKey)
     .toMatch(/^operations-print-physical-output:gpj7654322:/)
+})
+
+test('order workflow hides physical confirmation when browser session is ineligible', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderLabelPrintRoutes(page, {
+    canVerifyPhysicalOutput: false,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1004/ }).click()
+  await page.getByRole('button', { name: 'Print label' }).click()
+  const originalPrintJob = page.getByTestId(
+    `order-print-job-${capture.originalPrintJobGlobalId}`,
+  )
+  await expect(originalPrintJob.getByText('Paper not verified')).toBeVisible()
+  await expect(
+    originalPrintJob.getByRole('button', { name: 'Confirm paper output' }),
+  ).toHaveCount(0)
 })
 
 test('failed shipping-label print retries from the order without purchasing postage', async ({ page }) => {

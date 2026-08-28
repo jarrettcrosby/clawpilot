@@ -1004,6 +1004,7 @@ export type OperationsWorkspace = {
     canExecute: boolean
     canActivate: boolean
     canPurchaseLivePostage?: boolean
+    canVerifyPhysicalOutput?: boolean
   }
   dataPipeline: { id: string; name: string }
   activation: {

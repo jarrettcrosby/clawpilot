@@ -327,6 +327,7 @@ for (const fragment of [
   "(11, 'request_fingerprint', 'text', true, NULL::text)",
   'operations_print_physical_output_one_per_job',
   'pg_get_constraintdef',
+  "constraint_row.contype <> 'n'",
   'pg_get_indexdef',
   'procedure_row.prosrc',
   '3fd4f54c7070a9c1c28082afe360d638621d45b8de7d8acc5db183d45daf30c0',
@@ -382,6 +383,8 @@ for (const fragment of [
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERSION_CHANGED',
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_ALREADY_VERIFIED',
   'physicalOutputVerified: false',
+  'physical_output.delivered_at AS physical_output_delivered_at',
+  'deliveredAt: iso(row.physical_output_delivered_at) as string',
   'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
   'A compatible printer is configured, but its local print agent has never connected',
 ]) assert.ok(delivery.includes(fragment), `Print delivery persistence missing ${fragment}`)
@@ -426,8 +429,8 @@ for (const fragment of [
   'capabilities.canExecute',
   'requirePhysicalOutputBrowserSession',
   'requireRequestSession(req)',
-  'session.authenticatedUser !== session.effectiveUser',
-  'session.authenticatedUser !== actor.email',
+  'canUsePhysicalOutputAttestationBrowserSession',
+  'canVerifyPhysicalOutput: capabilities.canExecute',
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_BROWSER_SESSION_REQUIRED',
   'OPERATIONS_PRINT_PHYSICAL_OUTPUT_SAME_ORIGIN_REQUIRED',
   'physicalOutputReason(command.value.reason)',
@@ -435,6 +438,26 @@ for (const fragment of [
   'canManage || !capabilities.canExecute',
   'Idempotency-Key',
 ]) assert.ok(jobRoute.includes(fragment), `Print-job route missing ${fragment}`)
+
+const physicalOutputAuthorization = read(
+  'app_src/lib/operations/physicalOutputAttestationAuthorization.ts',
+)
+for (const fragment of [
+  "'magic_code'",
+  "'google_sso'",
+  "'operator_password'",
+  'session.legacy !== true',
+  '!session.impersonating',
+  'session.impersonationStartedAt === null',
+  'session.impersonationExpiresAt === null',
+  'session.authenticatedUser === session.effectiveUser',
+  'session.authenticatedUser === actor.email',
+  'session.activeWorkspaceOrganizationId === organizationId',
+  'session.activeWorkspaceRole === effectiveAuthorizationRole(actor)',
+]) assert.ok(
+  physicalOutputAuthorization.includes(fragment),
+  `Physical-output browser-session authorization missing ${fragment}`,
+)
 
 const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
 assert.ok(
@@ -547,6 +570,7 @@ for (const fragment of [
   'Confirm physical paper output',
   'expectedDeliveryAttemptId',
   'expectedDeliveryAttemptSequenceNumber',
+  'canVerifyPhysicalOutput',
   'Reprint shipping label',
   'Reprints reuse this stored label document and never purchase new postage.',
   'the original carrier-label document was not imported into ClawPilot',
@@ -560,7 +584,9 @@ for (const fragment of [
   'label.global_id AS source_label_global_id',
   'original.global_id AS reprint_of_job_global_id',
   'operations_print_physical_output_attestations physical_output',
+  'physical_output.delivered_at AS physical_output_delivered_at',
   'physicalOutputAttestation: item.physical_output_verified_at',
+  'deliveredAt: item.physical_output_delivered_at.toISOString()',
   'labelPrintJobs: labelPrintJobResult.rows.map',
 ]) assert.ok(
   operationsPersistence.includes(fragment),
