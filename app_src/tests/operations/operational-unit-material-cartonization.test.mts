@@ -4,7 +4,14 @@ import test from 'node:test'
 import {
   planOperationalUnitMaterialPackages,
   planShopifyCheckoutUnitMaterialPackages,
+  type OperationalUnitMaterialPlan,
 } from '../../lib/operations/operationalUnitMaterialCartonization.ts'
+import {
+  reconcileOperationalMixedMaterialPlans,
+} from '../../lib/operations/operationalMixedMaterialCartonization.ts'
+import type {
+  OperationalGeometryRatePlan,
+} from '../../lib/operations/operationalGeometryCartonization.ts'
 import type {
   HybridCartonizationLine,
   HybridCartonizationMaterial,
@@ -719,7 +726,7 @@ test('bounded shared-stock fallback is invariant to line and material input perm
   assert.deepEqual(run(false), run(true))
 })
 
-test('bounded fallback subtracts recipe material usage before matching residual units', () => {
+test('bounded fallback subtracts recipe and joint reservations before matching residual units', () => {
   const lines = Array.from({ length: 2 }, (_, index) => ({
     ...line,
     lineGlobalId: `gcol-recipe-bound-${index}`,
@@ -743,6 +750,10 @@ test('bounded fallback subtracts recipe material usage before matching residual 
       fitModel: 'unconstrained_unit' as const,
     })),
     recipePackages,
+    reservedMaterialUsage: [{
+      materialGlobalId: recipeMaterialId,
+      quantity: 1,
+    }],
     inventoryProducts: lines.map((item) => ({
       ...inventory(25)[0],
       productGlobalId: item.productGlobalId,
@@ -750,7 +761,7 @@ test('bounded fallback subtracts recipe material usage before matching residual 
     materials: Array.from({ length: 4 }, (_, index) => material({
       globalId: `gmat-recipe-bound-${index}`,
       inner: { length: 100, width: 100, height: 50 },
-      available: index === 0 ? 15 : index === 1 ? 13 : 12,
+      available: index === 0 ? 16 : index === 1 ? 13 : 12,
       unitCostMinor: index + 1,
     })),
     startingSequence: 3,
@@ -968,5 +979,276 @@ test('checkout unit-material planning rejects order-commitment authority substit
   assert.equal(
     result.blocker.code,
     'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_INVENTORY_REQUIRED',
+  )
+})
+
+function mixedReadyUnitPlan(
+  materialGlobalIds: string[],
+): OperationalUnitMaterialPlan {
+  return {
+    status: 'ready',
+    packages: materialGlobalIds.map((materialGlobalId, index) => ({
+      packagingMaterialGlobalId: materialGlobalId,
+      packageKey: `unit-${materialGlobalId}-${index}`,
+    })),
+  } as unknown as OperationalUnitMaterialPlan
+}
+
+function mixedBlockedUnitPlan(): OperationalUnitMaterialPlan {
+  return {
+    status: 'blocked',
+    packages: [],
+    blocker: {
+      code: 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_CAPACITY_REQUIRED',
+      detail: 'The reserved carton stock cannot carry the ordinary units.',
+    },
+  }
+}
+
+function mixedReadyGeometryPlan(
+  materialGlobalIds: string[],
+): OperationalGeometryRatePlan {
+  return {
+    status: 'ready',
+    packages: materialGlobalIds.map((materialGlobalId, index) => ({
+      packagingMaterialGlobalId: materialGlobalId,
+      packageKey: `geometry-${materialGlobalId}-${index}`,
+    })),
+  } as unknown as OperationalGeometryRatePlan
+}
+
+function mixedBlockedGeometryPlan(): OperationalGeometryRatePlan {
+  return {
+    status: 'blocked',
+    blocker: {
+      code: 'CARTONIZATION_RATE_EVIDENCE_OR_TOOLS_RESULT_REQUIRED',
+      detail: 'No rigid carton remains after shared-stock reservations.',
+    },
+  }
+}
+
+function usageMap(
+  usage: Array<{ materialGlobalId: string; quantity: number }>,
+) {
+  return new Map(usage.map((item) => [
+    item.materialGlobalId,
+    item.quantity,
+  ]))
+}
+
+test('mixed reconciliation reserves the only rigid carton and moves the ordinary unit to its smaller alternate', async () => {
+  const run = (reverseInputs: boolean) => {
+    const large = material({
+      globalId: 'large-a',
+      inner: { length: 1000, width: 1000, height: 1000 },
+      available: 1,
+    })
+    const small = material({
+      globalId: 'small-b',
+      inner: { length: 10, width: 10, height: 10 },
+      available: 1,
+    })
+    const materials = reverseInputs ? [small, large] : [large, small]
+    const planOrdinary = ({
+      reservedMaterialUsage,
+      maximumPackages,
+    }: {
+      reservedMaterialUsage: Array<{
+        materialGlobalId: string
+        quantity: number
+      }>
+      maximumPackages: number
+    }) => planOperationalUnitMaterialPackages({
+      ...baseInput,
+      lines: [{
+        ...line,
+        quantity: 1,
+        unitDimensionsMm: null,
+        unitDimensionsAuthority: null,
+      }],
+      fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 1 }],
+      materials,
+      inventoryProducts: inventory(1),
+      reservedMaterialUsage,
+      maximumPackages,
+    })
+    const ordinaryPreferred = planOrdinary({
+      reservedMaterialUsage: [],
+      maximumPackages: 2,
+    })
+    assert.equal(ordinaryPreferred.status, 'ready')
+    if (ordinaryPreferred.status === 'ready') {
+      assert.equal(
+        ordinaryPreferred.packages[0].packagingMaterialGlobalId,
+        'large-a',
+        'The factual ordinary-unit policy must exercise the large-carton conflict',
+      )
+    }
+    return reconcileOperationalMixedMaterialPlans({
+      maximumPackages: 2,
+      materialCapacities: (reverseInputs
+        ? [{ materialGlobalId: 'small-b', quantity: 1 },
+            { materialGlobalId: 'large-a', quantity: 1 }]
+        : [{ materialGlobalId: 'large-a', quantity: 1 },
+            { materialGlobalId: 'small-b', quantity: 1 }]),
+      planUnit: planOrdinary,
+      async planGeometry({
+        reservedMaterialUsage,
+        maximumPackages,
+      }) {
+        assert.ok(maximumPackages >= 1)
+        return usageMap(reservedMaterialUsage).has('large-a')
+          ? mixedBlockedGeometryPlan()
+          : mixedReadyGeometryPlan(['large-a'])
+      },
+    })
+  }
+  const first = await run(false)
+  const permuted = await run(true)
+  assert.equal(first.status, 'ready')
+  assert.equal(permuted.status, 'ready')
+  if (first.status !== 'ready' || permuted.status !== 'ready') return
+  assert.equal(
+    first.evidence.solver,
+    'bounded_geometry_material_conflict_backtracking',
+  )
+  assert.deepEqual(first.evidence.unitMaterialUsage, [{
+    materialGlobalId: 'small-b',
+    quantity: 1,
+  }])
+  assert.deepEqual(first.evidence.geometryMaterialUsage, [{
+    materialGlobalId: 'large-a',
+    quantity: 1,
+  }])
+  assert.deepEqual(first.evidence.combinedMaterialUsage, [{
+    materialGlobalId: 'large-a',
+    quantity: 1,
+  }, {
+    materialGlobalId: 'small-b',
+    quantity: 1,
+  }])
+  const {
+    decisionHash,
+    ...decisionEvidence
+  } = first.evidence
+  assert.match(first.evidence.decisionHash, /^[a-f0-9]{64}$/u)
+  assert.equal(
+    decisionHash,
+    persistenceCanonicalHash(decisionEvidence),
+    'The retained decision hash must seal the complete shared-stock allocation',
+  )
+  assert.notEqual(
+    decisionHash,
+    persistenceCanonicalHash({
+      ...decisionEvidence,
+      materialCapacities: [{
+        materialGlobalId: 'large-a',
+        quantity: 2,
+      }, ...decisionEvidence.materialCapacities.slice(1)],
+    }),
+    'A stock-capacity change must change the joint allocation hash',
+  )
+  assert.equal(
+    first.evidence.decisionHash,
+    permuted.evidence.decisionHash,
+    'Joint stock evidence must be invariant to material-capacity input order',
+  )
+})
+
+test('mixed reconciliation deterministically branches past mutually greedy ordinary and geometry choices', async () => {
+  const result = await reconcileOperationalMixedMaterialPlans({
+    maximumPackages: 3,
+    materialCapacities: [
+      { materialGlobalId: 'a', quantity: 1 },
+      { materialGlobalId: 'b', quantity: 1 },
+      { materialGlobalId: 'c', quantity: 1 },
+    ],
+    planUnit({ reservedMaterialUsage }) {
+      const reserved = usageMap(reservedMaterialUsage)
+      if (reserved.size === 0) return mixedReadyUnitPlan(['a', 'b'])
+      if (reserved.has('a')) return mixedBlockedUnitPlan()
+      if (reserved.has('b')) return mixedReadyUnitPlan(['a', 'c'])
+      return mixedBlockedUnitPlan()
+    },
+    async planGeometry({ reservedMaterialUsage }) {
+      const reserved = usageMap(reservedMaterialUsage)
+      if (!reserved.has('a')) return mixedReadyGeometryPlan(['a'])
+      if (!reserved.has('b')) return mixedReadyGeometryPlan(['b'])
+      return mixedBlockedGeometryPlan()
+    },
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.evidence.backtrackStatesEvaluated, 2)
+  assert.deepEqual(result.evidence.unitMaterialUsage, [{
+    materialGlobalId: 'a',
+    quantity: 1,
+  }, {
+    materialGlobalId: 'c',
+    quantity: 1,
+  }])
+  assert.deepEqual(result.evidence.geometryMaterialUsage, [{
+    materialGlobalId: 'b',
+    quantity: 1,
+  }])
+  assert.deepEqual(result.evidence.combinedMaterialUsage, [{
+    materialGlobalId: 'a',
+    quantity: 1,
+  }, {
+    materialGlobalId: 'b',
+    quantity: 1,
+  }, {
+    materialGlobalId: 'c',
+    quantity: 1,
+  }])
+})
+
+test('mixed reconciliation fails closed before exceeding its shared geometry-search deadline', async () => {
+  let geometryCalled = false
+  const result = await reconcileOperationalMixedMaterialPlans({
+    maximumPackages: 2,
+    materialCapacities: [{
+      materialGlobalId: 'large-a',
+      quantity: 2,
+    }],
+    geometrySearchDeadlineAtMs: Date.now() - 1,
+    planUnit: () => mixedReadyUnitPlan(['large-a']),
+    async planGeometry() {
+      geometryCalled = true
+      return mixedReadyGeometryPlan(['large-a'])
+    },
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_MIXED_MATERIAL_SEARCH_DEADLINE_EXCEEDED',
+  )
+  assert.equal(geometryCalled, false)
+})
+
+test('mixed reconciliation preserves an unreserved geometry root blocker', async () => {
+  const result = await reconcileOperationalMixedMaterialPlans({
+    maximumPackages: 2,
+    materialCapacities: [{
+      materialGlobalId: 'large-a',
+      quantity: 2,
+    }],
+    planUnit: () => mixedReadyUnitPlan(['large-a']),
+    async planGeometry() {
+      return {
+        status: 'blocked',
+        blocker: {
+          code: 'CARTONIZATION_RATE_EVIDENCE_OPTIMIZER_REQUIRED',
+          detail: 'The operational optimizer is not configured.',
+        },
+      }
+    },
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_OPTIMIZER_REQUIRED',
   )
 })

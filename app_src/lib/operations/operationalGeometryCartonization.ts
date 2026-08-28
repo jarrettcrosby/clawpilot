@@ -168,10 +168,11 @@ export async function planOperationalGeometryRatePackages(input: {
   lines: HybridCartonizationLine[]
   fallbackLines: HybridCartonizationResult['geometryFallbackLines']
   recipePackages: HybridRecipePackage[]
-  preplannedMaterialUsage: Array<{
+  reservedMaterialUsage: Array<{
     materialGlobalId: string
     quantity: number
   }>
+  simulatedMaterialAvailableQuantity?: number
   materials: HybridCartonizationMaterial[]
   inventoryProducts: InventoryProductEvidence[]
   availabilityMode?: 'operational' | 'shadow_training_simulated'
@@ -244,11 +245,11 @@ export async function planOperationalGeometryRatePackages(input: {
   }
 
   const usedMaterialQuantity = recipeMaterialUsage(input.recipePackages)
-  const preplannedMaterialIds = new Set<string>()
-  for (const usage of input.preplannedMaterialUsage) {
+  const reservedMaterialIds = new Set<string>()
+  for (const usage of input.reservedMaterialUsage) {
     if (
       !usage.materialGlobalId
-      || preplannedMaterialIds.has(usage.materialGlobalId)
+      || reservedMaterialIds.has(usage.materialGlobalId)
       || !positiveInteger(usage.quantity)
       || !input.materials.some((material) => (
         material.materialGlobalId === usage.materialGlobalId
@@ -256,19 +257,31 @@ export async function planOperationalGeometryRatePackages(input: {
     ) {
       return blocked(
         'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_USAGE_INVALID',
-        'Preplanned packages must retain one positive, unique material-usage count for selected factual stock.',
+        'Joint cartonization reservations require one positive, unique material-usage count for selected factual stock.',
       )
     }
-    preplannedMaterialIds.add(usage.materialGlobalId)
+    reservedMaterialIds.add(usage.materialGlobalId)
     const next = (usedMaterialQuantity.get(usage.materialGlobalId) || 0)
       + usage.quantity
     if (!Number.isSafeInteger(next)) {
       return blocked(
         'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_USAGE_INVALID',
-        'Preplanned package material usage exceeds the integer-safe stock boundary.',
+        'Joint cartonization material usage exceeds the integer-safe stock boundary.',
       )
     }
     usedMaterialQuantity.set(usage.materialGlobalId, next)
+  }
+  const simulatedMaterialAvailableQuantity = shadowTraining
+    ? input.simulatedMaterialAvailableQuantity ?? fallbackUnitCount
+    : null
+  if (
+    shadowTraining
+    && !positiveInteger(simulatedMaterialAvailableQuantity)
+  ) {
+    return blocked(
+      'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_USAGE_INVALID',
+      'Shadow-training joint cartonization requires one positive simulated material-stock boundary.',
+    )
   }
   const invalidMaterial = input.materials.find((material) => {
     const type = materialFamily(material.materialType)
@@ -325,7 +338,7 @@ export async function planOperationalGeometryRatePackages(input: {
         || !positiveInteger(materialCostMinor)
       ) return []
       const available = shadowTraining
-        ? fallbackUnitCount
+        ? Number(simulatedMaterialAvailableQuantity)
         : Number(material.availableQuantity)
           - (usedMaterialQuantity.get(material.materialGlobalId) || 0)
       if (!positiveInteger(available)) return []
@@ -422,7 +435,7 @@ export async function planOperationalGeometryRatePackages(input: {
     availabilityMode: input.availabilityMode || 'operational',
     fallbackLines: input.fallbackLines,
     recipePackageKeys: input.recipePackages.map((item) => item.packageKey),
-    preplannedMaterialUsage: [...input.preplannedMaterialUsage].sort(
+    reservedMaterialUsage: [...input.reservedMaterialUsage].sort(
       (left, right) => (
         left.materialGlobalId.localeCompare(right.materialGlobalId)
       ),

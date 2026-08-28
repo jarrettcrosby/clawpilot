@@ -745,6 +745,11 @@ export type OperationalUnitMaterialPlanInput = {
   lines: HybridCartonizationLine[]
   fallbackLines: HybridCartonizationResult['geometryFallbackLines']
   recipePackages: HybridRecipePackage[]
+  reservedMaterialUsage?: Array<{
+    materialGlobalId: string
+    quantity: number
+  }>
+  simulatedMaterialAvailableQuantity?: number
   materials: HybridCartonizationMaterial[]
   inventoryProducts: OperationalUnitMaterialInventoryProductEvidence[]
   availabilityMode?:
@@ -850,12 +855,52 @@ export function planOperationalUnitMaterialPackages(
   }
 
   const usedMaterials = recipeMaterialUsage(input.recipePackages)
+  const reservedMaterialIds = new Set<string>()
+  for (const usage of input.reservedMaterialUsage || []) {
+    if (
+      !usage.materialGlobalId
+      || reservedMaterialIds.has(usage.materialGlobalId)
+      || !positiveInteger(usage.quantity)
+      || !input.materials.some((material) => (
+        material.materialGlobalId === usage.materialGlobalId
+      ))
+    ) {
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_RESERVATION_INVALID',
+        'Joint cartonization reservations require one positive, unique count for selected factual material stock.',
+      )
+    }
+    reservedMaterialIds.add(usage.materialGlobalId)
+    const next = (usedMaterials.get(usage.materialGlobalId) || 0)
+      + usage.quantity
+    if (!Number.isSafeInteger(next)) {
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_RESERVATION_INVALID',
+        'Joint cartonization material reservations exceed the integer-safe stock boundary.',
+      )
+    }
+    usedMaterials.set(usage.materialGlobalId, next)
+  }
+  const simulatedMaterialAvailableQuantity = shadowTraining
+    ? input.simulatedMaterialAvailableQuantity ?? unitCount
+    : null
+  if (
+    shadowTraining
+    && !positiveInteger(simulatedMaterialAvailableQuantity)
+  ) {
+    return blocked(
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_RESERVATION_INVALID',
+      'Shadow-training joint cartonization requires one positive simulated material-stock boundary.',
+    )
+  }
   const materialRemaining = new Map<string, number>()
   const materials = input.materials.flatMap((material) => {
     const inner = material.innerDimensionsMm
     const outer = material.ratedOuterDimensionsMm
     const available = (
-      shadowTraining ? unitCount : Number(material.availableQuantity)
+      shadowTraining
+        ? Number(simulatedMaterialAvailableQuantity)
+        : Number(material.availableQuantity)
     ) - (usedMaterials.get(material.materialGlobalId) || 0)
     if (
       material.status !== 'active'

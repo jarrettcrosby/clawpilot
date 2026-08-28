@@ -34,6 +34,9 @@ import {
   planOperationalGeometryRatePackages,
 } from '@/lib/operations/operationalGeometryCartonization'
 import {
+  reconcileOperationalMixedMaterialPlans,
+} from '@/lib/operations/operationalMixedMaterialCartonization'
+import {
   planOperationalUnitMaterialPackages,
 } from '@/lib/operations/operationalUnitMaterialCartonization'
 import {
@@ -86,6 +89,7 @@ export const maxDuration = 60
 const EVIDENCE_GLOBAL_ID = /^gcte(?:[0-9]{7}|[0-9a-v]{12})$/
 const MAX_REQUEST_BYTES = 32 * 1024
 const MAX_SELECTED_MATERIALS = 8
+const MIXED_MATERIAL_GEOMETRY_SEARCH_BUDGET_MS = 20_000
 const MILLIMETERS_PER_INCH = 25.4
 const GRAMS_PER_POUND = 453.59237
 
@@ -1010,30 +1014,143 @@ export async function POST(req: NextRequest) {
     const geometryProfileFallbackLines = plan.geometryFallbackLines.filter(
       (line) => line.fitModel !== 'unconstrained_unit',
     )
+    const operationalAvailabilityMode = request.shadowTraining
+      ? 'shadow_training_simulated' as const
+      : 'operational' as const
+    const residualPackageLimit =
+      MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
+        - plan.recipePackages.length
+    const fallbackPackageSequence = (
+      Math.max(
+        0,
+        ...plan.recipePackages.map((item) => item.sequence),
+      ) + 1
+    )
+    const simulatedMaterialAvailableQuantity = request.shadowTraining
+      ? plan.recipePackages.length + plan.geometryFallbackLines.reduce(
+          (total, line) => total + line.quantity,
+          0,
+        )
+      : undefined
+    const recipeMaterialUsageById = new Map<string, number>()
+    for (const packagePlan of plan.recipePackages) {
+      recipeMaterialUsageById.set(
+        packagePlan.packagingMaterialGlobalId,
+        (recipeMaterialUsageById.get(
+          packagePlan.packagingMaterialGlobalId,
+        ) || 0) + 1,
+      )
+    }
+    const mixedMaterialCapacities = read.input.materials.map((material) => ({
+      materialGlobalId: material.materialGlobalId,
+      quantity: (
+        request.shadowTraining
+          ? Number(simulatedMaterialAvailableQuantity)
+          : Number(material.availableQuantity)
+      ) - (recipeMaterialUsageById.get(material.materialGlobalId) || 0),
+    }))
+    const planUnitMaterial = (input: {
+      reservedMaterialUsage: Array<{
+        materialGlobalId: string
+        quantity: number
+      }>
+      maximumPackages: number
+    }) => planOperationalUnitMaterialPackages({
+      provider: read.account.provider,
+      lines: read.input.lines,
+      fallbackLines: unitMaterialFallbackLines,
+      recipePackages: plan.recipePackages,
+      reservedMaterialUsage: input.reservedMaterialUsage,
+      simulatedMaterialAvailableQuantity,
+      materials: read.input.materials,
+      inventoryProducts: read.inventory.products,
+      availabilityMode: operationalAvailabilityMode,
+      startingSequence: fallbackPackageSequence,
+      maximumPackages: input.maximumPackages,
+    })
+    let optimizer = null
+    if (
+      request.evidenceMode === 'operational'
+      && geometryProfileFallbackLines.length > 0
+    ) {
+      try {
+        optimizer = configuredOrToolsFulfillmentOptimizer()
+      } catch {
+        // The operational planner returns a fail-closed configuration blocker.
+      }
+    }
+    const planGeometry = (input: {
+      reservedMaterialUsage: Array<{
+        materialGlobalId: string
+        quantity: number
+      }>
+      maximumPackages: number
+      precedingUnitPackageCount: number
+      optimizerDeadlineMs?: number
+    }) => planOperationalGeometryRatePackages({
+      organizationGlobalId: read.organizationGlobalId,
+      provider: read.account.provider,
+      candidateGlobalId: read.candidate.globalId,
+      candidateRowVersion: read.candidate.rowVersion,
+      currency: read.candidate.currency,
+      readAt: read.readAt,
+      warehouseGlobalId: read.warehouse.globalId,
+      lines: read.input.lines,
+      fallbackLines: geometryProfileFallbackLines,
+      recipePackages: plan.recipePackages,
+      reservedMaterialUsage: input.reservedMaterialUsage,
+      simulatedMaterialAvailableQuantity,
+      materials: read.input.materials,
+      inventoryProducts: read.inventory.products,
+      availabilityMode: operationalAvailabilityMode,
+      startingSequence:
+        fallbackPackageSequence + input.precedingUnitPackageCount,
+      maximumPackages: input.maximumPackages,
+      optimizer,
+      ...(input.optimizerDeadlineMs === undefined
+        ? {}
+        : {
+            options: {
+              deadlineMs: input.optimizerDeadlineMs,
+              maxCandidates: 8,
+            },
+          }),
+    })
     let operationalUnitMaterialPlan = null
+    let operationalGeometryRatePlan = null
+    let operationalMixedMaterialAllocation = null
     if (
       request.evidenceMode === 'operational'
       && unitMaterialFallbackLines.length > 0
+      && geometryProfileFallbackLines.length > 0
     ) {
-      operationalUnitMaterialPlan = planOperationalUnitMaterialPackages({
-        provider: read.account.provider,
-        lines: read.input.lines,
-        fallbackLines: unitMaterialFallbackLines,
-        recipePackages: plan.recipePackages,
-        materials: read.input.materials,
-        inventoryProducts: read.inventory.products,
-        availabilityMode: request.shadowTraining
-          ? 'shadow_training_simulated'
-          : 'operational',
-        startingSequence: (
-          Math.max(
-            0,
-            ...plan.recipePackages.map((item) => item.sequence),
-          ) + 1
-        ),
-        maximumPackages:
-          MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
-            - plan.recipePackages.length,
+      const reconciled = await reconcileOperationalMixedMaterialPlans({
+        maximumPackages: residualPackageLimit,
+        materialCapacities: mixedMaterialCapacities,
+        geometrySearchDeadlineAtMs:
+          Date.now() + MIXED_MATERIAL_GEOMETRY_SEARCH_BUDGET_MS,
+        planUnit: planUnitMaterial,
+        planGeometry,
+      })
+      if (reconciled.status === 'blocked') {
+        throw new RateEvidenceRequestError(
+          reconciled.blocker.detail,
+          422,
+          reconciled.blocker.code,
+        )
+      }
+      operationalUnitMaterialPlan = reconciled.unitPlan
+      operationalGeometryRatePlan = reconciled.geometryPlan
+      operationalMixedMaterialAllocation = reconciled.evidence
+    }
+    if (
+      request.evidenceMode === 'operational'
+      && unitMaterialFallbackLines.length > 0
+      && geometryProfileFallbackLines.length === 0
+    ) {
+      operationalUnitMaterialPlan = planUnitMaterial({
+        reservedMaterialUsage: [],
+        maximumPackages: residualPackageLimit,
       })
       if (operationalUnitMaterialPlan.status === 'blocked') {
         throw new RateEvidenceRequestError(
@@ -1043,72 +1160,16 @@ export async function POST(req: NextRequest) {
         )
       }
     }
-    let operationalGeometryRatePlan = null
     if (
       request.evidenceMode === 'operational'
+      && unitMaterialFallbackLines.length === 0
       && geometryProfileFallbackLines.length > 0
     ) {
-      const preplannedMaterialUsageById = new Map<string, number>()
-      for (const packagePlan of operationalUnitMaterialPlan?.status === 'ready'
-        ? operationalUnitMaterialPlan.packages
-        : []) {
-        preplannedMaterialUsageById.set(
-          packagePlan.packagingMaterialGlobalId,
-          (preplannedMaterialUsageById.get(
-            packagePlan.packagingMaterialGlobalId,
-          ) || 0) + 1,
-        )
-      }
-      let optimizer = null
-      try {
-        optimizer = configuredOrToolsFulfillmentOptimizer()
-      } catch {
-        // The operational planner returns a fail-closed configuration blocker.
-      }
-      operationalGeometryRatePlan =
-        await planOperationalGeometryRatePackages({
-          organizationGlobalId: read.organizationGlobalId,
-          provider: read.account.provider,
-          candidateGlobalId: read.candidate.globalId,
-          candidateRowVersion: read.candidate.rowVersion,
-          currency: read.candidate.currency,
-          readAt: read.readAt,
-          warehouseGlobalId: read.warehouse.globalId,
-          lines: read.input.lines,
-          fallbackLines: geometryProfileFallbackLines,
-          recipePackages: plan.recipePackages,
-          preplannedMaterialUsage: [...preplannedMaterialUsageById]
-            .map(([materialGlobalId, quantity]) => ({
-              materialGlobalId,
-              quantity,
-            }))
-            .sort((left, right) => (
-              left.materialGlobalId.localeCompare(right.materialGlobalId)
-            )),
-          materials: read.input.materials,
-          inventoryProducts: read.inventory.products,
-          availabilityMode: request.shadowTraining
-            ? 'shadow_training_simulated'
-            : 'operational',
-          startingSequence: (
-            Math.max(
-              0,
-              ...plan.recipePackages.map((item) => item.sequence),
-              ...(operationalUnitMaterialPlan?.status === 'ready'
-                ? operationalUnitMaterialPlan.packages.map(
-                    (item) => item.packageSequence,
-                  )
-                : []),
-            ) + 1
-          ),
-          maximumPackages:
-            MAX_CARTONIZATION_RATE_EVIDENCE_PACKAGES
-              - plan.recipePackages.length
-              - (operationalUnitMaterialPlan?.status === 'ready'
-                ? operationalUnitMaterialPlan.packages.length
-                : 0),
-          optimizer,
-        })
+      operationalGeometryRatePlan = await planGeometry({
+        reservedMaterialUsage: [],
+        maximumPackages: residualPackageLimit,
+        precedingUnitPackageCount: 0,
+      })
       if (operationalGeometryRatePlan.status === 'blocked') {
         throw new RateEvidenceRequestError(
           operationalGeometryRatePlan.blocker.detail,
@@ -1686,6 +1747,7 @@ export async function POST(req: NextRequest) {
               packages: operationalUnitMaterialPlan.packages,
             }
           : null,
+      operationalMixedMaterialAllocation,
       assumptions: plan.assumptions,
       blockers: plan.blockers,
       ...(request.shadowTraining
