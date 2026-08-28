@@ -651,6 +651,7 @@ export type OperationsOrderListItem = {
   customerGlobalId: string
   sourceProvider: string
   status: OperationsOrderStatus
+  externallyFulfilled: boolean
   warehouseName: string | null
   promisedDeliveryAt: string | null
   lineCount: number
@@ -777,6 +778,7 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     accountGlobalId: string
     candidateGlobalId: string
     candidateRowVersion: number
+    testOrder: boolean
   } | null
   fulfillmentNotificationPolicy:
     | {
@@ -870,6 +872,20 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     oneOffCarrierGroupGlobalId: string | null
     shippedAt: string
   }>
+  externalFulfillment: {
+    reconciliationGlobalId: string
+    provider: 'shopify'
+    providerFulfillmentId: string
+    providerFulfillmentName: string
+    fulfilledAt: string
+    reconciledAt: string
+    tracking: Array<{
+      company: string | null
+      number: string | null
+      url: string | null
+    }>
+    exactLabelArtifactAvailable: boolean
+  } | null
   trackingObservations: Array<{
     globalId: string
     shipmentGlobalId: string
@@ -883,6 +899,8 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     globalId: string
     packageGlobalId: string | null
     shipmentGlobalId: string | null
+    externalFulfillmentReconciliationGlobalId: string | null
+    externalTrackingNumber: string | null
     documentType: 'shipping_label' | 'packing_slip'
     documentKind:
       | 'shipping_label'
@@ -894,6 +912,16 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     filename: string | null
     contentUrl: string | null
     createdAt: string
+  }>
+  labelPrintJobs: Array<{
+    globalId: string
+    sourceLabelGlobalId: string | null
+    sourceArtifactGlobalId: string
+    status: 'queued' | 'claimed' | 'delivered' | 'failed' | 'cancelled' | 'printed' | 'rerouted'
+    reprintOfJobGlobalId: string | null
+    createdAt: string
+    deliveredAt: string | null
+    lastError: string | null
   }>
   commerceExports: Array<{
     globalId: string
@@ -1158,6 +1186,7 @@ export type OperationsImportedOrderWorkingCopy = {
     title: string
     sku: string | null
     quantity: number
+    unitMultiplier: number
     requiresShipping: boolean
     mappingStatus:
       | 'unresolved'

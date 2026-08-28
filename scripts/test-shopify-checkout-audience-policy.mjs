@@ -239,9 +239,9 @@ requireAll(panel, [
   'Retry exact pending save',
   'Eligible restricted customers',
   'const callbackServingReady = Boolean(',
-  'new authenticated ClawPilot callback returns an empty 200',
-  'prior successful customer-neutral rate response for up to 15 minutes',
-  'exactly mapped shippable item',
+  'Confirm checkout rates are off',
+  'Shopify may reuse a cached rate for up to 15 minutes.',
+  'Only mapped, in-stock items with usable packaging',
 ], 'checkout-audience UI')
 assert.doesNotMatch(
   panel,

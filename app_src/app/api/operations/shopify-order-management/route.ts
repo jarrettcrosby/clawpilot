@@ -26,6 +26,8 @@ const AUTHORIZATION_GLOBAL_ID = /^gsom(?:[0-9]{7}|[0-9a-v]{12})$/u
 const ATTEMPT_GLOBAL_ID = /^gsoa(?:[0-9]{7}|[0-9a-v]{12})$/u
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]{0,20}$/u
 const LINE_ITEM_GID = /^gid:\/\/shopify\/LineItem\/[1-9][0-9]{0,20}$/u
+const FULFILLMENT_GID =
+  /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]{0,20}$/u
 const SHOPIFY_DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/u
 const SHA256 = /^[a-f0-9]{64}$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
@@ -127,6 +129,15 @@ function rowVersion(value: unknown) {
 
 function reason(value: unknown) {
   return boundedText(value, 'Authorization reason', 500, 10)
+}
+
+function isoInstant(value: unknown, label: string) {
+  const normalized = boundedText(value, label, 64)
+  const parsed = new Date(normalized)
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== normalized) {
+    fail('SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID', `${label} is invalid`)
+  }
+  return normalized
 }
 
 function nullableField(
@@ -250,6 +261,34 @@ function mutation(value: unknown) {
     }
     return Object.freeze({ kind, tag })
   }
+  if (kind === 'cancel_fulfillment') {
+    exactFields(input, [
+      'kind', 'fulfillmentId', 'expectedFulfillmentUpdatedAt',
+    ])
+    return Object.freeze({
+      kind,
+      fulfillmentId: exactId(
+        input.fulfillmentId,
+        'Shopify fulfillment',
+        FULFILLMENT_GID,
+      ),
+      expectedFulfillmentUpdatedAt: isoInstant(
+        input.expectedFulfillmentUpdatedAt,
+        'Shopify fulfillment update time',
+      ),
+    })
+  }
+  if (kind === 'cancel_order_after_fulfillment_reversal') {
+    exactFields(input, ['kind', 'predecessorAuthorizationGlobalId'])
+    return Object.freeze({
+      kind,
+      predecessorAuthorizationGlobalId: exactId(
+        input.predecessorAuthorizationGlobalId,
+        'Shopify fulfillment-reversal authorization',
+        AUTHORIZATION_GLOBAL_ID,
+      ),
+    })
+  }
   if (kind === 'cancel') {
     exactFields(input, ['kind'])
     return Object.freeze({ kind })
@@ -334,7 +373,7 @@ function mutation(value: unknown) {
   }
   fail(
     'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
-    'Supported Shopify actions are save order, add tag, cancel, and decrease quantity',
+    'Supported Shopify actions are save order, add tag, reverse fulfillment, cancel after reversal, cancel, and decrease quantity',
   )
 }
 
@@ -375,6 +414,35 @@ function resultText(value: unknown, maximum = 512) {
 function resultNullableText(value: unknown, maximum = 512) {
   if (value === null) return null
   return resultText(value, maximum)
+}
+
+function resultTrackingUrl(value: unknown) {
+  const candidate = resultNullableText(value, 2_048)
+  if (candidate === null) return null
+  let parsed: URL
+  try {
+    parsed = new URL(candidate)
+  } catch {
+    resultInvalid()
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    resultInvalid()
+  }
+  return candidate
+}
+
+function resultIsoInstant(value: unknown) {
+  const candidate = resultText(value, 64)
+  const parsed = new Date(candidate)
+  if (Number.isNaN(parsed.valueOf()) || parsed.toISOString() !== candidate) {
+    resultInvalid()
+  }
+  return candidate
+}
+
+function resultNullableIsoInstant(value: unknown) {
+  if (value === null) return null
+  return resultIsoInstant(value)
 }
 
 function resultNullableField(
@@ -432,7 +500,11 @@ function publicOpenAttempt(value: unknown) {
   const state = resultText(source.state, 32)
   const actionKind = resultText(source.actionKind, 40)
   if (!['processing', 'unknown'].includes(state)) resultInvalid()
-  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(actionKind)) {
+  if (![
+    'add_tag', 'cancel_fulfillment',
+    'cancel_order_after_fulfillment_reversal', 'cancel',
+    'set_line_quantity', 'save_order',
+  ].includes(actionKind)) {
     resultInvalid()
   }
   const intentHash = resultText(source.intentHash, 64)
@@ -463,6 +535,9 @@ function publicManagement(value: unknown) {
   const addTag = resultRecord(eligibility.addTag)
   const ordinarySave = resultRecord(eligibility.ordinarySave)
   const cancel = resultRecord(eligibility.cancel)
+  const cancelAfterFulfillmentReversal = resultRecord(
+    eligibility.cancelAfterFulfillmentReversal,
+  )
   if (
     typeof source.runtimeAvailable !== 'boolean'
     || typeof order.test !== 'boolean'
@@ -471,10 +546,17 @@ function publicManagement(value: unknown) {
     || typeof addTag.allowed !== 'boolean'
     || typeof ordinarySave.allowed !== 'boolean'
     || typeof cancel.allowed !== 'boolean'
+    || typeof cancel.releasesAuthorization !== 'boolean'
+    || typeof cancelAfterFulfillmentReversal.allowed !== 'boolean'
+    || typeof cancelAfterFulfillmentReversal.releasesAuthorization !== 'boolean'
     || !Array.isArray(order.tags)
     || order.tags.length > 250
     || !Array.isArray(order.lines)
     || order.lines.length > 250
+    || !Array.isArray(order.fulfillments)
+    || order.fulfillments.length > 50
+    || !Array.isArray(eligibility.fulfillments)
+    || eligibility.fulfillments.length > 50
     || !Array.isArray(eligibility.lineEdits)
     || eligibility.lineEdits.length > 250
   ) resultInvalid()
@@ -497,6 +579,54 @@ function publicManagement(value: unknown) {
       ),
     })
   })
+  const fulfillments = order.fulfillments.map((value) => {
+    const fulfillment = resultRecord(value)
+    if (
+      !Array.isArray(fulfillment.tracking)
+      || fulfillment.tracking.length > 10
+    ) resultInvalid()
+    return Object.freeze({
+      fulfillmentId: resultId(fulfillment.fulfillmentId, FULFILLMENT_GID),
+      name: resultText(fulfillment.name, 255),
+      status: resultText(fulfillment.status, 64),
+      displayStatus: resultNullableText(fulfillment.displayStatus, 64),
+      updatedAt: resultIsoInstant(fulfillment.updatedAt),
+      deliveredAt: resultNullableIsoInstant(fulfillment.deliveredAt),
+      quantity: resultInteger(fulfillment.quantity, 2_147_483_647),
+      tracking: Object.freeze(fulfillment.tracking.map((value) => {
+        const tracking = resultRecord(value)
+        return Object.freeze({
+          company: resultNullableText(tracking.company, 255),
+          number: resultNullableText(tracking.number, 255),
+          url: resultTrackingUrl(tracking.url),
+        })
+      })),
+    })
+  })
+  const fulfillmentEligibility = eligibility.fulfillments.map((value) => {
+    const fulfillment = resultRecord(value)
+    if (typeof fulfillment.allowed !== 'boolean') resultInvalid()
+    return Object.freeze({
+      fulfillmentId: resultId(fulfillment.fulfillmentId, FULFILLMENT_GID),
+      expectedUpdatedAt: resultIsoInstant(fulfillment.expectedUpdatedAt),
+      allowed: fulfillment.allowed,
+      reason: resultNullableText(fulfillment.reason, 512),
+    })
+  })
+  if (
+    fulfillments.length !== fulfillmentEligibility.length
+    || new Set(fulfillments.map((fulfillment) => fulfillment.fulfillmentId)).size
+      !== fulfillments.length
+    || new Set(fulfillmentEligibility.map((fulfillment) => (
+      fulfillment.fulfillmentId
+    ))).size !== fulfillmentEligibility.length
+    || fulfillments.some((fulfillment) => !fulfillmentEligibility.some(
+      (eligibility) => (
+        eligibility.fulfillmentId === fulfillment.fulfillmentId
+        && eligibility.expectedUpdatedAt === fulfillment.updatedAt
+      ),
+    ))
+  ) resultInvalid()
   const lineEdits = eligibility.lineEdits.map((value) => {
     const line = resultRecord(value)
     if (typeof line.allowed !== 'boolean') resultInvalid()
@@ -508,6 +638,16 @@ function publicManagement(value: unknown) {
       maxQuantity: resultInteger(line.maxQuantity, 2_147_483_647),
     })
   })
+  const postReversalPredecessor = cancelAfterFulfillmentReversal
+    .predecessorAuthorizationGlobalId === null
+    ? null
+    : resultId(
+        cancelAfterFulfillmentReversal.predecessorAuthorizationGlobalId,
+        AUTHORIZATION_GLOBAL_ID,
+      )
+  if (cancelAfterFulfillmentReversal.allowed && !postReversalPredecessor) {
+    resultInvalid()
+  }
   return Object.freeze({
     runtimeAvailable: source.runtimeAvailable,
     blockerCode: resultNullableText(source.blockerCode, 512),
@@ -534,6 +674,7 @@ function publicManagement(value: unknown) {
       shippingAddress: resultShippingAddress(order.shippingAddress),
       tags: Object.freeze(tags),
       lines: Object.freeze(lines),
+      fulfillments: Object.freeze(fulfillments),
     }),
     eligibility: Object.freeze({
       addTag: Object.freeze({
@@ -547,7 +688,19 @@ function publicManagement(value: unknown) {
       cancel: Object.freeze({
         allowed: cancel.allowed,
         reason: resultNullableText(cancel.reason, 512),
+        releasesAuthorization: cancel.releasesAuthorization,
       }),
+      cancelAfterFulfillmentReversal: Object.freeze({
+        allowed: cancelAfterFulfillmentReversal.allowed,
+        reason: resultNullableText(
+          cancelAfterFulfillmentReversal.reason,
+          512,
+        ),
+        releasesAuthorization:
+          cancelAfterFulfillmentReversal.releasesAuthorization,
+        predecessorAuthorizationGlobalId: postReversalPredecessor,
+      }),
+      fulfillments: Object.freeze(fulfillmentEligibility),
       lineEdits: Object.freeze(lineEdits),
     }),
     openAttempt: publicOpenAttempt(source.openAttempt),
@@ -564,9 +717,25 @@ function publicAuthorization(value: unknown) {
   ) resultInvalid()
   const preview = resultRecord(source.preview)
   const action = resultText(preview.action, 40)
-  if (!['add_tag', 'cancel', 'set_line_quantity', 'save_order'].includes(action)) {
+  if (![
+    'add_tag', 'cancel_fulfillment',
+    'cancel_order_after_fulfillment_reversal', 'cancel',
+    'set_line_quantity', 'save_order',
+  ].includes(action)) {
     resultInvalid()
   }
+  const predecessorAuthorizationGlobalId =
+    preview.predecessorAuthorizationGlobalId === null
+      ? null
+      : resultId(
+          preview.predecessorAuthorizationGlobalId,
+          AUTHORIZATION_GLOBAL_ID,
+        )
+  if (
+    action === 'cancel_order_after_fulfillment_reversal'
+      ? predecessorAuthorizationGlobalId === null
+      : predecessorAuthorizationGlobalId !== null
+  ) resultInvalid()
   return Object.freeze({
     authorizationGlobalId: resultId(
       source.authorizationGlobalId,
@@ -582,6 +751,13 @@ function publicAuthorization(value: unknown) {
       orderTest: preview.orderTest === true,
       orderUpdatedAt: resultText(preview.orderUpdatedAt, 64),
       action,
+      fulfillmentId: preview.fulfillmentId === null
+        ? null : resultId(preview.fulfillmentId, FULFILLMENT_GID),
+      expectedFulfillmentUpdatedAt:
+        preview.expectedFulfillmentUpdatedAt === null
+          ? null : resultIsoInstant(preview.expectedFulfillmentUpdatedAt),
+      predecessorAuthorizationGlobalId:
+        predecessorAuthorizationGlobalId,
       lineItemId: preview.lineItemId === null
         ? null : resultId(preview.lineItemId, LINE_ITEM_GID),
       previousQuantity: preview.previousQuantity === null

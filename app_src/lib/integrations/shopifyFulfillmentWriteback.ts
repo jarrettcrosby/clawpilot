@@ -28,6 +28,12 @@ import {
 import {
   requireLegacySandboxCommerceE2eFulfillmentWriteClaimInPostgres,
 } from '@/lib/persistence/sandboxCommerceE2eAuthorization'
+import {
+  assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres,
+} from '@/lib/persistence/shopifyReversalFixture'
+import {
+  SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN,
+} from '@/lib/integrations/shopifyReversalFixtureRuntime'
 
 const SHOPIFY_ORDER_GID = /^gid:\/\/shopify\/Order\/[1-9][0-9]*$/
 const SHOPIFY_FULFILLMENT_GID = /^gid:\/\/shopify\/Fulfillment\/[1-9][0-9]*$/
@@ -636,7 +642,7 @@ const FULFILLMENT_CREATE_MUTATION = `mutation ClawPilotFulfillmentCreate($fulfil
   }
 }`
 
-type ProviderWriteInput = {
+export type ShopifyFulfillmentProviderInput = {
   externalOrderId: string
   trackingNumbers: string[]
   carrier: string
@@ -644,6 +650,59 @@ type ProviderWriteInput = {
   expectedLineItems: Array<{ lineItemId: string; quantity: number }>
   sandboxE2eAuthorityKind: SandboxE2eAuthorityKind | null
   allowLegacySignatureWithoutAuthorityKind: boolean
+}
+
+/**
+ * Low-level preparation for a caller that already owns a separate durable
+ * provider-write claim. It performs one bounded Shopify read and returns the
+ * immutable signature that must be used for the later mutation or read-only
+ * reconciliation. It does not authorize a provider write by itself.
+ */
+export async function prepareShopifyFulfillmentProviderAttempt(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: {
+    externalOrderId: unknown
+    trackingNumbers: unknown
+    carrier: unknown
+    notifyCustomer: unknown
+    expectedLineItems: unknown
+  },
+): Promise<ShopifyFulfillmentWritebackPreparation & {
+  providerInput: ShopifyFulfillmentProviderInput
+}> {
+  if (typeof input.notifyCustomer !== 'boolean') {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_FULFILLMENT_NOTIFICATION_DECISION_REQUIRED',
+      'An explicit Shopify customer notification decision is required',
+    )
+  }
+  const providerInput: ShopifyFulfillmentProviderInput = {
+    externalOrderId: orderGid(input.externalOrderId),
+    trackingNumbers: normalizedTrackingNumbers(
+      undefined,
+      input.trackingNumbers,
+    ),
+    carrier: clean(input.carrier, 'Carrier', 64),
+    notifyCustomer: input.notifyCustomer,
+    expectedLineItems: normalizeExpectedLineItems(input.expectedLineItems),
+    sandboxE2eAuthorityKind: null,
+    allowLegacySignatureWithoutAuthorityKind: false,
+  }
+  const inspection = await inspectShopifyFulfillment(
+    credential,
+    providerInput,
+  )
+  const plan = deriveOpenFulfillmentPlan(inspection.order, providerInput)
+  requirePlanMatchesExpectedLines(plan, providerInput)
+  return {
+    providerInput,
+    signature: plan.signature,
+    existing: findExactExistingFulfillment(
+      inspection.fulfillments,
+      plan.signature,
+      providerInput,
+    ),
+  }
 }
 
 type ObservedFulfillment = {
@@ -670,11 +729,25 @@ type ShopifyFulfillmentInspection = {
 
 type OpenFulfillmentPlan = {
   signature: ShopifyFulfillmentAttemptSignature
-  lineItemsByFulfillmentOrder: Array<{
-    fulfillmentOrderId: string
-    fulfillmentOrderLineItems: Array<{ id: string; quantity: number }>
-  }>
 }
+
+type ShopifyFulfillmentCreateVariables = Readonly<{
+  fulfillment: Readonly<{
+    lineItemsByFulfillmentOrder: ReadonlyArray<Readonly<{
+      fulfillmentOrderId: string
+      fulfillmentOrderLineItems: ReadonlyArray<Readonly<{
+        id: string
+        quantity: number
+      }>>
+    }>>
+    notifyCustomer: boolean
+    trackingInfo: Readonly<{
+      company: string
+      number?: string
+      numbers?: ReadonlyArray<string>
+    }>
+  }>
+}>
 
 function providerShapeError(message: string): never {
   throw new ShopifyFulfillmentWritebackError(
@@ -971,7 +1044,7 @@ export function shopifyFulfillmentAttemptSignatureHashCandidates(
 
 function normalizeAttemptSignatureForInput(
   value: unknown,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   const normalized = normalizeAttemptSignature(value)
   const omittedAuthorityKind = Boolean(
@@ -1006,7 +1079,7 @@ function signaturesEqual(
 
 function requireSignatureMatchesInput(
   signature: ShopifyFulfillmentAttemptSignature,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   const requestShape = {
     externalOrderId: input.externalOrderId,
@@ -1034,7 +1107,7 @@ function requireSignatureMatchesInput(
 
 function deriveOpenFulfillmentPlan(
   order: Record<string, unknown>,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): OpenFulfillmentPlan {
   if (typeof order.canNotifyCustomer !== 'boolean') {
     return providerShapeError('Shopify returned malformed order.canNotifyCustomer')
@@ -1147,21 +1220,44 @@ function deriveOpenFulfillmentPlan(
     notifyCustomer: input.notifyCustomer,
     sandboxE2eAuthorityKind: input.sandboxE2eAuthorityKind,
   })
-  return {
-    signature,
-    lineItemsByFulfillmentOrder: signature.fulfillmentOrders.map((fulfillmentOrder) => ({
+  return { signature }
+}
+
+function exactFulfillmentCreateVariables(
+  signature: ShopifyFulfillmentAttemptSignature,
+): ShopifyFulfillmentCreateVariables {
+  const lineItemsByFulfillmentOrder = Object.freeze(
+    signature.fulfillmentOrders.map((fulfillmentOrder) => Object.freeze({
       fulfillmentOrderId: fulfillmentOrder.fulfillmentOrderId,
-      fulfillmentOrderLineItems: fulfillmentOrder.lineItems.map((line) => ({
-        id: line.fulfillmentOrderLineItemId,
-        quantity: line.quantity,
-      })),
+      fulfillmentOrderLineItems: Object.freeze(
+        fulfillmentOrder.lineItems.map((line) => Object.freeze({
+          id: line.fulfillmentOrderLineItemId,
+          quantity: line.quantity,
+        })),
+      ),
     })),
-  }
+  )
+  const trackingInfo = signature.trackingNumbers.length === 1
+    ? Object.freeze({
+      number: signature.trackingNumbers[0],
+      company: signature.carrier,
+    })
+    : Object.freeze({
+      numbers: Object.freeze([...signature.trackingNumbers]),
+      company: signature.carrier,
+    })
+  return Object.freeze({
+    fulfillment: Object.freeze({
+      lineItemsByFulfillmentOrder,
+      notifyCustomer: signature.notifyCustomer,
+      trackingInfo,
+    }),
+  })
 }
 
 function requirePlanMatchesExpectedLines(
   plan: OpenFulfillmentPlan,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ) {
   if (JSON.stringify(plan.signature.lineItems) !== JSON.stringify(input.expectedLineItems)) {
     throw new ShopifyFulfillmentWritebackError(
@@ -1283,7 +1379,7 @@ function observedMatchesSignature(
 function findExactExistingFulfillment(
   fulfillments: ObservedFulfillment[],
   signature: ShopifyFulfillmentAttemptSignature,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): ShopifyFulfillmentWritebackResult | null {
   const matches = fulfillments.filter((fulfillment) => (
     fulfillment.status === 'SUCCESS'
@@ -1305,11 +1401,13 @@ function findExactExistingFulfillment(
   }
 }
 
-export async function writeShopifyFulfillment(
+async function writeShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
-  attemptSignature?: unknown,
-  beforeProviderMutation?: () => Promise<void>,
+  input: ShopifyFulfillmentProviderInput,
+  attemptSignature: unknown,
+  beforeProviderMutation: (
+    variables: ShopifyFulfillmentCreateVariables,
+  ) => Promise<void>,
 ): Promise<ShopifyFulfillmentWritebackResult> {
   const suppliedSignature = attemptSignature === undefined
     ? null
@@ -1349,23 +1447,13 @@ export async function writeShopifyFulfillment(
     }
   }
   let mutation: FulfillmentCreateResponse
-  await beforeProviderMutation?.()
+  const variables = exactFulfillmentCreateVariables(plan.signature)
+  await beforeProviderMutation(variables)
   try {
     mutation = await shopifyAdminGraphql<FulfillmentCreateResponse>(credential, {
       query: FULFILLMENT_CREATE_MUTATION,
       operationName: 'ClawPilotFulfillmentCreate',
-      variables: {
-        fulfillment: {
-          lineItemsByFulfillmentOrder: plan.lineItemsByFulfillmentOrder,
-          notifyCustomer: input.notifyCustomer,
-          trackingInfo: {
-            ...(input.trackingNumbers.length === 1
-              ? { number: input.trackingNumbers[0] }
-              : { numbers: input.trackingNumbers }),
-            company: input.carrier,
-          },
-        },
-      },
+      variables,
     })
   } catch {
     throw new ShopifyFulfillmentWritebackError(
@@ -1426,9 +1514,97 @@ export async function writeShopifyFulfillment(
   }
 }
 
+/**
+ * Narrow provider adapter for the hidden Test Pro Bakery Bites reversal
+ * fixture. Unlike the ordinary fulfillment path, the fixture owns a separate
+ * append-only claim ledger. Keep the generic mutation primitive private so no
+ * other caller can bypass the normal sealed commerce-export authority.
+ */
+export function shopifyReversalFixtureFulfillmentProviderPayloadHash(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ShopifyFulfillmentProviderInput,
+  attemptSignature: unknown,
+) {
+  const fixedTracking = input.trackingNumbers.length === 1
+    && /^CP-REV-gsfc(?:[0-9]{7}|[0-9a-v]{12})$/u.test(
+      input.trackingNumbers[0],
+    )
+  const fixedLine = input.expectedLineItems.length === 1
+    && SHOPIFY_LINE_ITEM_GID.test(input.expectedLineItems[0].lineItemId)
+    && input.expectedLineItems[0].quantity === 1
+  if (
+    credential.shopDomain !== SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN
+    || input.carrier !== 'ClawPilot Fixture'
+    || input.notifyCustomer !== false
+    || input.sandboxE2eAuthorityKind !== null
+    || input.allowLegacySignatureWithoutAuthorityKind !== false
+    || !fixedTracking
+    || !fixedLine
+  ) {
+    throw new ShopifyFulfillmentWritebackError(
+      'SHOPIFY_REVERSAL_FIXTURE_FULFILLMENT_PROVIDER_INPUT_INVALID',
+      'The hidden reversal fixture accepts only its exact fixed sandbox fulfillment input',
+    )
+  }
+  const signature = normalizeAttemptSignatureForInput(attemptSignature, input)
+  return shopifyReversalFixtureFulfillmentVariablesHash(
+    credential,
+    signature.externalOrderId,
+    exactFulfillmentCreateVariables(signature),
+  )
+}
+
+function shopifyReversalFixtureFulfillmentVariablesHash(
+  credential: ShopifyCommerceRuntimeCredential,
+  externalOrderId: string,
+  variables: ShopifyFulfillmentCreateVariables,
+) {
+  return createHash('sha256').update(JSON.stringify({
+    version: 'shopify-reversal-fixture-fulfillment-provider-payload-v1',
+    shopDomain: credential.shopDomain,
+    externalOrderId,
+    variables,
+  })).digest('hex')
+}
+
+export async function executeShopifyReversalFixtureFulfillmentProviderAttempt(
+  credential: ShopifyCommerceRuntimeCredential,
+  input: ShopifyFulfillmentProviderInput,
+  attemptSignature: unknown,
+  claim: {
+    organizationId: string
+    commandId: string
+    attemptId: string
+    actorEmail: string
+  },
+): Promise<ShopifyFulfillmentWritebackResult> {
+  shopifyReversalFixtureFulfillmentProviderPayloadHash(
+    credential,
+    input,
+    attemptSignature,
+  )
+  return writeShopifyFulfillment(
+    credential,
+    input,
+    attemptSignature,
+    async (variables) => {
+      const providerPayloadHash =
+        shopifyReversalFixtureFulfillmentVariablesHash(
+          credential,
+          input.externalOrderId,
+          variables,
+        )
+      await assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres({
+        ...claim,
+        providerPayloadHash,
+      })
+    },
+  )
+}
+
 async function inspectShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
 ): Promise<ShopifyFulfillmentInspection> {
   const data = await shopifyAdminGraphql<{ order?: unknown }>(credential, {
     query: ORDER_FULFILLMENT_QUERY,
@@ -1499,7 +1675,7 @@ async function inspectShopifyFulfillment(
 
 export async function readShopifyFulfillment(
   credential: ShopifyCommerceRuntimeCredential,
-  input: ProviderWriteInput,
+  input: ShopifyFulfillmentProviderInput,
   attemptSignature: unknown,
 ): Promise<ShopifyFulfillmentWritebackResult | null> {
   if (attemptSignature === undefined) {

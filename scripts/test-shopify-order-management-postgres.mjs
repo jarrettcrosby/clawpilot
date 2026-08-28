@@ -175,6 +175,21 @@ async function expectDatabaseRejected(work, pattern, message) {
   }
   assert.ok(error, `${message}: expected database rejection`)
   assert.match(String(error.message || error), pattern, message)
+  return error
+}
+
+async function expectFulfillmentReversalRaceRejected(work, message) {
+  const error = await expectDatabaseRejected(
+    work,
+    /Shopify order management attempt blocks downstream planning/iu,
+    message,
+  )
+  assert.equal(error.code, 'P0001', `${message}: exact guard SQLSTATE`)
+  assert.doesNotMatch(
+    String(error.message || error),
+    /violates (?:check|foreign key|not-null) constraint/iu,
+    `${message}: a schema constraint must not masquerade as the reversal guard`,
+  )
 }
 
 async function seed(pool) {
@@ -288,7 +303,7 @@ async function seed(pool) {
        '{
          "shopDomain":"ag-alchemy-order-management.myshopify.com",
          "authMode":"shopify_client_credentials",
-         "grantedScopes":["read_orders","write_order_edits","write_orders"]
+         "grantedScopes":["read_orders","write_merchant_managed_fulfillment_orders","write_order_edits","write_orders"]
        }'::jsonb,
        'gid://shopify/Shop/6600001', 1, $2, $2
      ) RETURNING id::text, global_id`,
@@ -319,9 +334,9 @@ async function seed(pool) {
        changed_role, idempotency_key, request_hash
      ) VALUES (
        $1::uuid, $2::uuid, 'shopify', 1, 0, 'on', 1,
-       ARRAY['read_orders','write_order_edits','write_orders']::text[],
+       ARRAY['read_orders','write_merchant_managed_fulfillment_orders','write_order_edits','write_orders']::text[],
        operations_commerce_granted_scope_digest(
-         ARRAY['read_orders','write_order_edits','write_orders']::text[]
+         ARRAY['read_orders','write_merchant_managed_fulfillment_orders','write_order_edits','write_orders']::text[]
        ),
        $3, 'owner', $4, repeat('9', 64)
      )`,
@@ -381,7 +396,8 @@ async function seed(pool) {
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'shopify', $5, $6,
          'imported', 'USD', 1000, '{"country":"US"}'::jsonb,
          jsonb_build_object('sourceHash', $7::text), $8, $8
-       ) RETURNING id::text, global_id, row_version::text`,
+       ) RETURNING id::text, global_id, external_order_id, order_number,
+                   row_version::text`,
       [
         organizationId,
         pipelineId,
@@ -509,6 +525,345 @@ async function seed(pool) {
   }
 }
 
+async function seedFulfillmentReversalEvidence(pool, fixture) {
+  const warehouse = await pool.query(
+    `INSERT INTO operations_warehouses (
+       organization_id, code, name, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, 'Fulfillment reversal acceptance warehouse', $3, $3
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      `REV-${randomUUID().slice(0, 8).toUpperCase()}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const warehouseId = warehouse.rows[0].id
+  const cancelledOrder = await pool.query(
+    `UPDATE operations_orders
+     SET status = 'cancelled', updated_by = $3,
+         updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid AND id = $2::uuid
+     RETURNING row_version::text`,
+    [fixture.organizationId, fixture.fulfilled.id, fixture.ownerEmail],
+  )
+  assert.equal(cancelledOrder.rowCount, 1)
+  const historicalPlan = await pool.query(
+    `INSERT INTO operations_fulfillment_plans (
+       organization_id, order_id, warehouse_id, version_number, status,
+       method, solver_status, estimated_cost_minor, explanation, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 1, 'cancelled',
+       'manual_override', 'not_run', 0, '{}'::jsonb, $4
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.fulfilled.id,
+      warehouseId,
+      fixture.ownerEmail,
+    ],
+  )
+  const plan = await pool.query(
+    `INSERT INTO operations_fulfillment_plans (
+       organization_id, order_id, warehouse_id, version_number, status,
+       method, solver_status, estimated_cost_minor, explanation, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, 2, 'cancelled',
+       'manual_override', 'not_run', 0, '{}'::jsonb, $4
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.fulfilled.id,
+      warehouseId,
+      fixture.ownerEmail,
+    ],
+  )
+  const product = await pool.query(
+    `INSERT INTO crm_products (
+       pipeline_id, source_key, name, sku, source_payload, source_hash,
+       sync_status, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2, $3, $4, '{}'::jsonb, repeat('4', 64),
+       'synced', $5, $5
+     ) RETURNING id::text`,
+    [
+      fixture.pipelineId,
+      `fulfillment-reversal-product-${randomUUID()}`,
+      `Fulfillment reversal product ${randomUUID()}`,
+      `REV-${randomUUID().slice(0, 8)}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const orderLine = await pool.query(
+    `INSERT INTO operations_order_lines (
+       organization_id, order_id, pipeline_id, product_id,
+       external_line_id, channel_sku, description, quantity,
+       unit_price_minor, weight_grams
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6,
+       'Externally fulfilled reversal acceptance line', 1, 1000, 250
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.fulfilled.id,
+      fixture.pipelineId,
+      product.rows[0].id,
+      `gid://shopify/LineItem/${Date.now()}`,
+      `REV-${randomUUID().slice(0, 8)}`,
+    ],
+  )
+  const location = await pool.query(
+    `INSERT INTO operations_locations (
+       organization_id, warehouse_id, code, zone, location_type, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 'PICK', 'pick', $4
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      warehouseId,
+      `REV-${randomUUID().slice(0, 8).toUpperCase()}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const inventoryPool = await pool.query(
+    `INSERT INTO operations_inventory_pools (
+       organization_id, pipeline_id, name, pool_type, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 'shared', $4
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.pipelineId,
+      `Fulfillment reversal pool ${randomUUID()}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const inventoryPosition = await pool.query(
+    `INSERT INTO operations_inventory_positions (
+       organization_id, pipeline_id, warehouse_id, location_id, pool_id,
+       product_id, lot_code, on_hand_quantity, reserved_quantity,
+       damaged_quantity, source_authority
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+       $6::uuid, '', 10, 0, 0, 'clawpilot'
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.pipelineId,
+      warehouseId,
+      location.rows[0].id,
+      inventoryPool.rows[0].id,
+      product.rows[0].id,
+    ],
+  )
+  const releasedReservation = await pool.query(
+    `INSERT INTO operations_reservations (
+       organization_id, order_id, order_line_id, position_id, quantity,
+       status, idempotency_key, created_by, reservation_authority
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, 1, 'active', $5, $6,
+       'local_balance'
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      fixture.fulfilled.id,
+      orderLine.rows[0].id,
+      inventoryPosition.rows[0].id,
+      `fulfillment-reversal-reservation-${randomUUID()}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const allocation = await pool.query(
+    `INSERT INTO operations_fulfillment_allocations (
+       organization_id, plan_id, order_line_id, reservation_id, position_id,
+       quantity
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      plan.rows[0].id,
+      orderLine.rows[0].id,
+      releasedReservation.rows[0].id,
+      inventoryPosition.rows[0].id,
+    ],
+  )
+  await pool.query(
+    `UPDATE operations_reservations
+     SET status = 'released', released_at = now()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organizationId, releasedReservation.rows[0].id],
+  )
+  const packagingMaterial = await pool.query(
+    `INSERT INTO operations_packaging_materials (
+       organization_id, code, name, material_type, inner_length_mm,
+       inner_width_mm, inner_height_mm, tare_weight_grams,
+       max_weight_grams, unit_cost_minor, currency, status, created_by,
+       updated_by, dimension_basis, dimension_evidence_type
+     ) VALUES (
+       $1::uuid, $2, 'Fulfillment reversal carton', 'carton', 300, 200,
+       100, 50, 5000, 100, 'USD', 'active', $3, $3, 'inner', 'legacy'
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      `REV-${randomUUID().slice(0, 8).toUpperCase()}`,
+      fixture.ownerEmail,
+    ],
+  )
+  const packagingStock = await pool.query(
+    `INSERT INTO operations_packaging_material_stock (
+       organization_id, packaging_material_id, warehouse_id, is_available,
+       on_hand_quantity, row_version, created_by, updated_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, true, 10, 0, $4, $4
+     ) RETURNING id::text, row_version::text`,
+    [
+      fixture.organizationId,
+      packagingMaterial.rows[0].id,
+      warehouseId,
+      fixture.ownerEmail,
+    ],
+  )
+  const carrierRate = await pool.query(
+    `INSERT INTO operations_carrier_rates (
+       organization_id, plan_id, carrier, service_code, service_name,
+       internal_cost_minor, customer_charge_minor, transit_days,
+       estimated_delivery_at, meets_promise, selected, quote_snapshot
+     ) VALUES (
+       $1::uuid, $2::uuid, 'UPS', 'GROUND', 'UPS Ground', 100, 100, 3,
+       now() + interval '3 days', true, false, '{}'::jsonb
+     ) RETURNING id::text`,
+    [fixture.organizationId, plan.rows[0].id],
+  )
+  const retainedPackage = await pool.query(
+    `INSERT INTO operations_packages (
+       organization_id, plan_id, package_number, length_mm, width_mm,
+       height_mm, weight_grams, status
+     ) VALUES (
+       $1::uuid, $2::uuid, 1, 300, 200, 100, 250, 'planned'
+     ) RETURNING id::text`,
+    [fixture.organizationId, plan.rows[0].id],
+  )
+  await pool.query(
+    `INSERT INTO operations_package_contents (
+       organization_id, plan_id, order_id, package_id, order_line_id,
+       quantity, created_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1, $6
+     )`,
+    [
+      fixture.organizationId,
+      plan.rows[0].id,
+      fixture.fulfilled.id,
+      retainedPackage.rows[0].id,
+      orderLine.rows[0].id,
+      fixture.ownerEmail,
+    ],
+  )
+  const wave = await pool.query(
+    `INSERT INTO operations_waves (
+       organization_id, warehouse_id, name, status, optimization_method,
+       released_by, released_at, completed_at
+     ) VALUES (
+       $1::uuid, $2::uuid, 'Fulfillment reversal acceptance wave',
+       'cancelled', 'deterministic_fallback', $3, now(), now()
+     ) RETURNING id::text`,
+    [fixture.organizationId, warehouseId, fixture.ownerEmail],
+  )
+  const receipt = await pool.query(
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, status, correlation_id, target_global_id,
+       result_payload, completed_at
+     ) VALUES (
+       $1::uuid, 'shopify_external_fulfillment_reconciliation', $2,
+       repeat('7', 64), $3, 'succeeded', $4::uuid, $5,
+       '{}'::jsonb, now()
+     ) RETURNING id::text`,
+    [
+      fixture.organizationId,
+      `shopify-external-recon-${randomUUID()}`,
+      fixture.ownerEmail,
+      randomUUID(),
+      fixture.fulfilled.global_id,
+    ],
+  )
+  const fulfillmentGid = `gid://shopify/Fulfillment/${Date.now()}`
+  const fulfillmentUpdatedAt = new Date(
+    Date.now() - 30_000,
+  ).toISOString()
+  const providerOrderUpdatedAt = new Date(
+    Date.now() - 60_000,
+  ).toISOString()
+  const evidenceSnapshot = {
+    version: 'shopify-external-fulfillment-reconciliation-v2',
+    order: { id: fixture.fulfilled.external_order_id },
+    fulfillment: {
+      id: fulfillmentGid,
+      updatedAt: fulfillmentUpdatedAt,
+      status: 'SUCCESS',
+      displayStatus: 'FULFILLED',
+    },
+  }
+  await pool.query(
+    `INSERT INTO operations_shopify_external_fulfillment_reconciliations (
+       organization_id, command_receipt_id, order_id,
+       integration_account_id, plan_id, wave_id, external_order_id,
+       provider_order_name, provider_order_updated_at,
+       provider_fulfillment_id, provider_fulfillment_name,
+       provider_fulfillment_created_at, provider_fulfillment_updated_at,
+       provider_location_id, provider_fulfillment_order_ids,
+       evidence_hash, evidence_snapshot, provider_read_count,
+       provider_write_count, reason, reconciled_by
+     ) VALUES (
+       $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7,
+       $8, $9::timestamptz, $10, $11, $12::timestamptz,
+       $13::timestamptz, $14, $15::text[], repeat('8', 64), $16::jsonb,
+       2, 0, $17, $18
+     )`,
+    [
+      fixture.organizationId,
+      receipt.rows[0].id,
+      fixture.fulfilled.id,
+      fixture.accountId,
+      plan.rows[0].id,
+      wave.rows[0].id,
+      fixture.fulfilled.external_order_id,
+      fixture.fulfilled.order_number,
+      providerOrderUpdatedAt,
+      fulfillmentGid,
+      '#REVERSAL-ACCEPTANCE',
+      new Date(Date.now() - 120_000).toISOString(),
+      fulfillmentUpdatedAt,
+      'gid://shopify/Location/6600001',
+      ['gid://shopify/FulfillmentOrder/6600001'],
+      JSON.stringify(evidenceSnapshot),
+      'Exact external fulfillment evidence for reversal acceptance',
+      fixture.ownerEmail,
+    ],
+  )
+  return {
+    expectedOrderRowVersion: Number(cancelledOrder.rows[0].row_version),
+    fulfillmentGid,
+    fulfillmentUpdatedAt,
+    providerOrderUpdatedAt,
+    planId: plan.rows[0].id,
+    historicalPlanId: historicalPlan.rows[0].id,
+    warehouseId,
+    waveId: wave.rows[0].id,
+    orderLineId: orderLine.rows[0].id,
+    allocationId: allocation.rows[0].id,
+    locationId: location.rows[0].id,
+    inventoryPositionId: inventoryPosition.rows[0].id,
+    releasedReservationId: releasedReservation.rows[0].id,
+    retainedPackageId: retainedPackage.rows[0].id,
+    packagingMaterialId: packagingMaterial.rows[0].id,
+    packagingStockId: packagingStock.rows[0].id,
+    packagingStockRowVersion: Number(packagingStock.rows[0].row_version),
+    carrierRateId: carrierRate.rows[0].id,
+  }
+}
+
 function snapshot(test, providerOrderUpdatedAt = null) {
   const observedAt = new Date()
   return {
@@ -554,6 +909,345 @@ async function appendProviderWriteControl(pool, fixture, rowVersion, mode) {
   )
 }
 
+async function waitForCompetingBackendLock(pool, excludedPid, message) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await pool.query(
+      `SELECT pid, state, wait_event_type
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND pid <> $1::integer
+         AND state = 'active'
+         AND wait_event_type = 'Lock'`,
+      [excludedPid],
+    )
+    if (activity.rowCount > 0) return
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10))
+  }
+  assert.fail(`${message}: preparation never waited on the downstream lock`)
+}
+
+async function assertDownstreamWinsBeforePreparation(input) {
+  const downstreamClient = await input.pool.connect()
+  let prepareResult = null
+  try {
+    await downstreamClient.query('BEGIN')
+    await downstreamClient.query("SET LOCAL statement_timeout = '10s'")
+    const backend = await downstreamClient.query(
+      'SELECT pg_backend_pid()::integer AS pid',
+    )
+    await downstreamClient.query(
+      `UPDATE operations_fulfillment_plans
+       SET status = 'released', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [input.organizationId, input.planId],
+    )
+    prepareResult = input.prepare().then(
+      (value) => ({ value, error: null }),
+      (error) => ({ value: null, error }),
+    )
+    await waitForCompetingBackendLock(
+      input.pool,
+      backend.rows[0].pid,
+      'downstream-before-preparation race',
+    )
+    await downstreamClient.query('COMMIT')
+    const result = await prepareResult
+    assert.equal(result.value, null)
+    const rejectionMessage = String(result.error?.message || result.error)
+    assert.ok(
+      result.error?.code === 'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT'
+        || (
+          result.error?.code === 'P0001'
+          && /Shopify fulfillment reversal authorization is not current or permitted/iu
+            .test(rejectionMessage)
+        ),
+      `preparation must fail through an exact currentness fence after downstream commit: ${rejectionMessage}`,
+    )
+  } finally {
+    await downstreamClient.query('ROLLBACK').catch(() => undefined)
+    downstreamClient.release()
+    if (prepareResult) await prepareResult.catch(() => undefined)
+  }
+  await input.pool.query(
+    `UPDATE operations_fulfillment_plans
+     SET status = 'cancelled', updated_at = clock_timestamp()
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [input.organizationId, input.planId],
+  )
+}
+
+async function assertFulfillmentReversalDownstreamGuards(
+  pool,
+  fixture,
+  evidence,
+) {
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `UPDATE operations_fulfillment_plans
+       SET status = 'released', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, evidence.historicalPlanId],
+    ),
+    'cancelled fulfillment-plan history must not reactivate during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `UPDATE operations_waves
+       SET status = 'released'
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, evidence.waveId],
+    ),
+    'exact reconciliation wave must not reactivate during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `UPDATE operations_reservations
+       SET status = 'active', released_at = NULL
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, evidence.releasedReservationId],
+    ),
+    'released inventory reservation must not reactivate during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_pick_tasks (
+         organization_id, wave_id, plan_id, allocation_id, from_location_id,
+         quantity, sequence_number, status
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1, 1, 'ready'
+       )`,
+      [
+        fixture.organizationId,
+        evidence.waveId,
+        evidence.planId,
+        evidence.allocationId,
+        evidence.locationId,
+      ],
+    ),
+    'pick creation through plan lineage must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_packaging_material_claims (
+         organization_id, plan_id, packaging_material_id, warehouse_id,
+         packaging_material_stock_id, quantity, status,
+         stock_row_version_at_claim, on_hand_quantity_at_claim, created_by,
+         updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 1, 'active',
+         $6::bigint, 10, $7, $7
+       )`,
+      [
+        fixture.organizationId,
+        evidence.planId,
+        evidence.packagingMaterialId,
+        evidence.warehouseId,
+        evidence.packagingStockId,
+        evidence.packagingStockRowVersion,
+        fixture.ownerEmail,
+      ],
+    ),
+    'packaging claim creation through plan lineage must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `UPDATE operations_packages
+       SET status = 'packed', packed_by = $3, packed_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [fixture.organizationId, evidence.retainedPackageId, fixture.ownerEmail],
+    ),
+    'retained planned carton must not become packed during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_labels (
+         organization_id, package_id, carrier_rate_id, carrier,
+         service_code, tracking_number, format, label_payload,
+         provider_label_id, idempotency_key, status
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'UPS', 'GROUND', $4, 'PDF',
+         'guarded-label', $5, $6, 'created'
+       )`,
+      [
+        fixture.organizationId,
+        evidence.retainedPackageId,
+        evidence.carrierRateId,
+        `REV${randomUUID().replaceAll('-', '').slice(0, 20)}`,
+        `provider-reversal-${randomUUID()}`,
+        `fulfillment-reversal-label-${randomUUID()}`,
+      ],
+    ),
+    'carrier label creation through package lineage must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_fulfillment_executions (
+         organization_id, order_id, plan_id, checkout_pack_rate_run_id,
+         fulfillment_pack_rate_run_id, authority_mode, state,
+         idempotency_key, request_hash, prepared_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'shadow',
+         'shadow_prepared', $6, repeat('1', 64), $7
+       )`,
+      [
+        fixture.organizationId,
+        fixture.fulfilled.id,
+        evidence.planId,
+        randomUUID(),
+        randomUUID(),
+        `fulfillment-reversal-execution-${randomUUID()}`,
+        fixture.ownerEmail,
+      ],
+    ),
+    'fulfillment execution creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_active_fulfillment_executions (
+         organization_id, shadow_fulfillment_execution_id, order_id,
+         plan_id, warehouse_id, authority_mode, state,
+         activation_revision, idempotency_key, request_hash, prepared_by,
+         expected_order_row_version, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'active',
+         'prepared', 1, $6, repeat('6', 64), $7, $8::bigint,
+         'Active execution must not race fulfillment reversal'
+       )`,
+      [
+        fixture.organizationId,
+        randomUUID(),
+        fixture.fulfilled.id,
+        evidence.planId,
+        evidence.warehouseId,
+        `fulfillment-reversal-active-execution-${randomUUID()}`,
+        fixture.ownerEmail,
+        evidence.expectedOrderRowVersion,
+      ],
+    ),
+    'active fulfillment execution creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_shipments (
+         organization_id, order_id, plan_id, package_id, label_id, status,
+         tracking_number, quoted_carrier_cost_minor, confirmed_by
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'confirmed',
+         $6, 100, $7
+       )`,
+      [
+        fixture.organizationId,
+        fixture.fulfilled.id,
+        evidence.planId,
+        evidence.retainedPackageId,
+        randomUUID(),
+        `REV${randomUUID().replaceAll('-', '').slice(0, 20)}`,
+        fixture.ownerEmail,
+      ],
+    ),
+    'shipment creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_commerce_fulfillment_exports (
+         organization_id, order_id, shipment_id, provider,
+         external_order_id, state, payload_snapshot, idempotency_key
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', $4, 'queued',
+         '{}'::jsonb, $5
+       )`,
+      [
+        fixture.organizationId,
+        fixture.fulfilled.id,
+        randomUUID(),
+        fixture.fulfilled.external_order_id,
+        `fulfillment-reversal-export-${randomUUID()}`,
+      ],
+    ),
+    'commerce fulfillment export creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_label_attempts (
+         organization_id, order_id, package_id, carrier_rate_id,
+         integration_account_id, carrier_account_id, action, state,
+         environment, provider, adapter_version, idempotency_key,
+         request_hash, redacted_request, actor_email
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+         'create', 'prepared', 'sandbox', 'ups_rest', 'guard-v1', $7,
+         repeat('2', 64), '{}'::jsonb, $8
+       )`,
+      [
+        fixture.organizationId,
+        fixture.fulfilled.id,
+        evidence.retainedPackageId,
+        evidence.carrierRateId,
+        fixture.accountId,
+        randomUUID(),
+        `fulfillment-reversal-attempt-${randomUUID()}`,
+        fixture.ownerEmail,
+      ],
+    ),
+    'carrier label attempt creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_shipment_groups (
+         organization_id, fulfillment_execution_id, order_id, plan_id,
+         warehouse_id, fulfillment_pack_rate_run_id, selected_provider,
+         selected_service_code, selected_service_name,
+         selected_carrier_cost_minor, currency, state,
+         selected_carrier_account_id
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+         'ups_rest', 'GROUND', 'UPS Ground', 100, 'USD', 'shadow_prepared',
+         $7::uuid
+       )`,
+      [
+        fixture.organizationId,
+        randomUUID(),
+        fixture.fulfilled.id,
+        evidence.planId,
+        evidence.warehouseId,
+        randomUUID(),
+        randomUUID(),
+      ],
+    ),
+    'shipment-group creation must be rejected during reversal',
+  )
+  await expectFulfillmentReversalRaceRejected(
+    () => pool.query(
+      `INSERT INTO operations_production_fulfillment_rerate_runs (
+         organization_id, active_fulfillment_execution_id,
+         active_shipment_group_id, order_id, plan_id, warehouse_id,
+         source_fulfillment_pack_rate_run_id, activation_revision,
+         currency, input_hash, destination_snapshot,
+         destination_fingerprint, ordered_package_set_fingerprint,
+         package_count, idempotency_key, actor_email
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
+         $7::uuid, 1, 'USD', repeat('3', 64), '{}'::jsonb,
+         repeat('4', 64), repeat('5', 64), 1, $8, $9
+       )`,
+      [
+        fixture.organizationId,
+        randomUUID(),
+        randomUUID(),
+        fixture.fulfilled.id,
+        evidence.planId,
+        evidence.warehouseId,
+        randomUUID(),
+        `fulfillment-reversal-rerate-${randomUUID()}`,
+        fixture.ownerEmail,
+      ],
+    ),
+    'production rerate creation must be rejected during reversal',
+  )
+}
+
 async function verify(databaseUrl) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -566,11 +1260,16 @@ async function verify(databaseUrl) {
   try {
     const fixture = await seed(pool)
     const independentFixture = await seed(pool)
+    const reversalFixture = await seed(pool)
     // This acceptance isolates the 0283 unresolved-attempt race. The 0290
     // Shadow canonical-plan fence has its own PostgreSQL acceptance suite.
     await pool.query(
       `ALTER TABLE operations_fulfillment_plans
        DISABLE TRIGGER guard_shadow_commerce_canonical_plan_insert`,
+    )
+    const reversalEvidence = await seedFulfillmentReversalEvidence(
+      pool,
+      reversalFixture,
     )
     const persistence = loadTypeScriptModule(
       'app_src/lib/persistence/shopifyOrderManagement.ts',
@@ -583,6 +1282,469 @@ async function verify(databaseUrl) {
         '@/lib/persistence/postgres': postgresAdapter(pool, transactionControl),
       },
     )
+
+    const reversalSafety = async () => {
+      const result = await pool.query(
+        `SELECT operations_shopify_fulfillment_reversal_is_safe(
+           $1::uuid, $2::uuid, $3, $4::timestamptz
+         ) AS safe`,
+        [
+          reversalFixture.organizationId,
+          reversalFixture.fulfilled.id,
+          reversalEvidence.fulfillmentGid,
+          reversalEvidence.fulfillmentUpdatedAt,
+        ],
+      )
+      return result.rows[0]?.safe === true
+    }
+    const productionShape = await pool.query(
+      `SELECT
+         (
+           SELECT count(*)::integer
+           FROM operations_fulfillment_plans plan
+           WHERE plan.organization_id = $1::uuid
+             AND plan.order_id = $2::uuid
+             AND plan.status = 'cancelled'
+         ) AS cancelled_plan_count,
+         (
+           SELECT count(*)::integer
+           FROM operations_fulfillment_plans plan
+           WHERE plan.organization_id = $1::uuid
+             AND plan.order_id = $2::uuid
+             AND plan.id = $3::uuid
+         ) AS exact_reconciliation_plan_count,
+         package.status AS retained_package_status,
+         package.packed_by,
+         package.packed_at,
+         (
+           SELECT count(*)::integer
+           FROM operations_package_contents content
+           WHERE content.organization_id = package.organization_id
+             AND content.package_id = package.id
+         ) AS retained_content_count
+       FROM operations_packages package
+       WHERE package.organization_id = $1::uuid
+         AND package.id = $4::uuid
+         AND package.plan_id = $3::uuid`,
+      [
+        reversalFixture.organizationId,
+        reversalFixture.fulfilled.id,
+        reversalEvidence.planId,
+        reversalEvidence.retainedPackageId,
+      ],
+    )
+    assert.equal(productionShape.rowCount, 1)
+    assert.equal(
+      productionShape.rows[0].cancelled_plan_count,
+      2,
+      'two cancelled plan versions model retained production history',
+    )
+    assert.equal(productionShape.rows[0].exact_reconciliation_plan_count, 1)
+    assert.equal(productionShape.rows[0].retained_package_status, 'planned')
+    assert.equal(productionShape.rows[0].packed_by, null)
+    assert.equal(productionShape.rows[0].packed_at, null)
+    assert.equal(productionShape.rows[0].retained_content_count, 1)
+    assert.equal(
+      await reversalSafety(),
+      true,
+      'two cancelled plan versions plus retained planned cartons must remain reversible',
+    )
+    const activeBlockerClient = await pool.connect()
+    try {
+      await activeBlockerClient.query('BEGIN')
+      await activeBlockerClient.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      await activeBlockerClient.query(
+        `INSERT INTO operations_active_fulfillment_executions (
+           organization_id, shadow_fulfillment_execution_id, order_id,
+           plan_id, warehouse_id, authority_mode, state,
+           activation_revision, idempotency_key, request_hash, prepared_by,
+           expected_order_row_version, reason
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+           'active', 'prepared', 1, $6, repeat('6', 64), $7,
+           $8::bigint, 'Active carrier execution blocks reversal'
+         )`,
+        [
+          reversalFixture.organizationId,
+          randomUUID(),
+          reversalFixture.fulfilled.id,
+          reversalEvidence.planId,
+          reversalEvidence.warehouseId,
+          `active-reversal-blocker-${randomUUID()}`,
+          reversalFixture.ownerEmail,
+          reversalEvidence.expectedOrderRowVersion,
+        ],
+      )
+      const blocked = await activeBlockerClient.query(
+        `SELECT operations_shopify_fulfillment_reversal_is_safe(
+           $1::uuid, $2::uuid, $3, $4::timestamptz
+         ) AS safe`,
+        [
+          reversalFixture.organizationId,
+          reversalFixture.fulfilled.id,
+          reversalEvidence.fulfillmentGid,
+          reversalEvidence.fulfillmentUpdatedAt,
+        ],
+      )
+      assert.equal(
+        blocked.rows[0]?.safe,
+        false,
+        'active carrier execution evidence must block fulfillment reversal',
+      )
+      await activeBlockerClient.query('ROLLBACK')
+    } finally {
+      await activeBlockerClient.query('ROLLBACK').catch(() => undefined)
+      activeBlockerClient.release()
+    }
+    assert.equal(await reversalSafety(), true)
+
+    const reversalAction = {
+      type: 'cancel_fulfillment',
+      fulfillmentGid: reversalEvidence.fulfillmentGid,
+      expectedFulfillmentUpdatedAt: reversalEvidence.fulfillmentUpdatedAt,
+    }
+    const reversalReason =
+      'Reverse the exact externally reconciled Shopify fulfillment'
+    const reversalPreparationInput = {
+      organizationId: reversalFixture.organizationId,
+      actorEmail: reversalFixture.ownerEmail,
+      accountGlobalId: reversalFixture.accountGlobalId,
+      orderGlobalId: reversalFixture.fulfilled.global_id,
+      expectedOrderRowVersion: reversalEvidence.expectedOrderRowVersion,
+      expectedSourceHash: reversalFixture.fulfilledSourceHash,
+      ...snapshot(true, reversalEvidence.providerOrderUpdatedAt),
+      action: reversalAction,
+      reason: reversalReason,
+    }
+    await assertDownstreamWinsBeforePreparation({
+      pool,
+      organizationId: reversalFixture.organizationId,
+      planId: reversalEvidence.planId,
+      prepare: () => persistence.prepareShopifyOrderManagementInPostgres({
+        ...reversalPreparationInput,
+        idempotencyKey: 'shopify-fulfillment-reversal-downstream-first',
+      }),
+    })
+    assert.equal(await reversalSafety(), true)
+    const reversalPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        ...reversalPreparationInput,
+        ...snapshot(true, reversalEvidence.providerOrderUpdatedAt),
+        idempotencyKey: 'shopify-fulfillment-reversal-exact',
+      })
+    assert.equal(
+      reversalPrepared.fulfillmentGid,
+      reversalEvidence.fulfillmentGid,
+    )
+    assert.equal(
+      reversalPrepared.expectedFulfillmentUpdatedAt,
+      reversalEvidence.fulfillmentUpdatedAt,
+    )
+    const preparedDownstream = await pool.query(
+      `UPDATE operations_fulfillment_plans
+       SET status = 'released', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid
+       RETURNING status`,
+      [reversalFixture.organizationId, reversalEvidence.historicalPlanId],
+    )
+    assert.equal(
+      preparedDownstream.rows[0]?.status,
+      'released',
+      'prepared authorization must not freeze zero-write downstream work',
+    )
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        authorizationGlobalId: reversalPrepared.authorizationGlobalId,
+        action: reversalAction,
+        reason: reversalReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_ORDER_NOT_CURRENT',
+      'downstream work after preparation must invalidate the final claim',
+    )
+    await pool.query(
+      `UPDATE operations_fulfillment_plans
+       SET status = 'cancelled', updated_at = clock_timestamp()
+       WHERE organization_id = $1::uuid AND id = $2::uuid`,
+      [reversalFixture.organizationId, reversalEvidence.historicalPlanId],
+    )
+    await expectRejected(
+      () => persistence.claimShopifyOrderManagementInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        authorizationGlobalId: reversalPrepared.authorizationGlobalId,
+        action: {
+          ...reversalAction,
+          fulfillmentGid: 'gid://shopify/Fulfillment/999999999999',
+        },
+        reason: reversalReason,
+      }),
+      'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH',
+      'a different fulfillment GID must not claim the authorization',
+    )
+    await expectDatabaseRejected(
+      () => pool.query(
+        `INSERT INTO operations_shopify_order_management_attempts (
+           organization_id, authorization_id, integration_account_id,
+           integration_account_global_id, provider, external_account_id,
+           credential_generation, provider_write_control_row_version,
+           provider_write_scope_digest, order_id, order_global_id,
+           external_order_id, expected_order_row_version,
+           expected_source_hash, provider_snapshot_hash, action,
+           fulfillment_gid, expected_fulfillment_updated_at, intent_hash,
+           expected_line_quantity, requested_projection_hash,
+           requires_order_edits, attempt_hash, dispatch_state, claimed_by,
+           accepted_observation_id, accepted_provider_order_updated_at,
+           claimed_at, processing_lease_expires_at
+         )
+         SELECT
+           authz.organization_id, authz.id, authz.integration_account_id,
+           authz.integration_account_global_id, authz.provider,
+           authz.external_account_id, authz.credential_generation,
+           authz.provider_write_control_row_version,
+           authz.provider_write_scope_digest, authz.order_id,
+           authz.order_global_id, authz.external_order_id,
+           authz.expected_order_row_version, authz.expected_source_hash,
+           authz.provider_snapshot_hash, authz.action, $3,
+           authz.expected_fulfillment_updated_at, authz.intent_hash,
+           authz.expected_line_quantity, authz.requested_projection_hash,
+           authz.requires_order_edits, repeat('5', 64), 'authorized',
+           authz.authorized_by, authz.accepted_observation_id,
+           authz.accepted_provider_order_updated_at, clock_timestamp(),
+           clock_timestamp() + interval '5 minutes'
+         FROM operations_shopify_order_management_authorizations authz
+         WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+        [
+          reversalFixture.organizationId,
+          reversalPrepared.authorizationGlobalId,
+          'gid://shopify/Fulfillment/999999999999',
+        ],
+      ),
+      /fulfillment reversal provider attempt is not currently authorized/iu,
+      'database trigger must reject a mismatched fulfillment GID',
+    )
+    const reversalAttemptBeforeClaim = await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_shopify_order_management_attempts attempt
+       JOIN operations_shopify_order_management_authorizations authz
+         ON authz.organization_id = attempt.organization_id
+        AND authz.id = attempt.authorization_id
+       WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+      [
+        reversalFixture.organizationId,
+        reversalPrepared.authorizationGlobalId,
+      ],
+    )
+    assert.equal(reversalAttemptBeforeClaim.rows[0].count, 0)
+    const reversalClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        authorizationGlobalId: reversalPrepared.authorizationGlobalId,
+        action: reversalAction,
+        reason: reversalReason,
+      })
+    assert.equal(
+      reversalClaimed.fulfillmentGid,
+      reversalEvidence.fulfillmentGid,
+    )
+    assert.equal(
+      reversalClaimed.expectedFulfillmentUpdatedAt,
+      reversalEvidence.fulfillmentUpdatedAt,
+    )
+    await assertFulfillmentReversalDownstreamGuards(
+      pool,
+      reversalFixture,
+      reversalEvidence,
+    )
+    const reversalStored = await pool.query(
+      `SELECT
+         authz.fulfillment_gid AS authorization_fulfillment_gid,
+         authz.expected_fulfillment_updated_at
+           AS authorization_fulfillment_updated_at,
+         attempt.fulfillment_gid AS attempt_fulfillment_gid,
+         attempt.expected_fulfillment_updated_at
+           AS attempt_fulfillment_updated_at
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+      [
+        reversalFixture.organizationId,
+        reversalPrepared.authorizationGlobalId,
+      ],
+    )
+    assert.equal(reversalStored.rowCount, 1)
+    assert.equal(
+      reversalStored.rows[0].authorization_fulfillment_gid,
+      reversalEvidence.fulfillmentGid,
+    )
+    assert.equal(
+      reversalStored.rows[0].attempt_fulfillment_gid,
+      reversalEvidence.fulfillmentGid,
+    )
+    assert.equal(
+      new Date(
+        reversalStored.rows[0].authorization_fulfillment_updated_at,
+      ).toISOString(),
+      reversalEvidence.fulfillmentUpdatedAt,
+    )
+    assert.equal(
+      new Date(
+        reversalStored.rows[0].attempt_fulfillment_updated_at,
+      ).toISOString(),
+      reversalEvidence.fulfillmentUpdatedAt,
+    )
+    const unknownReversal = await persistence
+      .recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: reversalFixture.organizationId,
+      actorEmail: reversalFixture.ownerEmail,
+      authorizationGlobalId: reversalPrepared.authorizationGlobalId,
+      providerAttemptGlobalId: reversalClaimed.providerAttemptGlobalId,
+      outcome: 'unknown',
+      evidence: {
+        schema: 'shopify-fulfillment-reversal-unknown-postgres-test-v1',
+        fulfillmentGid: reversalEvidence.fulfillmentGid,
+      },
+      errorCode: 'SHOPIFY_FULFILLMENT_REVERSAL_OUTCOME_UNKNOWN',
+      providerWriteCount: 1,
+    })
+    assert.equal(unknownReversal.status, 'unknown')
+    await expectFulfillmentReversalRaceRejected(
+      () => pool.query(
+        `UPDATE operations_fulfillment_plans
+         SET status = 'released', updated_at = clock_timestamp()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [reversalFixture.organizationId, reversalEvidence.historicalPlanId],
+      ),
+      'unknown fulfillment-reversal outcome must block downstream work',
+    )
+    const reconciledReversal = await persistence
+      .reconcileShopifyOrderManagementOutcomeInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        authorizationGlobalId: reversalPrepared.authorizationGlobalId,
+        providerAttemptGlobalId: reversalClaimed.providerAttemptGlobalId,
+        resolution: 'applied',
+        evidence: {
+          schema: 'shopify-fulfillment-reversal-applied-postgres-test-v1',
+          fulfillmentGid: reversalEvidence.fulfillmentGid,
+          observedStatus: 'CANCELLED',
+        },
+        providerReference: reversalEvidence.fulfillmentGid,
+        providerWriteCount: 1,
+      })
+    assert.equal(reconciledReversal.status, 'reconciled')
+    assert.equal(reconciledReversal.reconciliationResolution, 'applied')
+    const postReversalTarget = await persistence
+      .readShopifyOrderManagementTargetInPostgres({
+        organizationId: reversalFixture.organizationId,
+        orderGlobalId: reversalFixture.fulfilled.global_id,
+      })
+    assert.equal(
+      postReversalTarget?.postReversalOrderCancellationSafe,
+      true,
+    )
+    assert.equal(
+      postReversalTarget
+        ?.postReversalOrderCancellationPredecessorGlobalId,
+      reversalPrepared.authorizationGlobalId,
+    )
+    const postReversalCancelAction = {
+      type: 'cancel_order_after_fulfillment_reversal',
+      predecessorAuthorizationGlobalId:
+        reversalPrepared.authorizationGlobalId,
+      reason: 'STAFF',
+    }
+    const postReversalCancelReason =
+      'Separately cancel the test order after exact fulfillment reversal'
+    const postReversalCancelPrepared = await persistence
+      .prepareShopifyOrderManagementInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        accountGlobalId: reversalFixture.accountGlobalId,
+        orderGlobalId: reversalFixture.fulfilled.global_id,
+        expectedOrderRowVersion: reversalEvidence.expectedOrderRowVersion,
+        expectedSourceHash: reversalFixture.fulfilledSourceHash,
+        ...snapshot(true, reversalEvidence.providerOrderUpdatedAt),
+        action: postReversalCancelAction,
+        cancellationPaymentEvidence: {
+          schema: 'shopify-order-cancel-payment-evidence-v1',
+          transactionsCount: 0,
+          authorizationTransactionId: null,
+          authorizationAmount: null,
+        },
+        reason: postReversalCancelReason,
+        idempotencyKey: 'shopify-order-cancel-after-reversal-exact',
+      })
+    assert.equal(
+      postReversalCancelPrepared.predecessorAuthorizationGlobalId,
+      reversalPrepared.authorizationGlobalId,
+    )
+    const postReversalCancelClaimed = await persistence
+      .claimShopifyOrderManagementInPostgres({
+        organizationId: reversalFixture.organizationId,
+        actorEmail: reversalFixture.ownerEmail,
+        authorizationGlobalId:
+          postReversalCancelPrepared.authorizationGlobalId,
+        action: postReversalCancelAction,
+        reason: postReversalCancelReason,
+      })
+    assert.equal(
+      postReversalCancelClaimed.predecessorAuthorizationGlobalId,
+      reversalPrepared.authorizationGlobalId,
+    )
+    const postReversalPredecessorStored = await pool.query(
+      `SELECT
+         auth_predecessor.global_id AS authorization_predecessor_global_id,
+         attempt_predecessor.global_id AS attempt_predecessor_global_id
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_authorizations auth_predecessor
+         ON auth_predecessor.organization_id = authz.organization_id
+        AND auth_predecessor.id = authz.predecessor_authorization_id
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       JOIN operations_shopify_order_management_authorizations
+         attempt_predecessor
+         ON attempt_predecessor.organization_id = attempt.organization_id
+        AND attempt_predecessor.id = attempt.predecessor_authorization_id
+       WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+      [
+        reversalFixture.organizationId,
+        postReversalCancelPrepared.authorizationGlobalId,
+      ],
+    )
+    assert.equal(postReversalPredecessorStored.rowCount, 1)
+    assert.equal(
+      postReversalPredecessorStored.rows[0]
+        .authorization_predecessor_global_id,
+      reversalPrepared.authorizationGlobalId,
+    )
+    assert.equal(
+      postReversalPredecessorStored.rows[0].attempt_predecessor_global_id,
+      reversalPrepared.authorizationGlobalId,
+    )
+    await persistence.recordShopifyOrderManagementOutcomeInPostgres({
+      organizationId: reversalFixture.organizationId,
+      actorEmail: reversalFixture.ownerEmail,
+      authorizationGlobalId:
+        postReversalCancelPrepared.authorizationGlobalId,
+      providerAttemptGlobalId:
+        postReversalCancelClaimed.providerAttemptGlobalId,
+      outcome: 'succeeded',
+      evidence: {
+        schema: 'shopify-post-reversal-order-cancel-postgres-test-v1',
+        predecessorAuthorizationGlobalId:
+          reversalPrepared.authorizationGlobalId,
+      },
+      providerReference: 'gid://shopify/Job/6600001',
+      providerWriteCount: 1,
+    })
 
     // The new command lane is controlled only by the exact account revision.
     // A disabled global Operations activation must not affect it, and one
@@ -922,7 +2084,7 @@ async function verify(databaseUrl) {
        SET configuration = jsonb_set(
              configuration,
              '{grantedScopes}',
-             '["read_orders","write_order_edits","write_orders"]'::jsonb
+             '["read_orders","write_merchant_managed_fulfillment_orders","write_order_edits","write_orders"]'::jsonb
            ),
            updated_at = clock_timestamp(), updated_by = $3
        WHERE organization_id = $1::uuid AND id = $2::uuid`,
@@ -2309,6 +3471,56 @@ async function verify(databaseUrl) {
         independentFixture.organizationId,
         ordinaryPrepared.authorizationGlobalId,
       ],
+    )
+    const ordinaryFulfillmentBinding = await pool.query(
+      `SELECT
+         authz.fulfillment_gid AS authorization_fulfillment_gid,
+         authz.expected_fulfillment_updated_at
+           AS authorization_fulfillment_updated_at,
+         authz.predecessor_authorization_id
+           AS authorization_predecessor_authorization_id,
+         attempt.fulfillment_gid AS attempt_fulfillment_gid,
+         attempt.expected_fulfillment_updated_at
+           AS attempt_fulfillment_updated_at,
+         attempt.predecessor_authorization_id
+           AS attempt_predecessor_authorization_id
+       FROM operations_shopify_order_management_authorizations authz
+       JOIN operations_shopify_order_management_attempts attempt
+         ON attempt.organization_id = authz.organization_id
+        AND attempt.authorization_id = authz.id
+       WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+      [
+        independentFixture.organizationId,
+        ordinaryPrepared.authorizationGlobalId,
+      ],
+    )
+    assert.equal(ordinaryFulfillmentBinding.rowCount, 1)
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0].authorization_fulfillment_gid,
+      null,
+    )
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0]
+        .authorization_fulfillment_updated_at,
+      null,
+    )
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0].attempt_fulfillment_gid,
+      null,
+    )
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0].attempt_fulfillment_updated_at,
+      null,
+    )
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0]
+        .authorization_predecessor_authorization_id,
+      null,
+    )
+    assert.equal(
+      ordinaryFulfillmentBinding.rows[0]
+        .attempt_predecessor_authorization_id,
+      null,
     )
     const ordinarySerialized = JSON.stringify(ordinaryStored.rows)
     for (const privateValue of [

@@ -891,6 +891,158 @@ async function seedPrintSource(pool, fixture) {
   return { order, label, shipment }
 }
 
+async function seedExternalFulfillmentSource(pool, fixture) {
+  const source = await insertReturning(
+    pool,
+    `SELECT orders.pipeline_id::text, orders.customer_id::text
+     FROM operations_orders orders
+     WHERE orders.organization_id = $1::uuid
+     ORDER BY orders.created_at DESC, orders.id DESC
+     LIMIT 1`,
+    [fixture.organizationId],
+  )
+  const integration = await insertReturning(
+    pool,
+    `INSERT INTO operations_integration_accounts (
+       organization_id, provider, integration_type, environment,
+       display_name, created_by, updated_by
+     ) VALUES ($1, 'shopify', 'commerce', 'sandbox', $2, $3, $3)
+     RETURNING id`,
+    [
+      fixture.organizationId,
+      `External fulfillment ${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  const order = await insertReturning(
+    pool,
+    `INSERT INTO operations_orders (
+       organization_id, pipeline_id, customer_id, integration_account_id,
+       source_provider, external_order_id, order_number, status,
+       ship_to, created_by, updated_by
+     ) VALUES (
+       $1, $2, $3, $4, 'shopify', $5, $6, 'cancelled',
+       '{}'::jsonb, $7, $7
+     ) RETURNING id, global_id, order_number, row_version::text`,
+    [
+      fixture.organizationId,
+      source.pipeline_id,
+      source.customer_id,
+      integration.id,
+      `gid://shopify/Order/${fixture.suffix}`,
+      `EXTERNAL-${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  const plan = await insertReturning(
+    pool,
+    `INSERT INTO operations_fulfillment_plans (
+       organization_id, order_id, warehouse_id, status, method,
+       promised_delivery_at, created_by
+     ) VALUES (
+       $1, $2, $3, 'released', 'deterministic_fallback',
+       now() + interval '2 days', $4
+     ) RETURNING id`,
+    [fixture.organizationId, order.id, fixture.warehouseId, fixture.actorEmail],
+  )
+  const wave = await insertReturning(
+    pool,
+    `INSERT INTO operations_waves (
+       organization_id, warehouse_id, name, status, optimization_method,
+       released_by, released_at, completed_at
+     ) VALUES (
+       $1, $2, $3, 'cancelled', 'deterministic_fallback', $4, now(), now()
+     ) RETURNING id`,
+    [
+      fixture.organizationId,
+      fixture.warehouseId,
+      `External fulfillment ${fixture.suffix}`,
+      fixture.actorEmail,
+    ],
+  )
+  const receipt = await insertReturning(
+    pool,
+    `INSERT INTO operations_command_receipts (
+       organization_id, command_type, idempotency_key, request_hash,
+       actor_email, status, correlation_id, target_global_id,
+       result_payload, completed_at
+     ) VALUES (
+       $1, 'shopify_external_fulfillment_reconciliation', $2,
+       repeat('7', 64), $3, 'succeeded', $4::uuid, $5,
+       '{}'::jsonb, now()
+     ) RETURNING id`,
+    [
+      fixture.organizationId,
+      `external-reconciliation-${fixture.suffix}`,
+      fixture.actorEmail,
+      randomUUID(),
+      order.global_id,
+    ],
+  )
+  const trackingNumber = `1ZEXTERNAL${fixture.suffix.toUpperCase()}`
+  const fulfillmentId = `gid://shopify/Fulfillment/${fixture.suffix}`
+  const fulfilledAt = new Date(Date.now() - 120_000).toISOString()
+  const updatedAt = new Date(Date.now() - 60_000).toISOString()
+  const evidenceSnapshot = {
+    version: 'shopify-external-fulfillment-reconciliation-v2',
+    order: { id: `gid://shopify/Order/${fixture.suffix}` },
+    fulfillment: {
+      id: fulfillmentId,
+      createdAt: fulfilledAt,
+      updatedAt,
+      status: 'SUCCESS',
+      displayStatus: 'FULFILLED',
+      tracking: [{
+        company: 'UPS',
+        number: trackingNumber,
+        url: `https://www.ups.com/track?tracknum=${trackingNumber}`,
+      }],
+    },
+  }
+  const reconciliation = await insertReturning(
+    pool,
+    `INSERT INTO operations_shopify_external_fulfillment_reconciliations (
+       organization_id, command_receipt_id, order_id,
+       integration_account_id, plan_id, wave_id, external_order_id,
+       provider_order_name, provider_order_updated_at,
+       provider_fulfillment_id, provider_fulfillment_name,
+       provider_fulfillment_created_at, provider_fulfillment_updated_at,
+       provider_location_id, provider_fulfillment_order_ids,
+       evidence_hash, evidence_snapshot, provider_read_count,
+       provider_write_count, reason, reconciled_by
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7,
+       $8, $9::timestamptz, $10, $11, $12::timestamptz,
+       $9::timestamptz, $13, $14::text[], repeat('8', 64), $15::jsonb,
+       2, 0, $16, $17
+     ) RETURNING id, global_id`,
+    [
+      fixture.organizationId,
+      receipt.id,
+      order.id,
+      integration.id,
+      plan.id,
+      wave.id,
+      `gid://shopify/Order/${fixture.suffix}`,
+      order.order_number,
+      updatedAt,
+      fulfillmentId,
+      order.order_number,
+      fulfilledAt,
+      'gid://shopify/Location/1',
+      ['gid://shopify/FulfillmentOrder/1'],
+      JSON.stringify(evidenceSnapshot),
+      'Retain exact external fulfillment evidence for print acceptance',
+      fixture.actorEmail,
+    ],
+  )
+  return {
+    order,
+    reconciliation,
+    trackingNumber,
+  }
+}
+
 async function expectRejected(work, pattern) {
   let error
   try {
@@ -1027,6 +1179,27 @@ async function verifyAgentCapabilityBackfill(connectionString) {
       /subset of its local print agent capabilities/,
     )
     await pool.query(read('db/migrations/0262_operations_barcode_label_printing.sql'))
+    // This backfill check deliberately reapplies a historical migration on the
+    // shared disposable database. Restore the later external-label source
+    // shape before the runtime acceptance begins.
+    const externalLabelMigration = read(
+      'db/migrations/0324_operations_external_fulfillment_label_artifacts.sql',
+    )
+    const sourceConstraintStart = externalLabelMigration.indexOf(
+      'DROP CONSTRAINT IF EXISTS operations_print_artifacts_source_valid',
+    )
+    const sourceConstraintEnd = externalLabelMigration.indexOf(
+      '\n\nCREATE UNIQUE INDEX',
+      sourceConstraintStart,
+    )
+    assert.ok(
+      sourceConstraintStart >= 0 && sourceConstraintEnd > sourceConstraintStart,
+      'Unable to isolate the current print-artifact source constraint',
+    )
+    await pool.query(
+      'ALTER TABLE operations_print_artifacts\n  '
+      + externalLabelMigration.slice(sourceConstraintStart, sourceConstraintEnd),
+    )
   } finally {
     await pool.end()
   }
@@ -1048,6 +1221,14 @@ async function verifyRuntime(connectionString) {
         '@/lib/operations/printing': printing,
         '@/lib/persistence/operations': requestErrorAdapter(),
         '@/lib/persistence/operationPrinting': profileAdapter(),
+        '@/lib/persistence/postgres': postgresAdapter(pool),
+      },
+    )
+    const externalLabels = loadTypeScript(
+      'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
+      {
+        '@/lib/auditWriter': auditAdapter(auditCalls),
+        '@/lib/persistence/operations': requestErrorAdapter(),
         '@/lib/persistence/postgres': postgresAdapter(pool),
       },
     )
@@ -2099,6 +2280,161 @@ async function verifyRuntime(connectionString) {
       actorEmail: fixture.actorEmail,
       idempotencyKey: `cancel-label-reprint-${fixture.suffix}`,
       reason: 'Controlled label reprint proof completed without physical output',
+    })
+
+    const externalSource = await seedExternalFulfillmentSource(pool, fixture)
+    const externalZpl = Buffer.from(
+      `^XA\n^FO24,24^FDExternal ${fixture.suffix}^FS\n^XZ`,
+      'utf8',
+    )
+    const externalImportInput = {
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `external-label-import-${fixture.suffix}`,
+      orderGlobalId: externalSource.order.global_id,
+      expectedOrderRowVersion: Number(externalSource.order.row_version),
+      reconciliationGlobalId: externalSource.reconciliation.global_id,
+      trackingNumber: externalSource.trackingNumber,
+      format: 'ZPL',
+      media: 'label_4x6',
+      filename: '../../unsafe original label.zpl',
+      payload: externalZpl,
+      reason: 'Retain the exact original external carrier label for audited reprint',
+    }
+    const importedExternal = await externalLabels
+      .importOperationsExternalFulfillmentLabelInPostgres(externalImportInput)
+    assert.equal(importedExternal.replayed, false)
+    assert.equal(
+      importedExternal.contentSha256,
+      createHash('sha256').update(externalZpl).digest('hex'),
+    )
+    const replayedExternal = await externalLabels
+      .importOperationsExternalFulfillmentLabelInPostgres(externalImportInput)
+    assert.equal(replayedExternal.replayed, true)
+    assert.equal(replayedExternal.artifactGlobalId, importedExternal.artifactGlobalId)
+    await assert.rejects(
+      externalLabels.importOperationsExternalFulfillmentLabelInPostgres({
+        ...externalImportInput,
+        idempotencyKey: `external-label-tracking-mismatch-${fixture.suffix}`,
+        trackingNumber: `MISMATCH-${fixture.suffix}`,
+      }),
+      (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_TRACKING_MISMATCH',
+    )
+    await assert.rejects(
+      externalLabels.importOperationsExternalFulfillmentLabelInPostgres({
+        ...externalImportInput,
+        idempotencyKey: `external-label-order-mismatch-${fixture.suffix}`,
+        orderGlobalId: printSource.order.global_id,
+      }),
+      (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_RECONCILIATION_NOT_FOUND',
+    )
+    await assert.rejects(
+      externalLabels.importOperationsExternalFulfillmentLabelInPostgres({
+        ...externalImportInput,
+        idempotencyKey: `external-label-format-mismatch-${fixture.suffix}`,
+        format: 'PDF',
+      }),
+      (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_PAYLOAD_INVALID',
+    )
+    await assert.rejects(
+      externalLabels.importOperationsExternalFulfillmentLabelInPostgres({
+        ...externalImportInput,
+        idempotencyKey: `external-label-content-conflict-${fixture.suffix}`,
+        payload: Buffer.from(
+          `^XA\n^FO24,24^FDDifferent ${fixture.suffix}^FS\n^XZ`,
+          'utf8',
+        ),
+      }),
+      (error) => error?.code === 'OPERATIONS_EXTERNAL_LABEL_CONFLICT',
+    )
+    const retainedExternal = await insertReturning(
+      pool,
+      `SELECT artifact.global_id,
+              artifact.content_sha256,
+              artifact.byte_length::text,
+              payload.filename,
+              payload.payload,
+              reconciliation.global_id AS reconciliation_global_id
+       FROM operations_print_artifacts artifact
+       JOIN operations_print_artifact_payloads payload
+         ON payload.organization_id = artifact.organization_id
+        AND payload.artifact_id = artifact.id
+       JOIN operations_shopify_external_fulfillment_reconciliations reconciliation
+         ON reconciliation.organization_id = artifact.organization_id
+        AND reconciliation.id = artifact.source_external_fulfillment_reconciliation_id
+       WHERE artifact.organization_id = $1::uuid
+         AND artifact.global_id = $2`,
+      [fixture.organizationId, importedExternal.artifactGlobalId],
+    )
+    assert.equal(retainedExternal.reconciliation_global_id, externalSource.reconciliation.global_id)
+    assert.equal(retainedExternal.filename, 'unsafe-original-label.zpl')
+    assert.equal(Number(retainedExternal.byte_length), externalZpl.byteLength)
+    assert.deepEqual(retainedExternal.payload, externalZpl)
+
+    const externalJob = await persistence.enqueueOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `external-label-print-${fixture.suffix}`,
+      warehouseId: fixture.warehouseId,
+      preferredPrinterGlobalId: labelPrinter.global_id,
+      document: {
+        type: 'external_shipping_label_artifact',
+        sourceArtifactGlobalId: importedExternal.artifactGlobalId,
+      },
+    })
+    assert.equal(externalJob.artifactGlobalId, importedExternal.artifactGlobalId)
+    assert.equal(externalJob.sourceOrderGlobalId, externalSource.order.global_id)
+    assert.equal(externalJob.trackingNumber, externalSource.trackingNumber)
+    const externalClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: primaryAgent,
+      idempotencyKey: `external-label-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: labelCapabilities,
+    })
+    assert.equal(externalClaim.length, 1)
+    assert.equal(externalClaim[0].globalId, externalJob.globalId)
+    assert.equal(externalClaim[0].document.encoding, 'utf8')
+    assert.equal(externalClaim[0].document.inlinePayload, externalZpl.toString('utf8'))
+    assert.equal(
+      createHash('sha256').update(
+        externalClaim[0].document.inlinePayload,
+        'utf8',
+      ).digest('hex'),
+      retainedExternal.content_sha256,
+    )
+    const deliveredExternal = await persistence.acknowledgeOperationsPrintJobInPostgres({
+      agent: primaryAgent,
+      jobGlobalId: externalJob.globalId,
+      claimToken: externalClaim[0].claimToken,
+      idempotencyKey: `external-label-ack-${fixture.suffix}`,
+      deviceJobReference: `external-label-device-${fixture.suffix}`,
+    })
+    assert.equal(deliveredExternal.status, 'delivered')
+    const externalReprint = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: externalJob.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `external-label-reprint-${fixture.suffix}`,
+      reason: 'External label was damaged before carrier handoff',
+    })
+    assert.equal(externalReprint.status, 'queued')
+    assert.equal(externalReprint.reprintOfJobGlobalId, externalJob.globalId)
+    assert.equal(externalReprint.artifactGlobalId, importedExternal.artifactGlobalId)
+    const externalReprintAudit = auditCalls.find((event) => (
+      event.eventType === 'operations.print_job.reprinted'
+      && event.aggregateId === externalReprint.globalId
+    ))
+    assert.equal(
+      externalReprintAudit?.payload.reason,
+      'External label was damaged before carrier handoff',
+    )
+    await persistence.cancelOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: externalReprint.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `cancel-external-label-reprint-${fixture.suffix}`,
+      reason: 'Audited external-label reprint acceptance completed',
     })
 
     const barcodeAgent = await persistence.authenticateOperationsPrintAgentInPostgres(

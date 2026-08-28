@@ -51,6 +51,7 @@ import {
 } from '@/lib/integrations/commerceShopifyAutomaticPromotion'
 import type { CommerceRuntimeCredentialRecord } from '@/lib/persistence/commerceIntegrations'
 import {
+  commerceLinePackFactsRequired,
   commerceCurrencyMinorUnit,
   type CommerceAddressSnapshot,
   type CommerceDataField,
@@ -787,7 +788,10 @@ function lineBlockingCodes(line: CommerceNormalizedOrderLine) {
   const codes = new Set<string>()
   codes.add('product_mapping_required')
   if (line.unitPrice.state !== 'available') codes.add('line_price_required')
-  if (line.requiresShipping && line.packaging.state !== 'available') {
+  if (
+    commerceLinePackFactsRequired(line)
+    && line.packaging.state !== 'available'
+  ) {
     codes.add('packaging_required')
   }
   return [...codes].sort()
@@ -2746,7 +2750,13 @@ function dynamicLineBlockingCodes(line: CandidateLineRow) {
       && line.price_resolution_state !== 'manual') {
     codes.add('line_price_required')
   }
-  if (line.requires_shipping && line.packaging_state !== 'resolved') {
+  if (
+    commerceLinePackFactsRequired({
+      requiresShipping: line.requires_shipping,
+      unitMultiplier: Number(line.unit_multiplier),
+    })
+    && line.packaging_state !== 'resolved'
+  ) {
     codes.add('packaging_required')
   }
   return [...codes].sort()
@@ -3029,6 +3039,11 @@ async function advanceCandidate(
   for (const line of lines) {
     const codes = lineBlockers.get(line.id) || []
     const hasOperationalQuantity = Number(line.unfulfilled_quantity) > 0
+    const unitPackagingNotRequired = (
+      line.requires_shipping
+      && Number(line.unit_multiplier) === 1
+      && line.packaging_state === 'unresolved'
+    )
     const lineState = (
       hasOperationalQuantity
       && target === 'ready'
@@ -3039,14 +3054,19 @@ async function advanceCandidate(
     await client.query(
       `UPDATE operations_commerce_order_candidate_lines
        SET blocking_codes = $2::text[],
+           packaging_state = CASE
+             WHEN $5::boolean THEN 'not_required'
+             ELSE packaging_state
+           END,
            workflow_state = $3,
            row_version = row_version + 1,
            updated_by = $4,
            updated_at = now()
        WHERE id = $1::uuid`,
-      [line.id, codes, lineState, actorEmail],
+      [line.id, codes, lineState, actorEmail, unitPackagingNotRequired],
     )
     line.blocking_codes = codes
+    if (unitPackagingNotRequired) line.packaging_state = 'not_required'
     line.workflow_state = lineState
   }
   const codes = dynamicCandidateBlockingCodes(candidate, lines)
@@ -6631,9 +6651,12 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           : null
         const resolvedPackaging = mappedPackaging || providerPackaging
         const mappingState = mapping ? 'resolved' : 'unresolved'
-        const packagingState = line.requiresShipping
-          ? (resolvedPackaging ? 'resolved' : 'unresolved')
-          : 'not_required'
+        const packFactsRequired = commerceLinePackFactsRequired(line)
+        const packagingState = resolvedPackaging
+          ? 'resolved'
+          : packFactsRequired
+            ? 'unresolved'
+            : 'not_required'
         const providerPriceResolution = resolveCommerceOrderLineProviderPrice({
           orderCurrency: order.currency,
           unitPrice,
@@ -6641,7 +6664,10 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
         })
         const codes = lineBlockingCodes(line).filter((code) => {
           if (code === 'product_mapping_required' && mapping) return false
-          if (code === 'packaging_required' && resolvedPackaging) return false
+          if (
+            code === 'packaging_required'
+            && (resolvedPackaging || !packFactsRequired)
+          ) return false
           if (
             code === 'line_price_required'
             && !providerPriceResolution.requiresOperatorResolution
@@ -6649,7 +6675,7 @@ export async function stageCommerceNormalizationEnvelopeInPostgres(input: {
           return true
         })
         if (
-          line.requiresShipping
+          packFactsRequired
           && packagingState === 'unresolved'
           && !codes.includes('packaging_required')
         ) {
@@ -10114,9 +10140,15 @@ export async function resolveCommerceCandidateProductInPostgres(input: {
     } : null
     const resolvedPackaging = mappedPackaging || providerPackaging
     const mappedAssociation = currentPackResolution.association
-    const packagingState = line.requires_shipping
-      ? (resolvedPackaging ? 'resolved' : 'unresolved')
-      : 'not_required'
+    const packFactsRequired = commerceLinePackFactsRequired({
+      requiresShipping: line.requires_shipping,
+      unitMultiplier: Number(line.unit_multiplier),
+    })
+    const packagingState = resolvedPackaging
+      ? 'resolved'
+      : packFactsRequired
+        ? 'unresolved'
+        : 'not_required'
     const packagingSource = mappedPackaging
       ? 'variant_pack_mapping'
       : currentPackResolution.reason === 'recipe_required'
@@ -15054,14 +15086,25 @@ export async function promoteCommerceCandidateInPostgres(input: {
           }),
           line.unfulfilled_quantity,
           line.resolved_unit_price_minor,
-          line.requires_shipping ? line.weight_grams : 0,
-          JSON.stringify(line.requires_shipping
+          line.requires_shipping && line.packaging_state === 'resolved'
+            ? line.weight_grams
+            : 0,
+          JSON.stringify(
+            line.requires_shipping && line.packaging_state === 'resolved'
             ? {
                 length: line.length_mm,
                 width: line.width_mm,
                 height: line.height_mm,
               }
-            : { length: 1, width: 1, height: 1 }),
+            : {
+                length: 1,
+                width: 1,
+                height: 1,
+                source: line.requires_shipping
+                  ? 'cartonization_pending'
+                  : 'not_required',
+              },
+          ),
         ],
       )
       const canonical = canonicalLine.rows[0]

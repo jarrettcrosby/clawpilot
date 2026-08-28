@@ -33,6 +33,7 @@ async function waitForPostgres(databaseUrl) {
   while (Date.now() < deadline) {
     const pool = new Pool({
       connectionString: databaseUrl,
+      ssl: false,
       connectionTimeoutMillis: 1_000,
       max: 1,
     })
@@ -50,7 +51,7 @@ async function waitForPostgres(databaseUrl) {
 }
 
 async function installCareerSchema(databaseUrl) {
-  const pool = new Pool({ connectionString: databaseUrl, max: 1 })
+  const pool = new Pool({ connectionString: databaseUrl, ssl: false, max: 1 })
   await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto')
   await pool.query(`
     CREATE TABLE schema_migrations (
@@ -119,6 +120,8 @@ async function verifyImage(image) {
       {
         env: {
           ...process.env,
+          PGSSLMODE: 'disable',
+          DATABASE_SSL: 'false',
           CAREER_SITE_MIGRATION_DATABASE_URL: databaseUrl,
         },
       },

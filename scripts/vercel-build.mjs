@@ -36,13 +36,12 @@ try {
   run('npm', ['run', 'build'], appRoot)
 
   if (!managedDeployment()) {
-    console.log('Vercel database and mail gates skipped for an unmanaged preview or local build')
+    console.log('Vercel managed mail gate skipped for an unmanaged preview or local build')
     process.exit(0)
   }
 
   run(process.execPath, [resolve(root, 'scripts', 'verify-mail-sender.mjs')], root)
-  run(process.execPath, [resolve(root, 'scripts', 'db-migrate.mjs')], root)
-  console.log('Vercel managed deployment gates passed')
+  console.log('Vercel managed build and mail gates passed; database migrations are owned by the Railway deployment path')
 } catch (error) {
   console.error(`Vercel build failed: ${error instanceof Error ? error.message : String(error)}`)
   process.exit(1)

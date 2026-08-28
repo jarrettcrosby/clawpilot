@@ -429,6 +429,30 @@ for (const fragment of [
     `Exact persistence contract missing ${fragment}`,
   )
 }
+assert.ok(
+  sources.persistence.includes(
+    'AND ($5::boolean = false OR candidate.test_order = true)',
+  )
+    && sources.persistence.includes('Boolean(authorizationGlobalId)'),
+  'Ordinary planning must accept an exact promoted Shopify candidate while the authorized test-store lane remains fenced to provider test orders',
+)
+assert.equal(
+  sources.persistence.includes(
+    "AND candidate.workflow_state = 'promoted'\n         AND candidate.test_order = true\n         AND source_order.source_provider = 'shopify'",
+  ),
+  false,
+  'Ordinary Shopify planning must not be unconditionally restricted to test_order=true',
+)
+assert.ok(
+  sources.operations.includes(
+    'planning_candidate.test_order AS planning_candidate_test_order',
+  )
+    && sources.ui.includes("order.planningPreparation?.testOrder === true")
+    && sources.ui.includes(
+      '(!canonicalShopifyTestLane || Boolean(canonicalShopifyAuthorization))',
+    ),
+  'Only provider-confirmed Shopify test orders may enter the verified test authorization lane',
+)
 
 for (const fragment of [
   "provider_verified_at >= created_at - interval '5 minutes'",
@@ -540,29 +564,53 @@ for (const fragment of [
   "action === 'authorize-shopify-test-store-canonical-e2e'",
   "action === 'confirm-shopify-test-store-e2e-fulfillment'",
   '!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute',
-  'Only an organization owner or administrator may authorize',
-  'Only an organization owner or administrator may confirm',
+  'Only an organization owner or administrator may enable test fulfillment',
+  'Only an organization owner or administrator may confirm test fulfillment',
   'idempotencyKey: idempotencyKeyValue(req)',
 ]) {
   assert.ok(sources.route.includes(fragment), `Owner/admin route missing ${fragment}`)
 }
 
 for (const fragment of [
-  'Authorize verified test order',
-  'Renew or resume verified test order',
-  'Type the exact authorization statement',
-  'Type the exact fulfillment statement',
+  'Enable test fulfillment',
+  'Resume test fulfillment',
+  'Reason (audit log)',
+  'Labels and tracking are correct',
   'shopify-test-store-fulfillment-confirmed',
-  'Shopify customer notification is locked off',
+  'Tracking reviewed',
+  'No live postage will be purchased',
+  'Create one test label per package.',
+  'Fulfillment review saved. Shopify customer notification remains off.',
   'fullScreen={mobile}',
   'Current order state was refreshed. Review it before authorizing again.',
   'the exact authorization command is retained for retry.',
   'the exact fulfillment-confirmation command is retained for retry.',
   "'Idempotency-Key': canonicalCommand.idempotencyKey",
   "'Idempotency-Key': command.idempotencyKey",
+  "order.packages.length !== 1",
+  "order.sourceProvider === 'faire'",
+  'Use the package controls above for a multi-package shipment.',
 ]) {
   assert.ok(sources.ui.includes(fragment), `Operator UI missing ${fragment}`)
 }
+
+for (const fragment of [
+  '<DetailSection title="Sandbox fulfillment">',
+  'Create one sandbox label for each exact package.',
+  'pack-to-ship validation',
+]) {
+  assert.equal(
+    sources.ui.includes(fragment),
+    false,
+    `normal operator UI must not expose internal test copy: ${fragment}`,
+  )
+}
+
+assert.equal(
+  sources.route.includes('sandbox commerce E2E test'),
+  false,
+  'permission errors must not expose the internal E2E action name',
+)
 
 for (const fragment of [
   'assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPostgres',

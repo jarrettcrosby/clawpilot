@@ -13,6 +13,11 @@ import {
   BASE_PIPELINE_WORKFLOW,
   createBasePipelineDropdownCatalog,
 } from '../app_src/lib/pipeline/baseTemplate.mjs'
+import {
+  commitNumericDraft,
+  numericDraftFromValue,
+  sanitizeNumericDraft,
+} from '../app_src/lib/pipeline/numericDraft.mjs'
 
 const root = process.cwd()
 const read = (relativePath) => readFileSync(resolve(root, relativePath), 'utf8')
@@ -81,6 +86,11 @@ assert.match(component, /Select an organization already in CRM/)
 assert.match(component, /Associated contacts/)
 assert.match(component, /Select one or more contacts, then save the opportunity/)
 assert.match(component, /Save opportunity/)
+assert.match(component, /value=\{numericDrafts\.value\}/)
+assert.match(component, /value=\{numericDrafts\.probability\}/)
+assert.match(component, /commitNumericDraft\(numericDrafts\.value/)
+assert.match(component, /commitNumericDraft\(numericDrafts\.probability/)
+assert.match(component, /setNumericDrafts\(\{[\s\S]*?numericDraftFromValue\(normalized\?\.value\)[\s\S]*?numericDraftFromValue\(normalized\?\.probability\)[\s\S]*?\}\)[\s\S]*?\}, \[deal\]\)/)
 assert.match(component, /contactIds: newOpportunity\.contactIds/)
 assert.match(component, /contactIds: deal\.contactIds/)
 assert.match(component, /Add organization/)
@@ -90,6 +100,34 @@ assert.match(component, /'Idempotency-Key': newOpportunityMutationKey/)
 assert.doesNotMatch(component, /actor: 'Jarrett'/)
 assert.match(component, /pipelineAccess === 'owner' \|\| pipelineAccess === 'editor'/)
 assert.doesNotMatch(component, /canEdit\s*=\s*!pipelineSyncEnabled/, 'Sheet sync must not control CRM edit access')
+
+let amountDraft = ''
+for (const typedValue of ['1', '12', '123', '123.', '123.4', '123.45']) {
+  amountDraft = sanitizeNumericDraft(typedValue)
+  assert.equal(amountDraft, typedValue, `amount draft must preserve ${typedValue}`)
+}
+assert.deepEqual(
+  commitNumericDraft(amountDraft, { minimum: 0, fallback: 0 }),
+  { value: 123.45, draft: '123.45' },
+)
+
+let probabilityDraft = ''
+for (const typedValue of ['7', '7.', '7.2', '7.25']) {
+  probabilityDraft = sanitizeNumericDraft(typedValue)
+  assert.equal(probabilityDraft, typedValue, `probability draft must preserve ${typedValue}`)
+}
+assert.deepEqual(
+  commitNumericDraft(probabilityDraft, { minimum: 0, maximum: 100, fallback: 0 }),
+  { value: 7.25, draft: '7.25' },
+)
+assert.equal(sanitizeNumericDraft(''), '')
+assert.equal(sanitizeNumericDraft('-'), '-')
+assert.equal(sanitizeNumericDraft('123.'), '123.')
+assert.equal(sanitizeNumericDraft('$1,234.56'), '1234.56')
+assert.deepEqual(commitNumericDraft('-', { minimum: 0, fallback: 0 }), { value: 0, draft: '0' })
+assert.deepEqual(commitNumericDraft('-12.5', { minimum: 0, fallback: 0 }), { value: 0, draft: '0' })
+assert.deepEqual(commitNumericDraft('125.5', { minimum: 0, maximum: 100, fallback: 0 }), { value: 100, draft: '100' })
+assert.equal(numericDraftFromValue(987.654), '987.654')
 
 const catalogRoute = read('app_src/app/api/pipeline/catalog/route.ts')
 for (const fragment of [

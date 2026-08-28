@@ -21,6 +21,8 @@ clients/apple/Apps/Watch/Info.plist
 clients/apple/Config/Local.xcconfig
 
 # Local test/build artifacts
+/output/
+/tmp/
 app_src/test-results/
 app_src/.next/
 app_src/node_modules/

@@ -1185,7 +1185,7 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
          AND candidate.global_id = $3
          AND candidate.row_version = $4::bigint
          AND candidate.workflow_state = 'promoted'
-         AND candidate.test_order = true
+         AND ($5::boolean = false OR candidate.test_order = true)
          AND source_order.source_provider = 'shopify'
        LIMIT 2`,
       [
@@ -1193,12 +1193,15 @@ export async function assertShopifyTestStoreCanonicalPlanningEvidenceAccessInPos
         accountGlobalId,
         candidateGlobalId,
         expectedCandidateRowVersion,
+        Boolean(authorizationGlobalId),
       ],
     )
     if (context.rows.length !== 1) {
       fail(
         'SHOPIFY_TEST_E2E_CONTEXT_AMBIGUOUS',
-        'The exact promoted Shopify test-order candidate is unavailable or changed',
+        authorizationGlobalId
+          ? 'The exact promoted Shopify test-order candidate is unavailable or changed'
+          : 'The exact promoted Shopify candidate is unavailable or changed',
       )
     }
     const row = context.rows[0]

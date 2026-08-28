@@ -75,7 +75,7 @@ The following set defines the accepted authority boundary and implementation/ope
 
 ## Authority Model
 
-The active module contracts are the current product and architecture surface. The environment, knowledge, release, and brand contracts define how that product is operated. Operator-only Google Workspace, ChatGPT authorization, SuiteCRM, and Railway backup runbooks are linked from the [vault map](README.md). No deleted plan, review, or legacy OpenClaw note overrides these contracts; Git history is the source for superseded implementation evidence.
+The active module contracts are the current product and architecture surface. The environment, knowledge, release, and brand contracts define how that product is operated. The environment contract also fixes hosted release ordering: the Railway deployment path is the sole migration authority, and Vercel `dev`/`main` deployments are created from the exact commit only after Railway health succeeds. Operator-only Google Workspace, ChatGPT authorization, SuiteCRM, and Railway backup runbooks are linked from the [vault map](README.md). No deleted plan, review, or legacy OpenClaw note overrides these contracts; Git history is the source for superseded implementation evidence.
 
 ## Build And Release Trail
 

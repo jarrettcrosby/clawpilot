@@ -346,6 +346,31 @@ async function seedNonShippingReadyFacts(client, fixture) {
   )
 }
 
+async function seedUnitCartonizationReadyFacts(client, fixture) {
+  await seedReadyFacts(client, fixture)
+  await client.query(
+    `UPDATE operations_commerce_order_candidates
+     SET blocking_codes = array_append(
+       blocking_codes, 'packaging_required'
+     )
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+  await client.query(
+    `UPDATE operations_commerce_order_candidate_lines
+     SET packaging_state = 'unresolved',
+         packaging_source = 'none',
+         weight_grams = NULL,
+         length_mm = NULL,
+         width_mm = NULL,
+         height_mm = NULL,
+         blocking_codes = ARRAY['packaging_required']::text[]
+     WHERE organization_id = $1::uuid
+       AND order_candidate_id = $2::uuid`,
+    [fixture.organization, fixture.candidate],
+  )
+}
+
 async function seedNeedsInfoFacts(client, fixture) {
   await client.query(
     `INSERT INTO crm_reference_registry (
@@ -618,6 +643,50 @@ async function seedCurrentMappedProductPack(client, fixture) {
   })
 }
 
+async function seedUnitPackAssociationMigrationFixture(client, fixture) {
+  await client.query('SET session_replication_role = replica')
+  try {
+    await seedTenant(client, fixture, 'Unit pack migration')
+    await seedReadyFacts(client, fixture)
+    await seedCurrentMappedProductPack(client, fixture)
+    await client.query(
+      `UPDATE operations_commerce_order_candidate_lines line
+     SET packaging_state = 'unresolved',
+         packaging_source = 'variant_pack_mapping',
+         package_profile_id = NULL,
+         commerce_variant_pack_mapping_id = pack_mapping.id,
+         commerce_variant_pack_mapping_row_version = pack_mapping.row_version,
+         pack_profile_version_id = pack_version.id,
+         pack_profile_version_row_version = pack_version.row_version,
+         pack_profile_package_level = 'each',
+         pack_profile_base_each_quantity = 1,
+         packaging_weight_source = NULL,
+         weight_grams = NULL,
+         length_mm = NULL,
+         width_mm = NULL,
+         height_mm = NULL,
+         blocking_codes = ARRAY['packaging_required']::text[]
+     FROM operations_commerce_variant_pack_mappings pack_mapping
+     JOIN operations_product_pack_profile_versions pack_version
+       ON pack_version.organization_id = pack_mapping.organization_id
+      AND pack_version.id = pack_mapping.default_pack_profile_version_id
+     WHERE line.organization_id = $1::uuid
+       AND line.order_candidate_id = $2::uuid
+       AND pack_mapping.organization_id = line.organization_id
+       AND pack_mapping.global_id = $3
+       AND pack_version.global_id = $4`,
+      [
+        fixture.organization,
+        fixture.candidate,
+        fixture.packMappingGlobalId,
+        fixture.packVersionGlobalId,
+      ],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin')
+  }
+}
+
 async function seedFixtures(
   pool,
   primary,
@@ -646,7 +715,7 @@ async function seedFixtures(
     await seedReadyFacts(client, ready)
     await seedNeedsInfoFacts(client, needsInfo)
     await seedCurrentMappedProductPack(client, needsInfo)
-    await seedReadyFacts(client, accept)
+    await seedUnitCartonizationReadyFacts(client, accept)
     await seedNeedsInfoFacts(client, refresh)
     await seedNonShippingReadyFacts(client, nonShipping)
   } finally {
@@ -1857,6 +1926,9 @@ async function verifyAcceptance(
     assert.equal(unchangedReadyDraft.rowVersion, 1)
     assert.equal(unchangedReadyDraft.needsInfo, false)
     assert.equal(unchangedReadyDraft.shipTo.readiness, 'carrier_ready')
+    assert.equal(unchangedReadyDraft.lines[0].unitMultiplier, 1)
+    assert.equal(unchangedReadyDraft.lines[0].packageStatus, 'unresolved')
+    assert.deepEqual(unchangedReadyDraft.lines[0].blockerCodes, [])
     const acceptInput = {
       organizationId: acceptFixture.organization,
       actorEmail,
@@ -1894,6 +1966,31 @@ async function verifyAcceptance(
       ],
     )
     assert.equal(acceptedCanonicalCount.rows[0].count, 1)
+    const acceptedUnitCartonization = await pool.query(
+      `SELECT candidate_line.packaging_state,
+              canonical_line.weight_grams,
+              canonical_line.dimensions_mm
+       FROM operations_commerce_order_candidates candidate
+       JOIN operations_commerce_order_candidate_lines candidate_line
+         ON candidate_line.organization_id = candidate.organization_id
+        AND candidate_line.order_candidate_id = candidate.id
+       JOIN operations_order_lines canonical_line
+         ON canonical_line.organization_id = candidate_line.organization_id
+        AND canonical_line.id = candidate_line.canonical_order_line_id
+       WHERE candidate.organization_id = $1::uuid
+         AND candidate.id = $2::uuid`,
+      [acceptFixture.organization, acceptFixture.candidate],
+    )
+    assert.deepEqual(plain(acceptedUnitCartonization.rows[0]), {
+      packaging_state: 'not_required',
+      weight_grams: 0,
+      dimensions_mm: {
+        length: 1,
+        width: 1,
+        height: 1,
+        source: 'cartonization_pending',
+      },
+    })
 
     const nonShippingBefore = await candidateSnapshot(pool, nonShippingFixture)
     assert.equal(nonShippingBefore.ship_to_snapshot_state, 'missing')
@@ -2591,6 +2688,8 @@ async function main() {
       )
       const workbenchMigration =
         '0307_operations_commerce_order_workbench.sql'
+      const unitCartonizationMigration =
+        '0321_operations_unit_item_cartonization.sql'
       const workbenchIndex = files.indexOf(workbenchMigration)
       assert.ok(workbenchIndex > 0, '0307 workbench migration is missing')
       for (const file of files.slice(0, workbenchIndex)) {
@@ -2630,8 +2729,36 @@ async function main() {
       )
       assert.equal(installed.rows[0].validation_trigger, true)
       assert.equal(installed.rows[0].ship_to_constraint, true)
+      const migrationFixture = ids('0009799')
       for (const file of files.slice(workbenchIndex + 1)) {
+        if (file === unitCartonizationMigration) {
+          await seedUnitPackAssociationMigrationFixture(
+            client,
+            migrationFixture,
+          )
+        }
         await applyMigration(client, file)
+        if (file === unitCartonizationMigration) {
+          const migratedUnitAssociation = (await client.query(
+            `SELECT packaging_state, packaging_source,
+                    commerce_variant_pack_mapping_id IS NOT NULL
+                      AS retained_pack_mapping,
+                    pack_profile_version_id IS NOT NULL
+                      AS retained_pack_version,
+                    blocking_codes
+             FROM operations_commerce_order_candidate_lines
+             WHERE organization_id = $1::uuid
+               AND order_candidate_id = $2::uuid`,
+            [migrationFixture.organization, migrationFixture.candidate],
+          )).rows[0]
+          assert.deepEqual(plain(migratedUnitAssociation), {
+            packaging_state: 'not_required',
+            packaging_source: 'variant_pack_mapping',
+            retained_pack_mapping: true,
+            retained_pack_version: true,
+            blocking_codes: [],
+          })
+        }
       }
     } finally {
       client.release()

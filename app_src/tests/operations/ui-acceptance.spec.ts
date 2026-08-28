@@ -368,12 +368,161 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+async function installOrderLabelPrintRoutes(
+  page: Page,
+  options: { initialFailedJob?: boolean } = {},
+) {
+  const requests: Array<{
+    body: Record<string, unknown>
+    idempotencyKey: string
+  }> = []
+  let labelPrintJobs: Array<{
+    globalId: string
+    sourceLabelGlobalId: string
+    status: 'queued' | 'delivered' | 'failed'
+    reprintOfJobGlobalId: string | null
+    createdAt: string
+    deliveredAt: string | null
+    lastError: string | null
+  }> = options.initialFailedJob ? [{
+    globalId: 'gpj7654321',
+    sourceLabelGlobalId: 'glb7654321',
+    status: 'failed',
+    reprintOfJobGlobalId: null,
+    createdAt: '2026-08-22T16:14:00.000Z',
+    deliveredAt: null,
+    lastError: 'PRINTER_UNAVAILABLE',
+  }] : []
+  const sourceLabelGlobalId = 'glb7654321'
+  const originalPrintJobGlobalId = 'gpj7654321'
+  const reprintJobGlobalId = 'gpj7654322'
+  const shippedOrder = () => ({
+    ...selectedOrder,
+    id: 'shipped-order-id',
+    globalId: 'gor7654322',
+    orderNumber: '#1004',
+    sourceProvider: 'mock-commerce',
+    externalOrderId: 'mock-1004',
+    status: 'shipped',
+    rowVersion: 6,
+    planStatus: 'fulfilled',
+    waveStatus: 'completed',
+    warehouseId: 'warehouse-id',
+    warehouseName: 'Primary Warehouse',
+    packageCount: 1,
+    plannedPackageCount: 0,
+    packedPackageCount: 1,
+    availableActions: [],
+    trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+    sandboxCommerceE2eAuthorization: null,
+    fulfillmentPreparation: null,
+    planningPreparation: null,
+    labelAttempts: [],
+    trackingObservations: [],
+    printArtifacts: [],
+    commerceExports: [],
+    labelPrintJobs,
+    packages: [{
+      ...selectedOrder.packages[0],
+      status: 'shipped',
+      contents: [],
+      latestLabel: {
+        globalId: sourceLabelGlobalId,
+        status: 'created',
+        carrier: 'UPS',
+        serviceCode: '03',
+        trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+        environment: 'sandbox',
+        createAttemptGlobalId: null,
+        voidAttemptGlobalId: null,
+        createdAt: '2026-08-22T16:12:00.000Z',
+        voidedAt: null,
+      },
+    }],
+    shipments: [{
+      globalId: 'gsh7654321',
+      status: 'confirmed',
+      carrier: 'UPS',
+      serviceCode: '03',
+      trackingNumber: '1ZXXXXXXXXXXXXXXXX',
+      quotedCarrierCostMinor: '0',
+      oneOffCarrierGroupGlobalId: null,
+      shippedAt: '2026-08-22T16:13:00.000Z',
+    }],
+  })
+  const response = () => {
+    const base = workspace('resolved')
+    const order = shippedOrder()
+    return {
+      ...base,
+      orders: [order],
+      selectedOrder: order,
+      exceptions: [],
+      summary: {
+        ...base.summary,
+        openOrders: 0,
+        exceptions: 0,
+        shippedToday: 1,
+      },
+    }
+  }
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/print-jobs',
+    async (route) => {
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      const idempotencyKey = route.request().headers()['idempotency-key'] || ''
+      requests.push({ body, idempotencyKey })
+      if (body.action === 'enqueue-label') {
+        labelPrintJobs = [{
+          globalId: originalPrintJobGlobalId,
+          sourceLabelGlobalId,
+          status: 'delivered',
+          reprintOfJobGlobalId: null,
+          createdAt: '2026-08-22T16:14:00.000Z',
+          deliveredAt: '2026-08-22T16:14:01.000Z',
+          lastError: null,
+        }]
+        return route.fulfill({
+          json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
+        })
+      }
+      if (body.action === 'retry-job') {
+        labelPrintJobs = labelPrintJobs.map((job) => (
+          job.globalId === originalPrintJobGlobalId
+            ? { ...job, status: 'queued' as const, lastError: null }
+            : job
+        ))
+        return route.fulfill({
+          json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
+        })
+      }
+      expect(body.action).toBe('reprint-job')
+      labelPrintJobs = [{
+        globalId: reprintJobGlobalId,
+        sourceLabelGlobalId,
+        status: 'queued',
+        reprintOfJobGlobalId: originalPrintJobGlobalId,
+        createdAt: '2026-08-22T16:15:00.000Z',
+        deliveredAt: null,
+        lastError: null,
+      }, ...labelPrintJobs]
+      return route.fulfill({
+        json: { ok: true, job: { globalId: reprintJobGlobalId } },
+      })
+    },
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    await route.fulfill({ json: { ok: true, operations: response() } })
+  })
+  return { requests, sourceLabelGlobalId, originalPrintJobGlobalId }
+}
+
 const workbenchCandidateGlobalId = 'gcoc7654321'
 const workbenchLatestCandidateGlobalId = 'gcoc7654322'
 const workbenchCanonicalOrderGlobalId = 'gor8765432'
 const workbenchCustomerGlobalId = 'ga1234567'
 const workbenchProductGlobalId = 'gp1234567'
-const workbenchPackageProfileGlobalId = 'gpp1234567'
 const workbenchLineGlobalId = 'gcol7654321'
 
 const workbenchPartialShipTo = {
@@ -412,7 +561,6 @@ function importedWorkbenchOrder(
       'delivery_decision_required',
       'product_mapping_required',
       'line_price_required',
-      'packaging_required',
       'ship_to_region_required',
       'ship_to_postal_code_required',
     ],
@@ -444,6 +592,7 @@ function importedWorkbenchOrder(
       title: 'Trail Pack retail unit',
       sku: 'TRAIL-PROVIDER-001',
       quantity: 2,
+      unitMultiplier: 1,
       requiresShipping: true,
       mappingStatus: 'unresolved',
       priceStatus: 'unresolved',
@@ -455,17 +604,13 @@ function importedWorkbenchOrder(
       blockerCodes: [
         'product_mapping_required',
         'line_price_required',
-        'packaging_required',
       ],
     }] : [],
     productOptions: details ? [{
       globalId: workbenchProductGlobalId,
       name: 'Trail Pack',
       sku: 'TRAIL-001',
-      packageProfiles: [{
-        globalId: workbenchPackageProfileGlobalId,
-        name: 'Trail Pack measured single',
-      }],
+      packageProfiles: [],
     }] : [],
     shipTo: {
       value: workbenchPartialShipTo,
@@ -852,7 +997,10 @@ async function installImportedWorkbenchRoutes(
   return capture
 }
 
-async function installImportedOrderPreparationRoutes(page: Page) {
+async function installImportedOrderPreparationRoutes(
+  page: Page,
+  options: { missingUnitWeight?: boolean } = {},
+) {
   const authorizationIssuedAt = Date.now()
   const canonicalAuthorization = {
     authorizationGlobalId: 'gsea7654321',
@@ -900,6 +1048,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
       accountGlobalId: 'gia9286799',
       candidateGlobalId: 'gcoc35vrs9qjtmee',
       candidateRowVersion: 10,
+      testOrder: true,
     },
     lines: [{
       globalId: 'gol7654321',
@@ -1014,6 +1163,33 @@ async function installImportedOrderPreparationRoutes(page: Page) {
   }
   let planned = false
   let authorized = false
+  let orderUnitWeightGrams = options.missingUnitWeight ? null : 170
+  let orderUnitWeightFactVersion: number | null = null
+  const unitWeightRequests: Array<Record<string, unknown>> = []
+  const orderUnitWeightWorkspace = () => {
+    const line = {
+      lineGlobalId: 'gcol7654321',
+      productTitle: 'Test Product',
+      variantTitle: 'Vanilla',
+      quantity: 1,
+      unitWeightGrams: orderUnitWeightGrams,
+      weightSource: orderUnitWeightFactVersion === null
+        ? (orderUnitWeightGrams === null ? null : 'provider_catalog')
+        : 'order_specific',
+      factGlobalId: orderUnitWeightFactVersion === null
+        ? null
+        : 'gouw7654321',
+      factVersion: orderUnitWeightFactVersion,
+    }
+    return {
+      accountGlobalId: 'gia9286799',
+      candidateGlobalId: 'gcoc35vrs9qjtmee',
+      candidateRowVersion: 10,
+      orderGlobalId: 'gor7654321',
+      missingLines: orderUnitWeightGrams === null ? [line] : [],
+      effectiveLines: orderUnitWeightGrams === null ? [] : [line],
+    }
+  }
 
   await page.route((url) => url.pathname === '/api/operations/training', async (route) => {
     await route.fulfill({
@@ -1073,6 +1249,52 @@ async function installImportedOrderPreparationRoutes(page: Page) {
             providerWrites: 0,
           },
         },
+      })
+    },
+  )
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-unit-weights',
+    async (route) => {
+      if (route.request().method() === 'POST') {
+        const request = route.request().postDataJSON() as Record<string, unknown>
+        unitWeightRequests.push(request)
+        const lines = request.lines as Array<{
+          expectedFactVersion: number | null
+          lineGlobalId: string
+          unitWeightGrams: number
+        }>
+        expect(route.request().headers()['idempotency-key'])
+          .toMatch(/^operations-unit-weight:/)
+        expect(request).toMatchObject({
+          accountGlobalId: 'gia9286799',
+          candidateGlobalId: 'gcoc35vrs9qjtmee',
+          candidateRowVersion: 10,
+        })
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toMatchObject({
+          expectedFactVersion: orderUnitWeightFactVersion,
+          lineGlobalId: 'gcol7654321',
+        })
+        orderUnitWeightGrams = lines[0].unitWeightGrams
+        orderUnitWeightFactVersion = (orderUnitWeightFactVersion || 0) + 1
+        return route.fulfill({
+          json: {
+            ok: true,
+            result: {
+              replayed: false,
+              candidateGlobalId: 'gcoc35vrs9qjtmee',
+              orderGlobalId: 'gor7654321',
+              providerWriteCount: 0,
+              factGlobalIds: ['gouw7654321'],
+              workspace: orderUnitWeightWorkspace(),
+            },
+          },
+        })
+      }
+      expect(route.request().url()).toContain('candidateRowVersion=10')
+      return route.fulfill({
+        json: { ok: true, workspace: orderUnitWeightWorkspace() },
       })
     },
   )
@@ -1178,8 +1400,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
           expectedRowVersion: 0,
           confirmationStatement:
             SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
-          reason:
-            'Authorized end-to-end validation for Shopify test order #6600',
+          reason: 'Enable test fulfillment for Shopify order #6600',
           lifetimeMinutes: 120,
         })
         authorized = true
@@ -1271,6 +1492,7 @@ async function installImportedOrderPreparationRoutes(page: Page) {
       },
     })
   })
+  return { unitWeightRequests }
 }
 
 async function installOperationsNavigationRoute(page: Page) {
@@ -1684,9 +1906,12 @@ test('incomplete imported order saves locally before explicit acceptance into ca
   await page.getByRole('option', { name: /Trail Pack · TRAIL-001/ }).click()
   await page.getByLabel('Unit price (USD)').fill('12.50')
 
+  await expect(page.getByText(
+    'Unit item — cartonization chooses outbound packaging. No Product package assignment is required.',
+  )).toBeVisible()
   await expect(page.getByRole('combobox', {
-    name: 'Sellable pack override (optional)',
-  })).toHaveText('Use mapped product pack and cartonization')
+    name: 'Approved pack constraint (optional)',
+  })).toHaveCount(0)
 
   const requestedDelivery = page.getByLabel('Requested delivery')
   await requestedDelivery.fill('2026-08-30T15:30')
@@ -1873,6 +2098,61 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
 })
 
+test('shipped order prints and reprints the stored label without purchasing postage', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderLabelPrintRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1004/ }).click()
+  await expect(page.getByRole('heading', { name: 'Order #1004' })).toBeVisible()
+  await expect(page.getByText('Reprints reuse this stored label document and never purchase new postage.'))
+    .toBeVisible()
+
+  await page.getByRole('button', { name: 'Print label' }).click()
+  await expect(page.getByText(/was queued as print job gpj7654321/)).toBeVisible()
+  expect(capture.requests[0]).toEqual({
+    body: {
+      action: 'enqueue-label',
+      warehouseId: 'warehouse-id',
+      sourceLabelGlobalId: capture.sourceLabelGlobalId,
+      media: 'label_4x6',
+    },
+    idempotencyKey: `operations-shipping-label-print:${capture.sourceLabelGlobalId}`,
+  })
+
+  await page.getByRole('button', { name: 'Reprint label' }).click()
+  await expect(page.getByRole('heading', { name: 'Reprint shipping label' })).toBeVisible()
+  await expect(page.getByText(/does not call the carrier, buy postage/)).toBeVisible()
+  await page.getByRole('button', { name: 'Queue reprint' }).click()
+  await expect(page.getByText(/was queued for reprint as gpj7654322/)).toBeVisible()
+  expect(capture.requests[1].body).toEqual({
+    action: 'reprint-job',
+    jobGlobalId: capture.originalPrintJobGlobalId,
+    reason: 'Reprint shipping label for order #1004',
+  })
+  expect(capture.requests[1].idempotencyKey)
+    .toMatch(/^operations-shipping-label-reprint:gpj7654321:/)
+})
+
+test('failed shipping-label print retries from the order without purchasing postage', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderLabelPrintRoutes(page, { initialFailedJob: true })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1004/ }).click()
+  await expect(page.getByRole('button', { name: 'Retry label' })).toBeVisible()
+  await page.getByRole('button', { name: 'Retry label' }).click()
+  await expect(page.getByText(/was queued for another bounded attempt/)).toBeVisible()
+  expect(capture.requests[0].body).toEqual({
+    action: 'retry-job',
+    jobGlobalId: capture.originalPrintJobGlobalId,
+    reason: 'Retry failed shipping label for order #1004',
+  })
+  expect(capture.requests[0].idempotencyKey)
+    .toMatch(/^operations-shipping-label-retry:gpj7654321:/)
+  await expect(page.getByRole('button', { name: 'Print queued' })).toBeVisible()
+})
+
 test('measured outer dimensions save without a redundant evidence note', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   await installOperationsRoutes(page)
@@ -1974,13 +2254,12 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await expect(prepareOrder).toHaveCount(0)
   await authorizeOrder.click()
   await expect(
-    page.getByRole('heading', { name: 'Authorize verified Shopify test order' }),
+    page.getByRole('heading', { name: 'Enable test fulfillment' }),
   ).toBeVisible()
-  await page.getByTestId('shopify-test-store-authorization-statement')
-    .fill(SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION)
+  await page.getByTestId('sandbox-commerce-e2e-confirmation').check()
   await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
   await expect(page.getByTestId('sandbox-commerce-e2e-authorization-active'))
-    .toContainText('gsea7654321')
+    .toContainText('Enabled')
   await prepareOrder.click()
   await expect(
     page.getByRole('heading', { name: 'Prepare and plan imported order' }),
@@ -2001,6 +2280,48 @@ test('imported order preparation cartonizes, compares rates, and plans without r
   await expect(page.getByText(/was planned from gcte7654321/)).toBeVisible()
   await expect(page.getByRole('button', { name: 'Release to warehouse' })).toBeVisible()
   await expect(page.getByText('Not Released')).toBeVisible()
+})
+
+test('ordinary-unit weights save and invalidate stale cartonization before planning', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installImportedOrderPreparationRoutes(page, {
+    missingUnitWeight: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#6600/ }).click()
+  await page.getByTestId('authorize-shopify-test-store-canonical-e2e').click()
+  await page.getByTestId('sandbox-commerce-e2e-confirmation').check()
+  await page.getByTestId('confirm-sandbox-commerce-e2e-authorization').click()
+  await page.getByRole('button', { name: 'Prepare order' }).click()
+
+  await expect(page.getByText('Missing unit weights')).toBeVisible()
+  await expect(page.getByText('Vanilla · Quantity 1')).toBeVisible()
+  const unitWeight = page.getByLabel(/^Unit weight/)
+  const runCartonization = page.getByRole('button', {
+    name: 'Run cartonization and compare rates',
+  })
+  const saveUnitWeights = page.getByRole('button', { name: 'Save unit weights' })
+  await expect(runCartonization).toBeDisabled()
+  await expect(saveUnitWeights).toBeDisabled()
+  await unitWeight.fill('1')
+  await page.getByLabel('Audit reason').fill('Measured on the receiving scale')
+  await saveUnitWeights.click()
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(1)
+  await expect(page.getByText('Order unit weights')).toBeVisible()
+  await expect(runCartonization).toBeEnabled()
+
+  await runCartonization.click()
+  await expect(page.getByText('UPS · UPS Ground')).toBeVisible()
+  await unitWeight.fill('1.25')
+  await expect(page.getByText('UPS · UPS Ground')).toHaveCount(0)
+  await expect(runCartonization).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Confirm warehouse plan' }))
+    .toBeDisabled()
+  await page.getByLabel('Audit reason').fill('Corrected after scale verification')
+  await saveUnitWeights.click()
+  await expect.poll(() => capture.unitWeightRequests.length).toBe(2)
+  await expect(runCartonization).toBeEnabled()
 })
 
 test('operations tabs support touch navigation without portrait or landscape overflow', async ({ page }) => {
@@ -2071,7 +2392,7 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
 
   await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
   await page.getByRole('button', { name: 'Open operations guide' }).click()
-  await expect(page.getByText(/Deterministic mock adapters remain isolated to automated tests/)).toBeVisible()
+  await expect(page.getByText(/Hosted orders enter through connected commerce accounts/)).toBeVisible()
   await page.getByRole('button', { name: 'Done' }).click()
   await page.getByRole('button', { name: /PROOF-1042/ }).click()
   await expect(page.getByRole('heading', { name: 'Order PROOF-1042' })).toBeVisible()

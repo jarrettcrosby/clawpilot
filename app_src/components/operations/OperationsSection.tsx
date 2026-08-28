@@ -126,7 +126,14 @@ import ShadowOrderTrainingPanel, {
 } from '@/components/operations/ShadowOrderTrainingPanel'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import { useUserDateTime } from '@/components/timezone/UserDateTimeProvider'
-import { formatDimensionsMm, formatGrams } from '@/lib/measurements'
+import {
+  displayWeightToGrams,
+  formatDimensionsMm,
+  formatGrams,
+  gramsToDisplayWeight,
+  measurementUnits,
+  type MeasurementSystem,
+} from '@/lib/measurements'
 import {
   commerceActiveInitialSelection,
   type CommerceActiveContinuation,
@@ -139,7 +146,7 @@ import {
 } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import {
-  packagingDimensionEvidenceReady,
+  packagingMaterialReadiness,
   packagingRatedOuterEvidenceReady,
   type PackagingMaterial,
   type PackagingMaterialsWorkspace,
@@ -272,6 +279,46 @@ type PlanningEvidencePayload = {
     globalId: string
     status: 'succeeded' | 'partial' | 'failed'
   }
+}
+
+type OrderUnitWeightLine = {
+  lineGlobalId: string
+  productTitle: string
+  variantTitle: string | null
+  quantity: number
+  unitWeightGrams: number | null
+  weightSource: 'provider_order' | 'provider_catalog' | 'order_specific' | null
+  factGlobalId: string | null
+  factVersion: number | null
+}
+
+type OrderUnitWeightWorkspace = {
+  accountGlobalId: string
+  candidateGlobalId: string
+  candidateRowVersion: number
+  orderGlobalId: string
+  missingLines: OrderUnitWeightLine[]
+  effectiveLines: OrderUnitWeightLine[]
+}
+
+type OrderUnitWeightPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  workspace?: OrderUnitWeightWorkspace
+  result?: {
+    workspace: OrderUnitWeightWorkspace | null
+  }
+}
+
+function orderUnitWeightDraftValue(
+  unitWeightGrams: number,
+  system: MeasurementSystem,
+) {
+  return String(Number(gramsToDisplayWeight(
+    unitWeightGrams,
+    system,
+  ).toFixed(system === 'metric' ? 3 : 4)))
 }
 
 type ShopifyPlanningAssignment = {
@@ -559,6 +606,18 @@ function displayStatus(status: string) {
   return status.replace(/[_.-]+/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase())
 }
 
+function orderDisplayStatus(
+  order: Pick<OperationsOrderListItem, 'status' | 'externallyFulfilled'>,
+) {
+  return order.externallyFulfilled ? 'Fulfilled externally' : displayStatus(order.status)
+}
+
+function orderStatusColor(
+  order: Pick<OperationsOrderListItem, 'status' | 'externallyFulfilled'>,
+) {
+  return statusColor(order.externallyFulfilled ? 'shipped' : order.status)
+}
+
 function commerceActiveUnavailableLabel(
   option: CommerceActiveAccountOption['capabilities'][number],
 ) {
@@ -673,29 +732,33 @@ function money(minor: string | null | undefined, currency = 'USD') {
 function operationalPlanningMaterialBlockers(
   material: PackagingMaterial,
   warehouseGlobalId: string,
+  orderCurrency: string | null | undefined,
   requireStock = true,
 ) {
   const blockers: string[] = []
-  const inner = material.innerDimensionsMm
   const ratedOuter = material.ratedOuterDimensionsMm
+  const warehouseStock = material.stock.filter((item) => (
+    item.warehouseGlobalId === warehouseGlobalId
+  ))
+  const readiness = packagingMaterialReadiness({
+    status: material.status,
+    innerDimensionsMm: material.innerDimensionsMm,
+    dimensionBasis: material.dimensionBasis,
+    dimensionEvidenceType: material.dimensionEvidenceType,
+    dimensionEvidenceReference: material.dimensionEvidenceReference,
+    dimensionConfirmedAt: material.dimensionConfirmedAt,
+    tareWeightGrams: material.tareWeightGrams,
+    maxWeightGrams: material.maxWeightGrams,
+    unitCostMinor: material.unitCostMinor,
+    stock: warehouseStock,
+  })
   if (material.status !== 'active') blockers.push('not active')
-  if (
-    !Number.isSafeInteger(inner.length)
-    || Number(inner.length) < 1
-    || !Number.isSafeInteger(inner.width)
-    || Number(inner.width) < 1
-    || !Number.isSafeInteger(inner.height)
-    || Number(inner.height) < 1
-  ) {
+  if (readiness.missing.includes('dimensions')) {
     blockers.push('usable inner dimensions missing')
   }
   if (
-    material.dimensionBasis !== 'inner'
-    || !packagingDimensionEvidenceReady({
-      evidenceType: material.dimensionEvidenceType,
-      evidenceReference: material.dimensionEvidenceReference,
-      confirmedAt: material.dimensionConfirmedAt,
-    })
+    readiness.missing.includes('dimension_basis')
+    || readiness.missing.includes('dimension_evidence')
   ) {
     blockers.push('factual inner evidence missing')
   }
@@ -711,20 +774,42 @@ function operationalPlanningMaterialBlockers(
   ) {
     blockers.push('factual exterior evidence missing')
   }
-  if (!material.tareWeightGrams || material.tareWeightGrams <= 0) {
+  if (
+    readiness.missing.includes('tare_weight')
+    || !Number.isSafeInteger(material.tareWeightGrams)
+    || Number(material.tareWeightGrams) < 1
+  ) {
     blockers.push('tare weight missing')
   }
-  const stock = material.stock.find((item) => (
-    item.warehouseGlobalId === warehouseGlobalId
-  ))
+  if (
+    readiness.missing.includes('max_weight')
+    || !Number.isSafeInteger(material.maxWeightGrams)
+    || Number(material.maxWeightGrams) < 1
+  ) {
+    blockers.push('maximum weight missing')
+  }
+  if (
+    readiness.missing.includes('unit_cost')
+    || !Number.isSafeInteger(material.unitCostMinor)
+    || Number(material.unitCostMinor) < 1
+  ) {
+    blockers.push('material cost missing')
+  }
+  if (!orderCurrency) {
+    blockers.push('order currency missing')
+  }
+  if (!material.currency) {
+    blockers.push('material currency missing')
+  } else if (orderCurrency && material.currency !== orderCurrency) {
+    blockers.push(
+      `material currency ${material.currency} does not match order ${orderCurrency}`,
+    )
+  }
   if (
     requireStock
     && (
-    !stock
-    || stock.warehouseStatus !== 'active'
-    || !stock.isAvailable
-    || !stock.onHandQuantity
-    || stock.onHandQuantity <= 0
+      readiness.missing.includes('warehouse_stock')
+      || readiness.missing.includes('available_stock')
     )
   ) {
     blockers.push('available warehouse stock missing')
@@ -1097,6 +1182,11 @@ function OrderDetailDrawer({
   onPrepareFulfillment,
   onGeneratePackingSlip,
   onPrintPackingSlip,
+  onPrintLabel,
+  onUploadExternalLabel,
+  onPrintExternalLabel,
+  onRetryLabel,
+  onReprintLabel,
   onConfirmShipment,
   onRetryCommerceExport,
   onAuthorizeSandboxE2e,
@@ -1111,6 +1201,7 @@ function OrderDetailDrawer({
   onReviewOrderRevisionRecovery,
   generatingPackingSlipPackageId,
   printingPackingSlipArtifactId,
+  labelPrintBusyGlobalId,
 }: {
   order: OperationsOrderDetail | null
   sandboxCarrierAccounts: OperationsWorkspace['shipping']['sandboxCarrierAccounts']
@@ -1136,6 +1227,11 @@ function OrderDetailDrawer({
   onPrepareFulfillment: () => void
   onGeneratePackingSlip: (packageGlobalId: string) => void
   onPrintPackingSlip: (artifactGlobalId: string) => void
+  onPrintLabel: (labelGlobalId: string) => void
+  onUploadExternalLabel: (trackingNumber: string, file: File) => void
+  onPrintExternalLabel: (artifactGlobalId: string) => void
+  onRetryLabel: (labelGlobalId: string, printJobGlobalId: string) => void
+  onReprintLabel: (labelGlobalId: string, printJobGlobalId: string) => void
   onConfirmShipment: () => void
   onRetryCommerceExport: (
     commerceExportGlobalId: string,
@@ -1153,6 +1249,7 @@ function OrderDetailDrawer({
   onReviewOrderRevisionRecovery: (exceptionGlobalId: string) => void | Promise<void>
   generatingPackingSlipPackageId: string | null
   printingPackingSlipArtifactId: string | null
+  labelPrintBusyGlobalId: string | null
 }) {
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
@@ -1170,7 +1267,8 @@ function OrderDetailDrawer({
   const confirmShipmentAction = order?.availableActions?.find((item) => item.action === 'confirm_shipment')
   const sandboxE2eAuthorization = order?.sandboxCommerceE2eAuthorization || null
   const canonicalShopifyTestLane = Boolean(
-    order?.sourceProvider === 'shopify',
+    order?.sourceProvider === 'shopify'
+    && order.planningPreparation?.testOrder === true,
   )
   const canonicalShopifyAuthorization =
     sandboxE2eAuthorization?.authorityKind === 'shopify_test_store_canonical'
@@ -1180,6 +1278,7 @@ function OrderDetailDrawer({
     order?.status === 'imported'
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce'
+    && (!canonicalShopifyTestLane || Boolean(canonicalShopifyAuthorization))
   )
   const trainingProviderOrder = Boolean(
     order?.sourceProvider
@@ -1207,8 +1306,32 @@ function OrderDetailDrawer({
   const preparingFulfillment = primaryAction?.action === 'prepare_fulfillment'
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
   const shipments = order?.shipments || []
+  const externalFulfillment = order?.externalFulfillment || null
   const trackingObservations = order?.trackingObservations || []
   const printArtifacts = order?.printArtifacts || []
+  const labelPrintJobs = order?.labelPrintJobs || []
+  const externalLabelArtifacts = externalFulfillment
+    ? printArtifacts.filter((artifact) => (
+        artifact.documentType === 'shipping_label'
+        && artifact.externalFulfillmentReconciliationGlobalId
+          === externalFulfillment.reconciliationGlobalId
+      ))
+    : []
+  const missingExternalLabelArtifact = Boolean(
+    externalFulfillment
+    && (
+      externalFulfillment.tracking.length === 0
+      || externalFulfillment.tracking.some((tracking) => (
+        !tracking.number
+        || !externalLabelArtifacts.some(
+          (artifact) => artifact.externalTrackingNumber === tracking.number,
+        )
+      ))
+    ),
+  )
+  const shippingLabels = order?.packages.flatMap((item) => (
+    item.latestLabel ? [{ package: item, label: item.latestLabel }] : []
+  )) || []
   const commerceExports = order?.commerceExports || []
   const labelAttempts = order?.labelAttempts || []
   const selectedRate = order?.rates.find((rate) => rate.selected) || null
@@ -1230,6 +1353,8 @@ function OrderDetailDrawer({
         ? 'The ship-to changed after planning. Compare rates again before creating a label.'
       : order?.status !== 'packed'
         ? 'Verify package packing before creating a label.'
+        : order.packages.length !== 1
+          ? 'Use the package controls above for a multi-package shipment.'
         : activeLabel
           ? 'Void the active label before creating another.'
           : unresolvedAttempt
@@ -1237,9 +1362,9 @@ function OrderDetailDrawer({
             : !selectedRate
               ? 'Select a carrier rate before creating a label.'
               : !selectedProvider
-                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                ? `${selectedRate.carrier} does not support test labels.`
                 : eligibleCarrierAccounts.length === 0
-                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  ? `Connect and verify a TEST ${selectedRate.carrier} account first.`
                   : null
   const authorizedPackageCreateBlockedReason = !canExecute
       ? 'You do not have permission to purchase carrier labels.'
@@ -1248,7 +1373,7 @@ function OrderDetailDrawer({
       : order?.shipmentShipTo.rerateRequired
         ? 'The ship-to changed after planning. Compare rates again before creating labels.'
       : !sandboxE2eAuthorization
-        ? 'Authorize this exact commerce test order before creating package-specific sandbox labels.'
+        ? 'Enable test fulfillment before creating package labels.'
         : order?.status !== 'packed'
           ? 'Verify every package before creating labels.'
           : unresolvedAttempt
@@ -1256,20 +1381,20 @@ function OrderDetailDrawer({
             : !selectedRate
               ? 'Select a carrier rate before creating labels.'
               : !selectedProvider
-                ? `${selectedRate.carrier} does not have a direct sandbox label adapter.`
+                ? `${selectedRate.carrier} does not support test labels.`
                 : eligibleCarrierAccounts.length === 0
-                  ? `Connect and verify a sandbox ${selectedRate.carrier} account first.`
+                  ? `Connect and verify a TEST ${selectedRate.carrier} account first.`
                   : null
   const authorizeSandboxE2eBlockedReason = !canAuthorizeSandboxE2e
-    ? 'Only an authorized organization owner or administrator may authorize this test.'
+    ? 'Only an organization owner or administrator may enable test fulfillment.'
     : !order?.sourceProvider
       || !['shopify', 'faire'].includes(order.sourceProvider)
-      ? 'Sandbox commerce E2E authorization requires a Shopify or Faire order.'
+      ? 'Test fulfillment is available for Shopify and Faire orders.'
       : canonicalShopifyTestLane
         && !['imported', 'planned', 'released', 'picking', 'packed'].includes(order.status)
-        ? 'This Shopify test order is no longer at a resumable local stage.'
+        ? 'This order is no longer at a resumable fulfillment stage.'
         : !canonicalShopifyTestLane && order.status !== 'packed'
-          ? 'Verify every package before authorizing the test.'
+          ? 'Verify every package before enabling fulfillment.'
         : shipments.length > 0
           ? 'This order already has shipment evidence.'
           : null
@@ -1310,7 +1435,12 @@ function OrderDetailDrawer({
           {order && (
             <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 0.75, flexWrap: 'wrap', rowGap: 0.75 }}>
               <Chip size="small" label={order.globalId} variant="outlined" />
-              <Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} />
+              <Chip
+                size="small"
+                label={orderDisplayStatus(order)}
+                color={orderStatusColor(order)}
+                data-testid="order-derived-fulfillment-status"
+              />
             </Stack>
           )}
         </Box>
@@ -1756,61 +1886,64 @@ function OrderDetailDrawer({
             {(
               canonicalShopifyTestLane
               || (
-                ['shopify', 'faire'].includes(order.sourceProvider || '')
+                order.sourceProvider === 'faire'
                 && order.status === 'packed'
               )
             ) && (
-              <DetailSection title={canonicalShopifyTestLane
-                ? 'Verified Shopify test-store workflow'
-                : 'Authorized sandbox commerce E2E'}>
+              <DetailSection title="Test fulfillment">
                 {sandboxE2eAuthorization ? (
                   <Stack spacing={1.25}>
-                    <Alert
-                      severity="success"
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      alignItems="center"
                       data-testid="sandbox-commerce-e2e-authorization-active"
                     >
-                      Exact-order authorization{' '}
-                      {sandboxE2eAuthorization.authorizationGlobalId} is current until{' '}
-                      {formatUserDateTime(
-                        sandboxE2eAuthorization.expiresAt,
-                        dateTime,
-                        {
-                          year: 'numeric',
-                          month: 'short',
-                          day: 'numeric',
-                          hour: 'numeric',
-                          minute: '2-digit',
-                          fallback: sandboxE2eAuthorization.expiresAt,
-                        },
-                      )}. {canonicalShopifyAuthorization
-                        ? 'Local plan, release, pick, pack, and sandbox-label steps are available only for this verified Shopify test order. Provider writes must also be On before fulfillment is sent to Shopify.'
-                        : `It permits only this order's package-specific sandbox labels and reserved-inventory consumption. Provider writes must be On before ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment or tracking is sent.`}
-                    </Alert>
+                      <Chip size="small" color="success" label="Enabled" />
+                      <Typography variant="body2" color="text.secondary">
+                        Available until {formatUserDateTime(
+                          sandboxE2eAuthorization.expiresAt,
+                          dateTime,
+                          {
+                            year: 'numeric',
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                            fallback: sandboxE2eAuthorization.expiresAt,
+                          },
+                        )}
+                      </Typography>
+                    </Stack>
                     {canonicalShopifyAuthorization && order.status === 'packed' && (
                       canonicalShopifyAuthorization.fulfillmentConfirmedAt ? (
-                        <Alert
-                          severity="success"
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          alignItems="center"
                           data-testid="shopify-test-store-fulfillment-confirmed"
                         >
-                          The exact sandbox label and tracking snapshot was confirmed at{' '}
-                          {formatUserDateTime(
-                            canonicalShopifyAuthorization.fulfillmentConfirmedAt,
-                            dateTime,
-                            {
-                              year: 'numeric',
-                              month: 'short',
-                              day: 'numeric',
-                              hour: 'numeric',
-                              minute: '2-digit',
-                              fallback:
-                                canonicalShopifyAuthorization.fulfillmentConfirmedAt,
-                            },
-                          )}. Shopify customer notification is locked off.
-                        </Alert>
+                          <CheckCircleRounded color="success" fontSize="small" />
+                          <Typography variant="body2">
+                            Tracking reviewed {formatUserDateTime(
+                              canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                              dateTime,
+                              {
+                                year: 'numeric',
+                                month: 'short',
+                                day: 'numeric',
+                                hour: 'numeric',
+                                minute: '2-digit',
+                                fallback:
+                                  canonicalShopifyAuthorization.fulfillmentConfirmedAt,
+                              },
+                            )}
+                          </Typography>
+                        </Stack>
                       ) : (
                         <Tooltip title={canonicalLabelsReady
-                          ? 'Review the exact sandbox labels and explicitly confirm Shopify fulfillment'
-                          : 'Create one current sandbox label for every exact package first'}>
+                          ? 'Review package labels before completing fulfillment'
+                          : 'Create a current label for every package first'}>
                           <span>
                             <Button
                               fullWidth
@@ -1821,7 +1954,7 @@ function OrderDetailDrawer({
                               onClick={onConfirmShopifyTestFulfillment}
                               data-testid="review-shopify-test-store-fulfillment"
                             >
-                              Review and confirm Shopify fulfillment
+                              Review fulfillment
                             </Button>
                           </span>
                         </Tooltip>
@@ -1830,21 +1963,18 @@ function OrderDetailDrawer({
                   </Stack>
                 ) : (
                   <Stack spacing={1.25}>
-                    <Alert severity="warning">
-                      {canonicalShopifyTestLane
-                        ? `Authorize this exact provider-verified Shopify test order before starting or resuming its ${displayStatus(order.status)} local workflow. This does not enable unrelated orders, production postage, or customer notification.`
-                        : `This test path creates non-tracking sandbox labels and then performs real ClawPilot inventory and ${order.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment writes for this exact order. It does not authorize any other order or production carrier purchase.`}
-                    </Alert>
+                    <Typography variant="body2" color="text.secondary">
+                      Uses connected TEST carrier accounts. No live postage will be purchased.
+                    </Typography>
                     <Tooltip
                       title={authorizeSandboxE2eBlockedReason
-                        || 'Review and authorize this exact commerce test order'}
+                        || 'Enable test fulfillment for this order'}
                     >
                       <span>
                         <Button
                           fullWidth
                           variant="outlined"
-                          color="warning"
-                          startIcon={<WarningAmberRounded />}
+                          startIcon={<LocalShippingRounded />}
                           disabled={busy || Boolean(authorizeSandboxE2eBlockedReason)}
                           onClick={onAuthorizeSandboxE2e}
                           data-testid={canonicalShopifyTestLane
@@ -1852,10 +1982,8 @@ function OrderDetailDrawer({
                             : 'authorize-sandbox-commerce-e2e'}
                         >
                           {canonicalShopifyTestLane && order.status !== 'imported'
-                            ? 'Renew or resume verified test order'
-                            : canonicalShopifyTestLane
-                              ? 'Authorize verified test order'
-                              : 'Authorize exact-order E2E test'}
+                            ? 'Resume test fulfillment'
+                            : 'Enable test fulfillment'}
                         </Button>
                       </span>
                     </Tooltip>
@@ -1891,13 +2019,10 @@ function OrderDetailDrawer({
                 {sandboxE2eAuthorization ? (
                   <Stack spacing={1.25} data-testid="sandbox-commerce-e2e-packages">
                     <Alert severity="info">
-                      Create one sandbox label for each exact package. When all{' '}
-                      {order.packages.length} packages are labeled, Confirm shipment
-                      will consume the reserved inventory and write every tracking
-                      number to {order.sourceProvider === 'faire'
+                      Create one test label per package. Confirming shipment updates
+                      inventory and sends tracking to {order.sourceProvider === 'faire'
                         ? 'Faire'
-                        : 'Shopify'} under authorization{' '}
-                      {sandboxE2eAuthorization.authorizationGlobalId}.
+                        : 'Shopify'}.
                     </Alert>
                     {order.packages.map((item) => {
                       const packageLabel = item.latestLabel?.status === 'created'
@@ -1932,7 +2057,7 @@ function OrderDetailDrawer({
                               <Chip
                                 size="small"
                                 color={packageLabel ? 'success' : 'default'}
-                                label={packageLabel ? 'Sandbox label ready' : 'Label required'}
+                                label={packageLabel ? 'Test label ready' : 'Label required'}
                               />
                             </Stack>
                             {packageLabel ? (
@@ -1948,7 +2073,7 @@ function OrderDetailDrawer({
                             ) : (
                               <Tooltip
                                 title={authorizedPackageCreateBlockedReason
-                                  || `Create the sandbox label for package ${item.packageNumber}`}
+                                  || `Create the test label for package ${item.packageNumber}`}
                               >
                                 <span>
                                   <Button
@@ -1960,7 +2085,7 @@ function OrderDetailDrawer({
                                     onClick={() => onCreateSandboxLabel(item.globalId)}
                                     data-testid={`create-sandbox-label-${item.globalId}`}
                                   >
-                                    Create package {item.packageNumber} sandbox label
+                                    Create package {item.packageNumber} label
                                   </Button>
                                 </span>
                               </Tooltip>
@@ -1987,7 +2112,7 @@ function OrderDetailDrawer({
                               {activeLabel.createAttemptGlobalId ? ` · Purchase ${activeLabel.createAttemptGlobalId}` : ''}
                             </Typography>
                           </Box>
-                          <Tooltip title={voidBlockedReason || 'Void through the same sandbox account used to purchase this label'}>
+                          <Tooltip title={voidBlockedReason || 'Void through the same TEST account used to create this label'}>
                             <span>
                               <Button
                                 color="error"
@@ -2003,14 +2128,13 @@ function OrderDetailDrawer({
                           </Tooltip>
                         </Stack>
                       </Box>
-                    ) : (
-                      <Alert severity={createBlockedReason ? 'info' : 'warning'}>
-                        {createBlockedReason
-                          || 'Sandbox execution uses the fixed John Doe test shipment. Create the label, inspect the print evidence, then void it immediately.'}
-                      </Alert>
-                    )}
+                    ) : createBlockedReason ? (
+                      <Typography variant="body2" color="text.secondary">
+                        {createBlockedReason}
+                      </Typography>
+                    ) : null}
                     {!activeLabel && (
-                      <Tooltip title={createBlockedReason || 'Purchase a sandbox label and route its print job'}>
+                      <Tooltip title={createBlockedReason || 'Create a label and send it to the configured printer'}>
                         <span>
                           <Button
                             fullWidth
@@ -2019,7 +2143,7 @@ function OrderDetailDrawer({
                             disabled={busy || Boolean(createBlockedReason)}
                             onClick={() => onCreateSandboxLabel()}
                           >
-                            Create sandbox label
+                            Create test label
                           </Button>
                         </span>
                       </Tooltip>
@@ -2058,14 +2182,236 @@ function OrderDetailDrawer({
 
             <DetailSection title="Shipment evidence">
               {shipments.length === 0
+                && !externalFulfillment
                 && trackingObservations.length === 0
                 && printArtifacts.length === 0
+                && shippingLabels.length === 0
                 && commerceExports.length === 0 ? (
                   <Typography variant="body2" color="text.secondary">
                     Confirmed shipment, tracking, packing-slip, and commerce-export evidence will appear here.
                   </Typography>
                 ) : (
                   <Stack spacing={2}>
+                    {externalFulfillment && (
+                      <Box data-testid="order-external-fulfillment-evidence">
+                        <Typography variant="caption" color="text.secondary">
+                          External fulfillment
+                        </Typography>
+                        <Stack spacing={1.25} sx={{ mt: 0.75 }}>
+                          <Box>
+                            <Typography fontWeight={700}>
+                              Shopify · {externalFulfillment.providerFulfillmentName}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {externalFulfillment.providerFulfillmentId}
+                              {' · Fulfilled '}{formatUserDateTime(
+                                externalFulfillment.fulfilledAt,
+                                dateTime,
+                                {
+                                  year: 'numeric',
+                                  month: 'short',
+                                  day: 'numeric',
+                                  hour: 'numeric',
+                                  minute: '2-digit',
+                                  fallback: 'Unknown',
+                                },
+                              )}
+                              {' · Evidence '}{externalFulfillment.reconciliationGlobalId}
+                            </Typography>
+                          </Box>
+                          {externalFulfillment.tracking.length > 0 ? (
+                            <Stack divider={<Divider flexItem />}>
+                              {externalFulfillment.tracking.map((tracking, index) => {
+                                const artifact = externalLabelArtifacts.find(
+                                  (item) => item.externalTrackingNumber === tracking.number,
+                                ) || null
+                                const jobs = artifact
+                                  ? labelPrintJobs.filter(
+                                      (job) => job.sourceArtifactGlobalId === artifact.globalId,
+                                    )
+                                  : []
+                                const pendingJob = jobs.find(
+                                  (job) => job.status === 'queued' || job.status === 'claimed',
+                                ) || null
+                                const deliveredJob = jobs.find(
+                                  (job) => job.status === 'delivered',
+                                ) || null
+                                const failedJob = jobs.find(
+                                  (job) => job.status === 'failed',
+                                ) || null
+                                const busyKey = artifact?.globalId
+                                  || `external-upload:${tracking.number || index}`
+                                const busyLabel = labelPrintBusyGlobalId === busyKey
+                                const bundledAgentCompatible = artifact?.format === 'ZPL'
+                                const printBlockedReason = !canExecute
+                                  ? 'Warehouse execution access is required to print labels.'
+                                  : !order.warehouseId
+                                    ? 'The order has no fulfillment warehouse for printer routing.'
+                                    : pendingJob
+                                      ? `Print job ${pendingJob.globalId} is already ${pendingJob.status}.`
+                                      : jobs.length > 0 && !deliveredJob && !failedJob
+                                        ? 'Review the existing print job in Printing before authorizing another physical copy.'
+                                        : null
+                                return (
+                                  <Box
+                                    key={`${tracking.number || tracking.url || 'tracking'}-${index}`}
+                                    sx={{
+                                      py: 1,
+                                      display: 'grid',
+                                      gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                      gap: 1.5,
+                                      alignItems: 'center',
+                                    }}
+                                  >
+                                    <Box sx={{ minWidth: 0 }}>
+                                      <Typography fontWeight={600}>
+                                        {tracking.company || 'Carrier not supplied'}
+                                      </Typography>
+                                      <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                        {tracking.number || 'Tracking number not supplied'}
+                                      </Typography>
+                                      <Typography variant="caption" color="text.secondary" display="block">
+                                        {artifact
+                                          ? `${artifact.globalId} · Exact original ${artifact.format} retained${jobs[0] ? ` · Latest print ${jobs[0].globalId} (${displayStatus(jobs[0].status)})` : ''}`
+                                          : 'Exact original label not yet retained'}
+                                      </Typography>
+                                    </Box>
+                                    <Stack direction="row" spacing={1} flexWrap="wrap" justifyContent="flex-end">
+                                      {tracking.url && (
+                                        <Button
+                                          component="a"
+                                          href={tracking.url}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          size="small"
+                                          variant="outlined"
+                                          startIcon={<OpenInNewRounded />}
+                                        >
+                                          Track
+                                        </Button>
+                                      )}
+                                      {artifact?.contentUrl && (
+                                        <Button
+                                          component="a"
+                                          href={artifact.contentUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          size="small"
+                                          variant="outlined"
+                                          startIcon={<OpenInNewRounded />}
+                                        >
+                                          Download label
+                                        </Button>
+                                      )}
+                                      {artifact && bundledAgentCompatible ? (
+                                        <Tooltip title={printBlockedReason || (
+                                          deliveredJob
+                                            ? 'Create an audited reprint from these exact retained bytes'
+                                            : failedJob
+                                              ? 'Retry the failed print job using the same retained bytes'
+                                              : 'Queue these exact retained bytes to the configured warehouse printer'
+                                        )}>
+                                          <span>
+                                            <Button
+                                              size="small"
+                                              variant="contained"
+                                              startIcon={busyLabel
+                                                ? <CircularProgress size={16} />
+                                                : deliveredJob || failedJob
+                                                  ? <ReplayRounded />
+                                                  : <PrintRounded />}
+                                              disabled={
+                                                busy
+                                                || busyLabel
+                                                || Boolean(printBlockedReason)
+                                              }
+                                              onClick={() => {
+                                                if (deliveredJob) {
+                                                  onReprintLabel(
+                                                    artifact.globalId,
+                                                    deliveredJob.globalId,
+                                                  )
+                                                } else if (failedJob) {
+                                                  onRetryLabel(
+                                                    artifact.globalId,
+                                                    failedJob.globalId,
+                                                  )
+                                                } else {
+                                                  onPrintExternalLabel(artifact.globalId)
+                                                }
+                                              }}
+                                              data-testid={`order-external-label-print-${artifact.globalId}`}
+                                            >
+                                              {busyLabel
+                                                ? 'Queueing'
+                                                : deliveredJob
+                                                  ? 'Reprint label'
+                                                  : failedJob
+                                                    ? 'Retry label'
+                                                    : pendingJob
+                                                      ? 'Print queued'
+                                                      : 'Print label'}
+                                            </Button>
+                                          </span>
+                                        </Tooltip>
+                                      ) : !artifact && tracking.number ? (
+                                        <Tooltip title={!canManage || !canExecute
+                                          ? 'Operations management and warehouse execution access are required.'
+                                          : 'Retain the exact original label file without purchasing postage or writing to Shopify'}>
+                                          <span>
+                                            <Button
+                                              component="label"
+                                              size="small"
+                                              variant="contained"
+                                              startIcon={busyLabel
+                                                ? <CircularProgress size={16} />
+                                                : <MoveToInboxRounded />}
+                                              disabled={busy || busyLabel || !canManage || !canExecute}
+                                            >
+                                              {busyLabel ? 'Uploading' : 'Upload original label'}
+                                              <input
+                                                hidden
+                                                type="file"
+                                                accept=".zpl,.pdf,.png,application/vnd.zebra-zpl,application/pdf,image/png,text/plain"
+                                                onChange={(event) => {
+                                                  const file = event.target.files?.[0]
+                                                  event.target.value = ''
+                                                  if (file) onUploadExternalLabel(tracking.number!, file)
+                                                }}
+                                              />
+                                            </Button>
+                                          </span>
+                                        </Tooltip>
+                                      ) : null}
+                                    </Stack>
+                                    {artifact && !bundledAgentCompatible && (
+                                      <Typography
+                                        variant="caption"
+                                        color="text.secondary"
+                                        data-testid={`order-external-label-manual-${artifact.globalId}`}
+                                        sx={{ gridColumn: '1 / -1', textAlign: 'right' }}
+                                      >
+                                        {artifact.format} is available for download and manual printing. The bundled print agent accepts ZPL labels only.
+                                      </Typography>
+                                    )}
+                                  </Box>
+                                )
+                              })}
+                            </Stack>
+                          ) : (
+                            <Alert severity="info">
+                              Shopify did not supply tracking details for this fulfillment.
+                            </Alert>
+                          )}
+                          {missingExternalLabelArtifact && (
+                            <Alert severity="warning">
+                              Shopify supplied fulfillment and tracking facts, but not every exact original carrier-label document. Upload the original PDF, ZPL, or PNG from the label provider to enable audited order-level printing and reprinting. ClawPilot will not buy replacement postage automatically.
+                            </Alert>
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
+
                     {shipments.length > 0 && (
                       <Box>
                         <Typography variant="caption" color="text.secondary">Shipments</Typography>
@@ -2116,6 +2462,130 @@ function OrderDetailDrawer({
                         </Stack>
                       </Box>
                     )}
+
+                    {shippingLabels.length > 0 ? (
+                      <Box data-testid="order-shipping-labels">
+                        <Typography variant="caption" color="text.secondary">
+                          Shipping labels
+                        </Typography>
+                        <Stack divider={<Divider flexItem />}>
+                          {shippingLabels.map(({ package: item, label }) => {
+                            const jobs = labelPrintJobs.filter(
+                              (job) => job.sourceLabelGlobalId === label.globalId,
+                            )
+                            const pendingJob = jobs.find(
+                              (job) => job.status === 'queued' || job.status === 'claimed',
+                            ) || null
+                            const deliveredJob = jobs.find(
+                              (job) => job.status === 'delivered',
+                            ) || null
+                            const failedJob = jobs.find(
+                              (job) => job.status === 'failed',
+                            ) || null
+                            const busyLabel = labelPrintBusyGlobalId === label.globalId
+                            const canPrint = Boolean(
+                              canExecute
+                              && order.warehouseId
+                              && label.status === 'created',
+                            )
+                            const actionBlockedReason = !canExecute
+                              ? 'Warehouse execution access is required to print labels.'
+                              : !order.warehouseId
+                                ? 'The order has no fulfillment warehouse for printer routing.'
+                                : label.status !== 'created'
+                                  ? 'Inactive or voided carrier labels cannot be printed.'
+                                  : pendingJob
+                                    ? `Print job ${pendingJob.globalId} is already ${pendingJob.status}.`
+                                    : jobs.length > 0 && !deliveredJob && !failedJob
+                                      ? 'Review the existing print job in Printing before authorizing another physical copy.'
+                                      : null
+                            return (
+                              <Box
+                                key={label.globalId}
+                                sx={{
+                                  py: 1.25,
+                                  display: 'grid',
+                                  gridTemplateColumns: 'minmax(0, 1fr) auto',
+                                  gap: 1.5,
+                                  alignItems: 'center',
+                                }}
+                              >
+                                <Box sx={{ minWidth: 0 }}>
+                                  <Typography fontWeight={700}>
+                                    Package {item.packageNumber} · {label.carrier} {label.serviceCode}
+                                  </Typography>
+                                  <Typography sx={{ overflowWrap: 'anywhere' }}>
+                                    {label.trackingNumber}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {label.globalId} · {displayStatus(label.environment)}
+                                    {jobs[0]
+                                      ? ` · Latest print ${jobs[0].globalId} (${displayStatus(jobs[0].status)})`
+                                      : ' · Not yet printed from ClawPilot'}
+                                  </Typography>
+                                  <Typography variant="caption" color="text.secondary" display="block">
+                                    Reprints reuse this stored label document and never purchase new postage.
+                                  </Typography>
+                                </Box>
+                                <Tooltip title={actionBlockedReason || (
+                                  deliveredJob
+                                    ? 'Create a new audited print job from the original label bytes'
+                                    : failedJob
+                                      ? 'Retry the failed print job from the same immutable label; no carrier call, postage purchase, or tracking change'
+                                    : 'Queue the stored carrier label to the configured warehouse printer'
+                                )}>
+                                  <span>
+                                    <Button
+                                      size="small"
+                                      variant="contained"
+                                      startIcon={busyLabel
+                                        ? <CircularProgress size={16} />
+                                        : deliveredJob
+                                          ? <ReplayRounded />
+                                          : failedJob
+                                            ? <ReplayRounded />
+                                          : <PrintRounded />}
+                                      disabled={
+                                        busy
+                                        || busyLabel
+                                        || !canPrint
+                                        || Boolean(actionBlockedReason)
+                                      }
+                                      onClick={() => {
+                                        if (deliveredJob) {
+                                          onReprintLabel(label.globalId, deliveredJob.globalId)
+                                        } else if (failedJob) {
+                                          onRetryLabel(label.globalId, failedJob.globalId)
+                                        } else {
+                                          onPrintLabel(label.globalId)
+                                        }
+                                      }}
+                                      data-testid={`order-label-print-${label.globalId}`}
+                                    >
+                                      {busyLabel
+                                        ? 'Queueing'
+                                        : deliveredJob
+                                          ? 'Reprint label'
+                                          : failedJob
+                                            ? 'Retry label'
+                                          : pendingJob
+                                            ? 'Print queued'
+                                            : jobs.length > 0
+                                              ? 'Review print job'
+                                              : 'Print label'}
+                                    </Button>
+                                  </span>
+                                </Tooltip>
+                              </Box>
+                            )
+                          })}
+                        </Stack>
+                      </Box>
+                    ) : shipments.length > 0 ? (
+                      <Alert severity="warning">
+                        Tracking and shipment evidence are available, but the original carrier-label document was not imported into ClawPilot. Reprint is unavailable until that exact label artifact is retrieved from the shipping provider or uploaded; ClawPilot will not buy a replacement label automatically.
+                      </Alert>
+                    ) : null}
 
                     {printArtifacts.length > 0 && (
                       <Box>
@@ -2547,7 +3017,9 @@ function OperationsGuide({ open, onClose }: { open: boolean; onClose: () => void
           <Box><Typography fontWeight={700}>3. Release and execute</Typography><Typography color="text.secondary">Review the plan, reservations, packages, rates, cost, revenue, and margin before release. Release creates a wave and ready pick tasks. Pick confirmation completes the wave, and package verification records packing evidence and contract fees.</Typography></Box>
           <Box><Typography fontWeight={700}>4. Label, print, and void</Typography><Typography color="text.secondary">Authorized managers may purchase a label only through a verified sandbox UPS or FedEx account. ClawPilot records the provider attempt before the call, stores the result, routes the label to the configured printer, and requires the original account when voiding. Prepared or unknown attempts must be reconciled before retrying.</Typography></Box>
           <Box><Typography fontWeight={700}>5. Reconcile revenue</Typography><Typography color="text.secondary">Contract directives create immutable billable events for order handling, picks, packing, freight, storage, and special services.</Typography></Box>
-          <Alert severity="info">Hosted orders enter through approved commerce integrations. Sandbox label execution always uses the fixed John Doe test fixture between 101 Jegs Place and Massachusetts Maritime Academy. Deterministic mock adapters remain isolated to automated tests.</Alert>
+          <Typography variant="body2" color="text.secondary">
+            Hosted orders enter through connected commerce accounts. Sandbox carrier actions use non-billable test data.
+          </Typography>
         </Stack>
       </DialogContent>
       <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
@@ -2563,6 +3035,7 @@ export default function OperationsSection({
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const dateTime = useUserDateTime()
+  const { measurementSystem } = useMeasurementSystem()
   const [workspace, setWorkspace] = useState<OperationsWorkspace | null>(null)
   const [commerceFulfillmentRecoveryEnabled, setCommerceFulfillmentRecoveryEnabled] =
     useState(false)
@@ -2630,6 +3103,16 @@ export default function OperationsSection({
   const [planPreparationLoading, setPlanPreparationLoading] = useState(false)
   const [planPackagingWorkspace, setPlanPackagingWorkspace] =
     useState<PackagingMaterialsWorkspace | null>(null)
+  const [planUnitWeightWorkspace, setPlanUnitWeightWorkspace] =
+    useState<OrderUnitWeightWorkspace | null>(null)
+  const [planUnitWeightDrafts, setPlanUnitWeightDrafts] =
+    useState<Record<string, string>>({})
+  const [planUnitWeightDraftMeasurementSystem, setPlanUnitWeightDraftMeasurementSystem] =
+    useState<MeasurementSystem>(measurementSystem)
+  const [planUnitWeightReason, setPlanUnitWeightReason] = useState('')
+  const [planUnitWeightIdempotencyKey, setPlanUnitWeightIdempotencyKey] =
+    useState('')
+  const [savingPlanUnitWeights, setSavingPlanUnitWeights] = useState(false)
   const [planShopifyAssignment, setPlanShopifyAssignment] =
     useState<ShopifyPlanningAssignment | null>(null)
   const [planWarehouseGlobalId, setPlanWarehouseGlobalId] = useState('')
@@ -2646,6 +3129,7 @@ export default function OperationsSection({
   const [planIdempotencyKey, setPlanIdempotencyKey] = useState('')
   const [planError, setPlanError] = useState('')
   const [planningOrder, setPlanningOrder] = useState(false)
+  const planPreparationAbortController = useRef<AbortController | null>(null)
   const [releaseOpen, setReleaseOpen] = useState(false)
   const [releaseReason, setReleaseReason] = useState('Release the reviewed plan to warehouse execution')
   const [releaseIdempotencyKey, setReleaseIdempotencyKey] = useState('')
@@ -2704,9 +3188,8 @@ export default function OperationsSection({
   const [retryingCommerceExport, setRetryingCommerceExport] = useState(false)
   const [sandboxE2eAuthorizationOpen, setSandboxE2eAuthorizationOpen] = useState(false)
   const [sandboxE2eAuthorizationConfirmed, setSandboxE2eAuthorizationConfirmed] = useState(false)
-  const [sandboxE2eConfirmationText, setSandboxE2eConfirmationText] = useState('')
   const [sandboxE2eAuthorizationReason, setSandboxE2eAuthorizationReason] = useState(
-    'Authorized end-to-end validation for this exact commerce test order',
+    'Enable test fulfillment for this order',
   )
   const [authorizingSandboxE2e, setAuthorizingSandboxE2e] = useState(false)
   const pendingShopifyTestStoreAuthorization =
@@ -2714,20 +3197,20 @@ export default function OperationsSection({
   const [shopifyTestFulfillmentOpen, setShopifyTestFulfillmentOpen] = useState(false)
   const [shopifyTestFulfillmentText, setShopifyTestFulfillmentText] = useState('')
   const [shopifyTestFulfillmentReason, setShopifyTestFulfillmentReason] = useState(
-    'Reviewed the exact sandbox labels and tracking snapshot for Shopify test fulfillment',
+    'Reviewed package labels and tracking before fulfillment',
   )
   const [confirmingShopifyTestFulfillment, setConfirmingShopifyTestFulfillment] =
     useState(false)
   const pendingShopifyTestStoreFulfillment =
     useRef<ShopifyTestStoreFulfillmentCommand | null>(null)
   const [createLabelOpen, setCreateLabelOpen] = useState(false)
-  const [createLabelReason, setCreateLabelReason] = useState('Purchase a sandbox label for pack-to-ship validation')
+  const [createLabelReason, setCreateLabelReason] = useState('Create a test shipping label')
   const [createLabelIdempotencyKey, setCreateLabelIdempotencyKey] = useState('')
   const [carrierAccountGlobalId, setCarrierAccountGlobalId] = useState('')
   const [createLabelPackageGlobalId, setCreateLabelPackageGlobalId] = useState('')
   const [creatingLabel, setCreatingLabel] = useState(false)
   const [voidLabelOpen, setVoidLabelOpen] = useState(false)
-  const [voidLabelReason, setVoidLabelReason] = useState('Void the sandbox label after validation')
+  const [voidLabelReason, setVoidLabelReason] = useState('Void the test shipping label')
   const [voidLabelIdempotencyKey, setVoidLabelIdempotencyKey] = useState('')
   const [voidingLabel, setVoidingLabel] = useState(false)
   const [oneOffExecutionState, setOneOffExecutionState] =
@@ -2755,6 +3238,13 @@ export default function OperationsSection({
     printingPackingSlipArtifactId,
     setPrintingPackingSlipArtifactId,
   ] = useState<string | null>(null)
+  const [labelPrintBusyGlobalId, setLabelPrintBusyGlobalId] =
+    useState<string | null>(null)
+  const [labelReprintOpen, setLabelReprintOpen] = useState(false)
+  const [labelReprintLabelGlobalId, setLabelReprintLabelGlobalId] = useState('')
+  const [labelReprintJobGlobalId, setLabelReprintJobGlobalId] = useState('')
+  const [labelReprintReason, setLabelReprintReason] = useState('')
+  const [labelReprintIdempotencyKey, setLabelReprintIdempotencyKey] = useState('')
 
   useEffect(() => {
     const pendingOrderGlobalId = new URL(window.location.href).searchParams
@@ -2834,6 +3324,7 @@ export default function OperationsSection({
       }
       setOneOffExecutionState(payload.state)
     } catch (caught) {
+      if (signal?.aborted) return
       if (caught instanceof DOMException && caught.name === 'AbortError') return
       setOneOffExecutionError(caught instanceof Error
         ? caught.message
@@ -3301,6 +3792,7 @@ export default function OperationsSection({
   const loadPlanPreparation = async (
     order: OperationsOrderDetail,
     localTraining = false,
+    signal?: AbortSignal,
   ) => {
     if (!order.planningPreparation) {
       setPlanError(
@@ -3312,6 +3804,7 @@ export default function OperationsSection({
     try {
       const packagingRequest = fetch('/api/operations/packaging-materials', {
         cache: 'no-store',
+        signal,
       })
       const assignmentRequest = order.sourceProvider === 'shopify'
         && !localTraining
@@ -3320,6 +3813,7 @@ export default function OperationsSection({
             {
               method: 'POST',
               cache: 'no-store',
+              signal,
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'inspect',
@@ -3331,10 +3825,23 @@ export default function OperationsSection({
             },
           )
         : null
-      const [response, assignmentResponse] = await Promise.all([
-        packagingRequest,
-        assignmentRequest,
-      ])
+      const unitWeightParams = new URLSearchParams({
+        accountGlobalId: order.planningPreparation.accountGlobalId,
+        candidateGlobalId: order.planningPreparation.candidateGlobalId,
+        candidateRowVersion: String(
+          order.planningPreparation.candidateRowVersion,
+        ),
+      })
+      const unitWeightRequest = fetch(
+        `/api/operations/order-unit-weights?${unitWeightParams.toString()}`,
+        { cache: 'no-store', signal },
+      )
+      const [response, assignmentResponse, unitWeightResponse] =
+        await Promise.all([
+          packagingRequest,
+          assignmentRequest,
+          unitWeightRequest,
+        ])
       const payload = await response.json().catch(() => ({})) as
         PackagingMaterialsPayload
       if (!response.ok || !payload.ok || !payload.packagingMaterials) {
@@ -3343,6 +3850,20 @@ export default function OperationsSection({
         )
       }
       const packaging = payload.packagingMaterials
+      const unitWeightPayload = await unitWeightResponse.json()
+        .catch(() => ({})) as OrderUnitWeightPayload
+      if (signal?.aborted) return
+      if (
+        !unitWeightResponse.ok
+        || !unitWeightPayload.ok
+        || !unitWeightPayload.workspace
+      ) {
+        throw new Error(
+          `${unitWeightPayload.error || 'Order unit weights could not be loaded'}${
+            unitWeightPayload.code ? ` [${unitWeightPayload.code}]` : ''
+          }`,
+        )
+      }
       let assignment: ShopifyPlanningAssignment | null = null
       if (assignmentResponse) {
         const assignmentPayload = await assignmentResponse.json()
@@ -3357,6 +3878,7 @@ export default function OperationsSection({
         }
         assignment = assignmentPayload.assignment
       }
+      if (signal?.aborted) return
       const warehouseGlobalId = assignment?.status === 'ready'
         ? assignment.selectedWarehouse?.globalId || ''
         : packaging.warehouses.find(
@@ -3367,11 +3889,30 @@ export default function OperationsSection({
             operationalPlanningMaterialBlockers(
               material,
               warehouseGlobalId,
+              order.currency,
               !localTraining,
             ).length === 0
           ))
         : []
       setPlanPackagingWorkspace(packaging)
+      setPlanUnitWeightWorkspace(unitWeightPayload.workspace)
+      setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+      setPlanUnitWeightDrafts(Object.fromEntries(
+        [
+          ...unitWeightPayload.workspace.missingLines,
+          ...unitWeightPayload.workspace.effectiveLines.filter(
+            (line) => line.weightSource === 'order_specific',
+          ),
+        ].map((line) => [
+          line.lineGlobalId,
+          line.unitWeightGrams === null
+            ? ''
+            : orderUnitWeightDraftValue(
+                line.unitWeightGrams,
+                measurementSystem,
+              ),
+        ]),
+      ))
       setPlanShopifyAssignment(assignment)
       setPlanWarehouseGlobalId(warehouseGlobalId)
       setPlanMaterialGlobalIds(
@@ -3410,23 +3951,37 @@ export default function OperationsSection({
         )
       }
     } catch (caught) {
+      if (signal?.aborted) return
+      if (caught instanceof DOMException && caught.name === 'AbortError') return
       setPlanError(
         caught instanceof Error
           ? caught.message
           : 'Packaging materials could not be loaded',
       )
     } finally {
-      setPlanPreparationLoading(false)
+      if (planPreparationAbortController.current?.signal === signal) {
+        setPlanPreparationLoading(false)
+      }
     }
   }
 
   const openPlan = (trainingTarget?: ShadowTrainingPlanTarget) => {
+    planPreparationAbortController.current?.abort()
+    planPreparationAbortController.current = null
     const sealedTrainingEvidence = (
       trainingTarget?.cartonizationEvidenceGlobalId || ''
     ).trim().toLowerCase()
     setShadowTrainingPlanTarget(trainingTarget || null)
     setPlanCartonizationEvidenceGlobalId(sealedTrainingEvidence)
     setPlanPackagingWorkspace(null)
+    setPlanUnitWeightWorkspace(null)
+    setPlanUnitWeightDrafts({})
+    setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+    setPlanUnitWeightReason('')
+    setPlanUnitWeightIdempotencyKey(
+      `operations-unit-weight:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+    )
+    setSavingPlanUnitWeights(false)
     setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
@@ -3443,14 +3998,26 @@ export default function OperationsSection({
     setPlanError('')
     setPlanOpen(true)
     if (detail && !sealedTrainingEvidence) {
-      void loadPlanPreparation(detail, Boolean(trainingTarget))
+      const controller = new AbortController()
+      planPreparationAbortController.current = controller
+      void loadPlanPreparation(
+        detail,
+        Boolean(trainingTarget),
+        controller.signal,
+      )
     }
   }
 
   const closePlan = () => {
-    if (planningOrder || creatingPlanEvidence) return
+    if (planningOrder || creatingPlanEvidence || savingPlanUnitWeights) return
+    planPreparationAbortController.current?.abort()
+    planPreparationAbortController.current = null
+    setPlanPreparationLoading(false)
     setPlanOpen(false)
     setPlanPackagingWorkspace(null)
+    setPlanUnitWeightWorkspace(null)
+    setPlanUnitWeightDrafts({})
+    setPlanUnitWeightIdempotencyKey('')
     setPlanShopifyAssignment(null)
     setPlanWarehouseGlobalId('')
     setPlanMaterialGlobalIds([])
@@ -3461,6 +4028,121 @@ export default function OperationsSection({
     setPlanError('')
   }
 
+  const savePlanUnitWeights = async () => {
+    if (shadowTrainingPlanTarget) {
+      setPlanError('Order unit weights cannot be changed in training.')
+      return
+    }
+    const preparation = detail?.planningPreparation
+    const missingLines = planUnitWeightWorkspace?.missingLines || []
+    const existingOrderSpecificLines =
+      planUnitWeightWorkspace?.effectiveLines.filter(
+        (line) => line.weightSource === 'order_specific',
+      ) || []
+    const editableLines = [...missingLines, ...existingOrderSpecificLines]
+    if (
+      !preparation
+      || !editableLines.length
+      || !planUnitWeightIdempotencyKey
+    ) return
+    const lines = editableLines.flatMap((line) => {
+      const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+      const unitWeightGrams = Number.isFinite(displayWeight)
+        && displayWeight > 0
+        ? displayWeightToGrams(
+            displayWeight,
+            planUnitWeightDraftMeasurementSystem,
+          )
+        : 0
+      if (
+        line.unitWeightGrams !== null
+        && line.unitWeightGrams === unitWeightGrams
+      ) return []
+      return [{
+        lineGlobalId: line.lineGlobalId,
+        unitWeightGrams,
+        expectedFactVersion: line.factVersion,
+      }]
+    })
+    if (lines.some((line) => line.unitWeightGrams < 1)) {
+      setPlanError('Enter a positive unit weight for each missing line.')
+      return
+    }
+    if (!lines.length) {
+      setPlanError('Change at least one order-specific unit weight.')
+      return
+    }
+    if (planUnitWeightReason.trim().length < 8) {
+      setPlanError('Enter a short audit reason for these unit weights.')
+      return
+    }
+    setSavingPlanUnitWeights(true)
+    setPlanError('')
+    try {
+      const response = await fetch('/api/operations/order-unit-weights', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': planUnitWeightIdempotencyKey,
+        },
+        body: JSON.stringify({
+          accountGlobalId: preparation.accountGlobalId,
+          candidateGlobalId: preparation.candidateGlobalId,
+          candidateRowVersion: preparation.candidateRowVersion,
+          lines,
+          reason: planUnitWeightReason.trim(),
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        OrderUnitWeightPayload
+      if (!response.ok || !payload.ok || !payload.result) {
+        throw new Error(
+          `${payload.error || 'Unit weights could not be saved'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      if (!payload.result.workspace) {
+        setPlanUnitWeightWorkspace(null)
+        setPlanUnitWeightDrafts({})
+        setPlanUnitWeightReason('')
+        setPlanCartonizationEvidenceGlobalId('')
+        setPlanEvidenceIdempotencyKey('')
+        setPlanError('Unit weights were saved. Reopen Prepare order to refresh.')
+        return
+      }
+      setPlanUnitWeightWorkspace(payload.result.workspace)
+      setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+      setPlanUnitWeightReason('')
+      setPlanUnitWeightDrafts(Object.fromEntries(
+        payload.result.workspace.effectiveLines
+          .filter((line) => line.weightSource === 'order_specific')
+          .map((line) => [
+            line.lineGlobalId,
+            orderUnitWeightDraftValue(
+              line.unitWeightGrams || 0,
+              measurementSystem,
+            ),
+          ]),
+      ))
+      setPlanCartonizationEvidenceGlobalId('')
+      setPlanEvidenceIdempotencyKey(
+        `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+      )
+      setPlanUnitWeightIdempotencyKey(
+        `operations-unit-weight:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+      )
+    } catch (caught) {
+      setPlanError(
+        caught instanceof Error
+          ? caught.message
+          : 'Unit weights could not be saved',
+      )
+    } finally {
+      setSavingPlanUnitWeights(false)
+    }
+  }
+
   const createPlanEvidence = async () => {
     const preparation = detail?.planningPreparation
     const selectedMaterials = planPackagingWorkspace?.materials.filter(
@@ -3469,7 +4151,9 @@ export default function OperationsSection({
     if (
       !detail
       || !preparation
+      || planUnitWeightWorkspaceBlocked
       || !planWarehouseGlobalId
+      || Boolean(planUnitWeightWorkspace?.missingLines.length)
       || selectedMaterials.length < 1
       || selectedMaterials.length > 8
       || !planEvidenceIdempotencyKey
@@ -3478,6 +4162,7 @@ export default function OperationsSection({
       operationalPlanningMaterialBlockers(
         material,
         planWarehouseGlobalId,
+        detail?.currency,
         !shadowTrainingPlanTarget,
       )
         .map((reason) => `${material.code}: ${reason}`)
@@ -3555,6 +4240,7 @@ export default function OperationsSection({
     const evidenceGlobalId = planCartonizationEvidenceGlobalId.trim().toLowerCase()
     if (
       !detail
+      || planUnitWeightWorkspaceBlocked
       || !CARTONIZATION_EVIDENCE_GLOBAL_ID.test(evidenceGlobalId)
       || !planReason.trim()
       || !planIdempotencyKey
@@ -4198,6 +4884,283 @@ export default function OperationsSection({
     }
   }
 
+  const printShippingLabel = async (labelGlobalId: string) => {
+    if (!detail?.warehouseId || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(labelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-shipping-label-print:${labelGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'enqueue-label',
+          warehouseId: detail.warehouseId,
+          sourceLabelGlobalId: labelGlobalId,
+          media: 'label_4x6',
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping label could not be queued for printing')
+      }
+      setNotice(
+        `Shipping label ${labelGlobalId} was queued as print job ${payload.job.globalId}.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping label could not be queued for printing',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const uploadExternalShippingLabel = async (
+    trackingNumber: string,
+    file: File,
+  ) => {
+    if (
+      !detail?.externalFulfillment
+      || !detail.warehouseId
+      || labelPrintBusyGlobalId
+    ) return
+    const filename = file.name.toLowerCase()
+    const mime = file.type.toLowerCase()
+    const format = filename.endsWith('.zpl')
+      || mime === 'application/vnd.zebra-zpl'
+      || mime === 'text/plain'
+      ? 'ZPL'
+      : filename.endsWith('.pdf') || mime === 'application/pdf'
+        ? 'PDF'
+        : filename.endsWith('.png') || mime === 'image/png'
+          ? 'PNG'
+          : null
+    if (!format) {
+      setError('Choose the exact original label as a .zpl, .pdf, or .png file.')
+      return
+    }
+    const busyKey = `external-upload:${trackingNumber}`
+    setLabelPrintBusyGlobalId(busyKey)
+    setError('')
+    setNotice('')
+    try {
+      const form = new FormData()
+      form.set('file', file)
+      form.set('format', format)
+      form.set('media', 'label_4x6')
+      form.set('orderGlobalId', detail.globalId)
+      form.set('expectedOrderRowVersion', String(detail.rowVersion))
+      form.set(
+        'reconciliationGlobalId',
+        detail.externalFulfillment.reconciliationGlobalId,
+      )
+      form.set('trackingNumber', trackingNumber)
+      form.set(
+        'reason',
+        'Retain the exact original external carrier label for audited order-level reprint',
+      )
+      const response = await fetch('/api/operations/external-label-artifacts', {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': `operations-external-label-import:${detail.globalId}:${crypto.randomUUID()}`,
+        },
+        body: form,
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        result?: { artifactGlobalId?: string }
+      }
+      if (!response.ok || !payload.result?.artifactGlobalId) {
+        throw new Error(payload.error || 'External shipping label could not be retained')
+      }
+      setNotice(
+        `Exact original label ${payload.result.artifactGlobalId} was retained for tracking ${trackingNumber}. No postage was purchased and Shopify was not changed.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'External shipping label could not be retained',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const printExternalShippingLabel = async (artifactGlobalId: string) => {
+    if (!detail?.warehouseId || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(artifactGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-external-label-print:${artifactGlobalId}`,
+        },
+        body: JSON.stringify({
+          action: 'enqueue-external-label-artifact',
+          warehouseId: detail.warehouseId,
+          sourceArtifactGlobalId: artifactGlobalId,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'External shipping label could not be queued for printing')
+      }
+      setNotice(
+        `Exact external shipping label ${artifactGlobalId} was queued as print job ${payload.job.globalId}.`,
+      )
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'External shipping label could not be queued for printing',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const openLabelReprint = (
+    labelGlobalId: string,
+    printJobGlobalId: string,
+  ) => {
+    setLabelReprintLabelGlobalId(labelGlobalId)
+    setLabelReprintJobGlobalId(printJobGlobalId)
+    setLabelReprintReason(
+      `Reprint shipping label for order ${detail?.orderNumber || detail?.globalId || ''}`.trim(),
+    )
+    setLabelReprintIdempotencyKey(
+      `operations-shipping-label-reprint:${printJobGlobalId}:${crypto.randomUUID()}`,
+    )
+    setLabelReprintOpen(true)
+  }
+
+  const retryShippingLabel = async (
+    labelGlobalId: string,
+    printJobGlobalId: string,
+  ) => {
+    if (!detail || labelPrintBusyGlobalId) return
+    setLabelPrintBusyGlobalId(labelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-shipping-label-retry:${printJobGlobalId}:${crypto.randomUUID()}`,
+        },
+        body: JSON.stringify({
+          action: 'retry-job',
+          jobGlobalId: printJobGlobalId,
+          reason: `Retry failed shipping label for order ${detail.orderNumber || detail.globalId}`,
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping-label print job could not be retried')
+      }
+      setNotice(`Print job ${payload.job.globalId} was queued for another bounded attempt.`)
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping-label print job could not be retried',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
+  const closeLabelReprint = () => {
+    if (labelPrintBusyGlobalId) return
+    setLabelReprintOpen(false)
+    setLabelReprintLabelGlobalId('')
+    setLabelReprintJobGlobalId('')
+    setLabelReprintReason('')
+    setLabelReprintIdempotencyKey('')
+  }
+
+  const reprintShippingLabel = async (event: FormEvent) => {
+    event.preventDefault()
+    if (
+      !detail
+      || !labelReprintLabelGlobalId
+      || !labelReprintJobGlobalId
+      || !labelReprintReason.trim()
+      || !labelReprintIdempotencyKey
+      || labelPrintBusyGlobalId
+    ) return
+    setLabelPrintBusyGlobalId(labelReprintLabelGlobalId)
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/print-jobs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': labelReprintIdempotencyKey,
+        },
+        body: JSON.stringify({
+          action: 'reprint-job',
+          jobGlobalId: labelReprintJobGlobalId,
+          reason: labelReprintReason.trim(),
+        }),
+      })
+      const payload = await response.json() as {
+        ok?: boolean
+        error?: string
+        job?: { globalId?: string }
+      }
+      if (!response.ok || !payload.job?.globalId) {
+        throw new Error(payload.error || 'Shipping label reprint could not be queued')
+      }
+      setNotice(
+        `Shipping label ${labelReprintLabelGlobalId} was queued for reprint as ${payload.job.globalId}.`,
+      )
+      setLabelReprintOpen(false)
+      setLabelReprintLabelGlobalId('')
+      setLabelReprintJobGlobalId('')
+      setLabelReprintReason('')
+      setLabelReprintIdempotencyKey('')
+      await loadWorkspace(detail.globalId)
+    } catch (caught) {
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : 'Shipping label reprint could not be queued',
+      )
+    } finally {
+      setLabelPrintBusyGlobalId(null)
+    }
+  }
+
   const openConfirmShipment = () => {
     setConfirmShipmentReason('Confirm the packed order and create shipment evidence')
     setCustomerNotificationOverride(null)
@@ -4361,11 +5324,10 @@ export default function OperationsSection({
     if (!detail) return
     pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationConfirmed(false)
-    setSandboxE2eConfirmationText('')
     setSandboxE2eAuthorizationReason(
-      `Authorized end-to-end validation for ${detail.sourceProvider === 'faire'
+      `Enable test fulfillment for ${detail.sourceProvider === 'faire'
         ? 'Faire'
-        : 'Shopify'} test order ${detail.orderNumber}`,
+        : 'Shopify'} order ${detail.orderNumber}`,
     )
     setSandboxE2eAuthorizationOpen(true)
   }
@@ -4375,7 +5337,6 @@ export default function OperationsSection({
     pendingShopifyTestStoreAuthorization.current = null
     setSandboxE2eAuthorizationOpen(false)
     setSandboxE2eAuthorizationConfirmed(false)
-    setSandboxE2eConfirmationText('')
   }
 
   const authorizeSandboxE2e = async (event: FormEvent) => {
@@ -4385,12 +5346,7 @@ export default function OperationsSection({
     )
     if (
       !detail
-      || (
-        canonicalShopifyTestLane
-          ? sandboxE2eConfirmationText
-            !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-          : !sandboxE2eAuthorizationConfirmed
-      )
+      || !sandboxE2eAuthorizationConfirmed
       || !sandboxE2eAuthorizationReason.trim()
     ) return
     setAuthorizingSandboxE2e(true)
@@ -4442,7 +5398,7 @@ export default function OperationsSection({
         || !('authorizationGlobalId' in payload.result)
       ) {
         throw new ShopifyTestStoreCommandHttpError(
-          payload.error || 'Sandbox commerce E2E authorization failed',
+          payload.error || 'Test fulfillment could not be enabled',
           response.status,
           payload.code,
         )
@@ -4451,9 +5407,8 @@ export default function OperationsSection({
       pendingShopifyTestStoreAuthorization.current = null
       setSandboxE2eAuthorizationOpen(false)
       setSandboxE2eAuthorizationConfirmed(false)
-      setSandboxE2eConfirmationText('')
       setNotice(
-        `Exact-order sandbox E2E authorization ${result.authorizationGlobalId} is active until ${result.expiresAt}.`,
+        `Test fulfillment is enabled until ${result.expiresAt}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
@@ -4471,9 +5426,8 @@ export default function OperationsSection({
         ) {
           pendingShopifyTestStoreAuthorization.current = null
           setSandboxE2eAuthorizationOpen(false)
-          setSandboxE2eConfirmationText('')
           setNotice(
-            `The exact authorization response was reconciled. Authorization ${refreshedAuthorization.authorizationGlobalId} is current until ${refreshedAuthorization.expiresAt}.`,
+            `Test fulfillment is enabled until ${refreshedAuthorization.expiresAt}.`,
           )
           setError('')
         } else if (
@@ -4492,7 +5446,7 @@ export default function OperationsSection({
       } else {
         setError(caught instanceof Error
           ? caught.message
-          : 'Sandbox commerce E2E authorization failed')
+          : 'Test fulfillment could not be enabled')
       }
     } finally {
       setAuthorizingSandboxE2e(false)
@@ -4504,7 +5458,7 @@ export default function OperationsSection({
     pendingShopifyTestStoreFulfillment.current = null
     setShopifyTestFulfillmentText('')
     setShopifyTestFulfillmentReason(
-      `Reviewed the exact sandbox labels and tracking snapshot for Shopify test order ${detail.orderNumber}`,
+      `Reviewed package labels and tracking for Shopify order ${detail.orderNumber}`,
     )
     setShopifyTestFulfillmentOpen(true)
   }
@@ -4560,7 +5514,7 @@ export default function OperationsSection({
         || !('authorizationGlobalId' in payload.result)
       ) {
         throw new ShopifyTestStoreCommandHttpError(
-          payload.error || 'Shopify test fulfillment confirmation failed',
+          payload.error || 'Shopify fulfillment review failed',
           response.status,
           payload.code,
         )
@@ -4569,13 +5523,13 @@ export default function OperationsSection({
       setShopifyTestFulfillmentOpen(false)
       setShopifyTestFulfillmentText('')
       setNotice(
-        'The exact sandbox label and tracking snapshot is confirmed. Shopify customer notification is locked off; Confirm shipment now requires this same evidence.',
+        'Fulfillment review saved. Shopify customer notification remains off.',
       )
       await loadWorkspace(detail.globalId)
     } catch (caught) {
       const message = caught instanceof Error
         ? caught.message
-        : 'Shopify test fulfillment confirmation failed'
+        : 'Shopify fulfillment review failed'
       const refreshed = await loadWorkspace(command.orderGlobalId)
         .catch(() => null)
       const refreshedAuthorization =
@@ -4589,7 +5543,7 @@ export default function OperationsSection({
         setShopifyTestFulfillmentOpen(false)
         setShopifyTestFulfillmentText('')
         setNotice(
-          'The exact fulfillment-confirmation response was reconciled. Customer notification remains locked off.',
+          'Fulfillment review saved after refreshing the order. Shopify customer notification remains off.',
         )
         setError('')
       } else if (
@@ -4619,8 +5573,8 @@ export default function OperationsSection({
     setCarrierAccountGlobalId(account?.globalId || '')
     setCreateLabelPackageGlobalId(packageGlobalId || '')
     setCreateLabelReason(packageGlobalId
-      ? `Create the authorized sandbox E2E label for package ${packageGlobalId}`
-      : 'Purchase a sandbox label for pack-to-ship validation')
+      ? `Create a test label for package ${packageGlobalId}`
+      : 'Create a test shipping label')
     setCreateLabelIdempotencyKey(
       `operations-label-create:${detail?.globalId || 'order'}:${packageGlobalId || 'single'}:${crypto.randomUUID()}`,
     )
@@ -4671,7 +5625,7 @@ export default function OperationsSection({
       })
       const payload = await response.json() as OperationsPayload
       if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
-        throw new Error(payload.error || 'Sandbox label could not be created')
+        throw new Error(payload.error || 'Test label could not be created')
       }
       const result = payload.result
       setCreateLabelOpen(false)
@@ -4680,19 +5634,19 @@ export default function OperationsSection({
       setCreateLabelPackageGlobalId('')
       setNotice(
         result.printWarning
-          ? `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
-          : `Sandbox label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}${result.printJobGlobalId ? ` and print job ${result.printJobGlobalId}` : ''}.`,
+          ? `Test label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}. ${result.printWarning}`
+          : `Test label ${result.labelGlobalId} was created with tracking ${result.trackingNumber}${result.printJobGlobalId ? ` and print job ${result.printJobGlobalId}` : ''}.`,
       )
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be created')
+      setError(caught instanceof Error ? caught.message : 'Test label could not be created')
     } finally {
       setCreatingLabel(false)
     }
   }
 
   const openVoidLabel = () => {
-    setVoidLabelReason('Void the sandbox label after validation')
+    setVoidLabelReason('Void the test shipping label')
     setVoidLabelIdempotencyKey(`operations-label-void:${detail?.globalId || 'order'}:${crypto.randomUUID()}`)
     setVoidLabelOpen(true)
   }
@@ -4725,15 +5679,15 @@ export default function OperationsSection({
       })
       const payload = await response.json() as OperationsPayload
       if (!response.ok || !payload.result || !('labelGlobalId' in payload.result)) {
-        throw new Error(payload.error || 'Sandbox label could not be voided')
+        throw new Error(payload.error || 'Test label could not be voided')
       }
       const result = payload.result
       setVoidLabelOpen(false)
       setVoidLabelIdempotencyKey('')
-      setNotice(`Sandbox label ${result.labelGlobalId} and tracking ${result.trackingNumber} were voided.`)
+      setNotice(`Test label ${result.labelGlobalId} and tracking ${result.trackingNumber} were voided.`)
       await loadWorkspace(result.orderGlobalId)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Sandbox label could not be voided')
+      setError(caught instanceof Error ? caught.message : 'Test label could not be voided')
     } finally {
       setVoidingLabel(false)
     }
@@ -5444,6 +6398,73 @@ export default function OperationsSection({
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
+  const planEditableUnitWeightLines = [
+    ...(planUnitWeightWorkspace?.missingLines || []),
+    ...(planUnitWeightWorkspace?.effectiveLines.filter(
+      (line) => line.weightSource === 'order_specific',
+    ) || []),
+  ]
+  const planUnitWeightEditingAllowed = !shadowTrainingPlanTarget
+  const planUnitWeightHasInvalidDraft = planEditableUnitWeightLines.some((line) => {
+    const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+    return !Number.isFinite(displayWeight) || displayWeight <= 0
+  })
+  const planUnitWeightHasUnsavedChanges = planEditableUnitWeightLines.some((line) => {
+    const displayWeight = Number(planUnitWeightDrafts[line.lineGlobalId])
+    if (!Number.isFinite(displayWeight) || displayWeight <= 0) {
+      return line.unitWeightGrams !== null
+    }
+    const grams = displayWeightToGrams(
+      displayWeight,
+      planUnitWeightDraftMeasurementSystem,
+    )
+    return line.unitWeightGrams === null || line.unitWeightGrams !== grams
+  })
+  const planUnitWeightWorkspaceRequired = (
+    !shadowTrainingPlanTarget
+    || planPackagingWorkspace !== null
+  )
+  const planUnitWeightWorkspaceBlocked = (
+    planUnitWeightWorkspaceRequired
+    && (
+      planUnitWeightWorkspace === null
+      || planUnitWeightHasUnsavedChanges
+      || planUnitWeightWorkspace.missingLines.length > 0
+    )
+  )
+  useEffect(() => {
+    if (
+      !planOpen
+      || planUnitWeightDraftMeasurementSystem === measurementSystem
+    ) return
+    const entries = Object.entries(planUnitWeightDrafts)
+    if (entries.some(([, value]) => {
+      if (!value.trim()) return false
+      const numeric = Number(value)
+      return !Number.isFinite(numeric) || numeric <= 0
+    })) return
+    setPlanUnitWeightDrafts(Object.fromEntries(entries.map(([lineId, value]) => {
+      if (!value.trim()) return [lineId, value]
+      const grams = displayWeightToGrams(
+        Number(value),
+        planUnitWeightDraftMeasurementSystem,
+      )
+      return [lineId, orderUnitWeightDraftValue(grams, measurementSystem)]
+    })))
+    setPlanUnitWeightDraftMeasurementSystem(measurementSystem)
+    if (entries.length) {
+      setPlanCartonizationEvidenceGlobalId('')
+      setPlanEvidenceIdempotencyKey(
+        `operations-rate-plan:${selectedGlobalId || 'order'}:${crypto.randomUUID()}`,
+      )
+    }
+  }, [
+    measurementSystem,
+    planOpen,
+    planUnitWeightDraftMeasurementSystem,
+    planUnitWeightDrafts,
+    selectedGlobalId,
+  ])
   const detailSelectedRate = detail?.rates.find((rate) => rate.selected) || null
   const detailCreateLabelPackage = detail?.packages.find(
     (item) => item.globalId === createLabelPackageGlobalId,
@@ -6109,7 +7130,7 @@ export default function OperationsSection({
                     <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
                     <Typography variant="body2" color="text.secondary" noWrap>{order.customerName}</Typography>
                   </Box>
-                  <Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} />
+                  <Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} />
                 </Stack>
                 <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
                   <Box sx={{ minWidth: 0 }}>
@@ -6175,7 +7196,7 @@ export default function OperationsSection({
                   <TableRow key={order.globalId} hover onClick={() => chooseOrder(order)} sx={{ cursor: 'pointer' }}>
                     <TableCell><Typography fontWeight={600}>{order.orderNumber}</Typography><Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography></TableCell>
                     <TableCell><Typography>{order.customerName}</Typography><Typography variant="caption" color="text.secondary">{order.customerGlobalId}</Typography></TableCell>
-                    <TableCell><Chip size="small" label={displayStatus(order.status)} color={statusColor(order.status)} /></TableCell>
+                    <TableCell><Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} /></TableCell>
                     <TableCell>{order.warehouseName || '—'}</TableCell>
                     <TableCell>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: '—' })}</TableCell>
                     <TableCell align="right">{order.lineCount}</TableCell>
@@ -6246,6 +7267,7 @@ export default function OperationsSection({
           || Boolean(oneOffGroupAction)
           || Boolean(generatingPackingSlipPackageId)
           || Boolean(printingPackingSlipArtifactId)
+          || Boolean(labelPrintBusyGlobalId)
         }
         onClose={closeDrawer}
         trainingRefreshToken={shadowTrainingRefreshToken}
@@ -6264,6 +7286,19 @@ export default function OperationsSection({
         onPrintPackingSlip={(artifactGlobalId) => {
           void printPackingSlip(artifactGlobalId)
         }}
+        onPrintLabel={(labelGlobalId) => {
+          void printShippingLabel(labelGlobalId)
+        }}
+        onUploadExternalLabel={(trackingNumber, file) => {
+          void uploadExternalShippingLabel(trackingNumber, file)
+        }}
+        onPrintExternalLabel={(artifactGlobalId) => {
+          void printExternalShippingLabel(artifactGlobalId)
+        }}
+        onRetryLabel={(labelGlobalId, printJobGlobalId) => {
+          void retryShippingLabel(labelGlobalId, printJobGlobalId)
+        }}
+        onReprintLabel={openLabelReprint}
         onConfirmShipment={openConfirmShipment}
         onRetryCommerceExport={openCommerceExportRetry}
         onAuthorizeSandboxE2e={openSandboxE2eAuthorization}
@@ -6282,6 +7317,7 @@ export default function OperationsSection({
         onReviewOrderRevisionRecovery={reviewOrderRevisionRecovery}
         generatingPackingSlipPackageId={generatingPackingSlipPackageId}
         printingPackingSlipArtifactId={printingPackingSlipArtifactId}
+        labelPrintBusyGlobalId={labelPrintBusyGlobalId}
       />
       <ExceptionDetailDrawer
         key={selectedExceptionGlobalId || 'no-exception'}
@@ -6781,6 +7817,117 @@ export default function OperationsSection({
                               : 'Shopify has no untouched open fulfillment assignment for this order.'}
                     </Alert>
                   ) : null}
+                  {planEditableUnitWeightLines.length ? (
+                    <Box
+                      data-testid="order-planning-missing-unit-weights"
+                      sx={{
+                        border: 1,
+                        borderColor: 'divider',
+                        borderRadius: 1.5,
+                        p: 2,
+                      }}
+                    >
+                      <Stack spacing={1.5}>
+                        <Typography fontWeight={700}>
+                          {planUnitWeightWorkspace?.missingLines.length
+                            ? 'Missing unit weights'
+                            : 'Order unit weights'}
+                        </Typography>
+                        {planEditableUnitWeightLines.map((line) => (
+                          <Stack
+                            key={line.lineGlobalId}
+                            direction={{ xs: 'column', sm: 'row' }}
+                            spacing={1.5}
+                            alignItems={{ sm: 'center' }}
+                          >
+                            <Box sx={{ flex: 1, minWidth: 0 }}>
+                              <Typography fontWeight={600} noWrap>
+                                {line.productTitle}
+                              </Typography>
+                              <Typography variant="body2" color="text.secondary">
+                                {line.variantTitle
+                                  && line.variantTitle.toLowerCase() !== 'default title'
+                                  ? `${line.variantTitle} · `
+                                  : ''}
+                                Quantity {line.quantity}
+                              </Typography>
+                            </Box>
+                            <TextField
+                              size="small"
+                              type="number"
+                              required
+                              label={`Unit weight (${measurementUnits(
+                                planUnitWeightDraftMeasurementSystem,
+                              ).weight})`}
+                              value={planUnitWeightDrafts[line.lineGlobalId] || ''}
+                              disabled={
+                                savingPlanUnitWeights
+                                || !planUnitWeightEditingAllowed
+                              }
+                              onChange={(event) => {
+                                setPlanUnitWeightDrafts((current) => ({
+                                  ...current,
+                                  [line.lineGlobalId]: event.target.value,
+                                }))
+                                setPlanCartonizationEvidenceGlobalId('')
+                                setPlanEvidenceIdempotencyKey(
+                                  `operations-rate-plan:${detail?.globalId || 'order'}:${crypto.randomUUID()}`,
+                                )
+                                setPlanError('')
+                              }}
+                              inputProps={{
+                                min: planUnitWeightDraftMeasurementSystem === 'metric'
+                                  ? 0.001
+                                  : 0.0001,
+                                step: planUnitWeightDraftMeasurementSystem === 'metric'
+                                  ? 0.001
+                                  : 0.0001,
+                              }}
+                              sx={{ width: { sm: 190 } }}
+                            />
+                          </Stack>
+                        ))}
+                        {planUnitWeightEditingAllowed ? (
+                          <>
+                            <TextField
+                              size="small"
+                              required={planUnitWeightHasUnsavedChanges}
+                              label="Audit reason"
+                              value={planUnitWeightReason}
+                              disabled={savingPlanUnitWeights}
+                              onChange={(event) => {
+                                setPlanUnitWeightReason(event.target.value)
+                                setPlanError('')
+                              }}
+                              inputProps={{ maxLength: 500 }}
+                            />
+                            <Button
+                              type="button"
+                              variant="outlined"
+                              disabled={
+                                savingPlanUnitWeights
+                                || planUnitWeightHasInvalidDraft
+                                || !planUnitWeightHasUnsavedChanges
+                                || planUnitWeightReason.trim().length < 8
+                              }
+                              startIcon={savingPlanUnitWeights
+                                ? <CircularProgress size={16} />
+                                : undefined}
+                              onClick={() => void savePlanUnitWeights()}
+                            >
+                              {savingPlanUnitWeights
+                                ? 'Saving unit weights'
+                                : 'Save unit weights'}
+                            </Button>
+                          </>
+                        ) : (
+                          <Typography variant="body2" color="text.secondary">
+                            Order unit weights are read-only in training.
+                          </Typography>
+                        )}
+                      </Stack>
+                    </Box>
+                  ) : null}
                   <Typography variant="overline" color="text.secondary">
                     Step 1 · Choose fulfillment facts
                   </Typography>
@@ -6793,6 +7940,7 @@ export default function OperationsSection({
                       value={planWarehouseGlobalId}
                       disabled={
                         creatingPlanEvidence
+                        || savingPlanUnitWeights
                         || planEvidenceValid
                         || Boolean(
                           planShopifyAssignment && !shadowTrainingPlanTarget
@@ -6804,6 +7952,7 @@ export default function OperationsSection({
                           (material) => operationalPlanningMaterialBlockers(
                             material,
                             warehouseGlobalId,
+                            detail?.currency,
                             !shadowTrainingPlanTarget,
                           ).length === 0,
                         )
@@ -6846,7 +7995,11 @@ export default function OperationsSection({
                       multiple
                       label="Packaging materials (1–8)"
                       value={planMaterialGlobalIds}
-                      disabled={creatingPlanEvidence || planEvidenceValid}
+                      disabled={
+                        creatingPlanEvidence
+                        || savingPlanUnitWeights
+                        || planEvidenceValid
+                      }
                       onChange={(event) => {
                         const values = typeof event.target.value === 'string'
                           ? event.target.value.split(',')
@@ -6870,6 +8023,7 @@ export default function OperationsSection({
                         const blockers = operationalPlanningMaterialBlockers(
                           material,
                           planWarehouseGlobalId,
+                          detail?.currency,
                           !shadowTrainingPlanTarget,
                         )
                         const selected = planMaterialGlobalIds.includes(material.globalId)
@@ -6907,6 +8061,8 @@ export default function OperationsSection({
                         : <ScienceRounded />}
                       disabled={
                         creatingPlanEvidence
+                        || savingPlanUnitWeights
+                        || planUnitWeightWorkspaceBlocked
                         || !planWarehouseGlobalId
                         || planMaterialGlobalIds.length < 1
                         || planMaterialGlobalIds.length > 8
@@ -6961,7 +8117,11 @@ export default function OperationsSection({
           <DialogActions>
             <Button
               onClick={closePlan}
-              disabled={planningOrder || creatingPlanEvidence}
+              disabled={
+                planningOrder
+                || creatingPlanEvidence
+                || savingPlanUnitWeights
+              }
             >
               Cancel
             </Button>
@@ -6971,6 +8131,8 @@ export default function OperationsSection({
               disabled={
                 planningOrder
                 || creatingPlanEvidence
+                || savingPlanUnitWeights
+                || planUnitWeightWorkspaceBlocked
                 || !planEvidenceValid
                 || !planReason.trim()
               }
@@ -6985,6 +8147,61 @@ export default function OperationsSection({
                 : shadowTrainingPlanTarget
                   ? 'Confirm local training plan'
                   : 'Confirm warehouse plan'}
+            </Button>
+          </DialogActions>
+        </Box>
+      </Dialog>
+
+      <Dialog
+        open={labelReprintOpen}
+        onClose={closeLabelReprint}
+        fullWidth
+        maxWidth="sm"
+      >
+        <Box component="form" onSubmit={reprintShippingLabel}>
+          <DialogTitle>Reprint shipping label</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={2}>
+              <Alert severity="info">
+                This creates a new audited print job from the original immutable label document. It does not call the carrier, buy postage, create tracking, or replace the shipment label.
+              </Alert>
+              <Box>
+                <Typography variant="caption" color="text.secondary">
+                  Source label
+                </Typography>
+                <Typography>{labelReprintLabelGlobalId}</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  Acknowledged print job {labelReprintJobGlobalId}
+                </Typography>
+              </Box>
+              <TextField
+                fullWidth
+                multiline
+                minRows={3}
+                label="Reprint reason"
+                value={labelReprintReason}
+                onChange={(event) => setLabelReprintReason(event.target.value)}
+                inputProps={{ maxLength: 500 }}
+                helperText="Required for the immutable print audit trail"
+              />
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeLabelReprint} disabled={Boolean(labelPrintBusyGlobalId)}>
+              Cancel
+            </Button>
+            <Button
+              type="submit"
+              variant="contained"
+              startIcon={labelPrintBusyGlobalId
+                ? <CircularProgress size={16} />
+                : <ReplayRounded />}
+              disabled={
+                Boolean(labelPrintBusyGlobalId)
+                || !labelReprintReason.trim()
+              }
+            >
+              {labelPrintBusyGlobalId ? 'Queueing' : 'Queue reprint'}
             </Button>
           </DialogActions>
         </Box>
@@ -7298,72 +8515,33 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={authorizeSandboxE2e}>
-          <DialogTitle>
-            {detail?.sourceProvider === 'shopify'
-              ? detail.status === 'imported'
-                ? 'Authorize verified Shopify test order'
-                : 'Renew or resume verified Shopify test order'
-              : 'Authorize exact-order sandbox E2E test'}
-          </DialogTitle>
+          <DialogTitle>Enable test fulfillment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="error">
-                {detail?.sourceProvider === 'shopify'
-                  ? `ClawPilot will freshly query Shopify and must positively receive test=true for exact order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). Authority stays bound to this account, credential generation, candidate source, and local order revision. It expires after two hours and never permits production postage or customer notification.`
-                  : `This authority is limited to ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} order ${detail?.orderNumber || 'this order'} (${detail?.globalId || 'unknown'}). It permits non-tracking sandbox labels followed by real reserved inventory consumption and ${detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} fulfillment/tracking writeback. The authorization expires after two hours and is consumed by a successful shipment confirmation.`}
-              </Alert>
-              <Box
-                sx={{
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.16)',
-                  borderRadius: '8px',
-                }}
-              >
-                <Typography variant="body2">
-                  {detail?.sourceProvider === 'shopify'
-                    ? SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    : SANDBOX_COMMERCE_E2E_CONFIRMATION}
-                </Typography>
-              </Box>
-              {detail?.sourceProvider === 'shopify' ? (
-                <TextField
-                  required
-                  multiline
-                  minRows={4}
-                  label="Type the exact authorization statement"
-                  value={sandboxE2eConfirmationText}
-                  onChange={(event) => setSandboxE2eConfirmationText(event.target.value)}
-                  helperText={sandboxE2eConfirmationText
-                    === SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    ? 'Exact statement matched'
-                    : 'Copy the statement above exactly; whitespace and punctuation must match.'}
-                  inputProps={{
-                    'data-testid': 'shopify-test-store-authorization-statement',
-                  }}
-                />
-              ) : (
-                <FormControlLabel
-                  control={(
-                    <Checkbox
-                      checked={sandboxE2eAuthorizationConfirmed}
-                      onChange={(event) => {
-                        setSandboxE2eAuthorizationConfirmed(event.target.checked)
-                      }}
-                      data-testid="sandbox-commerce-e2e-confirmation"
-                    />
-                  )}
-                  label="I understand and explicitly authorize this exact order-bound test."
-                />
-              )}
+              <Typography variant="body2" color="text.secondary">
+                Rates and labels will use TEST carrier accounts. No live postage will be purchased.
+              </Typography>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={sandboxE2eAuthorizationConfirmed}
+                    onChange={(event) => {
+                      setSandboxE2eAuthorizationConfirmed(event.target.checked)
+                    }}
+                    data-testid="sandbox-commerce-e2e-confirmation"
+                  />
+                )}
+                label={`Enable this for ${detail?.orderNumber || 'this order'}`}
+              />
               <TextField
                 required
                 multiline
-                minRows={3}
-                label="Authorization reason"
+                minRows={2}
+                label="Reason (audit log)"
                 value={sandboxE2eAuthorizationReason}
                 onChange={(event) => setSandboxE2eAuthorizationReason(event.target.value)}
                 inputProps={{ maxLength: 500 }}
-                helperText={`${sandboxE2eAuthorizationReason.trim().length}/500 · Recorded with the exact authorization`}
+                helperText={`${sandboxE2eAuthorizationReason.trim().length}/500`}
               />
             </Stack>
           </DialogContent>
@@ -7381,10 +8559,7 @@ export default function OperationsSection({
               disabled={
                 authorizingSandboxE2e
                 || (
-                  detail?.sourceProvider === 'shopify'
-                    ? sandboxE2eConfirmationText
-                      !== SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION
-                    : !sandboxE2eAuthorizationConfirmed
+                  !sandboxE2eAuthorizationConfirmed
                 )
                 || !sandboxE2eAuthorizationReason.trim()
               }
@@ -7395,7 +8570,7 @@ export default function OperationsSection({
             >
               {authorizingSandboxE2e
                 ? 'Verifying with Shopify'
-                : 'Authorize this exact order'}
+                : 'Enable test fulfillment'}
             </Button>
           </DialogActions>
         </Box>
@@ -7409,51 +8584,36 @@ export default function OperationsSection({
         maxWidth="sm"
       >
         <Box component="form" onSubmit={confirmShopifyTestFulfillment}>
-          <DialogTitle>Confirm exact Shopify test fulfillment</DialogTitle>
+          <DialogTitle>Review fulfillment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="error">
-                This is the second owner/admin confirmation. ClawPilot will
-                freeze the exact sorted package, sandbox-label, and tracking
-                snapshot for {detail?.orderNumber || 'this order'}. Confirm
-                shipment will fail closed if a label is voided, replaced, or
-                changed. Shopify customer notification remains forcibly off.
-              </Alert>
-              <Box
-                sx={{
-                  p: 1.5,
-                  border: '1px solid rgba(255,255,255,0.16)',
-                  borderRadius: '8px',
-                }}
-              >
-                <Typography variant="body2">
-                  {SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION}
-                </Typography>
-              </Box>
-              <TextField
-                required
-                multiline
-                minRows={4}
-                label="Type the exact fulfillment statement"
-                value={shopifyTestFulfillmentText}
-                onChange={(event) => setShopifyTestFulfillmentText(event.target.value)}
-                helperText={shopifyTestFulfillmentText
-                  === SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
-                  ? 'Exact statement matched'
-                  : 'Copy the statement above exactly; whitespace and punctuation must match.'}
-                inputProps={{
-                  'data-testid': 'shopify-test-store-fulfillment-statement',
-                }}
+              <Typography variant="body2" color="text.secondary">
+                Confirm that the package labels and tracking numbers are correct before completing this order.
+              </Typography>
+              <FormControlLabel
+                control={(
+                  <Checkbox
+                    checked={shopifyTestFulfillmentText
+                      === SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION}
+                    onChange={(event) => setShopifyTestFulfillmentText(
+                      event.target.checked
+                        ? SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION
+                        : '',
+                    )}
+                    data-testid="shopify-test-store-fulfillment-statement"
+                  />
+                )}
+                label={`Labels and tracking are correct for ${detail?.orderNumber || 'this order'}`}
               />
               <TextField
                 required
                 multiline
-                minRows={3}
-                label="Fulfillment confirmation reason"
+                minRows={2}
+                label="Reason (audit log)"
                 value={shopifyTestFulfillmentReason}
                 onChange={(event) => setShopifyTestFulfillmentReason(event.target.value)}
                 inputProps={{ maxLength: 500 }}
-                helperText={`${shopifyTestFulfillmentReason.trim().length}/500 · Stored with the immutable label snapshot`}
+                helperText={`${shopifyTestFulfillmentReason.trim().length}/500`}
               />
             </Stack>
           </DialogContent>
@@ -7480,8 +8640,8 @@ export default function OperationsSection({
               data-testid="confirm-shopify-test-store-fulfillment"
             >
               {confirmingShopifyTestFulfillment
-                ? 'Confirming exact evidence'
-                : 'Confirm exact sandbox tracking'}
+                ? 'Saving review'
+                : 'Confirm fulfillment'}
             </Button>
           </DialogActions>
         </Box>
@@ -7492,27 +8652,25 @@ export default function OperationsSection({
           <DialogTitle>Confirm shipment</DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
-              <Alert severity="warning">
-                This consumes the reserved inventory, marks the order, package, and fulfillment
-                plan as shipped, creates immutable shipment and packing-slip evidence, seeds
-                tracking, and attempts the commerce fulfillment export for
-                {' '}{detail?.orderNumber || 'this order'}. The order version and shipment
-                readiness checks are repeated when you confirm. For Shopify and Faire,
-                the exact connection&apos;s Provider writes control must still be On and
-                bound to its current credential and scopes.
-              </Alert>
+              <Typography variant="body2" color="text.secondary">
+                Completes warehouse work, consumes inventory reservations, records shipment evidence, and syncs fulfillment to the connected commerce account.
+              </Typography>
               {detail?.sandboxCommerceE2eAuthorization && (
-                <Alert severity="error" data-testid="sandbox-commerce-e2e-confirm-shipment-warning">
-                  Authorized sandbox E2E execution is active under{' '}
-                  {detail.sandboxCommerceE2eAuthorization.authorizationGlobalId}.
-                  Confirming will consume that one-time authorization and send
-                  every package&apos;s sandbox tracking number to{' '}
-                  {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'} even though
-                  those labels will not track with the carrier.{' '}
-                  {detail.sourceProvider === 'faire'
-                    ? 'Faire may send a processing email when a NEW order is accepted, and submitting these tracking details triggers Faire\'s shipment email. Verify this test order uses a controlled recipient.'
-                    : 'Shopify customer notification is forcibly disabled for this test and cannot be overridden.'}
-                </Alert>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  alignItems="center"
+                  data-testid="sandbox-commerce-e2e-confirm-shipment-warning"
+                >
+                  <Chip size="small" label="Test" color="info" />
+                  <Typography variant="body2">
+                    Test tracking will be sent to{' '}
+                    {detail.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
+                    {detail.sourceProvider === 'shopify'
+                      ? ' Customer notification is off.'
+                      : ''}
+                  </Typography>
+                </Stack>
               )}
               {detail?.fulfillmentNotificationPolicy?.mode === 'provider_managed' ? (
                 <Alert severity="info">
@@ -7926,26 +9084,22 @@ export default function OperationsSection({
         <Box component="form" onSubmit={createSandboxLabel}>
           <DialogTitle>
             {detailCreateLabelPackage
-              ? `Create package ${detailCreateLabelPackage.packageNumber} sandbox label`
-              : 'Create sandbox carrier label'}
+              ? `Create label · Package ${detailCreateLabelPackage.packageNumber}`
+              : 'Create carrier label'}
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>
               {detailCreateLabelPackage ? (
-                <Alert severity="error">
-                  Authorized E2E test package only. ClawPilot will create a
-                  non-tracking sandbox label for {detailCreateLabelPackage.globalId}
-                  using the exact order allocation. Do not void it: after every
-                  package is labeled, shipment confirmation will consume the
-                  reservation and write all tracking numbers to{' '}
-                  {detail?.sourceProvider === 'faire' ? 'Faire' : 'Shopify'}.
-                </Alert>
+                <Typography variant="body2" color="text.secondary">
+                  Uses this package&apos;s dimensions, weight, and selected TEST carrier service.
+                </Typography>
               ) : (
-                <Alert severity="warning">
-                  Sandbox only. ClawPilot will use John Doe, Test Product, 101 Jegs Place in Delaware,
-                  Ohio, and Massachusetts Maritime Academy in Buzzards Bay. Inspect the label and
-                  print evidence, then void it immediately.
-                </Alert>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Chip size="small" label="Test" color="info" />
+                  <Typography variant="body2" color="text.secondary">
+                    No live postage will be purchased.
+                  </Typography>
+                </Stack>
               )}
               {detailCreateLabelPackage && (
                 <Box>
@@ -7969,10 +9123,10 @@ export default function OperationsSection({
               <TextField
                 required
                 select
-                label="Sandbox carrier account"
+                label="TEST carrier account"
                 value={carrierAccountGlobalId}
                 onChange={(event) => setCarrierAccountGlobalId(event.target.value)}
-                helperText="Only active, verified sandbox credentials for the selected carrier are available."
+                helperText="Only active, verified TEST accounts for the selected carrier are available."
               >
                 {eligibleSandboxCarrierAccounts.map((account) => (
                   <MenuItem key={account.globalId} value={account.globalId}>
@@ -8011,7 +9165,7 @@ export default function OperationsSection({
             >
               {creatingLabel
                 ? 'Creating label'
-                : 'Create sandbox label'}
+                : 'Create test label'}
             </Button>
           </DialogActions>
         </Box>
@@ -8020,7 +9174,7 @@ export default function OperationsSection({
       <Dialog open={voidLabelOpen} onClose={closeVoidLabel} fullWidth maxWidth="sm">
         <Box component="form" onSubmit={voidSandboxLabel}>
           <DialogTitle>
-            Void sandbox carrier label
+            Void test carrier label
           </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={2}>

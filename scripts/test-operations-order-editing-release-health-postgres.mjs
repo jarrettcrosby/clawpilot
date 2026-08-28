@@ -53,6 +53,7 @@ async function verifyNegativeCases(client) {
     '0310_operations_order_shipment_address_working_copy.sql',
     '0312_operations_shopify_order_single_save.sql',
     '0315_operations_carrier_writes_independent_activation.sql',
+    '0325_operations_shopify_fulfillment_reversal.sql',
   ]) {
     await inRollback(client, async () => {
       await client.query(
@@ -313,6 +314,13 @@ async function main() {
             await health(client),
             true,
             'The exact post-0315 carrier-write phase must satisfy health',
+          )
+        }
+        if (file === '0325_operations_shopify_fulfillment_reversal.sql') {
+          assert.equal(
+            await health(client),
+            true,
+            'The exact post-0325 fulfillment-reversal phase must satisfy health',
           )
         }
       }

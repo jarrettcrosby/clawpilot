@@ -29,6 +29,9 @@ import {
   OperationsOrderShipmentAddressError,
 } from '@/lib/persistence/operationsOrderShipmentAddress'
 import {
+  OperationsOrderUnitWeightError,
+} from '@/lib/persistence/orderUnitWeightEvidence'
+import {
   authorizeCommerceActiveTransitionInPostgres,
   CommerceActiveTransitionPersistenceError,
   consumeCommerceActiveTransitionAuthorizationInPostgres,
@@ -996,6 +999,9 @@ function errorResponse(error: unknown) {
   if (error instanceof OperationsRequestError) {
     return json({ ok: false, error: error.message, code: error.code }, error.status)
   }
+  if (error instanceof OperationsOrderUnitWeightError) {
+    return json({ ok: false, error: error.message, code: error.code }, error.status)
+  }
   if (
     error
     && typeof error === 'object'
@@ -1493,7 +1499,7 @@ export async function POST(req: NextRequest) {
         idempotencyKey: idempotencyKeyValue(req),
         sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
           body.sandboxE2eAuthorizationGlobalId,
-          'Shopify test-store authorization',
+          'Test fulfillment authorization',
           /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
       })
@@ -1917,7 +1923,7 @@ export async function POST(req: NextRequest) {
       if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'Only an organization owner or administrator may authorize the exact Shopify test-store lane',
+          error: 'Only an organization owner or administrator may enable test fulfillment',
           code: 'OPERATIONS_ACTIVATION_REQUIRED',
         }, 403)
       }
@@ -1946,7 +1952,7 @@ export async function POST(req: NextRequest) {
           2_147_483_647,
         ),
         confirmationStatement: body.confirmationStatement,
-        reason: textValue(body.reason, 'Test-store authorization reason', 500),
+        reason: textValue(body.reason, 'Test fulfillment reason', 500),
         lifetimeMinutes: body.lifetimeMinutes === undefined
           ? undefined
           : integerValue(body.lifetimeMinutes, 'Authorization lifetime', 5, 240),
@@ -1957,7 +1963,7 @@ export async function POST(req: NextRequest) {
       if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'Only an organization owner or administrator may confirm the exact Shopify test fulfillment',
+          error: 'Only an organization owner or administrator may confirm test fulfillment',
           code: 'OPERATIONS_ACTIVATION_REQUIRED',
         }, 403)
       }
@@ -1977,7 +1983,7 @@ export async function POST(req: NextRequest) {
           idempotencyKey: idempotencyKeyValue(req),
           authorizationGlobalId: globalIdValue(
             body.authorizationGlobalId,
-            'Shopify test-store authorization',
+            'Test fulfillment authorization',
             /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
           ),
           orderGlobalId: globalIdValue(
@@ -2000,7 +2006,7 @@ export async function POST(req: NextRequest) {
       if (!capabilities.canActivate || !capabilities.canManage || !capabilities.canExecute) {
         return json({
           ok: false,
-          error: 'Only an authorized organization owner or administrator may authorize a sandbox commerce E2E test',
+          error: 'Only an organization owner or administrator may enable test fulfillment',
           code: 'OPERATIONS_ACTIVATION_REQUIRED',
         }, 403)
       }
@@ -2022,7 +2028,7 @@ export async function POST(req: NextRequest) {
           ORDER_GLOBAL_ID,
         ),
         confirmationStatement: body.confirmationStatement,
-        reason: textValue(body.reason, 'Sandbox E2E authorization reason', 500),
+        reason: textValue(body.reason, 'Test fulfillment reason', 500),
         lifetimeMinutes: body.lifetimeMinutes === undefined
           ? undefined
           : integerValue(body.lifetimeMinutes, 'Authorization lifetime', 5, 1_440),
@@ -2359,7 +2365,7 @@ export async function POST(req: NextRequest) {
         ),
         sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
           body.sandboxE2eAuthorizationGlobalId,
-          'Sandbox E2E authorization',
+          'Test fulfillment authorization',
           /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
         expectedNotificationPolicyRevision:
@@ -2465,7 +2471,7 @@ export async function POST(req: NextRequest) {
         ),
         sandboxE2eAuthorizationGlobalId: optionalGlobalIdValue(
           body.sandboxE2eAuthorizationGlobalId,
-          'Sandbox E2E authorization',
+          'Test fulfillment authorization',
           /^gsea(?:[0-9]{7}|[0-9a-v]{12})$/,
         ),
         idempotencyKey: idempotencyKeyValue(req),

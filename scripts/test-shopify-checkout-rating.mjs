@@ -51,9 +51,16 @@ function load(path, mocks = {}) {
 }
 
 const hybrid = load('app_src/lib/operations/hybridCartonization.ts')
+const unitMaterial = load(
+  'app_src/lib/operations/operationalUnitMaterialCartonization.ts',
+  { '@/lib/operations/hybridCartonization': hybrid },
+)
 const checkout = load(
   'app_src/lib/operations/shopifyCheckoutRating.ts',
-  { '@/lib/operations/hybridCartonization': hybrid },
+  {
+    '@/lib/operations/hybridCartonization': hybrid,
+    '@/lib/operations/operationalUnitMaterialCartonization': unitMaterial,
+  },
 )
 
 function input() {
@@ -356,6 +363,157 @@ assert.deepEqual(
     sealedCaseReady.parcels.map((item) => item.grossPounds),
   )),
   [5.1, 5.1],
+)
+
+const mixedUnitMaterial = input()
+mixedUnitMaterial.materials[0].availableQuantity = 3
+mixedUnitMaterial.materials[0].maximumGrossWeightGrams = 10_000
+mixedUnitMaterial.lines.push({
+  lineGlobalId: 'line-self',
+  productGlobalId: 'gp0000002',
+  title: 'Sealed Bakery Bites case',
+  quantity: 1,
+  unitWeightGrams: 2268,
+  profile: {
+    ...structuredClone(mixedUnitMaterial.lines[0].profile),
+    versionGlobalId: 'gppv0000003',
+    packageLevel: 'case',
+    baseEachQuantity: 12,
+    shipsAsOwnPackage: true,
+    outerDimensionsMm: {
+      length: 279,
+      width: 229,
+      height: 178,
+    },
+    grossWeightGrams: 2268,
+  },
+}, {
+  lineGlobalId: 'line-unit',
+  productGlobalId: 'gp0000003',
+  title: 'Ordinary Bakery Bites unit',
+  quantity: 2,
+  unitWeightGrams: 340,
+  profile: {
+    versionGlobalId: 'unit-item:line-unit',
+    capturedRowVersion: 0,
+    currentRowVersion: 0,
+    isCurrent: true,
+    lifecycleState: 'active',
+    fitModel: 'unconstrained_unit',
+    evidenceType: 'provider',
+    evidenceReference: 'shopify-checkout-revision-1',
+    confirmedAt: null,
+    packageLevel: 'each',
+    baseEachQuantity: 1,
+    shipsAsOwnPackage: false,
+    outerDimensionsMm: null,
+    grossWeightGrams: 340,
+  },
+})
+const checkoutUnitInventory = [{
+  productGlobalId: 'gp0000003',
+  availabilityAuthority: 'shopify_checkout_available_snapshot',
+  effectiveAvailableQuantity: 2,
+  sourceLevelGlobalIds: ['gcil0000003'],
+}]
+const mixedUnitCandidates = checkout.planShopifyCheckoutPackageCandidates(
+  mixedUnitMaterial,
+  {
+    maxCandidates: 1,
+    unitMaterialInventoryProducts: checkoutUnitInventory,
+  },
+)
+assert.equal(mixedUnitCandidates.length, 1)
+assert.equal(mixedUnitCandidates[0].plan.selfPackages.length, 1)
+assert.equal(mixedUnitCandidates[0].plan.recipePackages.length, 1)
+assert.equal(mixedUnitCandidates[0].unitMaterialPlan.status, 'ready')
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    mixedUnitCandidates[0].unitMaterialPlan.packages.map((item) => ({
+      sequence: item.packageSequence,
+      method: item.planningMethod,
+      quantity: item.allocations[0].quantity,
+    })),
+  )),
+  [
+    { sequence: 3, method: 'unit_material_selection', quantity: 1 },
+    { sequence: 4, method: 'unit_material_selection', quantity: 1 },
+  ],
+)
+assert.equal(
+  mixedUnitCandidates[0].unitMaterialPlan.evidence.inventoryAuthority,
+  'shopify_checkout_available_snapshot',
+)
+assert.equal(
+  mixedUnitCandidates[0].unitMaterialPlan.evidence.materialAuthority,
+  'selected_material_stock_snapshot',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    mixedUnitCandidates[0].parcels.map((item) => item.description),
+  )),
+  [
+    'ClawPilot sealed case 1',
+    'ClawPilot carton 2',
+    'ClawPilot carton 3',
+    'ClawPilot carton 4',
+  ],
+  'self, recipe, and one-each material packages must form one conserved shipment',
+)
+assert.equal(mixedUnitCandidates[0].parcels.length, 4)
+assert.match(mixedUnitCandidates[0].candidateKey, /^hcan-[a-f0-9]{20}$/)
+assert.equal(
+  checkout.planShopifyCheckoutPackageCandidates(
+    mixedUnitMaterial,
+    {
+      maxCandidates: 1,
+      unitMaterialInventoryProducts: checkoutUnitInventory,
+    },
+  )[0].candidateKey,
+  mixedUnitCandidates[0].candidateKey,
+  'unit-material candidate evidence must remain deterministic',
+)
+
+const mixedUnitReady = checkout.planShopifyCheckoutPackages(
+  mixedUnitMaterial,
+  { unitMaterialInventoryProducts: checkoutUnitInventory },
+)
+assert.equal(mixedUnitReady.unitMaterialPlan.packages.length, 2)
+assert.equal(mixedUnitReady.parcels.length, 4)
+
+assert.throws(
+  () => checkout.planShopifyCheckoutPackageCandidates(
+    mixedUnitMaterial,
+    {
+      maxCandidates: 1,
+      unitMaterialInventoryProducts: [{
+        ...checkoutUnitInventory[0],
+        effectiveAvailableQuantity: 1,
+      }],
+    },
+  ),
+  (error) => (
+    error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_INVENTORY_REQUIRED'
+  ),
+  'checkout availability is a fail-closed quote snapshot, not a reservation',
+)
+
+const mixedUnitMaterialStockShort = structuredClone(mixedUnitMaterial)
+mixedUnitMaterialStockShort.materials[0].availableQuantity = 2
+assert.throws(
+  () => checkout.planShopifyCheckoutPackageCandidates(
+    mixedUnitMaterialStockShort,
+    {
+      maxCandidates: 1,
+      unitMaterialInventoryProducts: checkoutUnitInventory,
+    },
+  ),
+  (error) => (
+    error.code
+      === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_CAPACITY_REQUIRED'
+  ),
+  'unit cartons must consume only stock remaining after recipe cartons',
 )
 
 const fallback = input()

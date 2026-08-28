@@ -5,6 +5,8 @@ import { readFile } from 'node:fs/promises'
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 const [
   migration,
+  unitCartonizationMigration,
+  duplicateWorkbenchMigration,
   persistence,
   route,
   operationsRoute,
@@ -15,6 +17,8 @@ const [
   drawer,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
+  read('db/migrations/0321_operations_unit_item_cartonization.sql'),
+  read('db/migrations/0322_operations_duplicate_order_workbench_recovery.sql'),
   read('app_src/lib/persistence/commerceOrderWorkbench.ts'),
   read('app_src/app/api/operations/order-workbench/route.ts'),
   read('app_src/app/api/operations/route.ts'),
@@ -24,6 +28,32 @@ const [
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
 ])
+
+for (const fragment of [
+  'duplicate_workbenches',
+  'OPERATIONS_IMPORTED_ORDER_ALREADY_CANONICAL',
+  "receipt.status = 'processing'",
+  'canonical.external_order_id = candidate.external_order_id',
+  'SET canonical_order_id = canonical.id',
+]) {
+  assert.ok(
+    duplicateWorkbenchMigration.includes(fragment),
+    `Duplicate workbench recovery migration is missing ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  'unit_multiplier = 1',
+  "packaging_state = 'not_required'",
+  "array_remove(blocking_codes, 'packaging_required')",
+  'line.unit_multiplier <> 1',
+  'cartonization chooses',
+]) {
+  assert.ok(
+    unitCartonizationMigration.includes(fragment),
+    `Unit cartonization migration is missing ${fragment}`,
+  )
+}
 
 for (const fragment of [
   "SET LOCAL lock_timeout = '5s'",
@@ -181,8 +211,9 @@ for (const fragment of [
   "field === 'requestedDeliveryAt'",
   'savedDraftComplete',
   "shippingRequired && draftReadiness !== 'carrier_ready'",
-  'Sellable pack override (optional)',
-  'Use mapped product pack and cartonization',
+  'Approved pack constraint (optional)',
+  'No pack constraint — use cartonization',
+  'Unit item — cartonization chooses outbound packaging.',
 ]) {
   assert.ok(drawer.includes(fragment), `Drawer refresh is missing ${fragment}`)
 }
@@ -190,6 +221,10 @@ assert.equal(
   drawer.includes('!line.requiresShipping || draft.packageProfileGlobalId'),
   false,
   'The workbench must not require a manual legacy package profile when the mapped Product pack can be reconciled during acceptance',
+)
+assert.ok(
+  persistence.includes('canonical.external_order_id = candidate.external_order_id'),
+  'Already-canonical provider identities must not remain in the imported working-copy list',
 )
 assert.equal(
   /reasonValue|confirmationStatement|canActivate/u.test(route),

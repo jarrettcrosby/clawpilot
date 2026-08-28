@@ -303,10 +303,14 @@ const matchedCheckoutLineage = {
 }
 const checkoutPackBaseline = {
   snapshotVersion: 'shopify-checkout-line-pack-evidence-v1',
+  cartonizationAuthority: 'product_pack',
+  productMappingGlobalId: null,
   packEvidenceHash: 'a'.repeat(64),
   providerProductId: 'gid://shopify/Product/10',
   providerVariantId: 'gid://shopify/ProductVariant/20',
   productGlobalId: 'gp0000001',
+  channelSourceRevision: null,
+  channelSourceHash: null,
   mappingGlobalId: 'gcvm0000001',
   mappingRowVersion: 4,
   profileVersionGlobalId: 'gppv0000001',
@@ -429,6 +433,109 @@ for (const missingField of [
   )
 }
 
+const matchedUnitMaterialCheckoutLineage = {
+  ...matchedCheckoutLineage,
+  candidateProductMappingGlobalId: 'gpm0000001',
+  candidateChannelSourceRevision: 'channel-revision-a',
+  candidateChannelSourceHash: 'channel-hash-a',
+  receiptLine: withReceiptLineHash({
+    ...matchedCheckoutLineage.receiptLine,
+    line_snapshot: {
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+      cartonizationAuthority: 'unit_material_selection',
+      productGid: 'gid://shopify/Product/10',
+      variantGid: 'gid://shopify/ProductVariant/20',
+      productGlobalId: 'gp0000001',
+      productMappingGlobalId: 'gpm0000001',
+      channelSourceRevision: 'channel-revision-a',
+      channelSourceHash: 'channel-hash-a',
+      packMappingGlobalId: null,
+      packMappingRowVersion: null,
+      packEvidenceHash: null,
+      packProfileVersionGlobalId: null,
+      packProfileVersionRowVersion: null,
+      packageLevel: 'each',
+      baseEachQuantity: 1,
+      shipsAsOwnPackage: false,
+      inventoryLevelGlobalIds: ['giil0000001'],
+      quantity: 50,
+      unitWeightGrams: 170,
+    },
+  }),
+}
+assert.deepEqual(
+  JSON.parse(JSON.stringify(assertMatchedShopifyCheckoutPackLineage(
+    matchedUnitMaterialCheckoutLineage,
+  ))),
+  {
+    ...checkoutPackBaseline,
+    snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+    cartonizationAuthority: 'unit_material_selection',
+    productMappingGlobalId: 'gpm0000001',
+    packEvidenceHash: null,
+    channelSourceRevision: 'channel-revision-a',
+    channelSourceHash: 'channel-hash-a',
+    mappingGlobalId: null,
+    mappingRowVersion: null,
+    profileVersionGlobalId: null,
+    profileRowVersion: null,
+  },
+  'V2 unit-material checkout lineage remains usable without inventing a Product pack',
+)
+const matchedV2ProductPackLineage = {
+  ...matchedCheckoutLineage,
+  candidateProductMappingGlobalId: 'gpm0000001',
+  candidateChannelSourceRevision: 'channel-revision-a',
+  candidateChannelSourceHash: 'channel-hash-a',
+  receiptLine: withReceiptLineHash({
+    ...matchedCheckoutLineage.receiptLine,
+    line_snapshot: {
+      ...matchedCheckoutLineage.receiptLine.line_snapshot,
+      snapshotVersion: 'shopify-checkout-line-pack-evidence-v2',
+      cartonizationAuthority: 'product_pack',
+      productMappingGlobalId: 'gpm0000001',
+      channelSourceRevision: 'channel-revision-a',
+      channelSourceHash: 'channel-hash-a',
+    },
+  }),
+}
+assert.equal(
+  assertMatchedShopifyCheckoutPackLineage(
+    matchedV2ProductPackLineage,
+  ).mappingGlobalId,
+  'gcvm0000001',
+  'V2 product-pack authority retains strict exact pack mapping lineage',
+)
+for (const [field, value] of [
+  ['productMappingGlobalId', 'gpm-drifted'],
+  ['productGid', 'gid://shopify/Product/99'],
+  ['variantGid', 'gid://shopify/ProductVariant/99'],
+  ['channelSourceRevision', 'channel-revision-b'],
+  ['channelSourceHash', 'channel-hash-b'],
+  ['unitWeightGrams', 171],
+  ['inventoryLevelGlobalIds', undefined],
+  ['packMappingGlobalId', 'gcvm0000001'],
+]) {
+  assert.throws(
+    () => assertMatchedShopifyCheckoutPackLineage({
+      ...matchedUnitMaterialCheckoutLineage,
+      receiptLine: withReceiptLineHash({
+        ...matchedUnitMaterialCheckoutLineage.receiptLine,
+        line_snapshot: {
+          ...matchedUnitMaterialCheckoutLineage.receiptLine.line_snapshot,
+          [field]: value,
+        },
+      }),
+    }),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code
+        === 'HYBRID_CARTONIZATION_CHECKOUT_PACK_LINEAGE_INVALID'
+    ),
+    `V2 unit-material lineage must fail closed on ${field} drift`,
+  )
+}
+
 const fulfillmentCandidate = {
   global_id: 'gcol0000001',
   provider: 'shopify',
@@ -442,8 +549,26 @@ const fulfillmentCandidate = {
   requires_shipping: true,
   ordered_quantity: '50',
   unfulfilled_quantity: '50',
+  unit_multiplier: '1',
   packaging_weight_source: 'provider_catalog',
   weight_grams: 170,
+  length_mm: 203,
+  width_mm: 152,
+  height_mm: 51,
+  line_source_revision: 'line-source-revision-a',
+  line_source_hash: 'b'.repeat(64),
+  manual_measurement_evidence_id: null,
+  manual_measurement_source: null,
+  manual_measurement_weight_grams: null,
+  manual_measurement_length_mm: null,
+  manual_measurement_width_mm: null,
+  manual_measurement_height_mm: null,
+  manual_measurement_line_source_revision: null,
+  manual_measurement_line_source_hash: null,
+  manual_measurement_request_hash: null,
+  manual_measurement_result_payload_hash: null,
+  manual_measurement_decision_global_id: null,
+  manual_measurement_decision_created_at: null,
   mapping_state: 'resolved',
   packaging_state: 'resolved',
   packaging_source: 'variant_pack_mapping',
@@ -487,6 +612,236 @@ const fulfillmentCandidate = {
   checkout_receipt_global_id: 'gsqr0000001',
   fulfillment_pack_source: 'candidate_capture',
   checkout_pack_baseline: checkoutPackBaseline,
+}
+
+const unconstrainedUnitCandidate = {
+  ...fulfillmentCandidate,
+  packaging_state: 'not_required',
+  packaging_source: 'none',
+  packaging_weight_source: null,
+  weight_grams: null,
+  pack_mapping_id: null,
+  pack_mapping_global_id: null,
+  captured_pack_mapping_row_version: null,
+  current_pack_mapping_row_version: null,
+  pack_mapping_is_current: null,
+  pack_mapping_projection_state: null,
+  pack_mapping_source_revision: null,
+  pack_mapping_source_hash: null,
+  pack_mapping_pack_evidence_hash: null,
+  pack_mapping_purpose: null,
+  channel_pack_evidence_hash: null,
+  channel_weight_grams: 750,
+  pack_profile_version_id: null,
+  pack_profile_version_global_id: null,
+  captured_pack_profile_row_version: null,
+  current_pack_profile_row_version: null,
+  pack_profile_is_current: null,
+  pack_profile_lifecycle_state: null,
+  pack_profile_fit_model: null,
+  pack_profile_evidence_type: null,
+  pack_profile_evidence_reference: null,
+  pack_profile_confirmed_at: null,
+  pack_profile_status: null,
+  pack_profile_base_each_quantity: null,
+  current_pack_profile_base_each_quantity: null,
+  current_pack_profile_length_mm: null,
+  current_pack_profile_width_mm: null,
+  current_pack_profile_height_mm: null,
+  current_pack_profile_dimension_basis: null,
+  current_pack_profile_package_level: null,
+  current_pack_profile_ships_as_own_package: null,
+  current_pack_profile_gross_weight_grams: null,
+  current_pack_profile_weight_basis: null,
+  checkout_pack_baseline: null,
+}
+const mappedUnconstrainedUnit = mapCandidateLines(
+  { mode: 'production' },
+  [unconstrainedUnitCandidate],
+)[0]
+assert.equal(
+  mappedUnconstrainedUnit.packProfileVersionId,
+  null,
+  'A one-each line must not invent a Product-pack version',
+)
+assert.equal(
+  mappedUnconstrainedUnit.line.profile.fitModel,
+  'unconstrained_unit',
+  'A one-each line must enter the dedicated no-Product-pack planner',
+)
+assert.equal(
+  mappedUnconstrainedUnit.line.unitWeightGrams,
+  750,
+  'A one-each line must retain exact provider catalog weight',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{ ...unconstrainedUnitCandidate, channel_weight_grams: null }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_UNIT_WEIGHT_REQUIRED'
+  ),
+  'A one-each line without a Product pack must still fail closed on weight',
+)
+
+const orderSpecificUnitCandidate = {
+  ...unconstrainedUnitCandidate,
+  channel_weight_grams: null,
+  order_unit_weight_fact_global_id: 'gouw1vbvhkqodkjl',
+  order_unit_weight_fact_version: 1,
+  order_unit_weight_grams: 907,
+  order_unit_weight_line_source_revision:
+    unconstrainedUnitCandidate.line_source_revision,
+  order_unit_weight_line_source_hash:
+    unconstrainedUnitCandidate.line_source_hash,
+  order_unit_weight_request_hash: '7'.repeat(64),
+  order_unit_weight_fact_hash: '6'.repeat(64),
+  order_unit_weight_recorded_at: '2026-08-27T16:00:00.000Z',
+}
+const mappedOrderSpecificUnit = mapCandidateLines(
+  { mode: 'production' },
+  [orderSpecificUnitCandidate],
+)[0]
+assert.equal(
+  mappedOrderSpecificUnit.packProfileVersionId,
+  null,
+  'Order-specific weight evidence must not create a Product-pack assignment',
+)
+assert.equal(
+  mappedOrderSpecificUnit.line.unitWeightGrams,
+  907,
+  'An exact order-specific fact must supply the missing ordinary-unit weight',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightSource,
+  'order_specific',
+  'The retained source must distinguish operator order evidence from provider data',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightEvidenceReference,
+  orderSpecificUnitCandidate.order_unit_weight_fact_global_id,
+  'Cartonization must retain the exact append-only fact identity',
+)
+assert.equal(
+  mappedOrderSpecificUnit.evidence.weightEvidenceHash,
+  orderSpecificUnitCandidate.order_unit_weight_fact_hash,
+  'Cartonization must retain the deterministic fact-scoped hash',
+)
+assert.throws(
+  () => mapCandidateLines(
+    { mode: 'production' },
+    [{
+      ...orderSpecificUnitCandidate,
+      order_unit_weight_line_source_hash: '5'.repeat(64),
+    }],
+  ),
+  (error) => (
+    error instanceof HybridCartonizationPersistenceError
+    && error.code === 'HYBRID_CARTONIZATION_UNIT_ORDER_EVIDENCE_INVALID'
+  ),
+  'Order-specific weight evidence must fail closed when exact source lineage differs',
+)
+
+const legacyOrderSpecificUnitCandidate = {
+  ...unconstrainedUnitCandidate,
+  global_id: 'gcol1vbvhkqodkjl',
+  product_title_snapshot: 'The 3p Fulfilled Snowboard',
+  packaging_state: 'resolved',
+  packaging_source: 'manual',
+  packaging_weight_source: null,
+  weight_grams: 2268,
+  length_mm: 1524,
+  width_mm: 254,
+  height_mm: 254,
+  channel_weight_grams: null,
+  line_source_revision: '2026-08-15T00:14:33.000Z',
+  line_source_hash:
+    'bcf500459545d85e24aef8dae7d91c39e577560f008246ff317e65d061ecb4f0',
+  manual_measurement_evidence_id:
+    '00000000-0000-4000-8000-000000000041',
+  manual_measurement_source: 'manual_package_resolution',
+  manual_measurement_weight_grams: 2268,
+  manual_measurement_length_mm: 1524,
+  manual_measurement_width_mm: 254,
+  manual_measurement_height_mm: 254,
+  manual_measurement_line_source_revision:
+    '2026-08-15T00:14:33.000Z',
+  manual_measurement_line_source_hash:
+    'bcf500459545d85e24aef8dae7d91c39e577560f008246ff317e65d061ecb4f0',
+  manual_measurement_request_hash: '9'.repeat(64),
+  manual_measurement_result_payload_hash: '8'.repeat(64),
+  manual_measurement_decision_global_id: 'gcrd9rgkh0dr87mq',
+  manual_measurement_decision_created_at: '2026-08-15T00:57:08.685Z',
+}
+const mappedLegacyOrderSpecificUnit = mapCandidateLines(
+  { mode: 'production' },
+  [legacyOrderSpecificUnitCandidate],
+)[0]
+assert.equal(
+  mappedLegacyOrderSpecificUnit.line.profile.fitModel,
+  'unconstrained_unit',
+  'The exact #1001 legacy one-each shape must not require a Product pack',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.line.unitWeightGrams,
+  2268,
+  'The #1001 compatibility path must retain its positive order-specific weight',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightSource,
+  'manual_resolution',
+  'Legacy manual order-pack weight must retain an honest manual-resolution source',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceReference,
+  legacyOrderSpecificUnitCandidate.manual_measurement_decision_global_id,
+  'Manual weight evidence must retain the exact append-only decision',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceHash,
+  legacyOrderSpecificUnitCandidate.manual_measurement_result_payload_hash,
+  'Manual weight evidence must retain the exact command-result hash',
+)
+assert.equal(
+  mappedLegacyOrderSpecificUnit.evidence.weightEvidenceRequestHash,
+  legacyOrderSpecificUnitCandidate.manual_measurement_request_hash,
+  'Manual weight evidence must retain the exact package-resolution request hash',
+)
+for (const [override, code, detail] of [
+  [
+    { weight_grams: null },
+    'HYBRID_CARTONIZATION_UNIT_MANUAL_EVIDENCE_INVALID',
+    'missing order-specific weight',
+  ],
+  [
+    { manual_measurement_evidence_id: null },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'missing manual package-resolution evidence',
+  ],
+  [
+    { unit_multiplier: '6' },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'case-pick multiplier',
+  ],
+  [
+    { pack_mapping_id: '00000000-0000-4000-8000-000000000099' },
+    'HYBRID_CARTONIZATION_PACK_EVIDENCE_REQUIRED',
+    'explicit Product-pack constraint',
+  ],
+]) {
+  assert.throws(
+    () => mapCandidateLines(
+      { mode: 'production' },
+      [{ ...legacyOrderSpecificUnitCandidate, ...override }],
+    ),
+    (error) => (
+      error instanceof HybridCartonizationPersistenceError
+      && error.code === code
+    ),
+    `The #1001 compatibility path must fail closed for ${detail}`,
+  )
 }
 
 const publishedFaireSoldOutCandidate = {

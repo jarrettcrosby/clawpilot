@@ -1,0 +1,287 @@
+import { query } from '@/lib/persistence/postgres'
+
+export const SHOPIFY_REVERSAL_FIXTURE_MIGRATION =
+  '0326_operations_shopify_reversal_test_fixture.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_MIGRATION_CHECKSUM =
+  '8e23a84f09527467acaf2a1ec500642cd6bf11f532c4131dd98b4b8655e09a25' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION =
+  '0328_operations_shopify_reversal_fixture_provider_errors.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION_CHECKSUM =
+  'a08b02ab69b6cedf34087a7baee7d16f50a7717a7a9c32d0901944a7ca1e32aa' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION =
+  '0330_operations_shopify_reversal_fixture_profile_v3.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM =
+  '8d6b464403f08e38e4a92d6b6170dcb0e08662792475ccf602ef22ee5fe2ec4e' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION =
+  '0332_operations_shopify_reversal_fixture_profile_v4.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM =
+  'c54ec1a30b9c5d8b24d50a429f9e8e83d238c0fb3810484ec960ea4737a33ec6' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION =
+  '0333_operations_shopify_reversal_fixture_profile_v5.sql' as const
+export const SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION_CHECKSUM =
+  '058fe337553cd19676f0bb4b6f82104a80591bef724a7070784f3462676b2ad5' as const
+
+export async function readShopifyReversalFixtureHealthInPostgres() {
+  const structural = await query<{
+    migration_current: boolean
+    provider_error_migration_current: boolean
+    profile_v3_migration_current: boolean
+    profile_v4_migration_current: boolean
+    profile_v5_migration_current: boolean
+    command_table: boolean
+    approval_table: boolean
+    attempt_table: boolean
+    outcome_table: boolean
+    provider_error_column: boolean
+    provider_error_constraint: boolean
+    provider_error_message_column: boolean
+    provider_error_message_constraint: boolean
+    profile_version_constraint: boolean
+    provider_error_view_columns: boolean
+    state_view: boolean
+    actor_function: boolean
+    account_function: boolean
+    database_function: boolean
+    approval_session_function: boolean
+    approval_function: boolean
+    fulfillment_function: boolean
+    provider_claim_function: boolean
+    immutable_trigger_count: string
+    database_identity: string | null
+  }>(
+    `SELECT
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $1
+           AND migration.checksum = $2
+       ) AS migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $3
+           AND migration.checksum = $4
+       ) AS provider_error_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $5
+           AND migration.checksum = $6
+       ) AS profile_v3_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $7
+           AND migration.checksum = $8
+       ) AS profile_v4_migration_current,
+       EXISTS (
+         SELECT 1 FROM public.schema_migrations migration
+         WHERE migration.filename = $9
+           AND migration.checksum = $10
+       ) AS profile_v5_migration_current,
+       to_regclass('public.operations_shopify_reversal_fixture_commands')
+         IS NOT NULL AS command_table,
+       to_regclass('public.operations_shopify_reversal_fixture_approvals')
+         IS NOT NULL AS approval_table,
+       to_regclass('public.operations_shopify_reversal_fixture_attempts')
+         IS NOT NULL AS attempt_table,
+       to_regclass('public.operations_shopify_reversal_fixture_outcomes')
+         IS NOT NULL AS outcome_table,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_attribute column_definition
+         WHERE column_definition.attrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND column_definition.attname = 'provider_error_summary'
+           AND column_definition.atttypid = 'pg_catalog.text'::regtype
+           AND NOT column_definition.attnotnull
+           AND NOT column_definition.attisdropped
+       ) AS provider_error_column,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_constraint constraint_definition
+         WHERE constraint_definition.conrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND constraint_definition.conname =
+             'shopify_reversal_fixture_outcomes_provider_error_summary_valid'
+           AND constraint_definition.convalidated
+       ) AS provider_error_constraint,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_attribute column_definition
+         WHERE column_definition.attrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND column_definition.attname = 'provider_error_message'
+           AND column_definition.atttypid = 'pg_catalog.text'::regtype
+           AND NOT column_definition.attnotnull
+           AND NOT column_definition.attisdropped
+       ) AS provider_error_message_column,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_constraint constraint_definition
+         WHERE constraint_definition.conrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_outcomes'
+         )
+           AND constraint_definition.conname =
+             'shopify_reversal_fixture_outcomes_provider_error_message_valid'
+           AND constraint_definition.convalidated
+       ) AS provider_error_message_constraint,
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_constraint constraint_definition
+         WHERE constraint_definition.conrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_commands'
+         )
+           AND constraint_definition.conname =
+             'shopify_reversal_fixture_commands_profile_version_valid'
+           AND constraint_definition.convalidated
+           AND pg_catalog.pg_get_constraintdef(constraint_definition.oid)
+             LIKE '%shopify-reversal-fixture-v5%'
+       ) AS profile_version_constraint,
+       (
+         SELECT count(*) = 3
+         FROM pg_catalog.pg_attribute column_definition
+         WHERE column_definition.attrelid = to_regclass(
+           'public.operations_shopify_reversal_fixture_command_state'
+         )
+           AND column_definition.attname IN (
+             'provider_error_code', 'provider_error_summary',
+             'provider_error_message'
+           )
+           AND NOT column_definition.attisdropped
+       ) AS provider_error_view_columns,
+       to_regclass('public.operations_shopify_reversal_fixture_command_state')
+         IS NOT NULL AS state_view,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_actor_is_manager(uuid,text,text)'
+       ) IS NOT NULL AS actor_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_account_is_current(uuid,uuid,bigint,integer,text,text,text)'
+       ) IS NOT NULL AS account_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_database_is_trusted()'
+       ) IS NOT NULL AS database_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_approval_session_is_current(uuid,uuid,uuid,text,text,text,text)'
+       ) IS NOT NULL AS approval_session_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_approval_is_current(uuid,uuid,uuid)'
+       ) IS NOT NULL AS approval_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_fulfillment_is_safe(uuid,uuid,uuid,bigint,timestamp with time zone,text,jsonb)'
+       ) IS NOT NULL AS fulfillment_function,
+       to_regprocedure(
+         'public.operations_shopify_reversal_fixture_provider_claim_is_current(uuid,uuid,uuid,text,text,text)'
+       ) IS NOT NULL AS provider_claim_function,
+       (
+         SELECT count(*)::text
+         FROM pg_catalog.pg_trigger trigger
+         JOIN pg_catalog.pg_class relation ON relation.oid = trigger.tgrelid
+         JOIN pg_catalog.pg_namespace namespace
+           ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname IN (
+             'operations_shopify_reversal_fixture_commands',
+             'operations_shopify_reversal_fixture_approvals',
+             'operations_shopify_reversal_fixture_attempts',
+             'operations_shopify_reversal_fixture_outcomes'
+           )
+           AND trigger.tgname IN (
+             'protect_shopify_reversal_fixture_command_insert',
+             'protect_shopify_reversal_fixture_approval_insert',
+             'protect_shopify_reversal_fixture_attempt_insert',
+             'protect_shopify_reversal_fixture_outcome_insert',
+             'immutable_shopify_reversal_fixture_commands',
+             'immutable_shopify_reversal_fixture_approvals',
+             'immutable_shopify_reversal_fixture_attempts',
+             'immutable_shopify_reversal_fixture_outcomes'
+           )
+           AND NOT trigger.tgisinternal
+       ) AS immutable_trigger_count,
+       (
+         SELECT setting.value->>'id'
+         FROM public.app_settings setting
+         WHERE setting.key = 'deployment.database.identity'
+         LIMIT 1
+       ) AS database_identity`,
+    [
+      SHOPIFY_REVERSAL_FIXTURE_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROVIDER_ERRORS_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V3_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V4_MIGRATION_CHECKSUM,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION,
+      SHOPIFY_REVERSAL_FIXTURE_PROFILE_V5_MIGRATION_CHECKSUM,
+    ],
+  )
+  const row = structural.rows[0]
+  const structureCurrent = Boolean(
+    row?.migration_current
+    && row.provider_error_migration_current
+    && row.profile_v3_migration_current
+    && row.profile_v4_migration_current
+    && row.profile_v5_migration_current
+    && row.command_table
+    && row.approval_table
+    && row.attempt_table
+    && row.outcome_table
+    && row.provider_error_column
+    && row.provider_error_constraint
+    && row.provider_error_message_column
+    && row.provider_error_message_constraint
+    && row.profile_version_constraint
+    && row.provider_error_view_columns
+    && row.state_view
+    && row.actor_function
+    && row.account_function
+    && row.database_function
+    && row.approval_session_function
+    && row.approval_function
+    && row.fulfillment_function
+    && row.provider_claim_function
+    && Number(row.immutable_trigger_count) === 8,
+  )
+  if (!structureCurrent) {
+    return Object.freeze({
+      migrationCurrent: false,
+      structureCurrent: false,
+      databaseIdentity: row?.database_identity || null,
+      awaitingApproval: 0,
+      prepared: 0,
+      processing: 0,
+      unknown: 0,
+      terminal: 0,
+    })
+  }
+  const counts = await query<{
+    awaiting_approval: string
+    prepared: string
+    processing: string
+    unknown: string
+    terminal: string
+  }>(
+    `SELECT
+       count(*) FILTER (WHERE state = 'awaiting_approval')::text
+         AS awaiting_approval,
+       count(*) FILTER (WHERE state = 'prepared')::text AS prepared,
+       count(*) FILTER (WHERE state = 'processing')::text AS processing,
+       count(*) FILTER (WHERE state = 'unknown')::text AS unknown,
+       count(*) FILTER (WHERE state IN (
+         'succeeded', 'rejected', 'reconciled_applied',
+         'reconciled_absent', 'reconciled_ambiguous'
+       ))::text AS terminal
+     FROM public.operations_shopify_reversal_fixture_command_state`,
+  )
+  return Object.freeze({
+    migrationCurrent: true,
+    structureCurrent: true,
+    databaseIdentity: row.database_identity,
+    awaitingApproval: Number(counts.rows[0]?.awaiting_approval || 0),
+    prepared: Number(counts.rows[0]?.prepared || 0),
+    processing: Number(counts.rows[0]?.processing || 0),
+    unknown: Number(counts.rows[0]?.unknown || 0),
+    terminal: Number(counts.rows[0]?.terminal || 0),
+  })
+}

@@ -2,6 +2,7 @@ export type HybridCartonizationFitModel =
   | 'rigid_3d'
   | 'compressible'
   | 'approved_recipe_only'
+  | 'unconstrained_unit'
 
 export type HybridCartonizationEvidenceType =
   | 'unknown'
@@ -380,6 +381,10 @@ function profileEvidenceProblem(
   line: HybridCartonizationLine,
 ): HybridCartonizationBlocker | null {
   const { profile } = line
+  // A one-each commerce line may deliberately omit a Product pack. Its
+  // provider/order weight is retained separately and packaging is selected
+  // by the conservative unit-material planner.
+  if (profile.fitModel === 'unconstrained_unit') return null
   const eligibleLifecycle = profile.lifecycleState === 'active'
     || (
       input.mode === 'sandbox_demo'
@@ -1091,6 +1096,15 @@ function planHybridCartonizationWithPreference(
       line.profile.currentRowVersion,
       'Current profile row version',
     )
+    if (line.profile.fitModel === 'unconstrained_unit') {
+      geometryFallbackLines.push({
+        lineGlobalId: line.lineGlobalId,
+        productGlobalId: line.productGlobalId,
+        quantity: line.quantity,
+        fitModel: line.profile.fitModel,
+      })
+      continue
+    }
     const profileProblem = profileEvidenceProblem(input, line)
     if (profileProblem) {
       blockers.push(profileProblem)

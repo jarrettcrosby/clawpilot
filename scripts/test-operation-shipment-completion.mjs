@@ -1300,6 +1300,10 @@ async function verifyShipmentCompletion(databaseUrl) {
               }
             },
           },
+          '@/lib/integrations/shopifyReversalFixtureRuntime': {
+            SHOPIFY_REVERSAL_FIXTURE_SHOP_DOMAIN:
+              'test-pro-bakery-bites.myshopify.com',
+          },
           '@/lib/persistence/commerceIntegrations': {
             readCommerceRuntimeCredentialFromPostgres: async (input) => ({
               organizationId: input.organizationId,
@@ -1317,6 +1321,14 @@ async function verifyShipmentCompletion(databaseUrl) {
             }),
           },
           '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
+          '@/lib/persistence/shopifyReversalFixture': {
+            assertShopifyReversalFixtureFulfillmentClaimCurrentInPostgres:
+              async () => {
+                throw new Error(
+                  'Shipment completion acceptance does not use the hidden reversal fixture',
+                )
+              },
+          },
           '@/lib/persistence/shopifyTestStoreCanonicalE2e':
             shopifyTestStorePersistence,
           '@/lib/persistence/sandboxCommerceE2eAuthorization':
@@ -1380,6 +1392,9 @@ async function verifyShipmentCompletion(databaseUrl) {
         },
         '@/lib/persistence/commerceOrderWorkbench': {
           readCommerceOrderWorkbenchFromPostgres: async () => [],
+        },
+        '@/lib/persistence/orderUnitWeightEvidence': {
+          assertCurrentOrderUnitWeightEvidence: async () => {},
         },
         '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
         '@/lib/operations/orderShipTo': orderShipTo,
@@ -6659,7 +6674,6 @@ async function main() {
     'Customer notification not requested',
     'Use ClawPilot connection default',
     'shipment tracking triggers Faire&apos;s shipment email',
-    'Verify this test order uses a controlled recipient',
   ]) {
     assert.ok(
       operationsPanel.includes(fragment),

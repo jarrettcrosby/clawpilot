@@ -323,6 +323,26 @@ export type CommerceNormalizedOrderLine = Readonly<{
   sourceHash: string
 }>
 
+/**
+ * A provider line needs an exact approved Product pack only when the provider
+ * is selling more than one base each as a single pick. Ordinary unit lines
+ * stay eligible for order import without a Product-to-package assignment;
+ * outbound cartonization owns the shipping-package choice.
+ *
+ * Shopify does not supply a multiplier, so its null value is the normal
+ * single-unit case. Invalid non-null multipliers fail closed.
+ */
+export function commerceLinePackFactsRequired(input: Readonly<{
+  requiresShipping: boolean
+  unitMultiplier: number | null
+}>) {
+  if (!input.requiresShipping) return false
+  if (input.unitMultiplier === null) return false
+  return !Number.isSafeInteger(input.unitMultiplier)
+    || input.unitMultiplier > 1
+    || input.unitMultiplier < 1
+}
+
 export type CommerceReadinessDimension =
   | 'cancelled'
   | 'customer'
@@ -1354,9 +1374,11 @@ export function buildCommerceReadinessFacts(input: Readonly<{
     } else if (input.ambiguousSkus.has(line.sku)) {
       facts.push(fact('product', 'product_sku_ambiguous', true, subject))
     }
-    facts.push(line.packaging.state === 'available'
-      ? fact('packaging', 'packaging_available', false, subject)
-      : fact('packaging', 'packaging_required', true, subject))
+    if (line.packaging.state === 'available') {
+      facts.push(fact('packaging', 'packaging_available', false, subject))
+    } else if (commerceLinePackFactsRequired(line)) {
+      facts.push(fact('packaging', 'packaging_required', true, subject))
+    }
   }
 
   const partyContainsRedaction = input.party.state === 'available' && [
