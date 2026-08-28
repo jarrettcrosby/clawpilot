@@ -64,6 +64,10 @@ type ActiveMatonConnectionRow = {
   status: string
 }
 
+type MatonCredentialReadinessRow = {
+  ready: boolean
+}
+
 export type ActiveMatonGatewayConnection = {
   connectionId: string
   accountEmail: string | null
@@ -470,6 +474,26 @@ export async function readActiveMatonConnectionsFromPostgres(input: {
     accountEmail: row.account_email,
     status: 'ACTIVE',
   }))
+}
+
+export async function readMatonCredentialReadinessFromPostgres(
+  ownerEmail: string,
+): Promise<boolean> {
+  const result = await query<MatonCredentialReadinessRow>(
+    `
+      SELECT (
+        api_key_ciphertext IS NOT NULL
+        AND octet_length(api_key_ciphertext) BETWEEN 16 AND 4096
+        AND octet_length(api_key_iv) = 12
+        AND octet_length(api_key_tag) = 16
+        AND key_revoked_at IS NULL
+      ) AS ready
+      FROM user_maton_credentials
+      WHERE owner_email = $1
+    `,
+    [ownerEmail],
+  )
+  return result.rows[0]?.ready === true
 }
 
 export async function readEncryptedMatonApiKeyFromPostgres(

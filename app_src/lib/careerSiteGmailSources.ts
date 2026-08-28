@@ -1,7 +1,11 @@
 import {
   extractPublicHttpsUrls,
+  GMAIL_SOURCE_DEADLINE_MS,
+  MAX_GMAIL_ACTIVE_ACCOUNTS,
   MAX_GMAIL_BODY_TEXT_CHARS,
+  MAX_GMAIL_RESPONSE_BYTES,
   MAX_GMAIL_SNIPPET_CHARS,
+  MAX_GMAIL_TOTAL_MESSAGES,
   type CareerSiteGmailAccount,
   type CareerSiteGmailMessage,
   type CareerSiteGmailSourceRequest,
@@ -15,18 +19,24 @@ import {
 import { matonFetch } from '@/lib/maton'
 import {
   readActiveMatonConnectionsFromPostgres,
+  readMatonCredentialReadinessFromPostgres,
   type ActiveMatonGatewayConnection,
 } from '@/lib/persistence/matonCredentials'
 
 const GMAIL_APP = 'google-mail'
 const GMAIL_MESSAGES_PATH = '/google-mail/gmail/v1/users/me/messages'
-const MAX_ACTIVE_GMAIL_ACCOUNTS = 20
 const MAX_RAW_URL_SOURCE_CHARS = 50_000
-const MESSAGE_FETCH_CONCURRENCY = 5
+const GMAIL_REQUEST_CONCURRENCY = 5
+export const CAREER_GMAIL_IMMUTABLE_QUERY = '{"job alert" recruiter recruiting hiring application interview subject:(job OR role)}'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 type ActiveGmailConnection = ActiveMatonGatewayConnection & {
   accountEmail: string
+}
+
+type GmailMessageCandidate = {
+  connection: ActiveGmailConnection
+  messageId: string
 }
 
 export class CareerSiteGmailSourceError extends Error {
@@ -37,6 +47,13 @@ export class CareerSiteGmailSourceError extends Error {
   ) {
     super(message)
     this.name = 'CareerSiteGmailSourceError'
+  }
+}
+
+class SkippableGmailMessageError extends Error {
+  constructor() {
+    super('The Gmail message is unavailable')
+    this.name = 'SkippableGmailMessageError'
   }
 }
 
@@ -84,8 +101,9 @@ async function activeGmailConnections(ownerEmail: string): Promise<ActiveGmailCo
       'CAREER_SITE_GMAIL_SOURCE_REGISTRY_UNAVAILABLE',
     )
   }
-  if (connections.length > MAX_ACTIVE_GMAIL_ACCOUNTS) throw configurationError()
+  if (connections.length > MAX_GMAIL_ACTIVE_ACCOUNTS) throw configurationError()
 
+  const accountEmails = new Set<string>()
   return connections.map((connection) => {
     const accountEmail = String(connection.accountEmail || '').trim().toLowerCase()
     if (
@@ -96,9 +114,31 @@ async function activeGmailConnections(ownerEmail: string): Promise<ActiveGmailCo
       || !connection.connectionId
       || connection.connectionId.length > 512
       || !/^[\x21-\x7e]+$/.test(connection.connectionId)
+      || accountEmails.has(accountEmail)
     ) throw configurationError()
+    accountEmails.add(accountEmail)
     return { ...connection, accountEmail }
   })
+}
+
+export async function getCareerSiteGmailSourceReadiness(
+  ownerEmail: string,
+): Promise<{ ready: boolean; activeAccountCount: number }> {
+  let credentialReady: boolean
+  try {
+    credentialReady = await readMatonCredentialReadinessFromPostgres(ownerEmail)
+  } catch {
+    throw new CareerSiteGmailSourceError(
+      'The Gmail source credential registry is temporarily unavailable',
+      503,
+      'CAREER_SITE_GMAIL_SOURCE_REGISTRY_UNAVAILABLE',
+    )
+  }
+  const connections = await activeGmailConnections(ownerEmail)
+  return {
+    ready: credentialReady && connections.length > 0,
+    activeAccountCount: connections.length,
+  }
 }
 
 export async function getCareerSiteGmailAccounts(
@@ -112,12 +152,17 @@ export async function getCareerSiteGmailAccounts(
 }
 
 async function gmailJson(
-  input: { ownerEmail: string; connection: ActiveGmailConnection },
+  input: {
+    ownerEmail: string
+    connection: ActiveGmailConnection
+    signal: AbortSignal
+  },
   path: string,
+  operation: 'list' | 'get',
 ): Promise<Record<string, unknown>> {
   let response: Response
   try {
-    response = await matonFetch(path, { method: 'GET' }, {
+    response = await matonFetch(path, { method: 'GET', signal: input.signal }, {
       ownerEmail: input.ownerEmail,
       app: GMAIL_APP,
       boundConnectionId: input.connection.connectionId,
@@ -125,13 +170,25 @@ async function gmailJson(
   } catch {
     throw providerError()
   }
-  if (!response.ok) throw providerError()
+  if (!response.ok) {
+    if (operation === 'get' && [400, 404, 410, 422].includes(response.status)) {
+      throw new SkippableGmailMessageError()
+    }
+    throw providerError()
+  }
   try {
     const payload = asRecord(await response.json())
-    if (!payload) throw providerError()
+    if (!payload) {
+      if (operation === 'get') throw new SkippableGmailMessageError()
+      throw providerError()
+    }
     return payload
   } catch (error) {
-    if (error instanceof CareerSiteGmailSourceError) throw error
+    if (
+      error instanceof CareerSiteGmailSourceError
+      || error instanceof SkippableGmailMessageError
+    ) throw error
+    if (operation === 'get') throw new SkippableGmailMessageError()
     throw providerError()
   }
 }
@@ -143,7 +200,12 @@ function listedMessageIds(payload: Record<string, unknown>): string[] {
   const seen = new Set<string>()
   for (const entry of payload.messages) {
     const message = asRecord(entry)
-    const id = safeMessageId(message?.id)
+    let id: string
+    try {
+      id = safeMessageId(message?.id)
+    } catch {
+      continue
+    }
     if (seen.has(id)) continue
     seen.add(id)
     ids.push(id)
@@ -151,28 +213,29 @@ function listedMessageIds(payload: Record<string, unknown>): string[] {
   return ids
 }
 
-function gmailSearchQuery(request: CareerSiteGmailSourceRequest): string | null {
-  const parts: string[] = []
+function gmailSearchQuery(request: CareerSiteGmailSourceRequest): string {
+  const parts: string[] = [`(${CAREER_GMAIL_IMMUTABLE_QUERY})`]
   if (request.after) {
     parts.push(`after:${Math.max(0, Math.floor(new Date(request.after).getTime() / 1_000))}`)
   }
   if (request.query) parts.push(`(${request.query})`)
-  return parts.length > 0 ? parts.join(' ') : null
+  return parts.join(' ')
 }
 
 async function listedMessages(input: {
   ownerEmail: string
   connection: ActiveGmailConnection
   request: CareerSiteGmailSourceRequest
+  signal: AbortSignal
 }): Promise<string[]> {
   const parameters = new URLSearchParams({
     maxResults: String(input.request.maxMessagesPerAccount),
   })
-  const query = gmailSearchQuery(input.request)
-  if (query) parameters.set('q', query)
+  parameters.set('q', gmailSearchQuery(input.request))
   const payload = await gmailJson(
     input,
     `${GMAIL_MESSAGES_PATH}?${parameters.toString()}`,
+    'list',
   )
   return listedMessageIds(payload).slice(0, input.request.maxMessagesPerAccount)
 }
@@ -217,34 +280,55 @@ async function getMessage(input: {
   ownerEmail: string
   connection: ActiveGmailConnection
   messageId: string
-}): Promise<CareerSiteGmailMessage> {
-  const payload = await gmailJson(
-    input,
-    `${GMAIL_MESSAGES_PATH}/${encodeURIComponent(input.messageId)}?format=full`,
-  )
+  signal: AbortSignal
+}): Promise<CareerSiteGmailMessage | null> {
+  let payload: Record<string, unknown>
+  try {
+    payload = await gmailJson(
+      input,
+      `${GMAIL_MESSAGES_PATH}/${encodeURIComponent(input.messageId)}?format=full`,
+      'get',
+    )
+  } catch (error) {
+    if (error instanceof SkippableGmailMessageError) return null
+    throw error
+  }
   let parsed: ReturnType<typeof parseGmailMessage>
   try {
     parsed = parseGmailMessage(payload as GmailMessage)
   } catch {
-    throw providerError()
+    return null
   }
-  if (parsed.externalMessageId !== input.messageId) throw providerError()
-  const bodyText = parsed.bodyText.slice(0, MAX_GMAIL_BODY_TEXT_CHARS)
-  const snippet = parsed.snippet.slice(0, MAX_GMAIL_SNIPPET_CHARS)
+  const senderEmail = String(parsed.senderEmail || '').trim().toLowerCase()
+  if (
+    parsed.externalMessageId !== input.messageId
+    || !senderEmail
+    || senderEmail.length > 320
+    || !EMAIL_PATTERN.test(senderEmail)
+  ) return null
+  const bodyText = parsed.bodyText.slice(0, MAX_GMAIL_BODY_TEXT_CHARS).trim()
+  const snippet = parsed.snippet.slice(0, MAX_GMAIL_SNIPPET_CHARS).trim()
+  if (!bodyText && !snippet) return null
+  let urls: string[]
+  try {
+    urls = extractPublicHttpsUrls([
+      snippet,
+      bodyText,
+      ...rawMessageUrlSources(payload as GmailMessage),
+    ])
+  } catch {
+    urls = extractPublicHttpsUrls([snippet, bodyText])
+  }
   return {
     accountEmail: input.connection.accountEmail,
     externalMessageId: parsed.externalMessageId,
     externalThreadId: parsed.externalThreadId,
     receivedAt: parsed.receivedAt,
-    from: parsed.senderEmail,
+    from: senderEmail,
     subject: parsed.subject,
     snippet,
     bodyText,
-    urls: extractPublicHttpsUrls([
-      snippet,
-      bodyText,
-      ...rawMessageUrlSources(payload as GmailMessage),
-    ]),
+    urls,
   }
 }
 
@@ -252,11 +336,12 @@ async function mapWithConcurrency<T, R>(
   values: readonly T[],
   concurrency: number,
   mapper: (value: T) => Promise<R>,
+  signal?: AbortSignal,
 ): Promise<R[]> {
   const results = new Array<R>(values.length)
   let cursor = 0
   const worker = async () => {
-    while (cursor < values.length) {
+    while (cursor < values.length && !signal?.aborted) {
       const index = cursor
       cursor += 1
       results[index] = await mapper(values[index])
@@ -268,40 +353,111 @@ async function mapWithConcurrency<T, R>(
   return results
 }
 
+function boundedCandidates(
+  listed: Array<{ connection: ActiveGmailConnection; messageIds: string[] }>,
+): GmailMessageCandidate[] {
+  const candidates: GmailMessageCandidate[] = []
+  for (let index = 0; candidates.length < MAX_GMAIL_TOTAL_MESSAGES; index += 1) {
+    let added = false
+    for (const account of listed) {
+      const messageId = account.messageIds[index]
+      if (!messageId) continue
+      candidates.push({ connection: account.connection, messageId })
+      added = true
+      if (candidates.length >= MAX_GMAIL_TOTAL_MESSAGES) return candidates
+    }
+    if (!added) return candidates
+  }
+  return candidates
+}
+
+function boundedResponseMessages(
+  messages: CareerSiteGmailMessage[],
+): CareerSiteGmailMessage[] {
+  const bounded: CareerSiteGmailMessage[] = []
+  let bytes = Buffer.byteLength('{"ok":true,"messages":[]}', 'utf8')
+  for (const message of messages) {
+    const serializedBytes = Buffer.byteLength(JSON.stringify(message), 'utf8')
+    const separatorBytes = bounded.length > 0 ? 1 : 0
+    if (bytes + separatorBytes + serializedBytes > MAX_GMAIL_RESPONSE_BYTES) continue
+    bytes += separatorBytes + serializedBytes
+    bounded.push(message)
+  }
+  return bounded
+}
+
+function searchAbortError(timedOut: boolean): CareerSiteGmailSourceError {
+  return new CareerSiteGmailSourceError(
+    timedOut
+      ? 'The Gmail source search exceeded its safe execution window'
+      : 'The Gmail source search was cancelled',
+    503,
+    timedOut
+      ? 'CAREER_SITE_GMAIL_SOURCE_DEADLINE_EXCEEDED'
+      : 'CAREER_SITE_GMAIL_SOURCE_CANCELLED',
+  )
+}
+
 export async function searchCareerSiteGmailMessages(input: {
   ownerEmail: string
   request: CareerSiteGmailSourceRequest
+  signal?: AbortSignal
 }): Promise<CareerSiteGmailMessage[]> {
-  const connections = await activeGmailConnections(input.ownerEmail)
-  const messages: CareerSiteGmailMessage[] = []
-  const seen = new Set<string>()
+  const controller = new AbortController()
+  let timedOut = false
+  const cancel = () => controller.abort()
+  if (input.signal?.aborted) controller.abort()
+  else input.signal?.addEventListener('abort', cancel, { once: true })
+  const deadline = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, GMAIL_SOURCE_DEADLINE_MS)
 
-  for (const connection of connections) {
-    const messageIds = await listedMessages({
-      ownerEmail: input.ownerEmail,
-      connection,
-      request: input.request,
-    })
-    const fetched = await mapWithConcurrency(
-      messageIds,
-      MESSAGE_FETCH_CONCURRENCY,
-      (messageId) => getMessage({
-        ownerEmail: input.ownerEmail,
+  try {
+    if (controller.signal.aborted) throw searchAbortError(false)
+    const connections = await activeGmailConnections(input.ownerEmail)
+    const listed = await mapWithConcurrency(
+      connections,
+      GMAIL_REQUEST_CONCURRENCY,
+      async (connection) => ({
         connection,
-        messageId,
+        messageIds: await listedMessages({
+          ownerEmail: input.ownerEmail,
+          connection,
+          request: input.request,
+          signal: controller.signal,
+        }),
       }),
+      controller.signal,
     )
-    for (const message of fetched) {
-      const key = `${message.accountEmail}\u0000${message.externalMessageId}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      messages.push(message)
-    }
+    if (controller.signal.aborted) throw searchAbortError(timedOut)
+    const fetched = await mapWithConcurrency(
+      boundedCandidates(listed),
+      GMAIL_REQUEST_CONCURRENCY,
+      (candidate) => getMessage({
+        ownerEmail: input.ownerEmail,
+        connection: candidate.connection,
+        messageId: candidate.messageId,
+        signal: controller.signal,
+      }),
+      controller.signal,
+    )
+    if (controller.signal.aborted) throw searchAbortError(timedOut)
+    const eligible = fetched
+      .filter((message): message is CareerSiteGmailMessage => Boolean(message))
+      .slice(0, MAX_GMAIL_TOTAL_MESSAGES)
+    return boundedResponseMessages(eligible).sort((left, right) => (
+      right.receivedAt.localeCompare(left.receivedAt)
+      || left.accountEmail.localeCompare(right.accountEmail)
+      || left.externalMessageId.localeCompare(right.externalMessageId)
+    ))
+  } catch (error) {
+    const wasAborted = controller.signal.aborted
+    if (!wasAborted) controller.abort()
+    if (wasAborted) throw searchAbortError(timedOut)
+    throw error
+  } finally {
+    clearTimeout(deadline)
+    input.signal?.removeEventListener('abort', cancel)
   }
-
-  return messages.sort((left, right) => (
-    right.receivedAt.localeCompare(left.receivedAt)
-    || left.accountEmail.localeCompare(right.accountEmail)
-    || left.externalMessageId.localeCompare(right.externalMessageId)
-  ))
 }

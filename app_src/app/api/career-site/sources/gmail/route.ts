@@ -19,7 +19,7 @@ import {
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
 export const runtime = 'nodejs'
-export const maxDuration = 300
+export const maxDuration = 120
 
 const MAX_REQUEST_BYTES = 4 * 1024
 
@@ -135,6 +135,7 @@ export async function POST(req: NextRequest) {
       messages: await searchCareerSiteGmailMessages({
         ownerEmail: actor.ownerEmail,
         request,
+        signal: req.signal,
       }),
     })
   } catch (error) {

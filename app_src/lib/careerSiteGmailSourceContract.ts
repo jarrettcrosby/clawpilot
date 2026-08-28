@@ -8,9 +8,13 @@ import { isIP } from 'node:net'
 const MAX_QUERY_CHARS = 500
 export const DEFAULT_GMAIL_MESSAGES_PER_ACCOUNT = 10
 export const MAX_GMAIL_MESSAGES_PER_ACCOUNT = 25
+export const MAX_GMAIL_ACTIVE_ACCOUNTS = 10
+export const MAX_GMAIL_TOTAL_MESSAGES = 50
 export const MAX_GMAIL_SNIPPET_CHARS = 2_000
 export const MAX_GMAIL_BODY_TEXT_CHARS = 20_000
-export const MAX_GMAIL_PUBLIC_URLS = 25
+export const MAX_GMAIL_PUBLIC_URLS = 20
+export const MAX_GMAIL_RESPONSE_BYTES = 4 * 1024 * 1024
+export const GMAIL_SOURCE_DEADLINE_MS = 85_000
 
 const RFC3339_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/i
 
@@ -62,39 +66,9 @@ export class CareerSiteGmailSourceConfigurationError extends Error {
   }
 }
 
-function isNonPublicIp(hostname: string): boolean {
-  const version = isIP(hostname)
-  if (version === 4) {
-    const [a, b, c] = hostname.split('.').map(Number)
-    return a === 0
-      || a === 10
-      || a === 127
-      || (a === 100 && b >= 64 && b <= 127)
-      || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31)
-      || (a === 192 && b === 0 && c === 0)
-      || (a === 192 && b === 0 && c === 2)
-      || (a === 192 && b === 168)
-      || (a === 198 && [18, 19].includes(b))
-      || (a === 198 && b === 51 && c === 100)
-      || (a === 203 && b === 0 && c === 113)
-      || a >= 224
-  }
-  if (version === 6) {
-    const normalized = hostname.toLowerCase()
-    if (normalized === '::' || normalized === '::1') return true
-    if (/^(?:fc|fd)/.test(normalized) || /^fe[89ab]/.test(normalized)) return true
-    if (normalized.startsWith('::ffff:')) {
-      return isNonPublicIp(normalized.slice('::ffff:'.length))
-    }
-  }
-  return false
-}
-
 function isPublicHostname(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.$/, '')
-  if (!host || host.length > 253 || isNonPublicIp(host)) return false
-  if (isIP(host)) return true
+  if (!host || host.length > 253 || isIP(host) !== 0) return false
   if (!host.includes('.') || !/^[a-z0-9.-]+$/.test(host)) return false
   if (
     host === 'localhost'
@@ -134,6 +108,7 @@ export function extractPublicHttpsUrls(values: readonly string[]): string[] {
         ) continue
         url.hostname = url.hostname.toLowerCase()
         const normalized = url.toString()
+        if (normalized.length > 2_048) continue
         if (seen.has(normalized)) continue
         seen.add(normalized)
         urls.push(normalized)
@@ -152,14 +127,27 @@ function optionalQuery(value: unknown): string | undefined {
     throw new CareerSiteGmailSourceRequestError('query must be text')
   }
   const query = value.trim()
+  const tokens = query.split(/\s+/)
+  const isOr = (token: string) => token.toUpperCase() === 'OR'
+  const normalizedTokens = tokens.map((token) => isOr(token) ? 'OR' : token)
   if (
     !query
     || query.length > MAX_QUERY_CHARS
     || /[\u0000-\u001f\u007f]/.test(query)
+    || isOr(tokens[0])
+    || isOr(tokens[tokens.length - 1])
+    || tokens.some((token, index) => (
+      ['AND', 'AROUND'].includes(token.toUpperCase())
+      || (isOr(token) && isOr(tokens[index - 1] || ''))
+      || (!isOr(token)
+        && !/^-?(?:[a-z][a-z0-9_-]{0,63}:)?[a-z0-9][a-z0-9@._+\/-]{0,255}$/i.test(token))
+    ))
   ) {
-    throw new CareerSiteGmailSourceRequestError('query is invalid')
+    throw new CareerSiteGmailSourceRequestError(
+      'query must contain only safe Gmail refinement tokens',
+    )
   }
-  return query
+  return normalizedTokens.join(' ')
 }
 
 function optionalAfter(value: unknown): string | undefined {
