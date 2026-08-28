@@ -761,6 +761,20 @@ export function shopifyOrderCancellationPaymentEligibility(
       releasesAuthorization: false,
     })
   }
+  if (
+    preview.totalRefunded.currencyCode !== preview.totalReceived.currencyCode
+    || preview.totalCapturable.currencyCode !== preview.totalReceived.currencyCode
+    || compareDecimalAmounts(
+      preview.totalRefunded.amount,
+      preview.totalReceived.amount,
+    ) > 0
+  ) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify returned inconsistent received, refunded, or capturable totals',
+      releasesAuthorization: false,
+    })
+  }
   const successfulAuthorizations = preview.transactions.filter(
     (transaction) => (
       transaction.kind === 'AUTHORIZATION'
@@ -825,6 +839,13 @@ export function shopifyOrderCancellationPaymentEligibility(
     preview.totalReceived.amount,
     preview.totalRefunded.amount,
   ) > 0
+  if (refundMethod === 'original_payment_methods' && !unrefundedReceived) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'No captured Shopify payment remains to refund',
+      releasesAuthorization: false,
+    })
+  }
   const expectedAdditionalTransactions = liveTransactions.length
     + (refundMethod === 'original_payment_methods' && unrefundedReceived
       ? Math.max(1, capturedPayments.length)
@@ -2406,9 +2427,10 @@ export async function cancelShopifyOrder(
       variables: {
         orderId: orderGid,
         notifyCustomer,
-        refundMethod: refundMethod === 'original_payment_methods'
-          ? { originalPaymentMethodsRefund: true }
-          : null,
+        refundMethod: {
+          originalPaymentMethodsRefund:
+            refundMethod === 'original_payment_methods',
+        },
         restock,
         reason,
         staffNote,

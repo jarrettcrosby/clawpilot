@@ -1493,7 +1493,7 @@ for (const fulfillment of [
   assert.deepEqual(plain(mutation.variables), {
     orderId: orderGid,
     notifyCustomer: false,
-    refundMethod: null,
+    refundMethod: { originalPaymentMethodsRefund: false },
     restock: false,
     reason: 'STAFF',
     staffNote: 'Cancel after exact fulfillment reversal',
@@ -2101,7 +2101,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
   assert.deepEqual(plain(h.calls.graphql[1].request.variables), {
     orderId: orderGid,
     notifyCustomer: false,
-    refundMethod: null,
+    refundMethod: { originalPaymentMethodsRefund: false },
     restock: true,
     reason: 'CUSTOMER',
     staffNote: 'Customer requested cancellation',
@@ -2252,7 +2252,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
   assert.deepEqual(plain(mutation.variables), {
     orderId: orderGid,
     notifyCustomer: false,
-    refundMethod: null,
+    refundMethod: { originalPaymentMethodsRefund: false },
     restock: false,
     reason: 'STAFF',
     staffNote: 'ClawPilot warehouse test cancellation',

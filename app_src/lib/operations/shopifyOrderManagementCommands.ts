@@ -210,12 +210,28 @@ function providerAction(
 }
 
 function confirmationStatement(authorization: ShopifyOrderManagementAuthorization) {
-  return [
+  const statement = [
     'AUTHORIZE SHOPIFY WRITE',
     authorization.authorizationGlobalId,
     authorization.action.toUpperCase(),
     authorization.orderNumber,
-  ].join(' ')
+  ]
+  if (
+    authorization.action === 'cancel'
+    || authorization.action === 'cancel_order_after_fulfillment_reversal'
+  ) {
+    statement.push(
+      'REFUND',
+      authorization.cancelRefundMethod === 'original_payment_methods'
+        ? 'ORIGINAL_PAYMENT_METHODS'
+        : 'NONE',
+      'RESTOCK',
+      authorization.cancelRestock ? 'YES' : 'NO',
+      'NOTIFY',
+      authorization.cancelNotifyCustomer ? 'YES' : 'NO',
+    )
+  }
+  return statement.join(' ')
 }
 
 function exactCurrentSource(target: ShopifyOrderManagementTarget) {
@@ -587,9 +603,23 @@ function publicState(input: {
         fulfillment.id === input.target.reversibleExternalFulfillmentGid
       ))
     : undefined
-  const cancellationPayment = shopifyOrderCancellationPaymentEligibility(
+  const cancellationWithoutRefund = shopifyOrderCancellationPaymentEligibility(
     input.preview,
+    'none',
   )
+  const cancellationWithRefund = shopifyOrderCancellationPaymentEligibility(
+    input.preview,
+    'original_payment_methods',
+  )
+  const cancellationPaymentReason = cancellationWithoutRefund.allowed
+    || cancellationWithRefund.allowed
+    ? null
+    : cancellationWithoutRefund.reason === cancellationWithRefund.reason
+      ? cancellationWithoutRefund.reason
+      : [
+          cancellationWithoutRefund.reason,
+          cancellationWithRefund.reason,
+        ].filter(Boolean).join('; ')
   const postReversalCancellationReason = baseReason
     || productionCancellationOnlyReason
     || postReversalOrderCancellationTargetBlocker(input.target)
@@ -606,7 +636,7 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || cancellationPayment.reason
+    || cancellationWithoutRefund.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
@@ -622,7 +652,7 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || cancellationPayment.reason
+    || cancellationPaymentReason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
@@ -666,6 +696,15 @@ function publicState(input: {
     blockerCode: baseReason,
     accountLabel: input.target.accountDisplayName,
     shopDomain: input.target.shopDomain || 'unavailable.myshopify.com',
+    payment: Object.freeze({
+      totalReceived: Object.freeze({ ...input.preview.totalReceived }),
+      totalRefunded: Object.freeze({ ...input.preview.totalRefunded }),
+      totalCapturable: Object.freeze({ ...input.preview.totalCapturable }),
+      refundOptions: Object.freeze({
+        none: cancellationWithoutRefund,
+        original_payment_methods: cancellationWithRefund,
+      }),
+    }),
     order: Object.freeze({
       globalId: input.target.orderGlobalId,
       externalOrderId: input.target.externalOrderId,
@@ -723,13 +762,16 @@ function publicState(input: {
         allowed: cancellationReason === null,
         reason: cancellationReason,
         releasesAuthorization: cancellationReason === null
-          && cancellationPayment.releasesAuthorization,
+          && (
+            cancellationWithoutRefund.releasesAuthorization
+            || cancellationWithRefund.releasesAuthorization
+          ),
       }),
       cancelAfterFulfillmentReversal: Object.freeze({
         allowed: postReversalCancellationReason === null,
         reason: postReversalCancellationReason,
         releasesAuthorization: postReversalCancellationReason === null
-          && cancellationPayment.releasesAuthorization,
+          && cancellationWithoutRefund.releasesAuthorization,
         predecessorAuthorizationGlobalId:
           input.target.postReversalOrderCancellationPredecessorGlobalId,
       }),

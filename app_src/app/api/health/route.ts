@@ -5830,7 +5830,7 @@ export async function GET() {
                               WHERE filename =
                                 '0337_operations_shopify_ordinary_order_cancellation.sql'
                                 AND checksum =
-                                  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                                  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
                             ) THEN
                               'fb382954bb7e3dcfdcd1e0ef1305c364ff516a8f0527259d848f02812142246e'
                             WHEN EXISTS (
@@ -5905,7 +5905,7 @@ export async function GET() {
                     WHERE filename =
                       '0337_operations_shopify_ordinary_order_cancellation.sql'
                       AND checksum =
-                        '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                        '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
                   )
                   AND (
                     SELECT pg_catalog.count(*) = 8
@@ -5958,7 +5958,7 @@ export async function GET() {
                             installed.conname
                         ), 'UTF8'), 'sha256'
                       ), 'hex') =
-                        'a169cb9e1693ae47029d22a7c18bd76f1bbaeaf5c34b109adb26cfa7be29445c'
+                        '922c98d8622f56d4ab1569fd660b655dd1b1f73a6d544888abc26193dbdecc44'
                     FROM pg_catalog.pg_constraint installed
                     JOIN pg_catalog.pg_class table_row
                       ON table_row.oid = installed.conrelid
@@ -5973,7 +5973,7 @@ export async function GET() {
                       )
                   )
                   AND (
-                    SELECT pg_catalog.count(installed.oid) = 2
+                    SELECT pg_catalog.count(installed.oid) = 3
                       AND pg_catalog.encode(public.digest(
                         pg_catalog.convert_to(pg_catalog.string_agg(
                           pg_catalog.concat_ws('|',
@@ -6000,8 +6000,11 @@ export async function GET() {
                           ), E'\n' ORDER BY required.signature
                         ), 'UTF8'), 'sha256'
                       ), 'hex') =
-                        '9156d4559ad7f1aa35838cf0d19198551730f780dde245db3260dabcd9bf4d44'
+                        '07e089a45cbd1826c9b0f056aa3a3685457923b3777c31451d6847fe6d7b6231'
                     FROM (VALUES
+                      (
+                        'operations_shopify_order_cancel_payment_evidence_v2_valid(jsonb,text)'
+                      ),
                       ('protect_shopify_order_cancel_intent_insert()'),
                       ('protect_shopify_order_cancel_attempt_insert()')
                     ) required(signature)
@@ -6139,7 +6142,7 @@ export async function GET() {
                           WHERE filename =
                             '0337_operations_shopify_ordinary_order_cancellation.sql'
                             AND checksum =
-                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                              '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
                         ) THEN
                           '2158a97806c878f8f8b04d2e301b041b5c5728b5e1ffd0a96f0019b61ef2027c'
                         ELSE
@@ -6215,7 +6218,7 @@ export async function GET() {
                           WHERE filename =
                             '0337_operations_shopify_ordinary_order_cancellation.sql'
                             AND checksum =
-                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                              '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
                         ) THEN
                           'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc'
                         ELSE
@@ -6591,7 +6594,7 @@ export async function GET() {
                           WHERE filename =
                             '0337_operations_shopify_ordinary_order_cancellation.sql'
                             AND checksum =
-                              '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+                              '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
                         ) THEN
                           'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed'
                         WHEN EXISTS (

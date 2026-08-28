@@ -103,6 +103,10 @@ assert.doesNotMatch(
   'normal order work must require canManage only',
 )
 assert.match(source.panel, /releasesAuthorization: boolean/)
+assert.match(source.panel, /totalReceived: ShopifyMoney/)
+assert.match(source.panel, /totalRefunded: ShopifyMoney/)
+assert.match(source.panel, /totalCapturable: ShopifyMoney/)
+assert.match(source.panel, /refundOptions: Readonly<\{[\s\S]{0,120}none: CancellationPaymentOption[\s\S]{0,120}original_payment_methods: CancellationPaymentOption/)
 assert.match(
   source.panel,
   /Shopify will void the open payment authorization\./,
@@ -257,6 +261,23 @@ for (const cancellationControl of [
 }
 assert.match(source.panel, /const prepareCancellation = async/)
 assert.match(source.panel, /const executeCancellation = async/)
+assert.match(
+  source.panel,
+  /useState<[\s\S]{0,100}'none'[\s\S]{0,100}'original_payment_methods'[\s\S]{0,100}>\(''\)/,
+  'payment handling must start unset and require a deliberate operator choice',
+)
+assert.match(source.panel, /const cancellationMutation:[\s\S]{0,140}\| null = cancelRefundMethod/)
+assert.match(source.panel, /Select payment handling/)
+assert.match(source.panel, /data-testid="shopify-cancel-payment-facts"/)
+assert.match(source.panel, /\['Received', state\.payment\.totalReceived\]/)
+assert.match(source.panel, /\['Refunded', state\.payment\.totalRefunded\]/)
+assert.match(source.panel, /\['Capturable', state\.payment\.totalCapturable\]/)
+assert.match(source.panel, /disabled=\{!state\.payment\.refundOptions\.none\.allowed\}/)
+assert.match(
+  source.panel,
+  /disabled=\{!state\.payment\.refundOptions[\s\S]{0,80}original_payment_methods\.allowed\}/,
+)
+assert.match(source.panel, /Choose how Shopify should handle payment\./)
 assert.match(source.panel, /action: 'prepare' as const/)
 assert.match(source.panel, /action: 'execute' as const/)
 assert.match(source.panel, /confirmationStatement: cancelConfirmation/)
@@ -277,6 +298,11 @@ assert.match(
   source.panel,
   /cancelConfirmation\s*!== preparedCancel\.confirmationStatement/,
   'execution must require the exact prepared confirmation statement',
+)
+assert.match(
+  source.panel,
+  /data-testid="save-shopify-cancel-after-reversal"[\s\S]{0,450}!canCancel/,
+  'post-reversal cancellation must be disabled unless the same owner or administrator authority accepted by the API is present',
 )
 
 assert.match(

@@ -191,7 +191,7 @@ for (const fragment of [
 }
 assert.equal(
   ordinaryCancellationMigrationChecksum,
-  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f',
+  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b',
   'health attestation must pin the exact ordinary-cancellation migration',
 )
 for (const fragment of [
@@ -204,6 +204,7 @@ for (const fragment of [
   "action = 'cancel'",
   'protect_shopify_order_cancel_intent_insert',
   'protect_shopify_order_cancel_attempt_insert',
+  'operations_shopify_order_cancel_payment_evidence_v2_valid',
   "membership.role = 'owner'",
   "membership.role = 'admin'",
   "membership.permissions->>'manageOperations'",
@@ -274,15 +275,17 @@ for (const fragment of [
   "'protect_shopify_fulfillment_reversal_authorization_insert()'",
   "'protect_shopify_fulfillment_reversal_attempt_insert()'",
   "'0337_operations_shopify_ordinary_order_cancellation.sql'",
-  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f',
+  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b',
   'f67516c01f44ae9e7fa1733d71f068155f60d1633926716790f1da4eca4587e2',
-  'a169cb9e1693ae47029d22a7c18bd76f1bbaeaf5c34b109adb26cfa7be29445c',
+  '922c98d8622f56d4ab1569fd660b655dd1b1f73a6d544888abc26193dbdecc44',
+  '07e089a45cbd1826c9b0f056aa3a3685457923b3777c31451d6847fe6d7b6231',
   "'ops_shopify_order_mgmt_auth_environment_valid'",
   "'ops_shopify_order_mgmt_cancel_reason_valid'",
   "'ops_shopify_order_mgmt_cancel_choices_valid'",
   "'ops_shopify_order_mgmt_attempt_cancel_choices_valid'",
   "'protect_shopify_order_cancel_intent_insert()'",
   "'protect_shopify_order_cancel_attempt_insert()'",
+  "'operations_shopify_order_cancel_payment_evidence_v2_valid(jsonb,text)'",
 ]) {
   assert.ok(routeSource.includes(fragment), `Health route missing ${fragment}`)
 }
@@ -815,9 +818,11 @@ if (liveDatabaseUrl) {
     'fb97f262f1104adf5f090289158a2c6c911988f2193bed5f1b490a31afb38c25',
     '53032e88095ed3ce3159044c748684fed9500935b96c06d66af60f151116b052',
     '702f0b87268a63bc78762516719f410bcaed03318e1f041c3d3c4afa210eb59d',
-  'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
-  'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc',
-  'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed',
+    'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
+    'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc',
+    'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed',
+    '922c98d8622f56d4ab1569fd660b655dd1b1f73a6d544888abc26193dbdecc44',
+    '07e089a45cbd1826c9b0f056aa3a3685457923b3777c31451d6847fe6d7b6231',
   ]) {
     assert.ok(
       providerWriteHealthExpression.includes(requiredPhaseFragment),
@@ -866,6 +871,23 @@ if (liveDatabaseUrl) {
       `ALTER TABLE
          public.operations_shopify_order_management_authorizations
        DISABLE TRIGGER protect_shopify_order_cancel_intent_insert`,
+    )
+    assert.equal(await structuralReady(), false)
+    await client.query('ROLLBACK')
+
+    await client.query('BEGIN')
+    await client.query(
+      `CREATE OR REPLACE FUNCTION
+         public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+           payment_evidence jsonb,
+           refund_method text
+         )
+       RETURNS boolean
+       LANGUAGE sql
+       IMMUTABLE
+       PARALLEL SAFE
+       SET search_path = pg_catalog, public, pg_temp
+       AS 'SELECT true'`,
     )
     assert.equal(await structuralReady(), false)
     await client.query('ROLLBACK')

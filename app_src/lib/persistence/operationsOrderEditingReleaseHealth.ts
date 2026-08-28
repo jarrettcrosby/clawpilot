@@ -25,7 +25,7 @@ export const OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM =
   'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
 
 export const OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM =
-  '44f4de5a142d5ab8173d3e0a3a5de064c1722dee04ad0de9b4ab43dcd0bcd01f'
+  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
 
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
@@ -311,6 +311,7 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
       'public.operations_shopify_order_management_is_current(uuid,uuid,boolean)',
       'public.protect_shopify_order_management_authorization()',
       'public.protect_shopify_order_management_attempt()',
+      'public.operations_shopify_order_cancel_payment_evidence_v2_valid(jsonb,text)',
       'public.protect_shopify_order_cancel_intent_insert()',
       'public.protect_shopify_order_cancel_attempt_insert()',
     ])}
@@ -569,9 +570,9 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH =
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0'
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0325_ARTIFACT_HASH =
   'd0049adc200df110ed90132dd77bd300d0cfb9703b4921abcc5ae8bdb4eef24a'
-export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT = 88
+export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT = 89
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_HASH =
-  'd7e080f2655b79987d322a069c92dcce6b85ffc4d6d5fb06aac0b6960de95dfd'
+  'ea066a20282c6afb7df2e9c947ba6231a499c240ea2f23e9868a72bc42c8df2b'
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH =
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf'

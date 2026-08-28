@@ -69,6 +69,15 @@ type CancellationEligibility = Readonly<{
   reason: string | null
   releasesAuthorization: boolean
 }>
+type CancellationPaymentOption = Readonly<{
+  allowed: boolean
+  reason: string | null
+  releasesAuthorization: boolean
+}>
+type ShopifyMoney = Readonly<{
+  amount: string
+  currencyCode: string
+}>
 type PostReversalCancellationEligibility = Readonly<{
   allowed: boolean
   reason: string | null
@@ -116,6 +125,15 @@ type ShopifyManagement = Readonly<{
   blockerCode: string | null
   accountLabel: string
   shopDomain: string
+  payment: Readonly<{
+    totalReceived: ShopifyMoney
+    totalRefunded: ShopifyMoney
+    totalCapturable: ShopifyMoney
+    refundOptions: Readonly<{
+      none: CancellationPaymentOption
+      original_payment_methods: CancellationPaymentOption
+    }>
+  }>
   order: Readonly<{
     globalId: string
     externalOrderId: string
@@ -222,6 +240,8 @@ const SHOPIFY_FULFILLMENT_GID =
 const SHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/
 const SHA256 = /^[a-f0-9]{64}$/
 const COUNTRY_CODE = /^[A-Z]{2}$/
+const CURRENCY_CODE = /^(?:[A-Z]{3}|USDC)$/
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/
 const EMPTY_SHIPPING_ADDRESS: ShippingAddressDraft = {
   firstName: '',
   lastName: '',
@@ -269,6 +289,23 @@ function optionalText(value: unknown): value is string | null {
 }
 function integer(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value)
+}
+function shopifyMoney(value: unknown): value is ShopifyMoney {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<ShopifyMoney>
+  return typeof item.amount === 'string'
+    && NONNEGATIVE_DECIMAL.test(item.amount)
+    && typeof item.currencyCode === 'string'
+    && CURRENCY_CODE.test(item.currencyCode)
+}
+function cancellationPaymentOption(
+  value: unknown,
+): value is CancellationPaymentOption {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<CancellationPaymentOption>
+  return typeof item.allowed === 'boolean'
+    && optionalText(item.reason)
+    && typeof item.releasesAuthorization === 'boolean'
 }
 function isoInstant(value: unknown): value is string {
   if (!text(value)) return false
@@ -405,6 +442,8 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
   const order = item.order as Partial<ShopifyManagement['order']> | undefined
   const eligibility = item.eligibility as
     Partial<ShopifyManagement['eligibility']> | undefined
+  const payment = item.payment as
+    Partial<ShopifyManagement['payment']> | undefined
   const lines = Array.isArray(order?.lines) ? order.lines : []
   const edits = Array.isArray(eligibility?.lineEdits)
     ? eligibility.lineEdits
@@ -419,6 +458,13 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && optionalText(item.blockerCode)
     && text(item.accountLabel)
     && typeof item.shopDomain === 'string' && SHOPIFY_DOMAIN.test(item.shopDomain)
+    && shopifyMoney(payment?.totalReceived)
+    && shopifyMoney(payment?.totalRefunded)
+    && shopifyMoney(payment?.totalCapturable)
+    && cancellationPaymentOption(payment?.refundOptions?.none)
+    && cancellationPaymentOption(
+      payment?.refundOptions?.original_payment_methods,
+    )
     && order?.globalId === orderGlobalId && ORDER_GLOBAL_ID.test(orderGlobalId)
     && typeof order.externalOrderId === 'string'
     && SHOPIFY_ORDER_GID.test(order.externalOrderId)
@@ -584,8 +630,8 @@ export default function ShopifyOrderManagementPanel({
     'CUSTOMER' | 'DECLINED' | 'FRAUD' | 'INVENTORY' | 'OTHER' | 'STAFF'
   >('CUSTOMER')
   const [cancelRefundMethod, setCancelRefundMethod] = useState<
-    'none' | 'original_payment_methods'
-  >('none')
+    '' | 'none' | 'original_payment_methods'
+  >('')
   const [cancelRestock, setCancelRestock] = useState(true)
   const [cancelNotifyCustomer, setCancelNotifyCustomer] = useState(false)
   const [cancelReason, setCancelReason] = useState('')
@@ -648,6 +694,7 @@ export default function ShopifyOrderManagementPanel({
     setAmbiguousSave(false)
     setReversingFulfillmentId(null)
     setCancellingAfterReversal(false)
+    setCancelRefundMethod('')
     setPreparedCancel(null)
     setCancelConfirmation('')
     saveAttempt.current = null
@@ -771,17 +818,25 @@ export default function ShopifyOrderManagementPanel({
     && tagsValid
     && changedLinesValid
     && allLineDraftsValid
-  const cancellationMutation: Extract<ShopifyMutation, { kind: 'cancel' }> = {
-    kind: 'cancel',
-    reasonCode: cancelReasonCode,
-    refundMethod: cancelRefundMethod,
-    restock: cancelRestock,
-    notifyCustomer: cancelNotifyCustomer,
-  }
+  const cancellationMutation:
+    Extract<ShopifyMutation, { kind: 'cancel' }> | null = cancelRefundMethod
+      ? {
+          kind: 'cancel',
+          reasonCode: cancelReasonCode,
+          refundMethod: cancelRefundMethod,
+          restock: cancelRestock,
+          notifyCustomer: cancelNotifyCustomer,
+        }
+      : null
+  const selectedCancellationPayment = cancelRefundMethod
+    ? state?.payment.refundOptions[cancelRefundMethod]
+    : null
   const normalizedCancelReason = cancelReason.trim()
   const cancelDraftValid = normalizedCancelReason.length >= 10
     && normalizedCancelReason.length <= 500
     && !/[\u0000-\u001f\u007f]/.test(normalizedCancelReason)
+    && cancellationMutation !== null
+    && selectedCancellationPayment?.allowed === true
 
   const save = async (mutation: ShopifyMutation) => {
     if (!state || blocker || busy) return
@@ -902,6 +957,7 @@ export default function ShopifyOrderManagementPanel({
       || !canCancel
       || !state.eligibility.cancel.allowed
       || !cancelDraftValid
+      || !cancellationMutation
     ) return
     const body = {
       action: 'prepare' as const,
@@ -956,6 +1012,7 @@ export default function ShopifyOrderManagementPanel({
       || blocker
       || busy
       || !canCancel
+      || !cancellationMutation
       || cancelConfirmation !== preparedCancel.confirmationStatement
     ) return
     const body = {
@@ -1032,6 +1089,7 @@ export default function ShopifyOrderManagementPanel({
       || !predecessor
       || blocker
       || busy
+      || !canCancel
     ) return
     const confirmed = window.confirm(
       `Cancel ${currentState.order.name} in Shopify?\n\n`
@@ -1619,6 +1677,9 @@ export default function ShopifyOrderManagementPanel({
                     : ''}
                 </Typography>
                 <Tooltip title={blocker
+                  || (!canCancel
+                    ? 'Owner or operations administrator execution permission is required.'
+                    : null)
                   || state.eligibility.cancelAfterFulfillmentReversal.reason
                   || ''}
                 >
@@ -1632,6 +1693,7 @@ export default function ShopifyOrderManagementPanel({
                         : <CancelRounded />}
                       disabled={busy
                         || Boolean(blocker)
+                        || !canCancel
                         || !state.eligibility
                           .cancelAfterFulfillmentReversal.allowed}
                       onClick={() => void cancelAfterFulfillmentReversal()}
@@ -1645,7 +1707,9 @@ export default function ShopifyOrderManagementPanel({
                 <DisabledReason
                   value={state.eligibility.cancelAfterFulfillmentReversal
                     .allowed
-                    ? null
+                    ? (!canCancel
+                        ? 'Owner or operations administrator execution permission is required.'
+                        : null)
                     : state.eligibility.cancelAfterFulfillmentReversal.reason}
                 />
               </Stack>
@@ -1663,10 +1727,34 @@ export default function ShopifyOrderManagementPanel({
               <Typography variant="body2" color="text.secondary">
                 Cancel {state.order.name} in Shopify. Choose how payment,
                 inventory, and the customer should be handled.
-                {state.eligibility.cancel.releasesAuthorization
+                {selectedCancellationPayment?.releasesAuthorization
                   ? ' Shopify will void the open payment authorization.'
                   : ''}
               </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                  gap: 1,
+                }}
+                data-testid="shopify-cancel-payment-facts"
+              >
+                {([
+                  ['Received', state.payment.totalReceived],
+                  ['Refunded', state.payment.totalRefunded],
+                  ['Capturable', state.payment.totalCapturable],
+                ] satisfies ReadonlyArray<readonly [string, ShopifyMoney]>)
+                  .map(([label, money]) => (
+                    <Box key={label}>
+                      <Typography variant="caption" color="text.secondary">
+                        {label}
+                      </Typography>
+                      <Typography variant="body2" fontWeight={600}>
+                        {money.amount} {money.currencyCode}
+                      </Typography>
+                    </Box>
+                  ))}
+              </Box>
               <TextField
                 select
                 fullWidth
@@ -1696,11 +1784,26 @@ export default function ShopifyOrderManagementPanel({
                   typeof cancelRefundMethod)}
                 inputProps={{ 'data-testid': 'shopify-cancel-refund-method' }}
               >
-                <MenuItem value="none">Do not refund</MenuItem>
-                <MenuItem value="original_payment_methods">
+                <MenuItem value="" disabled>
+                  Select payment handling
+                </MenuItem>
+                <MenuItem
+                  value="none"
+                  disabled={!state.payment.refundOptions.none.allowed}
+                >
+                  Do not refund
+                </MenuItem>
+                <MenuItem
+                  value="original_payment_methods"
+                  disabled={!state.payment.refundOptions
+                    .original_payment_methods.allowed}
+                >
                   Full refund to original payment methods
                 </MenuItem>
               </TextField>
+              <DisabledReason value={cancelRefundMethod
+                ? selectedCancellationPayment?.reason
+                : 'Choose how Shopify should handle payment.'} />
               <Stack spacing={0}>
                 <FormControlLabel
                   control={<Checkbox
@@ -1780,6 +1883,7 @@ export default function ShopifyOrderManagementPanel({
                       disabled={busy
                         || Boolean(blocker)
                         || !canCancel
+                        || !cancellationMutation
                         || cancelConfirmation
                           !== preparedCancel.confirmationStatement}
                       onClick={() => void executeCancellation()}
@@ -1800,6 +1904,7 @@ export default function ShopifyOrderManagementPanel({
                         || Boolean(blocker)
                         || !canCancel
                         || !cancelDraftValid
+                        || !cancellationMutation
                         || !state.eligibility.cancel.allowed}
                       onClick={() => void prepareCancellation()}
                       sx={{ minHeight: 44 }}

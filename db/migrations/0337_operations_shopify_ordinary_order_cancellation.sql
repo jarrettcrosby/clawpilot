@@ -36,6 +36,105 @@ BEGIN
 END;
 $$;
 
+-- Every new cancellation stores the complete v2 payment ledger shape. This
+-- validator deliberately returns false (never SQL NULL) for a scalar, array,
+-- missing key, extra key, JSON null, wrong JSON type, non-canonical amount,
+-- currency mismatch, invalid hash/count, or refund choice mismatch.
+CREATE OR REPLACE FUNCTION
+  public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+    payment_evidence jsonb,
+    refund_method text
+  )
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+  transaction_count_text text;
+  transaction_hash_text text;
+  current_money jsonb;
+  amount_text text;
+  currency_code_text text;
+  received_currency text;
+BEGIN
+  IF refund_method NOT IN ('none', 'original_payment_methods')
+     OR pg_catalog.jsonb_typeof(payment_evidence) IS DISTINCT FROM 'object'
+     OR payment_evidence IS DISTINCT FROM pg_catalog.jsonb_build_object(
+       'schema', payment_evidence->'schema',
+       'transactionsCount', payment_evidence->'transactionsCount',
+       'transactionsHash', payment_evidence->'transactionsHash',
+       'totalReceived', payment_evidence->'totalReceived',
+       'totalRefunded', payment_evidence->'totalRefunded',
+       'totalCapturable', payment_evidence->'totalCapturable',
+       'refundMethod', payment_evidence->'refundMethod'
+     )
+     OR payment_evidence->'schema' IS DISTINCT FROM
+          pg_catalog.to_jsonb(
+            'shopify-order-cancel-payment-evidence-v2'::text
+          )
+     OR payment_evidence->'refundMethod' IS DISTINCT FROM
+          pg_catalog.to_jsonb(refund_method)
+     OR pg_catalog.jsonb_typeof(payment_evidence->'transactionsCount')
+          IS DISTINCT FROM 'number'
+     OR pg_catalog.jsonb_typeof(payment_evidence->'transactionsHash')
+          IS DISTINCT FROM 'string'
+  THEN
+    RETURN false;
+  END IF;
+
+  transaction_count_text := payment_evidence->>'transactionsCount';
+  transaction_hash_text := payment_evidence->>'transactionsHash';
+  IF transaction_count_text IS NULL
+     OR transaction_count_text !~ '^(0|[1-9][0-9]*)$'
+     OR pg_catalog.length(transaction_count_text) > 2
+     OR transaction_count_text::numeric > 25
+     OR transaction_hash_text IS NULL
+     OR transaction_hash_text !~ '^[a-f0-9]{64}$'
+  THEN
+    RETURN false;
+  END IF;
+
+  FOREACH current_money IN ARRAY ARRAY[
+    payment_evidence->'totalReceived',
+    payment_evidence->'totalRefunded',
+    payment_evidence->'totalCapturable'
+  ]::jsonb[]
+  LOOP
+    IF pg_catalog.jsonb_typeof(current_money) IS DISTINCT FROM 'object'
+       OR current_money IS DISTINCT FROM pg_catalog.jsonb_build_object(
+         'amount', current_money->'amount',
+         'currencyCode', current_money->'currencyCode'
+       )
+       OR pg_catalog.jsonb_typeof(current_money->'amount')
+            IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(current_money->'currencyCode')
+            IS DISTINCT FROM 'string'
+    THEN
+      RETURN false;
+    END IF;
+    amount_text := current_money->>'amount';
+    currency_code_text := current_money->>'currencyCode';
+    IF amount_text IS NULL
+       OR pg_catalog.length(amount_text) > 128
+       OR amount_text !~ '^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'
+       OR currency_code_text IS NULL
+       OR currency_code_text !~ '^(?:[A-Z]{3}|USDC)$'
+    THEN
+      RETURN false;
+    END IF;
+    IF received_currency IS NULL THEN
+      received_currency := currency_code_text;
+    ELSIF currency_code_text IS DISTINCT FROM received_currency THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  RETURN true;
+END;
+$$;
+
 ALTER TABLE public.operations_shopify_order_management_authorizations
   ADD CONSTRAINT ops_shopify_order_mgmt_auth_environment_valid CHECK (
     account_environment IN ('sandbox', 'production')
@@ -101,21 +200,10 @@ ALTER TABLE public.operations_shopify_order_management_authorizations
       AND cancel_refund_method IN ('none', 'original_payment_methods')
       AND cancel_restock IS NOT NULL
       AND cancel_notify_customer IS NOT NULL
-      AND (
-        cancellation_payment_evidence IS NULL
-        OR (
-          cancellation_payment_evidence->>'schema' IN (
-            'shopify-order-cancel-payment-evidence-v1',
-            'shopify-order-cancel-payment-evidence-v2'
-          )
-          AND (
-            cancellation_payment_evidence->>'schema' <>
-              'shopify-order-cancel-payment-evidence-v2'
-            OR cancellation_payment_evidence->>'refundMethod' =
-                 cancel_refund_method
-          )
-        )
-      )
+      AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+        cancellation_payment_evidence,
+        cancel_refund_method
+      ) IS TRUE
     )
     OR (
       action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
@@ -124,7 +212,7 @@ ALTER TABLE public.operations_shopify_order_management_authorizations
       AND cancel_notify_customer IS NULL
       AND cancellation_payment_evidence IS NULL
     )
-  );
+  ) NOT VALID;
 
 ALTER TABLE public.operations_shopify_order_management_attempts
   ADD CONSTRAINT ops_shopify_order_mgmt_attempt_cancel_choices_valid CHECK (
@@ -133,13 +221,10 @@ ALTER TABLE public.operations_shopify_order_management_attempts
       AND cancel_refund_method IN ('none', 'original_payment_methods')
       AND cancel_restock IS NOT NULL
       AND cancel_notify_customer IS NOT NULL
-      AND (
-        cancellation_payment_evidence IS NULL
-        OR cancellation_payment_evidence->>'schema' IN (
-          'shopify-order-cancel-payment-evidence-v1',
-          'shopify-order-cancel-payment-evidence-v2'
-        )
-      )
+      AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+        cancellation_payment_evidence,
+        cancel_refund_method
+      ) IS TRUE
     )
     OR (
       action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
@@ -148,7 +233,7 @@ ALTER TABLE public.operations_shopify_order_management_attempts
       AND cancel_notify_customer IS NULL
       AND cancellation_payment_evidence IS NULL
     )
-  );
+  ) NOT VALID;
 
 ALTER TABLE public.operations_shopify_order_management_authorizations
   DROP CONSTRAINT ops_shopify_order_mgmt_auth_action_valid;
@@ -341,30 +426,20 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp
 AS $$
 BEGIN
-  IF NEW.action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
-     OR NEW.cancel_refund_method NOT IN ('none', 'original_payment_methods')
-     OR NEW.cancel_restock IS NULL
-     OR NEW.cancel_notify_customer IS NULL
-     OR NEW.cancellation_payment_evidence IS NULL
-     OR NEW.cancellation_payment_evidence->>'schema' NOT IN (
-       'shopify-order-cancel-payment-evidence-v1',
-       'shopify-order-cancel-payment-evidence-v2'
-     )
-     OR (
-       NEW.cancellation_payment_evidence->>'schema' =
-         'shopify-order-cancel-payment-evidence-v2'
-       AND NEW.cancellation_payment_evidence->>'refundMethod' <>
-             NEW.cancel_refund_method
-     )
-     OR (
-       NOT NEW.provider_order_test
-       AND (
-         NEW.action <> 'cancel'
-         OR NEW.cancellation_payment_evidence->>'schema' <>
-              'shopify-order-cancel-payment-evidence-v2'
-       )
-     )
-     OR NOT EXISTS (
+  IF (
+    NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+    AND NEW.cancel_refund_method IN ('none', 'original_payment_methods')
+    AND NEW.cancel_restock IS NOT NULL
+    AND NEW.cancel_notify_customer IS NOT NULL
+    AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+      NEW.cancellation_payment_evidence,
+      NEW.cancel_refund_method
+    ) IS TRUE
+    AND (
+      NEW.provider_order_test
+      OR NEW.action = 'cancel'
+    )
+    AND EXISTS (
        SELECT 1
        FROM public.app_user_organization_memberships membership
        WHERE membership.organization_id = NEW.organization_id
@@ -385,7 +460,8 @@ BEGIN
              )
            )
          )
-     )
+    )
+  ) IS DISTINCT FROM TRUE
   THEN
     RAISE EXCEPTION
       'Shopify order cancellation intent is incomplete or not permitted';
@@ -401,8 +477,13 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, public, pg_temp
 AS $$
 BEGIN
-  IF NEW.action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
-     OR NOT EXISTS (
+  IF (
+    NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+    AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+      NEW.cancellation_payment_evidence,
+      NEW.cancel_refund_method
+    ) IS TRUE
+    AND EXISTS (
        SELECT 1
        FROM public.operations_shopify_order_management_authorizations authz
        WHERE authz.organization_id = NEW.organization_id
@@ -415,7 +496,8 @@ BEGIN
                NEW.cancellation_payment_evidence
          AND authz.intent_hash = NEW.intent_hash
          AND authz.provider_snapshot_hash = NEW.provider_snapshot_hash
-     )
+    )
+  ) IS DISTINCT FROM TRUE
   THEN
     RAISE EXCEPTION
       'Shopify order cancellation attempt does not match its durable intent';

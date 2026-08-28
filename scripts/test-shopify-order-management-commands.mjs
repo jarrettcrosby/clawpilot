@@ -552,6 +552,13 @@ function cancellationPaymentEligibility(preview, refundMethod = 'none') {
   ))
   const unrefundedReceived = Number(preview.totalReceived.amount)
     > Number(preview.totalRefunded.amount)
+  if (refundMethod === 'original_payment_methods' && !unrefundedReceived) {
+    return {
+      allowed: false,
+      reason: 'No captured Shopify payment remains to refund',
+      releasesAuthorization: false,
+    }
+  }
   const expectedAdditionalTransactions = liveTransactions.length
     + (refundMethod === 'original_payment_methods' && unrefundedReceived
       ? Math.max(1, capturedPayments.length)
@@ -1423,7 +1430,24 @@ assert.deepEqual(plain(management.eligibility.cancel), {
   reason: null,
   releasesAuthorization: true,
 })
-assert.equal(paymentEligibilityCallCount, 1)
+assert.equal(paymentEligibilityCallCount, 2)
+assert.deepEqual(plain(management.payment), {
+  totalReceived: { amount: '0.00', currencyCode: 'USD' },
+  totalRefunded: { amount: '0.00', currencyCode: 'USD' },
+  totalCapturable: { amount: '40.00', currencyCode: 'USD' },
+  refundOptions: {
+    none: {
+      allowed: true,
+      reason: null,
+      releasesAuthorization: true,
+    },
+    original_payment_methods: {
+      allowed: false,
+      reason: 'No captured Shopify payment remains to refund',
+      releasesAuthorization: false,
+    },
+  },
+})
 
 prepared = await commands.prepareShopifyOrderManagementCommand({
   organizationId,
@@ -1437,6 +1461,10 @@ prepared = await commands.prepareShopifyOrderManagementCommand({
 assert.deepEqual(
   plain(lastPrepareInput.cancellationPaymentEvidence),
   authorizationPaymentEvidenceFixture(),
+)
+assert.equal(
+  prepared.confirmationStatement,
+  'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL #6600 REFUND NONE RESTOCK NO NOTIFY NO',
 )
 
 reset()
@@ -1481,6 +1509,47 @@ management = await commands.readShopifyOrderManagementState({
 })
 assert.equal(management.eligibility.cancel.allowed, true)
 assert.equal(management.eligibility.cancel.releasesAuthorization, false)
+assert.deepEqual(plain(management.payment), {
+  totalReceived: { amount: '40.00', currencyCode: 'USD' },
+  totalRefunded: { amount: '0.00', currencyCode: 'USD' },
+  totalCapturable: { amount: '0.00', currencyCode: 'USD' },
+  refundOptions: {
+    none: { allowed: true, reason: null, releasesAuthorization: false },
+    original_payment_methods: {
+      allowed: true,
+      reason: null,
+      releasesAuthorization: false,
+    },
+  },
+})
+const paidRefundMutation = {
+  ...ordinaryCancelMutation,
+  refundMethod: 'original_payment_methods',
+  restock: true,
+  notifyCustomer: true,
+}
+const paidRefundPrepared = await commands.prepareShopifyOrderManagementCommand({
+  organizationId,
+  actorEmail,
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: paidRefundMutation,
+  reason: 'Refund the exact paid Shopify order selected by the operator',
+  idempotencyKey: 'shopify-paid-refund-selection-prepare-0001',
+})
+assert.deepEqual(plain(lastPrepareInput.cancellationPaymentEvidence), {
+  schema: 'shopify-order-cancel-payment-evidence-v2',
+  transactionsCount: 1,
+  transactionsHash: transactionEvidenceHash(inspection.preview.transactions),
+  totalReceived: { amount: '40.00', currencyCode: 'USD' },
+  totalRefunded: { amount: '0.00', currencyCode: 'USD' },
+  totalCapturable: { amount: '0.00', currencyCode: 'USD' },
+  refundMethod: 'original_payment_methods',
+})
+assert.equal(
+  paidRefundPrepared.confirmationStatement,
+  'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL #6600 REFUND ORIGINAL_PAYMENT_METHODS RESTOCK YES NOTIFY YES',
+)
 
 // Warehouse history must not hide the current Shopify facts. A shipped order
 // remains ineligible, but the UI receives the real fulfillment reason instead
@@ -1985,7 +2054,7 @@ currentAuthorization = authorizationFixture({
 })
 await expectCode(commands.executeShopifyOrderManagementCommand(commandInput({
   confirmationStatement:
-    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600 REFUND NONE RESTOCK NO NOTIFY NO',
   mutation: {
     kind: 'cancel_order_after_fulfillment_reversal',
     predecessorAuthorizationGlobalId: 'gsom9999999',
@@ -2006,7 +2075,7 @@ adapterExecution = successfulExecution({
 })
 const postReversalResult = await commands.executeShopifyOrderManagementCommand(commandInput({
   confirmationStatement:
-    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600 REFUND NONE RESTOCK NO NOTIFY NO',
   mutation: {
     kind: 'cancel_order_after_fulfillment_reversal',
     predecessorAuthorizationGlobalId,
@@ -2034,7 +2103,7 @@ currentAuthorization = authorizationFixture({
 adapterExecution = successfulExecution({ action: 'cancel' })
 const cancelResult = await commands.executeShopifyOrderManagementCommand(commandInput({
   confirmationStatement:
-    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL #6600',
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL #6600 REFUND NONE RESTOCK NO NOTIFY NO',
   mutation: ordinaryCancelMutation,
 }))
 const cancelProviderCall = events.find(
@@ -2064,7 +2133,7 @@ currentAuthorization = authorizationFixture({
 })
 const missingPredecessorResult = await commands.executeShopifyOrderManagementCommand(commandInput({
   confirmationStatement:
-    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600',
+    'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL_ORDER_AFTER_FULFILLMENT_REVERSAL #6600 REFUND NONE RESTOCK NO NOTIFY NO',
   mutation: {
     kind: 'cancel_order_after_fulfillment_reversal',
     predecessorAuthorizationGlobalId,

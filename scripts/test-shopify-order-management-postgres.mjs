@@ -1673,10 +1673,13 @@ async function verify(databaseUrl) {
         ...snapshot(true, reversalEvidence.providerOrderUpdatedAt),
         action: postReversalCancelAction,
         cancellationPaymentEvidence: {
-          schema: 'shopify-order-cancel-payment-evidence-v1',
+          schema: 'shopify-order-cancel-payment-evidence-v2',
           transactionsCount: 0,
-          authorizationTransactionId: null,
-          authorizationAmount: null,
+          transactionsHash: '0'.repeat(64),
+          totalReceived: { amount: '0', currencyCode: 'USD' },
+          totalRefunded: { amount: '0', currencyCode: 'USD' },
+          totalCapturable: { amount: '0', currencyCode: 'USD' },
+          refundMethod: 'none',
         },
         reason: postReversalCancelReason,
         idempotencyKey: 'shopify-order-cancel-after-reversal-exact',
@@ -3396,6 +3399,114 @@ async function verify(databaseUrl) {
       totalCapturable: { amount: '0', currencyCode: 'USD' },
       refundMethod: 'original_payment_methods',
     }
+    const missingTransactionsHashEvidence = {
+      ...ordinaryCancelPaymentEvidence,
+    }
+    delete missingTransactionsHashEvidence.transactionsHash
+    const cancellationPaymentEvidenceValidation = await pool.query(
+      `SELECT
+         public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+           $1::jsonb,
+           $2::text
+         ) AS valid`,
+      [JSON.stringify(ordinaryCancelPaymentEvidence), 'original_payment_methods'],
+    )
+    assert.equal(
+      cancellationPaymentEvidenceValidation.rows[0].valid,
+      true,
+      'the exact complete v2 cancellation payment ledger must validate',
+    )
+    const malformedCancellationPaymentEvidence = [
+      ['sql null', null, 'original_payment_methods'],
+      ['JSON null', 'null', 'original_payment_methods'],
+      ['scalar', JSON.stringify('not-an-object'), 'original_payment_methods'],
+      ['array', '[]', 'original_payment_methods'],
+      ['missing key', JSON.stringify(
+        missingTransactionsHashEvidence,
+      ), 'original_payment_methods'],
+      ['extra key', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        unbound: true,
+      }), 'original_payment_methods'],
+      ['wrong schema', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        schema: 'shopify-order-cancel-payment-evidence-v1',
+      }), 'original_payment_methods'],
+      ['wrong count type', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        transactionsCount: '2',
+      }), 'original_payment_methods'],
+      ['non-integer count', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        transactionsCount: 2.5,
+      }), 'original_payment_methods'],
+      ['wrong hash type', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        transactionsHash: 6,
+      }), 'original_payment_methods'],
+      ['invalid hash', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        transactionsHash: 'A'.repeat(64),
+      }), 'original_payment_methods'],
+      ['refund evidence mismatch', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        refundMethod: 'none',
+      }), 'original_payment_methods'],
+      ['invalid refund argument', JSON.stringify(
+        ordinaryCancelPaymentEvidence,
+      ), 'provider_credit'],
+      ['money scalar', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: '125',
+      }), 'original_payment_methods'],
+      ['money missing key', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: { amount: '125' },
+      }), 'original_payment_methods'],
+      ['money extra key', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: {
+          ...ordinaryCancelPaymentEvidence.totalReceived,
+          precision: 2,
+        },
+      }), 'original_payment_methods'],
+      ['wrong money amount type', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: { amount: 125, currencyCode: 'USD' },
+      }), 'original_payment_methods'],
+      ['noncanonical money amount', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: { amount: '125.00', currencyCode: 'USD' },
+      }), 'original_payment_methods'],
+      ['wrong money currency type', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: { amount: '125', currencyCode: 840 },
+      }), 'original_payment_methods'],
+      ['invalid money currency', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalReceived: { amount: '125', currencyCode: 'usd' },
+      }), 'original_payment_methods'],
+      ['mismatched money currency', JSON.stringify({
+        ...ordinaryCancelPaymentEvidence,
+        totalRefunded: { amount: '0', currencyCode: 'CAD' },
+      }), 'original_payment_methods'],
+    ]
+    for (const [description, evidence, refundMethod] of
+      malformedCancellationPaymentEvidence) {
+      const invalidEvidence = await pool.query(
+        `SELECT
+           public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+             $1::jsonb,
+             $2::text
+           ) AS valid`,
+        [evidence, refundMethod],
+      )
+      assert.equal(
+        invalidEvidence.rows[0].valid,
+        false,
+        `${description} cancellation payment evidence must fail closed`,
+      )
+    }
     const ordinaryCancelReason =
       'Customer requested cancellation before any warehouse work began'
     const ordinaryCancelPreparation = {
@@ -3459,6 +3570,55 @@ async function verify(databaseUrl) {
       )),
       ordinaryCancelPaymentEvidence,
     )
+    const malformedAuthorizationInsert = await expectDatabaseRejected(
+      () => pool.query(
+        `INSERT INTO operations_shopify_order_management_authorizations
+         SELECT (
+           pg_catalog.jsonb_populate_record(
+             NULL::public.operations_shopify_order_management_authorizations,
+             pg_catalog.to_jsonb(authz) || pg_catalog.jsonb_build_object(
+               'cancellation_payment_evidence', '"scalar"'::jsonb
+             )
+           )
+         ).*
+         FROM operations_shopify_order_management_authorizations authz
+         WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+        [
+          independentFixture.organizationId,
+          ordinaryCancelPrepared.authorizationGlobalId,
+        ],
+      ),
+      /cancellation intent is incomplete or not permitted/i,
+      'authorization insert trigger must reject malformed payment evidence',
+    )
+    assert.equal(malformedAuthorizationInsert.code, 'P0001')
+
+    const authorizationConstraintClient = await pool.connect()
+    try {
+      await authorizationConstraintClient.query('BEGIN')
+      await authorizationConstraintClient.query(
+        `ALTER TABLE operations_shopify_order_management_authorizations
+         DISABLE TRIGGER protect_shopify_order_management_authorization_write`,
+      )
+      const malformedAuthorizationUpdate = await expectDatabaseRejected(
+        () => authorizationConstraintClient.query(
+          `UPDATE operations_shopify_order_management_authorizations
+           SET cancellation_payment_evidence = '"scalar"'::jsonb
+           WHERE organization_id = $1::uuid AND global_id = $2`,
+          [
+            independentFixture.organizationId,
+            ordinaryCancelPrepared.authorizationGlobalId,
+          ],
+        ),
+        /ops_shopify_order_mgmt_cancel_choices_valid/i,
+        'authorization CHECK must reject malformed payment evidence',
+      )
+      assert.equal(malformedAuthorizationUpdate.code, '23514')
+      await authorizationConstraintClient.query('ROLLBACK')
+    } finally {
+      await authorizationConstraintClient.query('ROLLBACK').catch(() => {})
+      authorizationConstraintClient.release()
+    }
     await expectRejected(
       () => persistence.claimShopifyOrderManagementInPostgres({
         organizationId: independentFixture.organizationId,
@@ -3480,6 +3640,57 @@ async function verify(databaseUrl) {
         action: ordinaryCancelAction,
         reason: ordinaryCancelReason,
       })
+    const malformedAttemptInsert = await expectDatabaseRejected(
+      () => pool.query(
+        `INSERT INTO operations_shopify_order_management_attempts
+         SELECT (
+           pg_catalog.jsonb_populate_record(
+             NULL::public.operations_shopify_order_management_attempts,
+             pg_catalog.to_jsonb(attempt) || pg_catalog.jsonb_build_object(
+               'cancellation_payment_evidence', '{}'::jsonb
+             )
+           )
+         ).*
+         FROM operations_shopify_order_management_attempts attempt
+         WHERE attempt.organization_id = $1::uuid AND attempt.global_id = $2`,
+        [
+          independentFixture.organizationId,
+          ordinaryCancelClaimed.providerAttemptGlobalId,
+        ],
+      ),
+      /cancellation attempt does not match its durable intent/i,
+      'attempt insert trigger must reject incomplete payment evidence',
+    )
+    assert.equal(malformedAttemptInsert.code, 'P0001')
+
+    const attemptConstraintClient = await pool.connect()
+    try {
+      await attemptConstraintClient.query('BEGIN')
+      await attemptConstraintClient.query(
+        `ALTER TABLE operations_shopify_order_management_attempts
+         DISABLE TRIGGER protect_shopify_order_management_attempt_write`,
+      )
+      const malformedAttemptUpdate = await expectDatabaseRejected(
+        () => attemptConstraintClient.query(
+          `UPDATE operations_shopify_order_management_attempts
+           SET cancellation_payment_evidence =
+                 cancellation_payment_evidence
+                 || '{"refundMethod":"none"}'::jsonb
+           WHERE organization_id = $1::uuid AND global_id = $2`,
+          [
+            independentFixture.organizationId,
+            ordinaryCancelClaimed.providerAttemptGlobalId,
+          ],
+        ),
+        /ops_shopify_order_mgmt_attempt_cancel_choices_valid/i,
+        'attempt CHECK must reject payment evidence/refund choice mismatch',
+      )
+      assert.equal(malformedAttemptUpdate.code, '23514')
+      await attemptConstraintClient.query('ROLLBACK')
+    } finally {
+      await attemptConstraintClient.query('ROLLBACK').catch(() => {})
+      attemptConstraintClient.release()
+    }
     await persistence.recordShopifyOrderManagementOutcomeInPostgres({
       organizationId: independentFixture.organizationId,
       actorEmail: independentFixture.qualifiedAdminEmail,
