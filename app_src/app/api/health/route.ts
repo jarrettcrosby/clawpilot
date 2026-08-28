@@ -3098,7 +3098,7 @@ export async function GET() {
       errors.push(error instanceof Error ? error.message : 'Short-link configuration is invalid.')
     }
     if (process.env.CAREER_SITE_AGENTS_ENABLED !== '1') {
-      errors.push('Career Desk agents must be enabled in this hosted runtime.')
+      warnings.push('Career Desk agents are not enabled in this runtime.')
     } else {
       try {
         const configuration = resolveCareerSiteAgentConfiguration()
