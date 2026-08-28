@@ -35,6 +35,10 @@ const orderEditingReleaseMigrations = new Map([
     'db/migrations/0325_operations_shopify_fulfillment_reversal.sql',
     'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab',
   ],
+  [
+    'db/migrations/0337_operations_shopify_ordinary_order_cancellation.sql',
+    'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87',
+  ],
 ])
 
 const shopifyReversalFixtureMigration = [
