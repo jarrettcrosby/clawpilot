@@ -7,6 +7,7 @@ const source = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineProvisio
 const projectionSource = readFileSync(resolve(process.cwd(), 'app_src/lib/crm/workbookProjection.ts'), 'utf8')
 const legacySource = readFileSync(resolve(process.cwd(), 'app_src/lib/pipelineLegacyWorkbook.ts'), 'utf8')
 const rebuildRoute = readFileSync(resolve(process.cwd(), 'app_src/app/api/crm/workbook/rebuild/route.ts'), 'utf8')
+const pipelineDocs = readFileSync(resolve(process.cwd(), 'docs/modules/pipeline-and-sync.md'), 'utf8')
 
 for (const tutorialText of [
   'Only the Opportunities tab is operator-editable.',
@@ -20,6 +21,8 @@ for (const tutorialText of [
   assert.ok(source.includes(tutorialText), `Start Here tutorial missing: ${tutorialText}`)
 }
 assert.doesNotMatch(source, /Start Here[\s\S]{0,1800}(?:Eigen Racing)/i)
+assert.match(source, /Enter a percentage from 0 to 100 with up to two decimal places\./)
+assert.doesNotMatch(source, /Enter a whole percent/)
 assert.match(source, /title === 'Start Here' \? 'C' : 'B'/)
 assert.match(source, /'Start Here': \[64, 190, 720\]/)
 
@@ -109,7 +112,7 @@ assert.match(chartRequestBlock, /widthPixels: 440/)
 assert.match(chartRequestBlock, /heightPixels: 250/)
 for (const chartContract of [
   { title: 'Opportunities by stage', start: 3, end: 13, row: 9, column: 1, type: 'BAR', helper: 'DASHBOARD_STAGE_HELPER_COLUMN_INDEX' },
-  { title: 'Interactions, last quarter', start: 3, end: 7, row: 9, column: 7, type: 'COLUMN', helper: 'DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX' },
+  { title: 'Interactions, last 3 calendar months', start: 3, end: 7, row: 9, column: 7, type: 'COLUMN', helper: 'DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX' },
   { title: 'Potential Revenue by Stage, Next 2 Quarters', start: 3, end: 10, row: 24, column: 1, type: 'COLUMN', helper: 'DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX' },
   { title: 'Potential vs probable value', start: 3, end: 10, row: 24, column: 7, type: 'COLUMN', helper: 'DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX' },
 ]) {
@@ -123,7 +126,8 @@ for (const chartContract of [
   assert.ok(chartDefinition.includes(`chartType: '${chartContract.type}'`))
   assert.ok(chartDefinition.includes(`domainColumnIndex: ${chartContract.helper}`))
 }
-assert.match(chartRequestBlock, /title: 'Interactions, last quarter'/)
+assert.match(chartRequestBlock, /title: 'Interactions, last 3 calendar months'/)
+assert.doesNotMatch(chartRequestBlock, /Interactions, last quarter/)
 assert.match(chartRequestBlock, /stackedType: 'NOT_STACKED'/)
 assert.match(chartRequestBlock, /title: 'Opportunities by stage'[\s\S]*legendPosition: 'TOP_LEGEND'/)
 assert.match(chartRequestBlock, /seriesColors: opportunityStageColors/)
@@ -136,31 +140,99 @@ const dashboardWrites = source.slice(
   source.indexOf('function dashboardValueWrites'),
   source.indexOf('function googleBorder'),
 )
-assert.match(dashboardWrites, /const interactionTypes = \['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign'\]/)
+for (const label of ['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign', 'Other']) {
+  assert.match(dashboardWrites, new RegExp(`label: '${label}'`))
+}
 assert.match(dashboardWrites, /const opportunityStages = OPPORTUNITY_STAGE_PALETTE\.map/)
 assert.match(dashboardWrites, /\['Stage', \.\.\.opportunityStages\]/)
 assert.match(dashboardWrites, /=IF\(\$S\$\{5 \+ rowIndex\}=\$\{seriesColumn\}\$4,COUNTIFS/)
 assert.match(source, /Interactions: \['Priority', 'Type', 'Owner', 'Organization', 'Agent', 'Date', 'Opportunity', 'Contact', 'Notes'\]/)
 assert.match(dashboardWrites, /Interactions!\$C\$5:\$C/)
 assert.match(dashboardWrites, /Interactions!\$G\$5:\$G/)
+assert.match(
+  dashboardWrites,
+  /const normalizedInteractionTypeRange = 'ARRAYFORMULA\(LOWER\(REGEXREPLACE\(TRIM\(Interactions!\$C\$5:\$C\),"\[\\\\s_-\]\+"," "\)\)\)'/,
+)
+assert.match(dashboardWrites, /\{ label: 'Direct Mail', aliases: \['direct mail', 'directmail'\] \}/)
+assert.match(dashboardWrites, /\{ label: 'Call', aliases: \['call', 'calls', 'phone', 'phone call'\] \}/)
+assert.match(dashboardWrites, /=SUMPRODUCT\(--ARRAYFORMULA\(REGEXMATCH\(\$\{normalizedInteractionTypeRange\},\$\{aliasPattern\}\)\)/)
+assert.match(dashboardWrites, /const aliasPattern = `"\^\(\$\{type\.aliases\.join\('\|'\)\}\)\$"`/)
+assert.doesNotMatch(
+  dashboardWrites,
+  /COUNTIFS\(Interactions!\$C\$5:\$C/,
+  'interaction buckets must not compare unnormalized Sheet type values directly',
+)
+const normalizeInteractionVariant = (value) => value.trim().toLowerCase().replace(/[\s_-]+/g, ' ')
+assert.equal(normalizeInteractionVariant('  Direct_Mail  '), 'direct mail')
+assert.equal(normalizeInteractionVariant('phone-call'), 'phone call')
+assert.match(projectionSource, /replace\(\/\[\\s_-\]\+\/g, ' '\)/)
+assert.match(projectionSource, /\['direct mail', 'directmail'\]\.includes\(normalized\)\) return 'Direct Mail'/)
+assert.match(projectionSource, /\['call', 'calls', 'phone', 'phone call'\]\.includes\(normalized\)\) return 'Call'/)
+assert.match(dashboardWrites, /const interactionTrackerRows = \[-2, -1, 0\]/)
+assert.ok(
+  dashboardWrites.includes('Interactions!$G$5:$G,"<"&($${interactionMonthColumn}${sheetRow}+1)'),
+  'interaction month range must include final-day datetimes with an exclusive next-day bound',
+)
+assert.doesNotMatch(
+  dashboardWrites,
+  /Interactions!\$G\$5:\$G,"<="&\$\$\{interactionMonthColumn\}/,
+  'interaction month range must not stop at midnight on the final day',
+)
 assert.match(dashboardWrites, /const forecastStages = \['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead'\]/)
 assert.match(dashboardWrites, /forecastStageRows/)
 assert.match(dashboardWrites, /=SUMIFS\(Opportunities!\$J\$5:\$J/)
 assert.match(dashboardWrites, /Potential|forecastValueRows/)
+assert.match(dashboardWrites, /\{ label: 'Other', aliases: \[\] \}/)
+assert.match(dashboardWrites, /COUNTIFS\(\$\{monthCriteria\}\)-SUM/)
+assert.match(dashboardWrites, /interactionTypes\.map\(\(type\) => type\.label\)/)
 for (const cell of ['B5', 'B6', 'H5', 'H6', 'B8', 'D8', 'F8', 'I8', 'K8', 'B9', 'B24', 'B40']) {
   assert.ok(dashboardWrites.includes(`'Dashboard'!${cell}`), `Dashboard write missing ${cell}`)
 }
+assert.ok(
+  dashboardWrites.includes(`{ range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['WEIGHTED PIPELINE VALUE']] }`),
+  'Dashboard H5 must identify the weighted pipeline metric',
+)
+assert.ok(
+  dashboardWrites.includes(`{ range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C10']] }`),
+  'Dashboard H6 must bind to the weighted active value calculation',
+)
+assert.doesNotMatch(dashboardWrites, /values: \[\['POTENTIAL VALUE'\]\]/)
+for (const card of [
+  { cell: 'B8', label: 'CONTACTS · CURRENT', binding: 'Calculations!C16', format: '#,##0' },
+  { cell: 'D8', label: 'INTERACTIONS · ALL-TIME', binding: 'Calculations!C17', format: '#,##0' },
+  { cell: 'F8', label: 'OPPS · CURRENT TOTAL', binding: 'Calculations!C5', format: '#,##0' },
+  { cell: 'I8', label: 'WON OPPS · LIFETIME', binding: 'Calculations!C11', format: '#,##0' },
+  { cell: 'K8', label: 'WIN RATE · LIFETIME', binding: 'Calculations!C14', format: '0.0%' },
+]) {
+  const expected = `{ range: "'Dashboard'!${card.cell}", majorDimension: 'ROWS' as const, values: [['="${card.label}  "&TEXT(${card.binding},"${card.format}")']] }`
+  assert.ok(dashboardWrites.includes(expected), `${card.cell} must identify its calculation scope and exact binding`)
+}
+assert.match(dashboardWrites, /Grouped interactions use CRM activity type and UTC calendar months/)
+
+const dashboardFormatting = source.slice(
+  source.indexOf('function dashboardLayoutRequests'),
+  source.indexOf('export async function configurePipelineTabsWithRequest'),
+)
+assert.match(
+  dashboardFormatting,
+  /startColumnIndex: 1, endColumnIndex: 2, type: 'CURRENCY', pattern: '\$#,##0\.00'/,
+)
+assert.match(
+  dashboardFormatting,
+  /startColumnIndex: 7, endColumnIndex: 8, type: 'CURRENCY', pattern: '\$#,##0\.00'/,
+)
 assert.match(source, /const DASHBOARD_MATERIAL =/)
 assert.match(source, /fontFamily: 'Roboto Mono'/)
-for (const range of ['S4', 'AC4', 'AK4', 'AS4']) {
+for (const range of ['S4', 'AC4', 'AL4', 'AT4']) {
   assert.ok(dashboardWrites.includes(`'Dashboard'!${range}`), `Dashboard helper write missing ${range}`)
 }
 assert.match(source, /const DASHBOARD_HELPER_COLUMN_INDEX = 15/)
 assert.match(source, /const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18/)
 assert.match(source, /const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 28/)
-assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 36/)
-assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 44/)
-assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 47/)
+assert.match(source, /const interactionSeriesColors = \[[^\]]*'#78909C'\]/)
+assert.match(source, /const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 37/)
+assert.match(source, /const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 45/)
+assert.match(source, /const DASHBOARD_HELPER_END_COLUMN_INDEX = 48/)
 assert.match(source, /properties: \{ hiddenByUser: true \}/)
 assert.match(source, /hideGridlines: true/)
 assert.match(source, /tabColor: googleColor\(WORKBOOK_TAB_COLORS\[title\]\)/)
@@ -171,7 +243,10 @@ assert.match(source, /function opportunityStageConditionalFormatting/)
 assert.match(source, /columnIndex: 6/)
 assert.match(source, /\.\.\.opportunityStageConditionalFormatting\(sheetIdValue, rowCount\)/)
 
-assert.match(source, /pattern: '0\.0"%"'/)
+assert.match(source, /pattern: '0\.00"%"'/)
+assert.doesNotMatch(source, /pattern: '0\.0"%"'/)
+assert.match(projectionSource, /record\.stage, record\.lossReason, record\.source, record\.value, record\.probability,/)
+assert.match(pipelineDocs, /Probability is stored as a number from 0 through 100 with up to two decimal places/)
 assert.match(source, /numeric\(10, 'NUMBER_BETWEEN', \['0', '100'\]\)/)
 for (const contract of [
   "dropdown(1, 'E')",
@@ -220,6 +295,12 @@ assert.match(legacySource, /applyPipelineWorkbookBrandingWithRequest\(matonSheet
 assert.match(projectionSource, /function workbookInteractionType/)
 assert.match(projectionSource, /googleSheetsDateTime\(record\.occurredAt\)/)
 assert.match(projectionSource, /timestamp \/ 86_400_000\) \+ 25_569/)
+assert.match(source, /const PIPELINE_WORKBOOK_TIME_ZONE = 'Etc\/UTC'/)
+assert.match(source, /fields=spreadsheetId,properties\(timeZone\),sheets/)
+assert.match(configureBlock, /metadata\.properties\?\.timeZone !== PIPELINE_WORKBOOK_TIME_ZONE/)
+assert.match(configureBlock, /updateSpreadsheetProperties:[\s\S]{0,180}properties: \{ timeZone: PIPELINE_WORKBOOK_TIME_ZONE \}[\s\S]{0,80}fields: 'timeZone'/)
+assert.match(projectionSource, /configurePipelineTabs pins managed workbooks to Etc\/UTC/)
+assert.match(pipelineDocs, /Managed workbooks are pinned to `Etc\/UTC`/)
 assert.match(source, /export async function rebuildPipelineGoogleWorkbook/)
 assert.match(source, /pipeline-sheet-retired/)
 assert.match(source, /export async function rebuildPipelineTabsWithRequest/)

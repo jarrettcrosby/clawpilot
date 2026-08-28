@@ -46,6 +46,7 @@ import {
   readProductChannelStatesInPostgres,
 } from '@/lib/persistence/productChannelStates'
 import { splitPipelineProductNames } from '@/lib/pipeline/productNames.mjs'
+import { normalizePipelineReportingSnapshot } from '@/lib/pipeline/reportingSnapshot.mjs'
 import { query, withTransaction } from '@/lib/persistence/postgres'
 import { appPublicUrl } from '@/lib/publicUrl'
 import { shortLinkUrl } from '@/lib/shortlinks'
@@ -4895,6 +4896,517 @@ export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promis
     displayName: clean(row.display_name) || row.email,
     suiteCrmMapped: Boolean(row.suitecrm_user_id),
   }))
+}
+
+export type CrmPipelineInteractionMonth = {
+  month: string
+  label: string
+  total: number
+  types: {
+    directMail: number
+    linkedIn: number
+    email: number
+    call: number
+    inPerson: number
+    note: number
+    campaign: number
+    other: number
+  }
+}
+
+export type CrmPipelineActivityReport = {
+  contactsAdded: number
+  interactions: number
+  opportunitiesCreated: number
+  interactionsByMonth: CrmPipelineInteractionMonth[]
+  snapshot: CrmPipelineReportingSnapshot
+}
+
+export type CrmPipelineReportingSnapshot = {
+  totalContacts: number
+  totalOpportunities: number
+  activeOpportunities: number
+  openOpportunities: number
+  onHoldOpportunities: number
+  highPriorityActiveOpportunities: number
+  wonOpportunities: number
+  lostOpportunities: number
+  activePipelineValue: number
+  weightedPipelineValue: number
+  lifetimeWinRate: number
+  opportunitiesByStage: Array<{ stage: string; count: number }>
+  activeByStage: Array<{ label: string; count: number; value: number; weighted: number }>
+  activeByCloseQuarter: Array<{ label: string; count: number; value: number; weighted: number }>
+  attention: {
+    total: number
+    lifecycleConflicts: number
+    overdue: number
+    missingCloseDate: number
+    invalidProbability: number
+  }
+  forecast: {
+    months: Array<{
+      month: string
+      potential: number
+      weighted: number
+      stages: Array<{ stage: string; value: number }>
+    }>
+    outsideOrUnscheduledPotential: number
+    outsideOrUnscheduledWeighted: number
+  }
+}
+
+function crmPipelineReportingMonthLabel(value: string): string {
+  const match = /^(\d{4})-(\d{2})$/.exec(value)
+  if (!match) return value
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1, 12))
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(date)
+}
+
+/**
+ * Read period activity for one pipeline inside its owning workspace organization.
+ * All persisted timestamps use an inclusive start and exclusive end boundary.
+ */
+export async function readCrmPipelineActivityReportFromPostgres(input: {
+  pipelineId: string
+  organizationId: string
+  startAt: string
+  endAtExclusive: string
+  timeZone: string
+  snapshotDate: string
+}): Promise<CrmPipelineActivityReport> {
+  type ReportRow = {
+    contacts_added: string
+    interactions: string
+    opportunities_created: string
+    month: string
+    total: string
+    direct_mail: string
+    linked_in: string
+    email: string
+    call: string
+    in_person: string
+    note: string
+    campaign: string
+    other: string
+    total_contacts: string
+    total_opportunities: string
+    active_opportunities: string
+    open_opportunities: string
+    on_hold_opportunities: string
+    high_priority_active_opportunities: string
+    won_opportunities: string
+    lost_opportunities: string
+    active_pipeline_value: string
+    weighted_pipeline_value: string
+    opportunity_stage_counts: string
+    active_by_stage: string
+    active_by_close_quarter: string
+    attention_total: string
+    attention_lifecycle_conflicts: string
+    attention_overdue: string
+    attention_missing_close_date: string
+    attention_invalid_probability: string
+    forecast_months: string
+    outside_or_unscheduled_potential: string
+    outside_or_unscheduled_weighted: string
+  }
+
+  const result = await query<ReportRow>(
+    `WITH scope AS (
+       SELECT pipeline.id
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.id = $1::uuid
+         AND pipeline.workspace_organization_id = $2::uuid
+     ),
+     bounds AS (
+       SELECT
+         $3::timestamptz AS start_at,
+         $4::timestamptz AS end_at,
+         $5::text AS time_zone,
+         $6::date AS snapshot_date
+     ),
+     forecast_bounds AS (
+       SELECT bounds.snapshot_date, date_trunc('month', bounds.snapshot_date)::date AS start_month
+       FROM bounds
+     ),
+     forecast_months AS (
+       SELECT generate_series(
+         forecast_bounds.start_month,
+         forecast_bounds.start_month + interval '5 months',
+         interval '1 month'
+       )::date AS month_start
+       FROM forecast_bounds
+     ),
+     all_opportunity_snapshot AS (
+       SELECT
+         opportunity.expected_close,
+         initcap(lower(COALESCE(NULLIF(btrim(opportunity.stage), ''), 'Unstaged'))) AS stage,
+         lower(btrim(COALESCE(opportunity.stage, ''))) AS stage_key,
+         lower(btrim(COALESCE(opportunity.status, ''))) AS status_key,
+         upper(btrim(COALESCE(opportunity.priority, ''))) AS priority_key,
+         COALESCE(opportunity.amount, 0) AS amount,
+         COALESCE(opportunity.probability, 0) AS probability,
+         opportunity.probability AS raw_probability
+       FROM crm_opportunities opportunity
+       JOIN scope ON scope.id = opportunity.pipeline_id
+     ),
+     active_opportunity_snapshot AS (
+       SELECT *
+       FROM all_opportunity_snapshot
+       WHERE status_key NOT IN ('won', 'lost', 'closed', 'abandoned')
+     ),
+     forecast_month_totals AS (
+       SELECT
+         date_trunc('month', opportunity.expected_close)::date AS month_start,
+         sum(opportunity.amount) AS potential,
+         sum(opportunity.amount * opportunity.probability / 100) AS weighted
+       FROM active_opportunity_snapshot opportunity
+       CROSS JOIN forecast_bounds
+       WHERE opportunity.expected_close >= forecast_bounds.start_month
+         AND opportunity.expected_close < forecast_bounds.start_month + interval '6 months'
+       GROUP BY date_trunc('month', opportunity.expected_close)::date
+     ),
+     forecast_stage_totals AS (
+       SELECT
+         date_trunc('month', opportunity.expected_close)::date AS month_start,
+         min(opportunity.stage) AS stage,
+         sum(opportunity.amount) AS value
+       FROM active_opportunity_snapshot opportunity
+       CROSS JOIN forecast_bounds
+       WHERE opportunity.expected_close >= forecast_bounds.start_month
+         AND opportunity.expected_close < forecast_bounds.start_month + interval '6 months'
+       GROUP BY date_trunc('month', opportunity.expected_close)::date, opportunity.stage_key
+     ),
+     active_stage_summary AS (
+       SELECT
+         min(opportunity.stage) AS label,
+         count(*)::integer AS count,
+         sum(opportunity.amount) AS value,
+         sum(opportunity.amount * opportunity.probability / 100) AS weighted
+       FROM active_opportunity_snapshot opportunity
+       GROUP BY opportunity.stage_key
+     ),
+     active_close_quarter_summary AS (
+       SELECT
+         CASE
+           WHEN opportunity.expected_close IS NULL THEN 'No close date'
+           ELSE 'Q' || extract(quarter FROM opportunity.expected_close)::integer::text
+             || ' ' || extract(year FROM opportunity.expected_close)::integer::text
+         END AS label,
+         count(*)::integer AS count,
+         sum(opportunity.amount) AS value,
+         sum(opportunity.amount * opportunity.probability / 100) AS weighted,
+         min(opportunity.expected_close) AS sort_date
+       FROM active_opportunity_snapshot opportunity
+       GROUP BY CASE
+         WHEN opportunity.expected_close IS NULL THEN 'No close date'
+         ELSE 'Q' || extract(quarter FROM opportunity.expected_close)::integer::text
+           || ' ' || extract(year FROM opportunity.expected_close)::integer::text
+       END
+     ),
+     attention_flags AS (
+       SELECT
+         (opportunity.status_key NOT IN ('won', 'lost', 'closed', 'abandoned'))
+           <> (opportunity.stage_key NOT IN ('closed', 'closed delayed', 'won', 'loss')) AS lifecycle_conflict,
+         opportunity.status_key NOT IN ('won', 'lost', 'closed', 'abandoned')
+           AND opportunity.expected_close < forecast_bounds.snapshot_date AS overdue,
+         opportunity.status_key NOT IN ('won', 'lost', 'closed', 'abandoned')
+           AND opportunity.expected_close IS NULL AS missing_close_date,
+         opportunity.raw_probability IS NULL
+           OR opportunity.raw_probability < 0
+           OR opportunity.raw_probability > 100 AS invalid_probability
+       FROM all_opportunity_snapshot opportunity
+       CROSS JOIN forecast_bounds
+     ),
+     attention_summary AS (
+       SELECT
+         count(*) FILTER (
+           WHERE lifecycle_conflict OR overdue OR missing_close_date OR invalid_probability
+         )::integer AS total,
+         count(*) FILTER (WHERE lifecycle_conflict)::integer AS lifecycle_conflicts,
+         count(*) FILTER (WHERE overdue)::integer AS overdue,
+         count(*) FILTER (WHERE missing_close_date)::integer AS missing_close_date,
+         count(*) FILTER (WHERE invalid_probability)::integer AS invalid_probability
+       FROM attention_flags
+     ),
+     forecast_summary AS (
+       SELECT
+         (SELECT COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'month', to_char(month.month_start, 'YYYY-MM'),
+                'potential', COALESCE(total.potential, 0),
+                'weighted', COALESCE(total.weighted, 0),
+                'stages', COALESCE((
+                  SELECT jsonb_agg(
+                    jsonb_build_object('stage', stage.stage, 'value', stage.value)
+                    ORDER BY stage.stage
+                  )
+                  FROM forecast_stage_totals stage
+                  WHERE stage.month_start = month.month_start
+                ), '[]'::jsonb)
+              )
+              ORDER BY month.month_start
+            ),
+            '[]'::jsonb
+          )
+          FROM forecast_months month
+          LEFT JOIN forecast_month_totals total ON total.month_start = month.month_start) AS months,
+         COALESCE(sum(opportunity.amount) FILTER (
+           WHERE opportunity.expected_close IS NULL
+              OR opportunity.expected_close < forecast_bounds.start_month
+              OR opportunity.expected_close >= forecast_bounds.start_month + interval '6 months'
+         ), 0) AS outside_or_unscheduled_potential,
+         COALESCE(sum(opportunity.amount * opportunity.probability / 100) FILTER (
+           WHERE opportunity.expected_close IS NULL
+              OR opportunity.expected_close < forecast_bounds.start_month
+              OR opportunity.expected_close >= forecast_bounds.start_month + interval '6 months'
+         ), 0) AS outside_or_unscheduled_weighted
+       FROM forecast_bounds
+       LEFT JOIN active_opportunity_snapshot opportunity ON true
+       GROUP BY forecast_bounds.start_month
+     ),
+     normalized_interactions AS (
+       SELECT
+         date_trunc(
+           'month',
+           COALESCE(interaction.occurred_at, interaction.created_at) AT TIME ZONE bounds.time_zone
+         )::date AS month_start,
+         lower(regexp_replace(
+           btrim(COALESCE(interaction.interaction_type, '')),
+           '[[:space:]_-]+',
+           ' ',
+           'g'
+         )) AS interaction_type
+       FROM crm_interactions interaction
+       JOIN scope ON scope.id = interaction.pipeline_id
+       CROSS JOIN bounds
+       WHERE COALESCE(interaction.occurred_at, interaction.created_at) >= bounds.start_at
+         AND COALESCE(interaction.occurred_at, interaction.created_at) < bounds.end_at
+         AND ${activeCrmRecordSql('interaction')}
+     ),
+     categorized_interactions AS (
+       SELECT
+         month_start,
+         CASE
+           WHEN interaction_type IN ('direct mail', 'directmail') THEN 'direct_mail'
+           WHEN interaction_type IN ('linkedin', 'linked in') THEN 'linked_in'
+           WHEN interaction_type IN ('email', 'emails', 'e mail') THEN 'email'
+           WHEN interaction_type IN ('call', 'calls', 'phone', 'phone call') THEN 'call'
+           WHEN interaction_type IN ('in person', 'meeting', 'meetings') THEN 'in_person'
+           WHEN interaction_type IN ('note', 'notes') THEN 'note'
+           WHEN interaction_type IN ('campaign', 'campaigns') THEN 'campaign'
+           ELSE 'other'
+         END AS interaction_bucket
+       FROM normalized_interactions
+     ),
+     months AS (
+       SELECT generate_series(
+         date_trunc('month', bounds.start_at AT TIME ZONE bounds.time_zone),
+         date_trunc('month', (bounds.end_at - interval '1 microsecond') AT TIME ZONE bounds.time_zone),
+         interval '1 month'
+       )::date AS month_start
+       FROM bounds
+     ),
+     summary AS (
+       SELECT
+         (SELECT count(*)
+          FROM crm_contacts contact
+          JOIN scope ON scope.id = contact.pipeline_id
+          CROSS JOIN bounds
+          WHERE contact.created_at >= bounds.start_at
+            AND contact.created_at < bounds.end_at)::text AS contacts_added,
+         (SELECT count(*) FROM categorized_interactions)::text AS interactions,
+         (SELECT count(*)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id
+          CROSS JOIN bounds
+          WHERE opportunity.created_at >= bounds.start_at
+            AND opportunity.created_at < bounds.end_at)::text AS opportunities_created,
+         (SELECT count(*)
+          FROM crm_contacts contact
+          JOIN scope ON scope.id = contact.pipeline_id)::text AS total_contacts,
+         (SELECT count(*)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id)::text AS total_opportunities,
+         (SELECT count(*)
+         FROM crm_opportunities opportunity
+         JOIN scope ON scope.id = opportunity.pipeline_id
+         WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS active_opportunities,
+         (SELECT count(*) FROM active_opportunity_snapshot WHERE status_key = 'open')::text AS open_opportunities,
+         (SELECT count(*) FROM active_opportunity_snapshot WHERE status_key = 'on hold')::text AS on_hold_opportunities,
+         (SELECT count(*) FROM active_opportunity_snapshot WHERE priority_key IN ('A+', 'A'))::text AS high_priority_active_opportunities,
+         (SELECT count(*)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id
+          WHERE lower(btrim(COALESCE(opportunity.status, ''))) IN ('won', 'closed'))::text AS won_opportunities,
+         (SELECT count(*)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id
+          WHERE lower(btrim(COALESCE(opportunity.status, ''))) IN ('lost', 'abandoned'))::text AS lost_opportunities,
+         (SELECT COALESCE(sum(opportunity.amount), 0)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id
+          WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS active_pipeline_value,
+         (SELECT COALESCE(sum(opportunity.amount * opportunity.probability / 100), 0)
+          FROM crm_opportunities opportunity
+          JOIN scope ON scope.id = opportunity.pipeline_id
+          WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
+         (SELECT COALESCE(
+            jsonb_agg(
+              jsonb_build_object('stage', stage_counts.stage, 'count', stage_counts.count)
+              ORDER BY stage_counts.stage
+            ),
+            '[]'::jsonb
+          )::text
+          FROM (
+            SELECT
+              initcap(lower(COALESCE(NULLIF(btrim(opportunity.stage), ''), 'Unstaged'))) AS stage,
+              count(*)::integer AS count
+            FROM crm_opportunities opportunity
+            JOIN scope ON scope.id = opportunity.pipeline_id
+            GROUP BY lower(COALESCE(NULLIF(btrim(opportunity.stage), ''), 'Unstaged'))
+          ) stage_counts) AS opportunity_stage_counts,
+         (SELECT COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'label', stage.label,
+                'count', stage.count,
+                'value', stage.value,
+                'weighted', stage.weighted
+              ) ORDER BY stage.label
+            ), '[]'::jsonb
+          )::text FROM active_stage_summary stage) AS active_by_stage,
+         (SELECT COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'label', quarter.label,
+                'count', quarter.count,
+                'value', quarter.value,
+                'weighted', quarter.weighted
+              ) ORDER BY quarter.sort_date NULLS LAST
+            ), '[]'::jsonb
+          )::text FROM active_close_quarter_summary quarter) AS active_by_close_quarter,
+         attention_summary.total::text AS attention_total,
+         attention_summary.lifecycle_conflicts::text AS attention_lifecycle_conflicts,
+         attention_summary.overdue::text AS attention_overdue,
+         attention_summary.missing_close_date::text AS attention_missing_close_date,
+         attention_summary.invalid_probability::text AS attention_invalid_probability,
+         forecast_summary.months::text AS forecast_months,
+         forecast_summary.outside_or_unscheduled_potential::text AS outside_or_unscheduled_potential,
+         forecast_summary.outside_or_unscheduled_weighted::text AS outside_or_unscheduled_weighted
+       FROM forecast_summary
+       CROSS JOIN attention_summary
+     ),
+     interaction_months AS (
+       SELECT
+         month_start,
+         count(*) AS total,
+         count(*) FILTER (WHERE interaction_bucket = 'direct_mail') AS direct_mail,
+         count(*) FILTER (WHERE interaction_bucket = 'linked_in') AS linked_in,
+         count(*) FILTER (WHERE interaction_bucket = 'email') AS email,
+         count(*) FILTER (WHERE interaction_bucket = 'call') AS call,
+         count(*) FILTER (WHERE interaction_bucket = 'in_person') AS in_person,
+         count(*) FILTER (WHERE interaction_bucket = 'note') AS note,
+         count(*) FILTER (WHERE interaction_bucket = 'campaign') AS campaign,
+         count(*) FILTER (WHERE interaction_bucket = 'other') AS other
+       FROM categorized_interactions
+       GROUP BY month_start
+     )
+     SELECT
+       summary.contacts_added,
+       summary.interactions,
+       summary.opportunities_created,
+       summary.total_contacts,
+       summary.total_opportunities,
+       summary.active_opportunities,
+       summary.open_opportunities,
+       summary.on_hold_opportunities,
+       summary.high_priority_active_opportunities,
+       summary.won_opportunities,
+       summary.lost_opportunities,
+       summary.active_pipeline_value,
+       summary.weighted_pipeline_value,
+       summary.opportunity_stage_counts,
+       summary.active_by_stage,
+       summary.active_by_close_quarter,
+       summary.attention_total,
+       summary.attention_lifecycle_conflicts,
+       summary.attention_overdue,
+       summary.attention_missing_close_date,
+       summary.attention_invalid_probability,
+       summary.forecast_months,
+       summary.outside_or_unscheduled_potential,
+       summary.outside_or_unscheduled_weighted,
+       to_char(months.month_start, 'YYYY-MM') AS month,
+       COALESCE(interaction_months.total, 0)::text AS total,
+       COALESCE(interaction_months.direct_mail, 0)::text AS direct_mail,
+       COALESCE(interaction_months.linked_in, 0)::text AS linked_in,
+       COALESCE(interaction_months.email, 0)::text AS email,
+       COALESCE(interaction_months.call, 0)::text AS call,
+       COALESCE(interaction_months.in_person, 0)::text AS in_person,
+       COALESCE(interaction_months.note, 0)::text AS note,
+       COALESCE(interaction_months.campaign, 0)::text AS campaign,
+       COALESCE(interaction_months.other, 0)::text AS other
+     FROM scope
+     CROSS JOIN summary
+     CROSS JOIN months
+     LEFT JOIN interaction_months ON interaction_months.month_start = months.month_start
+     ORDER BY months.month_start`,
+    [input.pipelineId, input.organizationId, input.startAt, input.endAtExclusive, input.timeZone, input.snapshotDate],
+  )
+
+  if (!result.rows.length) throw new Error('Pipeline reporting scope was not found')
+  const first = result.rows[0]
+  const snapshot = normalizePipelineReportingSnapshot({
+    totalContacts: first.total_contacts,
+    totalOpportunities: first.total_opportunities,
+    activeOpportunities: first.active_opportunities,
+    openOpportunities: first.open_opportunities,
+    onHoldOpportunities: first.on_hold_opportunities,
+    highPriorityActiveOpportunities: first.high_priority_active_opportunities,
+    wonOpportunities: first.won_opportunities,
+    lostOpportunities: first.lost_opportunities,
+    activePipelineValue: first.active_pipeline_value,
+    weightedPipelineValue: first.weighted_pipeline_value,
+    opportunitiesByStage: first.opportunity_stage_counts,
+    activeByStage: first.active_by_stage,
+    activeByCloseQuarter: first.active_by_close_quarter,
+    attentionTotal: first.attention_total,
+    attentionLifecycleConflicts: first.attention_lifecycle_conflicts,
+    attentionOverdue: first.attention_overdue,
+    attentionMissingCloseDate: first.attention_missing_close_date,
+    attentionInvalidProbability: first.attention_invalid_probability,
+    forecastMonths: first.forecast_months,
+    outsideOrUnscheduledPotential: first.outside_or_unscheduled_potential,
+    outsideOrUnscheduledWeighted: first.outside_or_unscheduled_weighted,
+  }) as CrmPipelineReportingSnapshot
+  return {
+    contactsAdded: finite(first.contacts_added),
+    interactions: finite(first.interactions),
+    opportunitiesCreated: finite(first.opportunities_created),
+    interactionsByMonth: result.rows.map((row) => ({
+      month: row.month,
+      label: crmPipelineReportingMonthLabel(row.month),
+      total: finite(row.total),
+      types: {
+        directMail: finite(row.direct_mail),
+        linkedIn: finite(row.linked_in),
+        email: finite(row.email),
+        call: finite(row.call),
+        inPerson: finite(row.in_person),
+        note: finite(row.note),
+        campaign: finite(row.campaign),
+        other: finite(row.other),
+      },
+    })),
+    snapshot,
+  }
 }
 
 export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<CrmSummary> {

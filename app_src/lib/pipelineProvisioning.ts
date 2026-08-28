@@ -97,6 +97,9 @@ type DrivePermission = {
 
 type SpreadsheetMetadata = {
   spreadsheetId?: string
+  properties?: {
+    timeZone?: string
+  }
   sheets?: Array<{
     properties?: {
       sheetId?: number
@@ -143,6 +146,7 @@ const GENERATED_REPORT_CLEAR_RANGES = [
 ] as const
 const GENERATED_DROPDOWN_CLEAR_RANGE = "'Dropdowns'!B4:ZZZ"
 const GENERATED_HEADER_CLEAR_RANGES = EXPECTED_TABS.map((title) => `'${title}'!A1:ZZ3`)
+const PIPELINE_WORKBOOK_TIME_ZONE = 'Etc/UTC'
 
 const WORKBOOK_THEME = {
   shell: '#0F0F13',
@@ -209,9 +213,9 @@ const FILTERED_TABLE_TABS = ['Organizations', 'Contacts', 'Opportunities', 'Inte
 const DASHBOARD_HELPER_COLUMN_INDEX = 15
 const DASHBOARD_STAGE_HELPER_COLUMN_INDEX = 18
 const DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX = 28
-const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 36
-const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 44
-const DASHBOARD_HELPER_END_COLUMN_INDEX = 47
+const DASHBOARD_FORECAST_STAGE_HELPER_COLUMN_INDEX = 37
+const DASHBOARD_FORECAST_VALUE_HELPER_COLUMN_INDEX = 45
+const DASHBOARD_HELPER_END_COLUMN_INDEX = 48
 const DASHBOARD_LAST_VISIBLE_COLUMN_INDEX = 13
 const CANONICAL_DROPDOWN_KEYS = ['owner', 'product', 'stage', 'priority', 'status', 'source', 'loss_reason'] as const
 
@@ -249,7 +253,7 @@ const INITIAL_TAB_ROWS: Partial<Record<(typeof EXPECTED_TABS)[number], unknown[]
     ['1. Update opportunities', 'Only the Opportunities tab is operator-editable. ClawPilot syncs those changes with the CRM.'],
     ['2. Set lifecycle status', 'Status controls lifecycle reporting and formulas. Active excludes Won, Lost, Closed, and Abandoned; Open and On Hold remain active.'],
     ['3. Move the pipeline stage', 'Stage controls where an opportunity appears on the pipeline board.'],
-    ['4. Confirm probability', 'Probability controls weighted active value: opportunity value multiplied by win probability. Enter a whole percent from 0 to 100.'],
+    ['4. Confirm probability', 'Probability controls weighted active value: opportunity value multiplied by win probability. Enter a percentage from 0 to 100 with up to two decimal places.'],
     ['5. Add the forecast date', 'Expected Close controls when opportunity value appears in the sales forecast.'],
     ['PRODUCTS', 'Products are selected as a multi-select field in ClawPilot and synchronized with the opportunity.'],
     ['GENERATED REPORTING', 'Organizations, Contacts, Interactions, Calculations, Dashboard, and Dropdowns are managed by ClawPilot.'],
@@ -952,7 +956,7 @@ async function ensurePipelineSheet(
 
 async function spreadsheetMetadata(request: SheetsJsonRequest, sheetId: string) {
   const metadata = await request<SpreadsheetMetadata>(
-    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId),conditionalFormats,bandedRanges(bandedRangeId),basicFilter,merges)`,
+    `/v4/spreadsheets/${sheetId}?fields=spreadsheetId,properties(timeZone),sheets(properties,protectedRanges(protectedRangeId,description),charts(chartId),conditionalFormats,bandedRanges(bandedRangeId),basicFilter,merges)`,
   )
   if (validResourceId(metadata.spreadsheetId, 'Managed pipeline Sheet ID') !== sheetId) {
     throw new PipelineProvisioningRequestError(
@@ -1074,7 +1078,7 @@ function dashboardChartRequests(sheetId: number) {
     },
   })
 
-  const interactionSeriesColors = ['#5C6BC0', '#356BB3', '#7CB342', '#008C95', '#8E55A6', '#C29415', '#C75B39']
+  const interactionSeriesColors = ['#5C6BC0', '#356BB3', '#7CB342', '#008C95', '#8E55A6', '#C29415', '#C75B39', '#78909C']
   const opportunityStageColors = OPPORTUNITY_STAGE_PALETTE.map((stage) => stage.chart)
   const forecastStageColors = ['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead']
     .map((name) => OPPORTUNITY_STAGE_PALETTE.find((stage) => stage.name === name)?.chart || DASHBOARD_MATERIAL.primary)
@@ -1094,7 +1098,7 @@ function dashboardChartRequests(sheetId: number) {
       anchorColumnIndex: 1,
     }),
     chartShell({
-      title: 'Interactions, last quarter',
+      title: 'Interactions, last 3 calendar months',
       chartType: 'COLUMN',
       stackedType: 'NOT_STACKED',
       legendPosition: 'BOTTOM_LEGEND',
@@ -1139,7 +1143,17 @@ function dashboardChartRequests(sheetId: number) {
 }
 
 function dashboardValueWrites() {
-  const interactionTypes = ['Direct Mail', 'LinkedIn', 'Email', 'Call', 'In Person', 'Note', 'Campaign']
+  const interactionTypes = [
+    { label: 'Direct Mail', aliases: ['direct mail', 'directmail'] },
+    { label: 'LinkedIn', aliases: ['linkedin', 'linked in'] },
+    { label: 'Email', aliases: ['email', 'emails', 'e mail'] },
+    { label: 'Call', aliases: ['call', 'calls', 'phone', 'phone call'] },
+    { label: 'In Person', aliases: ['in person', 'meeting', 'meetings'] },
+    { label: 'Note', aliases: ['note', 'notes'] },
+    { label: 'Campaign', aliases: ['campaign', 'campaigns'] },
+    { label: 'Other', aliases: [] },
+  ]
+  const normalizedInteractionTypeRange = 'ARRAYFORMULA(LOWER(REGEXREPLACE(TRIM(Interactions!$C$5:$C),"[\\s_-]+"," ")))'
   const opportunityStages = OPPORTUNITY_STAGE_PALETTE.map((stage) => stage.name)
   const forecastStages = ['Closed', 'Closed Delayed', 'Proposal', 'Demo', 'Needs Analysis', 'Qualified Lead', 'Identified Lead']
   const interactionMonthColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX)
@@ -1148,9 +1162,15 @@ function dashboardValueWrites() {
     const sheetRow = 5 + rowIndex
     return [
       dateFormula,
-      ...interactionTypes.map((_, typeIndex) => {
-        const typeColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + 1 + typeIndex)
-        return `=COUNTIFS(Interactions!$C$5:$C,${typeColumn}$4,Interactions!$G$5:$G,">="&EOMONTH($${interactionMonthColumn}${sheetRow},-1)+1,Interactions!$G$5:$G,"<="&$${interactionMonthColumn}${sheetRow})`
+      ...interactionTypes.map((type, typeIndex) => {
+        const monthCriteria = `Interactions!$G$5:$G,">="&EOMONTH($${interactionMonthColumn}${sheetRow},-1)+1,Interactions!$G$5:$G,"<"&($${interactionMonthColumn}${sheetRow}+1)`
+        if (type.label === 'Other') {
+          const firstKnownColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + 1)
+          const lastKnownColumn = columnName(DASHBOARD_INTERACTION_HELPER_COLUMN_INDEX + typeIndex)
+          return `=COUNTIFS(${monthCriteria})-SUM($${firstKnownColumn}${sheetRow}:$${lastKnownColumn}${sheetRow})`
+        }
+        const aliasPattern = `"^(${type.aliases.join('|')})$"`
+        return `=SUMPRODUCT(--ARRAYFORMULA(REGEXMATCH(${normalizedInteractionTypeRange},${aliasPattern})),--(Interactions!$G$5:$G>=EOMONTH($${interactionMonthColumn}${sheetRow},-1)+1),--(Interactions!$G$5:$G<($${interactionMonthColumn}${sheetRow}+1)))`
       }),
     ]
   })
@@ -1178,13 +1198,13 @@ function dashboardValueWrites() {
   return [
     { range: "'Dashboard'!B5", majorDimension: 'ROWS' as const, values: [['OPEN OPPORTUNITIES VALUE']] },
     { range: "'Dashboard'!B6", majorDimension: 'ROWS' as const, values: [['=Calculations!C18']] },
-    { range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['POTENTIAL VALUE']] },
-    { range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C9']] },
-    { range: "'Dashboard'!B8", majorDimension: 'ROWS' as const, values: [['="CONTACTS  "&TEXT(Calculations!C16,"#,##0")']] },
-    { range: "'Dashboard'!D8", majorDimension: 'ROWS' as const, values: [['="INTERACTIONS  "&TEXT(Calculations!C17,"#,##0")']] },
-    { range: "'Dashboard'!F8", majorDimension: 'ROWS' as const, values: [['="OPPS PURSUED  "&TEXT(Calculations!C5,"#,##0")']] },
-    { range: "'Dashboard'!I8", majorDimension: 'ROWS' as const, values: [['="OPPS CLOSED  "&TEXT(Calculations!C11,"#,##0")']] },
-    { range: "'Dashboard'!K8", majorDimension: 'ROWS' as const, values: [['="WIN RATE  "&TEXT(Calculations!C14,"0.0%")']] },
+    { range: "'Dashboard'!H5", majorDimension: 'ROWS' as const, values: [['WEIGHTED PIPELINE VALUE']] },
+    { range: "'Dashboard'!H6", majorDimension: 'ROWS' as const, values: [['=Calculations!C10']] },
+    { range: "'Dashboard'!B8", majorDimension: 'ROWS' as const, values: [['="CONTACTS · CURRENT  "&TEXT(Calculations!C16,"#,##0")']] },
+    { range: "'Dashboard'!D8", majorDimension: 'ROWS' as const, values: [['="INTERACTIONS · ALL-TIME  "&TEXT(Calculations!C17,"#,##0")']] },
+    { range: "'Dashboard'!F8", majorDimension: 'ROWS' as const, values: [['="OPPS · CURRENT TOTAL  "&TEXT(Calculations!C5,"#,##0")']] },
+    { range: "'Dashboard'!I8", majorDimension: 'ROWS' as const, values: [['="WON OPPS · LIFETIME  "&TEXT(Calculations!C11,"#,##0")']] },
+    { range: "'Dashboard'!K8", majorDimension: 'ROWS' as const, values: [['="WIN RATE · LIFETIME  "&TEXT(Calculations!C14,"0.0%")']] },
     { range: "'Dashboard'!B9", majorDimension: 'ROWS' as const, values: [['PIPELINE AND CUSTOMER ACTIVITY']] },
     { range: "'Dashboard'!B24", majorDimension: 'ROWS' as const, values: [['SALES FORECAST']] },
     {
@@ -1204,22 +1224,22 @@ function dashboardValueWrites() {
     {
       range: "'Dashboard'!AC4",
       majorDimension: 'ROWS' as const,
-      values: [['Month ending', ...interactionTypes], ...interactionTrackerRows],
+      values: [['Month ending', ...interactionTypes.map((type) => type.label)], ...interactionTrackerRows],
     },
     {
-      range: "'Dashboard'!AK4",
+      range: "'Dashboard'!AL4",
       majorDimension: 'ROWS' as const,
       values: [['Month ending', ...forecastStages], ...forecastStageRows],
     },
     {
-      range: "'Dashboard'!AS4",
+      range: "'Dashboard'!AT4",
       majorDimension: 'ROWS' as const,
       values: [['Month ending', 'Potential', 'Probable'], ...forecastValueRows],
     },
     {
       range: "'Dashboard'!B40",
       majorDimension: 'ROWS' as const,
-      values: [['Generated from ClawPilot CRM records. Grouped interactions use CRM activity type; forecasts use expected close month.']],
+      values: [['Generated from ClawPilot CRM records. Grouped interactions use CRM activity type and UTC calendar months; forecasts use expected close month.']],
     },
   ]
 }
@@ -1569,8 +1589,8 @@ function dashboardLayoutRequests(sheetId: number) {
         fields: 'userEnteredFormat(textFormat,horizontalAlignment)',
       },
     },
-    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2, type: 'CURRENCY', pattern: '$#,##0' }),
-    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 7, endColumnIndex: 8, type: 'CURRENCY', pattern: '$#,##0' }),
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 1, endColumnIndex: 2, type: 'CURRENCY', pattern: '$#,##0.00' }),
+    setRangeNumberFormat({ sheetId, startRowIndex: 5, endRowIndex: 6, startColumnIndex: 7, endColumnIndex: 8, type: 'CURRENCY', pattern: '$#,##0.00' }),
     setRangeNumberFormat({
       sheetId,
       startRowIndex: 3,
@@ -1676,6 +1696,25 @@ export async function configurePipelineTabsWithRequest(
   protectionEditor?: string,
 ) {
   let metadata = await spreadsheetMetadata(request, sheetId)
+  if (metadata.properties?.timeZone !== PIPELINE_WORKBOOK_TIME_ZONE) {
+    await request(`/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: 'POST',
+      body: {
+        requests: [{
+          updateSpreadsheetProperties: {
+            properties: { timeZone: PIPELINE_WORKBOOK_TIME_ZONE },
+            fields: 'timeZone',
+          },
+        }],
+        includeSpreadsheetInResponse: false,
+      },
+      idempotent: true,
+    })
+    metadata = {
+      ...metadata,
+      properties: { ...metadata.properties, timeZone: PIPELINE_WORKBOOK_TIME_ZONE },
+    }
+  }
   const current = metadata.sheets || []
   const currentTitles = new Set(current.map((sheet) => sheet.properties?.title).filter(Boolean))
   const requests: unknown[] = []
@@ -2098,7 +2137,7 @@ export async function configurePipelineTabsWithRequest(
         ...opportunityStageConditionalFormatting(sheetIdValue, rowCount),
         ...opportunityValidationRequests(sheetIdValue, rowCount),
         setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 9, endColumnIndex: 10, type: 'CURRENCY', pattern: '$#,##0.00' }),
-        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 10, endColumnIndex: 11, type: 'NUMBER', pattern: '0.0"%"' }),
+        setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 10, endColumnIndex: 11, type: 'NUMBER', pattern: '0.00"%"' }),
         setRangeNumberFormat({ sheetId: sheetIdValue, startRowIndex: 4, startColumnIndex: 11, endColumnIndex: 12, type: 'DATE', pattern: 'mmm d, yyyy' }),
       )
     }
