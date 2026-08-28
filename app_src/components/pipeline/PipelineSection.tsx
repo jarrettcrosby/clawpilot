@@ -171,8 +171,8 @@ const PRIORITY_SORT_WEIGHT: Record<string, number> = {
 }
 
 function fmt$(n: number) {
-  if (!n) return '—'
-  return formatPipelineCurrency(Number(n || 0))
+  if (!Number.isFinite(n)) return '—'
+  return formatPipelineCurrency(n)
 }
 
 function fmtSnapshotCurrency(n: number | null) {

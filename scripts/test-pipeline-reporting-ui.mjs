@@ -152,6 +152,8 @@ assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.activePi
 assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.weightedPipelineValue/)
 assert.match(pipelineCurrency, /minimumFractionDigits: 2/)
 assert.match(pipelineCurrency, /maximumFractionDigits: 2/)
+assert.match(section, /function fmt\$\(n: number\)[\s\S]{0,160}formatPipelineCurrency\(n\)/)
+assert.doesNotMatch(section, /function fmt\$\(n: number\)[\s\S]{0,100}if \(!n\) return '—'/)
 assert.match(dashboardBootstrap, /activeOpportunities: summary\.activeOpportunities/)
 assert.match(dashboardBootstrap, /activePipelineValue: summary\.activePipelineValue/)
 assert.match(dashboardBootstrap, /weightedPipelineValue: summary\.weightedPipelineValue/)
