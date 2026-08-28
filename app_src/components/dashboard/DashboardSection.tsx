@@ -566,8 +566,10 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
           </Stack>
           <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 2, pt: 0.5 }}>
             {[
-              ['Opportunities', pipelineSummary?.opportunities ?? 0],
-              ['Open value', currency.format(pipelineSummary?.totalOpenValue ?? 0)],
+              ['Total opportunities', pipelineSummary?.opportunities ?? 0],
+              ['Active opportunities', pipelineSummary?.activeOpportunities ?? 0],
+              ['Active pipeline value', currency.format(pipelineSummary?.activePipelineValue ?? pipelineSummary?.totalOpenValue ?? 0)],
+              ['Weighted pipeline value', currency.format(pipelineSummary?.weightedPipelineValue ?? 0)],
               ['Organizations', pipelineSummary?.organizations ?? 0],
               ['Contacts', pipelineSummary?.contacts ?? 0],
             ].map(([label, value]) => (

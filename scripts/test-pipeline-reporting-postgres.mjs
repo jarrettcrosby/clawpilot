@@ -120,31 +120,95 @@ async function installReportingSchema(pool) {
       workspace_organization_id uuid NOT NULL
     );
 
+    CREATE TABLE crm_organizations (
+      id uuid PRIMARY KEY,
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      parent_organization_id uuid,
+      name text,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      sync_status text NOT NULL DEFAULT 'synced'
+    );
+
     CREATE TABLE crm_contacts (
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      organization_id uuid,
+      reference_code text,
+      full_name text,
+      email text,
+      phone_work text,
+      phone_mobile text,
+      job_title text,
+      sync_status text NOT NULL DEFAULT 'synced',
       created_at timestamptz NOT NULL
+    );
+
+    CREATE TABLE crm_products (
+      id uuid PRIMARY KEY,
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      sync_status text NOT NULL DEFAULT 'synced'
+    );
+
+    CREATE TABLE crm_leads (
+      id uuid PRIMARY KEY,
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      organization_id uuid,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      sync_status text NOT NULL DEFAULT 'synced'
     );
 
     CREATE TABLE crm_opportunities (
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      organization_id uuid,
+      organization_name text,
+      name text,
       status text,
       stage text,
       priority text,
       amount numeric(18,2) NOT NULL DEFAULT 0,
       probability numeric(5,2) NOT NULL DEFAULT 0,
       expected_close date,
+      sync_status text NOT NULL DEFAULT 'synced',
       created_at timestamptz NOT NULL
+    );
+
+    CREATE TABLE crm_meetings (
+      id uuid PRIMARY KEY,
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      organization_id uuid,
+      sync_status text NOT NULL DEFAULT 'synced'
     );
 
     CREATE TABLE crm_interactions (
       id uuid PRIMARY KEY,
       pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      organization_id uuid,
+      contact_id uuid,
+      lead_id uuid,
+      opportunity_id uuid,
+      meeting_id uuid,
       interaction_type text,
       occurred_at timestamptz,
       source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      sync_status text NOT NULL DEFAULT 'synced',
       created_at timestamptz NOT NULL
+    );
+
+    CREATE TABLE crm_campaigns (
+      id uuid PRIMARY KEY,
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      source_payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+      sync_status text NOT NULL DEFAULT 'synced'
+    );
+
+    CREATE TABLE crm_interaction_contacts (
+      pipeline_id uuid NOT NULL REFERENCES pipeline_spaces(id) ON DELETE CASCADE,
+      interaction_id uuid NOT NULL,
+      contact_id uuid NOT NULL,
+      is_primary boolean NOT NULL DEFAULT false,
+      sort_order integer NOT NULL DEFAULT 0
     );
   `)
 }
@@ -205,10 +269,12 @@ async function acceptance(databaseUrl) {
     const organizationB = randomUUID()
     const pipelineA = randomUUID()
     const pipelineB = randomUUID()
+    const pipelineC = randomUUID()
+    const organizationC = randomUUID()
     await pool.query(
       `INSERT INTO pipeline_spaces (id, workspace_organization_id)
-       VALUES ($1::uuid, $2::uuid), ($3::uuid, $4::uuid)`,
-      [pipelineA, organizationA, pipelineB, organizationB],
+       VALUES ($1::uuid, $2::uuid), ($3::uuid, $4::uuid), ($5::uuid, $6::uuid)`,
+      [pipelineA, organizationA, pipelineB, organizationB, pipelineC, organizationC],
     )
 
     const startAt = '2026-06-01T04:00:00.000Z'
@@ -232,7 +298,7 @@ async function acceptance(databaseUrl) {
         createdAt: '2026-06-01T03:59:59.999999Z',
       },
       {
-        status: 'Open',
+        status: ' Open ',
         stage: 'Proposal',
         priority: 'A',
         amount: '100.25',
@@ -440,6 +506,25 @@ async function acceptance(databaseUrl) {
       'Monthly interaction totals must reconcile with the period total',
     )
 
+    const valueSnapshotA = plain(await persistence.readCrmPipelineValueSnapshotFromPostgres({
+      pipelineId: pipelineA,
+      organizationId: organizationA,
+    }))
+    assert.deepEqual(valueSnapshotA, {
+      totalOpportunities: reportA.snapshot.totalOpportunities,
+      activeOpportunities: reportA.snapshot.activeOpportunities,
+      activePipelineValue: reportA.snapshot.activePipelineValue,
+      weightedPipelineValue: reportA.snapshot.weightedPipelineValue,
+    }, 'all reporting surfaces must use the authoritative current-value snapshot')
+    const homeSummaryA = plain(await persistence.readCrmSummaryFromPostgres(pipelineA))
+    assert.deepEqual({
+      totalOpportunities: homeSummaryA.opportunities,
+      activeOpportunities: homeSummaryA.activeOpportunities,
+      activePipelineValue: homeSummaryA.activePipelineValue,
+      weightedPipelineValue: homeSummaryA.weightedPipelineValue,
+    }, valueSnapshotA, 'home summary and period reporting must expose the same current-value snapshot')
+    assert.equal(homeSummaryA.openPipelineValue, homeSummaryA.activePipelineValue, 'legacy open-value alias must remain compatible')
+
     const reportB = plain(await persistence.readCrmPipelineActivityReportFromPostgres({
       pipelineId: pipelineB,
       organizationId: organizationB,
@@ -453,6 +538,74 @@ async function acceptance(databaseUrl) {
     assert.equal(reportB.interactions, 2)
     assert.equal(reportB.interactionsByMonth[1].types.email, 1)
     assert.equal(reportB.interactionsByMonth[1].types.other, 1)
+
+    await pool.query(
+      `INSERT INTO crm_opportunities (
+         id, pipeline_id, status, stage, amount, probability, created_at
+       )
+       SELECT
+         ('10000000-0000-4000-8000-' || lpad(value::text, 12, '0'))::uuid,
+         $1::uuid,
+         'Open',
+         'Proposal',
+         value::numeric,
+         25,
+         '2026-08-28T12:00:00Z'::timestamptz
+       FROM generate_series(1, 1005) value`,
+      [pipelineC],
+    )
+    const projectedOrganizationId = '20000000-0000-4000-8000-000000000001'
+    const projectedContactId = '30000000-0000-4000-8000-000000000001'
+    const projectedInteractionId = '40000000-0000-4000-8000-000000000001'
+    await pool.query(
+      `INSERT INTO crm_organizations (id, pipeline_id, name, source_payload)
+       VALUES
+         ($1::uuid, $2::uuid, 'Projected organization', '{}'::jsonb),
+         ('20000000-0000-4000-8000-000000000002'::uuid, $2::uuid, 'Archived organization', '{"archived":true}'::jsonb)`,
+      [projectedOrganizationId, pipelineC],
+    )
+    await pool.query(
+      `INSERT INTO crm_contacts (
+         id, pipeline_id, organization_id, reference_code, full_name, email, created_at
+       ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'contact-1', 'Projected contact', 'projection@example.test', now())`,
+      [projectedContactId, pipelineC, projectedOrganizationId],
+    )
+    await pool.query(
+      `INSERT INTO crm_interactions (
+         id, pipeline_id, organization_id, contact_id, interaction_type, source_payload, occurred_at, created_at
+       ) VALUES
+         ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'Email', '{}'::jsonb, now(), now()),
+         ('40000000-0000-4000-8000-000000000002'::uuid, $2::uuid, $3::uuid, $4::uuid,
+          'Email', '{"archived":true}'::jsonb, now(), now())`,
+      [projectedInteractionId, pipelineC, projectedOrganizationId, projectedContactId],
+    )
+    const workbookSnapshot = plain(await persistence.readCrmWorkbookProjectionSnapshotInPostgres({
+      pipelineId: pipelineC,
+    }))
+    assert.deepEqual(workbookSnapshot.counts, {
+      organizations: 1,
+      contacts: 1,
+      opportunities: 1005,
+      interactions: 1,
+    })
+    assert.equal(workbookSnapshot.organizations[0].id, projectedOrganizationId)
+    assert.equal(workbookSnapshot.contacts[0].id, projectedContactId)
+    assert.equal(workbookSnapshot.interactions[0].id, projectedInteractionId)
+    assert.equal(workbookSnapshot.opportunities.length, 1005)
+    assert.equal(new Set(workbookSnapshot.opportunities.map((record) => record.id)).size, 1005)
+    assert.equal(workbookSnapshot.opportunities[0].id, '10000000-0000-4000-8000-000000000001')
+    assert.equal(workbookSnapshot.opportunities.at(-1).id, '10000000-0000-4000-8000-000000001005')
+    assert.equal(workbookSnapshot.dataRowCapacity, 19_996)
+    assert.throws(
+      () => persistence.assertCrmWorkbookProjectionCountsWithinCapacity({
+        organizations: 0,
+        contacts: 0,
+        opportunities: 19_997,
+        interactions: 0,
+      }),
+      /cannot safely write 19997 opportunities.*capacity is 19996 data rows/,
+      'workbook projection must fail before writing a partial over-capacity export',
+    )
 
     await assert.rejects(
       persistence.readCrmPipelineActivityReportFromPostgres({

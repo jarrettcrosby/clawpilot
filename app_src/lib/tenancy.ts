@@ -129,7 +129,15 @@ type WorkspacePreferencesRow = {
 const EMPTY_PIPELINE: PipelineProjection = {
   syncedAt: null,
   source: 'app',
-  summary: { opportunities: 0, organizations: 0, contacts: 0, totalOpenValue: 0 },
+  summary: {
+    opportunities: 0,
+    activeOpportunities: 0,
+    organizations: 0,
+    contacts: 0,
+    totalOpenValue: 0,
+    activePipelineValue: 0,
+    weightedPipelineValue: 0,
+  },
   opportunities: [],
 }
 

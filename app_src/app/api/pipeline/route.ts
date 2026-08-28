@@ -146,9 +146,11 @@ export async function GET(req: NextRequest) {
             syncedAt: projection.syncedAt || null,
             summary: {
               opportunities: crmSummary.opportunities,
+              activeOpportunities: crmSummary.activeOpportunities,
               organizations: crmSummary.organizations,
               contacts: crmSummary.contacts,
               totalOpenValue: crmSummary.openPipelineValue,
+              activePipelineValue: crmSummary.activePipelineValue,
               weightedPipelineValue: crmSummary.weightedPipelineValue,
               pendingSync: crmSummary.pendingSync,
               failedSync: crmSummary.failedSync,

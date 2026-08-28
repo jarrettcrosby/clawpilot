@@ -73,9 +73,11 @@ type SyncSurface = {
   lastSyncedAt: string | null
   summary?: {
     opportunities?: number
+    activeOpportunities?: number
     organizations?: number
     contacts?: number
     totalOpenValue?: number
+    activePipelineValue?: number
     weightedPipelineValue?: number
     pendingSync?: number
     failedSync?: number
