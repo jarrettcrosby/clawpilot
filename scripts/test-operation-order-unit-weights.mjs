@@ -18,7 +18,7 @@ const physicalFactsMigrationPath =
   'db/migrations/0336_operations_order_unit_physical_facts.sql'
 const physicalFactsMigration = read(physicalFactsMigrationPath)
 const expectedPhysicalFactsChecksum =
-  '918177c469c3fe4832dfda4b52d12938472fdd202aeaab0513b87cbb62dde894'
+  '703b24f9eb3c255bb7f7594010fe40f8e0fc6fb02e99fc49fe18331204483e47'
 
 assert.equal(
   createHash('sha256').update(migration).digest('hex'),

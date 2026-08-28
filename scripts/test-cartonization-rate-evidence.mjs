@@ -618,8 +618,12 @@ function loadOperationalFaireRoute(
           evidence: {
             policyVersion: 'operational-unit-material-fixed-axis-v2',
             productPackConstraint: 'not_required_for_ordinary_unit',
-            packageSelectionBasis:
-              'fewest_packages_then_material_cost_then_inner_cube',
+            packageSelectionPolicies: {
+              dimensioned:
+                'fewest_packages_then_material_cost_then_inner_cube',
+              undimensioned:
+                'largest_selected_factual_container_with_available_stock',
+            },
             combinationPolicy: 'same_line_fixed_axis_only',
             unitWeightAuthority: 'provider_or_order_specific',
             unitDimensionsAuthority:
@@ -660,7 +664,7 @@ function loadOperationalFaireRoute(
               policyVersion: 'operational-unit-material-fixed-axis-v2',
               productPackConstraint: 'not_required_for_ordinary_unit',
               packageSelectionBasis:
-                'fewest_packages_then_material_cost_then_inner_cube',
+                'largest_selected_factual_container_with_available_stock',
               unitsPerPackage: 1,
               unitWeightGrams: 400,
               unitWeightAuthority: 'provider_or_order_specific',
@@ -1394,8 +1398,11 @@ const unitPackageInput = {
 const unitPlanEvidence = {
   policyVersion: 'operational-unit-material-fixed-axis-v2',
   productPackConstraint: 'not_required_for_ordinary_unit',
-  packageSelectionBasis:
-    'fewest_packages_then_material_cost_then_inner_cube',
+  packageSelectionPolicies: {
+    dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
+    undimensioned:
+      'largest_selected_factual_container_with_available_stock',
+  },
   combinationPolicy: 'same_line_fixed_axis_only',
   unitWeightAuthority: 'provider_or_order_specific',
   unitDimensionsAuthority:

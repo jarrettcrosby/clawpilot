@@ -251,8 +251,8 @@ BEGIN
          'operational-unit-material-fixed-axis-v2'
     OR retained_evidence->>'productPackConstraint' IS DISTINCT FROM
          'not_required_for_ordinary_unit'
-    OR retained_evidence->>'packageSelectionBasis' IS DISTINCT FROM
-         'fewest_packages_then_material_cost_then_inner_cube'
+    OR retained_evidence->'packageSelectionPolicies' IS DISTINCT FROM
+         '{"dimensioned":"fewest_packages_then_material_cost_then_inner_cube","undimensioned":"largest_selected_factual_container_with_available_stock"}'::jsonb
     OR retained_evidence->>'combinationPolicy' IS DISTINCT FROM
          'same_line_fixed_axis_only'
     OR retained_evidence->>'unitWeightAuthority' IS DISTINCT FROM
@@ -311,8 +311,6 @@ BEGIN
          'operational-unit-material-fixed-axis-v2'
     OR fit_evidence->>'productPackConstraint' IS DISTINCT FROM
          'not_required_for_ordinary_unit'
-    OR fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM
-         'fewest_packages_then_material_cost_then_inner_cube'
     OR fit_evidence->>'unitsPerPackage' IS DISTINCT FROM
          allocation_quantity::text
     OR fit_evidence->>'unitWeightGrams' !~ '^[1-9][0-9]{0,8}$'
@@ -338,7 +336,9 @@ BEGIN
   END IF;
 
   IF fit_evidence->>'fitModel' = 'fixed_axis_regular_grid' THEN
-    IF fit_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
+    IF fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM
+         'fewest_packages_then_material_cost_then_inner_cube'
+      OR fit_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
          'order_specific'
       OR NOT public.operations_cartonization_dimensions_mm_valid(
         fit_evidence->'unitDimensionsMm'
@@ -370,7 +370,9 @@ BEGIN
       RAISE EXCEPTION 'Fixed-axis unit-material fit evidence is invalid';
     END IF;
   ELSIF fit_evidence->>'fitModel' = 'one_each_without_fit_claim' THEN
-    IF allocation_quantity <> 1
+    IF fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM
+         'largest_selected_factual_container_with_available_stock'
+      OR allocation_quantity <> 1
       OR fit_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
            'unavailable'
       OR fit_evidence->'unitDimensionsMm' IS DISTINCT FROM 'null'::jsonb

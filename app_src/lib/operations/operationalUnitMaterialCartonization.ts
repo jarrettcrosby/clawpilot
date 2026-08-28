@@ -72,6 +72,7 @@ export type OperationalUnitMaterialPackage = {
     productPackConstraint: 'not_required_for_ordinary_unit'
     packageSelectionBasis:
       'fewest_packages_then_material_cost_then_inner_cube'
+      | 'largest_selected_factual_container_with_available_stock'
     unitsPerPackage: number
     unitWeightGrams: number
     unitWeightAuthority: 'provider_or_order_specific'
@@ -99,8 +100,11 @@ export type OperationalUnitMaterialPlan =
       evidence: {
         policyVersion: typeof OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION
         productPackConstraint: 'not_required_for_ordinary_unit'
-        packageSelectionBasis:
-          'fewest_packages_then_material_cost_then_inner_cube'
+        packageSelectionPolicies: {
+          dimensioned: 'fewest_packages_then_material_cost_then_inner_cube'
+          undimensioned:
+            'largest_selected_factual_container_with_available_stock'
+        }
         combinationPolicy: 'same_line_fixed_axis_only'
         unitWeightAuthority: 'provider_or_order_specific'
         unitDimensionsAuthority:
@@ -181,62 +185,150 @@ function compareSelection(
     || compareCounts(left.counts, right.counts)
 }
 
-function selectMaterialCounts(input: {
+function enumerateMaterialCounts(input: {
   quantity: number
   maximumPackages: number
   options: MaterialOption[]
 }) {
-  let states = new Map<string, MaterialSelection>([[
-    '0:0',
-    {
-      packageCount: 0,
-      coveredUnits: 0,
-      materialCostMinor: 0,
-      innerCubeMm3: 0,
-      counts: input.options.map(() => 0),
-    },
-  ]])
-  input.options.forEach((option, optionIndex) => {
-    const next = new Map(states)
-    for (const state of states.values()) {
-      const maximumUse = Math.min(
-        option.availableQuantity,
-        input.maximumPackages - state.packageCount,
-      )
-      for (let use = 1; use <= maximumUse; use += 1) {
-        const packageCount = state.packageCount + use
-        const coveredUnits = Math.min(
-          input.quantity,
-          state.coveredUnits + use * option.effectiveCapacityUnits,
-        )
-        const counts = [...state.counts]
-        counts[optionIndex] += use
-        const candidate: MaterialSelection = {
+  const selections: MaterialSelection[] = []
+  const counts = input.options.map(() => 0)
+  const visit = (
+    optionIndex: number,
+    packageCount: number,
+    coveredUnits: number,
+    materialCostMinor: number,
+    innerCubeMm3: number,
+  ) => {
+    if (optionIndex === input.options.length) {
+      if (
+        coveredUnits >= input.quantity
+        && packageCount <= input.quantity
+      ) {
+        selections.push({
           packageCount,
-          coveredUnits,
-          materialCostMinor:
-            state.materialCostMinor + use * option.unitCostMinor,
-          innerCubeMm3: state.innerCubeMm3 + use * option.innerCubeMm3,
-          counts,
-        }
-        const key = `${packageCount}:${coveredUnits}`
-        const retained = next.get(key)
-        if (!retained || compareSelection(candidate, retained) < 0) {
-          next.set(key, candidate)
-        }
+          coveredUnits: input.quantity,
+          materialCostMinor,
+          innerCubeMm3,
+          counts: [...counts],
+        })
       }
+      return
     }
-    states = next
-  })
-  for (
-    let packageCount = 1;
-    packageCount <= input.maximumPackages;
-    packageCount += 1
-  ) {
-    const selection = states.get(`${packageCount}:${input.quantity}`)
-    if (selection) return selection
+    const option = input.options[optionIndex]
+    const maximumUse = Math.min(
+      option.availableQuantity,
+      input.maximumPackages - packageCount,
+      input.quantity - packageCount,
+    )
+    for (let use = 0; use <= maximumUse; use += 1) {
+      counts[optionIndex] = use
+      visit(
+        optionIndex + 1,
+        packageCount + use,
+        Math.min(
+          input.quantity,
+          coveredUnits + use * option.effectiveCapacityUnits,
+        ),
+        materialCostMinor + use * option.unitCostMinor,
+        innerCubeMm3 + use * option.innerCubeMm3,
+      )
+    }
+    counts[optionIndex] = 0
   }
-  return null
+  visit(0, 0, 0, 0, 0)
+  return selections.sort((left, right) => (
+    left.packageCount - right.packageCount
+    || compareSelection(left, right)
+  ))
+}
+
+function selectGlobalDimensionedMaterialCounts(input: {
+  lines: Array<{
+    lineGlobalId: string
+    quantity: number
+    options: MaterialOption[]
+  }>
+  maximumPackages: number
+  materialRemaining: Map<string, number>
+}) {
+  const ordered = [...input.lines].sort((left, right) => (
+    left.lineGlobalId.localeCompare(right.lineGlobalId)
+  ))
+  type GlobalSelection = {
+    packageCount: number
+    materialCostMinor: number
+    innerCubeMm3: number
+    byLine: Map<string, MaterialSelection>
+  }
+  let best: GlobalSelection | null = null
+  const visit = (
+    lineIndex: number,
+    packageCount: number,
+    materialCostMinor: number,
+    innerCubeMm3: number,
+    remaining: Map<string, number>,
+    byLine: Map<string, MaterialSelection>,
+  ) => {
+    if (best && packageCount > best.packageCount) return
+    if (lineIndex === ordered.length) {
+      const candidate = {
+        packageCount,
+        materialCostMinor,
+        innerCubeMm3,
+        byLine: new Map(byLine),
+      }
+      if (
+        !best
+        || candidate.packageCount < best.packageCount
+        || (
+          candidate.packageCount === best.packageCount
+          && (
+            candidate.materialCostMinor < best.materialCostMinor
+            || (
+              candidate.materialCostMinor === best.materialCostMinor
+              && candidate.innerCubeMm3 < best.innerCubeMm3
+            )
+          )
+        )
+      ) best = candidate
+      return
+    }
+    const entry = ordered[lineIndex]
+    const options = entry.options.map((option) => ({
+      ...option,
+      availableQuantity: Number(
+        remaining.get(option.material.materialGlobalId) || 0,
+      ),
+    }))
+    const candidates = enumerateMaterialCounts({
+      quantity: entry.quantity,
+      maximumPackages: input.maximumPackages - packageCount,
+      options,
+    })
+    for (const selection of candidates) {
+      const nextRemaining = new Map(remaining)
+      selection.counts.forEach((count, optionIndex) => {
+        const materialId = options[optionIndex].material.materialGlobalId
+        nextRemaining.set(
+          materialId,
+          Number(nextRemaining.get(materialId) || 0) - count,
+        )
+      })
+      byLine.set(entry.lineGlobalId, selection)
+      visit(
+        lineIndex + 1,
+        packageCount + selection.packageCount,
+        materialCostMinor + selection.materialCostMinor,
+        innerCubeMm3 + selection.innerCubeMm3,
+        nextRemaining,
+        byLine,
+      )
+      byLine.delete(entry.lineGlobalId)
+    }
+  }
+  visit(0, 0, 0, 0, new Map(input.materialRemaining), new Map())
+  const retained = best as GlobalSelection | null
+  return retained ? retained.byLine : null
 }
 
 function materialOptions(input: {
@@ -487,9 +579,45 @@ export function planOperationalUnitMaterialPackages(
   const packages: OperationalUnitMaterialPackage[] = []
   let dimensionedLineCount = 0
   let oneEachUndimensionedLineCount = 0
-  for (const fallback of [...input.fallbackLines].sort((left, right) => (
-    left.lineGlobalId.localeCompare(right.lineGlobalId)
-  ))) {
+  const orderedFallbackLines = [...input.fallbackLines].sort((left, right) => {
+    const leftLine = lineById.get(left.lineGlobalId)
+    const rightLine = lineById.get(right.lineGlobalId)
+    const leftDimensioned = Boolean(
+      !checkoutAvailable && exactDimensions(leftLine?.unitDimensionsMm),
+    )
+    const rightDimensioned = Boolean(
+      !checkoutAvailable && exactDimensions(rightLine?.unitDimensionsMm),
+    )
+    return Number(rightDimensioned) - Number(leftDimensioned)
+      || left.lineGlobalId.localeCompare(right.lineGlobalId)
+  })
+  const dimensionedEntries = orderedFallbackLines.flatMap((fallback) => {
+    const candidate = lineById.get(fallback.lineGlobalId)
+    const dimensions = !checkoutAvailable
+      && exactDimensions(candidate?.unitDimensionsMm)
+      ? candidate.unitDimensionsMm
+      : null
+    if (!candidate || !dimensions) return []
+    return [{
+      lineGlobalId: fallback.lineGlobalId,
+      quantity: fallback.quantity,
+      options: materialOptions({
+        line: candidate,
+        dimensions,
+        materials,
+        materialRemaining,
+      }),
+    }]
+  })
+  const globalDimensionedSelections = selectGlobalDimensionedMaterialCounts({
+    lines: dimensionedEntries,
+    maximumPackages: input.maximumPackages,
+    materialRemaining,
+  })
+  const dimensionedOptionsByLine = new Map(dimensionedEntries.map((entry) => (
+    [entry.lineGlobalId, entry.options]
+  )))
+  for (const fallback of orderedFallbackLines) {
     const line = lineById.get(fallback.lineGlobalId) as HybridCartonizationLine
     // Checkout has no independently retained item-dimension evidence today.
     // Keep its established no-fit, one-carton-per-unit quote behavior even if
@@ -519,18 +647,45 @@ export function planOperationalUnitMaterialPackages(
     if (dimensions) dimensionedLineCount += 1
     else oneEachUndimensionedLineCount += 1
 
-    const options = materialOptions({
-      line,
-      dimensions,
-      materials,
-      materialRemaining,
-    })
+    const options = dimensions
+      ? dimensionedOptionsByLine.get(fallback.lineGlobalId) || []
+      : materialOptions({
+          line,
+          dimensions,
+          materials,
+          materialRemaining,
+        })
     const remainingPackageBound = input.maximumPackages - packages.length
-    const selection = selectMaterialCounts({
-      quantity: fallback.quantity,
-      maximumPackages: remainingPackageBound,
-      options,
-    })
+    const selection = dimensions
+      ? globalDimensionedSelections?.get(fallback.lineGlobalId) || null
+      : fallback.quantity <= remainingPackageBound
+          && options.reduce((sum, option) => sum + option.availableQuantity, 0)
+            >= fallback.quantity
+        ? {
+            packageCount: fallback.quantity,
+            coveredUnits: fallback.quantity,
+            materialCostMinor: 0,
+            innerCubeMm3: 0,
+            counts: options.map(() => 0),
+          }
+        : null
+    if (!dimensions && selection) {
+      let unitsToAssign = fallback.quantity
+      const largestFirst = options
+        .map((option, optionIndex) => ({ option, optionIndex }))
+        .sort((left, right) => (
+          right.option.innerCubeMm3 - left.option.innerCubeMm3
+          || left.option.material.materialGlobalId.localeCompare(
+            right.option.material.materialGlobalId,
+          )
+        ))
+      for (const { option, optionIndex } of largestFirst) {
+        const use = Math.min(option.availableQuantity, unitsToAssign)
+        selection.counts[optionIndex] = use
+        unitsToAssign -= use
+        if (unitsToAssign === 0) break
+      }
+    }
     if (!selection) {
       const stockCapacity = options.reduce((total, option) => (
         total + option.availableQuantity * option.effectiveCapacityUnits
@@ -556,14 +711,17 @@ export function planOperationalUnitMaterialPackages(
         { length: selection.counts[optionIndex] },
         () => option,
       )
-    )).sort((left, right) => (
-      right.effectiveCapacityUnits - left.effectiveCapacityUnits
-      || left.unitCostMinor - right.unitCostMinor
-      || left.innerCubeMm3 - right.innerCubeMm3
-      || left.material.materialGlobalId.localeCompare(
-        right.material.materialGlobalId,
-      )
-    ))
+    )).sort((left, right) => dimensions
+      ? right.effectiveCapacityUnits - left.effectiveCapacityUnits
+        || left.unitCostMinor - right.unitCostMinor
+        || left.innerCubeMm3 - right.innerCubeMm3
+        || left.material.materialGlobalId.localeCompare(
+          right.material.materialGlobalId,
+        )
+      : right.innerCubeMm3 - left.innerCubeMm3
+        || left.material.materialGlobalId.localeCompare(
+          right.material.materialGlobalId,
+        ))
     let remainingUnits = fallback.quantity
     for (let selectedIndex = 0; selectedIndex < selected.length; selectedIndex += 1) {
       const option = selected[selectedIndex]
@@ -623,8 +781,9 @@ export function planOperationalUnitMaterialPackages(
         unitMaterialEvidence: {
           policyVersion: OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION,
           productPackConstraint: 'not_required_for_ordinary_unit',
-          packageSelectionBasis:
-            'fewest_packages_then_material_cost_then_inner_cube',
+          packageSelectionBasis: dimensions
+            ? 'fewest_packages_then_material_cost_then_inner_cube'
+            : 'largest_selected_factual_container_with_available_stock',
           unitsPerPackage: quantity,
           unitWeightGrams: line.unitWeightGrams,
           unitWeightAuthority: 'provider_or_order_specific',
@@ -658,8 +817,11 @@ export function planOperationalUnitMaterialPackages(
     evidence: {
       policyVersion: OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION,
       productPackConstraint: 'not_required_for_ordinary_unit',
-      packageSelectionBasis:
-        'fewest_packages_then_material_cost_then_inner_cube',
+      packageSelectionPolicies: {
+        dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
+        undimensioned:
+          'largest_selected_factual_container_with_available_stock',
+      },
       combinationPolicy: 'same_line_fixed_axis_only',
       unitWeightAuthority: 'provider_or_order_specific',
       unitDimensionsAuthority:

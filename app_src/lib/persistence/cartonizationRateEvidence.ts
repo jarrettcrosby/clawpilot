@@ -829,8 +829,12 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       !== 'operational-unit-material-fixed-axis-v2'
     || evidenceRecord.productPackConstraint
       !== 'not_required_for_ordinary_unit'
-    || evidenceRecord.packageSelectionBasis
-      !== 'fewest_packages_then_material_cost_then_inner_cube'
+    || canonicalOptimizerHash(evidenceRecord.packageSelectionPolicies)
+      !== canonicalOptimizerHash({
+        dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
+        undimensioned:
+          'largest_selected_factual_container_with_available_stock',
+      })
     || evidenceRecord.combinationPolicy !== 'same_line_fixed_axis_only'
     || evidenceRecord.unitWeightAuthority
       !== 'provider_or_order_specific'
@@ -916,8 +920,6 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
         !== 'operational-unit-material-fixed-axis-v2'
       || unitEvidenceRecord.productPackConstraint
         !== 'not_required_for_ordinary_unit'
-      || unitEvidenceRecord.packageSelectionBasis
-        !== 'fewest_packages_then_material_cost_then_inner_cube'
       || unitEvidenceRecord.unitsPerPackage !== allocationQuantity
       || unitEvidenceRecord.unitWeightAuthority
         !== 'provider_or_order_specific'
@@ -942,6 +944,18 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       === 'fixed_axis_regular_grid'
     const oneEach = unitEvidenceRecord.fitModel
       === 'one_each_without_fit_claim'
+    if (
+      (fixedAxis && unitEvidenceRecord.packageSelectionBasis
+        !== 'fewest_packages_then_material_cost_then_inner_cube')
+      || (oneEach && unitEvidenceRecord.packageSelectionBasis
+        !== 'largest_selected_factual_container_with_available_stock')
+    ) {
+      fail(
+        `${packageInput.packageKey} has an invalid ordinary-unit material selection policy`,
+        400,
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+      )
+    }
     const dimensions = unitEvidenceRecord.unitDimensionsMm
     const axisCounts = unitEvidenceRecord.axisCounts
     const exactDimensionRecord = (value: unknown) => (

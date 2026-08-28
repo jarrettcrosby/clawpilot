@@ -41,6 +41,7 @@ const material = (input: {
   globalId: string
   inner: { length: number; width: number; height: number }
   available: number
+  unitCostMinor?: number
 }): HybridCartonizationMaterial => ({
   materialGlobalId: input.globalId,
   materialType: 'carton',
@@ -54,7 +55,7 @@ const material = (input: {
   dimensionEvidenceReference: 'warehouse measurement',
   dimensionConfirmedAt: '2026-08-24T00:00:00.000Z',
   tareWeightGrams: 100,
-  unitCostMinor: 125,
+  unitCostMinor: input.unitCostMinor ?? 125,
   currency: 'USD',
   stockRowVersion: 4,
   stockOnHandQuantity: input.available,
@@ -218,6 +219,45 @@ test('operational lines without item dimensions retain a truthful one-each fallb
   assert.equal(result.evidence.oneEachUndimensionedLineCount, 1)
 })
 
+test('undimensioned units choose the largest factual carton and fall back only after its stock is exhausted', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, unitDimensionsMm: null, unitDimensionsAuthority: null }],
+    materials: [
+      material({
+        globalId: 'gmat-tiny',
+        inner: { length: 10, width: 10, height: 10 },
+        available: 2,
+        unitCostMinor: 1,
+      }),
+      material({
+        globalId: 'gmat-large',
+        inner: { length: 1000, width: 1000, height: 1000 },
+        available: 1,
+        unitCostMinor: 999,
+      }),
+    ],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.deepEqual(
+    result.packages.map((item) => item.packagingMaterialGlobalId),
+    ['gmat-large', 'gmat-tiny', 'gmat-tiny'],
+  )
+  const large = result.packages.find((item) => (
+    item.packagingMaterialGlobalId === 'gmat-large'
+  ))
+  assert.deepEqual(
+    large?.ratedOuterDimensionsMm,
+    { length: 1010, width: 1010, height: 1010 },
+  )
+  assert.ok(result.packages.every((item) => (
+    item.allocations[0].quantity === 1
+    && item.unitMaterialEvidence.packageSelectionBasis
+      === 'largest_selected_factual_container_with_available_stock'
+  )))
+})
+
 test('checkout ignores synthetic dimensions until checkout retains its own item facts', () => {
   const result = planShopifyCheckoutUnitMaterialPackages({
     ...baseInput,
@@ -240,6 +280,41 @@ test('checkout ignores synthetic dimensions until checkout retains its own item 
     item.allocations[0].quantity === 1
     && item.unitMaterialEvidence.fitModel === 'one_each_without_fit_claim'
   )))
+})
+
+test('checkout quotes unknown-size units in the largest factual carton, not the cheapest tiny carton', () => {
+  const result = planShopifyCheckoutUnitMaterialPackages({
+    ...baseInput,
+    lines: [{ ...line, quantity: 1 }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 1 }],
+    materials: [
+      material({
+        globalId: 'gmat-tiny',
+        inner: { length: 10, width: 10, height: 10 },
+        available: 1,
+        unitCostMinor: 1,
+      }),
+      material({
+        globalId: 'gmat-large',
+        inner: { length: 1000, width: 1000, height: 1000 },
+        available: 1,
+        unitCostMinor: 999,
+      }),
+    ].map((item) => ({ ...item, unitCostMinor: null, currency: null })),
+    inventoryProducts: [{
+      productGlobalId: line.productGlobalId,
+      availabilityAuthority: 'shopify_checkout_available_snapshot',
+      effectiveAvailableQuantity: 1,
+      sourceLevelGlobalIds: ['giil0000001'],
+    }],
+  })
+  assert.equal(result.status, 'ready')
+  if (result.status !== 'ready') return
+  assert.equal(result.packages[0].packagingMaterialGlobalId, 'gmat-large')
+  assert.deepEqual(
+    result.packages[0].ratedOuterDimensionsMm,
+    { length: 1010, width: 1010, height: 1010 },
+  )
 })
 
 test('fixed-axis and gross-weight capacity both constrain grouping', () => {
@@ -266,6 +341,67 @@ test('fixed-axis and gross-weight capacity both constrain grouping', () => {
   assert.ok(result.packages.every((item) => (
     item.ratedGrossWeightGrams <= item.maxWeightGrams
   )))
+})
+
+test('global shared-stock search preserves the only feasible allocation independent of line IDs and input order', () => {
+  const run = (reverse: boolean) => {
+    const flexible = {
+      ...line,
+      lineGlobalId: reverse ? 'gcol-z' : 'gcol-a',
+      productGlobalId: 'gp-flexible',
+      quantity: 1,
+    }
+    const constrained = {
+      ...line,
+      lineGlobalId: reverse ? 'gcol-a' : 'gcol-z',
+      productGlobalId: 'gp-constrained',
+      quantity: 2,
+      unitDimensionsMm: { length: 300, width: 100, height: 50 },
+    }
+    const lines = reverse
+      ? [constrained, flexible]
+      : [flexible, constrained]
+    return planOperationalUnitMaterialPackages({
+      ...baseInput,
+      lines,
+      fallbackLines: lines.map((item) => ({
+        lineGlobalId: item.lineGlobalId,
+        productGlobalId: item.productGlobalId,
+        quantity: item.quantity,
+        fitModel: 'unconstrained_unit' as const,
+      })),
+      materials: [
+        material({
+          globalId: 'gmat-x',
+          inner: { length: 600, width: 100, height: 50 },
+          available: 1,
+          unitCostMinor: 1,
+        }),
+        material({
+          globalId: 'gmat-y',
+          inner: { length: 300, width: 100, height: 50 },
+          available: 1,
+          unitCostMinor: 999,
+        }),
+      ],
+      inventoryProducts: [
+        { ...inventory(1)[0], productGlobalId: 'gp-flexible' },
+        { ...inventory(2)[0], productGlobalId: 'gp-constrained' },
+      ],
+    })
+  }
+  for (const result of [run(false), run(true)]) {
+    assert.equal(result.status, 'ready', JSON.stringify(result))
+    if (result.status !== 'ready') continue
+    const materialByProduct = Object.fromEntries(result.packages.map((item) => [
+      item.allocations[0].productGlobalId,
+      item.packagingMaterialGlobalId,
+    ]))
+    assert.deepEqual(materialByProduct, {
+      'gp-flexible': 'gmat-y',
+      'gp-constrained': 'gmat-x',
+    })
+  }
 })
 
 test('fixed-axis fit blocks volume-only false positives', () => {
