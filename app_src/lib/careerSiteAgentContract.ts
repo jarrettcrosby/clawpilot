@@ -3,7 +3,7 @@ const SCHEMA_NAME_PATTERN = /^[a-z][a-z0-9_]{2,63}$/
 const CAREER_SITE_SOURCE_APP = 'jarrett-career-agents'
 const CAREER_SITE_OWNER_EMAIL = 'jarrett@suburbiasandwichco.com'
 const CAREER_SITE_ORGANIZATION_ID = '405bb919-0364-4a88-8a62-b4c9da42cd8f'
-const CLAWPILOT_PRODUCTION_ORIGIN = 'https://aiapp.eigenracing.com'
+const CLAWPILOT_LOCAL_ORIGIN = 'http://localhost:4002'
 const MAX_INSTRUCTIONS_LENGTH = 16_000
 const MAX_PROMPT_LENGTH = 180_000
 const MAX_SCHEMA_BYTES = 64 * 1024
@@ -130,7 +130,7 @@ export function parseCareerSiteAgentRequest(value: unknown): CareerSiteAgentRequ
 function connectUrl(): string {
   const configured = String(process.env.CLAWPILOT_PUBLIC_URL || '').trim()
   try {
-    const url = new URL(configured || CLAWPILOT_PRODUCTION_ORIGIN)
+    const url = new URL(configured || CLAWPILOT_LOCAL_ORIGIN)
     const loopback = process.env.NODE_ENV !== 'production'
       && url.protocol === 'http:'
       && (url.hostname === 'localhost' || url.hostname === '127.0.0.1')

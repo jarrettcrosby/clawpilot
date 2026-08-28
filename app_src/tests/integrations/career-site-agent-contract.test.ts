@@ -26,6 +26,7 @@ const originalEnvironment = {
   CAREER_SITE_SUBMISSIONS_OWNER_EMAIL: process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL,
   CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID: process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID,
   CLAWPILOT_PUBLIC_URL: process.env.CLAWPILOT_PUBLIC_URL,
+  NODE_ENV: process.env.NODE_ENV,
 }
 
 afterEach(() => {
@@ -77,6 +78,17 @@ test('requires the exact Career Desk service identity and exposes the Agents log
     organizationId: '405bb919-0364-4a88-8a62-b4c9da42cd8f',
     connectUrl: 'https://aiapp.eigenracing.com/#agents',
   })
+
+  delete process.env.CLAWPILOT_PUBLIC_URL
+  process.env.NODE_ENV = 'development'
+  assert.equal(
+    resolveCareerSiteAgentConfiguration().connectUrl,
+    'http://localhost:4002/#agents',
+  )
+
+  process.env.NODE_ENV = 'production'
+  assert.throws(() => resolveCareerSiteAgentConfiguration())
+  process.env.CLAWPILOT_PUBLIC_URL = 'https://aiapp.eigenracing.com'
 
   process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL = 'other@example.com'
   assert.throws(() => resolveCareerSiteAgentConfiguration())
