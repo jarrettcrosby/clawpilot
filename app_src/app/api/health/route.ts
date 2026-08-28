@@ -7,6 +7,8 @@ import { resolveCareerSiteSubmissionConfiguration } from '@/lib/careerSiteSubmis
 import { resolveCareerSiteMailConfiguration } from '@/lib/careerSiteMailContract'
 import { resolveCareerSiteAgentConfiguration } from '@/lib/careerSiteAgentContract'
 import { getCareerSiteAgentConnectionHealth } from '@/lib/careerSiteAgents'
+import { resolveCareerSiteGmailSourceConfiguration } from '@/lib/careerSiteGmailSourceContract'
+import { getCareerSiteGmailSourceReadiness } from '@/lib/careerSiteGmailSources'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
@@ -2920,6 +2922,12 @@ export async function GET() {
       configured: false,
       connected: null,
     }
+    let careerSiteGmailSources: Record<string, unknown> = {
+      enabled: process.env.CAREER_SITE_AGENTS_ENABLED === '1',
+      configured: false,
+      ready: false,
+      activeAccountCount: 0,
+    }
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
@@ -3131,6 +3139,43 @@ export async function GET() {
           name: error instanceof Error ? error.name : typeof error,
         })
         errors.push('Career Desk agent configuration is invalid.')
+      }
+    }
+    if (process.env.CAREER_SITE_AGENTS_ENABLED === '1') {
+      try {
+        const configuration = resolveCareerSiteGmailSourceConfiguration()
+        if (!configuration.enabled || !shortLinkConfigurationReady) {
+          throw new Error('Career Desk Gmail source service identity is unavailable')
+        }
+        careerSiteGmailSources = {
+          enabled: true,
+          configured: true,
+          ready: false,
+          activeAccountCount: 0,
+        }
+        try {
+          const readiness = await getCareerSiteGmailSourceReadiness(
+            configuration.ownerEmail,
+          )
+          careerSiteGmailSources = {
+            enabled: true,
+            configured: true,
+            ...readiness,
+          }
+          if (!readiness.ready) {
+            warnings.push('Career Desk Gmail sources are not ready.')
+          }
+        } catch (error) {
+          console.error('[health] Career Desk Gmail source readiness check failed', {
+            name: error instanceof Error ? error.name : typeof error,
+          })
+          warnings.push('Career Desk Gmail source readiness could not be verified.')
+        }
+      } catch (error) {
+        console.error('[health] Career Desk Gmail source configuration check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career Desk Gmail source configuration is invalid.')
       }
     }
     let embeddingProvider: 'local' | 'openai' = 'local'
@@ -10004,6 +10049,7 @@ export async function GET() {
       careerSiteSubmissions,
       careerSiteMail,
       careerSiteAgents,
+      careerSiteGmailSources,
       credentialStore,
       worker,
       agentWorker,

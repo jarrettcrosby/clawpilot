@@ -58,6 +58,22 @@ type MatonGatewayCredentialRow = {
   account_email: string | null
 }
 
+type ActiveMatonConnectionRow = {
+  connection_id: string
+  account_email: string | null
+  status: string
+}
+
+type MatonCredentialReadinessRow = {
+  ready: boolean
+}
+
+export type ActiveMatonGatewayConnection = {
+  connectionId: string
+  accountEmail: string | null
+  status: 'ACTIVE'
+}
+
 export type MatonConnectionWrite = {
   connectionId: string
   name: string
@@ -435,6 +451,49 @@ export async function readMatonCredentialStateFromPostgres(ownerEmail: string): 
     [ownerEmail],
   )
   return credentialState(credential.rows[0], connections.rows)
+}
+
+export async function readActiveMatonConnectionsFromPostgres(input: {
+  ownerEmail: string
+  app: string
+}): Promise<ActiveMatonGatewayConnection[]> {
+  const result = await query<ActiveMatonConnectionRow>(
+    `
+      SELECT connection_id, account_email, status
+      FROM user_maton_connections
+      WHERE owner_email = $1
+        AND app = $2
+        AND status = 'ACTIVE'
+        AND source = 'maton'
+      ORDER BY account_email ASC NULLS LAST, connection_id ASC
+    `,
+    [input.ownerEmail, input.app],
+  )
+  return result.rows.map((row) => ({
+    connectionId: row.connection_id,
+    accountEmail: row.account_email,
+    status: 'ACTIVE',
+  }))
+}
+
+export async function readMatonCredentialReadinessFromPostgres(
+  ownerEmail: string,
+): Promise<boolean> {
+  const result = await query<MatonCredentialReadinessRow>(
+    `
+      SELECT (
+        api_key_ciphertext IS NOT NULL
+        AND octet_length(api_key_ciphertext) BETWEEN 16 AND 4096
+        AND octet_length(api_key_iv) = 12
+        AND octet_length(api_key_tag) = 16
+        AND key_revoked_at IS NULL
+      ) AS ready
+      FROM user_maton_credentials
+      WHERE owner_email = $1
+    `,
+    [ownerEmail],
+  )
+  return result.rows[0]?.ready === true
 }
 
 export async function readEncryptedMatonApiKeyFromPostgres(
