@@ -1404,6 +1404,7 @@ for (const requiredPath of [
   'scripts/test-career-site-mail-delivery.mjs',
   'scripts/test-career-site-mail-worker.mjs',
   'scripts/test-mail-sender-verifier.mjs',
+  'scripts/test-career-site-migration-verifier.mjs',
   'scripts/test-career-site-submissions-postgres.mjs',
   'scripts/test-career-site-mail-postgres.mjs',
   'scripts/verify-career-site-migrations.mjs',
@@ -1516,6 +1517,13 @@ for (const requiredPath of [
   if (!existsSync(resolve(root, requiredPath))) {
     fail(`missing deployment runtime file: ${requiredPath}`)
   }
+}
+
+if (
+  !String(rootPackage?.scripts?.['test:career-site-submissions'] || '')
+    .includes('scripts/test-career-site-migration-verifier.mjs')
+) {
+  fail('career-site submission tests must run the PostgreSQL 16/18 migration verifier')
 }
 
 const applicationPackage = JSON.parse(readFileSync(resolve(root, 'app_src/package.json'), 'utf8'))
