@@ -58,6 +58,18 @@ type MatonGatewayCredentialRow = {
   account_email: string | null
 }
 
+type ActiveMatonConnectionRow = {
+  connection_id: string
+  account_email: string | null
+  status: string
+}
+
+export type ActiveMatonGatewayConnection = {
+  connectionId: string
+  accountEmail: string | null
+  status: 'ACTIVE'
+}
+
 export type MatonConnectionWrite = {
   connectionId: string
   name: string
@@ -435,6 +447,29 @@ export async function readMatonCredentialStateFromPostgres(ownerEmail: string): 
     [ownerEmail],
   )
   return credentialState(credential.rows[0], connections.rows)
+}
+
+export async function readActiveMatonConnectionsFromPostgres(input: {
+  ownerEmail: string
+  app: string
+}): Promise<ActiveMatonGatewayConnection[]> {
+  const result = await query<ActiveMatonConnectionRow>(
+    `
+      SELECT connection_id, account_email, status
+      FROM user_maton_connections
+      WHERE owner_email = $1
+        AND app = $2
+        AND status = 'ACTIVE'
+        AND source = 'maton'
+      ORDER BY account_email ASC NULLS LAST, connection_id ASC
+    `,
+    [input.ownerEmail, input.app],
+  )
+  return result.rows.map((row) => ({
+    connectionId: row.connection_id,
+    accountEmail: row.account_email,
+    status: 'ACTIVE',
+  }))
 }
 
 export async function readEncryptedMatonApiKeyFromPostgres(
