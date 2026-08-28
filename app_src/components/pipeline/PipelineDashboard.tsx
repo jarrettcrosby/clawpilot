@@ -17,6 +17,7 @@ import type {
   PipelineSnapshot,
   ReportPreset,
 } from '@/components/pipeline/usePipelineReport'
+import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 
 type Props = {
   stages: string[]
@@ -92,13 +93,7 @@ function forecastMonthLabel(value: string) {
 }
 
 function money(value: number) {
-  const number = Number(value || 0)
-  return number.toLocaleString('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: Number.isInteger(number) ? 0 : 2,
-    maximumFractionDigits: 2,
-  })
+  return formatPipelineCurrency(Number(value || 0))
 }
 
 function shortMoney(value: number) {

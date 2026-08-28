@@ -11,6 +11,7 @@ import Typography from '@mui/material/Typography'
 import EventBusyRounded from '@mui/icons-material/EventBusyRounded'
 import WarningAmberRounded from '@mui/icons-material/WarningAmberRounded'
 import type { PipelineSnapshot } from '@/components/pipeline/usePipelineReport'
+import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 import { summarizePipeline } from '@/lib/pipeline/analytics.mjs'
 
 export type PipelineInsightDeal = {
@@ -47,12 +48,6 @@ type ValueGroup = {
   value: number
   weighted: number
 }
-
-const currency = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 2,
-})
 
 const percent = new Intl.NumberFormat('en-US', {
   style: 'percent',
@@ -93,12 +88,12 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
               <Stack direction="row" justifyContent="space-between" alignItems="baseline" spacing={1}>
                 <Typography variant="body2" fontWeight={600} noWrap>{group.label}</Typography>
                 <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
-                  {group.count} · {currency.format(value)}
+                  {group.count} · {formatPipelineCurrency(value)}
                 </Typography>
               </Stack>
               <Box sx={{ mt: 0.65, height: 6, backgroundColor: 'rgba(255,255,255,0.07)', borderRadius: 1 }}>
                 <Tooltip
-                  title={`${group.label} · ${weighted ? 'Weighted value' : 'Active value'}: ${currency.format(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
+                  title={`${group.label} · ${weighted ? 'Weighted value' : 'Active value'}: ${formatPipelineCurrency(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
                   arrow
                   describeChild
                   enterTouchDelay={0}
@@ -108,7 +103,7 @@ function Distribution({ title, groups, weighted = false }: { title: string; grou
                     data-chart-mark
                     tabIndex={0}
                     role="img"
-                    aria-label={`${group.label}: ${currency.format(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
+                    aria-label={`${group.label}: ${formatPipelineCurrency(value)} across ${group.count.toLocaleString('en-US')} opportunities`}
                     sx={{
                       height: '100%',
                       width: `${Math.max(2, (value / max) * 100)}%`,
@@ -161,8 +156,8 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
           mb: 3,
         }}
       >
-        <Metric label="Active pipeline · current snapshot" value={snapshot ? currency.format(snapshot.activePipelineValue) : '—'} tone="positive" />
-        <Metric label="Weighted pipeline · current snapshot" value={snapshot ? currency.format(snapshot.weightedPipelineValue) : '—'} />
+        <Metric label="Active pipeline · current snapshot" value={snapshot ? formatPipelineCurrency(snapshot.activePipelineValue) : '—'} tone="positive" />
+        <Metric label="Weighted pipeline · current snapshot" value={snapshot ? formatPipelineCurrency(snapshot.weightedPipelineValue) : '—'} />
         <Metric label="Active · current snapshot" value={snapshot?.activeOpportunities ?? '—'} />
         <Metric label="On hold · current snapshot" value={snapshot?.onHoldOpportunities ?? '—'} tone={snapshot && snapshot.onHoldOpportunities > 0 ? 'warning' : 'default'} />
         <Metric label="Lifetime won" value={snapshot?.wonOpportunities ?? '—'} tone="positive" />
@@ -227,7 +222,7 @@ export default function PipelineInsights({ deals, snapshot, stages, onOpenDeal }
               <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block' }}>{deal.name || 'Unspecified product'} · {deal.stage || 'Unspecified stage'}</Typography>
             </Box>
             <Box sx={{ textAlign: 'right', flexShrink: 0, pl: 2 }}>
-              <Typography variant="body2" fontWeight={700} color="#66BB6A">{currency.format(Number(deal.value || 0))}</Typography>
+              <Typography variant="body2" fontWeight={700} color="#66BB6A">{formatPipelineCurrency(Number(deal.value || 0))}</Typography>
               <Typography variant="caption" color="text.secondary">{Number(deal.probability || 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}%</Typography>
             </Box>
           </ButtonBase>

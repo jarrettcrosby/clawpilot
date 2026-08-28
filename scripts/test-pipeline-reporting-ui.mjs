@@ -11,6 +11,7 @@ const reportHook = read('app_src/components/pipeline/usePipelineReport.ts')
 const homeDashboard = read('app_src/components/dashboard/DashboardSection.tsx')
 const dashboardBootstrap = read('app_src/lib/dashboardBootstrapServer.ts')
 const crmPersistence = read('app_src/lib/persistence/crm.ts')
+const pipelineCurrency = read('app_src/lib/crm/pipelineCurrency.ts')
 
 for (const fragment of [
   "useState<ReportPreset>('last_3_calendar_months')",
@@ -147,6 +148,10 @@ for (const label of [
   assert.ok(homeDashboard.includes(label), `home dashboard missing honest pipeline label: ${label}`)
 }
 assert.doesNotMatch(homeDashboard, /\['Open value'/)
+assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.activePipelineValue/)
+assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.weightedPipelineValue/)
+assert.match(pipelineCurrency, /minimumFractionDigits: 2/)
+assert.match(pipelineCurrency, /maximumFractionDigits: 2/)
 assert.match(dashboardBootstrap, /activeOpportunities: summary\.activeOpportunities/)
 assert.match(dashboardBootstrap, /activePipelineValue: summary\.activePipelineValue/)
 assert.match(dashboardBootstrap, /weightedPipelineValue: summary\.weightedPipelineValue/)
