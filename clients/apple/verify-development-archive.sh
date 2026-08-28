@@ -43,25 +43,72 @@ expected_build="$(/usr/bin/awk '
 [[ -d "${phone_app}" && -f "${phone_plist}" ]] || fail "signed iPhone application is missing"
 [[ -d "${watch_app}" && -f "${watch_plist}" ]] || fail "signed Watch application is missing"
 
+config_value_from_file() {
+  local key="$1"
+  local config_path="$2"
+  local depth="$3"
+  local config_dir
+  local line
+  local include_optional
+  local include_reference
+  local include_path
+  local include_value
+  local assignment_value
+  local resolved_value=""
+  local found_value=false
+
+  (( depth <= 16 )) || return 1
+  [[ -f "${config_path}" ]] || return 1
+  config_dir="$(cd "$(dirname "${config_path}")" && pwd)" || return 1
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*#include(\?)?[[:space:]]+\"([^\"]+)\" ]]; then
+      include_optional="${BASH_REMATCH[1]}"
+      include_reference="${BASH_REMATCH[2]}"
+      if [[ "${include_reference}" == /* ]]; then
+        include_path="${include_reference}"
+      else
+        include_path="${config_dir}/${include_reference}"
+      fi
+
+      if [[ -f "${include_path}" ]]; then
+        if include_value="$(config_value_from_file "${key}" "${include_path}" "$((depth + 1))")"; then
+          resolved_value="${include_value}"
+          found_value=true
+        fi
+      elif [[ "${include_optional}" != "?" ]]; then
+        return 1
+      fi
+      continue
+    fi
+
+    assignment_value="$(printf '%s\n' "${line}" | /usr/bin/awk -v wanted="${key}" '
+      function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+      }
+      {
+        separator = index($0, "=")
+        if (separator == 0) exit 1
+        name = trim(substr($0, 1, separator - 1))
+        if (name != wanted) exit 1
+        value = trim(substr($0, separator + 1))
+        if (value == "") exit 1
+        printf "%s", value
+      }
+    ')" || continue
+    resolved_value="${assignment_value}"
+    found_value=true
+  done < "${config_path}"
+
+  [[ "${found_value}" == true ]] || return 1
+  printf '%s' "${resolved_value}"
+}
+
 config_value() {
   local key="$1"
-  /usr/bin/awk -v wanted="${key}" '
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-    {
-      separator = index($0, "=")
-      if (separator == 0) next
-      name = trim(substr($0, 1, separator - 1))
-      if (name == wanted) result = trim(substr($0, separator + 1))
-    }
-    END {
-      if (result == "") exit 1
-      printf "%s", result
-    }
-  ' "${local_config_path}"
+  config_value_from_file "${key}" "${local_config_path}" 0
 }
 
 required_config_value() {
