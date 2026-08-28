@@ -5,6 +5,8 @@ import { getRepositoryRunnerConfiguration } from '@/lib/agents/repositoryRunnerC
 import { getPrintAgentReleaseConfiguration } from '@/lib/operations/printAgentReleaseConfig'
 import { resolveCareerSiteSubmissionConfiguration } from '@/lib/careerSiteSubmissionContract'
 import { resolveCareerSiteMailConfiguration } from '@/lib/careerSiteMailContract'
+import { resolveCareerSiteAgentConfiguration } from '@/lib/careerSiteAgentContract'
+import { getCareerSiteAgentConnectionHealth } from '@/lib/careerSiteAgents'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
@@ -2913,6 +2915,11 @@ export async function GET() {
       healthy: true,
       status: 'disabled',
     }
+    let careerSiteAgents: Record<string, unknown> = {
+      enabled: process.env.CAREER_SITE_AGENTS_ENABLED === '1',
+      configured: false,
+      connected: null,
+    }
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
@@ -3083,10 +3090,48 @@ export async function GET() {
         errors.push(error instanceof Error ? error.message : 'SuiteCRM configuration is invalid.')
       }
     }
+    let shortLinkConfigurationReady = false
     try {
       validateShortLinkConfiguration({ requireServiceClient: true, requirePublicOrigin: true })
+      shortLinkConfigurationReady = true
     } catch (error) {
       errors.push(error instanceof Error ? error.message : 'Short-link configuration is invalid.')
+    }
+    if (process.env.CAREER_SITE_AGENTS_ENABLED !== '1') {
+      warnings.push('Career Desk agents are not enabled in this runtime.')
+    } else {
+      try {
+        const configuration = resolveCareerSiteAgentConfiguration()
+        if (!configuration.enabled || !shortLinkConfigurationReady) {
+          throw new Error('Career Desk agent service identity is unavailable')
+        }
+        careerSiteAgents = {
+          enabled: true,
+          configured: true,
+          connected: null,
+        }
+        if (credentialStore.status === 'reachable') {
+          try {
+            const connection = await getCareerSiteAgentConnectionHealth(
+              configuration.ownerEmail,
+            )
+            careerSiteAgents.connected = connection.connected
+            if (!connection.connected) {
+              warnings.push('Career Desk ChatGPT connection is not connected.')
+            }
+          } catch (error) {
+            console.error('[health] Career Desk ChatGPT connection check failed', {
+              name: error instanceof Error ? error.name : typeof error,
+            })
+            errors.push('Career Desk ChatGPT connection could not be verified.')
+          }
+        }
+      } catch (error) {
+        console.error('[health] Career Desk agent configuration check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career Desk agent configuration is invalid.')
+      }
     }
     let embeddingProvider: 'local' | 'openai' = 'local'
     try {
@@ -9958,6 +10003,7 @@ export async function GET() {
       database,
       careerSiteSubmissions,
       careerSiteMail,
+      careerSiteAgents,
       credentialStore,
       worker,
       agentWorker,

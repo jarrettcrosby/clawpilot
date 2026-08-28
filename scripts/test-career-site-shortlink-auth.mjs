@@ -81,6 +81,7 @@ function configureCareerClient() {
 
 const original = {
   enabled: process.env.CAREER_SITE_SUBMISSIONS_ENABLED,
+  agentsEnabled: process.env.CAREER_SITE_AGENTS_ENABLED,
   owner: process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL,
   organization: process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID,
   origin: process.env.SHORTLINK_PUBLIC_ORIGIN,
@@ -124,7 +125,44 @@ try {
   )
   assert.equal(membershipCalls, 0)
 
+  process.env.CAREER_SITE_AGENTS_ENABLED = '1'
+  process.env.SHORTLINK_SERVICE_CLIENTS_JSON = JSON.stringify([
+    {
+      sourceApp: 'jarrett-career-site',
+      secret: 'career-site-secret-that-is-longer-than-thirty-two-characters',
+      ownerDomain: 'suburbiasandwichco.com',
+      ownerEmail: 'jarrett@suburbiasandwichco.com',
+      organizationId,
+    },
+    {
+      sourceApp: 'jarrett-career-agents',
+      secret: 'isolated-career-agent-secret-longer-than-thirty-two-characters',
+      ownerDomain: 'suburbiasandwichco.com',
+      ownerEmail: 'jarrett@suburbiasandwichco.com',
+      organizationId,
+    },
+  ])
+  shortlinks = loadShortlinks(async () => ({ organizationId }))
+  assert.doesNotThrow(() => shortlinks.validateShortLinkConfiguration({ requireServiceClient: true }))
+  const agent = await shortlinks.resolveShortLinkActor(request({
+    authorization: 'Bearer isolated-career-agent-secret-longer-than-thirty-two-characters',
+    'x-shortlink-source': 'jarrett-career-agents',
+    'x-shortlink-owner': 'jarrett@suburbiasandwichco.com',
+    'x-shortlink-organization': organizationId,
+  }))
+  assert.equal(agent.service, true)
+  assert.equal(agent.sourceApp, 'jarrett-career-agents')
+
+  const duplicateSecretClients = JSON.parse(process.env.SHORTLINK_SERVICE_CLIENTS_JSON)
+  duplicateSecretClients[1].secret = duplicateSecretClients[0].secret
+  process.env.SHORTLINK_SERVICE_CLIENTS_JSON = JSON.stringify(duplicateSecretClients)
+  assert.throws(
+    () => shortlinks.validateShortLinkConfiguration({ requireServiceClient: true }),
+    /secret must be unique/,
+  )
+
   process.env.CAREER_SITE_SUBMISSIONS_ENABLED = '0'
+  process.env.CAREER_SITE_AGENTS_ENABLED = '0'
   process.env.SHORTLINK_SERVICE_CLIENTS_JSON = JSON.stringify([{
     sourceApp: 'legacy-client',
     secret: 'legacy-service-secret-that-is-longer-than-thirty-two-characters',
@@ -147,6 +185,7 @@ try {
     else process.env[name] = value
   }
   restore('CAREER_SITE_SUBMISSIONS_ENABLED', original.enabled)
+  restore('CAREER_SITE_AGENTS_ENABLED', original.agentsEnabled)
   restore('CAREER_SITE_SUBMISSIONS_OWNER_EMAIL', original.owner)
   restore('CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID', original.organization)
   restore('SHORTLINK_PUBLIC_ORIGIN', original.origin)

@@ -267,6 +267,38 @@ export function validateShortLinkConfiguration(options: { requireServiceClient?:
       }
     }
   }
+  if (process.env.CAREER_SITE_AGENTS_ENABLED === '1') {
+    if (!String(process.env.SHORTLINK_SERVICE_CLIENTS_JSON || '').trim()) {
+      throw new Error('Career Desk agents require an isolated JSON service client')
+    }
+    const expectedOwner = normalizeUserEmail(process.env.CAREER_SITE_SUBMISSIONS_OWNER_EMAIL)
+    const expectedOrganizationId = String(
+      process.env.CAREER_SITE_SUBMISSIONS_ORGANIZATION_ID || '',
+    ).trim().toLowerCase()
+    if (expectedOrganizationId !== CAREER_SITE_ORGANIZATION_ID) {
+      throw new Error('Career Desk agent organization identity is not configured')
+    }
+    const agentClient = clients.find((client) => client.sourceApp === 'jarrett-career-agents')
+    if (
+      !agentClient
+      || agentClient.ownerDomain !== 'suburbiasandwichco.com'
+      || agentClient.ownerEmail !== expectedOwner
+      || agentClient.organizationId !== expectedOrganizationId
+    ) {
+      throw new Error('Career Desk agent service identity is not exact')
+    }
+    if (clients.some((client) => client !== agentClient && secureEqual(client.secret, agentClient.secret))) {
+      throw new Error('Career Desk agent service secret must be unique')
+    }
+    for (const otherSecret of [
+      process.env.SHORTLINK_SERVICE_SECRET,
+      process.env.PIPELINE_OUTBOX_WORKER_SECRET,
+    ]) {
+      if (otherSecret && secureEqual(otherSecret, agentClient.secret)) {
+        throw new Error('Career Desk agent service secret must be isolated from worker and legacy credentials')
+      }
+    }
+  }
   return { origin, serviceClientCount: clients.length }
 }
 

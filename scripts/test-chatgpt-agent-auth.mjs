@@ -124,6 +124,29 @@ assert.equal(body.store, false)
 assert.equal(body.model, 'gpt-test')
 assert.equal(body.input[0].content[0].text, 'Test prompt')
 
+requests.length = 0
+await responseModule.runChatGPTCodexStructuredResponse({
+  credential: { accessToken: 'test-access', accountId: 'account-123' },
+  model: 'gpt-test',
+  instructions: 'Return JSON',
+  prompt: 'Structured prompt',
+  sessionId: 'clawpilot_structured_session',
+  outputSchema: {
+    name: 'career_test_output',
+    schema: {
+      type: 'object',
+      properties: { result: { type: 'string' } },
+      required: ['result'],
+      additionalProperties: false,
+    },
+  },
+})
+const structuredBody = JSON.parse(requests[0].init.body)
+assert.equal(structuredBody.text.format.type, 'json_schema')
+assert.equal(structuredBody.text.format.name, 'career_test_output')
+assert.equal(structuredBody.text.format.strict, true)
+assert.equal(structuredBody.text.format.schema.additionalProperties, false)
+
 const errorModule = loadTypeScriptModule('app_src/lib/agents/chatgptResponses.ts', {
   async fetch() {
     return new Response(JSON.stringify({ error: { message: 'authorization expired' } }), {
