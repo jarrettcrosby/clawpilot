@@ -47,6 +47,28 @@ private final class GoogleLinkRequiredURLProtocol: URLProtocol, @unchecked Senda
     override func stopLoading() {}
 }
 
+private final class MagicCodeUnavailableURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 503,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"ok":false,"error":"Unable to send a sign-in code."}"#.utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class WorkspaceRejectedURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -381,6 +403,26 @@ func nativeAuthenticationPersistsSessionCookie() async throws {
     })
     #expect(cookie.value == "test-token")
     #expect(cookie.isSecure)
+}
+
+@Test("native magic-code requests preserve a code-less service error")
+func nativeMagicCodeRequestPreservesServiceError() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [MagicCodeUnavailableURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-magic-code-unavailable.test")!,
+        session: URLSession(configuration: configuration)
+    )
+
+    do {
+        try await client.requestMagicCode(email: "picker@example.com")
+        Issue.record("Expected the unavailable magic-code request to be rejected")
+    } catch let error as PickingAPIError {
+        #expect(error == .rejected(
+            code: "AUTH_FAILED",
+            message: "Unable to send a sign-in code."
+        ))
+    }
 }
 
 @Test("native workspace switching persists the rotated secure session cookie")
