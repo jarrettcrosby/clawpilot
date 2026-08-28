@@ -191,7 +191,7 @@ for (const fragment of [
 }
 assert.equal(
   ordinaryCancellationMigrationChecksum,
-  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b',
+  'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87',
   'health attestation must pin the exact ordinary-cancellation migration',
 )
 for (const fragment of [
@@ -200,6 +200,7 @@ for (const fragment of [
   'ADD COLUMN cancel_restock boolean',
   'ADD COLUMN cancel_notify_customer boolean',
   'ADD COLUMN cancellation_payment_evidence jsonb',
+  'ADD COLUMN legacy_cancellation_without_payment_evidence boolean NOT NULL DEFAULT false',
   "'shopify-order-cancel-payment-evidence-v2'",
   "action = 'cancel'",
   'protect_shopify_order_cancel_intent_insert',
@@ -275,10 +276,10 @@ for (const fragment of [
   "'protect_shopify_fulfillment_reversal_authorization_insert()'",
   "'protect_shopify_fulfillment_reversal_attempt_insert()'",
   "'0337_operations_shopify_ordinary_order_cancellation.sql'",
-  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b',
-  'f67516c01f44ae9e7fa1733d71f068155f60d1633926716790f1da4eca4587e2',
-  '922c98d8622f56d4ab1569fd660b655dd1b1f73a6d544888abc26193dbdecc44',
-  '07e089a45cbd1826c9b0f056aa3a3685457923b3777c31451d6847fe6d7b6231',
+  'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87',
+  '39acf5cbf1ff256164a7356ee99dee632061846149c872653d30aa035245bd21',
+  '009867f38b56aa5a0beaca8a080e1722f31d2049990b176348af824f6a0641b6',
+  'a05377aa0740afa35ff880f338025d5dbab16d9f25e8e9229611c1c6d468f018',
   "'ops_shopify_order_mgmt_auth_environment_valid'",
   "'ops_shopify_order_mgmt_cancel_reason_valid'",
   "'ops_shopify_order_mgmt_cancel_choices_valid'",
@@ -821,8 +822,8 @@ if (liveDatabaseUrl) {
     'e2b3e102a168eca0294656e883c74bfd2ebdac1740bfe13a14c36c282c79af99',
     'efbf355bd9d0c9f620a627ac36911a94b0f7d4a9647093afa5f0921e068405fc',
     'e618c2fe799586d8ef6835844e0666c2cfe18bf7123461eb731868c1fc5ceeed',
-    '922c98d8622f56d4ab1569fd660b655dd1b1f73a6d544888abc26193dbdecc44',
-    '07e089a45cbd1826c9b0f056aa3a3685457923b3777c31451d6847fe6d7b6231',
+    '009867f38b56aa5a0beaca8a080e1722f31d2049990b176348af824f6a0641b6',
+    'a05377aa0740afa35ff880f338025d5dbab16d9f25e8e9229611c1c6d468f018',
   ]) {
     assert.ok(
       providerWriteHealthExpression.includes(requiredPhaseFragment),

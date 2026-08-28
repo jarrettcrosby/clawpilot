@@ -144,28 +144,45 @@ ALTER TABLE public.operations_shopify_order_management_authorizations
   ADD COLUMN cancel_refund_method text,
   ADD COLUMN cancel_restock boolean,
   ADD COLUMN cancel_notify_customer boolean,
-  ADD COLUMN cancellation_payment_evidence jsonb;
+  ADD COLUMN cancellation_payment_evidence jsonb,
+  ADD COLUMN legacy_cancellation_without_payment_evidence boolean NOT NULL DEFAULT false;
 
 ALTER TABLE public.operations_shopify_order_management_attempts
   ADD COLUMN cancel_refund_method text,
   ADD COLUMN cancel_restock boolean,
   ADD COLUMN cancel_notify_customer boolean,
-  ADD COLUMN cancellation_payment_evidence jsonb;
+  ADD COLUMN cancellation_payment_evidence jsonb,
+  ADD COLUMN legacy_cancellation_without_payment_evidence boolean NOT NULL DEFAULT false;
 
 -- Historical test-fixture rows did not retain the choices because all three
 -- were hard-coded false. Preserve that exact meaning without fabricating the
 -- older payment snapshot, which remains bound by provider_snapshot_hash.
+-- The ledger's normal immutable-write triggers correctly reject these field
+-- changes, so disable only those two triggers inside this transactional
+-- migration and immediately restore them after the bounded backfill.
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  DISABLE TRIGGER protect_shopify_order_management_authorization_write;
+ALTER TABLE public.operations_shopify_order_management_attempts
+  DISABLE TRIGGER protect_shopify_order_management_attempt_write;
+
 UPDATE public.operations_shopify_order_management_authorizations
 SET cancel_refund_method = 'none',
     cancel_restock = false,
-    cancel_notify_customer = false
+    cancel_notify_customer = false,
+    legacy_cancellation_without_payment_evidence = true
 WHERE action IN ('cancel', 'cancel_order_after_fulfillment_reversal');
 
 UPDATE public.operations_shopify_order_management_attempts
 SET cancel_refund_method = 'none',
     cancel_restock = false,
-    cancel_notify_customer = false
+    cancel_notify_customer = false,
+    legacy_cancellation_without_payment_evidence = true
 WHERE action IN ('cancel', 'cancel_order_after_fulfillment_reversal');
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ENABLE TRIGGER protect_shopify_order_management_authorization_write;
+ALTER TABLE public.operations_shopify_order_management_attempts
+  ENABLE TRIGGER protect_shopify_order_management_attempt_write;
 
 DO $$
 DECLARE
@@ -197,13 +214,25 @@ ALTER TABLE public.operations_shopify_order_management_authorizations
   ADD CONSTRAINT ops_shopify_order_mgmt_cancel_choices_valid CHECK (
     (
       action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
-      AND cancel_refund_method IN ('none', 'original_payment_methods')
-      AND cancel_restock IS NOT NULL
-      AND cancel_notify_customer IS NOT NULL
-      AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
-        cancellation_payment_evidence,
-        cancel_refund_method
-      ) IS TRUE
+      AND (
+        (
+          legacy_cancellation_without_payment_evidence IS TRUE
+          AND cancel_refund_method = 'none'
+          AND cancel_restock IS FALSE
+          AND cancel_notify_customer IS FALSE
+          AND cancellation_payment_evidence IS NULL
+        )
+        OR (
+          legacy_cancellation_without_payment_evidence IS FALSE
+          AND cancel_refund_method IN ('none', 'original_payment_methods')
+          AND cancel_restock IS NOT NULL
+          AND cancel_notify_customer IS NOT NULL
+          AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+            cancellation_payment_evidence,
+            cancel_refund_method
+          ) IS TRUE
+        )
+      )
     )
     OR (
       action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
@@ -211,6 +240,7 @@ ALTER TABLE public.operations_shopify_order_management_authorizations
       AND cancel_restock IS NULL
       AND cancel_notify_customer IS NULL
       AND cancellation_payment_evidence IS NULL
+      AND legacy_cancellation_without_payment_evidence IS FALSE
     )
   ) NOT VALID;
 
@@ -218,13 +248,25 @@ ALTER TABLE public.operations_shopify_order_management_attempts
   ADD CONSTRAINT ops_shopify_order_mgmt_attempt_cancel_choices_valid CHECK (
     (
       action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
-      AND cancel_refund_method IN ('none', 'original_payment_methods')
-      AND cancel_restock IS NOT NULL
-      AND cancel_notify_customer IS NOT NULL
-      AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
-        cancellation_payment_evidence,
-        cancel_refund_method
-      ) IS TRUE
+      AND (
+        (
+          legacy_cancellation_without_payment_evidence IS TRUE
+          AND cancel_refund_method = 'none'
+          AND cancel_restock IS FALSE
+          AND cancel_notify_customer IS FALSE
+          AND cancellation_payment_evidence IS NULL
+        )
+        OR (
+          legacy_cancellation_without_payment_evidence IS FALSE
+          AND cancel_refund_method IN ('none', 'original_payment_methods')
+          AND cancel_restock IS NOT NULL
+          AND cancel_notify_customer IS NOT NULL
+          AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+            cancellation_payment_evidence,
+            cancel_refund_method
+          ) IS TRUE
+        )
+      )
     )
     OR (
       action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
@@ -232,6 +274,7 @@ ALTER TABLE public.operations_shopify_order_management_attempts
       AND cancel_restock IS NULL
       AND cancel_notify_customer IS NULL
       AND cancellation_payment_evidence IS NULL
+      AND legacy_cancellation_without_payment_evidence IS FALSE
     )
   ) NOT VALID;
 
@@ -428,6 +471,7 @@ AS $$
 BEGIN
   IF (
     NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+    AND NEW.legacy_cancellation_without_payment_evidence IS FALSE
     AND NEW.cancel_refund_method IN ('none', 'original_payment_methods')
     AND NEW.cancel_restock IS NOT NULL
     AND NEW.cancel_notify_customer IS NOT NULL
@@ -479,10 +523,22 @@ AS $$
 BEGIN
   IF (
     NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
-    AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
-      NEW.cancellation_payment_evidence,
-      NEW.cancel_refund_method
-    ) IS TRUE
+    AND (
+      (
+        NEW.legacy_cancellation_without_payment_evidence IS FALSE
+        AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+          NEW.cancellation_payment_evidence,
+          NEW.cancel_refund_method
+        ) IS TRUE
+      )
+      OR (
+        NEW.legacy_cancellation_without_payment_evidence IS TRUE
+        AND NEW.cancel_refund_method = 'none'
+        AND NEW.cancel_restock IS FALSE
+        AND NEW.cancel_notify_customer IS FALSE
+        AND NEW.cancellation_payment_evidence IS NULL
+      )
+    )
     AND EXISTS (
        SELECT 1
        FROM public.operations_shopify_order_management_authorizations authz
@@ -492,8 +548,10 @@ BEGIN
          AND authz.cancel_refund_method = NEW.cancel_refund_method
          AND authz.cancel_restock = NEW.cancel_restock
          AND authz.cancel_notify_customer = NEW.cancel_notify_customer
-         AND authz.cancellation_payment_evidence =
+         AND authz.cancellation_payment_evidence IS NOT DISTINCT FROM
                NEW.cancellation_payment_evidence
+         AND authz.legacy_cancellation_without_payment_evidence =
+               NEW.legacy_cancellation_without_payment_evidence
          AND authz.intent_hash = NEW.intent_hash
          AND authz.provider_snapshot_hash = NEW.provider_snapshot_hash
     )

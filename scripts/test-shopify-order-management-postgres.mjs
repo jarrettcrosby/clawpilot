@@ -864,6 +864,281 @@ async function seedFulfillmentReversalEvidence(pool, fixture) {
   }
 }
 
+async function seedLegacyCancellationAuthorization(
+  pool,
+  fixture,
+  status,
+  legacyIntentHash,
+) {
+  const activation = await pool.query(
+    `SELECT state, revision::text
+     FROM operations_activation_scopes
+     WHERE organization_id = $1::uuid`,
+    [fixture.organizationId],
+  )
+  assert.equal(activation.rowCount, 1)
+  const preparedAt = new Date(
+    Date.now() - (status === 'prepared' ? 60_000 : 10 * 60_000),
+  ).toISOString()
+  const observedAt = new Date(
+    Date.now() - (status === 'prepared' ? 30_000 : 9 * 60_000),
+  ).toISOString()
+  const evidenceHash = createHash('sha256')
+    .update(`${fixture.organizationId}:${status}`)
+    .digest('hex')
+  const authorization = await pool.query(
+    `INSERT INTO operations_shopify_order_management_authorizations (
+       organization_id, integration_account_id, integration_account_global_id,
+       provider, account_environment, external_account_id, shop_domain,
+       credential_generation, activation_state, activation_revision,
+       provider_write_control_row_version, provider_write_scope_digest,
+       order_id, order_global_id, external_order_id, order_number,
+       expected_order_row_version, expected_source_hash,
+       accepted_observation_id, accepted_provider_order_updated_at,
+       provider_order_updated_at, provider_order_observed_at,
+       provider_order_test, provider_snapshot_hash, action, cancel_reason,
+       authorization_reason, intent_hash, idempotency_key, request_hash,
+       status, authorized_by, authorized_role, prepared_at, expires_at
+     ) VALUES (
+       $1::uuid, $2::uuid, $3, 'shopify', 'sandbox',
+       'gid://shopify/Shop/6600001',
+       'ag-alchemy-order-management.myshopify.com',
+       1, $4, $5::integer, NULL, NULL,
+       $6::uuid, $7, $8, $9, $10::bigint, $11,
+       $12::uuid, $13::timestamptz, $13::timestamptz, $14::timestamptz,
+       true, $15, 'cancel', 'OTHER',
+       'Migration-era cancellation recovery regression', $16, $17, $15,
+       'prepared', $18, 'owner', $19::timestamptz,
+       $19::timestamptz + interval '5 minutes'
+     ) RETURNING id::text, global_id`,
+    [
+      fixture.organizationId,
+      fixture.accountId,
+      fixture.accountGlobalId,
+      activation.rows[0].state,
+      activation.rows[0].revision,
+      fixture.current.id,
+      fixture.current.global_id,
+      fixture.current.external_order_id,
+      fixture.current.order_number,
+      fixture.current.row_version,
+      fixture.currentSourceHash,
+      fixture.currentAcceptedObservationId,
+      fixture.currentAcceptedProviderUpdatedAt,
+      observedAt,
+      evidenceHash,
+      legacyIntentHash,
+      `legacy-cancel-${status}-${randomUUID()}`,
+      fixture.ownerEmail,
+      preparedAt,
+    ],
+  )
+  if (status === 'prepared') return authorization.rows[0]
+
+  const attempt = await pool.query(
+    `INSERT INTO operations_shopify_order_management_attempts (
+       organization_id, authorization_id, integration_account_id,
+       integration_account_global_id, provider, external_account_id,
+       credential_generation, activation_revision,
+       provider_write_control_row_version, provider_write_scope_digest,
+       order_id, order_global_id, external_order_id,
+       expected_order_row_version, expected_source_hash,
+       accepted_observation_id, accepted_provider_order_updated_at,
+       provider_snapshot_hash, action, intent_hash, attempt_hash,
+       dispatch_state, claimed_by, claimed_at,
+       processing_lease_expires_at
+     ) SELECT
+       $1::uuid, $2::uuid, $3::uuid, $4, 'shopify',
+       'gid://shopify/Shop/6600001', 1, $5::integer, NULL, NULL,
+       $6::uuid, $7, $8, $9::bigint, $10, $11::uuid,
+       $12::timestamptz, $13, 'cancel', $13, $14,
+       'authorized', $15, claim_clock.claimed_at,
+       claim_clock.claimed_at + interval '5 minutes'
+     FROM (SELECT clock_timestamp() - interval '10 minutes' AS claimed_at) claim_clock
+     RETURNING id::text, global_id, claimed_at`,
+    [
+      fixture.organizationId,
+      authorization.rows[0].id,
+      fixture.accountId,
+      fixture.accountGlobalId,
+      activation.rows[0].revision,
+      fixture.current.id,
+      fixture.current.global_id,
+      fixture.current.external_order_id,
+      fixture.current.row_version,
+      fixture.currentSourceHash,
+      fixture.currentAcceptedObservationId,
+      fixture.currentAcceptedProviderUpdatedAt,
+      legacyIntentHash,
+      createHash('sha256').update(`${evidenceHash}:attempt`).digest('hex'),
+      fixture.ownerEmail,
+    ],
+  )
+  await pool.query(
+    `UPDATE operations_shopify_order_management_authorizations
+     SET status = 'processing', provider_attempt_id = $3::uuid,
+         processing_at = $4::timestamptz
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [
+      fixture.organizationId,
+      authorization.rows[0].id,
+      attempt.rows[0].id,
+      attempt.rows[0].claimed_at,
+    ],
+  )
+  if (status === 'processing') {
+    return { ...authorization.rows[0], attempt: attempt.rows[0] }
+  }
+  const outcomeHash = createHash('sha256')
+    .update(`${evidenceHash}:unknown`)
+    .digest('hex')
+  const outcome = await pool.query(
+    `INSERT INTO operations_shopify_order_management_outcomes (
+       organization_id, authorization_id, provider_attempt_id,
+       outcome_state, provider_write_count, evidence_hash, error_code,
+       recorded_by
+     ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'unknown', NULL, $4,
+       'SHOPIFY_ORDER_MANAGEMENT_PROCESSING_LEASE_EXPIRED', $5)
+     RETURNING id::text, global_id, recorded_at`,
+    [
+      fixture.organizationId,
+      authorization.rows[0].id,
+      attempt.rows[0].id,
+      outcomeHash,
+      fixture.ownerEmail,
+    ],
+  )
+  await pool.query(
+    `UPDATE operations_shopify_order_management_authorizations
+     SET status = 'unknown', latest_outcome_id = $3::uuid,
+         completed_at = $4::timestamptz
+     WHERE organization_id = $1::uuid AND id = $2::uuid`,
+    [
+      fixture.organizationId,
+      authorization.rows[0].id,
+      outcome.rows[0].id,
+      outcome.rows[0].recorded_at,
+    ],
+  )
+  return {
+    ...authorization.rows[0],
+    attempt: attempt.rows[0],
+    outcome: outcome.rows[0],
+  }
+}
+
+async function verifyLegacyCancellationUpgrade(pool) {
+  const audits = []
+  const persistence = loadTypeScriptModule(
+    'app_src/lib/persistence/shopifyOrderManagement.ts',
+    {
+      '@/lib/auditWriter': {
+        async recordAuditEvent(event) { audits.push(event) },
+      },
+      '@/lib/persistence/postgres': postgresAdapter(pool),
+    },
+  )
+  const legacyReason = 'Migration-era cancellation recovery regression'
+  const legacyClaimAction = {
+    type: 'cancel',
+    reason: 'OTHER',
+    refundMethod: 'none',
+    restock: false,
+    notifyCustomer: false,
+  }
+  const legacyIntentHash = persistence.shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-intent-v1',
+    action: { type: 'cancel', reason: 'OTHER' },
+    reason: legacyReason,
+    expectedLineQuantity: null,
+  })
+  const preparedFixture = await seed(pool)
+  const processingFixture = await seed(pool)
+  const unknownFixture = await seed(pool)
+  await pool.query('SET session_replication_role = replica')
+  let prepared
+  let processing
+  let unknown
+  try {
+    prepared = await seedLegacyCancellationAuthorization(
+      pool, preparedFixture, 'prepared', legacyIntentHash,
+    )
+    processing = await seedLegacyCancellationAuthorization(
+      pool, processingFixture, 'processing', legacyIntentHash,
+    )
+    unknown = await seedLegacyCancellationAuthorization(
+      pool, unknownFixture, 'unknown', legacyIntentHash,
+    )
+  } finally {
+    await pool.query('SET session_replication_role = origin')
+  }
+  await applyMigration(
+    pool,
+    '0337_operations_shopify_ordinary_order_cancellation.sql',
+  )
+
+  const upgraded = await pool.query(
+    `SELECT status, cancel_refund_method, cancel_restock,
+            cancel_notify_customer, cancellation_payment_evidence,
+            legacy_cancellation_without_payment_evidence
+     FROM operations_shopify_order_management_authorizations
+     WHERE id = ANY($1::uuid[])
+     ORDER BY status`,
+    [[prepared.id, processing.id, unknown.id]],
+  )
+  assert.equal(upgraded.rowCount, 3)
+  for (const row of upgraded.rows) {
+    assert.equal(row.cancel_refund_method, 'none')
+    assert.equal(row.cancel_restock, false)
+    assert.equal(row.cancel_notify_customer, false)
+    assert.equal(row.cancellation_payment_evidence, null)
+    assert.equal(row.legacy_cancellation_without_payment_evidence, true)
+  }
+
+  const claimed = await persistence.claimShopifyOrderManagementInPostgres({
+    organizationId: preparedFixture.organizationId,
+    actorEmail: preparedFixture.ownerEmail,
+    authorizationGlobalId: prepared.global_id,
+    action: legacyClaimAction,
+    reason: legacyReason,
+  })
+  assert.equal(claimed.status, 'processing')
+  const recovered = await persistence
+    .recoverStaleShopifyOrderManagementAttemptInPostgres({
+      organizationId: processingFixture.organizationId,
+      actorEmail: processingFixture.ownerEmail,
+      authorizationGlobalId: processing.global_id,
+      providerAttemptGlobalId: processing.attempt.global_id,
+    })
+  assert.equal(recovered.recovered, true)
+  assert.equal(recovered.authorization.status, 'unknown')
+  const reconciled = await persistence
+    .reconcileShopifyOrderManagementOutcomeInPostgres({
+      organizationId: unknownFixture.organizationId,
+      actorEmail: unknownFixture.ownerEmail,
+      authorizationGlobalId: unknown.global_id,
+      providerAttemptGlobalId: unknown.attempt.global_id,
+      resolution: 'not_applied',
+      evidence: { exactRead: true, cancellationAbsent: true },
+      providerWriteCount: null,
+    })
+  assert.equal(reconciled.status, 'reconciled')
+  const statuses = await pool.query(
+    `SELECT id::text, status
+     FROM operations_shopify_order_management_authorizations
+     WHERE id = ANY($1::uuid[])`,
+    [[prepared.id, processing.id, unknown.id]],
+  )
+  assert.deepEqual(
+    new Map(statuses.rows.map((row) => [row.id, row.status])),
+    new Map([
+      [prepared.id, 'processing'],
+      [processing.id, 'unknown'],
+      [unknown.id, 'reconciled'],
+    ]),
+  )
+}
+
 function snapshot(test, providerOrderUpdatedAt = null) {
   const observedAt = new Date()
   return {
@@ -3592,6 +3867,32 @@ async function verify(databaseUrl) {
       'authorization insert trigger must reject malformed payment evidence',
     )
     assert.equal(malformedAuthorizationInsert.code, 'P0001')
+    const fabricatedLegacyAuthorization = await expectDatabaseRejected(
+      () => pool.query(
+        `INSERT INTO operations_shopify_order_management_authorizations
+         SELECT (
+           pg_catalog.jsonb_populate_record(
+             NULL::public.operations_shopify_order_management_authorizations,
+             pg_catalog.to_jsonb(authz) || pg_catalog.jsonb_build_object(
+               'legacy_cancellation_without_payment_evidence', true,
+               'cancel_refund_method', 'none',
+               'cancel_restock', false,
+               'cancel_notify_customer', false,
+               'cancellation_payment_evidence', NULL
+             )
+           )
+         ).*
+         FROM operations_shopify_order_management_authorizations authz
+         WHERE authz.organization_id = $1::uuid AND authz.global_id = $2`,
+        [
+          independentFixture.organizationId,
+          ordinaryCancelPrepared.authorizationGlobalId,
+        ],
+      ),
+      /cancellation intent is incomplete or not permitted/i,
+      'new authorization must not fabricate the migration-only legacy marker',
+    )
+    assert.equal(fabricatedLegacyAuthorization.code, 'P0001')
 
     const authorizationConstraintClient = await pool.connect()
     try {
@@ -4070,39 +4371,48 @@ async function verify(databaseUrl) {
 
 async function main() {
   command('docker', ['info'], { timeout: 30_000 })
-  const container = `clawpilot-shopify-order-management-${randomUUID()}`
-  try {
-    command('docker', [
-      'run', '--detach', '--rm', '--name', container,
-      '-e', 'POSTGRES_PASSWORD=postgres',
-      '-e', 'POSTGRES_DB=clawpilot_order_management_test',
-      '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
-    ])
-    const portOutput = command('docker', ['port', container, '5432/tcp'])
-    const port = portOutput.trim().split(':').at(-1)
-    const databaseUrl =
-      `postgresql://postgres:postgres@127.0.0.1:${port}/clawpilot_order_management_test`
-    await waitForPostgres(databaseUrl)
-    const pool = new Pool({ connectionString: databaseUrl, max: 1 })
+  for (const phase of ['upgrade', 'fresh']) {
+    const container =
+      `clawpilot-shopify-order-management-${phase}-${randomUUID()}`
     try {
-      for (const filename of migrations()) {
-        await applyMigration(pool, filename)
+      command('docker', [
+        'run', '--detach', '--rm', '--name', container,
+        '-e', 'POSTGRES_PASSWORD=postgres',
+        '-e', 'POSTGRES_DB=clawpilot_order_management_test',
+        '-p', '127.0.0.1::5432',
+        'pgvector/pgvector:pg18',
+      ])
+      const portOutput = command('docker', ['port', container, '5432/tcp'])
+      const port = portOutput.trim().split(':').at(-1)
+      const databaseUrl =
+        `postgresql://postgres:postgres@127.0.0.1:${port}/clawpilot_order_management_test`
+      await waitForPostgres(databaseUrl)
+      const pool = new Pool({ connectionString: databaseUrl, max: 1 })
+      try {
+        for (const filename of migrations().filter((name) => (
+          phase === 'fresh'
+          || name !== '0337_operations_shopify_ordinary_order_cancellation.sql'
+        ))) {
+          await applyMigration(pool, filename)
+        }
+        if (phase === 'upgrade') {
+          await verifyLegacyCancellationUpgrade(pool)
+        }
+      } finally {
+        await pool.end()
       }
+      if (phase === 'fresh') await verify(databaseUrl)
     } finally {
-      await pool.end()
+      spawnSync('docker', ['stop', '-t', '1', container], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
     }
-    await verify(databaseUrl)
-    console.log(
-      'Shopify order management PostgreSQL transitions and safety fences passed.',
-    )
-  } finally {
-    spawnSync('docker', ['stop', '-t', '1', container], {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 30_000,
-    })
   }
+  console.log(
+    'Shopify order management PostgreSQL upgrade, transitions, and safety fences passed.',
+  )
 }
 
 await main()

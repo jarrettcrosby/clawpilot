@@ -348,6 +348,7 @@ type AuthorizationRow = {
   cancel_restock: boolean | null
   cancel_notify_customer: boolean | null
   cancellation_payment_evidence: unknown | null
+  legacy_cancellation_without_payment_evidence: boolean
   staff_note_hash: string | null
   requested_projection_hash: string | null
   requires_order_edits: boolean
@@ -1484,6 +1485,34 @@ function intentHash(
   })
 }
 
+function legacyCancellationIntentHash(
+  action: ShopifyOrderManagementAction,
+  reason: string,
+  expectedLineQuantityValue: number | null,
+) {
+  if (
+    action.type !== 'cancel'
+    && action.type !== 'cancel_order_after_fulfillment_reversal'
+  ) return null
+  const legacyAction = {
+    type: action.type,
+    ...(action.type === 'cancel_order_after_fulfillment_reversal'
+      ? {
+          predecessorAuthorizationGlobalId:
+            action.predecessorAuthorizationGlobalId,
+        }
+      : {}),
+    reason: action.reason,
+    ...(action.staffNote ? { staffNote: action.staffNote } : {}),
+  }
+  return shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-intent-v1',
+    action: legacyAction,
+    reason,
+    expectedLineQuantity: expectedLineQuantityValue,
+  })
+}
+
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
 }
@@ -2287,6 +2316,11 @@ export async function claimShopifyOrderManagementInPostgres(
     reason,
     expectedLineQuantityValue,
   )
+  const exactLegacyCancellationIntentHash = legacyCancellationIntentHash(
+    action,
+    reason,
+    expectedLineQuantityValue,
+  )
 
   const result = await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -2329,7 +2363,23 @@ export async function claimShopifyOrderManagementInPostgres(
       || (action.type === 'save_order') !== Boolean(
         row.requested_projection_hash,
       )
-      || row.intent_hash !== exactIntentHash
+      || (
+        row.intent_hash !== exactIntentHash
+        && !(
+          row.legacy_cancellation_without_payment_evidence
+          && row.intent_hash === exactLegacyCancellationIntentHash
+          && row.cancel_refund_method === 'none'
+          && row.cancel_restock === false
+          && row.cancel_notify_customer === false
+          && action.type !== 'add_tag'
+          && action.type !== 'cancel_fulfillment'
+          && action.type !== 'save_order'
+          && action.type !== 'set_line_quantity'
+          && action.refundMethod === 'none'
+          && action.restock === false
+          && action.notifyCustomer === false
+        )
+      )
     ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH',
@@ -2404,6 +2454,8 @@ export async function claimShopifyOrderManagementInPostgres(
       cancelRestock: row.cancel_restock,
       cancelNotifyCustomer: row.cancel_notify_customer,
       cancellationPaymentEvidence: row.cancellation_payment_evidence,
+      legacyCancellationWithoutPaymentEvidence:
+        row.legacy_cancellation_without_payment_evidence,
       ...(row.action === 'cancel_fulfillment'
         ? {
             fulfillmentGid: row.fulfillment_gid,
@@ -2434,7 +2486,8 @@ export async function claimShopifyOrderManagementInPostgres(
        INSERT INTO operations_shopify_order_management_attempts (
          organization_id, authorization_id, integration_account_id,
          integration_account_global_id, provider, external_account_id,
-         credential_generation, provider_write_control_row_version,
+         credential_generation, activation_revision,
+         provider_write_control_row_version,
          provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
          expected_source_hash, provider_snapshot_hash, action,
@@ -2444,14 +2497,15 @@ export async function claimShopifyOrderManagementInPostgres(
          accepted_observation_id, accepted_provider_order_updated_at,
          predecessor_authorization_id,
          cancel_refund_method, cancel_restock, cancel_notify_customer,
-         cancellation_payment_evidence, claimed_at,
+         cancellation_payment_evidence,
+         legacy_cancellation_without_payment_evidence, claimed_at,
          processing_lease_expires_at
        ) SELECT
-         $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
-         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15,
-         $16, $17::timestamptz, $18, $19, $20, $21, $22,
-         'authorized', $23, $24::uuid, $25::timestamptz, $26::uuid,
-         $27, $28::boolean, $29::boolean, $30::jsonb,
+         $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6,
+         $7::integer, $8, $9, $10::uuid, $11, $12, $13::bigint, $14,
+         $15, $16, $17, $18::timestamptz, $19, $20, $21, $22, $23,
+         'authorized', $24, $25::uuid, $26::timestamptz, $27::uuid,
+         $28, $29::boolean, $30::boolean, $31::jsonb, $32::boolean,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -2464,6 +2518,7 @@ export async function claimShopifyOrderManagementInPostgres(
         row.integration_account_global_id,
         row.external_account_id,
         row.credential_generation,
+        row.activation_revision,
         row.provider_write_control_row_version,
         row.provider_write_scope_digest,
         row.order_id,
@@ -2489,6 +2544,7 @@ export async function claimShopifyOrderManagementInPostgres(
         row.cancel_notify_customer,
         row.cancellation_payment_evidence === null
           ? null : JSON.stringify(row.cancellation_payment_evidence),
+        row.legacy_cancellation_without_payment_evidence,
       ],
     )
     const attempt = attempted.rows[0]

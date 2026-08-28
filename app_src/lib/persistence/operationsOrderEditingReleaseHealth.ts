@@ -25,7 +25,7 @@ export const OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM =
   'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
 
 export const OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM =
-  '52998c68ea46c560fa2b3a0b70d12dda3650f8ec869518793aea1cb0b884ae7b'
+  'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87'
 
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
@@ -248,6 +248,7 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
         ('operations_shopify_order_management_authorizations', 'cancel_restock'),
         ('operations_shopify_order_management_authorizations', 'cancel_notify_customer'),
         ('operations_shopify_order_management_authorizations', 'cancellation_payment_evidence'),
+        ('operations_shopify_order_management_authorizations', 'legacy_cancellation_without_payment_evidence'),
         ('operations_shopify_order_management_attempts', 'activation_revision'),
         ('operations_shopify_order_management_attempts', 'provider_write_control_row_version'),
         ('operations_shopify_order_management_attempts', 'provider_write_scope_digest'),
@@ -257,6 +258,7 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
         ,('operations_shopify_order_management_attempts', 'cancel_restock')
         ,('operations_shopify_order_management_attempts', 'cancel_notify_customer')
         ,('operations_shopify_order_management_attempts', 'cancellation_payment_evidence')
+        ,('operations_shopify_order_management_attempts', 'legacy_cancellation_without_payment_evidence')
       )
     UNION ALL
     ${tableConstraintArtifacts('operations_commerce_provider_write_controls')}
@@ -570,9 +572,9 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH =
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0'
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0325_ARTIFACT_HASH =
   'd0049adc200df110ed90132dd77bd300d0cfb9703b4921abcc5ae8bdb4eef24a'
-export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT = 89
+export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT = 91
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_HASH =
-  'ea066a20282c6afb7df2e9c947ba6231a499c240ea2f23e9868a72bc42c8df2b'
+  '52895af4fa649a7d4df74fb73c89f84ba21091e8914951eafb20464bc2a01b3a'
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH =
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf'
