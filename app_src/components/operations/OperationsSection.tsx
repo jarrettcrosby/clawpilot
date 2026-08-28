@@ -1189,6 +1189,7 @@ function OrderDetailDrawer({
   activationState,
   canManage,
   canExecute,
+  canCancelProviderOrder,
   canPurchaseLivePostage,
   canAuthorizeSandboxE2e,
   oneOffExecutionState,
@@ -1234,6 +1235,7 @@ function OrderDetailDrawer({
   activationState: OperationsActivationState
   canManage: boolean
   canExecute: boolean
+  canCancelProviderOrder: boolean
   canPurchaseLivePostage: boolean
   canAuthorizeSandboxE2e: boolean
   oneOffExecutionState: OneOffShipmentExecutionState | null
@@ -1522,6 +1524,7 @@ function OrderDetailDrawer({
                   orderGlobalId={order.globalId}
                   orderRowVersion={order.rowVersion}
                   canManage={canManage}
+                  canCancel={canCancelProviderOrder}
                   disabled={busy}
                   onBusyChange={onOrderRevisionBusyChange}
                   onOrderChanged={onOrderRevisionChanged}
@@ -7459,6 +7462,11 @@ export default function OperationsSection({
         activationState={workspace?.activation.state || 'disabled'}
         canManage={Boolean(capabilities?.canManage)}
         canExecute={Boolean(capabilities?.canManage && capabilities.canExecute)}
+        canCancelProviderOrder={Boolean(
+          capabilities?.canActivate
+          && capabilities.canManage
+          && capabilities.canExecute
+        )}
         canPurchaseLivePostage={Boolean(
           workspace?.capabilities.canPurchaseLivePostage,
         )}

@@ -11,8 +11,11 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   CircularProgress,
   Divider,
+  FormControlLabel,
+  MenuItem,
   Stack,
   TextField,
   Tooltip,
@@ -66,6 +69,15 @@ type CancellationEligibility = Readonly<{
   reason: string | null
   releasesAuthorization: boolean
 }>
+type CancellationPaymentOption = Readonly<{
+  allowed: boolean
+  reason: string | null
+  releasesAuthorization: boolean
+}>
+type ShopifyMoney = Readonly<{
+  amount: string
+  currencyCode: string
+}>
 type PostReversalCancellationEligibility = Readonly<{
   allowed: boolean
   reason: string | null
@@ -113,6 +125,15 @@ type ShopifyManagement = Readonly<{
   blockerCode: string | null
   accountLabel: string
   shopDomain: string
+  payment: Readonly<{
+    totalReceived: ShopifyMoney
+    totalRefunded: ShopifyMoney
+    totalCapturable: ShopifyMoney
+    refundOptions: Readonly<{
+      none: CancellationPaymentOption
+      original_payment_methods: CancellationPaymentOption
+    }>
+  }>
   order: Readonly<{
     globalId: string
     externalOrderId: string
@@ -153,7 +174,14 @@ type ShopifyMutation = Readonly<{ kind: 'add_tag'; tag: string }>
       kind: 'cancel_order_after_fulfillment_reversal'
       predecessorAuthorizationGlobalId: string
     }>
-  | Readonly<{ kind: 'cancel' }>
+  | Readonly<{
+      kind: 'cancel'
+      reasonCode: 'CUSTOMER' | 'DECLINED' | 'FRAUD'
+        | 'INVENTORY' | 'OTHER' | 'STAFF'
+      refundMethod: 'none' | 'original_payment_methods'
+      restock: boolean
+      notifyCustomer: boolean
+    }>
   | Readonly<{
       kind: 'set_line_quantity'
       lineItemId: string
@@ -189,6 +217,16 @@ type ManagementPayload = Readonly<{
   code?: string
   management?: ShopifyManagement
   result?: ManagementResult
+  authorization?: PreparedAuthorization
+}>
+type PreparedAuthorization = Readonly<{
+  authorizationGlobalId: string
+  intentHash: string
+  expiresAt: string
+  confirmationStatement: string
+  replayed: boolean
+  providerReads: number
+  providerWrites: 0
 }>
 type IdempotencyAttempt = { fingerprint: string; key: string }
 
@@ -202,6 +240,8 @@ const SHOPIFY_FULFILLMENT_GID =
 const SHOPIFY_DOMAIN = /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/
 const SHA256 = /^[a-f0-9]{64}$/
 const COUNTRY_CODE = /^[A-Z]{2}$/
+const CURRENCY_CODE = /^(?:[A-Z]{3}|USDC)$/
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/
 const EMPTY_SHIPPING_ADDRESS: ShippingAddressDraft = {
   firstName: '',
   lastName: '',
@@ -215,7 +255,10 @@ const EMPTY_SHIPPING_ADDRESS: ShippingAddressDraft = {
   phone: '',
 }
 
-function idempotencyKey(action: 'save' | 'reconcile', exactId: string) {
+function idempotencyKey(
+  action: 'save' | 'prepare' | 'execute' | 'reconcile',
+  exactId: string,
+) {
   const nonce = typeof crypto !== 'undefined'
     && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
@@ -226,7 +269,7 @@ function idempotencyKey(action: 'save' | 'reconcile', exactId: string) {
 function stableAttemptKey(
   reference: MutableRefObject<IdempotencyAttempt | null>,
   fingerprint: string,
-  action: 'save' | 'reconcile',
+  action: 'save' | 'prepare' | 'execute' | 'reconcile',
   exactId: string,
 ) {
   if (reference.current?.fingerprint !== fingerprint) {
@@ -246,6 +289,23 @@ function optionalText(value: unknown): value is string | null {
 }
 function integer(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value)
+}
+function shopifyMoney(value: unknown): value is ShopifyMoney {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<ShopifyMoney>
+  return typeof item.amount === 'string'
+    && NONNEGATIVE_DECIMAL.test(item.amount)
+    && typeof item.currencyCode === 'string'
+    && CURRENCY_CODE.test(item.currencyCode)
+}
+function cancellationPaymentOption(
+  value: unknown,
+): value is CancellationPaymentOption {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Partial<CancellationPaymentOption>
+  return typeof item.allowed === 'boolean'
+    && optionalText(item.reason)
+    && typeof item.releasesAuthorization === 'boolean'
 }
 function isoInstant(value: unknown): value is string {
   if (!text(value)) return false
@@ -382,6 +442,8 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
   const order = item.order as Partial<ShopifyManagement['order']> | undefined
   const eligibility = item.eligibility as
     Partial<ShopifyManagement['eligibility']> | undefined
+  const payment = item.payment as
+    Partial<ShopifyManagement['payment']> | undefined
   const lines = Array.isArray(order?.lines) ? order.lines : []
   const edits = Array.isArray(eligibility?.lineEdits)
     ? eligibility.lineEdits
@@ -396,6 +458,13 @@ function management(value: unknown, orderGlobalId: string): value is ShopifyMana
     && optionalText(item.blockerCode)
     && text(item.accountLabel)
     && typeof item.shopDomain === 'string' && SHOPIFY_DOMAIN.test(item.shopDomain)
+    && shopifyMoney(payment?.totalReceived)
+    && shopifyMoney(payment?.totalRefunded)
+    && shopifyMoney(payment?.totalCapturable)
+    && cancellationPaymentOption(payment?.refundOptions?.none)
+    && cancellationPaymentOption(
+      payment?.refundOptions?.original_payment_methods,
+    )
     && order?.globalId === orderGlobalId && ORDER_GLOBAL_ID.test(orderGlobalId)
     && typeof order.externalOrderId === 'string'
     && SHOPIFY_ORDER_GID.test(order.externalOrderId)
@@ -493,6 +562,24 @@ function result(
   return item as ManagementResult
 }
 
+function preparedAuthorization(value: unknown): PreparedAuthorization | null {
+  if (!value || typeof value !== 'object') return null
+  const item = value as Partial<PreparedAuthorization>
+  if (
+    typeof item.authorizationGlobalId !== 'string'
+    || !AUTHORIZATION_GLOBAL_ID.test(item.authorizationGlobalId)
+    || typeof item.intentHash !== 'string'
+    || !SHA256.test(item.intentHash)
+    || !isoInstant(item.expiresAt)
+    || !text(item.confirmationStatement)
+    || typeof item.replayed !== 'boolean'
+    || !integer(item.providerReads)
+    || item.providerReads < 1
+    || item.providerWrites !== 0
+  ) return null
+  return item as PreparedAuthorization
+}
+
 function DisabledReason({ value }: { value: string | null | undefined }) {
   return value ? (
     <Typography variant="caption" color="text.secondary" display="block">
@@ -505,6 +592,7 @@ export default function ShopifyOrderManagementPanel({
   orderGlobalId,
   orderRowVersion,
   canManage,
+  canCancel,
   disabled = false,
   onBusyChange,
   onOrderChanged,
@@ -512,13 +600,16 @@ export default function ShopifyOrderManagementPanel({
   orderGlobalId: string
   orderRowVersion: number
   canManage: boolean
+  canCancel: boolean
   disabled?: boolean
   onBusyChange?: (busy: boolean) => void
   onOrderChanged: () => void | Promise<void>
 }) {
   const [state, setState] = useState<ShopifyManagement | null>(null)
   const [loading, setLoading] = useState(false)
-  const [action, setAction] = useState<'save' | 'reconcile' | null>(null)
+  const [action, setAction] = useState<
+    'save' | 'prepare_cancel' | 'execute_cancel' | 'reconcile' | null
+  >(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [email, setEmail] = useState('')
@@ -535,7 +626,21 @@ export default function ShopifyOrderManagementPanel({
     useState<string | null>(null)
   const [cancellingAfterReversal, setCancellingAfterReversal] =
     useState(false)
+  const [cancelReasonCode, setCancelReasonCode] = useState<
+    'CUSTOMER' | 'DECLINED' | 'FRAUD' | 'INVENTORY' | 'OTHER' | 'STAFF'
+  >('CUSTOMER')
+  const [cancelRefundMethod, setCancelRefundMethod] = useState<
+    '' | 'none' | 'original_payment_methods'
+  >('')
+  const [cancelRestock, setCancelRestock] = useState(true)
+  const [cancelNotifyCustomer, setCancelNotifyCustomer] = useState(false)
+  const [cancelReason, setCancelReason] = useState('')
+  const [preparedCancel, setPreparedCancel] =
+    useState<PreparedAuthorization | null>(null)
+  const [cancelConfirmation, setCancelConfirmation] = useState('')
   const saveAttempt = useRef<IdempotencyAttempt | null>(null)
+  const prepareCancelAttempt = useRef<IdempotencyAttempt | null>(null)
+  const executeCancelAttempt = useRef<IdempotencyAttempt | null>(null)
   const reconcileAttempt = useRef<IdempotencyAttempt | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -589,7 +694,12 @@ export default function ShopifyOrderManagementPanel({
     setAmbiguousSave(false)
     setReversingFulfillmentId(null)
     setCancellingAfterReversal(false)
+    setCancelRefundMethod('')
+    setPreparedCancel(null)
+    setCancelConfirmation('')
     saveAttempt.current = null
+    prepareCancelAttempt.current = null
+    executeCancelAttempt.current = null
     reconcileAttempt.current = null
     const controller = new AbortController()
     void load(controller.signal)
@@ -600,6 +710,19 @@ export default function ShopifyOrderManagementPanel({
     onBusyChange?.(action !== null)
     return () => onBusyChange?.(false)
   }, [action, onBusyChange])
+
+  useEffect(() => {
+    setPreparedCancel(null)
+    setCancelConfirmation('')
+    prepareCancelAttempt.current = null
+    executeCancelAttempt.current = null
+  }, [
+    cancelReasonCode,
+    cancelRefundMethod,
+    cancelRestock,
+    cancelNotifyCustomer,
+    cancelReason,
+  ])
 
   const retainedAttempt = state?.openAttempt || null
   const stale = Boolean(state && state.order.rowVersion !== orderRowVersion)
@@ -695,6 +818,25 @@ export default function ShopifyOrderManagementPanel({
     && tagsValid
     && changedLinesValid
     && allLineDraftsValid
+  const cancellationMutation:
+    Extract<ShopifyMutation, { kind: 'cancel' }> | null = cancelRefundMethod
+      ? {
+          kind: 'cancel',
+          reasonCode: cancelReasonCode,
+          refundMethod: cancelRefundMethod,
+          restock: cancelRestock,
+          notifyCustomer: cancelNotifyCustomer,
+        }
+      : null
+  const selectedCancellationPayment = cancelRefundMethod
+    ? state?.payment.refundOptions[cancelRefundMethod]
+    : null
+  const normalizedCancelReason = cancelReason.trim()
+  const cancelDraftValid = normalizedCancelReason.length >= 10
+    && normalizedCancelReason.length <= 500
+    && !/[\u0000-\u001f\u007f]/.test(normalizedCancelReason)
+    && cancellationMutation !== null
+    && selectedCancellationPayment?.allowed === true
 
   const save = async (mutation: ShopifyMutation) => {
     if (!state || blocker || busy) return
@@ -807,6 +949,136 @@ export default function ShopifyOrderManagementPanel({
     }
   }
 
+  const prepareCancellation = async () => {
+    if (
+      !state
+      || blocker
+      || busy
+      || !canCancel
+      || !state.eligibility.cancel.allowed
+      || !cancelDraftValid
+      || !cancellationMutation
+    ) return
+    const body = {
+      action: 'prepare' as const,
+      orderGlobalId,
+      expectedRowVersion: state.order.rowVersion,
+      mutation: cancellationMutation,
+      reason: normalizedCancelReason,
+    }
+    const key = stableAttemptKey(
+      prepareCancelAttempt,
+      JSON.stringify(body),
+      'prepare',
+      `${orderGlobalId}:v${state.order.rowVersion}:cancel`,
+    )
+    setAction('prepare_cancel')
+    setError('')
+    setNotice('')
+    try {
+      const response = await fetch('/api/operations/shopify-order-management', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': key,
+        },
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json().catch(() => ({})) as ManagementPayload
+      const prepared = preparedAuthorization(payload.authorization)
+      if (!response.ok || !payload.ok || !prepared) {
+        prepareCancelAttempt.current = null
+        throw new Error(
+          `${payload.error || 'Shopify cancellation could not be prepared'}`
+          + `${payload.code ? ` [${payload.code}]` : ''}`,
+        )
+      }
+      setPreparedCancel(prepared)
+      setCancelConfirmation('')
+      setNotice('Review the choices and enter the confirmation shown below.')
+    } catch (caught) {
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Shopify cancellation could not be prepared')
+    } finally {
+      setAction(null)
+    }
+  }
+
+  const executeCancellation = async () => {
+    if (
+      !state
+      || !preparedCancel
+      || blocker
+      || busy
+      || !canCancel
+      || !cancellationMutation
+      || cancelConfirmation !== preparedCancel.confirmationStatement
+    ) return
+    const body = {
+      action: 'execute' as const,
+      authorizationGlobalId: preparedCancel.authorizationGlobalId,
+      intentHash: preparedCancel.intentHash,
+      confirmationStatement: cancelConfirmation,
+      mutation: cancellationMutation,
+      reason: normalizedCancelReason,
+    }
+    const key = stableAttemptKey(
+      executeCancelAttempt,
+      JSON.stringify(body),
+      'execute',
+      preparedCancel.authorizationGlobalId,
+    )
+    setAction('execute_cancel')
+    setError('')
+    setNotice('')
+    setLastResult(null)
+    try {
+      const response = await fetch('/api/operations/shopify-order-management', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': key,
+        },
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json().catch(() => ({})) as ManagementPayload
+      const executed = result(payload.result, orderGlobalId)
+      if (!response.ok || !payload.ok || !executed) {
+        throw new Error(
+          `${payload.error || 'Shopify cancellation could not be sent'}`
+          + `${payload.code ? ` [${payload.code}]` : ''}`,
+        )
+      }
+      setState(executed.management)
+      setLastResult(executed)
+      setPreparedCancel(null)
+      setCancelConfirmation('')
+      if (executed.state === 'unknown') {
+        setNotice(
+          `Shopify has not confirmed the result for attempt ${executed.attemptGlobalId}. Use Reconcile; do not send another cancellation.`,
+        )
+      } else if (executed.state === 'failed') {
+        setError('Shopify rejected the cancellation. Refresh before preparing another request.')
+      } else {
+        setNotice('Shopify order cancelled.')
+        await load()
+        await Promise.resolve(onOrderChanged())
+      }
+    } catch (caught) {
+      if (caught instanceof TypeError) {
+        setAmbiguousSave(true)
+        setNotice('The response was interrupted. Refresh and reconcile the retained attempt; do not send another cancellation.')
+      } else {
+        setError(caught instanceof Error
+          ? caught.message
+          : 'Shopify cancellation could not be sent')
+      }
+    } finally {
+      setAction(null)
+    }
+  }
+
   const cancelAfterFulfillmentReversal = async () => {
     const currentState = state
     const eligibility = currentState?.eligibility.cancelAfterFulfillmentReversal
@@ -817,6 +1089,7 @@ export default function ShopifyOrderManagementPanel({
       || !predecessor
       || blocker
       || busy
+      || !canCancel
     ) return
     const confirmed = window.confirm(
       `Cancel ${currentState.order.name} in Shopify?\n\n`
@@ -1404,6 +1677,9 @@ export default function ShopifyOrderManagementPanel({
                     : ''}
                 </Typography>
                 <Tooltip title={blocker
+                  || (!canCancel
+                    ? 'Owner or operations administrator execution permission is required.'
+                    : null)
                   || state.eligibility.cancelAfterFulfillmentReversal.reason
                   || ''}
                 >
@@ -1417,6 +1693,7 @@ export default function ShopifyOrderManagementPanel({
                         : <CancelRounded />}
                       disabled={busy
                         || Boolean(blocker)
+                        || !canCancel
                         || !state.eligibility
                           .cancelAfterFulfillmentReversal.allowed}
                       onClick={() => void cancelAfterFulfillmentReversal()}
@@ -1430,7 +1707,9 @@ export default function ShopifyOrderManagementPanel({
                 <DisabledReason
                   value={state.eligibility.cancelAfterFulfillmentReversal
                     .allowed
-                    ? null
+                    ? (!canCancel
+                        ? 'Owner or operations administrator execution permission is required.'
+                        : null)
                     : state.eligibility.cancelAfterFulfillmentReversal.reason}
                 />
               </Stack>
@@ -1446,35 +1725,200 @@ export default function ShopifyOrderManagementPanel({
                 <Typography fontWeight={700}>Cancel order</Typography>
               </Stack>
               <Typography variant="body2" color="text.secondary">
-                Cancels {state.order.name} when Shopify reports the order is
-                eligible. No refund, restock, or customer notification is
-                requested.
-                {state.eligibility.cancel.releasesAuthorization
-                  ? ' Shopify will release the successful test payment authorization.'
+                Cancel {state.order.name} in Shopify. Choose how payment,
+                inventory, and the customer should be handled.
+                {selectedCancellationPayment?.releasesAuthorization
+                  ? ' Shopify will void the open payment authorization.'
                   : ''}
               </Typography>
-              <Tooltip title={blocker || state.eligibility.cancel.reason || ''}>
-                <Box component="span" sx={{ display: 'block' }}>
-                  <Button
-                    fullWidth
-                    variant="outlined"
-                    color="error"
-                    startIcon={action === 'save'
-                      ? <CircularProgress size={16} />
-                      : <CancelRounded />}
-                    disabled={busy
-                      || Boolean(blocker)
-                      || !state.eligibility.cancel.allowed}
-                    onClick={() => void save({ kind: 'cancel' })}
-                    sx={{ minHeight: 44 }}
-                    data-testid="save-shopify-cancel"
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                  gap: 1,
+                }}
+                data-testid="shopify-cancel-payment-facts"
+              >
+                {([
+                  ['Received', state.payment.totalReceived],
+                  ['Refunded', state.payment.totalRefunded],
+                  ['Capturable', state.payment.totalCapturable],
+                ] satisfies ReadonlyArray<readonly [string, ShopifyMoney]>)
+                  .map(([label, money]) => (
+                    <Box key={label}>
+                      <Typography variant="caption" color="text.secondary">
+                        {label}
+                      </Typography>
+                      <Typography variant="body2" fontWeight={600}>
+                        {money.amount} {money.currencyCode}
+                      </Typography>
+                    </Box>
+                  ))}
+              </Box>
+              <TextField
+                select
+                fullWidth
+                size="small"
+                label="Reason"
+                value={cancelReasonCode}
+                disabled={busy || Boolean(preparedCancel)}
+                onChange={(event) => setCancelReasonCode(event.target.value as
+                  typeof cancelReasonCode)}
+                inputProps={{ 'data-testid': 'shopify-cancel-reason-code' }}
+              >
+                <MenuItem value="CUSTOMER">Customer requested</MenuItem>
+                <MenuItem value="DECLINED">Payment declined</MenuItem>
+                <MenuItem value="FRAUD">Fraud</MenuItem>
+                <MenuItem value="INVENTORY">Inventory unavailable</MenuItem>
+                <MenuItem value="STAFF">Staff decision</MenuItem>
+                <MenuItem value="OTHER">Other</MenuItem>
+              </TextField>
+              <TextField
+                select
+                fullWidth
+                size="small"
+                label="Payment"
+                value={cancelRefundMethod}
+                disabled={busy || Boolean(preparedCancel)}
+                onChange={(event) => setCancelRefundMethod(event.target.value as
+                  typeof cancelRefundMethod)}
+                inputProps={{ 'data-testid': 'shopify-cancel-refund-method' }}
+              >
+                <MenuItem value="" disabled>
+                  Select payment handling
+                </MenuItem>
+                <MenuItem
+                  value="none"
+                  disabled={!state.payment.refundOptions.none.allowed}
+                >
+                  Do not refund
+                </MenuItem>
+                <MenuItem
+                  value="original_payment_methods"
+                  disabled={!state.payment.refundOptions
+                    .original_payment_methods.allowed}
+                >
+                  Full refund to original payment methods
+                </MenuItem>
+              </TextField>
+              <DisabledReason value={cancelRefundMethod
+                ? selectedCancellationPayment?.reason
+                : 'Choose how Shopify should handle payment.'} />
+              <Stack spacing={0}>
+                <FormControlLabel
+                  control={<Checkbox
+                    data-testid="shopify-cancel-restock"
+                    checked={cancelRestock}
+                    disabled={busy || Boolean(preparedCancel)}
+                    onChange={(event) => setCancelRestock(event.target.checked)}
+                  />}
+                  label="Restock inventory"
+                />
+                <FormControlLabel
+                  control={<Checkbox
+                    data-testid="shopify-cancel-notify-customer"
+                    checked={cancelNotifyCustomer}
+                    disabled={busy || Boolean(preparedCancel)}
+                    onChange={(event) => setCancelNotifyCustomer(
+                      event.target.checked,
+                    )}
+                  />}
+                  label="Notify customer"
+                />
+              </Stack>
+              <TextField
+                fullWidth
+                size="small"
+                label="Operator reason"
+                value={cancelReason}
+                disabled={busy || Boolean(preparedCancel)}
+                onChange={(event) => setCancelReason(event.target.value)}
+                helperText={`${normalizedCancelReason.length}/500 · minimum 10 characters`}
+                inputProps={{
+                  maxLength: 500,
+                  'data-testid': 'shopify-cancel-operator-reason',
+                }}
+              />
+              {preparedCancel && (
+                <Stack spacing={1}>
+                  <Typography variant="caption" color="text.secondary">
+                    Enter this confirmation exactly:
+                  </Typography>
+                  <Typography
+                    variant="body2"
+                    sx={{ fontFamily: 'monospace', overflowWrap: 'anywhere' }}
+                    data-testid="shopify-cancel-confirmation-statement"
                   >
-                    Cancel Shopify order
-                  </Button>
+                    {preparedCancel.confirmationStatement}
+                  </Typography>
+                  <TextField
+                    fullWidth
+                    size="small"
+                    label="Confirmation"
+                    value={cancelConfirmation}
+                    disabled={busy}
+                    onChange={(event) => setCancelConfirmation(
+                      event.target.value,
+                    )}
+                    inputProps={{
+                      'data-testid': 'shopify-cancel-confirmation-input',
+                    }}
+                  />
+                </Stack>
+              )}
+              <Tooltip title={blocker
+                || (!canCancel
+                  ? 'Owner or operations administrator execution permission is required.'
+                  : state.eligibility.cancel.reason || '')}
+              >
+                <Box component="span" sx={{ display: 'block' }}>
+                  {preparedCancel ? (
+                    <Button
+                      fullWidth
+                      variant="contained"
+                      color="error"
+                      startIcon={action === 'execute_cancel'
+                        ? <CircularProgress size={16} />
+                        : <CancelRounded />}
+                      disabled={busy
+                        || Boolean(blocker)
+                        || !canCancel
+                        || !cancellationMutation
+                        || cancelConfirmation
+                          !== preparedCancel.confirmationStatement}
+                      onClick={() => void executeCancellation()}
+                      sx={{ minHeight: 44 }}
+                      data-testid="save-shopify-cancel"
+                    >
+                      Send cancellation to Shopify
+                    </Button>
+                  ) : (
+                    <Button
+                      fullWidth
+                      variant="outlined"
+                      color="error"
+                      startIcon={action === 'prepare_cancel'
+                        ? <CircularProgress size={16} />
+                        : <CancelRounded />}
+                      disabled={busy
+                        || Boolean(blocker)
+                        || !canCancel
+                        || !cancelDraftValid
+                        || !cancellationMutation
+                        || !state.eligibility.cancel.allowed}
+                      onClick={() => void prepareCancellation()}
+                      sx={{ minHeight: 44 }}
+                      data-testid="prepare-shopify-cancel"
+                    >
+                      Review cancellation
+                    </Button>
+                  )}
                 </Box>
               </Tooltip>
               <DisabledReason value={state.eligibility.cancel.allowed
-                ? null
+                ? (!canCancel
+                    ? 'Owner or operations administrator execution permission is required.'
+                    : null)
                 : state.eligibility.cancel.reason} />
               </Stack>
             </Box>

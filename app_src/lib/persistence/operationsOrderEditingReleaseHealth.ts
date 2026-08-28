@@ -24,6 +24,9 @@ export const OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_MIGRATION_CHECKSUM
 export const OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM =
   'f17aa20305e3190c6d26950aceb9c788e3b9b1ecc1cba3515e1d0d64aace50ab'
 
+export const OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM =
+  'f4329527452d37fe058fc533bc1d94442b167951657fa04946a20e29c1f7ab87'
+
 const tableRelationArtifact = (tableName: string) => String.raw`
   SELECT 'relation'::text AS kind,
          installed_namespace.nspname || '.' || installed_table.relname
@@ -241,11 +244,21 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
         ('operations_shopify_order_management_authorizations', 'provider_write_scope_digest'),
         ('operations_shopify_order_management_authorizations', 'requested_projection_hash'),
         ('operations_shopify_order_management_authorizations', 'requires_order_edits'),
+        ('operations_shopify_order_management_authorizations', 'cancel_refund_method'),
+        ('operations_shopify_order_management_authorizations', 'cancel_restock'),
+        ('operations_shopify_order_management_authorizations', 'cancel_notify_customer'),
+        ('operations_shopify_order_management_authorizations', 'cancellation_payment_evidence'),
+        ('operations_shopify_order_management_authorizations', 'legacy_cancellation_without_payment_evidence'),
         ('operations_shopify_order_management_attempts', 'activation_revision'),
         ('operations_shopify_order_management_attempts', 'provider_write_control_row_version'),
         ('operations_shopify_order_management_attempts', 'provider_write_scope_digest'),
         ('operations_shopify_order_management_attempts', 'requested_projection_hash'),
         ('operations_shopify_order_management_attempts', 'requires_order_edits')
+        ,('operations_shopify_order_management_attempts', 'cancel_refund_method')
+        ,('operations_shopify_order_management_attempts', 'cancel_restock')
+        ,('operations_shopify_order_management_attempts', 'cancel_notify_customer')
+        ,('operations_shopify_order_management_attempts', 'cancellation_payment_evidence')
+        ,('operations_shopify_order_management_attempts', 'legacy_cancellation_without_payment_evidence')
       )
     UNION ALL
     ${tableConstraintArtifacts('operations_commerce_provider_write_controls')}
@@ -275,13 +288,17 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
         ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_auth_provider_write_control_fkey'),
         ('operations_shopify_order_management_authorizations', 'operations_shopify_order_management_authorizations_action_check'),
         ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_auth_action_valid'),
+        ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_auth_environment_valid'),
         ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_auth_projection_hash_valid'),
+        ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_cancel_reason_valid'),
+        ('operations_shopify_order_management_authorizations', 'ops_shopify_order_mgmt_cancel_choices_valid'),
         ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_legacy_activation_valid'),
         ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_provider_write_binding_valid'),
         ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_provider_write_control_fkey'),
         ('operations_shopify_order_management_attempts', 'operations_shopify_order_management_attempts_action_check'),
         ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_identity_valid'),
         ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_projection_hash_valid'),
+        ('operations_shopify_order_management_attempts', 'ops_shopify_order_mgmt_attempt_cancel_choices_valid'),
         ('operations_shopify_order_management_outcomes', 'ops_shopify_order_mgmt_outcome_write_count_valid'),
         ('operations_shopify_order_management_outcomes', 'ops_shopify_order_mgmt_outcome_state_valid')
       )
@@ -296,6 +313,9 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL = String.raw`
       'public.operations_shopify_order_management_is_current(uuid,uuid,boolean)',
       'public.protect_shopify_order_management_authorization()',
       'public.protect_shopify_order_management_attempt()',
+      'public.operations_shopify_order_cancel_payment_evidence_v2_valid(jsonb,text)',
+      'public.protect_shopify_order_cancel_intent_insert()',
+      'public.protect_shopify_order_cancel_attempt_insert()',
     ])}
     UNION ALL
     ${tableTriggerArtifacts('operations_commerce_provider_write_controls')}
@@ -552,6 +572,9 @@ export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_HASH =
   '5332f582504b1632421f74018cd4d4c2f9b8ac561b9d4f65ca96b74977e580e0'
 export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0325_ARTIFACT_HASH =
   'd0049adc200df110ed90132dd77bd300d0cfb9703b4921abcc5ae8bdb4eef24a'
+export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT = 91
+export const OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_HASH =
+  '52895af4fa649a7d4df74fb73c89f84ba21091e8914951eafb20464bc2a01b3a'
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_ARTIFACT_COUNT = 50
 export const OPERATIONS_ORDER_SHIPMENT_ADDRESS_PRE_0315_ARTIFACT_HASH =
   'f0ac6b2e4600a1fa13f45ca9e3ce89e39805c64187b6b6a5d4c9d0cc91cfe9bf'
@@ -601,14 +624,33 @@ export const OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL = String.raw`
   )
   AND (
     WITH ${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACTS_SQL}
-    SELECT pg_catalog.count(*) =
-             ${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT}
+    SELECT pg_catalog.count(*) = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0337_operations_shopify_ordinary_order_cancellation.sql'
+        ) THEN ${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_COUNT}
+        ELSE ${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_ARTIFACT_COUNT}
+      END
       AND pg_catalog.encode(public.digest(pg_catalog.convert_to(
         pg_catalog.string_agg(
           kind || '|' || identity || '|' || definition,
           pg_catalog.chr(10) ORDER BY kind, identity
       ), 'UTF8'
       ), 'sha256'), 'hex') = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0337_operations_shopify_ordinary_order_cancellation.sql'
+            AND checksum =
+              '${OPERATIONS_SHOPIFY_ORDINARY_CANCELLATION_MIGRATION_CHECKSUM}'
+        ) AND EXISTS (
+          SELECT 1 FROM public.schema_migrations
+          WHERE filename =
+            '0325_operations_shopify_fulfillment_reversal.sql'
+            AND checksum =
+              '${OPERATIONS_SHOPIFY_FULFILLMENT_REVERSAL_MIGRATION_CHECKSUM}'
+        ) THEN '${OPERATIONS_PROVIDER_WRITE_SINGLE_SAVE_POST_0337_ARTIFACT_HASH}'
         WHEN NOT EXISTS (
           SELECT 1 FROM public.schema_migrations
           WHERE filename =

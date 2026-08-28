@@ -1,0 +1,587 @@
+-- Guarded cancellation for an ordinary Shopify order in a verified account.
+-- Runtime policy separately defaults production writes off and requires the
+-- exact Railway production identity, a production-only enable flag, and an
+-- exact account allowlist. The choices and payment snapshot are immutable on
+-- both the authorization and attempt.
+
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '30s';
+
+DO $$
+DECLARE
+  constraint_name text;
+  removed_count integer := 0;
+BEGIN
+  FOR constraint_name IN
+    SELECT conname
+    FROM pg_catalog.pg_constraint
+    WHERE conrelid =
+          'public.operations_shopify_order_management_authorizations'::regclass
+      AND contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(oid) LIKE '%account_environment%'
+      AND pg_catalog.pg_get_constraintdef(oid) LIKE '%sandbox%'
+      AND pg_catalog.pg_get_constraintdef(oid) NOT LIKE '%production%'
+  LOOP
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE public.operations_shopify_order_management_authorizations DROP CONSTRAINT %I',
+      constraint_name
+    );
+    removed_count := removed_count + 1;
+  END LOOP;
+  IF removed_count <> 1 THEN
+    RAISE EXCEPTION
+      'Expected one sandbox-only Shopify authorization environment constraint, found %',
+      removed_count;
+  END IF;
+END;
+$$;
+
+-- Every new cancellation stores the complete v2 payment ledger shape. This
+-- validator deliberately returns false (never SQL NULL) for a scalar, array,
+-- missing key, extra key, JSON null, wrong JSON type, non-canonical amount,
+-- currency mismatch, invalid hash/count, or refund choice mismatch.
+CREATE OR REPLACE FUNCTION
+  public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+    payment_evidence jsonb,
+    refund_method text
+  )
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+DECLARE
+  transaction_count_text text;
+  transaction_hash_text text;
+  current_money jsonb;
+  amount_text text;
+  currency_code_text text;
+  received_currency text;
+BEGIN
+  IF refund_method NOT IN ('none', 'original_payment_methods')
+     OR pg_catalog.jsonb_typeof(payment_evidence) IS DISTINCT FROM 'object'
+     OR payment_evidence IS DISTINCT FROM pg_catalog.jsonb_build_object(
+       'schema', payment_evidence->'schema',
+       'transactionsCount', payment_evidence->'transactionsCount',
+       'transactionsHash', payment_evidence->'transactionsHash',
+       'totalReceived', payment_evidence->'totalReceived',
+       'totalRefunded', payment_evidence->'totalRefunded',
+       'totalCapturable', payment_evidence->'totalCapturable',
+       'refundMethod', payment_evidence->'refundMethod'
+     )
+     OR payment_evidence->'schema' IS DISTINCT FROM
+          pg_catalog.to_jsonb(
+            'shopify-order-cancel-payment-evidence-v2'::text
+          )
+     OR payment_evidence->'refundMethod' IS DISTINCT FROM
+          pg_catalog.to_jsonb(refund_method)
+     OR pg_catalog.jsonb_typeof(payment_evidence->'transactionsCount')
+          IS DISTINCT FROM 'number'
+     OR pg_catalog.jsonb_typeof(payment_evidence->'transactionsHash')
+          IS DISTINCT FROM 'string'
+  THEN
+    RETURN false;
+  END IF;
+
+  transaction_count_text := payment_evidence->>'transactionsCount';
+  transaction_hash_text := payment_evidence->>'transactionsHash';
+  IF transaction_count_text IS NULL
+     OR transaction_count_text !~ '^(0|[1-9][0-9]*)$'
+     OR pg_catalog.length(transaction_count_text) > 2
+     OR transaction_count_text::numeric > 25
+     OR transaction_hash_text IS NULL
+     OR transaction_hash_text !~ '^[a-f0-9]{64}$'
+  THEN
+    RETURN false;
+  END IF;
+
+  FOREACH current_money IN ARRAY ARRAY[
+    payment_evidence->'totalReceived',
+    payment_evidence->'totalRefunded',
+    payment_evidence->'totalCapturable'
+  ]::jsonb[]
+  LOOP
+    IF pg_catalog.jsonb_typeof(current_money) IS DISTINCT FROM 'object'
+       OR current_money IS DISTINCT FROM pg_catalog.jsonb_build_object(
+         'amount', current_money->'amount',
+         'currencyCode', current_money->'currencyCode'
+       )
+       OR pg_catalog.jsonb_typeof(current_money->'amount')
+            IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(current_money->'currencyCode')
+            IS DISTINCT FROM 'string'
+    THEN
+      RETURN false;
+    END IF;
+    amount_text := current_money->>'amount';
+    currency_code_text := current_money->>'currencyCode';
+    IF amount_text IS NULL
+       OR pg_catalog.length(amount_text) > 128
+       OR amount_text !~ '^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'
+       OR currency_code_text IS NULL
+       OR currency_code_text !~ '^(?:[A-Z]{3}|USDC)$'
+    THEN
+      RETURN false;
+    END IF;
+    IF received_currency IS NULL THEN
+      received_currency := currency_code_text;
+    ELSIF currency_code_text IS DISTINCT FROM received_currency THEN
+      RETURN false;
+    END IF;
+  END LOOP;
+
+  RETURN true;
+END;
+$$;
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ADD CONSTRAINT ops_shopify_order_mgmt_auth_environment_valid CHECK (
+    account_environment IN ('sandbox', 'production')
+  );
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ADD COLUMN cancel_refund_method text,
+  ADD COLUMN cancel_restock boolean,
+  ADD COLUMN cancel_notify_customer boolean,
+  ADD COLUMN cancellation_payment_evidence jsonb,
+  ADD COLUMN legacy_cancellation_without_payment_evidence boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.operations_shopify_order_management_attempts
+  ADD COLUMN cancel_refund_method text,
+  ADD COLUMN cancel_restock boolean,
+  ADD COLUMN cancel_notify_customer boolean,
+  ADD COLUMN cancellation_payment_evidence jsonb,
+  ADD COLUMN legacy_cancellation_without_payment_evidence boolean NOT NULL DEFAULT false;
+
+-- Historical test-fixture rows did not retain the choices because all three
+-- were hard-coded false. Preserve that exact meaning without fabricating the
+-- older payment snapshot, which remains bound by provider_snapshot_hash.
+-- The ledger's normal immutable-write triggers correctly reject these field
+-- changes, so disable only those two triggers inside this transactional
+-- migration and immediately restore them after the bounded backfill.
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  DISABLE TRIGGER protect_shopify_order_management_authorization_write;
+ALTER TABLE public.operations_shopify_order_management_attempts
+  DISABLE TRIGGER protect_shopify_order_management_attempt_write;
+
+UPDATE public.operations_shopify_order_management_authorizations
+SET cancel_refund_method = 'none',
+    cancel_restock = false,
+    cancel_notify_customer = false,
+    legacy_cancellation_without_payment_evidence = true
+WHERE action IN ('cancel', 'cancel_order_after_fulfillment_reversal');
+
+UPDATE public.operations_shopify_order_management_attempts
+SET cancel_refund_method = 'none',
+    cancel_restock = false,
+    cancel_notify_customer = false,
+    legacy_cancellation_without_payment_evidence = true
+WHERE action IN ('cancel', 'cancel_order_after_fulfillment_reversal');
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ENABLE TRIGGER protect_shopify_order_management_authorization_write;
+ALTER TABLE public.operations_shopify_order_management_attempts
+  ENABLE TRIGGER protect_shopify_order_management_attempt_write;
+
+DO $$
+DECLARE
+  constraint_name text;
+BEGIN
+  FOR constraint_name IN
+    SELECT conname
+    FROM pg_catalog.pg_constraint
+    WHERE conrelid =
+          'public.operations_shopify_order_management_authorizations'::regclass
+      AND contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(oid) LIKE '%cancel_reason%STAFF%OTHER%'
+      AND conname <> 'ops_shopify_order_mgmt_auth_action_valid'
+  LOOP
+    EXECUTE pg_catalog.format(
+      'ALTER TABLE public.operations_shopify_order_management_authorizations DROP CONSTRAINT %I',
+      constraint_name
+    );
+  END LOOP;
+END;
+$$;
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ADD CONSTRAINT ops_shopify_order_mgmt_cancel_reason_valid CHECK (
+    cancel_reason IS NULL OR cancel_reason IN (
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF'
+    )
+  ),
+  ADD CONSTRAINT ops_shopify_order_mgmt_cancel_choices_valid CHECK (
+    (
+      action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+      AND (
+        (
+          legacy_cancellation_without_payment_evidence IS TRUE
+          AND cancel_refund_method = 'none'
+          AND cancel_restock IS FALSE
+          AND cancel_notify_customer IS FALSE
+          AND cancellation_payment_evidence IS NULL
+        )
+        OR (
+          legacy_cancellation_without_payment_evidence IS FALSE
+          AND cancel_refund_method IN ('none', 'original_payment_methods')
+          AND cancel_restock IS NOT NULL
+          AND cancel_notify_customer IS NOT NULL
+          AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+            cancellation_payment_evidence,
+            cancel_refund_method
+          ) IS TRUE
+        )
+      )
+    )
+    OR (
+      action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+      AND cancel_refund_method IS NULL
+      AND cancel_restock IS NULL
+      AND cancel_notify_customer IS NULL
+      AND cancellation_payment_evidence IS NULL
+      AND legacy_cancellation_without_payment_evidence IS FALSE
+    )
+  ) NOT VALID;
+
+ALTER TABLE public.operations_shopify_order_management_attempts
+  ADD CONSTRAINT ops_shopify_order_mgmt_attempt_cancel_choices_valid CHECK (
+    (
+      action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+      AND (
+        (
+          legacy_cancellation_without_payment_evidence IS TRUE
+          AND cancel_refund_method = 'none'
+          AND cancel_restock IS FALSE
+          AND cancel_notify_customer IS FALSE
+          AND cancellation_payment_evidence IS NULL
+        )
+        OR (
+          legacy_cancellation_without_payment_evidence IS FALSE
+          AND cancel_refund_method IN ('none', 'original_payment_methods')
+          AND cancel_restock IS NOT NULL
+          AND cancel_notify_customer IS NOT NULL
+          AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+            cancellation_payment_evidence,
+            cancel_refund_method
+          ) IS TRUE
+        )
+      )
+    )
+    OR (
+      action NOT IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+      AND cancel_refund_method IS NULL
+      AND cancel_restock IS NULL
+      AND cancel_notify_customer IS NULL
+      AND cancellation_payment_evidence IS NULL
+      AND legacy_cancellation_without_payment_evidence IS FALSE
+    )
+  ) NOT VALID;
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  DROP CONSTRAINT ops_shopify_order_mgmt_auth_action_valid;
+
+ALTER TABLE public.operations_shopify_order_management_authorizations
+  ADD CONSTRAINT ops_shopify_order_mgmt_auth_action_valid CHECK (
+    (
+      action = 'add_tag'
+      AND tag_hash IS NOT NULL
+      AND accepted_observation_id IS NULL
+      AND accepted_provider_order_updated_at IS NULL
+      AND fulfillment_gid IS NULL
+      AND expected_fulfillment_updated_at IS NULL
+      AND predecessor_authorization_id IS NULL
+      AND line_item_id IS NULL
+      AND expected_line_quantity IS NULL
+      AND requested_quantity IS NULL
+      AND cancel_reason IS NULL
+      AND staff_note_hash IS NULL
+      AND requested_projection_hash IS NULL
+      AND NOT requires_order_edits
+    )
+    OR (
+      action = 'cancel_fulfillment'
+      AND provider_order_test
+      AND accepted_observation_id IS NULL
+      AND accepted_provider_order_updated_at IS NULL
+      AND fulfillment_gid ~ '^gid://shopify/Fulfillment/[1-9][0-9]{0,20}$'
+      AND expected_fulfillment_updated_at IS NOT NULL
+      AND expected_fulfillment_updated_at <= provider_order_observed_at
+      AND predecessor_authorization_id IS NULL
+      AND line_item_id IS NULL
+      AND expected_line_quantity IS NULL
+      AND requested_quantity IS NULL
+      AND tag_hash IS NULL
+      AND cancel_reason IS NULL
+      AND staff_note_hash IS NULL
+      AND requested_projection_hash IS NULL
+      AND NOT requires_order_edits
+    )
+    OR (
+      action = 'cancel'
+      AND accepted_observation_id IS NOT NULL
+      AND accepted_provider_order_updated_at = provider_order_updated_at
+      AND fulfillment_gid IS NULL
+      AND expected_fulfillment_updated_at IS NULL
+      AND predecessor_authorization_id IS NULL
+      AND tag_hash IS NULL
+      AND line_item_id IS NULL
+      AND expected_line_quantity IS NULL
+      AND requested_quantity IS NULL
+      AND cancel_reason IS NOT NULL
+      AND requested_projection_hash IS NULL
+      AND NOT requires_order_edits
+    )
+    OR (
+      action = 'cancel_order_after_fulfillment_reversal'
+      AND provider_order_test
+      AND accepted_observation_id IS NULL
+      AND accepted_provider_order_updated_at IS NULL
+      AND fulfillment_gid IS NULL
+      AND expected_fulfillment_updated_at IS NULL
+      AND predecessor_authorization_id IS NOT NULL
+      AND tag_hash IS NULL
+      AND line_item_id IS NULL
+      AND expected_line_quantity IS NULL
+      AND requested_quantity IS NULL
+      AND cancel_reason IS NOT NULL
+      AND requested_projection_hash IS NULL
+      AND NOT requires_order_edits
+    )
+    OR (
+      action = 'set_line_quantity'
+      AND provider_order_test
+      AND accepted_observation_id IS NOT NULL
+      AND accepted_provider_order_updated_at = provider_order_updated_at
+      AND fulfillment_gid IS NULL
+      AND expected_fulfillment_updated_at IS NULL
+      AND predecessor_authorization_id IS NULL
+      AND tag_hash IS NULL
+      AND line_item_id ~ '^gid://shopify/LineItem/[1-9][0-9]{0,20}$'
+      AND expected_line_quantity BETWEEN 1 AND 2147483647
+      AND requested_quantity BETWEEN 0 AND 2147483647
+      AND requested_quantity < expected_line_quantity
+      AND cancel_reason IS NULL
+      AND requested_projection_hash IS NULL
+      AND NOT requires_order_edits
+    )
+    OR (
+      action = 'save_order'
+      AND (provider_order_test OR NOT requires_order_edits)
+      AND accepted_observation_id IS NOT NULL
+      AND accepted_provider_order_updated_at = provider_order_updated_at
+      AND fulfillment_gid IS NULL
+      AND expected_fulfillment_updated_at IS NULL
+      AND predecessor_authorization_id IS NULL
+      AND tag_hash IS NULL
+      AND line_item_id IS NULL
+      AND expected_line_quantity IS NULL
+      AND requested_quantity IS NULL
+      AND cancel_reason IS NULL
+      AND staff_note_hash IS NULL
+      AND requested_projection_hash ~ '^[a-f0-9]{64}$'
+    )
+  );
+
+-- The predecessor ledger functions were intentionally sandbox-only. Expand
+-- exactly their one environment predicate so a production account can retain
+-- and claim only an ordinary cancellation intent. Production cannot use the
+-- legacy rolling activation lane: it must bind the current Provider-writes
+-- control row and scope digest. Every other production action remains denied.
+-- The replacement fails closed if either predecessor definition changes.
+DO $migration$
+DECLARE
+  current_definition text;
+  updated_definition text;
+  sandbox_predicate constant text :=
+    'AND account.environment = ''sandbox''';
+BEGIN
+  SELECT pg_catalog.pg_get_functiondef(
+    'public.operations_shopify_order_management_is_current(uuid,uuid,boolean)'::regprocedure
+  )
+  INTO current_definition;
+
+  IF (
+    pg_catalog.length(current_definition)
+    - pg_catalog.length(
+        pg_catalog.replace(current_definition, sandbox_predicate, '')
+      )
+  ) <> pg_catalog.length(sandbox_predicate) THEN
+    RAISE EXCEPTION
+      'Unexpected Shopify authorization-current environment predicate';
+  END IF;
+
+  updated_definition := pg_catalog.replace(
+    current_definition,
+    sandbox_predicate,
+    'AND (
+        account.environment = ''sandbox''
+        OR (
+          account.environment = ''production''
+          AND authz.action = ''cancel''
+          AND authz.activation_state IS NULL
+          AND authz.activation_revision IS NULL
+          AND authz.provider_write_control_row_version IS NOT NULL
+          AND authz.provider_write_scope_digest IS NOT NULL
+        )
+      )'
+  );
+  EXECUTE updated_definition;
+
+  SELECT pg_catalog.pg_get_functiondef(
+    'public.protect_shopify_order_management_authorization()'::regprocedure
+  )
+  INTO current_definition;
+
+  IF (
+    pg_catalog.length(current_definition)
+    - pg_catalog.length(
+        pg_catalog.replace(current_definition, sandbox_predicate, '')
+      )
+  ) <> pg_catalog.length(sandbox_predicate) THEN
+    RAISE EXCEPTION
+      'Unexpected Shopify authorization-insert environment predicate';
+  END IF;
+
+  updated_definition := pg_catalog.replace(
+    current_definition,
+    sandbox_predicate,
+    'AND (
+             account.environment = ''sandbox''
+             OR (
+               account.environment = ''production''
+               AND NEW.action = ''cancel''
+               AND NEW.activation_state IS NULL
+               AND NEW.activation_revision IS NULL
+               AND NEW.provider_write_control_row_version IS NOT NULL
+               AND NEW.provider_write_scope_digest IS NOT NULL
+             )
+           )'
+  );
+  EXECUTE updated_definition;
+END;
+$migration$;
+
+CREATE OR REPLACE FUNCTION
+  public.protect_shopify_order_cancel_intent_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  IF (
+    NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+    AND NEW.legacy_cancellation_without_payment_evidence IS FALSE
+    AND NEW.cancel_refund_method IN ('none', 'original_payment_methods')
+    AND NEW.cancel_restock IS NOT NULL
+    AND NEW.cancel_notify_customer IS NOT NULL
+    AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+      NEW.cancellation_payment_evidence,
+      NEW.cancel_refund_method
+    ) IS TRUE
+    AND (
+      NEW.provider_order_test
+      OR NEW.action = 'cancel'
+    )
+    AND EXISTS (
+       SELECT 1
+       FROM public.app_user_organization_memberships membership
+       WHERE membership.organization_id = NEW.organization_id
+         AND membership.user_email = NEW.authorized_by
+         AND membership.status = 'active'
+         AND membership.role = NEW.authorized_role
+         AND (
+           membership.role = 'owner'
+           OR (
+             membership.role = 'admin'
+             AND COALESCE(
+               (membership.permissions->>'manageOperations')::boolean,
+               false
+             )
+             AND COALESCE(
+               (membership.permissions->>'executeWarehouse')::boolean,
+               false
+             )
+           )
+         )
+    )
+  ) IS DISTINCT FROM TRUE
+  THEN
+    RAISE EXCEPTION
+      'Shopify order cancellation intent is incomplete or not permitted';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION
+  public.protect_shopify_order_cancel_attempt_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public, pg_temp
+AS $$
+BEGIN
+  IF (
+    NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal')
+    AND (
+      (
+        NEW.legacy_cancellation_without_payment_evidence IS FALSE
+        AND public.operations_shopify_order_cancel_payment_evidence_v2_valid(
+          NEW.cancellation_payment_evidence,
+          NEW.cancel_refund_method
+        ) IS TRUE
+      )
+      OR (
+        NEW.legacy_cancellation_without_payment_evidence IS TRUE
+        AND NEW.cancel_refund_method = 'none'
+        AND NEW.cancel_restock IS FALSE
+        AND NEW.cancel_notify_customer IS FALSE
+        AND NEW.cancellation_payment_evidence IS NULL
+      )
+    )
+    AND EXISTS (
+       SELECT 1
+       FROM public.operations_shopify_order_management_authorizations authz
+       WHERE authz.organization_id = NEW.organization_id
+         AND authz.id = NEW.authorization_id
+         AND authz.status = 'prepared'
+         AND authz.cancel_refund_method = NEW.cancel_refund_method
+         AND authz.cancel_restock = NEW.cancel_restock
+         AND authz.cancel_notify_customer = NEW.cancel_notify_customer
+         AND authz.cancellation_payment_evidence IS NOT DISTINCT FROM
+               NEW.cancellation_payment_evidence
+         AND authz.legacy_cancellation_without_payment_evidence =
+               NEW.legacy_cancellation_without_payment_evidence
+         AND authz.intent_hash = NEW.intent_hash
+         AND authz.provider_snapshot_hash = NEW.provider_snapshot_hash
+    )
+  ) IS DISTINCT FROM TRUE
+  THEN
+    RAISE EXCEPTION
+      'Shopify order cancellation attempt does not match its durable intent';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS protect_shopify_order_cancel_intent_insert
+ON public.operations_shopify_order_management_authorizations;
+
+CREATE TRIGGER protect_shopify_order_cancel_intent_insert
+BEFORE INSERT ON public.operations_shopify_order_management_authorizations
+FOR EACH ROW
+WHEN (NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal'))
+EXECUTE FUNCTION public.protect_shopify_order_cancel_intent_insert();
+
+DROP TRIGGER IF EXISTS protect_shopify_order_cancel_attempt_insert
+ON public.operations_shopify_order_management_attempts;
+
+CREATE TRIGGER protect_shopify_order_cancel_attempt_insert
+BEFORE INSERT ON public.operations_shopify_order_management_attempts
+FOR EACH ROW
+WHEN (NEW.action IN ('cancel', 'cancel_order_after_fulfillment_reversal'))
+EXECUTE FUNCTION public.protect_shopify_order_cancel_attempt_insert();
+
+COMMENT ON COLUMN
+  public.operations_shopify_order_management_authorizations.cancellation_payment_evidence
+IS 'Immutable bounded payment snapshot used to reconcile orderCancel without retrying an unknown provider outcome.';
