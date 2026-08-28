@@ -249,6 +249,325 @@ const gmailSources = runModule(
   },
 )
 
+const baseMessageSignals = {
+  senderEmail: 'recruiter@acme.com',
+  subject: 'Vice President supply chain role',
+  snippet: 'I am a recruiter retained for this leadership position.',
+  bodyText: 'Your experience may fit. Would you be open to an interview?',
+  labelIds: ['INBOX'],
+  listUnsubscribe: '',
+  precedence: '',
+  autoSubmitted: '',
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant(baseMessageSignals),
+  true,
+  'direct recruiter outreach must remain eligible',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'marketing@navyfederal.org',
+    subject: 'Auto loans as low as 3.98% APR for new cars',
+    snippet: 'Access your credit application and view this special member offer.',
+    bodyText: 'Apply for an auto loan. Limited-time offer and rewards available.',
+    labelIds: ['INBOX', 'CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<mailto:unsubscribe@navyfederal.org>',
+  }),
+  false,
+  'consumer lending marketing must never qualify as job outreach',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'newsletter@unknown.example.org',
+    subject: 'Weekly career newsletter and special offer',
+    snippet: 'Hiring trends and roles from this week.',
+    bodyText: 'A bulk career digest for subscribers.',
+    listUnsubscribe: '<https://unknown.example.org/unsubscribe>',
+    precedence: 'bulk',
+  }),
+  false,
+  'generic bulk career newsletters must not enter the outreach inbox',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'notifications@greenhouse.io',
+    subject: 'Application update for Vice President, Supply Chain',
+    snippet: 'Your application has moved to the hiring manager review stage.',
+    bodyText: 'Sign in to your candidate portal for next steps.',
+    listUnsubscribe: '<mailto:unsubscribe@greenhouse.io>',
+    autoSubmitted: 'auto-generated',
+  }),
+  true,
+  'an ATS application update remains eligible even when automated',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jobalerts-noreply@linkedin.com',
+    subject: 'Job alert: Vice President of Supply Chain',
+    snippet: 'New jobs matching your saved search.',
+    bodyText: 'Recommended jobs in New York and Connecticut.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<https://linkedin.com/comm/settings>',
+  }),
+  true,
+  'a known-platform job alert remains eligible in Promotions',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'recruiting@navyfederal.org',
+    subject: 'Interview for Vice President, Logistics Technology',
+    snippet: 'Our talent acquisition team would like to schedule an interview.',
+    bodyText: 'Please share times to meet the hiring manager.',
+  }),
+  true,
+  'a bank recruiter interview is not confused with consumer finance marketing',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    labelIds: ['SPAM'],
+  }),
+  false,
+  'Gmail spam labels always win over content terms',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jane@searchfirm.com',
+    subject: 'A VP Supply Chain opportunity',
+    snippet: 'I came across your profile and think you could be a great fit.',
+    bodyText: 'Would you be open to a quick call?',
+  }),
+  true,
+  'ordinary personalized recruiter outreach must qualify without recruiter keywords',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jane@manufacturer.com',
+    subject: 'VP Operations position',
+    snippet: 'Your background caught my eye.',
+    bodyText: 'Can we connect to discuss the position?',
+  }),
+  true,
+  'company recruiter outreach must qualify from title and personal-outreach evidence',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'admissions@university.edu',
+    subject: 'Your application update',
+    snippet: 'Your application for the MBA program is complete.',
+    bodyText: 'Sign in to the student admissions portal.',
+  }),
+  false,
+  'education applications are not employment applications',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'servicing@mortgage.example',
+    subject: 'Your application update',
+    snippet: 'Your mortgage application status changed.',
+    bodyText: 'Review the loan documents in your account.',
+  }),
+  false,
+  'mortgage application updates are not employment applications',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jobs@company.icims.com',
+    subject: 'Application update for VP Operations',
+    snippet: 'Your candidate application moved to hiring manager review.',
+    bodyText: 'Sign in for the next steps in this job application.',
+    listUnsubscribe: '<https://company.icims.com/unsubscribe>',
+    autoSubmitted: 'auto-generated',
+  }),
+  true,
+  'iCIMS ATS application updates remain eligible when automated',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'careers@manufacturer.com',
+    subject: 'Job alert: new leadership matches',
+    snippet: 'New jobs matching your saved preferences.',
+    bodyText: 'Review the latest director and vice president positions.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<https://manufacturer.com/careers/unsubscribe>',
+  }),
+  true,
+  'employer-hosted job alerts remain eligible in Promotions',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'newsletter@searchfirm.com',
+    subject: 'Our weekly leadership newsletter',
+    snippet: 'We are recruiting for a leadership role.',
+    bodyText: 'Read industry news and subscribe for future issues.',
+    listUnsubscribe: '<https://searchfirm.com/unsubscribe>',
+    precedence: 'bulk',
+  }),
+  false,
+  'bulk recruiting newsletters do not qualify from generic role language alone',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'newsletter@leadership.example',
+    subject: 'Exclusive interview with our CEO',
+    snippet: 'An opportunity to watch this leadership interview.',
+    bodyText: 'Read our latest article and subscribe for weekly episodes.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<https://leadership.example/unsubscribe>',
+  }),
+  false,
+  'promotional leadership interviews are not job interviews',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'producer@operationspodcast.example',
+    subject: 'Interview opportunity',
+    snippet: 'We would like to interview you on our show.',
+    bodyText: 'Join us as a guest on an upcoming podcast episode.',
+  }),
+  false,
+  'media interview invitations are not job interviews',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'admissions@university.edu',
+    subject: 'Interview for your MBA application',
+    snippet: 'Schedule your student admissions interview.',
+    bodyText: 'Choose an available time for the degree program interview.',
+  }),
+  false,
+  'admissions interviews are not job interviews',
+)
+for (const example of [
+  {
+    senderEmail: 'careers@university.edu',
+    subject: 'Application update: VP Operations',
+    bodyText: 'Your university VP Operations position is with the hiring manager.',
+  },
+  {
+    senderEmail: 'careers@bank.example',
+    subject: 'Application update: VP Credit Risk',
+    bodyText: 'Your candidate application for this position is with the hiring manager.',
+  },
+  {
+    senderEmail: 'careers@insurer.example',
+    subject: 'Application update: Director of Insurance Operations',
+    bodyText: 'Your job application is with the hiring manager.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+      snippet: example.bodyText,
+    }),
+    true,
+    `employment application must win over an employer industry term: ${example.subject}`,
+  )
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'calendar@company.example',
+    subject: 'Interview scheduling invitation',
+    snippet: 'Please choose an available time.',
+    bodyText: 'Open the calendar to schedule your interview.',
+    autoSubmitted: 'auto-generated',
+  }),
+  true,
+  'a bare automated job-interview scheduler remains eligible',
+)
+for (const example of [
+  {
+    subject: 'Exclusive interview with a COO',
+    snippet: 'An opportunity to read our latest article.',
+    bodyText: 'Subscribe to the publication for more executive interviews.',
+  },
+  {
+    subject: 'CIO interview webinar',
+    snippet: 'Join our live webinar about leadership opportunities.',
+    bodyText: 'Register for this episode and future webinars.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+      senderEmail: 'newsletter@leadership.example',
+      labelIds: ['CATEGORY_PROMOTIONS'],
+      listUnsubscribe: '<https://leadership.example/unsubscribe>',
+    }),
+    false,
+    `an executive title does not turn content marketing into a job interview: ${example.subject}`,
+  )
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'producer@operationspodcast.example',
+    subject: 'Interview opportunity for a VP of Supply Chain',
+    snippet: 'We would like you as a guest.',
+    bodyText: 'Join an upcoming podcast episode.',
+  }),
+  false,
+  'an executive title does not turn a podcast invitation into job outreach',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'admissions@university.edu',
+    subject: 'Interview for Director MBA application',
+    snippet: 'Your student admissions interview is ready to schedule.',
+    bodyText: 'Choose a time in the degree program portal.',
+  }),
+  false,
+  'an executive title does not turn an MBA admissions interview into employment',
+)
+for (const example of [
+  {
+    subject: 'Exclusive interview with a COO',
+    snippet: 'Read our executive interview.',
+    bodyText: 'An article about the changing role of the COO.',
+  },
+  {
+    subject: 'Interview opportunity',
+    snippet: 'Join our podcast as a guest.',
+    bodyText: 'Discuss your role as VP of Supply Chain in an upcoming episode.',
+  },
+  {
+    subject: 'Interview opportunity',
+    snippet: 'Join our podcast as a guest.',
+    bodyText: 'An episode about recruiting for leadership roles.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+      senderEmail: 'producer@leadershipmedia.example',
+      labelIds: ['CATEGORY_PROMOTIONS'],
+      listUnsubscribe: '<https://leadershipmedia.example/unsubscribe>',
+    }),
+    false,
+    `media topics do not masquerade as recruiting provenance: ${example.bodyText}`,
+  )
+}
+
 const accounts = await gmailSources.getCareerSiteGmailAccounts(identity.CAREER_SITE_OWNER_EMAIL)
 assert.equal(JSON.stringify(accounts), JSON.stringify([
   { accountEmail: 'alpha@gmail.com', status: 'ACTIVE' },
@@ -504,6 +823,7 @@ const malformedSources = loadGmailSources({
         { id: 'oversized-sender' },
         { id: 'attachment-only' },
         { id: 'whitespace-only' },
+        { id: 'consumer-promotion' },
       ] })
     }
     const id = decodeURIComponent(path.match(/\/messages\/([^?]+)/)?.[1] || '')
@@ -520,6 +840,7 @@ const malformedSources = loadGmailSources({
   parseGmailMessage(message) {
     if (message.id === 'throws') throw new Error('malformed provider message')
     const valid = message.id === 'valid'
+    const consumerPromotion = message.id === 'consumer-promotion'
     return {
       externalMessageId: message.id,
       externalThreadId: null,
@@ -529,13 +850,29 @@ const malformedSources = loadGmailSources({
           ? `${'a'.repeat(1_000)}@acme.com`
           : 'recruiter@acme.com',
       recipientEmails: [],
-      subject: valid ? 'Valid role' : '',
+      subject: valid
+        ? 'Valid role'
+        : consumerPromotion
+          ? 'Auto loans as low as 3.98% APR for new cars'
+          : '',
       receivedAt: '2026-08-28T16:00:00.000Z',
-      snippet: valid ? 'A real role' : message.id === 'whitespace-only' ? '   ' : '',
-      bodyText: valid ? 'A real role' : message.id === 'whitespace-only' ? '\n\t' : '',
+      snippet: valid
+        ? 'A real role for a candidate'
+        : consumerPromotion
+          ? 'Access your credit application and view this member offer.'
+          : message.id === 'whitespace-only'
+            ? '   '
+            : '',
+      bodyText: valid
+        ? 'A recruiter is hiring for a real role.'
+        : consumerPromotion
+          ? 'Apply for an auto loan and save on new cars.'
+          : message.id === 'whitespace-only'
+            ? '\n\t'
+            : '',
       markerReferences: [],
       historyId: null,
-      labelIds: [],
+      labelIds: consumerPromotion ? ['CATEGORY_PROMOTIONS'] : [],
       sizeEstimate: null,
     }
   },
