@@ -1303,6 +1303,71 @@ async function verify(databaseUrl) {
       true,
       'Hosted health must require order-specific ordinary-item physical facts',
     )
+    const healthTamperClient = await pool.connect()
+    try {
+      const assertHealthRejectsTamper = async (sql, message) => {
+        await healthTamperClient.query('BEGIN')
+        try {
+          await healthTamperClient.query(sql)
+          const result = await healthTamperClient.query(
+            `SELECT (
+               ${unitWeightHealth.OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL}
+             ) AS applied`,
+          )
+          assert.equal(result.rows[0]?.applied, false, message)
+        } finally {
+          await healthTamperClient.query('ROLLBACK')
+        }
+      }
+      await assertHealthRejectsTamper(
+        `UPDATE public.schema_migrations
+         SET checksum = repeat('0', 64)
+         WHERE filename = '0336_operations_order_unit_physical_facts.sql'`,
+        '0336 health must reject a drifted migration ledger checksum',
+      )
+      await assertHealthRejectsTamper(
+        `ALTER TABLE public.operations_order_unit_weight_facts
+         ALTER COLUMN unit_length_mm TYPE bigint`,
+        '0336 health must reject column type drift',
+      )
+      await assertHealthRejectsTamper(
+        `ALTER TABLE public.operations_order_unit_weight_facts
+         DROP CONSTRAINT operations_order_unit_weight_facts_dimensions_valid`,
+        '0336 health must reject constraint drift',
+      )
+      await assertHealthRejectsTamper(
+        `ALTER INDEX public.operations_order_unit_weight_facts_latest_idx
+         RENAME TO operations_order_unit_weight_facts_latest_drifted_idx`,
+        '0336 health must reject index drift',
+      )
+      await assertHealthRejectsTamper(
+        `CREATE OR REPLACE FUNCTION
+           public.protect_operations_order_unit_weight_fact()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$ BEGIN RETURN OLD; END; $$`,
+        '0336 health must reject integrity-function body drift',
+      )
+      await assertHealthRejectsTamper(
+        `ALTER TABLE public.operations_cartonization_rate_evidence_packages
+         DISABLE TRIGGER
+           validate_operations_cartonization_unit_material_package`,
+        '0336 health must reject a disabled cartonization trigger',
+      )
+      await assertHealthRejectsTamper(
+        `DROP TRIGGER validate_operations_cartonization_unit_material_package
+           ON public.operations_cartonization_rate_evidence_packages;
+         CREATE TRIGGER
+           validate_operations_cartonization_unit_material_package
+         AFTER INSERT OR UPDATE
+           ON public.operations_cartonization_rate_evidence_packages
+         FOR EACH ROW EXECUTE FUNCTION
+           public.validate_operations_cartonization_unit_material_package()`,
+        '0336 health must reject trigger type and deferrability drift',
+      )
+    } finally {
+      healthTamperClient.release()
+    }
 
     const ordinaryUnitContext = await pool.query(
       `SELECT line.packaging_state, line.packaging_source,
@@ -1860,7 +1925,7 @@ async function verify(databaseUrl) {
            $1::uuid, $2::uuid, $3::uuid,
            10, $4, $5, $6::uuid, NULL,
            'operational', 'ordinary-unit-postgres-acceptance-v1',
-           'operational-unit-material-fixed-axis-v2',
+           'operational-unit-material-shared-stock-v3',
            $7, $8, $9, $10::jsonb, '{}'::jsonb, 'succeeded',
            $11, $12, $13
          ) RETURNING id::text`,
@@ -1936,6 +2001,85 @@ async function verify(databaseUrl) {
       assert.equal(retained.rowCount, 1)
       assert.equal(retained.rows[0].allocations[0].quantity, 3)
       assert.equal(retained.rows[0].content_weight_grams, 9000)
+      await packageEvidenceClient.query('SAVEPOINT line_count_tamper')
+      await packageEvidenceClient.query(
+        `SET CONSTRAINTS
+           validate_operations_cartonization_unit_material_package DEFERRED`,
+      )
+      const tamperedEvidence = (await packageEvidenceClient.query(
+        `INSERT INTO operations_cartonization_rate_evidence (
+           organization_id, integration_account_id, order_candidate_id,
+           candidate_row_version, candidate_source_hash,
+           destination_fingerprint, warehouse_id, inventory_sync_run_id,
+           evidence_mode, policy_version, algorithm_version,
+           request_hash, plan_input_hash, plan_result_hash,
+           plan_snapshot, assumption_snapshot, status,
+           idempotency_key, actor_email, write_token_hash
+         )
+         SELECT organization_id, integration_account_id, order_candidate_id,
+                candidate_row_version, candidate_source_hash,
+                destination_fingerprint, warehouse_id, inventory_sync_run_id,
+                evidence_mode, policy_version, algorithm_version,
+                $2, $3, $4,
+                pg_catalog.jsonb_set(
+                  plan_snapshot,
+                  '{operationalUnitMaterialPlan,evidence,dimensionedLineCount}',
+                  '0'::jsonb,
+                  false
+                ), assumption_snapshot, status,
+                $5, actor_email, write_token_hash
+         FROM operations_cartonization_rate_evidence
+         WHERE organization_id = $1::uuid AND id = $6::uuid
+         RETURNING id::text`,
+        [
+          fixture.organizationId,
+          hash(`unit-material-count-tamper-request-${packageFixtureSuffix}`),
+          hash(`unit-material-count-tamper-input-${packageFixtureSuffix}`),
+          hash(`unit-material-count-tamper-result-${packageFixtureSuffix}`),
+          `unit-material-count-tamper-${packageFixtureSuffix}`,
+          evidence.id,
+        ],
+      )).rows[0]
+      await packageEvidenceClient.query(
+        `INSERT INTO operations_cartonization_rate_evidence_packages (
+           organization_id, evidence_id, package_key, package_sequence,
+           planning_method, packaging_material_id, material_row_version,
+           inner_dimensions_mm, rated_outer_dimensions_mm,
+           content_weight_grams, tare_weight_grams,
+           rated_gross_weight_grams, max_weight_grams,
+           allocations, carrier_parcel_snapshot, package_hash
+         )
+         SELECT organization_id, $3::uuid, package_key, package_sequence,
+                planning_method, packaging_material_id, material_row_version,
+                inner_dimensions_mm, rated_outer_dimensions_mm,
+                content_weight_grams, tare_weight_grams,
+                rated_gross_weight_grams, max_weight_grams,
+                allocations, carrier_parcel_snapshot, $4
+         FROM operations_cartonization_rate_evidence_packages
+         WHERE organization_id = $1::uuid
+           AND evidence_id = $2::uuid
+           AND package_key = $5`,
+        [
+          fixture.organizationId,
+          evidence.id,
+          tamperedEvidence.id,
+          hash(`unit-material-count-tamper-package-${packageFixtureSuffix}`),
+          retainedPackage.packageKey,
+        ],
+      )
+      await assert.rejects(
+        packageEvidenceClient.query(
+          `SET CONSTRAINTS
+             validate_operations_cartonization_unit_material_package IMMEDIATE`,
+        ),
+        /exact retained operational evidence/,
+        'PostgreSQL must derive line counts from retained package fit models',
+      )
+      await packageEvidenceClient.query('ROLLBACK TO SAVEPOINT line_count_tamper')
+      await packageEvidenceClient.query(
+        `SET CONSTRAINTS
+           validate_operations_cartonization_unit_material_package IMMEDIATE`,
+      )
     } finally {
       await packageEvidenceClient.query('ROLLBACK')
       packageEvidenceClient.release()
@@ -1955,7 +2099,7 @@ async function main() {
       '-e', 'POSTGRES_PASSWORD=legacy_unit',
       '-e', 'POSTGRES_DB=legacy_unit',
       '-p', '127.0.0.1::5432',
-      'pgvector/pgvector:pg16',
+      'pgvector/pgvector:pg18',
     ], { timeout: 180_000 })
     const portOutput = command('docker', ['port', container, '5432/tcp'])
     const port = Number(portOutput.match(/:(\d+)\s*$/u)?.[1])

@@ -826,15 +826,21 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
   }
   if (
     evidenceRecord.policyVersion
-      !== 'operational-unit-material-fixed-axis-v2'
+      !== 'operational-unit-material-shared-stock-v3'
     || evidenceRecord.productPackConstraint
       !== 'not_required_for_ordinary_unit'
     || canonicalOptimizerHash(evidenceRecord.packageSelectionPolicies)
       !== canonicalOptimizerHash({
         dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
         undimensioned:
-          'largest_selected_factual_container_with_available_stock',
+          'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+        boundedFallback:
+          'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
       })
+    || ![
+      'exact_bounded_search',
+      'min_cost_max_flow_one_carton_per_unit_fallback',
+    ].includes(String(evidenceRecord.sharedStockSolver || ''))
     || evidenceRecord.combinationPolicy !== 'same_line_fixed_axis_only'
     || evidenceRecord.unitWeightAuthority
       !== 'provider_or_order_specific'
@@ -863,6 +869,8 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
     )
   }
+  const dimensionedLineIds = new Set<string>()
+  const oneEachUndimensionedLineIds = new Set<string>()
   for (const packageInput of unitPackages) {
     const packageRecord = retainedByKey.get(packageInput.packageKey)
     const allocations = packageRecord?.allocations
@@ -906,6 +914,8 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       || canonicalOptimizerHash(allocations)
         !== canonicalOptimizerHash(packageInput.allocations)
       || !allocation
+      || typeof allocation.lineGlobalId !== 'string'
+      || !allocation.lineGlobalId
       || !Number.isSafeInteger(allocationQuantity)
       || allocationQuantity < 1
       || !Number.isSafeInteger(allocationUnitWeight)
@@ -917,13 +927,15 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       || packageInput.orToolsProfiles.length !== 0
       || !unitEvidenceRecord
       || unitEvidenceRecord.policyVersion
-        !== 'operational-unit-material-fixed-axis-v2'
+        !== 'operational-unit-material-shared-stock-v3'
       || unitEvidenceRecord.productPackConstraint
         !== 'not_required_for_ordinary_unit'
       || unitEvidenceRecord.unitsPerPackage !== allocationQuantity
       || unitEvidenceRecord.unitWeightAuthority
         !== 'provider_or_order_specific'
       || unitEvidenceRecord.rotationAllowed !== false
+      || unitEvidenceRecord.sharedStockSolver
+        !== evidenceRecord.sharedStockSolver
       || packageInput.maxWeightGrams === null
       || !Number.isSafeInteger(expectedWeightCapacity)
       || Number(expectedWeightCapacity) < allocationQuantity
@@ -944,11 +956,16 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
       === 'fixed_axis_regular_grid'
     const oneEach = unitEvidenceRecord.fitModel
       === 'one_each_without_fit_claim'
+    const fallbackSolver = evidenceRecord.sharedStockSolver
+      === 'min_cost_max_flow_one_carton_per_unit_fallback'
     if (
       (fixedAxis && unitEvidenceRecord.packageSelectionBasis
-        !== 'fewest_packages_then_material_cost_then_inner_cube')
+        !== (fallbackSolver
+          ? 'deterministic_shared_stock_one_carton_per_unit'
+          : 'fewest_packages_then_material_cost_then_inner_cube'))
       || (oneEach && unitEvidenceRecord.packageSelectionBasis
-        !== 'largest_selected_factual_container_with_available_stock')
+        !== 'largest_rated_outer_volume_then_sorted_axes_then_material_id')
+      || (fallbackSolver && allocationQuantity !== 1)
     ) {
       fail(
         `${packageInput.packageKey} has an invalid ordinary-unit material selection policy`,
@@ -1033,6 +1050,25 @@ export function assertCartonizationRateEvidenceUnitMaterialProvenance(
         'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
       )
     }
+    if (fixedAxis) {
+      dimensionedLineIds.add(String(allocation.lineGlobalId))
+    } else {
+      oneEachUndimensionedLineIds.add(String(allocation.lineGlobalId))
+    }
+  }
+  if (
+    [...dimensionedLineIds].some((lineGlobalId) => (
+      oneEachUndimensionedLineIds.has(lineGlobalId)
+    ))
+    || evidenceRecord.dimensionedLineCount !== dimensionedLineIds.size
+    || evidenceRecord.oneEachUndimensionedLineCount
+      !== oneEachUndimensionedLineIds.size
+  ) {
+    fail(
+      'Retained ordinary-unit line counts do not match package provenance',
+      400,
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+    )
   }
 }
 

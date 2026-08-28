@@ -616,14 +616,17 @@ function loadOperationalFaireRoute(
         return {
           status: 'ready',
           evidence: {
-            policyVersion: 'operational-unit-material-fixed-axis-v2',
+            policyVersion: 'operational-unit-material-shared-stock-v3',
             productPackConstraint: 'not_required_for_ordinary_unit',
             packageSelectionPolicies: {
               dimensioned:
                 'fewest_packages_then_material_cost_then_inner_cube',
               undimensioned:
-                'largest_selected_factual_container_with_available_stock',
+                'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+              boundedFallback:
+                'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
             },
+            sharedStockSolver: 'exact_bounded_search',
             combinationPolicy: 'same_line_fixed_axis_only',
             unitWeightAuthority: 'provider_or_order_specific',
             unitDimensionsAuthority:
@@ -661,10 +664,11 @@ function loadOperationalFaireRoute(
               quantity: 1,
             }],
             unitMaterialEvidence: {
-              policyVersion: 'operational-unit-material-fixed-axis-v2',
+              policyVersion: 'operational-unit-material-shared-stock-v3',
               productPackConstraint: 'not_required_for_ordinary_unit',
               packageSelectionBasis:
-                'largest_selected_factual_container_with_available_stock',
+                'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+              sharedStockSolver: 'exact_bounded_search',
               unitsPerPackage: 1,
               unitWeightGrams: 400,
               unitWeightAuthority: 'provider_or_order_specific',
@@ -981,7 +985,9 @@ assertIncludes(orToolsProfileMigration, [
 ], 'Operational OR-Tools profile evidence migration')
 assertIncludes(unitMaterialMigration, [
   'validate_operations_cartonization_unit_material_package()',
-  'operational-unit-material-fixed-axis-v2',
+  'operational-unit-material-shared-stock-v3',
+  'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+  'min_cost_max_flow_one_carton_per_unit_fallback',
   'same_line_fixed_axis_only',
   'fixed_axis_regular_grid',
   'one_each_without_fit_claim',
@@ -1365,10 +1371,11 @@ const unitRetainedPackage = {
   maxWeightGrams: 5000,
   allocations: [unitAllocation],
   unitMaterialEvidence: {
-    policyVersion: 'operational-unit-material-fixed-axis-v2',
+    policyVersion: 'operational-unit-material-shared-stock-v3',
     productPackConstraint: 'not_required_for_ordinary_unit',
     packageSelectionBasis:
       'fewest_packages_then_material_cost_then_inner_cube',
+    sharedStockSolver: 'exact_bounded_search',
     unitsPerPackage: 3,
     unitWeightGrams: 500,
     unitWeightAuthority: 'provider_or_order_specific',
@@ -1396,13 +1403,16 @@ const unitPackageInput = {
   packageHash: 'a'.repeat(64),
 }
 const unitPlanEvidence = {
-  policyVersion: 'operational-unit-material-fixed-axis-v2',
+  policyVersion: 'operational-unit-material-shared-stock-v3',
   productPackConstraint: 'not_required_for_ordinary_unit',
   packageSelectionPolicies: {
     dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
     undimensioned:
-      'largest_selected_factual_container_with_available_stock',
+      'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+    boundedFallback:
+      'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
   },
+  sharedStockSolver: 'exact_bounded_search',
   combinationPolicy: 'same_line_fixed_axis_only',
   unitWeightAuthority: 'provider_or_order_specific',
   unitDimensionsAuthority:
@@ -1481,6 +1491,44 @@ assert.throws(
   (error) => error?.code
     === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
   'Fixed-axis counts must be recomputed from exact item and carton dimensions',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          dimensionedLineCount: 0,
+          oneEachUndimensionedLineCount: 1,
+        },
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Ordinary-unit line counts must be derived from package fit provenance',
+)
+assert.throws(
+  () => assertCartonizationRateEvidenceUnitMaterialProvenance({
+    evidenceMode: 'operational',
+    packages: [unitPackageInput],
+    planSnapshot: {
+      operationalUnitMaterialPlan: {
+        evidence: {
+          ...unitPlanEvidence,
+          sharedStockSolver:
+            'min_cost_max_flow_one_carton_per_unit_fallback',
+        },
+        packages: [unitRetainedPackage],
+      },
+    },
+  }),
+  (error) => error?.code
+    === 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PROVENANCE_INVALID',
+  'Package and plan shared-stock solver provenance must match',
 )
 
 const {

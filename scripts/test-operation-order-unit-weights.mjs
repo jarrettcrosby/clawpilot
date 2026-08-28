@@ -18,7 +18,7 @@ const physicalFactsMigrationPath =
   'db/migrations/0336_operations_order_unit_physical_facts.sql'
 const physicalFactsMigration = read(physicalFactsMigrationPath)
 const expectedPhysicalFactsChecksum =
-  '703b24f9eb3c255bb7f7594010fe40f8e0fc6fb02e99fc49fe18331204483e47'
+  '8969fcb35a786b7c7109d544d84021b32e9637162509a6aa5a1c1761d81d995c'
 
 assert.equal(
   createHash('sha256').update(migration).digest('hex'),
@@ -63,7 +63,9 @@ for (const fragment of [
   'operator_recorded_order_dimensions',
   "'unitDimensionsMm', CASE",
   'pg_catalog.jsonb_build_object(',
-  'operational-unit-material-fixed-axis-v2',
+  'operational-unit-material-shared-stock-v3',
+  'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+  'sharedStockSolver',
   'fixed_axis_regular_grid',
   'one_each_without_fit_claim',
   "NEW.inner_dimensions_mm->>'length'",

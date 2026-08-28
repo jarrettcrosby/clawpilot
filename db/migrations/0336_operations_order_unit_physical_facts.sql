@@ -224,6 +224,9 @@ DECLARE
   fit_evidence jsonb;
   allocation_quantity integer;
   material_global_id text;
+  dimensioned_line_count integer;
+  undimensioned_line_count integer;
+  overlapping_line_count integer;
 BEGIN
   IF NEW.planning_method <> 'unit_material_selection' THEN
     RETURN NEW;
@@ -246,13 +249,62 @@ BEGIN
   WHERE material.organization_id = NEW.organization_id
     AND material.id = NEW.packaging_material_id;
 
+  SELECT
+    pg_catalog.count(DISTINCT
+      package_plan->'allocations'->0->>'lineGlobalId'
+    ) FILTER (
+      WHERE package_plan->'unitMaterialEvidence'->>'fitModel' =
+              'fixed_axis_regular_grid'
+    )::integer,
+    pg_catalog.count(DISTINCT
+      package_plan->'allocations'->0->>'lineGlobalId'
+    ) FILTER (
+      WHERE package_plan->'unitMaterialEvidence'->>'fitModel' =
+              'one_each_without_fit_claim'
+    )::integer,
+    (
+      SELECT pg_catalog.count(*)::integer
+      FROM (
+        SELECT candidate_package->'allocations'->0->>'lineGlobalId'
+          AS line_global_id
+        FROM public.operations_cartonization_rate_evidence aggregate_evidence
+        CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(
+          aggregate_evidence.plan_snapshot->
+            'operationalUnitMaterialPlan'->'packages'
+        ) candidate_package
+        WHERE aggregate_evidence.organization_id = NEW.organization_id
+          AND aggregate_evidence.id = NEW.evidence_id
+          AND candidate_package->>'planningMethod' =
+                'unit_material_selection'
+        GROUP BY candidate_package->'allocations'->0->>'lineGlobalId'
+        HAVING pg_catalog.count(DISTINCT
+          candidate_package->'unitMaterialEvidence'->>'fitModel'
+        ) > 1
+      ) overlap
+    )
+    INTO dimensioned_line_count, undimensioned_line_count,
+         overlapping_line_count
+  FROM public.operations_cartonization_rate_evidence aggregate_evidence
+  CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(
+    aggregate_evidence.plan_snapshot->
+      'operationalUnitMaterialPlan'->'packages'
+  ) package_plan
+  WHERE aggregate_evidence.organization_id = NEW.organization_id
+    AND aggregate_evidence.id = NEW.evidence_id
+    AND package_plan->>'planningMethod' = 'unit_material_selection';
+
   IF retained_package IS NULL
     OR retained_evidence->>'policyVersion' IS DISTINCT FROM
-         'operational-unit-material-fixed-axis-v2'
+         'operational-unit-material-shared-stock-v3'
     OR retained_evidence->>'productPackConstraint' IS DISTINCT FROM
          'not_required_for_ordinary_unit'
     OR retained_evidence->'packageSelectionPolicies' IS DISTINCT FROM
-         '{"dimensioned":"fewest_packages_then_material_cost_then_inner_cube","undimensioned":"largest_selected_factual_container_with_available_stock"}'::jsonb
+         '{"boundedFallback":"unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit","dimensioned":"fewest_packages_then_material_cost_then_inner_cube","undimensioned":"largest_rated_outer_volume_then_sorted_axes_then_material_id"}'::jsonb
+    OR retained_evidence->>'sharedStockSolver' IS NULL
+    OR retained_evidence->>'sharedStockSolver' NOT IN (
+         'exact_bounded_search',
+         'min_cost_max_flow_one_carton_per_unit_fallback'
+       )
     OR retained_evidence->>'combinationPolicy' IS DISTINCT FROM
          'same_line_fixed_axis_only'
     OR retained_evidence->>'unitWeightAuthority' IS DISTINCT FROM
@@ -260,8 +312,19 @@ BEGIN
     OR retained_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
          'order_specific_or_one_each_without_fit_claim'
     OR retained_evidence->>'rotationAllowed' IS DISTINCT FROM 'false'
+    OR retained_evidence->>'dimensionedLineCount' IS NULL
+    OR retained_evidence->>'dimensionedLineCount' !~ '^[0-9]{1,9}$'
+    OR (retained_evidence->>'dimensionedLineCount')::integer <>
+         dimensioned_line_count
+    OR retained_evidence->>'oneEachUndimensionedLineCount' IS NULL
+    OR retained_evidence->>'oneEachUndimensionedLineCount'
+         !~ '^[0-9]{1,9}$'
+    OR (retained_evidence->>'oneEachUndimensionedLineCount')::integer <>
+         undimensioned_line_count
+    OR overlapping_line_count <> 0
     OR retained_evidence->>'materialAuthority' IS DISTINCT FROM
          'current_active_material_and_unclaimed_warehouse_stock'
+    OR retained_evidence->>'inventoryAuthority' IS NULL
     OR retained_evidence->>'inventoryAuthority' NOT IN (
          'shopify_provider_commitment_less_active_reservations',
          'shadow_training_simulated'
@@ -269,6 +332,9 @@ BEGIN
     OR pg_catalog.jsonb_typeof(retained_package->'allocations')
          IS DISTINCT FROM 'array'
     OR pg_catalog.jsonb_array_length(retained_package->'allocations') <> 1
+    OR retained_package->'allocations'->0->>'lineGlobalId' IS NULL
+    OR retained_package->'allocations'->0->>'lineGlobalId'
+         !~ '^(gcol|gcal)'
     OR retained_package->'allocations' IS DISTINCT FROM NEW.allocations
     OR retained_package->>'planningMethod' IS DISTINCT FROM
          'unit_material_selection'
@@ -308,7 +374,7 @@ BEGIN
 
   IF pg_catalog.jsonb_typeof(fit_evidence) IS DISTINCT FROM 'object'
     OR fit_evidence->>'policyVersion' IS DISTINCT FROM
-         'operational-unit-material-fixed-axis-v2'
+         'operational-unit-material-shared-stock-v3'
     OR fit_evidence->>'productPackConstraint' IS DISTINCT FROM
          'not_required_for_ordinary_unit'
     OR fit_evidence->>'unitsPerPackage' IS DISTINCT FROM
@@ -320,6 +386,8 @@ BEGIN
     OR (retained_package->>'contentWeightGrams')::integer <>
          NEW.content_weight_grams
     OR fit_evidence->>'rotationAllowed' IS DISTINCT FROM 'false'
+    OR fit_evidence->>'sharedStockSolver' IS DISTINCT FROM
+         retained_evidence->>'sharedStockSolver'
     OR fit_evidence->>'unitWeightAuthority' IS DISTINCT FROM
          'provider_or_order_specific'
     OR NEW.max_weight_grams IS NULL
@@ -336,8 +404,19 @@ BEGIN
   END IF;
 
   IF fit_evidence->>'fitModel' = 'fixed_axis_regular_grid' THEN
-    IF fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM
-         'fewest_packages_then_material_cost_then_inner_cube'
+    IF fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM (
+         CASE
+           WHEN retained_evidence->>'sharedStockSolver' =
+                  'min_cost_max_flow_one_carton_per_unit_fallback'
+             THEN 'deterministic_shared_stock_one_carton_per_unit'
+           ELSE 'fewest_packages_then_material_cost_then_inner_cube'
+         END
+       )
+      OR (
+        retained_evidence->>'sharedStockSolver' =
+          'min_cost_max_flow_one_carton_per_unit_fallback'
+        AND allocation_quantity <> 1
+      )
       OR fit_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
          'order_specific'
       OR NOT public.operations_cartonization_dimensions_mm_valid(
@@ -371,7 +450,7 @@ BEGIN
     END IF;
   ELSIF fit_evidence->>'fitModel' = 'one_each_without_fit_claim' THEN
     IF fit_evidence->>'packageSelectionBasis' IS DISTINCT FROM
-         'largest_selected_factual_container_with_available_stock'
+         'largest_rated_outer_volume_then_sorted_axes_then_material_id'
       OR allocation_quantity <> 1
       OR fit_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
            'unavailable'

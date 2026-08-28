@@ -40,8 +40,10 @@ const line: HybridCartonizationLine = {
 const material = (input: {
   globalId: string
   inner: { length: number; width: number; height: number }
+  outer?: { length: number; width: number; height: number }
   available: number
   unitCostMinor?: number
+  maximumGrossWeightGrams?: number
 }): HybridCartonizationMaterial => ({
   materialGlobalId: input.globalId,
   materialType: 'carton',
@@ -60,9 +62,9 @@ const material = (input: {
   stockRowVersion: 4,
   stockOnHandQuantity: input.available,
   activeClaimedQuantity: 0,
-  maximumGrossWeightGrams: 10_000,
+  maximumGrossWeightGrams: input.maximumGrossWeightGrams ?? 10_000,
   availableQuantity: input.available,
-  ratedOuterDimensionsMm: {
+  ratedOuterDimensionsMm: input.outer ?? {
     length: input.inner.length + 10,
     width: input.inner.width + 10,
     height: input.inner.height + 10,
@@ -219,7 +221,7 @@ test('operational lines without item dimensions retain a truthful one-each fallb
   assert.equal(result.evidence.oneEachUndimensionedLineCount, 1)
 })
 
-test('undimensioned units choose the largest factual carton and fall back only after its stock is exhausted', () => {
+test('undimensioned units choose the largest rated outer carrier envelope and fall back only after stock is exhausted', () => {
   const result = planOperationalUnitMaterialPackages({
     ...baseInput,
     lines: [{ ...line, unitDimensionsMm: null, unitDimensionsAuthority: null }],
@@ -254,8 +256,80 @@ test('undimensioned units choose the largest factual carton and fall back only a
   assert.ok(result.packages.every((item) => (
     item.allocations[0].quantity === 1
     && item.unitMaterialEvidence.packageSelectionBasis
-      === 'largest_selected_factual_container_with_available_stock'
+      === 'largest_rated_outer_volume_then_sorted_axes_then_material_id'
   )))
+})
+
+test('undimensioned ranking uses rated outer carrier envelope rather than inverted inner cube', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{
+      ...line,
+      quantity: 1,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 1 }],
+    materials: [
+      material({
+        globalId: 'gmat-larger-inner-smaller-outer',
+        inner: { length: 500, width: 500, height: 500 },
+        outer: { length: 510, width: 510, height: 510 },
+        available: 1,
+      }),
+      material({
+        globalId: 'gmat-smaller-inner-larger-outer',
+        inner: { length: 400, width: 400, height: 400 },
+        outer: { length: 800, width: 800, height: 800 },
+        available: 1,
+      }),
+    ],
+    inventoryProducts: inventory(1),
+  })
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.equal(
+    result.packages[0].packagingMaterialGlobalId,
+    'gmat-smaller-inner-larger-outer',
+  )
+  assert.deepEqual(
+    result.packages[0].ratedOuterDimensionsMm,
+    { length: 800, width: 800, height: 800 },
+  )
+})
+
+test('equal rated-outer volume ranks the longer carrier envelope first', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{
+      ...line,
+      quantity: 1,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 1 }],
+    materials: [
+      material({
+        globalId: 'gmat-equal-cube-compact',
+        inner: { length: 80, width: 80, height: 80 },
+        outer: { length: 300, width: 300, height: 100 },
+        available: 1,
+      }),
+      material({
+        globalId: 'gmat-equal-cube-long',
+        inner: { length: 80, width: 80, height: 80 },
+        outer: { length: 900, width: 100, height: 100 },
+        available: 1,
+      }),
+    ],
+    inventoryProducts: inventory(1),
+  })
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.equal(
+    result.packages[0].packagingMaterialGlobalId,
+    'gmat-equal-cube-long',
+  )
 })
 
 test('checkout ignores synthetic dimensions until checkout retains its own item facts', () => {
@@ -404,6 +478,139 @@ test('global shared-stock search preserves the only feasible allocation independ
   }
 })
 
+test('shared stock jointly reserves a heavy unknown carton before a light dimensioned line', () => {
+  const run = (reverse: boolean) => {
+    const unknown = {
+      ...line,
+      lineGlobalId: reverse ? 'gcol-z' : 'gcol-a',
+      productGlobalId: 'gp-heavy-unknown',
+      title: 'Heavy unknown',
+      quantity: 1,
+      unitWeightGrams: 9_000,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }
+    const dimensioned = {
+      ...line,
+      lineGlobalId: reverse ? 'gcol-a' : 'gcol-z',
+      productGlobalId: 'gp-light-dimensioned',
+      title: 'Light dimensioned',
+      quantity: 1,
+      unitWeightGrams: 100,
+    }
+    const lines = reverse ? [dimensioned, unknown] : [unknown, dimensioned]
+    return planOperationalUnitMaterialPackages({
+      ...baseInput,
+      lines,
+      fallbackLines: lines.map((item) => ({
+        lineGlobalId: item.lineGlobalId,
+        productGlobalId: item.productGlobalId,
+        quantity: item.quantity,
+        fitModel: 'unconstrained_unit' as const,
+      })),
+      materials: [
+        material({
+          globalId: 'gmat-heavy',
+          inner: { length: 300, width: 300, height: 300 },
+          outer: { length: 700, width: 700, height: 700 },
+          available: 1,
+          maximumGrossWeightGrams: 10_000,
+        }),
+        material({
+          globalId: 'gmat-light',
+          inner: { length: 300, width: 300, height: 300 },
+          outer: { length: 310, width: 310, height: 310 },
+          available: 1,
+          maximumGrossWeightGrams: 1_000,
+        }),
+      ],
+      inventoryProducts: [
+        { ...inventory(1)[0], productGlobalId: unknown.productGlobalId },
+        { ...inventory(1)[0], productGlobalId: dimensioned.productGlobalId },
+      ],
+    })
+  }
+  for (const result of [run(false), run(true)]) {
+    assert.equal(result.status, 'ready', JSON.stringify(result))
+    if (result.status !== 'ready') continue
+    assert.deepEqual(
+      Object.fromEntries(result.packages.map((item) => [
+        item.allocations[0].productGlobalId,
+        item.packagingMaterialGlobalId,
+      ])),
+      {
+        'gp-heavy-unknown': 'gmat-heavy',
+        'gp-light-dimensioned': 'gmat-light',
+      },
+    )
+  }
+})
+
+test('shared stock jointly matches multiple unknown weights', () => {
+  const lines = [
+    {
+      ...line,
+      lineGlobalId: 'gcol-light-unknown',
+      productGlobalId: 'gp-light-unknown',
+      quantity: 1,
+      unitWeightGrams: 100,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    },
+    {
+      ...line,
+      lineGlobalId: 'gcol-heavy-unknown',
+      productGlobalId: 'gp-heavy-unknown',
+      quantity: 1,
+      unitWeightGrams: 9_000,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    },
+  ]
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines,
+    fallbackLines: lines.map((item) => ({
+      lineGlobalId: item.lineGlobalId,
+      productGlobalId: item.productGlobalId,
+      quantity: item.quantity,
+      fitModel: 'unconstrained_unit' as const,
+    })),
+    materials: [
+      material({
+        globalId: 'gmat-heavy',
+        inner: { length: 500, width: 500, height: 500 },
+        outer: { length: 600, width: 600, height: 600 },
+        available: 1,
+        maximumGrossWeightGrams: 10_000,
+      }),
+      material({
+        globalId: 'gmat-light',
+        inner: { length: 300, width: 300, height: 300 },
+        outer: { length: 310, width: 310, height: 310 },
+        available: 1,
+        maximumGrossWeightGrams: 1_000,
+      }),
+    ],
+    inventoryProducts: lines.map((item) => ({
+      ...inventory(1)[0],
+      productGlobalId: item.productGlobalId,
+    })),
+  })
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.deepEqual(
+    Object.fromEntries(result.packages.map((item) => [
+      item.allocations[0].productGlobalId,
+      item.packagingMaterialGlobalId,
+    ])),
+    {
+      'gp-heavy-unknown': 'gmat-heavy',
+      'gp-light-unknown': 'gmat-light',
+    },
+  )
+})
+
 test('exact search stays bounded with ten materials and fifty packages', () => {
   const startedAt = performance.now()
   const result = planOperationalUnitMaterialPackages({
@@ -426,12 +633,12 @@ test('exact search stays bounded with ten materials and fifty packages', () => {
   assert.ok(elapsedMs < 1_000, `bounded search took ${elapsedMs}ms`)
 })
 
-test('shared-stock search fails closed at its explicit state bound', () => {
-  const lines = Array.from({ length: 4 }, (_, index) => ({
+test('state-budget exhaustion falls back to deterministic shared-stock matching for 2x25 units', () => {
+  const lines = Array.from({ length: 2 }, (_, index) => ({
     ...line,
     lineGlobalId: `gcol-bound-${index}`,
     productGlobalId: `gp-bound-${index}`,
-    quantity: 50,
+    quantity: 25,
   }))
   const startedAt = performance.now()
   const result = planOperationalUnitMaterialPackages({
@@ -444,25 +651,183 @@ test('shared-stock search fails closed at its explicit state bound', () => {
       fitModel: 'unconstrained_unit' as const,
     })),
     inventoryProducts: lines.map((item) => ({
-      ...inventory(50)[0],
+      ...inventory(25)[0],
       productGlobalId: item.productGlobalId,
     })),
-    materials: Array.from({ length: 10 }, (_, index) => material({
+    materials: Array.from({ length: 4 }, (_, index) => material({
       globalId: `gmat-bound-${index}`,
       inner: { length: 100, width: 100, height: 50 },
-      available: 50,
+      available: index < 2 ? 13 : 12,
       unitCostMinor: index + 1,
     })),
     maximumPackages: 50,
   })
   const elapsedMs = performance.now() - startedAt
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 50)
+  assert.equal(
+    result.evidence.sharedStockSolver,
+    'min_cost_max_flow_one_carton_per_unit_fallback',
+  )
+  assert.ok(elapsedMs < 1_000, `bounded failure took ${elapsedMs}ms`)
+})
+
+test('bounded shared-stock fallback is invariant to line and material input permutations', () => {
+  const run = (reverse: boolean) => {
+    const lines = Array.from({ length: 2 }, (_, index) => ({
+      ...line,
+      lineGlobalId: `gcol-permutation-${index}`,
+      productGlobalId: `gp-permutation-${index}`,
+      quantity: 25,
+    }))
+    const materials = Array.from({ length: 4 }, (_, index) => material({
+      globalId: `gmat-permutation-${index}`,
+      inner: { length: 100, width: 100, height: 50 },
+      available: index < 2 ? 13 : 12,
+      unitCostMinor: index + 1,
+    }))
+    const result = planOperationalUnitMaterialPackages({
+      ...baseInput,
+      lines: reverse ? [...lines].reverse() : lines,
+      fallbackLines: (reverse ? [...lines].reverse() : lines).map((item) => ({
+        lineGlobalId: item.lineGlobalId,
+        productGlobalId: item.productGlobalId,
+        quantity: item.quantity,
+        fitModel: 'unconstrained_unit' as const,
+      })),
+      inventoryProducts: (reverse ? [...lines].reverse() : lines).map(
+        (item) => ({
+          ...inventory(25)[0],
+          productGlobalId: item.productGlobalId,
+        }),
+      ),
+      materials: reverse ? [...materials].reverse() : materials,
+      maximumPackages: 50,
+    })
+    assert.equal(result.status, 'ready', JSON.stringify(result))
+    if (result.status !== 'ready') return null
+    return result.packages.map((item) => ({
+      key: item.packageKey,
+      sequence: item.packageSequence,
+      product: item.allocations[0].productGlobalId,
+      material: item.packagingMaterialGlobalId,
+      gross: item.ratedGrossWeightGrams,
+      outer: item.ratedOuterDimensionsMm,
+    }))
+  }
+  assert.deepEqual(run(false), run(true))
+})
+
+test('bounded fallback subtracts recipe material usage before matching residual units', () => {
+  const lines = Array.from({ length: 2 }, (_, index) => ({
+    ...line,
+    lineGlobalId: `gcol-recipe-bound-${index}`,
+    productGlobalId: `gp-recipe-bound-${index}`,
+    quantity: 25,
+  }))
+  const recipeMaterialId = 'gmat-recipe-bound-0'
+  const recipePackages = [0, 1].map((index) => ({
+    ...retainedRecipePackage,
+    packageKey: `recipe-bound-${index}`,
+    sequence: index + 1,
+    packagingMaterialGlobalId: recipeMaterialId,
+  }))
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines,
+    fallbackLines: lines.map((item) => ({
+      lineGlobalId: item.lineGlobalId,
+      productGlobalId: item.productGlobalId,
+      quantity: item.quantity,
+      fitModel: 'unconstrained_unit' as const,
+    })),
+    recipePackages,
+    inventoryProducts: lines.map((item) => ({
+      ...inventory(25)[0],
+      productGlobalId: item.productGlobalId,
+    })),
+    materials: Array.from({ length: 4 }, (_, index) => material({
+      globalId: `gmat-recipe-bound-${index}`,
+      inner: { length: 100, width: 100, height: 50 },
+      available: index === 0 ? 15 : index === 1 ? 13 : 12,
+      unitCostMinor: index + 1,
+    })),
+    startingSequence: 3,
+    maximumPackages: 50,
+  })
+  assert.equal(result.status, 'ready', JSON.stringify(result))
+  if (result.status !== 'ready') return
+  assert.equal(result.packages.length, 50)
+  assert.equal(
+    result.packages.filter((item) => (
+      item.packagingMaterialGlobalId === recipeMaterialId
+    )).length,
+    13,
+  )
+})
+
+test('one-carton fallback rejects the same 2x25 demand at a 49-package limit', () => {
+  const lines = Array.from({ length: 2 }, (_, index) => ({
+    ...line,
+    lineGlobalId: `gcol-limit-${index}`,
+    productGlobalId: `gp-limit-${index}`,
+    quantity: 25,
+  }))
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines,
+    fallbackLines: lines.map((item) => ({
+      lineGlobalId: item.lineGlobalId,
+      productGlobalId: item.productGlobalId,
+      quantity: item.quantity,
+      fitModel: 'unconstrained_unit' as const,
+    })),
+    inventoryProducts: lines.map((item) => ({
+      ...inventory(25)[0],
+      productGlobalId: item.productGlobalId,
+    })),
+    materials: Array.from({ length: 4 }, (_, index) => material({
+      globalId: `gmat-limit-${index}`,
+      inner: { length: 100, width: 100, height: 50 },
+      available: index < 2 ? 13 : 12,
+      unitCostMinor: index + 1,
+    })),
+    maximumPackages: 49,
+  })
   assert.equal(result.status, 'blocked')
   if (result.status !== 'blocked') return
   assert.equal(
     result.blocker.code,
-    'CARTONIZATION_RATE_EVIDENCE_GLOBAL_SEARCH_BOUND_EXCEEDED',
+    'CARTONIZATION_RATE_EVIDENCE_PACKAGE_COUNT_INVALID',
   )
-  assert.ok(elapsedMs < 1_000, `bounded failure took ${elapsedMs}ms`)
+})
+
+test('undimensioned overweight demand fails closed without a carrying carton', () => {
+  const result = planOperationalUnitMaterialPackages({
+    ...baseInput,
+    lines: [{
+      ...line,
+      quantity: 1,
+      unitWeightGrams: 9_000,
+      unitDimensionsMm: null,
+      unitDimensionsAuthority: null,
+    }],
+    fallbackLines: [{ ...baseInput.fallbackLines[0], quantity: 1 }],
+    inventoryProducts: inventory(1),
+    materials: [material({
+      globalId: 'gmat-overweight',
+      inner: { length: 500, width: 500, height: 500 },
+      available: 1,
+      maximumGrossWeightGrams: 5_000,
+    })],
+  })
+  assert.equal(result.status, 'blocked')
+  if (result.status !== 'blocked') return
+  assert.equal(
+    result.blocker.code,
+    'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_CAPACITY_REQUIRED',
+  )
 })
 
 test('fixed-axis fit blocks volume-only false positives', () => {

@@ -7,7 +7,15 @@ import type {
 } from '@/lib/operations/hybridCartonization'
 
 export const OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION =
-  'operational-unit-material-fixed-axis-v2' as const
+  'operational-unit-material-shared-stock-v3' as const
+
+export const OPERATIONAL_UNIT_MATERIAL_SELECTION_POLICIES = {
+  dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
+  undimensioned:
+    'largest_rated_outer_volume_then_sorted_axes_then_material_id',
+  boundedFallback:
+    'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit',
+} as const
 
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue)
@@ -72,7 +80,11 @@ export type OperationalUnitMaterialPackage = {
     productPackConstraint: 'not_required_for_ordinary_unit'
     packageSelectionBasis:
       'fewest_packages_then_material_cost_then_inner_cube'
-      | 'largest_selected_factual_container_with_available_stock'
+      | 'largest_rated_outer_volume_then_sorted_axes_then_material_id'
+      | 'deterministic_shared_stock_one_carton_per_unit'
+    sharedStockSolver:
+      | 'exact_bounded_search'
+      | 'min_cost_max_flow_one_carton_per_unit_fallback'
     unitsPerPackage: number
     unitWeightGrams: number
     unitWeightAuthority: 'provider_or_order_specific'
@@ -103,8 +115,13 @@ export type OperationalUnitMaterialPlan =
         packageSelectionPolicies: {
           dimensioned: 'fewest_packages_then_material_cost_then_inner_cube'
           undimensioned:
-            'largest_selected_factual_container_with_available_stock'
+            'largest_rated_outer_volume_then_sorted_axes_then_material_id'
+          boundedFallback:
+            'unknown_outer_rank_then_dimensioned_cost_rank_min_cost_max_flow_one_carton_per_unit'
         }
+        sharedStockSolver:
+          | 'exact_bounded_search'
+          | 'min_cost_max_flow_one_carton_per_unit_fallback'
         combinationPolicy: 'same_line_fixed_axis_only'
         unitWeightAuthority: 'provider_or_order_specific'
         unitDimensionsAuthority:
@@ -159,6 +176,8 @@ type MaterialOption = {
   effectiveCapacityUnits: number
   unitCostMinor: number
   innerCubeMm3: number
+  ratedOuterVolumeMm3: bigint
+  ratedOuterEnvelopeAxesMm: [number, number, number]
 }
 
 type MaterialSelection = {
@@ -166,6 +185,7 @@ type MaterialSelection = {
   coveredUnits: number
   materialCostMinor: number
   innerCubeMm3: number
+  undimensionedPreferenceCost: number
   counts: number[]
 }
 
@@ -176,7 +196,7 @@ function compareCounts(left: number[], right: number[]) {
   return 0
 }
 
-function compareSelection(
+function compareDimensionedSelection(
   left: MaterialSelection,
   right: MaterialSelection,
 ) {
@@ -185,18 +205,51 @@ function compareSelection(
     || compareCounts(left.counts, right.counts)
 }
 
+function compareRatedOuterCarrierEnvelope(
+  left: MaterialOption,
+  right: MaterialOption,
+) {
+  if (left.ratedOuterVolumeMm3 !== right.ratedOuterVolumeMm3) {
+    return left.ratedOuterVolumeMm3 > right.ratedOuterVolumeMm3 ? -1 : 1
+  }
+  return right.ratedOuterEnvelopeAxesMm[0]
+      - left.ratedOuterEnvelopeAxesMm[0]
+    || right.ratedOuterEnvelopeAxesMm[1]
+      - left.ratedOuterEnvelopeAxesMm[1]
+    || right.ratedOuterEnvelopeAxesMm[2]
+      - left.ratedOuterEnvelopeAxesMm[2]
+    || left.material.materialGlobalId.localeCompare(
+      right.material.materialGlobalId,
+    )
+}
+
+type SharedStockLine = {
+  lineGlobalId: string
+  productGlobalId: string
+  quantity: number
+  dimensions: DimensionsMm | null
+  options: MaterialOption[]
+}
+
 function enumerateMaterialCounts(input: {
   quantity: number
   maximumPackages: number
   options: MaterialOption[]
   preserveMaterialIds: Set<string>
   stateBudget: { remaining: number }
+  dimensioned: boolean
 }) {
+  const undimensionedRanks = new Map(
+    [...input.options]
+      .sort(compareRatedOuterCarrierEnvelope)
+      .map((option, index) => [option.material.materialGlobalId, index]),
+  )
   let states = new Map<string, MaterialSelection>([['0:0:', {
     packageCount: 0,
     coveredUnits: 0,
     materialCostMinor: 0,
     innerCubeMm3: 0,
+    undimensionedPreferenceCost: 0,
     counts: input.options.map(() => 0),
   }]])
   for (let optionIndex = 0; optionIndex < input.options.length; optionIndex += 1) {
@@ -222,6 +275,10 @@ function enumerateMaterialCounts(input: {
           materialCostMinor:
             state.materialCostMinor + use * option.unitCostMinor,
           innerCubeMm3: state.innerCubeMm3 + use * option.innerCubeMm3,
+          undimensionedPreferenceCost:
+            state.undimensionedPreferenceCost + use * Number(
+              undimensionedRanks.get(option.material.materialGlobalId) || 0,
+            ),
           counts,
         }
         const preservedCounts = input.options.flatMap((candidateOption, index) => (
@@ -231,7 +288,14 @@ function enumerateMaterialCounts(input: {
         )).join(',')
         const key = `${candidate.packageCount}:${candidate.coveredUnits}:${preservedCounts}`
         const retained = next.get(key)
-        if (!retained || compareSelection(candidate, retained) < 0) {
+        const preference = !retained
+          ? -1
+          : input.dimensioned
+            ? compareDimensionedSelection(candidate, retained)
+            : candidate.undimensionedPreferenceCost
+                - retained.undimensionedPreferenceCost
+              || compareCounts(candidate.counts, retained.counts)
+        if (!retained || preference < 0) {
           next.set(key, candidate)
         }
       }
@@ -243,27 +307,43 @@ function enumerateMaterialCounts(input: {
     && selection.packageCount <= input.quantity
   )).sort((left, right) => (
     left.packageCount - right.packageCount
-    || compareSelection(left, right)
+    || (input.dimensioned
+      ? compareDimensionedSelection(left, right)
+      : left.undimensionedPreferenceCost
+          - right.undimensionedPreferenceCost
+        || compareCounts(left.counts, right.counts))
   ))
 }
 
-function selectGlobalDimensionedMaterialCounts(input: {
-  lines: Array<{
-    lineGlobalId: string
-    quantity: number
-    options: MaterialOption[]
-  }>
+function selectionSignature(input: {
+  ordered: SharedStockLine[]
+  byLine: Map<string, MaterialSelection>
+}) {
+  return input.ordered.map((line) => {
+    const selection = input.byLine.get(line.lineGlobalId)
+    return `${line.productGlobalId}:${line.lineGlobalId}:${
+      selection?.counts.join(',') || ''
+    }`
+  }).join('|')
+}
+
+function selectGlobalMaterialCounts(input: {
+  lines: SharedStockLine[]
   maximumPackages: number
   materialRemaining: Map<string, number>
 }) {
   const stateBudget = { remaining: 100_000 }
   const ordered = [...input.lines].sort((left, right) => (
-    left.lineGlobalId.localeCompare(right.lineGlobalId)
+    left.options.length - right.options.length
+    || Number(Boolean(right.dimensions)) - Number(Boolean(left.dimensions))
+    || left.productGlobalId.localeCompare(right.productGlobalId)
+    || left.lineGlobalId.localeCompare(right.lineGlobalId)
   ))
   type GlobalSelection = {
     packageCount: number
     materialCostMinor: number
     innerCubeMm3: number
+    undimensionedPreferenceCost: number
     byLine: Map<string, MaterialSelection>
   }
   let best: GlobalSelection | null = null
@@ -273,9 +353,11 @@ function selectGlobalDimensionedMaterialCounts(input: {
     packageCount: number,
     materialCostMinor: number,
     innerCubeMm3: number,
+    undimensionedPreferenceCost: number,
     remaining: Map<string, number>,
     byLine: Map<string, MaterialSelection>,
   ) => {
+    if (exceeded) return
     stateBudget.remaining -= 1
     if (stateBudget.remaining < 0) {
       exceeded = true
@@ -287,6 +369,7 @@ function selectGlobalDimensionedMaterialCounts(input: {
         packageCount,
         materialCostMinor,
         innerCubeMm3,
+        undimensionedPreferenceCost,
         byLine: new Map(byLine),
       }
       if (
@@ -295,10 +378,25 @@ function selectGlobalDimensionedMaterialCounts(input: {
         || (
           candidate.packageCount === best.packageCount
           && (
-            candidate.materialCostMinor < best.materialCostMinor
+            candidate.undimensionedPreferenceCost
+              < best.undimensionedPreferenceCost
             || (
-              candidate.materialCostMinor === best.materialCostMinor
-              && candidate.innerCubeMm3 < best.innerCubeMm3
+              candidate.undimensionedPreferenceCost
+                === best.undimensionedPreferenceCost
+              && (
+                candidate.materialCostMinor < best.materialCostMinor
+                || (
+                  candidate.materialCostMinor === best.materialCostMinor
+                  && (
+                    candidate.innerCubeMm3 < best.innerCubeMm3
+                    || (
+                      candidate.innerCubeMm3 === best.innerCubeMm3
+                      && selectionSignature({ ordered, byLine: candidate.byLine })
+                        < selectionSignature({ ordered, byLine: best.byLine })
+                    )
+                  )
+                )
+              )
             )
           )
         )
@@ -322,12 +420,14 @@ function selectGlobalDimensionedMaterialCounts(input: {
         ),
       )),
       stateBudget,
+      dimensioned: Boolean(entry.dimensions),
     })
     if (!candidates) {
       exceeded = true
       return
     }
     for (const selection of candidates) {
+      if (exceeded) break
       const nextRemaining = new Map(remaining)
       selection.counts.forEach((count, optionIndex) => {
         const materialId = options[optionIndex].material.materialGlobalId
@@ -342,18 +442,197 @@ function selectGlobalDimensionedMaterialCounts(input: {
         packageCount + selection.packageCount,
         materialCostMinor + selection.materialCostMinor,
         innerCubeMm3 + selection.innerCubeMm3,
+        undimensionedPreferenceCost + (
+          entry.dimensions ? 0 : selection.undimensionedPreferenceCost
+        ),
         nextRemaining,
         byLine,
       )
       byLine.delete(entry.lineGlobalId)
     }
   }
-  visit(0, 0, 0, 0, new Map(input.materialRemaining), new Map())
+  visit(0, 0, 0, 0, 0, new Map(input.materialRemaining), new Map())
   const retained = best as GlobalSelection | null
   return {
     selections: retained ? retained.byLine : null,
     exceeded,
   }
+}
+
+type FlowEdge = {
+  to: number
+  reverse: number
+  capacity: number
+  cost: number
+}
+
+function addFlowEdge(
+  graph: FlowEdge[][],
+  from: number,
+  to: number,
+  capacity: number,
+  cost: number,
+) {
+  const forward: FlowEdge = {
+    to,
+    reverse: graph[to].length,
+    capacity,
+    cost,
+  }
+  const reverse: FlowEdge = {
+    to: from,
+    reverse: graph[from].length,
+    capacity: 0,
+    cost: -cost,
+  }
+  graph[from].push(forward)
+  graph[to].push(reverse)
+}
+
+/**
+ * Polynomial fail-safe used only when the exact consolidating search exhausts
+ * its explicit state budget. Every residual unit receives one independently
+ * factual carton. Integral min-cost max-flow jointly reserves shared stock,
+ * so a flexible line cannot consume the only carton that can carry another
+ * line. Forward edge order and tie-breaking are canonical.
+ */
+function selectOneCartonPerUnitSharedStock(input: {
+  lines: SharedStockLine[]
+  maximumPackages: number
+  materialRemaining: Map<string, number>
+}) {
+  const orderedLines = [...input.lines].sort((left, right) => (
+    left.productGlobalId.localeCompare(right.productGlobalId)
+    || left.lineGlobalId.localeCompare(right.lineGlobalId)
+  ))
+  const unitCount = orderedLines.reduce(
+    (total, line) => total + line.quantity,
+    0,
+  )
+  if (unitCount > input.maximumPackages) {
+    return { selections: null, packageBoundExceeded: true }
+  }
+  const materialIds = [...input.materialRemaining.keys()].sort()
+  const materialIndex = new Map(materialIds.map((id, index) => [id, index]))
+  const source = 0
+  const lineOffset = 1
+  const materialOffset = lineOffset + orderedLines.length
+  const sink = materialOffset + materialIds.length
+  const graph: FlowEdge[][] = Array.from({ length: sink + 1 }, () => [])
+  const unknownPriorityMultiplier = unitCount * Math.max(1, materialIds.length)
+    + 1
+  const lineMaterialEdges = new Map<string, Map<string, FlowEdge>>()
+  orderedLines.forEach((line, lineIndex) => {
+    addFlowEdge(graph, source, lineOffset + lineIndex, line.quantity, 0)
+    const preferred = [...line.options].sort((left, right) => (
+      line.dimensions
+        ? left.unitCostMinor - right.unitCostMinor
+          || left.innerCubeMm3 - right.innerCubeMm3
+          || left.material.materialGlobalId.localeCompare(
+            right.material.materialGlobalId,
+          )
+        : compareRatedOuterCarrierEnvelope(left, right)
+    ))
+    const edges = new Map<string, FlowEdge>()
+    preferred.forEach((option, preferenceRank) => {
+      const id = option.material.materialGlobalId
+      const index = materialIndex.get(id)
+      if (index === undefined) return
+      addFlowEdge(
+        graph,
+        lineOffset + lineIndex,
+        materialOffset + index,
+        line.quantity,
+        preferenceRank * (line.dimensions ? 1 : unknownPriorityMultiplier),
+      )
+      edges.set(id, graph[lineOffset + lineIndex].at(-1) as FlowEdge)
+    })
+    lineMaterialEdges.set(line.lineGlobalId, edges)
+  })
+  materialIds.forEach((id, index) => {
+    addFlowEdge(
+      graph,
+      materialOffset + index,
+      sink,
+      Number(input.materialRemaining.get(id) || 0),
+      0,
+    )
+  })
+
+  let flow = 0
+  while (flow < unitCount) {
+    const distance = Array(graph.length).fill(Number.POSITIVE_INFINITY)
+    const previousNode = Array(graph.length).fill(-1)
+    const previousEdge = Array(graph.length).fill(-1)
+    distance[source] = 0
+    for (let pass = 0; pass < graph.length - 1; pass += 1) {
+      let changed = false
+      for (let from = 0; from < graph.length; from += 1) {
+        if (!Number.isFinite(distance[from])) continue
+        for (let edgeIndex = 0; edgeIndex < graph[from].length; edgeIndex += 1) {
+          const edge = graph[from][edgeIndex]
+          if (edge.capacity < 1) continue
+          const candidate = distance[from] + edge.cost
+          if (candidate < distance[edge.to]) {
+            distance[edge.to] = candidate
+            previousNode[edge.to] = from
+            previousEdge[edge.to] = edgeIndex
+            changed = true
+          }
+        }
+      }
+      if (!changed) break
+    }
+    if (previousNode[sink] < 0) {
+      return { selections: null, packageBoundExceeded: false }
+    }
+    let augment = unitCount - flow
+    for (let node = sink; node !== source; node = previousNode[node]) {
+      augment = Math.min(
+        augment,
+        graph[previousNode[node]][previousEdge[node]].capacity,
+      )
+    }
+    for (let node = sink; node !== source; node = previousNode[node]) {
+      const edge = graph[previousNode[node]][previousEdge[node]]
+      edge.capacity -= augment
+      graph[node][edge.reverse].capacity += augment
+    }
+    flow += augment
+  }
+
+  const selections = new Map<string, MaterialSelection>()
+  for (const line of orderedLines) {
+    const counts = line.options.map((option) => {
+      const edge = lineMaterialEdges.get(line.lineGlobalId)?.get(
+        option.material.materialGlobalId,
+      )
+      return edge ? graph[edge.to][edge.reverse].capacity : 0
+    })
+    selections.set(line.lineGlobalId, {
+      packageCount: line.quantity,
+      coveredUnits: line.quantity,
+      materialCostMinor: counts.reduce(
+        (total, count, index) => total + count * line.options[index].unitCostMinor,
+        0,
+      ),
+      innerCubeMm3: counts.reduce(
+        (total, count, index) => total + count * line.options[index].innerCubeMm3,
+        0,
+      ),
+      undimensionedPreferenceCost: counts.reduce((total, count, index) => {
+        if (line.dimensions) return total
+        const ranked = [...line.options].sort(compareRatedOuterCarrierEnvelope)
+        const rank = ranked.findIndex((option) => (
+          option.material.materialGlobalId
+            === line.options[index].material.materialGlobalId
+        ))
+        return total + count * rank
+      }, 0),
+      counts,
+    })
+  }
+  return { selections, packageBoundExceeded: false }
 }
 
 function materialOptions(input: {
@@ -363,6 +642,8 @@ function materialOptions(input: {
   materialRemaining: Map<string, number>
 }) {
   return input.materials.flatMap((material) => {
+    const ratedOuter = material.ratedOuterDimensionsMm
+    if (!ratedOuter) return []
     const remaining = Number(
       input.materialRemaining.get(material.materialGlobalId) || 0,
     )
@@ -410,6 +691,15 @@ function materialOptions(input: {
       effectiveCapacityUnits,
       unitCostMinor: Number(material.unitCostMinor || 0),
       innerCubeMm3: volume(material.innerDimensionsMm),
+      ratedOuterVolumeMm3:
+        BigInt(ratedOuter.length)
+        * BigInt(ratedOuter.width)
+        * BigInt(ratedOuter.height),
+      ratedOuterEnvelopeAxesMm: [
+        ratedOuter.length,
+        ratedOuter.width,
+        ratedOuter.height,
+      ].sort((left, right) => right - left) as [number, number, number],
     }]
   }).sort((left, right) => (
     left.material.materialGlobalId.localeCompare(
@@ -564,10 +854,9 @@ export function planOperationalUnitMaterialPackages(
   const materials = input.materials.flatMap((material) => {
     const inner = material.innerDimensionsMm
     const outer = material.ratedOuterDimensionsMm
-    const available = shadowTraining
-      ? unitCount
-      : Number(material.availableQuantity)
-        - (usedMaterials.get(material.materialGlobalId) || 0)
+    const available = (
+      shadowTraining ? unitCount : Number(material.availableQuantity)
+    ) - (usedMaterials.get(material.materialGlobalId) || 0)
     if (
       material.status !== 'active'
       || material.isCurrent !== true
@@ -601,54 +890,14 @@ export function planOperationalUnitMaterialPackages(
     )
   }
 
-  const packages: OperationalUnitMaterialPackage[] = []
-  let dimensionedLineCount = 0
-  let oneEachUndimensionedLineCount = 0
   const orderedFallbackLines = [...input.fallbackLines].sort((left, right) => {
     const leftLine = lineById.get(left.lineGlobalId)
     const rightLine = lineById.get(right.lineGlobalId)
-    const leftDimensioned = Boolean(
-      !checkoutAvailable && exactDimensions(leftLine?.unitDimensionsMm),
-    )
-    const rightDimensioned = Boolean(
-      !checkoutAvailable && exactDimensions(rightLine?.unitDimensionsMm),
-    )
-    return Number(rightDimensioned) - Number(leftDimensioned)
-      || left.lineGlobalId.localeCompare(right.lineGlobalId)
+    return String(leftLine?.productGlobalId || '').localeCompare(
+      String(rightLine?.productGlobalId || ''),
+    ) || left.lineGlobalId.localeCompare(right.lineGlobalId)
   })
-  const dimensionedEntries = orderedFallbackLines.flatMap((fallback) => {
-    const candidate = lineById.get(fallback.lineGlobalId)
-    const dimensions = !checkoutAvailable
-      && exactDimensions(candidate?.unitDimensionsMm)
-      ? candidate.unitDimensionsMm
-      : null
-    if (!candidate || !dimensions) return []
-    return [{
-      lineGlobalId: fallback.lineGlobalId,
-      quantity: fallback.quantity,
-      options: materialOptions({
-        line: candidate,
-        dimensions,
-        materials,
-        materialRemaining,
-      }),
-    }]
-  })
-  const globalDimensionedResult = selectGlobalDimensionedMaterialCounts({
-    lines: dimensionedEntries,
-    maximumPackages: input.maximumPackages,
-    materialRemaining,
-  })
-  if (globalDimensionedResult.exceeded) {
-    return blocked(
-      'CARTONIZATION_RATE_EVIDENCE_GLOBAL_SEARCH_BOUND_EXCEEDED',
-      'Exact shared-stock cartonization exceeded its 100000-state safety bound.',
-    )
-  }
-  const globalDimensionedSelections = globalDimensionedResult.selections
-  const dimensionedOptionsByLine = new Map(dimensionedEntries.map((entry) => (
-    [entry.lineGlobalId, entry.options]
-  )))
+  const sharedStockLines: SharedStockLine[] = []
   for (const fallback of orderedFallbackLines) {
     const line = lineById.get(fallback.lineGlobalId) as HybridCartonizationLine
     // Checkout has no independently retained item-dimension evidence today.
@@ -676,58 +925,13 @@ export function planOperationalUnitMaterialPackages(
         `Line ${line.lineGlobalId} has ordinary-item dimensions without exact order-specific authority.`,
       )
     }
-    if (dimensions) dimensionedLineCount += 1
-    else oneEachUndimensionedLineCount += 1
-
-    const options = dimensions
-      ? dimensionedOptionsByLine.get(fallback.lineGlobalId) || []
-      : materialOptions({
-          line,
-          dimensions,
-          materials,
-          materialRemaining,
-        })
-    const remainingPackageBound = input.maximumPackages - packages.length
-    const selection = dimensions
-      ? globalDimensionedSelections?.get(fallback.lineGlobalId) || null
-      : fallback.quantity <= remainingPackageBound
-          && options.reduce((sum, option) => sum + option.availableQuantity, 0)
-            >= fallback.quantity
-        ? {
-            packageCount: fallback.quantity,
-            coveredUnits: fallback.quantity,
-            materialCostMinor: 0,
-            innerCubeMm3: 0,
-            counts: options.map(() => 0),
-          }
-        : null
-    if (!dimensions && selection) {
-      let unitsToAssign = fallback.quantity
-      const largestFirst = options
-        .map((option, optionIndex) => ({ option, optionIndex }))
-        .sort((left, right) => (
-          right.option.innerCubeMm3 - left.option.innerCubeMm3
-          || left.option.material.materialGlobalId.localeCompare(
-            right.option.material.materialGlobalId,
-          )
-        ))
-      for (const { option, optionIndex } of largestFirst) {
-        const use = Math.min(option.availableQuantity, unitsToAssign)
-        selection.counts[optionIndex] = use
-        unitsToAssign -= use
-        if (unitsToAssign === 0) break
-      }
-    }
-    if (!selection) {
-      const stockCapacity = options.reduce((total, option) => (
-        total + option.availableQuantity * option.effectiveCapacityUnits
-      ), 0)
-      if (stockCapacity >= fallback.quantity) {
-        return blocked(
-          'CARTONIZATION_RATE_EVIDENCE_PACKAGE_COUNT_INVALID',
-          `The minimum factual plan for ${line.title} exceeds the remaining ${remainingPackageBound} package bound.`,
-        )
-      }
+    const options = materialOptions({
+      line,
+      dimensions,
+      materials,
+      materialRemaining,
+    })
+    if (options.length < 1) {
       return blocked(
         dimensions
           ? 'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_FIT_REQUIRED'
@@ -735,6 +939,64 @@ export function planOperationalUnitMaterialPackages(
         dimensions
           ? `No selected factual carton stock can fit and carry all ${fallback.quantity} unit(s) of ${line.title}.`
           : `No selected factual material has remaining stock and gross-weight capacity for ${line.title}.`,
+      )
+    }
+    sharedStockLines.push({
+      lineGlobalId: line.lineGlobalId,
+      productGlobalId: line.productGlobalId,
+      quantity: fallback.quantity,
+      dimensions,
+      options,
+    })
+  }
+
+  const exact = selectGlobalMaterialCounts({
+    lines: sharedStockLines,
+    maximumPackages: input.maximumPackages,
+    materialRemaining,
+  })
+  let sharedStockSolver:
+    | 'exact_bounded_search'
+    | 'min_cost_max_flow_one_carton_per_unit_fallback'
+  let selections = exact.selections
+  if (exact.exceeded || !selections) {
+    const bounded = selectOneCartonPerUnitSharedStock({
+      lines: sharedStockLines,
+      maximumPackages: input.maximumPackages,
+      materialRemaining,
+    })
+    if (!bounded.selections) {
+      if (bounded.packageBoundExceeded) {
+        return blocked(
+          'CARTONIZATION_RATE_EVIDENCE_PACKAGE_COUNT_INVALID',
+          `The bounded factual fallback requires ${unitCount} packages, exceeding the ${input.maximumPackages}-package residual limit.`,
+        )
+      }
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_CAPACITY_REQUIRED',
+        'Selected factual material stock cannot jointly fit and carry every residual ordinary unit.',
+      )
+    }
+    selections = bounded.selections
+    sharedStockSolver = 'min_cost_max_flow_one_carton_per_unit_fallback'
+  } else {
+    sharedStockSolver = 'exact_bounded_search'
+  }
+
+  const packages: OperationalUnitMaterialPackage[] = []
+  const sharedStockLineById = new Map(sharedStockLines.map((entry) => (
+    [entry.lineGlobalId, entry]
+  )))
+  for (const fallback of orderedFallbackLines) {
+    const line = lineById.get(fallback.lineGlobalId) as HybridCartonizationLine
+    const entry = sharedStockLineById.get(fallback.lineGlobalId)
+    const dimensions = entry?.dimensions || null
+    const options = entry?.options || []
+    const selection = selections.get(fallback.lineGlobalId)
+    if (!selection) {
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PLAN_INVALID',
+        `The shared-stock allocation for ${line.title} is incomplete.`,
       )
     }
 
@@ -750,18 +1012,18 @@ export function planOperationalUnitMaterialPackages(
         || left.material.materialGlobalId.localeCompare(
           right.material.materialGlobalId,
         )
-      : right.innerCubeMm3 - left.innerCubeMm3
-        || left.material.materialGlobalId.localeCompare(
-          right.material.materialGlobalId,
-        ))
+      : compareRatedOuterCarrierEnvelope(left, right))
     let remainingUnits = fallback.quantity
     for (let selectedIndex = 0; selectedIndex < selected.length; selectedIndex += 1) {
       const option = selected[selectedIndex]
       const remainingPackages = selected.length - selectedIndex
-      const quantity = Math.min(
-        option.effectiveCapacityUnits,
-        remainingUnits - remainingPackages + 1,
-      )
+      const quantity = sharedStockSolver
+        === 'min_cost_max_flow_one_carton_per_unit_fallback'
+        ? 1
+        : Math.min(
+            option.effectiveCapacityUnits,
+            remainingUnits - remainingPackages + 1,
+          )
       const material = option.material
       if (
         quantity < 1
@@ -791,6 +1053,7 @@ export function planOperationalUnitMaterialPackages(
         allocation,
         unitWeightGrams: line.unitWeightGrams,
         unitDimensionsMm: dimensions,
+        sharedStockSolver,
         materialGlobalId: material.materialGlobalId,
         materialRowVersion: material.currentRowVersion,
       }
@@ -814,8 +1077,11 @@ export function planOperationalUnitMaterialPackages(
           policyVersion: OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION,
           productPackConstraint: 'not_required_for_ordinary_unit',
           packageSelectionBasis: dimensions
-            ? 'fewest_packages_then_material_cost_then_inner_cube'
-            : 'largest_selected_factual_container_with_available_stock',
+            ? sharedStockSolver === 'exact_bounded_search'
+              ? OPERATIONAL_UNIT_MATERIAL_SELECTION_POLICIES.dimensioned
+              : 'deterministic_shared_stock_one_carton_per_unit'
+            : OPERATIONAL_UNIT_MATERIAL_SELECTION_POLICIES.undimensioned,
+          sharedStockSolver,
           unitsPerPackage: quantity,
           unitWeightGrams: line.unitWeightGrams,
           unitWeightAuthority: 'provider_or_order_specific',
@@ -842,6 +1108,24 @@ export function planOperationalUnitMaterialPackages(
       )
     }
   }
+  const dimensionedLineIds = new Set(packages.flatMap((item) => (
+    item.unitMaterialEvidence.fitModel === 'fixed_axis_regular_grid'
+      ? [item.allocations[0].lineGlobalId]
+      : []
+  )))
+  const oneEachUndimensionedLineIds = new Set(packages.flatMap((item) => (
+    item.unitMaterialEvidence.fitModel === 'one_each_without_fit_claim'
+      ? [item.allocations[0].lineGlobalId]
+      : []
+  )))
+  if ([...dimensionedLineIds].some((id) => (
+    oneEachUndimensionedLineIds.has(id)
+  ))) {
+    return blocked(
+      'CARTONIZATION_RATE_EVIDENCE_UNIT_MATERIAL_PLAN_INVALID',
+      'One ordinary line cannot retain both dimensioned and undimensioned package evidence.',
+    )
+  }
   return {
     status: 'ready',
     policyVersion: OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION,
@@ -849,18 +1133,16 @@ export function planOperationalUnitMaterialPackages(
     evidence: {
       policyVersion: OPERATIONAL_UNIT_MATERIAL_POLICY_VERSION,
       productPackConstraint: 'not_required_for_ordinary_unit',
-      packageSelectionPolicies: {
-        dimensioned: 'fewest_packages_then_material_cost_then_inner_cube',
-        undimensioned:
-          'largest_selected_factual_container_with_available_stock',
-      },
+      packageSelectionPolicies:
+        OPERATIONAL_UNIT_MATERIAL_SELECTION_POLICIES,
+      sharedStockSolver,
       combinationPolicy: 'same_line_fixed_axis_only',
       unitWeightAuthority: 'provider_or_order_specific',
       unitDimensionsAuthority:
         'order_specific_or_one_each_without_fit_claim',
       rotationAllowed: false,
-      dimensionedLineCount,
-      oneEachUndimensionedLineCount,
+      dimensionedLineCount: dimensionedLineIds.size,
+      oneEachUndimensionedLineCount: oneEachUndimensionedLineIds.size,
       materialAuthority: checkoutAvailable
         ? 'selected_material_stock_snapshot'
         : 'current_active_material_and_unclaimed_warehouse_stock',
