@@ -2080,6 +2080,122 @@ async function verify(databaseUrl) {
         `SET CONSTRAINTS
            validate_operations_cartonization_unit_material_package IMMEDIATE`,
       )
+
+      const assertFitEvidenceTamperRejected = async ({
+        field,
+        kind,
+        value = null,
+      }) => {
+        const marker = `${field}-${kind}`
+        await packageEvidenceClient.query('SAVEPOINT fit_evidence_tamper')
+        try {
+          await packageEvidenceClient.query(
+            `SET CONSTRAINTS
+               validate_operations_cartonization_unit_material_package DEFERRED`,
+          )
+          const tampered = (await packageEvidenceClient.query(
+            `INSERT INTO operations_cartonization_rate_evidence (
+               organization_id, integration_account_id, order_candidate_id,
+               candidate_row_version, candidate_source_hash,
+               destination_fingerprint, warehouse_id, inventory_sync_run_id,
+               evidence_mode, policy_version, algorithm_version,
+               request_hash, plan_input_hash, plan_result_hash,
+               plan_snapshot, assumption_snapshot, status,
+               idempotency_key, actor_email, write_token_hash
+             )
+             SELECT organization_id, integration_account_id,
+                    order_candidate_id, candidate_row_version,
+                    candidate_source_hash, destination_fingerprint,
+                    warehouse_id, inventory_sync_run_id, evidence_mode,
+                    policy_version, algorithm_version, $2, $3, $4,
+                    CASE WHEN $7::boolean
+                      THEN plan_snapshot #- $6::text[]
+                      ELSE pg_catalog.jsonb_set(
+                        plan_snapshot, $6::text[], $8::jsonb, false
+                      )
+                    END,
+                    assumption_snapshot, status, $5,
+                    actor_email, write_token_hash
+             FROM operations_cartonization_rate_evidence
+             WHERE organization_id = $1::uuid AND id = $9::uuid
+             RETURNING id::text`,
+            [
+              fixture.organizationId,
+              hash(`unit-material-${marker}-request-${packageFixtureSuffix}`),
+              hash(`unit-material-${marker}-input-${packageFixtureSuffix}`),
+              hash(`unit-material-${marker}-result-${packageFixtureSuffix}`),
+              `unit-material-${marker}-${packageFixtureSuffix}`,
+              [
+                'operationalUnitMaterialPlan',
+                'packages',
+                '0',
+                'unitMaterialEvidence',
+                field,
+              ],
+              kind === 'missing',
+              kind === 'null' ? 'null' : JSON.stringify(value),
+              evidence.id,
+            ],
+          )).rows[0]
+          await packageEvidenceClient.query(
+            `INSERT INTO operations_cartonization_rate_evidence_packages (
+               organization_id, evidence_id, package_key, package_sequence,
+               planning_method, packaging_material_id, material_row_version,
+               inner_dimensions_mm, rated_outer_dimensions_mm,
+               content_weight_grams, tare_weight_grams,
+               rated_gross_weight_grams, max_weight_grams,
+               allocations, carrier_parcel_snapshot, package_hash
+             )
+             SELECT organization_id, $3::uuid, package_key,
+                    package_sequence, planning_method, packaging_material_id,
+                    material_row_version, inner_dimensions_mm,
+                    rated_outer_dimensions_mm, content_weight_grams,
+                    tare_weight_grams, rated_gross_weight_grams,
+                    max_weight_grams, allocations,
+                    carrier_parcel_snapshot, $4
+             FROM operations_cartonization_rate_evidence_packages
+             WHERE organization_id = $1::uuid
+               AND evidence_id = $2::uuid
+               AND package_key = $5`,
+            [
+              fixture.organizationId,
+              evidence.id,
+              tampered.id,
+              hash(`unit-material-${marker}-package-${packageFixtureSuffix}`),
+              retainedPackage.packageKey,
+            ],
+          )
+          await assert.rejects(
+            packageEvidenceClient.query(
+              `SET CONSTRAINTS
+                 validate_operations_cartonization_unit_material_package IMMEDIATE`,
+            ),
+            /unit-material .*evidence is invalid/i,
+            `PostgreSQL 18 must reject ${kind} ${field} fit evidence`,
+          )
+        } finally {
+          await packageEvidenceClient.query(
+            'ROLLBACK TO SAVEPOINT fit_evidence_tamper',
+          )
+          await packageEvidenceClient.query(
+            'RELEASE SAVEPOINT fit_evidence_tamper',
+          )
+        }
+      }
+      for (const field of [
+        'unitWeightGrams',
+        'weightCapacityUnits',
+        'spatialCapacityUnits',
+        'effectiveCapacityUnits',
+      ]) {
+        for (const kind of ['missing', 'null', 'wrong-type']) {
+          await assertFitEvidenceTamperRejected({
+            field,
+            kind,
+            value: String(retainedPackage.unitMaterialEvidence[field]),
+          })
+        }
+      }
     } finally {
       await packageEvidenceClient.query('ROLLBACK')
       packageEvidenceClient.release()

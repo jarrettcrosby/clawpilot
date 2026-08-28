@@ -1048,6 +1048,17 @@ export async function POST(req: NextRequest) {
       request.evidenceMode === 'operational'
       && geometryProfileFallbackLines.length > 0
     ) {
+      const preplannedMaterialUsageById = new Map<string, number>()
+      for (const packagePlan of operationalUnitMaterialPlan?.status === 'ready'
+        ? operationalUnitMaterialPlan.packages
+        : []) {
+        preplannedMaterialUsageById.set(
+          packagePlan.packagingMaterialGlobalId,
+          (preplannedMaterialUsageById.get(
+            packagePlan.packagingMaterialGlobalId,
+          ) || 0) + 1,
+        )
+      }
       let optimizer = null
       try {
         optimizer = configuredOrToolsFulfillmentOptimizer()
@@ -1066,6 +1077,14 @@ export async function POST(req: NextRequest) {
           lines: read.input.lines,
           fallbackLines: geometryProfileFallbackLines,
           recipePackages: plan.recipePackages,
+          preplannedMaterialUsage: [...preplannedMaterialUsageById]
+            .map(([materialGlobalId, quantity]) => ({
+              materialGlobalId,
+              quantity,
+            }))
+            .sort((left, right) => (
+              left.materialGlobalId.localeCompare(right.materialGlobalId)
+            )),
           materials: read.input.materials,
           inventoryProducts: read.inventory.products,
           availabilityMode: request.shadowTraining

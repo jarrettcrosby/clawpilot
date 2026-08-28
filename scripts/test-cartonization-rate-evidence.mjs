@@ -1144,6 +1144,8 @@ const operationalGeometryFence = section(
 )
 assertIncludes(operationalGeometryFence, [
   'configuredOrToolsFulfillmentOptimizer()',
+  'preplannedMaterialUsageById',
+  'preplannedMaterialUsage: [...preplannedMaterialUsageById]',
   'planOperationalGeometryRatePackages({',
   'optimizer,',
   "operationalGeometryRatePlan.status === 'blocked'",
@@ -1772,6 +1774,7 @@ const operationalGeometryInput = {
     fitModel: 'rigid_3d',
   }],
   recipePackages: [],
+  preplannedMaterialUsage: [],
   materials: [{
     materialGlobalId: 'gmat0000001',
     materialType: 'carton',
@@ -1804,25 +1807,35 @@ const operationalGeometryInput = {
   maximumPackages: 50,
 }
 function validOperationalOptimizerResult(input, options, method = 'or_tools') {
+  const selectedCarton = input.cartons[0]
+  assert.ok(selectedCarton, 'The optimizer fixture requires an eligible carton')
   const selectedPlan = {
     planId: 'plan-operational-1',
     warehouseGlobalIds: ['gwh0000001'],
     warehouseCount: 1,
     shipmentCount: 1,
     cartonCount: 1,
-    estimatedTotalCostMinor: 55,
-    unusedVolumeMm3: 6_860_000,
+    estimatedTotalCostMinor: selectedCarton.materialCostMinor,
+    unusedVolumeMm3:
+      selectedCarton.innerDimensionsMm.length
+      * selectedCarton.innerDimensionsMm.width
+      * selectedCarton.innerDimensionsMm.height
+      - 640_000,
     packages: [{
       packageKey: 'package-operational-1',
       warehouseGlobalId: 'gwh0000001',
-      cartonGlobalId: 'gmat0000001',
-      innerDimensionsMm: { length: 250, width: 200, height: 150 },
-      maxWeightGrams: 10_000,
-      emptyWeightGrams: 120,
-      totalWeightGrams: 520,
+      cartonGlobalId: selectedCarton.cartonGlobalId,
+      innerDimensionsMm: selectedCarton.innerDimensionsMm,
+      maxWeightGrams: selectedCarton.maxWeightGrams,
+      emptyWeightGrams: selectedCarton.emptyWeightGrams,
+      totalWeightGrams: selectedCarton.emptyWeightGrams + 400,
       usedVolumeMm3: 640_000,
-      unusedVolumeMm3: 6_860_000,
-      estimatedCostMinor: 55,
+      unusedVolumeMm3:
+        selectedCarton.innerDimensionsMm.length
+        * selectedCarton.innerDimensionsMm.width
+        * selectedCarton.innerDimensionsMm.height
+        - 640_000,
+      estimatedCostMinor: selectedCarton.materialCostMinor,
       allocations: [{
         lineGlobalId: 'gcol0000001',
         productGlobalId: 'gp0000001',
@@ -1883,6 +1896,43 @@ assert.equal(
   operationalGeometryReady.optimizerInput.cartons[0].availableQuantity,
   4,
   'Operational optimizer material stock must subtract active package claims',
+)
+const scarcePreferredMaterial = {
+  ...operationalGeometryInput.materials[0],
+  stockOnHandQuantity: 1,
+  activeClaimedQuantity: 0,
+  availableQuantity: 1,
+}
+const alternateGeometryMaterial = {
+  ...scarcePreferredMaterial,
+  materialGlobalId: 'gmat0000002',
+  unitCostMinor: 65,
+}
+const mixedUnitGeometryReady = await planOperationalGeometryRatePackages({
+  ...operationalGeometryInput,
+  materials: [scarcePreferredMaterial, alternateGeometryMaterial],
+  preplannedMaterialUsage: [{
+    materialGlobalId: scarcePreferredMaterial.materialGlobalId,
+    quantity: 1,
+  }],
+  optimizer: {
+    async optimize(input, options) {
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(input.cartons.map((carton) => (
+          carton.cartonGlobalId
+        )))),
+        [alternateGeometryMaterial.materialGlobalId],
+        'Geometry planning must receive residual stock after ordinary-unit packages',
+      )
+      return validOperationalOptimizerResult(input, options)
+    },
+  },
+})
+assert.equal(mixedUnitGeometryReady.status, 'ready')
+assert.equal(
+  mixedUnitGeometryReady.packages[0].packagingMaterialGlobalId,
+  alternateGeometryMaterial.materialGlobalId,
+  'A mixed ordinary-plus-rigid order must use a feasible alternate carton instead of double-claiming scarce stock',
 )
 const fullyRecipeConsumedMaterial = {
   ...operationalGeometryInput.materials[0],

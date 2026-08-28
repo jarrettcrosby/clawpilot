@@ -168,6 +168,10 @@ export async function planOperationalGeometryRatePackages(input: {
   lines: HybridCartonizationLine[]
   fallbackLines: HybridCartonizationResult['geometryFallbackLines']
   recipePackages: HybridRecipePackage[]
+  preplannedMaterialUsage: Array<{
+    materialGlobalId: string
+    quantity: number
+  }>
   materials: HybridCartonizationMaterial[]
   inventoryProducts: InventoryProductEvidence[]
   availabilityMode?: 'operational' | 'shadow_training_simulated'
@@ -240,6 +244,32 @@ export async function planOperationalGeometryRatePackages(input: {
   }
 
   const usedMaterialQuantity = recipeMaterialUsage(input.recipePackages)
+  const preplannedMaterialIds = new Set<string>()
+  for (const usage of input.preplannedMaterialUsage) {
+    if (
+      !usage.materialGlobalId
+      || preplannedMaterialIds.has(usage.materialGlobalId)
+      || !positiveInteger(usage.quantity)
+      || !input.materials.some((material) => (
+        material.materialGlobalId === usage.materialGlobalId
+      ))
+    ) {
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_USAGE_INVALID',
+        'Preplanned packages must retain one positive, unique material-usage count for selected factual stock.',
+      )
+    }
+    preplannedMaterialIds.add(usage.materialGlobalId)
+    const next = (usedMaterialQuantity.get(usage.materialGlobalId) || 0)
+      + usage.quantity
+    if (!Number.isSafeInteger(next)) {
+      return blocked(
+        'CARTONIZATION_RATE_EVIDENCE_OPERATIONAL_MATERIAL_USAGE_INVALID',
+        'Preplanned package material usage exceeds the integer-safe stock boundary.',
+      )
+    }
+    usedMaterialQuantity.set(usage.materialGlobalId, next)
+  }
   const invalidMaterial = input.materials.find((material) => {
     const type = materialFamily(material.materialType)
     return (
@@ -392,6 +422,11 @@ export async function planOperationalGeometryRatePackages(input: {
     availabilityMode: input.availabilityMode || 'operational',
     fallbackLines: input.fallbackLines,
     recipePackageKeys: input.recipePackages.map((item) => item.packageKey),
+    preplannedMaterialUsage: [...input.preplannedMaterialUsage].sort(
+      (left, right) => (
+        left.materialGlobalId.localeCompare(right.materialGlobalId)
+      ),
+    ),
     materialFacts: input.materials,
     inventoryFacts: input.inventoryProducts,
   })

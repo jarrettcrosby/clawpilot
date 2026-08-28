@@ -294,6 +294,7 @@ BEGIN
     AND package_plan->>'planningMethod' = 'unit_material_selection';
 
   IF retained_package IS NULL
+    OR pg_catalog.jsonb_typeof(retained_evidence) IS DISTINCT FROM 'object'
     OR retained_evidence->>'policyVersion' IS DISTINCT FROM
          'operational-unit-material-shared-stock-v3'
     OR retained_evidence->>'productPackConstraint' IS DISTINCT FROM
@@ -312,11 +313,19 @@ BEGIN
     OR retained_evidence->>'unitDimensionsAuthority' IS DISTINCT FROM
          'order_specific_or_one_each_without_fit_claim'
     OR retained_evidence->>'rotationAllowed' IS DISTINCT FROM 'false'
+    OR pg_catalog.jsonb_typeof(retained_evidence->'rotationAllowed')
+         IS DISTINCT FROM 'boolean'
+    OR pg_catalog.jsonb_typeof(
+         retained_evidence->'dimensionedLineCount'
+       ) IS DISTINCT FROM 'number'
     OR retained_evidence->>'dimensionedLineCount' IS NULL
     OR retained_evidence->>'dimensionedLineCount' !~ '^[0-9]{1,9}$'
     OR (retained_evidence->>'dimensionedLineCount')::integer <>
          dimensioned_line_count
     OR retained_evidence->>'oneEachUndimensionedLineCount' IS NULL
+    OR pg_catalog.jsonb_typeof(
+         retained_evidence->'oneEachUndimensionedLineCount'
+       ) IS DISTINCT FROM 'number'
     OR retained_evidence->>'oneEachUndimensionedLineCount'
          !~ '^[0-9]{1,9}$'
     OR (retained_evidence->>'oneEachUndimensionedLineCount')::integer <>
@@ -332,17 +341,24 @@ BEGIN
     OR pg_catalog.jsonb_typeof(retained_package->'allocations')
          IS DISTINCT FROM 'array'
     OR pg_catalog.jsonb_array_length(retained_package->'allocations') <> 1
+    OR pg_catalog.jsonb_typeof(
+         retained_package->'allocations'->0->'lineGlobalId'
+       ) IS DISTINCT FROM 'string'
     OR retained_package->'allocations'->0->>'lineGlobalId' IS NULL
     OR retained_package->'allocations'->0->>'lineGlobalId'
          !~ '^(gcol|gcal)'
     OR retained_package->'allocations' IS DISTINCT FROM NEW.allocations
     OR retained_package->>'planningMethod' IS DISTINCT FROM
          'unit_material_selection'
+    OR pg_catalog.jsonb_typeof(retained_package->'packageSequence')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'packageSequence' IS DISTINCT FROM
          NEW.package_sequence::text
     OR material_global_id IS NULL
     OR retained_package->>'packagingMaterialGlobalId' IS DISTINCT FROM
          material_global_id
+    OR pg_catalog.jsonb_typeof(retained_package->'materialRowVersion')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'materialRowVersion' IS DISTINCT FROM
          NEW.material_row_version::text
     OR retained_package->'recipes' IS DISTINCT FROM '[]'::jsonb
@@ -351,12 +367,20 @@ BEGIN
          NEW.inner_dimensions_mm
     OR retained_package->'ratedOuterDimensionsMm' IS DISTINCT FROM
          NEW.rated_outer_dimensions_mm
+    OR pg_catalog.jsonb_typeof(retained_package->'contentWeightGrams')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'contentWeightGrams' IS DISTINCT FROM
          NEW.content_weight_grams::text
+    OR pg_catalog.jsonb_typeof(retained_package->'tareWeightGrams')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'tareWeightGrams' IS DISTINCT FROM
          NEW.tare_weight_grams::text
+    OR pg_catalog.jsonb_typeof(retained_package->'ratedGrossWeightGrams')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'ratedGrossWeightGrams' IS DISTINCT FROM
          NEW.rated_gross_weight_grams::text
+    OR pg_catalog.jsonb_typeof(retained_package->'maxWeightGrams')
+         IS DISTINCT FROM 'number'
     OR retained_package->>'maxWeightGrams' IS DISTINCT FROM
          NEW.max_weight_grams::text
   THEN
@@ -364,7 +388,11 @@ BEGIN
       'Unit-material packages require exact retained operational evidence';
   END IF;
 
-  IF retained_package->'allocations'->0->>'quantity'
+  IF pg_catalog.jsonb_typeof(
+       retained_package->'allocations'->0->'quantity'
+     ) IS DISTINCT FROM 'number'
+    OR retained_package->'allocations'->0->>'quantity' IS NULL
+    OR retained_package->'allocations'->0->>'quantity'
        !~ '^[1-9][0-9]{0,8}$' THEN
     RAISE EXCEPTION 'Unit-material allocation quantity is invalid';
   END IF;
@@ -377,28 +405,42 @@ BEGIN
          'operational-unit-material-shared-stock-v3'
     OR fit_evidence->>'productPackConstraint' IS DISTINCT FROM
          'not_required_for_ordinary_unit'
+    OR pg_catalog.jsonb_typeof(fit_evidence->'unitsPerPackage')
+         IS DISTINCT FROM 'number'
     OR fit_evidence->>'unitsPerPackage' IS DISTINCT FROM
          allocation_quantity::text
+    OR pg_catalog.jsonb_typeof(fit_evidence->'unitWeightGrams')
+         IS DISTINCT FROM 'number'
+    OR fit_evidence->>'unitWeightGrams' IS NULL
     OR fit_evidence->>'unitWeightGrams' !~ '^[1-9][0-9]{0,8}$'
+    OR retained_package->>'contentWeightGrams' IS NULL
     OR retained_package->>'contentWeightGrams' !~ '^[1-9][0-9]{0,8}$'
     OR (fit_evidence->>'unitWeightGrams')::integer * allocation_quantity <>
          (retained_package->>'contentWeightGrams')::integer
     OR (retained_package->>'contentWeightGrams')::integer <>
          NEW.content_weight_grams
+    OR pg_catalog.jsonb_typeof(fit_evidence->'rotationAllowed')
+         IS DISTINCT FROM 'boolean'
     OR fit_evidence->>'rotationAllowed' IS DISTINCT FROM 'false'
     OR fit_evidence->>'sharedStockSolver' IS DISTINCT FROM
          retained_evidence->>'sharedStockSolver'
     OR fit_evidence->>'unitWeightAuthority' IS DISTINCT FROM
          'provider_or_order_specific'
     OR NEW.max_weight_grams IS NULL
+    OR pg_catalog.jsonb_typeof(fit_evidence->'weightCapacityUnits')
+         IS DISTINCT FROM 'number'
+    OR fit_evidence->>'weightCapacityUnits' IS NULL
     OR fit_evidence->>'weightCapacityUnits' !~ '^[1-9][0-9]{0,8}$'
     OR (fit_evidence->>'weightCapacityUnits')::integer <>
          (NEW.max_weight_grams - NEW.tare_weight_grams) /
            (fit_evidence->>'unitWeightGrams')::integer
+    OR pg_catalog.jsonb_typeof(fit_evidence->'effectiveCapacityUnits')
+         IS DISTINCT FROM 'number'
+    OR fit_evidence->>'effectiveCapacityUnits' IS NULL
     OR fit_evidence->>'effectiveCapacityUnits'
          !~ '^[1-9][0-9]{0,15}$'
-    OR (fit_evidence->>'effectiveCapacityUnits')::integer <
-         allocation_quantity
+    OR (fit_evidence->>'effectiveCapacityUnits')::numeric <
+         allocation_quantity::numeric
   THEN
     RAISE EXCEPTION 'Unit-material package fit evidence is invalid';
   END IF;
@@ -434,6 +476,9 @@ BEGIN
       OR (fit_evidence->'axisCounts'->>'height')::integer <>
            (NEW.inner_dimensions_mm->>'height')::integer /
              (fit_evidence->'unitDimensionsMm'->>'height')::integer
+      OR pg_catalog.jsonb_typeof(fit_evidence->'spatialCapacityUnits')
+           IS DISTINCT FROM 'number'
+      OR fit_evidence->>'spatialCapacityUnits' IS NULL
       OR fit_evidence->>'spatialCapacityUnits'
            !~ '^[1-9][0-9]{0,15}$'
       OR (fit_evidence->>'spatialCapacityUnits')::numeric <>

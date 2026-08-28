@@ -1,7 +1,7 @@
 export const OPERATIONS_ORDER_UNIT_WEIGHT_MIGRATION =
   '0336_operations_order_unit_physical_facts.sql' as const
 export const OPERATIONS_ORDER_UNIT_WEIGHT_MIGRATION_CHECKSUM =
-  '8969fcb35a786b7c7109d544d84021b32e9637162509a6aa5a1c1761d81d995c' as const
+  '37620c5cdac39bbea692deadc8a152ee55ffc050117b53864a0455ae16a7a971' as const
 
 export const OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL = String.raw`
   EXISTS (
@@ -10,7 +10,7 @@ export const OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL = String.raw`
     WHERE migration.filename =
       '0336_operations_order_unit_physical_facts.sql'
       AND migration.checksum =
-        '8969fcb35a786b7c7109d544d84021b32e9637162509a6aa5a1c1761d81d995c'
+        '37620c5cdac39bbea692deadc8a152ee55ffc050117b53864a0455ae16a7a971'
   )
   AND (
     SELECT pg_catalog.count(installed_table.oid) = 1
@@ -159,7 +159,7 @@ export const OPERATIONS_ORDER_UNIT_WEIGHT_HEALTH_SQL = String.raw`
           ), E'\n' ORDER BY required.signature
         ), 'UTF8'), 'sha256'
       ), 'hex') =
-        '175ff2b853304ab55e0137de831c0f5f1be1fa1a6065765cdec2dfdc78bf9295'
+        'a4d8bb6af56923e3e436f37049ea0a043e5242b5ccd80d95556c595ac6c6a7d3'
     FROM (VALUES
       ('validate_operations_order_unit_weight_fact()'),
       ('protect_operations_order_unit_weight_fact()'),
