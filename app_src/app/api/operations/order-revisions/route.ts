@@ -481,7 +481,15 @@ function errorResponse(error: unknown) {
     error instanceof CommerceOrderRevisionApiError
     || error instanceof CommerceOrderRevisionDispositionError
   ) {
-    return json({ ok: false, error: error.message, code: error.code }, error.status)
+    return json({
+      ok: false,
+      error: error.message,
+      code: error.code,
+      ...(error instanceof CommerceOrderRevisionDispositionError
+        && error.retryWithNewIdempotencyKey
+        ? { retryWithNewIdempotencyKey: true }
+        : {}),
+    }, error.status)
   }
   if (
     error

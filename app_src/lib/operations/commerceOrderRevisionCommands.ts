@@ -118,16 +118,24 @@ export async function refreshCommerceOrderRevisionFromProvider(input: {
     }
   } catch (error) {
     const errorCode = providerErrorCode(error)
-    await failManagerCommerceOrderRevisionRefreshInPostgres({
+    const retryWithNewIdempotencyKey = await failManagerCommerceOrderRevisionRefreshInPostgres({
       claim,
       commandReceiptId: prepared.commandReceiptId,
       errorCode,
     })
-    if (error instanceof CommerceOrderRevisionDispositionError) throw error
+    if (error instanceof CommerceOrderRevisionDispositionError) {
+      throw new CommerceOrderRevisionDispositionError(
+        error.code,
+        error.message,
+        error.status,
+        retryWithNewIdempotencyKey,
+      )
+    }
     throw new CommerceOrderRevisionDispositionError(
       errorCode,
       `The exact ${claim.provider === 'shopify' ? 'Shopify' : 'Faire'} order refresh failed`,
       502,
+      retryWithNewIdempotencyKey,
     )
   }
 }
