@@ -143,8 +143,22 @@ async function readCodexStream(response: Response): Promise<ChatGPTCodexResearch
   let buffer = ''
   let text = ''
   let completedText = ''
-  let citations: ChatGPTCodexCitation[] = []
+  const citations = new Map<string, ChatGPTCodexCitation>()
   let total = 0
+
+  function mergeCitations(payload: Record<string, unknown>) {
+    for (const citation of extractCitations(payload)) {
+      const existing = citations.get(citation.url)
+      if (existing) {
+        citations.set(citation.url, {
+          url: citation.url,
+          title: citation.title || existing.title,
+        })
+      } else if (citations.size < 30) {
+        citations.set(citation.url, citation)
+      }
+    }
+  }
 
   function consume(chunk: string) {
     const event = parseEvent(chunk)
@@ -154,13 +168,17 @@ async function readCodexStream(response: Response): Promise<ChatGPTCodexResearch
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
       text += event.delta
     }
+    const item = event.item && typeof event.item === 'object'
+      ? event.item as Record<string, unknown>
+      : null
+    if (item) mergeCitations({ output: [item] })
     if (event.type === 'response.completed' || event.type === 'response.done') {
       const responsePayload = event.response && typeof event.response === 'object'
         ? event.response as Record<string, unknown>
         : null
       const completed = responsePayload ? extractOutputText(responsePayload) : ''
       if (completed) completedText = completed
-      if (responsePayload) citations = extractCitations(responsePayload)
+      if (responsePayload) mergeCitations(responsePayload)
     }
   }
 
@@ -187,7 +205,7 @@ async function readCodexStream(response: Response): Promise<ChatGPTCodexResearch
 
   const result = text.trim() || completedText.trim()
   if (!result) throw new Error('ChatGPT returned an empty agent response')
-  return { text: result, citations }
+  return { text: result, citations: [...citations.values()] }
 }
 
 async function runChatGPTCodexRequest(input: {
