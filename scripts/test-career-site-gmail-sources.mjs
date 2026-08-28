@@ -264,6 +264,45 @@ assert.equal(
   true,
   'direct recruiter outreach must remain eligible',
 )
+assert.ok(
+  gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY.includes(
+    'recruiter recruiting hiring application "talent acquisition"',
+  ),
+  'the coarse provider query must retain broad hiring and application candidates',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'no-reply@manufacturer.com',
+    subject: 'Candidate application received',
+    snippet: 'We received your materials.',
+    bodyText: 'Our hiring team will review them.',
+  }),
+  true,
+  'a candidate application receipt remains eligible after broad provider retrieval',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jane@searchfirm.com',
+    subject: 'Opportunity to connect',
+    snippet: 'I came across your profile and think you are a strong fit for a VP Operations position.',
+    bodyText: 'Would you be open to a quick call? Book now using my calendar link.',
+  }),
+  true,
+  'a recruiter calendar call to action is not consumer marketing evidence',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Shareholder opportunity',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  }),
+  false,
+  'an executive title requires independent employment or outreach provenance',
+)
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
@@ -613,7 +652,7 @@ assert.deepEqual(
 assert.ok(providerCalls.every((call) => !Object.hasOwn(call.context, 'is_selected')))
 assert.ok(providerCalls.filter((call) => call.path.includes('?maxResults=')).every((call) => {
   const parsed = new URL(call.path, 'https://gateway.maton.ai')
-  return parsed.searchParams.get('maxResults') === '2'
+  return parsed.searchParams.get('maxResults') === String(contract.MAX_GMAIL_MESSAGES_PER_ACCOUNT)
     && parsed.searchParams.get('q') === `(${gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY}) after:1787832000 (newer_than:7d)`
     && !call.path.includes('{"job alert"')
 }))
@@ -806,6 +845,89 @@ for (const row of bulkRows) {
   )
 }
 assert.ok(bulkMessages.every((message) => message.urls.length === 20))
+
+const backfillListTokens = []
+let backfillGetCalls = 0
+const backfillSources = loadGmailSources({
+  rows: [{
+    connectionId: 'backfill-connection',
+    accountEmail: 'backfill@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path, init, context) {
+    assert.ok(init.signal instanceof AbortSignal)
+    assert.equal(context.ownerEmail, identity.CAREER_SITE_OWNER_EMAIL)
+    assert.equal(context.app, 'google-mail')
+    assert.equal(context.boundConnectionId, 'backfill-connection')
+    assert.ok(!Object.hasOwn(context, 'is_selected'))
+    const parsed = new URL(path, 'https://gateway.maton.ai')
+    if (parsed.searchParams.has('maxResults')) {
+      assert.equal(
+        parsed.searchParams.get('maxResults'),
+        String(contract.MAX_GMAIL_MESSAGES_PER_ACCOUNT),
+      )
+      assert.equal(parsed.searchParams.get('q'), `(${gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY})`)
+      const pageToken = parsed.searchParams.get('pageToken')
+      backfillListTokens.push(pageToken)
+      if (!pageToken) {
+        return Response.json({
+          messages: [{ id: 'promotional-first-hit' }],
+          nextPageToken: 'career-page',
+        })
+      }
+      assert.equal(pageToken, 'career-page')
+      return Response.json({ messages: [{ id: 'career-second-hit' }] })
+    }
+    backfillGetCalls += 1
+    const id = decodeURIComponent(path.match(/\/messages\/([^?]+)/)?.[1] || '')
+    if (id === 'promotional-first-hit') {
+      return Response.json({
+        id,
+        sender: 'offers@bank.com',
+        subject: 'Opportunity: auto loan at 3.9% APR',
+        receivedAt: '2026-08-28T20:00:00.000Z',
+        snippet: 'A limited-time credit offer.',
+        bodyText: 'Apply for a car loan and earn rewards points.',
+      })
+    }
+    assert.equal(id, 'career-second-hit')
+    return Response.json({
+      id,
+      sender: 'recruiter@acme.com',
+      subject: 'VP Operations role',
+      receivedAt: '2026-08-28T19:00:00.000Z',
+      snippet: 'A recruiter reviewed your background.',
+      bodyText: 'Would you be open to an interview?',
+    })
+  },
+  parseGmailMessage(message) {
+    return {
+      externalMessageId: message.id,
+      externalThreadId: null,
+      senderEmail: message.sender,
+      recipientEmails: [],
+      subject: message.subject,
+      receivedAt: message.receivedAt,
+      snippet: message.snippet,
+      bodyText: message.bodyText,
+      markerReferences: [],
+      historyId: null,
+      labelIds: ['INBOX'],
+      sizeEstimate: null,
+    }
+  },
+})
+const backfilledMessages = await backfillSources.searchCareerSiteGmailMessages({
+  ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+  request: { maxMessagesPerAccount: 1 },
+})
+assert.deepEqual(backfillListTokens, [null, 'career-page'])
+assert.equal(backfillGetCalls, 2)
+assert.equal(
+  JSON.stringify(backfilledMessages.map((message) => message.externalMessageId)),
+  JSON.stringify(['career-second-hit']),
+  'a rejected first page must backfill from a later bounded Gmail page',
+)
 
 const malformedSources = loadGmailSources({
   rows: [{ connectionId: 'malformed', accountEmail: 'malformed@gmail.com', status: 'ACTIVE' }],

@@ -3,6 +3,7 @@ import {
   GMAIL_SOURCE_DEADLINE_MS,
   MAX_GMAIL_ACTIVE_ACCOUNTS,
   MAX_GMAIL_BODY_TEXT_CHARS,
+  MAX_GMAIL_MESSAGES_PER_ACCOUNT,
   MAX_GMAIL_RESPONSE_BYTES,
   MAX_GMAIL_SNIPPET_CHARS,
   MAX_GMAIL_TOTAL_MESSAGES,
@@ -27,7 +28,15 @@ const GMAIL_APP = 'google-mail'
 const GMAIL_MESSAGES_PATH = '/google-mail/gmail/v1/users/me/messages'
 const MAX_RAW_URL_SOURCE_CHARS = 50_000
 const GMAIL_REQUEST_CONCURRENCY = 5
-export const CAREER_GMAIL_IMMUTABLE_QUERY = '{"job alert" "recommended jobs" "jobs you may be interested in" "new matches for you" recruiter recruiting "talent acquisition" "hiring manager" interview "your application" "application update" subject:(job OR role OR position OR opportunity)} -in:spam -in:trash'
+const GMAIL_LIST_PAGE_SIZE = MAX_GMAIL_MESSAGES_PER_ACCOUNT
+const MAX_GMAIL_LIST_PAGES_PER_ACCOUNT = 4
+const MAX_GMAIL_CANDIDATES_PER_ACCOUNT = (
+  GMAIL_LIST_PAGE_SIZE * MAX_GMAIL_LIST_PAGES_PER_ACCOUNT
+)
+const MAX_GMAIL_TOTAL_CANDIDATES = MAX_GMAIL_TOTAL_MESSAGES * 4
+const GMAIL_CANDIDATE_FETCH_BATCH_SIZE = GMAIL_REQUEST_CONCURRENCY * 2
+const MAX_GMAIL_PAGE_TOKEN_CHARS = 2_048
+export const CAREER_GMAIL_IMMUTABLE_QUERY = '{"job alert" "recommended jobs" "jobs you may be interested in" "new matches for you" recruiter recruiting hiring application "talent acquisition" "hiring manager" interview "your application" "application update" subject:(job OR role OR position OR opportunity)} -in:spam -in:trash'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 type ActiveGmailConnection = ActiveMatonGatewayConnection & {
@@ -62,7 +71,7 @@ const EMPLOYMENT_CONTEXT_PATTERN = /\b(?:hiring|candidate|resume|résumé|compen
 const HUMAN_OUTREACH_PATTERN = /\b(?:(?:came across|found|reviewed|saw|noticed) your (?:profile|background|experience)|your (?:profile|background|experience) (?:(?:caught|grabbed) my (?:eye|attention)|stood out|(?:aligns|matches|fits))|(?:strong|great|excellent|good|potential) fit|would you be open|open to (?:a |an )?(?:quick )?(?:call|chat|conversation|discussion|hearing|learning|exploring)|quick (?:call|chat|conversation)|connect (?:about|regarding|to discuss)|discuss (?:a|an|the|this) (?:job|role|position|opportunity))\b/i
 const INTERVIEW_SCHEDULING_PATTERN = /\b(?:schedule|scheduled|scheduling|availability|available times?|calendar|appointment|zoom|microsoft teams|google meet|reschedule)\b/i
 const MEDIA_INTERVIEW_PATTERN = /\b(?:podcast|show|episode|publication|article|webinar|guest appearance|on camera|livestream|live stream)\b/i
-const CONSUMER_PROMOTION_PATTERN = /\b(?:apr|auto loans?|car loans?|mortgage|refinanc(?:e|ing)|credit cards?|checking account|savings account|cash back|rewards points?|insurance quote|pre-?approved|limited[- ]time offer|coupon|percent off|\d{1,2}% off|shop now|book now)\b/i
+const CONSUMER_PROMOTION_PATTERN = /\b(?:apr|auto loans?|car loans?|mortgage|refinanc(?:e|ing)|credit cards?|checking account|savings account|cash back|rewards points?|insurance quote|pre-?approved|limited[- ]time offer|coupon|percent off|\d{1,2}% off|shop now)\b/i
 const NON_EMPLOYMENT_APPLICATION_PATTERN = /\b(?:admissions?|college|university|mba|degree program|enrollment|student|mortgage|loan|credit|rental|lease|apartment|insurance|membership|grant application)\b/i
 const MARKETING_SUBJECT_PATTERN = /\b(?:sale|save \$|save \d|newsletter|weekly digest|exclusive offer|special offer|member offer|ends (?:today|soon)|new cars?|travel deals?)\b/i
 const MARKETING_SENDER_PATTERN = /(?:^|[.@_+-])(?:marketing|newsletter|offers?|promotions?|deals?)(?:[.@_+-]|$)/i
@@ -134,21 +143,23 @@ export function careerGmailMessageIsRelevant(
     applicationStatus
     && /\b(?:hiring manager|candidate|requisition|job application|employment application)\b/i.test(searchable)
   )
-  const unambiguousEmploymentContext = (
+  const independentEmploymentProvenance = (
     employmentContext
-    || explicitRole
     || directRecruiting
     || jobPlatform
   )
   const applicationCareerContext = (
     applicationStatus
-    && (unambiguousEmploymentContext || executiveTitle)
+    && independentEmploymentProvenance
   )
-  const employmentInterview = interview && unambiguousEmploymentContext
+  const employmentInterview = (
+    interview
+    && (independentEmploymentProvenance || (humanOutreach && roleEvidence))
+  )
   const interviewScheduling = interview && INTERVIEW_SCHEDULING_PATTERN.test(searchable)
   const roleWithCareerContext = (
     roleEvidence
-    && (employmentContext || executiveTitle || humanOutreach || directRecruiting)
+    && (independentEmploymentProvenance || humanOutreach)
   )
   const platformMessage = (
     jobPlatform
@@ -167,7 +178,7 @@ export function careerGmailMessageIsRelevant(
   const nonEmploymentApplicationOrInterview = (
     (applicationStatus || interview)
     && NON_EMPLOYMENT_APPLICATION_PATTERN.test(searchable)
-    && !unambiguousEmploymentContext
+    && !independentEmploymentProvenance
   )
   const mediaInterview = (
     interview
@@ -396,6 +407,18 @@ function listedMessageIds(payload: Record<string, unknown>): string[] {
   return ids
 }
 
+function listedNextPageToken(payload: Record<string, unknown>): string | null {
+  if (payload.nextPageToken === undefined) return null
+  const token = typeof payload.nextPageToken === 'string' ? payload.nextPageToken : ''
+  if (
+    !token
+    || token !== token.trim()
+    || token.length > MAX_GMAIL_PAGE_TOKEN_CHARS
+    || !/^[\x21-\x7e]+$/.test(token)
+  ) throw providerError()
+  return token
+}
+
 function gmailSearchQuery(request: CareerSiteGmailSourceRequest): string {
   const parts: string[] = [`(${CAREER_GMAIL_IMMUTABLE_QUERY})`]
   if (request.after) {
@@ -411,16 +434,46 @@ async function listedMessages(input: {
   request: CareerSiteGmailSourceRequest
   signal: AbortSignal
 }): Promise<string[]> {
-  const parameters = new URLSearchParams({
-    maxResults: String(input.request.maxMessagesPerAccount),
-  })
-  parameters.set('q', gmailSearchQuery(input.request))
-  const payload = await gmailJson(
-    input,
-    `${GMAIL_MESSAGES_PATH}?${parameters.toString()}`,
-    'list',
+  const candidateLimit = Math.min(
+    MAX_GMAIL_CANDIDATES_PER_ACCOUNT,
+    Math.max(
+      GMAIL_LIST_PAGE_SIZE,
+      input.request.maxMessagesPerAccount * MAX_GMAIL_LIST_PAGES_PER_ACCOUNT,
+    ),
   )
-  return listedMessageIds(payload).slice(0, input.request.maxMessagesPerAccount)
+  const messageIds: string[] = []
+  const seenMessageIds = new Set<string>()
+  const seenPageTokens = new Set<string>()
+  let pageToken: string | null = null
+
+  for (
+    let page = 0;
+    page < MAX_GMAIL_LIST_PAGES_PER_ACCOUNT && messageIds.length < candidateLimit;
+    page += 1
+  ) {
+    const parameters = new URLSearchParams({
+      maxResults: String(GMAIL_LIST_PAGE_SIZE),
+      q: gmailSearchQuery(input.request),
+    })
+    if (pageToken) parameters.set('pageToken', pageToken)
+    const payload = await gmailJson(
+      input,
+      `${GMAIL_MESSAGES_PATH}?${parameters.toString()}`,
+      'list',
+    )
+    for (const messageId of listedMessageIds(payload)) {
+      if (seenMessageIds.has(messageId)) continue
+      seenMessageIds.add(messageId)
+      messageIds.push(messageId)
+      if (messageIds.length >= candidateLimit) return messageIds
+    }
+    const nextPageToken = listedNextPageToken(payload)
+    if (!nextPageToken) return messageIds
+    if (seenPageTokens.has(nextPageToken)) throw providerError()
+    seenPageTokens.add(nextPageToken)
+    pageToken = nextPageToken
+  }
+  return messageIds
 }
 
 function header(part: GmailMessagePart | undefined, name: string): string {
@@ -552,14 +605,14 @@ function boundedCandidates(
   listed: Array<{ connection: ActiveGmailConnection; messageIds: string[] }>,
 ): GmailMessageCandidate[] {
   const candidates: GmailMessageCandidate[] = []
-  for (let index = 0; candidates.length < MAX_GMAIL_TOTAL_MESSAGES; index += 1) {
+  for (let index = 0; candidates.length < MAX_GMAIL_TOTAL_CANDIDATES; index += 1) {
     let added = false
     for (const account of listed) {
       const messageId = account.messageIds[index]
       if (!messageId) continue
       candidates.push({ connection: account.connection, messageId })
       added = true
-      if (candidates.length >= MAX_GMAIL_TOTAL_MESSAGES) return candidates
+      if (candidates.length >= MAX_GMAIL_TOTAL_CANDIDATES) return candidates
     }
     if (!added) return candidates
   }
@@ -626,21 +679,39 @@ export async function searchCareerSiteGmailMessages(input: {
       controller.signal,
     )
     if (controller.signal.aborted) throw searchAbortError(timedOut)
-    const fetched = await mapWithConcurrency(
-      boundedCandidates(listed),
-      GMAIL_REQUEST_CONCURRENCY,
-      (candidate) => getMessage({
-        ownerEmail: input.ownerEmail,
-        connection: candidate.connection,
-        messageId: candidate.messageId,
-        signal: controller.signal,
-      }),
-      controller.signal,
-    )
-    if (controller.signal.aborted) throw searchAbortError(timedOut)
-    const eligible = fetched
-      .filter((message): message is CareerSiteGmailMessage => Boolean(message))
-      .slice(0, MAX_GMAIL_TOTAL_MESSAGES)
+    const candidates = boundedCandidates(listed)
+    const eligible: CareerSiteGmailMessage[] = []
+    const eligibleByAccount = new Map<string, number>()
+    for (
+      let offset = 0;
+      offset < candidates.length && eligible.length < MAX_GMAIL_TOTAL_MESSAGES;
+      offset += GMAIL_CANDIDATE_FETCH_BATCH_SIZE
+    ) {
+      const fetched = await mapWithConcurrency(
+        candidates.slice(offset, offset + GMAIL_CANDIDATE_FETCH_BATCH_SIZE),
+        GMAIL_REQUEST_CONCURRENCY,
+        (candidate) => getMessage({
+          ownerEmail: input.ownerEmail,
+          connection: candidate.connection,
+          messageId: candidate.messageId,
+          signal: controller.signal,
+        }),
+        controller.signal,
+      )
+      if (controller.signal.aborted) throw searchAbortError(timedOut)
+      for (const message of fetched) {
+        if (!message) continue
+        const accountCount = eligibleByAccount.get(message.accountEmail) || 0
+        if (accountCount >= input.request.maxMessagesPerAccount) continue
+        eligible.push(message)
+        eligibleByAccount.set(message.accountEmail, accountCount + 1)
+        if (eligible.length >= MAX_GMAIL_TOTAL_MESSAGES) break
+      }
+      if (connections.every((connection) => (
+        (eligibleByAccount.get(connection.accountEmail) || 0)
+          >= input.request.maxMessagesPerAccount
+      ))) break
+    }
     return boundedResponseMessages(eligible).sort((left, right) => (
       right.receivedAt.localeCompare(left.receivedAt)
       || left.accountEmail.localeCompare(right.accountEmail)
