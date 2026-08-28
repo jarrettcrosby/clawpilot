@@ -356,6 +356,16 @@ export default function CommerceOrderRevisionManagerPanel({
       })
       const payload = await response.json().catch(() => ({})) as RevisionPayload
       if (!response.ok || !payload.ok || !payload.result) {
+        if (
+          nextAction === 'refresh-from-provider'
+          && payload.code === 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED'
+        ) {
+          // The server has durably failed this read receipt and explicitly
+          // requires a new Idempotency-Key. Keep the same key for ambiguous
+          // network failures, but do not trap the operator on a terminal
+          // provider-read receipt that can only replay its failure.
+          refreshIdempotencyAttempt.current = null
+        }
         throw new Error(`${payload.error || `${label} order action failed`}${payload.code ? ` [${payload.code}]` : ''}`)
       }
 

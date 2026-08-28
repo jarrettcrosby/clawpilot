@@ -123,6 +123,11 @@ assert.match(source.panel, /!payload\.result\.dispositionGlobalId/)
 assert.match(source.panel, /payload\.result\.previousStatus !== 'imported'/)
 assert.match(source.panel, /payload\.result\.status !== 'cancelled'/)
 assert.match(source.panel, /operations-order-revision:\$\{action\}:\$\{readGlobalId\}:\$\{nonce\}/)
+assert.match(
+  source.panel,
+  /nextAction === 'refresh-from-provider'[\s\S]{0,220}payload\.code === 'SHOPIFY_ORDER_REVISION_PROVIDER_READ_FAILED'[\s\S]{0,520}refreshIdempotencyAttempt\.current = null/u,
+  'A terminal provider-read receipt must release its refresh idempotency key so the visible retry can issue a new read',
+)
 assert.match(source.panel, /const exactIdempotencyAttempt = useRef</)
 assert.match(source.panel, /const refreshIdempotencyAttempt = useRef</)
 assert.match(source.panel, /const fingerprint = JSON\.stringify\(body\)/)
