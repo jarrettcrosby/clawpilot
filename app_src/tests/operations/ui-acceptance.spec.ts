@@ -2392,7 +2392,7 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
 
   await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
   await page.getByRole('button', { name: 'Open operations guide' }).click()
-  await expect(page.getByText(/Deterministic mock adapters remain isolated to automated tests/)).toBeVisible()
+  await expect(page.getByText(/Hosted orders enter through connected commerce accounts/)).toBeVisible()
   await page.getByRole('button', { name: 'Done' }).click()
   await page.getByRole('button', { name: /PROOF-1042/ }).click()
   await expect(page.getByRole('heading', { name: 'Order PROOF-1042' })).toBeVisible()

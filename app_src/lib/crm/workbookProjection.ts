@@ -100,18 +100,20 @@ function opportunityRow(record: CrmOpportunity): unknown[] {
 export function googleSheetsDateTime(value: string | null | undefined): number | '' {
   const timestamp = Date.parse(String(value || ''))
   if (!Number.isFinite(timestamp)) return ''
+  // configurePipelineTabs pins managed workbooks to Etc/UTC, so the serial's
+  // wall-clock value and all Sheet calendar-month formulas are deterministic.
   return (timestamp / 86_400_000) + 25_569
 }
 
 function workbookInteractionType(record: CrmInteraction) {
   const normalized = record.interactionType.trim().toLowerCase().replace(/[\s_-]+/g, ' ')
-  if (normalized === 'meeting' || normalized === 'in person') return 'In Person'
-  if (normalized === 'linkedin') return 'LinkedIn'
-  if (normalized === 'direct mail') return 'Direct Mail'
-  if (normalized === 'email') return 'Email'
-  if (normalized === 'call') return 'Call'
-  if (normalized === 'campaign') return 'Campaign'
-  if (normalized === 'note') return 'Note'
+  if (['meeting', 'meetings', 'in person'].includes(normalized)) return 'In Person'
+  if (['linkedin', 'linked in'].includes(normalized)) return 'LinkedIn'
+  if (['direct mail', 'directmail'].includes(normalized)) return 'Direct Mail'
+  if (['email', 'emails', 'e mail'].includes(normalized)) return 'Email'
+  if (['call', 'calls', 'phone', 'phone call'].includes(normalized)) return 'Call'
+  if (['campaign', 'campaigns'].includes(normalized)) return 'Campaign'
+  if (['note', 'notes'].includes(normalized)) return 'Note'
   return record.interactionType || 'Note'
 }
 
