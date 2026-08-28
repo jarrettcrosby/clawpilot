@@ -183,11 +183,17 @@ type PrintJobRow = {
   available_at: TimestampValue
   claim_expires_at: TimestampValue | null
   delivered_at: TimestampValue | null
+  delivered_attempt_id: string | null
+  delivered_attempt_sequence_number: number | null
+  physical_output_verified_at: TimestampValue | null
+  physical_output_verified_by: string | null
+  physical_output_reason: string | null
   last_error: string | null
   reprint_of_job_global_id: string | null
   reprint_reason: string | null
   enqueued_by: string | null
   attempt_history: Array<{
+    id: string
     attemptNumber: number
     sequenceNumber: number
     state: OperationsPrintAttemptListItem['state']
@@ -231,6 +237,7 @@ type LockedPrintJobRow = {
   fallback_printer_id: string | null
   fallback_printer_global_id: string | null
   status: OperationsPrintJobListItem['status']
+  delivered_at: TimestampValue | null
   attempts: number
   max_attempts: number
   claimed_by_print_agent_id: string | null
@@ -1090,6 +1097,22 @@ function jobItem(row: PrintJobRow): OperationsPrintJobListItem {
     availableAt: iso(row.available_at) as string,
     claimExpiresAt: iso(row.claim_expires_at),
     deliveredAt: iso(row.delivered_at),
+    deliveredAttemptId: row.delivered_attempt_id,
+    deliveredAttemptSequenceNumber: row.delivered_attempt_sequence_number,
+    physicalOutputAttestation: row.physical_output_verified_at
+      && row.physical_output_verified_by
+      && row.physical_output_reason
+      && row.delivered_attempt_id
+      && row.delivered_attempt_sequence_number
+      ? {
+          deliveryAttemptId: row.delivered_attempt_id,
+          deliveryAttemptSequenceNumber: row.delivered_attempt_sequence_number,
+          deliveredAt: iso(row.delivered_at) as string,
+          verifiedAt: iso(row.physical_output_verified_at) as string,
+          verifiedBy: row.physical_output_verified_by,
+          reason: row.physical_output_reason,
+        }
+      : null,
     lastError: row.last_error,
     reprintOfJobGlobalId: row.reprint_of_job_global_id,
     reprintReason: row.reprint_reason,
@@ -1208,6 +1231,11 @@ const PRINT_JOB_SELECT = `
     job.available_at,
     job.claim_expires_at,
     job.delivered_at,
+    delivered_attempt.id::text AS delivered_attempt_id,
+    delivered_attempt.sequence_number AS delivered_attempt_sequence_number,
+    physical_output.verified_at AS physical_output_verified_at,
+    physical_output.verified_by AS physical_output_verified_by,
+    physical_output.reason AS physical_output_reason,
     job.last_error,
     prior.global_id AS reprint_of_job_global_id,
     job.reprint_reason,
@@ -1254,9 +1282,23 @@ const PRINT_JOB_SELECT = `
     ON prior.organization_id = job.organization_id
    AND prior.id = job.reprint_of_job_id
   LEFT JOIN LATERAL (
+    SELECT attempt.id, attempt.sequence_number
+    FROM operations_print_delivery_attempts attempt
+    WHERE attempt.organization_id = job.organization_id
+      AND attempt.print_job_id = job.id
+      AND attempt.state = 'delivered'
+    ORDER BY attempt.sequence_number DESC
+    LIMIT 1
+  ) delivered_attempt ON true
+  LEFT JOIN operations_print_physical_output_attestations physical_output
+    ON physical_output.organization_id = job.organization_id
+   AND physical_output.print_job_id = job.id
+   AND physical_output.delivery_attempt_id = delivered_attempt.id
+  LEFT JOIN LATERAL (
     SELECT COALESCE(
       jsonb_agg(
         jsonb_build_object(
+          'id', attempt.id::text,
           'attemptNumber', attempt.attempt_number,
           'sequenceNumber', attempt.sequence_number,
           'state', attempt.state,
@@ -1634,6 +1676,7 @@ export async function readOperationsPrintJobWorkspaceFromPostgres(input: {
       canManage: input.canManage,
       canExecute: input.canExecute,
       canReprint: input.canManage && input.canExecute,
+      canVerifyPhysicalOutput: input.canExecute,
     },
     jobs: result.rows.map(jobItem),
     generatedAt: new Date().toISOString(),
@@ -4518,6 +4561,7 @@ const LOCKED_PRINT_JOB_SELECT = `
     job.fallback_printer_id::text,
     fallback.global_id AS fallback_printer_global_id,
     job.status,
+    job.delivered_at,
     job.attempts,
     job.max_attempts,
     job.claimed_by_print_agent_id::text,
@@ -5814,6 +5858,216 @@ export async function acknowledgeOperationsPrintJobInPostgres(input: {
       },
     }, client)
     return oneJob(input.agent.organizationId, job.global_id, client)
+  })
+}
+
+async function assertPhysicalOutputVerifier(
+  client: PoolClient,
+  organizationId: string,
+  actorEmail: string,
+) {
+  const membership = await client.query<{
+    role: string
+    permissions: Record<string, unknown>
+    status: string
+  }>(
+    `SELECT role, permissions, status
+     FROM app_user_organization_memberships
+     WHERE user_email = $1
+       AND organization_id = $2::uuid
+     FOR SHARE`,
+    [actorEmail, organizationId],
+  )
+  const row = membership.rows[0]
+  if (
+    !row
+    || row.status !== 'active'
+    || (row.role !== 'owner' && row.permissions?.executeWarehouse !== true)
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERIFY_REQUIRED',
+      'Confirming physical output requires active warehouse execution access',
+      403,
+    )
+  }
+}
+
+export async function attestOperationsPrintJobPhysicalOutputInPostgres(input: {
+  organizationId: string
+  jobGlobalId: string
+  expectedDeliveryAttemptId: string
+  expectedDeliveryAttemptSequenceNumber: number
+  actorEmail: string
+  idempotencyKey: string
+  reason: string
+}) {
+  const organizationId = requiredOrganizationId(input.organizationId)
+  const actorEmail = requiredActor(input.actorEmail)
+  const callerKey = requiredIdempotencyKey(input.idempotencyKey)
+  const reason = requiredReason(input.reason, 'Physical-output confirmation reason')
+  const expectedDeliveryAttemptId = String(
+    input.expectedDeliveryAttemptId || '',
+  ).trim().toLowerCase()
+  const expectedDeliveryAttemptSequenceNumber = Number(
+    input.expectedDeliveryAttemptSequenceNumber,
+  )
+  if (
+    !UUID.test(expectedDeliveryAttemptId)
+    || !Number.isSafeInteger(expectedDeliveryAttemptSequenceNumber)
+    || expectedDeliveryAttemptSequenceNumber < 1
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERSION_INVALID',
+      'The delivered print-job version is invalid',
+    )
+  }
+  const idempotencyKey = `print-user:physical-output:${callerKey}`
+  const requestFingerprint = fingerprint({
+    action: 'attest-print-physical-output',
+    actorEmail,
+    jobGlobalId: input.jobGlobalId,
+    expectedDeliveryAttemptId,
+    expectedDeliveryAttemptSequenceNumber,
+    reason,
+  })
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-physical-output:idempotency:${organizationId}:${idempotencyKey}`,
+    )
+    await acquireTransactionAdvisoryLock(
+      client,
+      `operations:print-physical-output:${organizationId}:${input.jobGlobalId}`,
+    )
+    const job = await lockedJob(client, organizationId, input.jobGlobalId)
+    await assertPhysicalOutputVerifier(client, organizationId, actorEmail)
+
+    const replay = await client.query<{
+      print_job_id: string
+      request_fingerprint: string
+    }>(
+      `SELECT print_job_id::text, request_fingerprint
+       FROM operations_print_physical_output_attestations
+       WHERE organization_id = $1::uuid
+         AND idempotency_key = $2
+       FOR SHARE`,
+      [organizationId, idempotencyKey],
+    )
+    if (replay.rows[0]) {
+      if (
+        replay.rows[0].request_fingerprint !== requestFingerprint
+        || replay.rows[0].print_job_id !== job.id
+      ) {
+        throw new OperationsRequestError(
+          'OPERATIONS_PRINT_IDEMPOTENCY_REUSED',
+          'Idempotency-Key was already used for a different physical-output confirmation',
+          409,
+        )
+      }
+      return oneJob(organizationId, job.global_id, client)
+    }
+
+    const latestAttempt = await client.query<{
+      id: string
+      sequence_number: number
+      state: OperationsPrintAttemptListItem['state']
+      occurred_at: TimestampValue
+    }>(
+      `SELECT id::text, sequence_number, state, occurred_at
+       FROM operations_print_delivery_attempts
+       WHERE organization_id = $1::uuid
+         AND print_job_id = $2::uuid
+       ORDER BY sequence_number DESC
+       LIMIT 1
+       FOR SHARE`,
+      [organizationId, job.id],
+    )
+    const deliveredAttempt = latestAttempt.rows[0]
+    if (
+      job.status !== 'delivered'
+      || !job.delivered_at
+      || !deliveredAttempt
+      || deliveredAttempt.state !== 'delivered'
+      || deliveredAttempt.id !== expectedDeliveryAttemptId
+      || deliveredAttempt.sequence_number
+        !== expectedDeliveryAttemptSequenceNumber
+      || new Date(deliveredAttempt.occurred_at).getTime()
+        !== new Date(job.delivered_at).getTime()
+    ) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERSION_CHANGED',
+        'The exact delivered print-job version changed; refresh before confirming physical output',
+        409,
+      )
+    }
+
+    const existing = await client.query<{ id: string }>(
+      `SELECT id::text
+       FROM operations_print_physical_output_attestations
+       WHERE organization_id = $1::uuid
+         AND print_job_id = $2::uuid
+       FOR SHARE`,
+      [organizationId, job.id],
+    )
+    if (existing.rows[0]) {
+      throw new OperationsRequestError(
+        'OPERATIONS_PRINT_PHYSICAL_OUTPUT_ALREADY_VERIFIED',
+        'Physical output was already confirmed for this print job',
+        409,
+      )
+    }
+
+    const inserted = await client.query<{
+      id: string
+      verified_at: TimestampValue
+    }>(
+      `INSERT INTO operations_print_physical_output_attestations (
+         organization_id, print_job_id, delivery_attempt_id,
+         delivery_attempt_sequence_number, delivered_at,
+         verified_by, reason, idempotency_key, request_fingerprint
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid,
+         $4, $5::timestamptz,
+         $6, $7, $8, $9
+       )
+       RETURNING id::text, verified_at`,
+      [
+        organizationId,
+        job.id,
+        deliveredAttempt.id,
+        deliveredAttempt.sequence_number,
+        iso(deliveredAttempt.occurred_at),
+        actorEmail,
+        reason,
+        idempotencyKey,
+        requestFingerprint,
+      ],
+    )
+    const attestation = inserted.rows[0]
+    await recordAuditEvent({
+      actor: actorEmail,
+      eventType: 'operations.print_job.physical_output_verified',
+      aggregateType: 'operations.print_job',
+      aggregateId: job.global_id,
+      eventKey: `operations:print-job:physical-output:${attestation.id}`,
+      subject: job.global_id,
+      organizationId,
+      payload: {
+        printJobGlobalId: job.global_id,
+        deliveryAttemptId: deliveredAttempt.id,
+        deliveryAttemptSequenceNumber: deliveredAttempt.sequence_number,
+        deliveredAt: iso(deliveredAttempt.occurred_at),
+        verifiedAt: iso(attestation.verified_at),
+        verifiedBy: actorEmail,
+        reason,
+        verificationMethod: 'operator_visual_confirmation',
+        physicalOutputVerified: true,
+        sourceOrderGlobalId: job.source_order_global_id,
+        sourceShipmentGlobalId: job.source_shipment_global_id,
+        trackingNumber: job.tracking_number,
+      },
+    }, client)
+    return oneJob(organizationId, job.global_id, client)
   })
 }
 

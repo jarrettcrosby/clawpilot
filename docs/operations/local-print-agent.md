@@ -1,7 +1,7 @@
 ---
 id: cp-ops-local-print-agent
 title: Local Print Agent
-summary: Enrollment, claim leases, delivery acknowledgement, failure, fallback, retry, and reprint controls for warehouse printing.
+summary: Enrollment, claim leases, delivery acknowledgement, operator physical-output attestation, failure, fallback, retry, and reprint controls for warehouse printing.
 status: active
 kind: operations-guide
 area: distributed-operations
@@ -25,11 +25,13 @@ The durable model supports:
 - warehouse-scoped agent credentials stored only as SHA-256 verifiers;
 - leased claims with a fenced claim token;
 - append-only acknowledgement and failure attempts;
+- append-only operator confirmation of personally observed paper output, fenced
+  to the exact terminal delivery event;
 - bounded retries on the same job;
 - an explicit compatible fallback printer;
 - reason-gated, permission-checked reprints that create a new job from the same artifact.
 
-`delivered` or **Acknowledged** means the local agent handed the artifact to its configured device. It does not prove that paper exited the printer. Browser downloads and print dialogs never create durable delivery evidence.
+`delivered` or **Acknowledged** means the local agent handed the artifact to its configured device. It does not prove that paper exited the printer. Browser downloads and print dialogs never create durable delivery evidence. A separate **Paper verified** attestation is authoritative evidence that an authorized human personally observed output. The print agent has no command that can create this attestation.
 
 Authorized operators may download the exact immutable bytes from a print-job
 detail or a stored diagnostic label after its print artifact exists. The
@@ -424,6 +426,13 @@ The **Jobs** view shows current target, document type, media, format, attempts, 
 - **Cancel** is available for queued or claimed jobs and requires a reason. Cancelling fences later acknowledgement, but a device may already have accepted a claimed document.
 - **Reprint** is available only after an acknowledged durable delivery, requires both printer-management and warehouse-execution access, and requires a reason.
 - A reprint creates a new job with `reprint_of_job_id`, authorization actor, and immutable reason. It reuses the existing artifact and label reference.
+- **Confirm paper output** is available only for the current delivered event of a
+  job and requires warehouse-execution access. It stores the operator identity,
+  database verification time, exact delivery-attempt ID and sequence, and a
+  required observation reason. It is append-only and cannot be edited, deleted,
+  or repeated under another idempotency key.
+- Original jobs and reprint jobs are distinct physical deliveries. The order
+  workflow displays each one separately, and each requires its own confirmation.
 
 Ordinary label enqueue permits one original print job for each immutable
 carrier label. Repeating the same request with the same idempotency key returns
@@ -443,6 +452,13 @@ The signed-in operator APIs are:
 
 Queue commands accept an existing active carrier label or immutable packing-slip artifact metadata. They route only to a capability-compatible online local-agent profile.
 
+The signed-in `POST /api/operations/print-jobs` command
+`attest-physical-output` requires the print-job Global ID, the exact delivered
+attempt UUID, the exact attempt sequence number, a required reason, and a stable
+`Idempotency-Key`. The active organization and signed-in actor come only from
+the authenticated session. A stale delivery version, a mismatched replay, a
+different organization, an ineligible role, or a second attestation is rejected.
+
 Packing-slip enqueue may include the source order and shipment Global IDs. A
 shipment reference is validated against both its order and selected warehouse.
 The job projection and enqueue, claim, delivery, failure, cancellation,
@@ -457,6 +473,10 @@ putting document contents into audit payloads.
 - Agents are scoped to one organization and warehouse.
 - A claim is limited to printers explicitly bound to that agent.
 - Claim tokens fence every acknowledgement and failure.
+- Physical-output attestations are human-only, organization-scoped, permission
+  checked in both the API and database, and fenced to the latest delivered
+  attempt. The database supplies `verified_at` and retains the verifier identity
+  and reason even if membership later changes.
 - Artifact payloads and storage references are never written to audit events.
 - Artifact downloads require an authenticated operator with Operations view
   access in the artifact's organization. Cross-organization and malformed
@@ -481,4 +501,6 @@ The PostgreSQL tests use disposable databases and verify the full migration
 chain, immutable artifacts, warehouse scoping, capability constraints,
 ordinary-label uniqueness, order and shipment linkage, offline rerouting,
 revoked-agent failure, claim fencing, append-only attempts, acknowledgement
-projection, credential rotation, and audited reprints.
+projection, denied and stale physical-output attestations, idempotent concurrent
+replay, append-only attestation evidence for original and reprint jobs,
+credential rotation, and audited reprints.

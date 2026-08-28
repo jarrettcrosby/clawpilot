@@ -5,6 +5,7 @@ import {
 } from '@/lib/operations/authorization'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import {
+  attestOperationsPrintJobPhysicalOutputInPostgres,
   cancelOperationsPrintJobInPostgres,
   enqueueOperationsPrintJobInPostgres,
   readOperationsPrintJobWorkspaceFromPostgres,
@@ -49,6 +50,10 @@ const ACTION_FIELDS: Record<string, Set<string>> = {
   'retry-job': new Set(['action', 'jobGlobalId', 'reason']),
   'reprint-job': new Set(['action', 'jobGlobalId', 'reason']),
   'cancel-job': new Set(['action', 'jobGlobalId', 'reason']),
+  'attest-physical-output': new Set([
+    'action', 'jobGlobalId', 'expectedDeliveryAttemptId',
+    'expectedDeliveryAttemptSequenceNumber', 'reason',
+  ]),
 }
 
 function json(payload: Record<string, unknown>, status = 200) {
@@ -158,6 +163,14 @@ function jobGlobalId(value: unknown) {
   return id
 }
 
+function deliveryAttemptId(value: unknown) {
+  const id = text(value, 'Delivered attempt', 36).toLowerCase()
+  if (!UUID.test(id)) {
+    fail('OPERATIONS_PRINT_JOB_REQUEST_INVALID', 'Delivered attempt is invalid')
+  }
+  return id
+}
+
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
@@ -204,6 +217,36 @@ export async function POST(req: NextRequest) {
     const command = await body(req)
     const organizationId = activeOperationsOrganizationId(actor)
     const key = idempotencyKey(req)
+    if (command.action === 'attest-physical-output') {
+      if (!capabilities.canExecute) {
+        return json({
+          ok: false,
+          error: 'Confirming physical output requires warehouse execution access',
+          code: 'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERIFY_REQUIRED',
+        }, 403)
+      }
+      const job = await attestOperationsPrintJobPhysicalOutputInPostgres({
+        organizationId,
+        actorEmail: actor.email,
+        idempotencyKey: key,
+        jobGlobalId: jobGlobalId(command.value.jobGlobalId),
+        expectedDeliveryAttemptId: deliveryAttemptId(
+          command.value.expectedDeliveryAttemptId,
+        ),
+        expectedDeliveryAttemptSequenceNumber: positiveInteger(
+          command.value.expectedDeliveryAttemptSequenceNumber,
+          'Delivered attempt sequence',
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        reason: text(
+          command.value.reason,
+          'Physical-output confirmation reason',
+          500,
+        ),
+      })
+      return json({ ok: true, job })
+    }
     if (command.action === 'reprint-job') {
       if (!capabilities.canManage || !capabilities.canExecute) {
         return json({

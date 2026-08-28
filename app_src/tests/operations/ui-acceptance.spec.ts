@@ -379,18 +379,31 @@ async function installOrderLabelPrintRoutes(
   let labelPrintJobs: Array<{
     globalId: string
     sourceLabelGlobalId: string
+    sourceArtifactGlobalId: string
     status: 'queued' | 'delivered' | 'failed'
     reprintOfJobGlobalId: string | null
     createdAt: string
     deliveredAt: string | null
+    deliveredAttemptId: string | null
+    deliveredAttemptSequenceNumber: number | null
+    physicalOutputAttestation: {
+      deliveredAt: string
+      verifiedAt: string
+      verifiedBy: string
+      reason: string
+    } | null
     lastError: string | null
   }> = options.initialFailedJob ? [{
     globalId: 'gpj7654321',
     sourceLabelGlobalId: 'glb7654321',
+    sourceArtifactGlobalId: 'gpf7654321',
     status: 'failed',
     reprintOfJobGlobalId: null,
     createdAt: '2026-08-22T16:14:00.000Z',
     deliveredAt: null,
+    deliveredAttemptId: null,
+    deliveredAttemptSequenceNumber: null,
+    physicalOutputAttestation: null,
     lastError: 'PRINTER_UNAVAILABLE',
   }] : []
   const sourceLabelGlobalId = 'glb7654321'
@@ -477,10 +490,14 @@ async function installOrderLabelPrintRoutes(
         labelPrintJobs = [{
           globalId: originalPrintJobGlobalId,
           sourceLabelGlobalId,
+          sourceArtifactGlobalId: 'gpf7654321',
           status: 'delivered',
           reprintOfJobGlobalId: null,
           createdAt: '2026-08-22T16:14:00.000Z',
           deliveredAt: '2026-08-22T16:14:01.000Z',
+          deliveredAttemptId: '99fdcbe7-a2bf-489c-b82b-93499c171304',
+          deliveredAttemptSequenceNumber: 3,
+          physicalOutputAttestation: null,
           lastError: null,
         }]
         return route.fulfill({
@@ -497,14 +514,36 @@ async function installOrderLabelPrintRoutes(
           json: { ok: true, job: { globalId: originalPrintJobGlobalId } },
         })
       }
+      if (body.action === 'attest-physical-output') {
+        labelPrintJobs = labelPrintJobs.map((job) => (
+          job.globalId === body.jobGlobalId
+            ? {
+                ...job,
+                physicalOutputAttestation: {
+                  deliveredAt: job.deliveredAt!,
+                  verifiedAt: '2026-08-22T16:16:00.000Z',
+                  verifiedBy: 'owner@example.com',
+                  reason: String(body.reason),
+                },
+              }
+            : job
+        ))
+        return route.fulfill({
+          json: { ok: true, job: { globalId: body.jobGlobalId } },
+        })
+      }
       expect(body.action).toBe('reprint-job')
       labelPrintJobs = [{
         globalId: reprintJobGlobalId,
         sourceLabelGlobalId,
-        status: 'queued',
+        sourceArtifactGlobalId: 'gpf7654321',
+        status: 'delivered',
         reprintOfJobGlobalId: originalPrintJobGlobalId,
         createdAt: '2026-08-22T16:15:00.000Z',
-        deliveredAt: null,
+        deliveredAt: '2026-08-22T16:15:01.000Z',
+        deliveredAttemptId: 'dfe72f16-0605-43b8-9ea7-a573335f6a55',
+        deliveredAttemptSequenceNumber: 1,
+        physicalOutputAttestation: null,
         lastError: null,
       }, ...labelPrintJobs]
       return route.fulfill({
@@ -515,7 +554,12 @@ async function installOrderLabelPrintRoutes(
   await page.route((url) => url.pathname === '/api/operations', async (route) => {
     await route.fulfill({ json: { ok: true, operations: response() } })
   })
-  return { requests, sourceLabelGlobalId, originalPrintJobGlobalId }
+  return {
+    requests,
+    sourceLabelGlobalId,
+    originalPrintJobGlobalId,
+    reprintJobGlobalId,
+  }
 }
 
 const workbenchCandidateGlobalId = 'gcoc7654321'
@@ -2113,7 +2157,7 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
 })
 
-test('shipped order prints and reprints the stored label without purchasing postage', async ({ page }) => {
+test('shipped order independently confirms original and reprint paper output', async ({ page }) => {
   await page.setViewportSize({ width: 1366, height: 900 })
   const capture = await installOrderLabelPrintRoutes(page)
   await gotoApp(page, '/#operations')
@@ -2135,18 +2179,69 @@ test('shipped order prints and reprints the stored label without purchasing post
     idempotencyKey: `operations-shipping-label-print:${capture.sourceLabelGlobalId}`,
   })
 
+  const originalPrintJob = page.getByTestId(
+    `order-print-job-${capture.originalPrintJobGlobalId}`,
+  )
+  await expect(originalPrintJob.getByText('Original gpj7654321')).toBeVisible()
+  await expect(originalPrintJob.getByText('Paper not verified')).toBeVisible()
+  await originalPrintJob.getByRole('button', { name: 'Confirm paper output' }).click()
+  await expect(page.getByRole('heading', { name: 'Confirm physical paper output' })).toBeVisible()
+  await expect(page.getByText(
+    'Delivery event 3 · 99fdcbe7-a2bf-489c-b82b-93499c171304',
+  )).toBeVisible()
+  const originalReason = 'Observed one complete, legible 4 x 6 shipping label exit the printer'
+  await page.getByLabel('What physical output did you observe?').fill(originalReason)
+  await page.getByRole('button', { name: 'Confirm paper output' }).click()
+  await expect(page.getByText(
+    /Physical paper output was confirmed for print job gpj7654321/,
+  )).toBeVisible()
+  await expect(originalPrintJob.getByText('Paper verified')).toBeVisible()
+  expect(capture.requests[1].body).toEqual({
+    action: 'attest-physical-output',
+    jobGlobalId: capture.originalPrintJobGlobalId,
+    expectedDeliveryAttemptId: '99fdcbe7-a2bf-489c-b82b-93499c171304',
+    expectedDeliveryAttemptSequenceNumber: 3,
+    reason: originalReason,
+  })
+  expect(capture.requests[1].idempotencyKey)
+    .toMatch(/^operations-print-physical-output:gpj7654321:/)
+
   await page.getByRole('button', { name: 'Reprint label' }).click()
   await expect(page.getByRole('heading', { name: 'Reprint shipping label' })).toBeVisible()
   await expect(page.getByText(/does not call the carrier, buy postage/)).toBeVisible()
   await page.getByRole('button', { name: 'Queue reprint' }).click()
   await expect(page.getByText(/was queued for reprint as gpj7654322/)).toBeVisible()
-  expect(capture.requests[1].body).toEqual({
+  expect(capture.requests[2].body).toEqual({
     action: 'reprint-job',
     jobGlobalId: capture.originalPrintJobGlobalId,
     reason: 'Reprint shipping label for order #1004',
   })
-  expect(capture.requests[1].idempotencyKey)
+  expect(capture.requests[2].idempotencyKey)
     .toMatch(/^operations-shipping-label-reprint:gpj7654321:/)
+
+  const reprintJob = page.getByTestId(`order-print-job-${capture.reprintJobGlobalId}`)
+  await expect(reprintJob.getByText('Reprint gpj7654322')).toBeVisible()
+  await expect(reprintJob.getByText('Paper not verified')).toBeVisible()
+  await reprintJob.getByRole('button', { name: 'Confirm paper output' }).click()
+  await expect(page.getByText(
+    'Delivery event 1 · dfe72f16-0605-43b8-9ea7-a573335f6a55',
+  )).toBeVisible()
+  const reprintReason = 'Observed the replacement label exit the printer cleanly'
+  await page.getByLabel('What physical output did you observe?').fill(reprintReason)
+  await page.getByRole('button', { name: 'Confirm paper output' }).click()
+  await expect(page.getByText(
+    /Physical paper output was confirmed for print job gpj7654322/,
+  )).toBeVisible()
+  await expect(reprintJob.getByText('Paper verified')).toBeVisible()
+  expect(capture.requests[3].body).toEqual({
+    action: 'attest-physical-output',
+    jobGlobalId: capture.reprintJobGlobalId,
+    expectedDeliveryAttemptId: 'dfe72f16-0605-43b8-9ea7-a573335f6a55',
+    expectedDeliveryAttemptSequenceNumber: 1,
+    reason: reprintReason,
+  })
+  expect(capture.requests[3].idempotencyKey)
+    .toMatch(/^operations-print-physical-output:gpj7654322:/)
 })
 
 test('failed shipping-label print retries from the order without purchasing postage', async ({ page }) => {

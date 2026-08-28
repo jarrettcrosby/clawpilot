@@ -291,6 +291,43 @@ for (const fragment of [
   `Print-delivery migration missing ${fragment}`,
 )
 
+const physicalOutputMigration = read(
+  'db/migrations/0338_operations_print_physical_output_attestation.sql',
+)
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_print_physical_output_attestations',
+  'delivery_attempt_id uuid NOT NULL',
+  'delivery_attempt_sequence_number integer NOT NULL',
+  'verified_at timestamptz NOT NULL',
+  'verified_by text NOT NULL',
+  'reason text NOT NULL',
+  'operations_print_physical_output_one_per_job',
+  'operations_print_physical_output_idempotency_unique',
+  'validate_operations_print_physical_output_attestation',
+  "membership.permissions\n         @> '{\"executeWarehouse\":true}'::jsonb",
+  'physical output attestation delivery version is not current',
+  'protect_operations_print_physical_output_attestation_write',
+  'Local print agents never write this table',
+]) assert.ok(
+  physicalOutputMigration.includes(fragment),
+  `Physical-output migration missing ${fragment}`,
+)
+
+const physicalOutputHealth = read(
+  'app_src/lib/persistence/operationsPrintPhysicalOutputHealth.ts',
+)
+for (const fragment of [
+  '0338_operations_print_physical_output_attestation.sql',
+  'de6379a35f682bea29aaea4ede56d65ea66e209324c04150fd89e4c17ec31239',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',
+  'operations_print_physical_output_one_per_job',
+  'validate_operations_print_physical_output_attestation_write',
+  'protect_operations_print_physical_output_attestation_write',
+]) assert.ok(
+  physicalOutputHealth.includes(fragment),
+  `Physical-output persistence health missing ${fragment}`,
+)
+
 const persistence = read('app_src/lib/persistence/operationPrinting.ts')
 for (const fragment of [
   'readOperationsPrinterWorkspaceFromPostgres',
@@ -319,6 +356,7 @@ for (const fragment of [
   'retryOperationsPrintJobInPostgres',
   'cancelOperationsPrintJobInPostgres',
   'reprintOperationsPrintJobInPostgres',
+  'attestOperationsPrintJobPhysicalOutputInPostgres',
   'upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres',
   'LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES',
   'operations:print-attempt:',
@@ -328,6 +366,10 @@ for (const fragment of [
   'scheduleRetry',
   'reprint_of_job_id',
   "'operations.print_job.reprinted'",
+  "'operations.print_job.physical_output_verified'",
+  'expectedDeliveryAttemptSequenceNumber',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERSION_CHANGED',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_ALREADY_VERIFIED',
   'physicalOutputVerified: false',
   'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
   'A compatible printer is configured, but its local print agent has never connected',
@@ -357,12 +399,20 @@ for (const fragment of [
   'Idempotency-Key',
   'Cache-Control',
 ]) assert.ok(agentRoute.includes(fragment), `Local print-agent route missing ${fragment}`)
+assert.ok(
+  !agentRoute.includes('attest-physical-output'),
+  'The local print-agent protocol must never expose operator physical-output attestation',
+)
 
 const jobRoute = read('app_src/app/api/operations/print-jobs/route.ts')
 for (const fragment of [
   "command.action === 'retry-job'",
   "command.action === 'cancel-job'",
   "command.action === 'reprint-job'",
+  "command.action === 'attest-physical-output'",
+  'expectedDeliveryAttemptId',
+  'expectedDeliveryAttemptSequenceNumber',
+  'capabilities.canExecute',
   'canManage || !capabilities.canExecute',
   'Idempotency-Key',
 ]) assert.ok(jobRoute.includes(fragment), `Print-job route missing ${fragment}`)
@@ -402,6 +452,10 @@ for (const fragment of [
   'Cancel print job',
   'Retry print job',
   'does not prove physical output',
+  'Confirm paper output',
+  'operator attestation',
+  'canVerifyPhysicalOutput',
+  'physicalOutputAttestation',
   'Print job details',
   'Agent heartbeat',
   'Agent never connected',
@@ -467,6 +521,13 @@ for (const fragment of [
   'data-testid="order-shipping-labels"',
   "action: 'enqueue-label'",
   "action: 'reprint-job'",
+  "action: 'attest-physical-output'",
+  'order-label-print-history',
+  'Original',
+  'Reprint',
+  'Confirm physical paper output',
+  'expectedDeliveryAttemptId',
+  'expectedDeliveryAttemptSequenceNumber',
   'Reprint shipping label',
   'Reprints reuse this stored label document and never purchase new postage.',
   'the original carrier-label document was not imported into ClawPilot',
@@ -479,6 +540,8 @@ for (const fragment of [
   'labelPrintJobResult',
   'label.global_id AS source_label_global_id',
   'original.global_id AS reprint_of_job_global_id',
+  'operations_print_physical_output_attestations physical_output',
+  'physicalOutputAttestation: item.physical_output_verified_at',
   'labelPrintJobs: labelPrintJobResult.rows.map',
 ]) assert.ok(
   operationsPersistence.includes(fragment),

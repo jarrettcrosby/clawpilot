@@ -921,6 +921,14 @@ export type OperationsOrderDetail = OperationsOrderListItem & {
     reprintOfJobGlobalId: string | null
     createdAt: string
     deliveredAt: string | null
+    deliveredAttemptId: string | null
+    deliveredAttemptSequenceNumber: number | null
+    physicalOutputAttestation: {
+      deliveredAt: string
+      verifiedAt: string
+      verifiedBy: string
+      reason: string
+    } | null
     lastError: string | null
   }>
   commerceExports: Array<{

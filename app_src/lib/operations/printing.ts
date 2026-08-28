@@ -178,6 +178,7 @@ export type OperationsPrintAgentCredential = {
 }
 
 export type OperationsPrintAttemptListItem = {
+  id: string
   attemptNumber: number
   sequenceNumber: number
   state: PrintJobStatus
@@ -193,6 +194,15 @@ export type OperationsPrintAttemptListItem = {
   deliveryEvidence: string | null
   physicalOutputVerified: boolean
   occurredAt: string
+}
+
+export type OperationsPrintPhysicalOutputAttestation = {
+  deliveryAttemptId: string
+  deliveryAttemptSequenceNumber: number
+  deliveredAt: string
+  verifiedAt: string
+  verifiedBy: string
+  reason: string
 }
 
 export type OperationsPrintJobListItem = {
@@ -247,6 +257,9 @@ export type OperationsPrintJobListItem = {
   availableAt: string
   claimExpiresAt: string | null
   deliveredAt: string | null
+  deliveredAttemptId: string | null
+  deliveredAttemptSequenceNumber: number | null
+  physicalOutputAttestation: OperationsPrintPhysicalOutputAttestation | null
   lastError: string | null
   reprintOfJobGlobalId: string | null
   reprintReason: string | null
@@ -263,9 +276,26 @@ export type OperationsPrintJobWorkspace = {
     canManage: boolean
     canExecute: boolean
     canReprint: boolean
+    canVerifyPhysicalOutput: boolean
   }
   jobs: OperationsPrintJobListItem[]
   generatedAt: string
+}
+
+export function canAttestOperationsPrintJobPhysicalOutput(
+  job: Pick<
+    OperationsPrintJobListItem,
+    | 'status'
+    | 'deliveredAttemptId'
+    | 'deliveredAttemptSequenceNumber'
+    | 'physicalOutputAttestation'
+  >,
+) {
+  return job.status === 'delivered'
+    && Boolean(job.deliveredAttemptId)
+    && Number.isSafeInteger(job.deliveredAttemptSequenceNumber)
+    && Number(job.deliveredAttemptSequenceNumber) > 0
+    && job.physicalOutputAttestation === null
 }
 
 export type OperationsPrintAgentContext = {

@@ -161,7 +161,8 @@ These decisions are deliberately not hidden in schema defaults:
 - Inventory valuation method and financial ownership rules for operator-owned, consigned, shared, and borrowed inventory.
 - Append-only lifecycle representation for draft/published/retired contract versions and estimated/unbilled/billed/credited charge facts.
 - Invoice/AR authority, export cadence, dispute workflow, and accounting destination for billable events.
-- Local print-agent enrollment, certificate rotation, offline queue limits, and proof that a physical print completed.
+- Local print-agent certificate rotation, offline queue limits, and certified
+  device telemetry beyond the implemented human physical-output attestation.
 - Returns, inbound receiving, kitting, LTL/international, hazmat, and regulated inventory scope for the first production customer.
 - Recovery point objective, recovery time objective, and provider replay windows specific to operations data.
 

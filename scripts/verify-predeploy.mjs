@@ -76,6 +76,11 @@ const orderUnitWeightMigration = [
   '37620c5cdac39bbea692deadc8a152ee55ffc050117b53864a0455ae16a7a971',
 ]
 
+const printPhysicalOutputMigration = [
+  'db/migrations/0338_operations_print_physical_output_attestation.sql',
+  'de6379a35f682bea29aaea4ede56d65ea66e209324c04150fd89e4c17ec31239',
+]
+
 const shopifyCheckoutUnitMaterialMigration = [
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
   'e5a480092b91a3b84cbdde09ab5205590014e6169f55715a654cf8eff8632873',
@@ -220,6 +225,46 @@ for (const requiredFragment of [
 ]) {
   if (!healthRouteSource.includes(requiredFragment)) {
     fail(`health route is missing order unit-weight wiring: ${requiredFragment}`)
+  }
+}
+const [
+  printPhysicalOutputMigrationPath,
+  printPhysicalOutputMigrationChecksum,
+] = printPhysicalOutputMigration
+if (!existsSync(resolve(root, printPhysicalOutputMigrationPath))) {
+  fail(`missing print physical-output migration: ${printPhysicalOutputMigrationPath}`)
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(resolve(root, printPhysicalOutputMigrationPath)))
+    .digest('hex') !== printPhysicalOutputMigrationChecksum
+) {
+  fail('Print physical-output migration checksum drifted')
+}
+const printPhysicalOutputHealthPath =
+  'app_src/lib/persistence/operationsPrintPhysicalOutputHealth.ts'
+const printPhysicalOutputHealthSource = readFileSync(
+  resolve(root, printPhysicalOutputHealthPath),
+  'utf8',
+)
+for (const requiredFragment of [
+  printPhysicalOutputMigrationChecksum,
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',
+  'operations_print_physical_output_attestations',
+  'validate_operations_print_physical_output_attestation_write',
+  'protect_operations_print_physical_output_attestation_write',
+]) {
+  if (!printPhysicalOutputHealthSource.includes(requiredFragment)) {
+    fail(`print physical-output health is missing ${requiredFragment}`)
+  }
+}
+for (const requiredFragment of [
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',
+  'operations_print_physical_output_attestation_applied',
+  '${OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL}',
+]) {
+  if (!healthRouteSource.includes(requiredFragment)) {
+    fail(`health route is missing print physical-output wiring: ${requiredFragment}`)
   }
 }
 if (
