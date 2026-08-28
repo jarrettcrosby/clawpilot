@@ -70,17 +70,34 @@ npm run test:wearable-phase1
 npm run build:apple-picking-simulators
 npm run pilot:apple-wearable-readiness
 clients/apple/verify-development-archive.sh /absolute/path/to/ClawPilot-Dev.xcarchive
+clients/apple/verify-production-archive.sh /absolute/path/to/ClawPilot.xcarchive
 ```
 
-The simulator build pins `facebook/meta-wearables-dat-ios` exactly to 0.9.0 and
-compiles the iPhone and Watch targets unsigned, then asserts that the phone app
-contains the Watch companion. The readiness command prints only whether each
+From a clean checkout, the simulator build pins
+`facebook/meta-wearables-dat-ios` exactly to 0.9.0 and
+compiles all four development/production iPhone and Watch targets unsigned. It
+then inspects the built product plists for the exact environment, origin,
+bundle and companion identifiers, fixture provider callbacks, build number,
+and full source commit. The readiness command prints only whether each
 build-owned setting is present; it never prints configured values or
 credentials.
-The archive verifier is mandatory before every development TestFlight upload.
-It compares the signed Google and Meta configuration to the ignored local
-overlay without printing either value and rejects an archive whose build does
-not match the checked-out `project.yml`.
+
+Create a reviewable archive only from a clean checkout so its signed products
+carry the exact Git commit:
+
+```sh
+clients/apple/archive-apple-app.sh development /absolute/new/path/ClawPilot-Dev.xcarchive
+clients/apple/archive-apple-app.sh production /absolute/new/path/ClawPilot.xcarchive
+```
+
+The matching archive verifier compares the signed Google and Meta
+configuration to the ignored local overlay without printing either value. It
+also rejects an archive whose build, marketing version, source commit, app
+identity, environment, origin, phone/Watch relationship, signing team, or
+signature integrity does not match the clean checkout. A passing production
+archive check is configuration and signature-integrity evidence only; it does
+not claim that an Apple Distribution profile is available or that App Store
+Connect or TestFlight will accept the archive.
 
 The source-controlled project produces two fixed environments from the same
 source revision. `ClawPilotPickingPhoneDev` builds **ClawPilot Dev** with the

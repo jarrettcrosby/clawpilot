@@ -85,6 +85,180 @@ const loginPage = read('app_src/app/login/page.tsx')
 assert.ok(loginPage.includes("invitedFlow ? '/api/invitations/accept' : '/api/auth/magic/request'"))
 assert.ok(loginPage.includes("window.sessionStorage.removeItem(INVITATION_TOKEN_STORAGE_KEY)"))
 
+const magicRequestRoute = read('app_src/app/api/auth/magic/request/route.ts')
+for (const fragment of [
+  "export const dynamic = 'force-dynamic'",
+  "'Cache-Control': 'private, no-store, max-age=0'",
+  "code: 'AUTH_MAGIC_REQUEST_INVALID'",
+  "code: 'AUTH_MAGIC_EMAIL_INVALID'",
+  "code: 'AUTH_MAGIC_RATE_LIMITED'",
+  "code: 'AUTH_MAGIC_DELIVERY_UNAVAILABLE'",
+  "{ 'Retry-After': String(retryAfter) }",
+]) {
+  assert.ok(magicRequestRoute.includes(fragment), `magic-code request route missing ${fragment}`)
+}
+
+const magicVerifyRoute = read('app_src/app/api/auth/magic/verify/route.ts')
+for (const fragment of [
+  "export const dynamic = 'force-dynamic'",
+  "'Cache-Control': 'private, no-store, max-age=0'",
+  "code: 'AUTH_MAGIC_REQUEST_INVALID'",
+  "code: 'AUTH_MAGIC_CODE_INVALID'",
+  "code: 'AUTH_MAGIC_VERIFICATION_UNAVAILABLE'",
+]) {
+  assert.ok(magicVerifyRoute.includes(fragment), `magic-code verify route missing ${fragment}`)
+}
+
+const nativeAuthAdapter = read('clients/apple/Sources/ClawPilotPickingApple/AppleAdapters.swift')
+for (const fragment of [
+  'case serviceUnavailable(statusCode: Int, retryAfterSeconds: Int?)',
+  'request.setValue("application/json", forHTTPHeaderField: "Accept")',
+  'if [502, 503, 504].contains(http.statusCode), envelope == nil',
+  'ClawPilot is temporarily unavailable. Try again shortly.',
+]) {
+  assert.ok(nativeAuthAdapter.includes(fragment), `native auth adapter missing ${fragment}`)
+}
+const nativePhoneModel = read('clients/apple/Apps/iPhone/ClawPilotPickingPhoneApp.swift')
+assert.ok(nativePhoneModel.includes('error.isInvalidMagicCode'))
+assert.ok(nativePhoneModel.includes('That code is invalid or expired. Check the code or request a new one.'))
+assert.ok(nativePhoneModel.includes('Code verification failed: \\(error.localizedDescription)'))
+
+const nextServerMock = {
+  NextResponse: {
+    json(payload, init = {}) {
+      return Response.json(payload, init)
+    },
+  },
+}
+const requestRouteState = { result: { status: 'sent' }, error: null }
+const requestRouteModule = loadTypeScriptModule('app_src/app/api/auth/magic/request/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/authMagicCode': {
+    async requestAuthMagicCode() {
+      if (requestRouteState.error) throw requestRouteState.error
+      return requestRouteState.result
+    },
+  },
+  '@/lib/authAudit': { async recordAuthActivity() {} },
+})
+
+const verifyRouteState = { result: { status: 'invalid' }, error: null }
+const verifyRouteModule = loadTypeScriptModule('app_src/app/api/auth/magic/verify/route.ts', {
+  'next/server': nextServerMock,
+  '@/lib/authSessions': {
+    async createBrowserSession() { return { token: 'test-session' } },
+    setBrowserSessionCookie() {},
+  },
+  '@/lib/authAudit': { async recordAuthActivity() {} },
+  '@/lib/authMagicCode': {
+    async verifyAuthMagicCode() {
+      if (verifyRouteState.error) throw verifyRouteState.error
+      return verifyRouteState.result
+    },
+  },
+  '@/lib/pipelineProvisioning': { async queuePipelineProvisioning() {} },
+  '@/lib/persistence/crm': { async syncAppUserProfileToOwnedPipelines() {} },
+  '@/lib/tenancy': { async ensureDefaultResourcesForUser() { return { pipelineProvisioningRequired: false } } },
+  '@/lib/workspaceMemberships': {
+    async requireWorkspaceAppUser(email, organizationId) {
+      return { email, organizationId }
+    },
+  },
+})
+
+function authRequest(path, body, forwardedFor) {
+  return new Request(`https://auth-route.test${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-forwarded-for': forwardedFor,
+    },
+    body,
+  })
+}
+
+async function assertAuthResponse(response, expectedStatus, expectedCode) {
+  assert.equal(response.status, expectedStatus)
+  assert.equal(response.headers.get('cache-control'), 'private, no-store, max-age=0')
+  assert.equal(response.headers.get('pragma'), 'no-cache')
+  assert.equal(response.headers.get('expires'), '0')
+  assert.match(response.headers.get('vary') || '', /Cookie/i)
+  const payload = await response.json()
+  assert.equal(payload.code, expectedCode)
+  return payload
+}
+
+await assertAuthResponse(
+  await requestRouteModule.exports.POST(authRequest('/api/auth/magic/request', '{', 'request-malformed')),
+  400,
+  'AUTH_MAGIC_REQUEST_INVALID',
+)
+await assertAuthResponse(
+  await requestRouteModule.exports.POST(authRequest('/api/auth/magic/request', JSON.stringify({ email: 'invalid' }), 'request-invalid-email')),
+  400,
+  'AUTH_MAGIC_EMAIL_INVALID',
+)
+requestRouteState.result = { status: 'unavailable' }
+await assertAuthResponse(
+  await requestRouteModule.exports.POST(authRequest('/api/auth/magic/request', JSON.stringify({ email: 'picker@example.com' }), 'request-unavailable')),
+  503,
+  'AUTH_MAGIC_DELIVERY_UNAVAILABLE',
+)
+requestRouteState.result = { status: 'sent' }
+for (let attempt = 0; attempt < 5; attempt += 1) {
+  const response = await requestRouteModule.exports.POST(
+    authRequest('/api/auth/magic/request', JSON.stringify({ email: 'picker@example.com' }), 'request-rate-limit'),
+  )
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('cache-control'), 'private, no-store, max-age=0')
+}
+const limitedResponse = await requestRouteModule.exports.POST(
+  authRequest('/api/auth/magic/request', JSON.stringify({ email: 'picker@example.com' }), 'request-rate-limit'),
+)
+await assertAuthResponse(limitedResponse, 429, 'AUTH_MAGIC_RATE_LIMITED')
+assert.match(limitedResponse.headers.get('retry-after') || '', /^\d+$/)
+
+await assertAuthResponse(
+  await verifyRouteModule.exports.POST(authRequest('/api/auth/magic/verify', '{', 'verify-malformed')),
+  400,
+  'AUTH_MAGIC_REQUEST_INVALID',
+)
+await assertAuthResponse(
+  await verifyRouteModule.exports.POST(authRequest('/api/auth/magic/verify', JSON.stringify({ email: 'picker@example.com', code: '12' }), 'verify-invalid-input')),
+  401,
+  'AUTH_MAGIC_CODE_INVALID',
+)
+verifyRouteState.result = { status: 'invalid' }
+await assertAuthResponse(
+  await verifyRouteModule.exports.POST(authRequest('/api/auth/magic/verify', JSON.stringify({ email: 'picker@example.com', code: '123456' }), 'verify-invalid-code')),
+  401,
+  'AUTH_MAGIC_CODE_INVALID',
+)
+verifyRouteState.error = new Error('database unavailable')
+const originalConsoleError = console.error
+try {
+  console.error = () => {}
+  await assertAuthResponse(
+    await verifyRouteModule.exports.POST(authRequest('/api/auth/magic/verify', JSON.stringify({ email: 'picker@example.com', code: '123456' }), 'verify-unavailable')),
+    503,
+    'AUTH_MAGIC_VERIFICATION_UNAVAILABLE',
+  )
+} finally {
+  console.error = originalConsoleError
+}
+verifyRouteState.error = null
+verifyRouteState.result = {
+  status: 'verified',
+  email: 'picker@example.com',
+  organizationId: '10000000-0000-4000-8000-000000000001',
+}
+const verifiedResponse = await verifyRouteModule.exports.POST(
+  authRequest('/api/auth/magic/verify', JSON.stringify({ email: 'picker@example.com', code: '123456' }), 'verify-success'),
+)
+assert.equal(verifiedResponse.status, 200)
+assert.equal(verifiedResponse.headers.get('cache-control'), 'private, no-store, max-age=0')
+assert.deepEqual(await verifiedResponse.json(), { ok: true })
+
 const originalEnv = {
   APP_LOGIN_EMAIL: process.env.APP_LOGIN_EMAIL,
   APP_SESSION_SECRET: process.env.APP_SESSION_SECRET,

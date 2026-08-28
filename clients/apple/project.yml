@@ -15,8 +15,9 @@ configs:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    CURRENT_PROJECT_VERSION: "15"
+    CURRENT_PROJECT_VERSION: "16"
     MARKETING_VERSION: "0.1.0"
+    CLAWPILOT_SOURCE_COMMIT: UNSET
     CLAWPILOT_APPLE_DEVELOPMENT_TEAM: "CN2T77JHQQ"
     DEVELOPMENT_TEAM: $(CLAWPILOT_APPLE_DEVELOPMENT_TEAM)
 
@@ -63,6 +64,7 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         ClawPilotEnvironment: $(CLAWPILOT_ENVIRONMENT)
         ClawPilotServerOrigin: $(CLAWPILOT_SERVER_ORIGIN)
+        ClawPilotSourceCommit: $(CLAWPILOT_SOURCE_COMMIT)
         GIDClientID: $(CLAWPILOT_GOOGLE_IOS_CLIENT_ID)
         GIDServerClientID: $(CLAWPILOT_GOOGLE_SERVER_CLIENT_ID)
         CFBundleURLTypes:
@@ -140,6 +142,9 @@ targets:
         CFBundleDisplayName: $(CLAWPILOT_DISPLAY_NAME)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        ClawPilotEnvironment: $(CLAWPILOT_ENVIRONMENT)
+        ClawPilotServerOrigin: $(CLAWPILOT_SERVER_ORIGIN)
+        ClawPilotSourceCommit: $(CLAWPILOT_SOURCE_COMMIT)
         WKApplication: true
         WKCompanionAppBundleIdentifier: $(CLAWPILOT_PHONE_BUNDLE_IDENTIFIER)
     dependencies:
