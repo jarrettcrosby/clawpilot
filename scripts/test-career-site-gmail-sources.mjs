@@ -299,6 +299,17 @@ for (const subject of [
     `an explicit application role receipt remains eligible: ${subject}`,
   )
 }
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'updates@example.com',
+    subject: 'Director Operations application update',
+    snippet: 'Your application status has changed.',
+    bodyText: 'Review the latest status and next steps.',
+  }),
+  true,
+  'a role-first candidate-specific application status remains eligible',
+)
 for (const example of [
   {
     subject: 'Candidate application update for VP Operations',
@@ -491,6 +502,18 @@ for (const example of [
     subject: 'Director application update for the board seat',
     snippet: 'Review the nominee materials before voting.',
     bodyText: 'The annual meeting ballot is now available.',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director board application update',
+    snippet: 'Your application status changed for the board position.',
+    bodyText: 'The nomination committee will place the nominee on the annual meeting ballot.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'Director MBA application update',
+    snippet: 'Your application status changed in the admissions portal.',
+    bodyText: 'Review the degree program decision online.',
   },
 ]) {
   assert.equal(
