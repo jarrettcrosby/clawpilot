@@ -67,16 +67,16 @@ const APPLICATION_STATUS_PATTERN = /\b(?:your application|application (?:for|to|
 const JOB_ALERT_PATTERN = /\b(?:job alert|new jobs? (?:for|matching)|recommended jobs?|jobs? you may be interested in|new matches for you)\b/i
 const ROLE_PATTERN = /\b(?:job|role|position|opening|vacancy|career opportunity|leadership opportunity|employment opportunity)\b/i
 const EXECUTIVE_TITLE_PATTERN = /\b(?:vp|svp|evp|vice president|director|head of|chief (?:operating|technology|information|financial|supply chain|people|commercial) officer|coo|cto|cio|cfo|cpo)\b/i
-const EMPLOYMENT_CONTEXT_PATTERN = /\b(?:hiring|candidate|resume|résumé|compensation|salary|employment|career|job description|requisition)\b/i
+const EMPLOYMENT_CONTEXT_PATTERN = /\b(?:hiring|resume|résumé|compensation|salary|employment|career|job description|requisition)\b/i
 const HUMAN_OUTREACH_PATTERN = /\b(?:(?:came across|found|reviewed|saw|noticed) your (?:profile|background|experience)|your (?:profile|background|experience) (?:(?:caught|grabbed) my (?:eye|attention)|stood out|(?:aligns|matches|fits))|(?:strong|great|excellent|good|potential) fit|would you be open|open to (?:a |an )?(?:quick )?(?:call|chat|conversation|discussion|hearing|learning|exploring)|quick (?:call|chat|conversation)|connect (?:about|regarding|to discuss)|discuss (?:a|an|the|this) (?:job|role|position|opportunity))\b/i
 const INTERVIEW_SCHEDULING_PATTERN = /\b(?:schedule|scheduled|scheduling|availability|available times?|calendar|appointment|zoom|microsoft teams|google meet|reschedule)\b/i
 const MEDIA_INTERVIEW_PATTERN = /\b(?:podcast|show|episode|publication|article|webinar|guest appearance|on camera|livestream|live stream)\b/i
 const CONSUMER_PROMOTION_PATTERN = /\b(?:apr|auto loans?|car loans?|mortgage|refinanc(?:e|ing)|credit cards?|checking account|savings account|cash back|rewards points?|insurance quote|pre-?approved|limited[- ]time offer|coupon|percent off|\d{1,2}% off|shop now)\b/i
-const NON_EMPLOYMENT_APPLICATION_PATTERN = /\b(?:admissions?|college|university|mba|degree program|enrollment|student|mortgage|loan|credit|rental|lease|apartment|insurance|membership|grant application)\b/i
+const STRONG_NON_EMPLOYMENT_PATTERN = /\b(?:admissions? (?:application|portal|program|committee)|student (?:application|admissions?|portal|enrollment)|mba (?:application|program|admissions?|degree)|degree program|enrollment (?:application|status|portal)|membership (?:application|committee|nomination|vote|ballot)|grant application|volunteer board|board (?:nomination|position|seat|election)|director nomination|nomination committee|governance committee|nominee|annual[- ]meeting|ballot|proxy(?: ballot| vote| statement)?|(?:investor|shareholder) (?:meeting|vote|ballot|proposal|nomination|proxy))\b/i
+const AMBIGUOUS_NON_EMPLOYMENT_INDUSTRY_PATTERN = /\b(?:mortgage|loan|credit|rental|lease|apartment|insurance)\b/i
 const MARKETING_SUBJECT_PATTERN = /\b(?:sale|save \$|save \d|newsletter|weekly digest|exclusive offer|special offer|member offer|ends (?:today|soon)|new cars?|travel deals?)\b/i
 const MARKETING_SENDER_PATTERN = /(?:^|[.@_+-])(?:marketing|newsletter|offers?|promotions?|deals?)(?:[.@_+-]|$)/i
-const BOOKING_CTA_PATTERN = /\bbook now\b/i
-const CAREER_COACHING_SUBJECT_PATTERN = /\b(?:interview|career|job search|resume|résumé) (?:coach(?:ing)?|prep(?:aration)?)\b/i
+const BOOKING_CTA_PATTERN = /\b(?:book now|book (?:a|an|your) (?:call|consultation|session|appointment)|schedule (?:a|an|your) (?:call|consultation|session|appointment)|reserve (?:a|an|your) (?:consultation|session|appointment|spot)|(?:choose|select|pick) (?:a|an|your) (?:available )?(?:time|slot))\b/i
 const RECRUITING_SENDER_PATTERN = /^(?:recruiter|recruiting|talent|careers?|jobs?|people)(?:[.+_-][^@]+)?@/i
 const JOB_PLATFORM_DOMAINS = [
   'ashbyhq.com',
@@ -143,7 +143,7 @@ export function careerGmailMessageIsRelevant(
   )
   const employmentApplicationProvenance = (
     applicationStatus
-    && /\b(?:hiring manager|candidate|requisition|job application|employment application)\b/i.test(searchable)
+    && /\b(?:hiring manager|requisition|job application|employment application)\b/i.test(searchable)
   )
   const personalizedRoleOutreach = humanOutreach && roleEvidence
   const independentEmploymentProvenance = (
@@ -151,6 +151,14 @@ export function careerGmailMessageIsRelevant(
     || directRecruiting
     || jobPlatform
     || employmentApplicationProvenance
+  )
+  const unmistakableEmploymentProvenance = (
+    jobPlatform
+    || employmentApplicationProvenance
+    || (
+      directRecruiting
+      && /\b(?:job|employment|hiring|requisition|compensation|salary)\b/i.test(searchable)
+    )
   )
   const applicationRoleEvidence = explicitRole || executiveTitle
   const applicationCareerContext = (
@@ -170,6 +178,16 @@ export function careerGmailMessageIsRelevant(
     jobPlatform
     && (roleEvidence || applicationCareerContext || interview || jobAlert)
   )
+  const bulkMarketingEvidence = (
+    labels.has('CATEGORY_PROMOTIONS')
+    || labels.has('CATEGORY_SOCIAL')
+    || labels.has('CATEGORY_FORUMS')
+    || Boolean(String(input.listUnsubscribe || '').trim())
+    || Boolean(String(input.listId || '').trim())
+    || Boolean(String(input.feedbackId || '').trim())
+    || MARKETING_SENDER_PATTERN.test(input.senderEmail)
+    || /\b(?:bulk|list|junk)\b/i.test(input.precedence)
+  )
   if (
     !directRecruiting
     && !interview
@@ -181,11 +199,18 @@ export function careerGmailMessageIsRelevant(
   ) return false
 
   const nonEmploymentApplicationOrInterview = (
-    (applicationStatus || interview)
-    && NON_EMPLOYMENT_APPLICATION_PATTERN.test(searchable)
-    && !independentEmploymentProvenance
-    && !personalizedRoleOutreach
-    && !(applicationStatus && explicitRole && executiveTitle)
+    (
+      STRONG_NON_EMPLOYMENT_PATTERN.test(searchable)
+      && !unmistakableEmploymentProvenance
+    )
+    || (
+      (applicationStatus || interview)
+      && !independentEmploymentProvenance
+      && (
+        AMBIGUOUS_NON_EMPLOYMENT_INDUSTRY_PATTERN.test(searchable)
+        && !personalizedRoleOutreach
+      )
+    )
   )
   const mediaInterview = (
     interview
@@ -197,14 +222,7 @@ export function careerGmailMessageIsRelevant(
 
   const bookingPromotion = (
     BOOKING_CTA_PATTERN.test(searchable)
-    && (
-      CAREER_COACHING_SUBJECT_PATTERN.test(subject)
-      || MARKETING_SUBJECT_PATTERN.test(subject)
-      || MARKETING_SENDER_PATTERN.test(input.senderEmail)
-    )
-    && !directRecruiting
-    && !jobPlatform
-    && !personalizedRoleOutreach
+    && (bulkMarketingEvidence || MARKETING_SUBJECT_PATTERN.test(subject))
   )
   if (bookingPromotion) return false
 
@@ -221,14 +239,7 @@ export function careerGmailMessageIsRelevant(
   if (consumerPromotion && !explicitCareerSubject) return false
 
   const bulkMessage = (
-    labels.has('CATEGORY_PROMOTIONS')
-    || labels.has('CATEGORY_SOCIAL')
-    || labels.has('CATEGORY_FORUMS')
-    || Boolean(String(input.listUnsubscribe || '').trim())
-    || Boolean(String(input.listId || '').trim())
-    || Boolean(String(input.feedbackId || '').trim())
-    || MARKETING_SENDER_PATTERN.test(input.senderEmail)
-    || /\b(?:bulk|list|junk)\b/i.test(input.precedence)
+    bulkMarketingEvidence
     || /\bauto-(?:generated|replied)\b/i.test(input.autoSubmitted)
   )
   if (bulkMessage) {

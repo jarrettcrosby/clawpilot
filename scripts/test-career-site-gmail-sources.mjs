@@ -297,6 +297,28 @@ for (const subject of [
     `an explicit application role receipt remains eligible: ${subject}`,
   )
 }
+for (const example of [
+  {
+    subject: 'Candidate application update for VP Operations',
+    snippet: 'Your job application is with the hiring manager.',
+    bodyText: 'We will contact you with next steps for requisition 4812.',
+  },
+  {
+    subject: 'Candidate interview for Director of Operations',
+    snippet: 'Our talent acquisition team would like to schedule an interview.',
+    bodyText: 'Please share your availability to meet the hiring team.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'no-reply@manufacturer.com',
+      ...example,
+    }),
+    true,
+    `candidate language remains eligible with independent employment evidence: ${example.subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
@@ -311,17 +333,40 @@ assert.equal(
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
-    senderEmail: 'coach@interviewprep.com',
-    subject: 'Interview coaching opportunity',
-    snippet: 'Prepare for your next interview with a one-hour coaching session.',
+    senderEmail: 'coach@skills.example',
+    subject: 'Master your next interview',
+    snippet: 'Private coaching sessions can help you prepare.',
     bodyText: 'Schedule your session today. Book now.',
     labelIds: ['CATEGORY_PROMOTIONS'],
-    listUnsubscribe: '<https://interviewprep.com/unsubscribe>',
-    listId: 'coaching.interviewprep.com',
+    listUnsubscribe: '<https://skills.example/unsubscribe>',
+    listId: 'coaching.skills.example',
     precedence: 'bulk',
   }),
   false,
-  'a bulk interview-coaching Book now promotion is not a job interview',
+  'bulk delivery evidence prevents a booking promotion from being rescued as interview scheduling',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'marketing@skills.example',
+    subject: 'Ace your next interview',
+    snippet: 'Build confidence for the conversation.',
+    bodyText: 'One-on-one interview prep is available. Schedule your session today. Book now.',
+  }),
+  false,
+  'marketing sender evidence rejects a booking promotion when prep language appears only in the body',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'coach@skills.example',
+    subject: 'Master your next interview',
+    snippet: 'Private coaching sessions can help you prepare.',
+    bodyText: 'Choose an available time on my calendar.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+  }),
+  false,
+  'a bulk choose-an-available-time promotion cannot be rescued as interview scheduling',
 )
 for (const example of [
   {
@@ -346,6 +391,54 @@ for (const example of [
     `personalized employer outreach wins over an industry term: ${example.subject}`,
   )
 }
+for (const subject of [
+  'Director of Investor Relations position',
+  'Director of Membership position',
+  'Director of Admissions position',
+  'VP of University Operations role',
+  'Director of Student Affairs position',
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'jane@employer.example',
+      subject,
+      snippet: 'I came across your profile and think you would be a strong fit.',
+      bodyText: 'Would you be open to an interview?',
+    }),
+    true,
+    `a job-function noun does not override personalized role outreach: ${subject}`,
+  )
+}
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director position on our volunteer board',
+    snippet: 'I came across your profile and think you would be a strong fit for this membership role.',
+    bodyText: 'Would you be open to an interview?',
+  },
+  {
+    senderEmail: 'jane@university.edu',
+    subject: 'Interview for a Director MBA program',
+    snippet: 'I reviewed your background and think you are a strong fit for this degree program.',
+    bodyText: 'Would you be open to an admissions interview?',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director opportunity',
+    snippet: 'I reviewed your background.',
+    bodyText: 'Would you be open to joining our volunteer board?',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `personalized wording cannot override strong non-employment evidence: ${example.subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
@@ -357,6 +450,76 @@ assert.equal(
   false,
   'an executive title requires independent employment or outreach provenance',
 )
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Your application for the Director position',
+    snippet: 'The membership committee is reviewing your board nomination.',
+    bodyText: 'We will contact you after the association board meets.',
+  },
+  {
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Director application update',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Your application for a board position',
+    snippet: 'The nomination committee will review your materials.',
+    bodyText: 'Members will vote at the annual meeting.',
+  },
+  {
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Director application update for the board seat',
+    snippet: 'Review the nominee materials before voting.',
+    bodyText: 'The annual meeting ballot is now available.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `application wording cannot override non-employment executive-title evidence: ${example.subject}`,
+  )
+}
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Board candidate application update for Director',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'Candidate application update: Director MBA program',
+    snippet: 'The admissions committee reviewed your application.',
+    bodyText: 'Sign in to the degree program portal for next steps.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'MBA application update',
+    snippet: 'Your resume was received in the degree program admissions portal.',
+    bodyText: 'Review your status online.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'MBA application update',
+    snippet: 'Advance your career through our MBA program.',
+    bodyText: 'Your materials are available in the degree program admissions portal.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `candidate wording alone cannot override strong non-employment evidence: ${example.subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
