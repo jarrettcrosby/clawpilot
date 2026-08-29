@@ -13,7 +13,7 @@ import { matonFetch } from '@/lib/maton'
 import {
   beginCrmSyncRun,
   finishCrmSyncRun,
-  listCrmRecordsInPostgres,
+  readCrmWorkbookProjectionSnapshotInPostgres,
   readCrmWorkbookProjectionReadiness,
 } from '@/lib/persistence/crm'
 import {
@@ -142,6 +142,9 @@ export async function projectCrmWorkbook(input: {
   if (!readiness.ready) {
     throw new Error(`CRM workbook projection is waiting for reconciliation (${readiness.unresolved} unresolved records)`)
   }
+  const projection = await readCrmWorkbookProjectionSnapshotInPostgres({
+    pipelineId: input.context.pipelineId,
+  })
   const binding = await resolvePipelineSheetBindingInPostgres(input.context)
   const runtime = binding.legacyOwnerFallback
     ? null
@@ -158,23 +161,24 @@ export async function projectCrmWorkbook(input: {
   })
   try {
     const branding = await readPipelineWorkbookBranding(input.context.pipelineId)
+    const dataRowCounts = {
+      Organizations: projection.counts.organizations,
+      Contacts: projection.counts.contacts,
+      Opportunities: projection.counts.opportunities,
+      Interactions: projection.counts.interactions,
+    }
     if (runtime) {
-      await configurePipelineTabs(runtime, input.context.sheetId)
+      await configurePipelineTabs(runtime, input.context.sheetId, dataRowCounts)
       await applyPipelineWorkbookBranding(
         runtime,
         input.context.sheetId,
         branding,
       )
     } else {
-      await configureLegacyPipelineTabs(input.context.sheetId)
+      await configureLegacyPipelineTabs(input.context.sheetId, dataRowCounts)
       await applyLegacyPipelineWorkbookBranding(input.context.sheetId, branding)
     }
-    const [organizations, contacts, opportunities, interactions] = await Promise.all([
-      listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'organizations', limit: 1000 }) as Promise<CrmOrganization[]>,
-      listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'contacts', limit: 1000 }) as Promise<CrmContact[]>,
-      listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'opportunities', limit: 1000 }) as Promise<CrmOpportunity[]>,
-      listCrmRecordsInPostgres({ pipelineId: input.context.pipelineId, entity: 'interactions', limit: 1000 }) as Promise<CrmInteraction[]>,
-    ])
+    const { organizations, contacts, opportunities, interactions } = projection
     const contactNames = new Map(contacts.map((record) => [record.id, record.fullName]))
     const opportunityNames = new Map(opportunities.map((record) => [record.id, record.name]))
     const rows: Record<(typeof PROJECTED_TABS)[number], unknown[][]> = {
@@ -191,12 +195,7 @@ export async function projectCrmWorkbook(input: {
       'UPDATE pipeline_spaces SET crm_last_synced_at = now(), updated_at = now() WHERE id = $1::uuid AND sheet_id = $2',
       [input.context.pipelineId, input.context.sheetId],
     )
-    const counts = {
-      organizations: organizations.length,
-      contacts: contacts.length,
-      opportunities: opportunities.length,
-      interactions: interactions.length,
-    }
+    const counts = projection.counts
     await finishCrmSyncRun({ id: runId, status: 'succeeded', counts })
     return { ok: true as const, counts }
   } catch (error) {

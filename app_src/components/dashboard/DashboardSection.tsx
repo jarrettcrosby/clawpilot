@@ -28,6 +28,7 @@ import { deriveNowWorking } from '@/lib/nowWorking'
 import type { Task } from '@/lib/types'
 import { hourInUserTimeZone } from '@/lib/userDateTime'
 import { deriveNextActionGuidance, deriveStateTruth } from '@/lib/workItemModel'
+import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 import type {
   DashboardAvailability as Availability,
   DashboardDocMeta as DocMeta,
@@ -306,12 +307,6 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
   const taskLoading = loading || selectionPending === 'board'
   const pipelineLoading = loading || selectionPending === 'pipeline'
   const pipelineSummary = pipelineSnapshot?.summary
-  const currency = useMemo(() => new Intl.NumberFormat(undefined, {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  }), [])
-
   const metrics = [
     { label: 'In progress', value: inProgress.length, available: availability.tasks, loading: taskLoading, Icon: TrendingUpRounded, color: '#A8C7FA', action: () => navigateToProjects({ priority: [], status: ['in-progress'], labels: [] }) },
     { label: 'High priority', value: highPriority.length, available: availability.tasks, loading: taskLoading, Icon: PriorityHighRounded, color: '#FFA726', action: () => navigateToProjects({ priority: ['high'], status: [], labels: [] }) },
@@ -566,8 +561,10 @@ export default function DashboardSection({ onNavigate, onNavigateWithFilter, ini
           </Stack>
           <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 2, pt: 0.5 }}>
             {[
-              ['Opportunities', pipelineSummary?.opportunities ?? 0],
-              ['Open value', currency.format(pipelineSummary?.totalOpenValue ?? 0)],
+              ['Total opportunities', pipelineSummary?.opportunities ?? 0],
+              ['Active opportunities', pipelineSummary?.activeOpportunities ?? 0],
+              ['Active pipeline value', formatPipelineCurrency(pipelineSummary?.activePipelineValue ?? pipelineSummary?.totalOpenValue ?? 0)],
+              ['Weighted pipeline value', formatPipelineCurrency(pipelineSummary?.weightedPipelineValue ?? 0)],
               ['Organizations', pipelineSummary?.organizations ?? 0],
               ['Contacts', pipelineSummary?.contacts ?? 0],
             ].map(([label, value]) => (

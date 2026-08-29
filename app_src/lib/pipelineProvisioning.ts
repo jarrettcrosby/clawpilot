@@ -1690,10 +1690,16 @@ function dashboardLayoutRequests(sheetId: number) {
   return requests
 }
 
+export type PipelineWorkbookDataRowCounts = Partial<Record<
+  'Organizations' | 'Contacts' | 'Opportunities' | 'Interactions',
+  number
+>>
+
 export async function configurePipelineTabsWithRequest(
   request: SheetsJsonRequest,
   sheetId: string,
   protectionEditor?: string,
+  dataRowCounts: PipelineWorkbookDataRowCounts = {},
 ) {
   let metadata = await spreadsheetMetadata(request, sheetId)
   if (metadata.properties?.timeZone !== PIPELINE_WORKBOOK_TIME_ZONE) {
@@ -1779,7 +1785,14 @@ export async function configurePipelineTabsWithRequest(
     const title = sheet.properties?.title as (typeof EXPECTED_TABS)[number]
     if (id === undefined || !EXPECTED_TABS.includes(title)) return []
     const tableStartColumnIndex = title === 'Start Here' ? 2 : 1
-    const minimumRows = title === 'Dashboard' ? 44 : title === 'Start Here' ? 30 : title === 'Calculations' ? 40 : 1000
+    const projectedDataRows = Math.max(0, Math.trunc(dataRowCounts[title as keyof PipelineWorkbookDataRowCounts] || 0))
+    const minimumRows = title === 'Dashboard'
+      ? 44
+      : title === 'Start Here'
+        ? 30
+        : title === 'Calculations'
+          ? 40
+          : Math.max(1000, projectedDataRows + 4)
     const minimumColumns = title === 'Dashboard'
       ? DASHBOARD_HELPER_END_COLUMN_INDEX
       : tableStartColumnIndex + (title === 'Dropdowns' ? configuredDropdownRows[0].length : TAB_HEADERS[title].length)
@@ -2204,9 +2217,13 @@ export async function configurePipelineTabsWithRequest(
   }
 }
 
-export async function configurePipelineTabs(runtime: GoogleWorkspaceRuntime, sheetId: string) {
+export async function configurePipelineTabs(
+  runtime: GoogleWorkspaceRuntime,
+  sheetId: string,
+  dataRowCounts: PipelineWorkbookDataRowCounts = {},
+) {
   const request: SheetsJsonRequest = (pathname, input) => googleSheetsJson(runtime, pathname, input)
-  return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail)
+  return configurePipelineTabsWithRequest(request, sheetId, runtime.serviceAccountEmail, dataRowCounts)
 }
 
 export async function rebuildPipelineTabsWithRequest(

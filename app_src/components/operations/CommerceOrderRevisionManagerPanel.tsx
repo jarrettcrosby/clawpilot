@@ -17,6 +17,9 @@ import {
 import CancelRounded from '@mui/icons-material/CancelRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SyncAltRounded from '@mui/icons-material/SyncAltRounded'
+import {
+  commerceOrderRevisionRefreshNeedsNewIdempotencyKey,
+} from '@/lib/operations/commerceOrderRevisionRetry'
 
 type RevisionProvider = 'shopify' | 'faire'
 
@@ -55,6 +58,7 @@ type RevisionPayload = Readonly<{
   ok?: boolean
   error?: string
   code?: string
+  retryWithNewIdempotencyKey?: boolean
   revision?: CommerceOrderRevisionManagerFixture
   result?: {
     replayed?: boolean
@@ -356,6 +360,15 @@ export default function CommerceOrderRevisionManagerPanel({
       })
       const payload = await response.json().catch(() => ({})) as RevisionPayload
       if (!response.ok || !payload.ok || !payload.result) {
+        if (
+          nextAction === 'refresh-from-provider'
+          && commerceOrderRevisionRefreshNeedsNewIdempotencyKey(payload)
+        ) {
+          // The server confirmed that this receipt is terminal and explicitly
+          // requires a new Idempotency-Key. Keep the same key when transport or
+          // receipt finalization is ambiguous.
+          refreshIdempotencyAttempt.current = null
+        }
         throw new Error(`${payload.error || `${label} order action failed`}${payload.code ? ` [${payload.code}]` : ''}`)
       }
 

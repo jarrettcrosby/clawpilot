@@ -118,6 +118,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
   const [loadedRequestKey, setLoadedRequestKey] = useState('')
   const [loadingRequestKey, setLoadingRequestKey] = useState('')
   const [requestError, setRequestError] = useState<{ key: string; message: string } | null>(null)
+  const [retryRevision, setRetryRevision] = useState(0)
   const [dayRefreshRevision, setDayRefreshRevision] = useState('')
   const observedDayRef = useRef('')
 
@@ -136,6 +137,10 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
     || loadingRequestKey === requestKey
     || (!reportMatchesSelection && !customPeriodIncomplete && !reportError)
   )
+  const retryReport = () => {
+    setRequestError((current) => current?.key === requestKey ? null : current)
+    setRetryRevision((current) => current + 1)
+  }
 
   useEffect(() => {
     const timeZone = report?.period.timeZone
@@ -189,7 +194,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
       window.clearTimeout(loadingTimer)
       controller.abort()
     }
-  }, [customEnd, customPeriodIncomplete, customStart, dayRefreshRevision, enabled, preset, reportRevision, requestKey, syncRevision, syncState])
+  }, [customEnd, customPeriodIncomplete, customStart, dayRefreshRevision, enabled, preset, reportRevision, requestKey, retryRevision, syncRevision, syncState])
 
   return {
     preset,
@@ -206,6 +211,7 @@ export function usePipelineReport({ enabled, reportRevision, syncRevision, syncS
     customPeriodGuidance: customPeriodIncomplete ? 'Choose both dates to apply the custom reporting period.' : '',
     reportError,
     isReportPending,
+    retryReport,
   }
 }
 

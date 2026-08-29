@@ -829,7 +829,9 @@ function verifySourceContracts() {
   const route = read('app_src/app/api/operations/route.ts')
   for (const fragment of [
     'requireRequestUser',
+    'requestSession',
     'operationsCapabilities',
+    'canUsePhysicalOutputAttestationBrowserSession',
     'activeOperationsOrganizationId',
     'isPostgresStorageEnabled',
     'readOperationsWorkspaceFromPostgres',
@@ -870,6 +872,7 @@ function verifySourceContracts() {
     'expectedCurrentRevision',
     'COMMERCE_ACTIVE_AUTHORIZATION_REQUIRED',
     "action === 'update-activation'",
+    'canVerifyPhysicalOutput',
   ]) assert.ok(route.includes(fragment), `Operations route missing ${fragment}`)
   assert.ok(!/clientSecret|accessToken|privateKey/i.test(route), 'Operations route must not handle credentials')
 
@@ -1301,6 +1304,16 @@ async function verifyRouteBehavior() {
   const shadowTraining = loadTypeScriptModule(
     'app_src/lib/operations/shadowTraining.ts',
   )
+  const physicalOutputAttestationAuthorization = loadTypeScriptModule(
+    'app_src/lib/operations/physicalOutputAttestationAuthorization.ts',
+    {
+      mocks: {
+        '@/lib/users': {
+          effectiveAuthorizationRole: (actor) => actor.organizationRole || actor.role,
+        },
+      },
+    },
+  )
   const calls = {
     reads: [],
     proofs: [],
@@ -1340,6 +1353,9 @@ async function verifyRouteBehavior() {
           return actor.organizationId
         },
       },
+      '@/lib/operations/physicalOutputAttestationAuthorization': (
+        physicalOutputAttestationAuthorization
+      ),
       '@/lib/operations/types': {
         canRequestOperationsPickHandoff: (capabilities) => (
           capabilities.canView && capabilities.canExecute
@@ -1622,6 +1638,7 @@ async function verifyRouteBehavior() {
         },
       },
       '@/lib/requestUser': {
+        requestSession: async (request) => request.session,
         requireRequestUser: async (request) => request.actor,
       },
     },
@@ -1630,10 +1647,26 @@ async function verifyRouteBehavior() {
   const actor = {
     email: 'operator@example.com',
     organizationId: randomUUID(),
+    role: 'owner',
+    organizationRole: 'owner',
     capabilities: { canView: true, canManage: true, canExecute: true, canActivate: true },
+  }
+  const directSession = {
+    authenticatedUser: actor.email,
+    effectiveUser: actor.email,
+    activeWorkspaceOrganizationId: actor.organizationId,
+    activeWorkspaceRole: actor.organizationRole,
+    authMethod: 'magic_code',
+    impersonating: false,
+    impersonationStartedAt: null,
+    impersonationExpiresAt: null,
+    legacy: false,
   }
   const request = (url, options = {}) => ({
     actor: options.actor || actor,
+    session: Object.prototype.hasOwnProperty.call(options, 'session')
+      ? options.session
+      : directSession,
     nextUrl: new URL(url),
     headers: new Headers(options.headers || {}),
     text: async () => options.body || '',
@@ -1658,12 +1691,43 @@ async function verifyRouteBehavior() {
     organizationId: actor.organizationId,
     actorEmail: actor.email,
     capabilities: actor.capabilities,
+    canVerifyPhysicalOutput: true,
     canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
     exceptionStatus: 'open',
     selectedOrderGlobalId: 'gor1234567',
   })
+
+  const impersonatedRead = await route.GET(request(
+    'http://localhost/api/operations?order=gor1234567',
+    {
+      session: {
+        ...directSession,
+        authenticatedUser: 'support@example.com',
+        impersonating: true,
+        impersonationStartedAt: '2026-08-28T12:00:00.000Z',
+        impersonationExpiresAt: '2026-08-28T12:30:00.000Z',
+      },
+    },
+  ))
+  assert.equal(impersonatedRead.status, 200)
+  assert.equal(
+    calls.reads.at(-1).canVerifyPhysicalOutput,
+    false,
+    'Impersonated sessions must not receive physical-output attestation capability',
+  )
+
+  const legacyRead = await route.GET(request(
+    'http://localhost/api/operations?order=gor1234567',
+    { session: { ...directSession, legacy: true } },
+  ))
+  assert.equal(legacyRead.status, 200)
+  assert.equal(
+    calls.reads.at(-1).canVerifyPhysicalOutput,
+    false,
+    'Legacy sessions must not receive physical-output attestation capability',
+  )
 
   const requested = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
   const proof = {

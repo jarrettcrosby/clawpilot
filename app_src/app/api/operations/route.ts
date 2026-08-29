@@ -4,6 +4,9 @@ import {
   operationsCapabilities,
   shippingCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  canUsePhysicalOutputAttestationBrowserSession,
+} from '@/lib/operations/physicalOutputAttestationAuthorization'
 import type {
   Address,
   MockOperationsProofInput,
@@ -105,7 +108,7 @@ import type {
   WearablePickTaskCountEvidenceInput,
   WearablePickTaskScanEvidenceInput,
 } from '@/lib/operations/wearablePicking'
-import { requireRequestUser } from '@/lib/requestUser'
+import { requestSession, requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -1080,6 +1083,7 @@ export async function GET(req: NextRequest) {
     requirePostgres()
     const actor = await requireRequestUser(req)
     const capabilities = operationsCapabilities(actor)
+    const organizationId = activeOperationsOrganizationId(actor)
     if (!capabilities.canView) {
       return json({
         ok: false,
@@ -1104,9 +1108,15 @@ export async function GET(req: NextRequest) {
       requestError('OPERATIONS_SEARCH_INVALID', 'Order search is invalid')
     }
     const operations = await readOperationsWorkspaceFromPostgres({
-      organizationId: activeOperationsOrganizationId(actor),
+      organizationId,
       actorEmail: actor.email,
       capabilities,
+      canVerifyPhysicalOutput: capabilities.canExecute
+        && canUsePhysicalOutputAttestationBrowserSession({
+          session: await requestSession(req),
+          actor,
+          organizationId,
+        }),
       canPurchaseLivePostage:
         shippingCapabilities(actor).canPurchaseLivePostage,
       search,

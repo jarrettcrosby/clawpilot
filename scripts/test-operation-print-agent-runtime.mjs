@@ -1210,6 +1210,9 @@ async function verifyRuntime(connectionString) {
   const auditCalls = []
   try {
     const printing = loadTypeScript('app_src/lib/operations/printing.ts')
+    const physicalOutputHealth = loadTypeScript(
+      'app_src/lib/persistence/operationsPrintPhysicalOutputHealth.ts',
+    )
     const carrierManagedDelegation = loadTypeScript(
       'app_src/lib/integrations/carrierManagedDelegation.ts',
     )
@@ -2021,6 +2024,314 @@ async function verifyRuntime(connectionString) {
     )
     assert.equal(storedReference.rows[0].device_job_reference, deliveredReference)
 
+    assert.ok(delivered.deliveredAttemptId)
+    assert.ok(delivered.deliveredAttemptSequenceNumber > 0)
+    assert.equal(delivered.physicalOutputAttestation, null)
+    const verifierEmail = `print-output-verifier-${fixture.suffix}@example.com`
+    await pool.query(
+      `INSERT INTO app_users (email, role, status, display_name)
+       VALUES ($1, 'member', 'active', 'Print Output Verifier')`,
+      [verifierEmail],
+    )
+    await pool.query(
+      `INSERT INTO app_user_organization_memberships (
+         user_email, organization_id, role, permissions, status,
+         is_default, created_by, updated_by
+       ) VALUES (
+         $1, $2::uuid, 'member', '{"executeWarehouse":false}'::jsonb,
+         'active', false, $3, $3
+       )`,
+      [verifierEmail, fixture.organizationId, fixture.actorEmail],
+    )
+    const attestationInput = {
+      organizationId: fixture.organizationId,
+      jobGlobalId: queued.globalId,
+      expectedDeliveryAttemptId: delivered.deliveredAttemptId,
+      expectedDeliveryAttemptSequenceNumber:
+        delivered.deliveredAttemptSequenceNumber,
+      actorEmail: verifierEmail,
+      idempotencyKey: `physical-output-${fixture.suffix}`,
+      reason: [
+        'Observed one complete, legible packing slip exit the printer.',
+        '\tSecond line confirms the page was not torn or clipped.',
+      ].join('\n'),
+    }
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres(
+        attestationInput,
+      ),
+      /requires active warehouse execution access/,
+    )
+    await pool.query(
+      `UPDATE app_user_organization_memberships
+       SET permissions = permissions || '{"executeWarehouse":true}'::jsonb,
+           updated_by = $3,
+           updated_at = clock_timestamp()
+       WHERE user_email = $1
+         AND organization_id = $2::uuid`,
+      [verifierEmail, fixture.organizationId, fixture.actorEmail],
+    )
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
+        ...attestationInput,
+        expectedDeliveryAttemptSequenceNumber:
+          delivered.deliveredAttemptSequenceNumber + 1,
+        idempotencyKey: `physical-output-stale-${fixture.suffix}`,
+      }),
+      /exact delivered print-job version changed/,
+    )
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
+        ...attestationInput,
+        organizationId: randomUUID(),
+        idempotencyKey: `physical-output-cross-tenant-${fixture.suffix}`,
+      }),
+      /Print job was not found/,
+    )
+    const [attested, attestationReplay] = await Promise.all([
+      persistence.attestOperationsPrintJobPhysicalOutputInPostgres(
+        attestationInput,
+      ),
+      persistence.attestOperationsPrintJobPhysicalOutputInPostgres(
+        attestationInput,
+      ),
+    ])
+    assert.equal(attested.globalId, queued.globalId)
+    assert.equal(attestationReplay.globalId, queued.globalId)
+    assert.equal(
+      attested.physicalOutputAttestation.deliveryAttemptId,
+      delivered.deliveredAttemptId,
+    )
+    assert.equal(
+      attested.physicalOutputAttestation.deliveryAttemptSequenceNumber,
+      delivered.deliveredAttemptSequenceNumber,
+    )
+    assert.equal(attested.physicalOutputAttestation.deliveredAt, delivered.deliveredAt)
+    assert.equal(
+      attested.physicalOutputAttestation.verifiedAt,
+      attestationReplay.physicalOutputAttestation.verifiedAt,
+    )
+    assert.equal(attested.physicalOutputAttestation.verifiedBy, verifierEmail)
+    assert.equal(attested.physicalOutputAttestation.reason, attestationInput.reason)
+    const immutableAttestationDeliveredAt =
+      attested.physicalOutputAttestation.deliveredAt
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET delivered_at = delivered_at + interval '1 hour'
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [fixture.organizationId, queued.globalId],
+    )
+    const mutatedDeliveryWorkspace = await persistence
+      .readOperationsPrintJobWorkspaceFromPostgres({
+        organizationId: fixture.organizationId,
+        canView: true,
+        canManage: true,
+        canExecute: true,
+        canVerifyPhysicalOutput: true,
+      })
+    const mutatedDeliveryJob = mutatedDeliveryWorkspace.jobs.find(
+      (job) => job.globalId === queued.globalId,
+    )
+    assert.ok(mutatedDeliveryJob)
+    assert.notEqual(
+      mutatedDeliveryJob.deliveredAt,
+      immutableAttestationDeliveredAt,
+      'The mutable job delivery projection must differ in this regression fixture',
+    )
+    assert.equal(
+      mutatedDeliveryJob.physicalOutputAttestation?.deliveredAt,
+      immutableAttestationDeliveredAt,
+      'Print workspace attestation must use the immutable attestation timestamp',
+    )
+    const orderWorkflowDeliveryProjection = await insertReturning(
+      pool,
+      `SELECT job.delivered_at AS job_delivered_at,
+              physical_output.delivered_at
+                AS physical_output_delivered_at,
+              physical_output.verified_at,
+              physical_output.verified_by,
+              physical_output.reason
+       FROM operations_print_jobs job
+       JOIN operations_print_physical_output_attestations physical_output
+         ON physical_output.organization_id = job.organization_id
+        AND physical_output.print_job_id = job.id
+       WHERE job.organization_id = $1::uuid
+         AND job.global_id = $2`,
+      [fixture.organizationId, queued.globalId],
+    )
+    assert.notEqual(
+      new Date(orderWorkflowDeliveryProjection.job_delivered_at).toISOString(),
+      immutableAttestationDeliveredAt,
+    )
+    assert.equal(
+      new Date(
+        orderWorkflowDeliveryProjection.physical_output_delivered_at,
+      ).toISOString(),
+      immutableAttestationDeliveredAt,
+      'Order workflow projection must retain the immutable attestation timestamp',
+    )
+    assert.equal(orderWorkflowDeliveryProjection.verified_by, verifierEmail)
+    assert.equal(orderWorkflowDeliveryProjection.reason, attestationInput.reason)
+    await pool.query(
+      `UPDATE operations_print_jobs
+       SET delivered_at = $3::timestamptz
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [fixture.organizationId, queued.globalId, delivered.deliveredAt],
+    )
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
+        ...attestationInput,
+        reason: 'A different statement cannot reuse the same command key',
+      }),
+      /Idempotency-Key was already used/,
+    )
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
+        ...attestationInput,
+        idempotencyKey: `physical-output-duplicate-${fixture.suffix}`,
+      }),
+      /already confirmed/,
+    )
+    const physicalOutputEvidence = await insertReturning(
+      pool,
+      `SELECT
+         attestation.id::text,
+         attestation.verified_by,
+         attestation.reason,
+         attempt.physical_output_verified AS agent_asserted_physical_output
+       FROM operations_print_physical_output_attestations attestation
+       JOIN operations_print_delivery_attempts attempt
+         ON attempt.organization_id = attestation.organization_id
+        AND attempt.print_job_id = attestation.print_job_id
+        AND attempt.id = attestation.delivery_attempt_id
+       WHERE attestation.organization_id = $1::uuid
+         AND attestation.print_job_id = (
+           SELECT id FROM operations_print_jobs
+           WHERE organization_id = $1::uuid AND global_id = $2
+         )`,
+      [fixture.organizationId, queued.globalId],
+    )
+    assert.deepEqual(physicalOutputEvidence, {
+      id: physicalOutputEvidence.id,
+      verified_by: verifierEmail,
+      reason: attestationInput.reason,
+      agent_asserted_physical_output: false,
+    })
+    await expectRejected(
+      () => pool.query(
+        `UPDATE operations_print_physical_output_attestations
+         SET reason = 'must not change'
+         WHERE id = $1::uuid`,
+        [physicalOutputEvidence.id],
+      ),
+      /append-only/i,
+    )
+    await expectRejected(
+      () => pool.query(
+        `DELETE FROM operations_print_physical_output_attestations
+         WHERE id = $1::uuid`,
+        [physicalOutputEvidence.id],
+      ),
+      /append-only/i,
+    )
+    const attestationPersistenceHealth = await insertReturning(
+      pool,
+      `SELECT
+         (
+           ${physicalOutputHealth.OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL}
+         ) AS exact_health_ready,
+         EXISTS (
+           SELECT 1 FROM schema_migrations
+           WHERE filename =
+             '0338_operations_print_physical_output_attestation.sql'
+             AND checksum ~ '^[a-f0-9]{64}$'
+         ) AS migration_recorded,
+         to_regclass(
+           'public.operations_print_physical_output_attestations'
+         ) IS NOT NULL AS table_present,
+         EXISTS (
+           SELECT 1 FROM pg_trigger trigger
+           WHERE trigger.tgrelid = to_regclass(
+             'public.operations_print_physical_output_attestations'
+           )
+             AND trigger.tgname =
+               'validate_operations_print_physical_output_attestation_write'
+             AND trigger.tgenabled = 'O'
+             AND NOT trigger.tgisinternal
+         ) AS validation_guard_enabled,
+         EXISTS (
+           SELECT 1 FROM pg_trigger trigger
+           WHERE trigger.tgrelid = to_regclass(
+             'public.operations_print_physical_output_attestations'
+           )
+             AND trigger.tgname =
+               'protect_operations_print_physical_output_attestation_write'
+             AND trigger.tgenabled = 'O'
+             AND NOT trigger.tgisinternal
+         ) AS append_only_guard_enabled`,
+    )
+    assert.deepEqual(attestationPersistenceHealth, {
+      exact_health_ready: true,
+      migration_recorded: true,
+      table_present: true,
+      validation_guard_enabled: true,
+      append_only_guard_enabled: true,
+    })
+
+    const exactPhysicalOutputHealth = async () => {
+      const result = await insertReturning(
+        pool,
+        `SELECT (
+           ${physicalOutputHealth.OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL}
+         ) AS ready`,
+      )
+      return result.ready
+    }
+    const assertPhysicalOutputCatalogTamperDetected = async (tamper) => {
+      await pool.query('BEGIN')
+      try {
+        await tamper()
+        assert.equal(await exactPhysicalOutputHealth(), false)
+      } finally {
+        await pool.query('ROLLBACK')
+      }
+      assert.equal(await exactPhysicalOutputHealth(), true)
+    }
+    await assertPhysicalOutputCatalogTamperDetected(() => pool.query(
+      `CREATE OR REPLACE FUNCTION
+         validate_operations_print_physical_output_attestation()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $tamper$
+       BEGIN
+         RETURN NEW;
+       END;
+       $tamper$`,
+    ))
+    await assertPhysicalOutputCatalogTamperDetected(() => pool.query(
+      `CREATE OR REPLACE FUNCTION protect_operations_append_only()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $tamper$
+       BEGIN
+         RETURN OLD;
+       END;
+       $tamper$`,
+    ))
+    await assertPhysicalOutputCatalogTamperDetected(async () => {
+      await pool.query(
+        `ALTER TABLE operations_print_physical_output_attestations
+         DROP CONSTRAINT operations_print_physical_output_reason_valid`,
+      )
+      await pool.query(
+        `ALTER TABLE operations_print_physical_output_attestations
+         ADD CONSTRAINT operations_print_physical_output_reason_valid
+         CHECK (true)`,
+      )
+    })
+
     const reprint = await persistence.reprintOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
       jobGlobalId: queued.globalId,
@@ -2050,6 +2361,54 @@ async function verifyRuntime(connectionString) {
     ])
     assert.equal(cancelledReprint.status, 'cancelled')
     assert.equal(duplicateCancellation.status, 'cancelled')
+
+    const deliveredReprint = await persistence.reprintOperationsPrintJobInPostgres({
+      organizationId: fixture.organizationId,
+      jobGlobalId: queued.globalId,
+      actorEmail: fixture.actorEmail,
+      idempotencyKey: `delivered-reprint-${fixture.suffix}`,
+      reason: 'Create a second physical copy for the receiving desk',
+    })
+    const deliveredReprintClaim = await persistence.claimOperationsPrintJobsInPostgres({
+      agent: fallbackAgent,
+      idempotencyKey: `delivered-reprint-claim-${fixture.suffix}`,
+      limit: 1,
+      leaseSeconds: 120,
+      runtimeCapabilities: packingCapabilities,
+    })
+    assert.equal(deliveredReprintClaim[0].globalId, deliveredReprint.globalId)
+    const acknowledgedReprint = await persistence.acknowledgeOperationsPrintJobInPostgres({
+      agent: fallbackAgent,
+      jobGlobalId: deliveredReprint.globalId,
+      claimToken: deliveredReprintClaim[0].claimToken,
+      idempotencyKey: `delivered-reprint-ack-${fixture.suffix}`,
+    })
+    await expectRejected(
+      () => persistence.attestOperationsPrintJobPhysicalOutputInPostgres({
+        ...attestationInput,
+        jobGlobalId: deliveredReprint.globalId,
+        expectedDeliveryAttemptId: acknowledgedReprint.deliveredAttemptId,
+        expectedDeliveryAttemptSequenceNumber:
+          acknowledgedReprint.deliveredAttemptSequenceNumber,
+      }),
+      /Idempotency-Key was already used/,
+    )
+    const attestedReprint = await persistence
+      .attestOperationsPrintJobPhysicalOutputInPostgres({
+        organizationId: fixture.organizationId,
+        jobGlobalId: deliveredReprint.globalId,
+        expectedDeliveryAttemptId: acknowledgedReprint.deliveredAttemptId,
+        expectedDeliveryAttemptSequenceNumber:
+          acknowledgedReprint.deliveredAttemptSequenceNumber,
+        actorEmail: verifierEmail,
+        idempotencyKey: `delivered-reprint-output-${fixture.suffix}`,
+        reason: 'Observed the receiving-desk reprint exit on one complete sheet',
+      })
+    assert.equal(attestedReprint.reprintOfJobGlobalId, queued.globalId)
+    assert.equal(
+      attestedReprint.physicalOutputAttestation.deliveryAttemptId,
+      acknowledgedReprint.deliveredAttemptId,
+    )
 
     const uncertainSource = await persistence.reprintOperationsPrintJobInPostgres({
       organizationId: fixture.organizationId,
@@ -3257,6 +3616,16 @@ async function verifyRuntime(connectionString) {
       reprintAudit.payload.reason,
       'Original packing slip was damaged during carton close',
     )
+    const physicalOutputAudits = auditCalls.filter((event) => (
+      event.eventType === 'operations.print_job.physical_output_verified'
+    ))
+    assert.equal(physicalOutputAudits.length, 2)
+    assert.equal(physicalOutputAudits[0].actor, verifierEmail)
+    assert.equal(
+      physicalOutputAudits[0].payload.verificationMethod,
+      'operator_visual_confirmation',
+    )
+    assert.equal(physicalOutputAudits[0].payload.physicalOutputVerified, true)
     const rerouteAudit = auditCalls.find((event) => (
       event.eventType === 'operations.print_job.rerouted'
       && event.aggregateId === offlineJob.globalId

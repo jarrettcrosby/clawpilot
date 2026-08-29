@@ -69,6 +69,57 @@ private final class MagicCodeUnavailableURLProtocol: URLProtocol, @unchecked Sen
     override func stopLoading() {}
 }
 
+private final class GatewayUnavailableURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let acceptsJSON = request.value(forHTTPHeaderField: "Accept") == "application/json"
+        let requestedStatus = [502, 503, 504].first {
+            request.url?.host?.contains(String($0)) == true
+        } ?? 503
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: acceptsJSON ? requestedStatus : 400,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": "text/html; charset=utf-8",
+                "Retry-After": "17",
+            ]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data("<html><body>upstream unavailable</body></html>".utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class MagicCodeInvalidURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 401,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(
+            self,
+            didLoad: Data(#"{"ok":false,"code":"AUTH_MAGIC_CODE_INVALID","error":"The code is invalid or expired."}"#.utf8)
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class WorkspaceRejectedURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -422,6 +473,52 @@ func nativeMagicCodeRequestPreservesServiceError() async throws {
             code: "AUTH_FAILED",
             message: "Unable to send a sign-in code."
         ))
+    }
+}
+
+@Test("native authentication classifies a non-JSON gateway outage")
+func nativeAuthenticationClassifiesGatewayOutage() async throws {
+    for statusCode in [502, 503, 504] {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GatewayUnavailableURLProtocol.self]
+        let client = try PickingAPIClient(
+            origin: URL(string: "https://native-auth-gateway-\(statusCode).test")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        do {
+            try await client.requestMagicCode(email: "picker@example.com")
+            Issue.record("Expected gateway status \(statusCode) to be classified")
+        } catch let error as PickingAPIError {
+            #expect(error == .serviceUnavailable(
+                statusCode: statusCode,
+                retryAfterSeconds: 17
+            ))
+            #expect(error.localizedDescription
+                == "ClawPilot is temporarily unavailable. Try again in 17 seconds.")
+            #expect(!error.isInvalidMagicCode)
+        }
+    }
+}
+
+@Test("native authentication distinguishes an invalid code from an outage")
+func nativeAuthenticationClassifiesInvalidMagicCode() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [MagicCodeInvalidURLProtocol.self]
+    let client = try PickingAPIClient(
+        origin: URL(string: "https://native-auth-invalid-code.test")!,
+        session: URLSession(configuration: configuration)
+    )
+
+    do {
+        try await client.verifyMagicCode(email: "picker@example.com", code: "123456")
+        Issue.record("Expected the invalid magic code to be rejected")
+    } catch let error as PickingAPIError {
+        #expect(error == .rejected(
+            code: "AUTH_MAGIC_CODE_INVALID",
+            message: "The code is invalid or expired."
+        ))
+        #expect(error.isInvalidMagicCode)
     }
 }
 

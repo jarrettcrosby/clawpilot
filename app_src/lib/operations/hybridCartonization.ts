@@ -18,6 +18,17 @@ export type HybridCartonizationLine = {
   title: string
   quantity: number
   unitWeightGrams: number
+  /**
+   * Physical item facts are deliberately separate from Product-pack
+   * profiles. Ordinary units can therefore be measured for carton fit
+   * without assigning an approved case, multipack, or shipping package.
+   */
+  unitDimensionsMm?: {
+    length: number
+    width: number
+    height: number
+  } | null
+  unitDimensionsAuthority?: 'order_specific' | null
   profile: {
     versionGlobalId: string
     capturedRowVersion: number

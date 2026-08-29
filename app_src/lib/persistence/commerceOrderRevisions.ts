@@ -190,12 +190,19 @@ export type CommerceOrderRevisionApplicationResult = Readonly<{
 export class CommerceOrderRevisionDispositionError extends Error {
   readonly code: string
   readonly status: number
+  readonly retryWithNewIdempotencyKey: boolean
 
-  constructor(code: string, message: string, status = 409) {
+  constructor(
+    code: string,
+    message: string,
+    status = 409,
+    retryWithNewIdempotencyKey = false,
+  ) {
     super(message)
     this.name = 'CommerceOrderRevisionDispositionError'
     this.code = code
     this.status = status
+    this.retryWithNewIdempotencyKey = retryWithNewIdempotencyKey
   }
 }
 
@@ -671,6 +678,8 @@ export async function prepareManagerCommerceOrderRevisionRefreshInPostgres(
           ? String(receipt.error_code)
           : 'COMMERCE_ORDER_REVISION_REFRESH_PREVIOUSLY_FAILED',
         'This exact provider refresh previously failed. Retry with a new Idempotency-Key.',
+        409,
+        true,
       )
     }
     if (

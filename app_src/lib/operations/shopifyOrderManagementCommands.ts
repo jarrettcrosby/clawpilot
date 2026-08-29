@@ -12,6 +12,8 @@ import {
   shopifyOrderManagementProjectionHash,
   type ShopifyOrderManagementAction,
   type ShopifyOrderCancellationPaymentEvidence,
+  type ShopifyOrderCancellationReason,
+  type ShopifyOrderCancellationRefundMethod,
   type ShopifyOrderManagementPreview,
   type ShopifyOrderShippingAddress,
 } from '@/lib/integrations/shopifyOrderManagement'
@@ -43,6 +45,10 @@ function boundCancellationPaymentEvidence(
   authorization: ShopifyOrderManagementAuthorization,
   preview: ShopifyOrderManagementPreview,
 ): ShopifyOrderCancellationPaymentEvidence | null {
+  if (authorization.cancellationPaymentEvidence) {
+    return authorization.cancellationPaymentEvidence as
+      ShopifyOrderCancellationPaymentEvidence
+  }
   if (
     !preview.paymentEvidenceComplete
     || preview.transactionsCount === null
@@ -96,7 +102,13 @@ export type ShopifyOrderManagementMutation =
       kind: 'cancel_order_after_fulfillment_reversal'
       predecessorAuthorizationGlobalId: string
     }>
-  | Readonly<{ kind: 'cancel' }>
+  | Readonly<{
+      kind: 'cancel'
+      reasonCode: ShopifyOrderCancellationReason
+      refundMethod: ShopifyOrderCancellationRefundMethod
+      restock: boolean
+      notifyCustomer: boolean
+    }>
   | Readonly<{
       kind: 'set_line_quantity'
       lineItemId: string
@@ -132,8 +144,12 @@ function fail(code: string, message: string, status = 409): never {
   throw new ShopifyOrderManagementCommandError(code, message, status)
 }
 
-function staffNote(reason: string) {
-  return `ClawPilot authorized test action: ${reason}`.slice(0, 255)
+function cancellationStaffNote(reason: string) {
+  return `ClawPilot cancellation: ${reason}`.slice(0, 255)
+}
+
+function operatorStaffNote(reason: string) {
+  return `ClawPilot operator action: ${reason}`.slice(0, 255)
 }
 
 function providerAction(
@@ -156,14 +172,17 @@ function providerAction(
       predecessorAuthorizationGlobalId:
         mutation.predecessorAuthorizationGlobalId,
       reason: 'STAFF',
-      staffNote: staffNote(reason),
+      staffNote: cancellationStaffNote(reason),
     }
   }
   if (mutation.kind === 'cancel') {
     return {
       type: 'cancel',
-      reason: 'STAFF',
-      staffNote: staffNote(reason),
+      reason: mutation.reasonCode,
+      staffNote: cancellationStaffNote(reason),
+      refundMethod: mutation.refundMethod,
+      restock: mutation.restock,
+      notifyCustomer: mutation.notifyCustomer,
     }
   }
   if (mutation.kind === 'save_order') {
@@ -186,17 +205,33 @@ function providerAction(
     type: 'set_line_quantity',
     lineItemGid: mutation.lineItemId,
     quantity: mutation.quantity,
-    staffNote: staffNote(reason),
+    staffNote: operatorStaffNote(reason),
   }
 }
 
 function confirmationStatement(authorization: ShopifyOrderManagementAuthorization) {
-  return [
+  const statement = [
     'AUTHORIZE SHOPIFY WRITE',
     authorization.authorizationGlobalId,
     authorization.action.toUpperCase(),
     authorization.orderNumber,
-  ].join(' ')
+  ]
+  if (
+    authorization.action === 'cancel'
+    || authorization.action === 'cancel_order_after_fulfillment_reversal'
+  ) {
+    statement.push(
+      'REFUND',
+      authorization.cancelRefundMethod === 'original_payment_methods'
+        ? 'ORIGINAL_PAYMENT_METHODS'
+        : 'NONE',
+      'RESTOCK',
+      authorization.cancelRestock ? 'YES' : 'NO',
+      'NOTIFY',
+      authorization.cancelNotifyCustomer ? 'YES' : 'NO',
+    )
+  }
+  return statement.join(' ')
 }
 
 function exactCurrentSource(target: ShopifyOrderManagementTarget) {
@@ -212,8 +247,18 @@ function exactCurrentSource(target: ShopifyOrderManagementTarget) {
 }
 
 function targetReadBlocker(target: ShopifyOrderManagementTarget) {
-  if (target.accountEnvironment !== 'sandbox') {
-    return 'SHOPIFY_ORDER_MANAGEMENT_SANDBOX_ACCOUNT_REQUIRED'
+  if (!['sandbox', 'production'].includes(target.accountEnvironment)) {
+    return 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_ENVIRONMENT_INVALID'
+  }
+  const runtime = shopifyOrderManagementRuntime()
+  if (!runtime.available) {
+    return runtime.blockerCode || 'SHOPIFY_ORDER_MANAGEMENT_RUNTIME_UNAVAILABLE'
+  }
+  if (!shopifyOrderManagementAccountAllowed(
+    target.accountGlobalId,
+    target.accountEnvironment,
+  )) {
+    return 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED'
   }
   if (!target.credentialCurrent) {
     return 'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT'
@@ -313,6 +358,14 @@ function assertReconciliationTarget(
 }
 
 function assertProviderWritesEnabled(target: ShopifyOrderManagementTarget) {
+  const runtimeBlocker = targetReadBlocker(target)
+  if (runtimeBlocker) {
+    fail(
+      runtimeBlocker,
+      'Shopify order management is not enabled for this runtime and account',
+      503,
+    )
+  }
   if (providerWriteBlocker(target)) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_PROVIDER_WRITES_OFF',
@@ -322,9 +375,15 @@ function assertProviderWritesEnabled(target: ShopifyOrderManagementTarget) {
   }
 }
 
-function assertLegacyRollingWriteAuthorized(accountGlobalId: string) {
+function assertLegacyRollingWriteAuthorized(
+  accountGlobalId: string,
+  accountEnvironment: string,
+) {
   const runtime = shopifyOrderManagementRuntime()
-  if (!runtime.available || !shopifyOrderManagementAccountAllowed(accountGlobalId)) {
+  if (!runtime.available || !shopifyOrderManagementAccountAllowed(
+    accountGlobalId,
+    accountEnvironment,
+  )) {
     fail(
       runtime.blockerCode || 'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_ALLOWLISTED',
       'The rolling-deploy Shopify write lane is unavailable',
@@ -366,7 +425,8 @@ async function credentialFor(input: {
   if (
     !runtime
     || runtime.provider !== 'shopify'
-    || runtime.environment !== 'sandbox'
+    || runtime.environment !== input.target.accountEnvironment
+    || !['sandbox', 'production'].includes(runtime.environment)
     || runtime.status !== 'active'
     || runtime.verificationStatus !== 'verified'
     || runtime.credentialVersion !== input.target.credentialGeneration
@@ -375,7 +435,7 @@ async function credentialFor(input: {
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT',
-      'The exact Shopify sandbox credential is unavailable',
+      'The exact Shopify credential is unavailable',
     )
   }
   const decrypted = decryptCommerceCredential(
@@ -388,7 +448,7 @@ async function credentialFor(input: {
   if (decrypted.provider !== 'shopify') {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_CREDENTIAL_NOT_CURRENT',
-      'The exact Shopify sandbox credential is unavailable',
+      'The exact Shopify credential is unavailable',
     )
   }
   return {
@@ -421,6 +481,7 @@ function placeholderPreview(target: ShopifyOrderManagementTarget): ShopifyOrderM
     currentTotalPrice: { amount: '0.00', currencyCode: 'XXX' },
     totalOutstanding: { amount: '0.00', currencyCode: 'XXX' },
     totalReceived: { amount: '0.00', currencyCode: 'XXX' },
+    totalRefunded: { amount: '0.00', currencyCode: 'XXX' },
     totalCapturable: { amount: '0.00', currencyCode: 'XXX' },
     transactionsCount: null,
     paymentEvidenceComplete: false,
@@ -505,13 +566,18 @@ function publicState(input: {
     input.grantedScopes,
     'write_merchant_managed_fulfillment_orders',
   )
-  const addTagReason = writeReason || (!writeOrders
+  const productionCancellationOnlyReason =
+    input.target.accountEnvironment === 'production'
+      ? 'Only order cancellation is enabled for this production Shopify account'
+      : null
+  const addTagReason = writeReason || productionCancellationOnlyReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
-  const ordinarySaveReason = writeReason || (!writeOrders
+  const ordinarySaveReason = writeReason || productionCancellationOnlyReason || (!writeOrders
     ? 'The Shopify connection is missing write_orders'
     : null)
   const fulfillmentBaseReason = baseReason
+    || productionCancellationOnlyReason
     || fulfillmentReversalTargetBlocker(input.target)
     || (!readOrders
       ? 'The Shopify connection is missing read_orders'
@@ -537,10 +603,25 @@ function publicState(input: {
         fulfillment.id === input.target.reversibleExternalFulfillmentGid
       ))
     : undefined
-  const cancellationPayment = shopifyOrderCancellationPaymentEligibility(
+  const cancellationWithoutRefund = shopifyOrderCancellationPaymentEligibility(
     input.preview,
+    'none',
   )
+  const cancellationWithRefund = shopifyOrderCancellationPaymentEligibility(
+    input.preview,
+    'original_payment_methods',
+  )
+  const cancellationPaymentReason = cancellationWithoutRefund.allowed
+    || cancellationWithRefund.allowed
+    ? null
+    : cancellationWithoutRefund.reason === cancellationWithRefund.reason
+      ? cancellationWithoutRefund.reason
+      : [
+          cancellationWithoutRefund.reason,
+          cancellationWithRefund.reason,
+        ].filter(Boolean).join('; ')
   const postReversalCancellationReason = baseReason
+    || productionCancellationOnlyReason
     || postReversalOrderCancellationTargetBlocker(input.target)
     || (!writeOrders
       ? 'The Shopify connection is missing write_orders'
@@ -555,7 +636,7 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || cancellationPayment.reason
+    || cancellationWithoutRefund.reason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
@@ -571,21 +652,19 @@ function publicState(input: {
       ? 'The Shopify order is already cancelled'
       : null)
     || (input.preview.closed ? 'The Shopify order is closed' : null)
-    || cancellationPayment.reason
+    || cancellationPaymentReason
     || (input.preview.returnStatus !== 'NO_RETURN'
       ? 'The Shopify order has return activity'
       : null)
     || (!whollyUnfulfilled(input.preview)
       ? 'This order has fulfillment activity. Cancel or return that fulfillment before cancelling the order'
       : null)
-    || (!input.preview.test
-      ? 'Cancellation is limited to Shopify test orders'
-      : null)
     || (!destructiveCurrent
       ? 'Refresh and accept the current provider revision before changing order state'
       : null)
     || targetReason
   const lineBaseReason = writeReason
+    || productionCancellationOnlyReason
     || (!writeOrderEdits
       ? 'The Shopify connection is missing write_order_edits'
       : null)
@@ -617,6 +696,15 @@ function publicState(input: {
     blockerCode: baseReason,
     accountLabel: input.target.accountDisplayName,
     shopDomain: input.target.shopDomain || 'unavailable.myshopify.com',
+    payment: Object.freeze({
+      totalReceived: Object.freeze({ ...input.preview.totalReceived }),
+      totalRefunded: Object.freeze({ ...input.preview.totalRefunded }),
+      totalCapturable: Object.freeze({ ...input.preview.totalCapturable }),
+      refundOptions: Object.freeze({
+        none: cancellationWithoutRefund,
+        original_payment_methods: cancellationWithRefund,
+      }),
+    }),
     order: Object.freeze({
       globalId: input.target.orderGlobalId,
       externalOrderId: input.target.externalOrderId,
@@ -674,13 +762,16 @@ function publicState(input: {
         allowed: cancellationReason === null,
         reason: cancellationReason,
         releasesAuthorization: cancellationReason === null
-          && cancellationPayment.releasesAuthorization,
+          && (
+            cancellationWithoutRefund.releasesAuthorization
+            || cancellationWithRefund.releasesAuthorization
+          ),
       }),
       cancelAfterFulfillmentReversal: Object.freeze({
         allowed: postReversalCancellationReason === null,
         reason: postReversalCancellationReason,
         releasesAuthorization: postReversalCancellationReason === null
-          && cancellationPayment.releasesAuthorization,
+          && cancellationWithoutRefund.releasesAuthorization,
         predecessorAuthorizationGlobalId:
           input.target.postReversalOrderCancellationPredecessorGlobalId,
       }),
@@ -739,6 +830,19 @@ function publicState(input: {
     }),
     openAttempt: unresolved,
   })
+}
+
+function assertProductionCancellationOnly(
+  target: ShopifyOrderManagementTarget,
+  mutationKind: ShopifyOrderManagementMutation['kind'],
+) {
+  if (target.accountEnvironment === 'production' && mutationKind !== 'cancel') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_PRODUCTION_CANCEL_ONLY',
+      'Only order cancellation is enabled for this production Shopify account',
+      403,
+    )
+  }
 }
 
 async function inspect(input: {
@@ -825,6 +929,16 @@ function assertPreparedMutation(input: {
       fail(
         'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
         input.management.eligibility.cancel.reason || 'Shopify cancellation is unavailable',
+      )
+    }
+    const payment = shopifyOrderCancellationPaymentEligibility(
+      input.preview,
+      input.mutation.refundMethod,
+    )
+    if (!payment.allowed) {
+      fail(
+        'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
+        payment.reason || 'Shopify payment state cannot be cancelled with these choices',
       )
     }
     return
@@ -931,6 +1045,7 @@ export async function prepareShopifyOrderManagementCommand(input: {
       'The ClawPilot order changed before this action was prepared',
     )
   }
+  assertProductionCancellationOnly(target, input.mutation.kind)
   assertProviderWritesEnabled(target)
   const action = providerAction(input.mutation, input.reason)
   const live = await inspect({
@@ -973,7 +1088,10 @@ export async function prepareShopifyOrderManagementCommand(input: {
   const cancellation = action.type === 'cancel'
     || action.type === 'cancel_order_after_fulfillment_reversal'
   const cancellationPaymentEvidence = cancellation
-    ? shopifyOrderCancellationPaymentEvidence(live.inspected.preview)
+    ? shopifyOrderCancellationPaymentEvidence(
+        live.inspected.preview,
+        action.refundMethod || 'none',
+      )
     : undefined
   if (cancellation && !cancellationPaymentEvidence) {
     fail(
@@ -1033,7 +1151,12 @@ function automaticSaveReason(mutation: ShopifyOrderManagementMutation) {
   if (mutation.kind === 'cancel_order_after_fulfillment_reversal') {
     return 'Cancelled Shopify order after fulfillment reversal in ClawPilot'
   }
-  if (mutation.kind === 'cancel') return 'Saved Shopify order cancellation in ClawPilot'
+  if (mutation.kind === 'cancel') {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_CONFIRMATION_REQUIRED',
+      'Prepare and confirm the Shopify cancellation before sending it',
+    )
+  }
   if (mutation.kind === 'save_order') return 'Saved Shopify order changes in ClawPilot'
   return 'Saved Shopify order line quantity in ClawPilot'
 }
@@ -1076,6 +1199,10 @@ function actionMatchesMutation(
   }
   if (action.type === 'cancel') {
     return authorization.cancelReason === action.reason
+      && authorization.cancelRefundMethod === (action.refundMethod || 'none')
+      && authorization.cancelRestock === (action.restock ?? false)
+      && authorization.cancelNotifyCustomer
+        === (action.notifyCustomer ?? false)
       && authorization.staffNoteHash === shopifyOrderManagementEvidenceHash({
         schema: 'shopify-order-management-staff-note-v1',
         staffNote: action.staffNote,
@@ -1090,6 +1217,10 @@ function actionMatchesMutation(
     return authorization.predecessorAuthorizationGlobalId
         === action.predecessorAuthorizationGlobalId
       && authorization.cancelReason === action.reason
+      && authorization.cancelRefundMethod === (action.refundMethod || 'none')
+      && authorization.cancelRestock === (action.restock ?? false)
+      && authorization.cancelNotifyCustomer
+        === (action.notifyCustomer ?? false)
       && authorization.staffNoteHash === shopifyOrderManagementEvidenceHash({
         schema: 'shopify-order-management-staff-note-v1',
         staffNote: action.staffNote,
@@ -1223,13 +1354,17 @@ export async function executeShopifyOrderManagementCommand(input: {
     organizationId: input.organizationId,
     orderGlobalId: authorization.orderGlobalId,
   })
+  assertProductionCancellationOnly(target, input.mutation.kind)
   const legacyRollingAuthorization =
     authorization.providerWriteControlRowVersion === null
     && authorization.providerWriteScopeDigest === null
     && authorization.legacyActivationState !== null
     && authorization.legacyActivationRevision !== null
   if (legacyRollingAuthorization) {
-    assertLegacyRollingWriteAuthorized(authorization.accountGlobalId)
+    assertLegacyRollingWriteAuthorized(
+      authorization.accountGlobalId,
+      authorization.accountEnvironment,
+    )
   } else {
     assertProviderWritesEnabled(target)
   }

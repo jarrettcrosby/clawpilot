@@ -27,6 +27,12 @@ export type OrderUnitWeightLine = {
   quantity: number
   unitWeightGrams: number | null
   weightSource: 'provider_order' | 'provider_catalog' | 'order_specific' | null
+  unitDimensionsMm: {
+    length: number
+    width: number
+    height: number
+  } | null
+  dimensionSource: 'order_specific' | null
   factGlobalId: string | null
   factVersion: number | null
 }
@@ -37,6 +43,7 @@ export type OrderUnitWeightWorkspace = {
   candidateRowVersion: number
   orderGlobalId: string
   missingLines: OrderUnitWeightLine[]
+  dimensionMissingLines: OrderUnitWeightLine[]
   effectiveLines: OrderUnitWeightLine[]
 }
 
@@ -72,6 +79,9 @@ type PlanningLineRow = QueryResultRow & {
   fact_id: string | null
   fact_version: number | null
   fact_weight_grams: number | null
+  fact_length_mm: number | null
+  fact_width_mm: number | null
+  fact_height_mm: number | null
   fact_hash: string | null
   fact_request_hash: string | null
 }
@@ -120,6 +130,48 @@ function exactPositiveInteger(value: unknown, label: string) {
     )
   }
   return value
+}
+
+function exactDimensions(value: unknown, label: string) {
+  if (value === null) return null
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(
+      'OPERATIONS_ORDER_UNIT_DIMENSIONS_INVALID',
+      `${label} must include positive whole-number millimeters`,
+      422,
+    )
+  }
+  const record = value as Record<string, unknown>
+  if (
+    Object.keys(record).sort().join(',') !== 'height,length,width'
+  ) {
+    fail(
+      'OPERATIONS_ORDER_UNIT_DIMENSIONS_INVALID',
+      `${label} includes missing or unsupported fields`,
+      422,
+    )
+  }
+  const axis = (name: 'length' | 'width' | 'height') => {
+    const millimeters = record[name]
+    if (
+      typeof millimeters !== 'number'
+      || !Number.isSafeInteger(millimeters)
+      || millimeters < 1
+      || millimeters > 1_000_000
+    ) {
+      fail(
+        'OPERATIONS_ORDER_UNIT_DIMENSIONS_INVALID',
+        `${label} ${name} must be positive whole-number millimeters`,
+        422,
+      )
+    }
+    return millimeters
+  }
+  return {
+    length: axis('length'),
+    width: axis('width'),
+    height: axis('height'),
+  }
 }
 
 async function readCandidate(
@@ -221,6 +273,9 @@ async function readPlanningLines(
                  fact.id::text AS fact_id,
                  fact.fact_version,
                  fact.unit_weight_grams AS fact_weight_grams,
+                 fact.unit_length_mm AS fact_length_mm,
+                 fact.unit_width_mm AS fact_width_mm,
+                 fact.unit_height_mm AS fact_height_mm,
                  fact.fact_hash,
                  fact.request_hash AS fact_request_hash
                FROM operations_commerce_current_planning_lines line
@@ -250,7 +305,9 @@ async function readPlanningLines(
                 AND channel_state.product_mapping_id = line.product_mapping_id
                LEFT JOIN LATERAL (
                  SELECT retained.id, retained.global_id, retained.fact_version,
-                        retained.unit_weight_grams, retained.fact_hash,
+                        retained.unit_weight_grams, retained.unit_length_mm,
+                        retained.unit_width_mm, retained.unit_height_mm,
+                        retained.fact_hash,
                         retained.request_hash
                  FROM operations_order_unit_weight_facts retained
                  WHERE retained.organization_id = line.organization_id
@@ -320,25 +377,45 @@ function lineWorkspace(row: PlanningLineRow): OrderUnitWeightLine {
     Number.isSafeInteger(row.fact_weight_grams)
     && Number(row.fact_weight_grams) > 0
   )
+  const orderSpecificDimensions = (
+    Number.isSafeInteger(row.fact_length_mm)
+    && Number(row.fact_length_mm) > 0
+    && Number.isSafeInteger(row.fact_width_mm)
+    && Number(row.fact_width_mm) > 0
+    && Number.isSafeInteger(row.fact_height_mm)
+    && Number(row.fact_height_mm) > 0
+  )
   return {
     lineGlobalId: row.global_id,
     productTitle: row.product_title_snapshot,
     variantTitle: row.variant_title_snapshot,
     quantity: Number(row.unfulfilled_quantity),
-    unitWeightGrams: orderSpecificWeight
-      ? Number(row.fact_weight_grams)
-      : providerOrderWeight
-        ? Number(row.order_weight_grams)
-        : providerCatalogWeight
-          ? Number(row.channel_weight_grams)
+    unitWeightGrams: providerOrderWeight
+      ? Number(row.order_weight_grams)
+      : providerCatalogWeight
+        ? Number(row.channel_weight_grams)
+        : orderSpecificWeight
+          ? Number(row.fact_weight_grams)
           : null,
     weightSource: orderSpecificWeight
-      ? 'order_specific'
+      ? providerOrderWeight
+        ? 'provider_order'
+        : providerCatalogWeight
+          ? 'provider_catalog'
+          : 'order_specific'
       : providerOrderWeight
         ? 'provider_order'
         : providerCatalogWeight
           ? 'provider_catalog'
           : null,
+    unitDimensionsMm: orderSpecificDimensions
+      ? {
+          length: Number(row.fact_length_mm),
+          width: Number(row.fact_width_mm),
+          height: Number(row.fact_height_mm),
+        }
+      : null,
+    dimensionSource: orderSpecificDimensions ? 'order_specific' : null,
     factGlobalId: row.fact_global_id,
     factVersion: row.fact_version,
   }
@@ -378,6 +455,9 @@ async function workspace(
     candidateRowVersion: Number(candidate.row_version),
     orderGlobalId: candidate.order_global_id,
     missingLines: lines.filter((line) => line.unitWeightGrams === null),
+    dimensionMissingLines: lines.filter((line) => (
+      line.unitWeightGrams !== null && line.unitDimensionsMm === null
+    )),
     effectiveLines: lines.filter((line) => line.unitWeightGrams !== null),
   }
 }
@@ -415,12 +495,29 @@ export async function assertCurrentOrderUnitWeightEvidence(
   const retained = lineEvidence.flatMap((entry) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
     const value = entry as Record<string, unknown>
-    if (value.weightSource !== 'order_specific') return []
-    const factGlobalId = String(value.weightEvidenceReference || '')
-    const factHash = String(value.weightEvidenceHash || '')
-    const requestHash = String(value.weightEvidenceRequestHash || '')
+    const retainsWeight = value.weightSource === 'order_specific'
+    const retainsDimensions = value.dimensionSource === 'order_specific'
+    if (!retainsWeight && !retainsDimensions) return []
+    const factGlobalId = String(retainsDimensions
+      ? value.dimensionEvidenceReference || ''
+      : value.weightEvidenceReference || '')
+    const factHash = String(retainsDimensions
+      ? value.dimensionEvidenceHash || ''
+      : value.weightEvidenceHash || '')
+    const requestHash = String(retainsDimensions
+      ? value.dimensionEvidenceRequestHash || ''
+      : value.weightEvidenceRequestHash || '')
     const lineGlobalId = String(value.lineGlobalId || '')
     const weightGrams = Number(value.weightGrams)
+    const dimensions = value.unitDimensionsMm
+    const dimensionRecord = dimensions
+      && typeof dimensions === 'object'
+      && !Array.isArray(dimensions)
+      ? dimensions as Record<string, unknown>
+      : null
+    const lengthMm = dimensionRecord ? Number(dimensionRecord.length) : null
+    const widthMm = dimensionRecord ? Number(dimensionRecord.width) : null
+    const heightMm = dimensionRecord ? Number(dimensionRecord.height) : null
     if (
       !/^gouw(?:[0-9]{7}|[0-9a-v]{12})$/u.test(factGlobalId)
       || !/^[a-f0-9]{64}$/u.test(factHash)
@@ -428,6 +525,21 @@ export async function assertCurrentOrderUnitWeightEvidence(
       || !/^(?:gcol|gcal)(?:[0-9]{7}|[0-9a-v]{12})$/u.test(lineGlobalId)
       || !Number.isSafeInteger(weightGrams)
       || weightGrams < 1
+      || (
+        retainsDimensions
+        && (
+          !Number.isSafeInteger(lengthMm)
+          || Number(lengthMm) < 1
+          || !Number.isSafeInteger(widthMm)
+          || Number(widthMm) < 1
+          || !Number.isSafeInteger(heightMm)
+          || Number(heightMm) < 1
+        )
+      )
+      || (
+        !retainsDimensions
+        && (lengthMm !== null || widthMm !== null || heightMm !== null)
+      )
     ) {
       fail(
         'OPERATIONS_ORDER_UNIT_WEIGHT_EVIDENCE_CORRUPT',
@@ -441,6 +553,9 @@ export async function assertCurrentOrderUnitWeightEvidence(
       lineGlobalId,
       requestHash,
       weightGrams,
+      lengthMm,
+      widthMm,
+      heightMm,
     }]
   })
   if (!retained.length) return
@@ -478,13 +593,17 @@ export async function assertCurrentOrderUnitWeightEvidence(
       AND revision_line.active = true
      JOIN jsonb_to_recordset($3::jsonb) retained(
        "factGlobalId" text, "factHash" text, "lineGlobalId" text,
-       "requestHash" text, "weightGrams" integer
+       "requestHash" text, "weightGrams" integer,
+       "lengthMm" integer, "widthMm" integer, "heightMm" integer
      )
        ON retained."factGlobalId" = fact.global_id
       AND retained."factHash" = fact.fact_hash
       AND retained."lineGlobalId" = fact.planning_line_global_id
       AND retained."requestHash" = fact.request_hash
       AND retained."weightGrams" = fact.unit_weight_grams
+      AND retained."lengthMm" IS NOT DISTINCT FROM fact.unit_length_mm
+      AND retained."widthMm" IS NOT DISTINCT FROM fact.unit_width_mm
+      AND retained."heightMm" IS NOT DISTINCT FROM fact.unit_height_mm
      WHERE fact.organization_id = $1::uuid
        AND candidate.global_id = $2
        AND candidate.workflow_state = 'promoted'
@@ -648,6 +767,11 @@ export async function recordOrderUnitWeightsInPostgres(input: {
   lines: Array<{
     lineGlobalId: string
     unitWeightGrams: number
+    unitDimensionsMm: {
+      length: number
+      width: number
+      height: number
+    } | null
     expectedFactVersion: number | null
   }>
 }) {
@@ -661,6 +785,10 @@ export async function recordOrderUnitWeightsInPostgres(input: {
       unitWeightGrams: exactPositiveInteger(
         line.unitWeightGrams,
         `${line.lineGlobalId} unit weight`,
+      ),
+      unitDimensionsMm: exactDimensions(
+        line.unitDimensionsMm,
+        `${line.lineGlobalId} unit dimensions`,
       ),
       expectedFactVersion: line.expectedFactVersion === null
         ? null
@@ -781,13 +909,18 @@ export async function recordOrderUnitWeightsInPostgres(input: {
           && Number(source.order_weight_grams) > 0
         )
         const providerCatalogWeight = Number(source.channel_weight_grams) > 0
+        const providerWeight = providerOrderWeight
+          ? Number(source.order_weight_grams)
+          : providerCatalogWeight
+            ? Number(source.channel_weight_grams)
+            : null
         if (
-          currentFactVersion === null
-          && (providerOrderWeight || providerCatalogWeight)
+          providerWeight !== null
+          && providerWeight !== line.unitWeightGrams
         ) {
           fail(
             'OPERATIONS_ORDER_UNIT_WEIGHT_PROVIDER_FACT_READ_ONLY',
-            `${source.product_title_snapshot} uses a provider weight and cannot be edited here`,
+            `${source.product_title_snapshot} uses a provider weight; record dimensions without changing that weight`,
             409,
           )
         }
@@ -801,10 +934,16 @@ export async function recordOrderUnitWeightsInPostgres(input: {
         if (
           currentFactVersion !== null
           && Number(source.fact_weight_grams) === line.unitWeightGrams
+          && source.fact_length_mm
+            === (line.unitDimensionsMm?.length ?? null)
+          && source.fact_width_mm
+            === (line.unitDimensionsMm?.width ?? null)
+          && source.fact_height_mm
+            === (line.unitDimensionsMm?.height ?? null)
         ) {
           fail(
             'OPERATIONS_ORDER_UNIT_WEIGHT_UNCHANGED',
-            `${source.product_title_snapshot} already has this unit weight`,
+            `${source.product_title_snapshot} already has these unit facts`,
             422,
           )
         }
@@ -820,7 +959,10 @@ export async function recordOrderUnitWeightsInPostgres(input: {
              planning_line_id, planning_line_global_id,
              candidate_line_id, revision_application_line_id,
              line_source_revision, line_source_hash, fact_version,
-             supersedes_fact_id, unit_weight_grams, reason, request_hash, fact_hash,
+             supersedes_fact_id, unit_weight_grams,
+             unit_length_mm, unit_width_mm, unit_height_mm,
+             dimension_evidence_basis,
+             reason, request_hash, fact_hash,
              command_receipt_id, recorded_by
            )
            SELECT $1::text, line.organization_id, line.integration_account_id,
@@ -829,7 +971,11 @@ export async function recordOrderUnitWeightsInPostgres(input: {
                   line.canonical_order_line_id, line.id, line.global_id,
                   $14::uuid, $15::uuid,
                   line.source_revision, line.source_hash, $12::integer,
-                  $13::uuid, $3::integer, $4, $5,
+                  $13::uuid, $3::integer,
+                  $18::integer, $19::integer, $20::integer,
+                  CASE WHEN $18::integer IS NULL THEN NULL
+                    ELSE 'operator_recorded_order_dimensions'
+                  END, $4, $5,
                   encode(digest(convert_to(jsonb_build_object(
                     'candidateGlobalId', candidate.global_id,
                     'candidateRowVersion', $2::bigint,
@@ -838,6 +984,14 @@ export async function recordOrderUnitWeightsInPostgres(input: {
                     'lineGlobalId', line.global_id,
                     'lineSourceHash', line.source_hash,
                     'lineSourceRevision', line.source_revision,
+                    'unitDimensionsMm', CASE
+                      WHEN $18::integer IS NULL THEN NULL
+                      ELSE jsonb_build_object(
+                        'height', $20::integer,
+                        'length', $18::integer,
+                        'width', $19::integer
+                      )
+                    END,
                     'unitWeightGrams', $3::integer
                   )::text, 'UTF8'), 'sha256'), 'hex'),
                   $6::uuid, $7
@@ -870,6 +1024,9 @@ export async function recordOrderUnitWeightsInPostgres(input: {
             source.revision_application_line_id,
             source.line_source_revision,
             source.line_source_hash,
+            line.unitDimensionsMm?.length ?? null,
+            line.unitDimensionsMm?.width ?? null,
+            line.unitDimensionsMm?.height ?? null,
           ],
         )
         if (inserted.rowCount !== 1) {

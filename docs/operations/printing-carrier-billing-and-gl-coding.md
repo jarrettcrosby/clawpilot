@@ -72,7 +72,7 @@ Open **Operations > Printing > Jobs** and choose **Details** on a job. The opera
 - created, available, leased, acknowledged, failed, cancelled, and reprinted lifecycle timestamps;
 - retry counts, last safe error, reprint actor and reason, and every fenced agent/device delivery attempt.
 
-**Agent heartbeat** and **last device delivery** are separate signals. The heartbeat proves the enrolled local agent has recently polled ClawPilot, including when no work was available. Last device delivery records the most recent acknowledged handoff to that printer. An acknowledged job proves that the agent handed the document to the configured device; it does not prove that paper or label stock physically exited the printer.
+**Agent heartbeat**, **last device delivery**, and **paper verified** are separate signals. The heartbeat proves the enrolled local agent has recently polled ClawPilot, including when no work was available. Last device delivery records the most recent acknowledged handoff to that printer. An acknowledged job proves only that the agent handed the document to the configured device. Paper verified is a separate append-only attestation made by an authorized operator who personally observed output; the print agent cannot assert it, and each reprint requires independent evidence.
 
 Credentials, complete carrier-account numbers, artifact storage references, and raw label bytes remain outside the operator view. A retry or reprint always references the existing durable artifact and never purchases another carrier label.
 

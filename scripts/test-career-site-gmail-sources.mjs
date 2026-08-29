@@ -264,6 +264,326 @@ assert.equal(
   true,
   'direct recruiter outreach must remain eligible',
 )
+assert.ok(
+  gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY.includes(
+    'recruiter recruiting "talent acquisition" "hiring manager" interview assessment',
+  ),
+  'the coarse provider query must retain high-signal recruiting and application candidates',
+)
+assert.ok(!gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY.includes('"job alert"'))
+assert.ok(gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY.includes('-in:sent -in:drafts'))
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'no-reply@manufacturer.com',
+    subject: 'Candidate application received',
+    snippet: 'We received your materials.',
+    bodyText: 'Our hiring team will review them.',
+  }),
+  true,
+  'a candidate application receipt remains eligible after broad provider retrieval',
+)
+for (const subject of [
+  'Your application for the VP Operations position',
+  'Your application for Director of Operations',
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'no-reply@manufacturer.com',
+      subject,
+      snippet: 'We have received your application.',
+      bodyText: 'We will contact you with next steps.',
+    }),
+    true,
+    `an explicit application role receipt remains eligible: ${subject}`,
+  )
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'updates@example.com',
+    subject: 'Director Operations application update',
+    snippet: 'Your application status has changed.',
+    bodyText: 'Review the latest status and next steps.',
+  }),
+  true,
+  'a role-first candidate-specific application status remains eligible',
+)
+for (const example of [
+  {
+    subject: 'Candidate application update for VP Operations',
+    snippet: 'Your job application is with the hiring manager.',
+    bodyText: 'We will contact you with next steps for requisition 4812.',
+  },
+  {
+    subject: 'Candidate interview for Director of Operations',
+    snippet: 'Our talent acquisition team would like to schedule an interview.',
+    bodyText: 'Please share your availability to meet the hiring team.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'no-reply@manufacturer.com',
+      ...example,
+    }),
+    true,
+    `candidate language remains eligible with independent employment evidence: ${example.subject}`,
+  )
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'jane@searchfirm.com',
+    subject: 'Opportunity to connect',
+    snippet: 'I came across your profile and think you are a strong fit for a VP Operations position.',
+    bodyText: 'Would you be open to a quick call? Book now using my calendar link.',
+  }),
+  true,
+  'a recruiter calendar call to action is not consumer marketing evidence',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'coach@skills.example',
+    subject: 'Master your next interview',
+    snippet: 'Private coaching sessions can help you prepare.',
+    bodyText: 'Schedule your session today. Book now.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<https://skills.example/unsubscribe>',
+    listId: 'coaching.skills.example',
+    precedence: 'bulk',
+  }),
+  false,
+  'bulk delivery evidence prevents a booking promotion from being rescued as interview scheduling',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'marketing@skills.example',
+    subject: 'Ace your next interview',
+    snippet: 'Build confidence for the conversation.',
+    bodyText: 'One-on-one interview prep is available. Schedule your session today. Book now.',
+  }),
+  false,
+  'marketing sender evidence rejects a booking promotion when prep language appears only in the body',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'coach@skills.example',
+    subject: 'Master your next interview',
+    snippet: 'Private coaching sessions can help you prepare.',
+    bodyText: 'Choose an available time on my calendar.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+  }),
+  false,
+  'a bulk choose-an-available-time promotion cannot be rescued as interview scheduling',
+)
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'notifications@greenhouse.io',
+    subject: 'Candidate interview scheduler',
+    snippet: 'Book your appointment with the hiring manager.',
+    bodyText: 'Choose an available time in the candidate portal.',
+    listUnsubscribe: '<https://greenhouse.io/unsubscribe>',
+    precedence: 'bulk',
+    autoSubmitted: 'auto-generated',
+  }),
+  false,
+  'bulk booking evidence cannot be rescued by ATS or interview-process provenance',
+)
+for (const example of [
+  {
+    senderEmail: 'jane@bank.example',
+    subject: 'VP Credit Risk role',
+    snippet: 'I came across your profile and think you would be a strong fit.',
+    bodyText: 'Would you be open to an interview?',
+  },
+  {
+    senderEmail: 'jane@insurer.example',
+    subject: 'Director of Insurance Operations position',
+    snippet: 'Your background caught my eye and aligns with this leadership position.',
+    bodyText: 'Would you be open to an interview?',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    true,
+    `personalized employer outreach wins over an industry term: ${example.subject}`,
+  )
+}
+for (const subject of [
+  'Director of Investor Relations position',
+  'Director of Membership position',
+  'Director of Admissions position',
+  'VP of University Operations role',
+  'Director of Student Affairs position',
+  'Director of Mortgage Operations position',
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'jane@employer.example',
+      subject,
+      snippet: 'I came across your profile and think you would be a strong fit.',
+      bodyText: 'Would you be open to an interview?',
+    }),
+    true,
+    `a job-function noun does not override personalized role outreach: ${subject}`,
+  )
+}
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director position on our volunteer board',
+    snippet: 'I came across your profile and think you would be a strong fit for this membership role.',
+    bodyText: 'Would you be open to an interview?',
+  },
+  {
+    senderEmail: 'jane@university.edu',
+    subject: 'Interview for a Director MBA program',
+    snippet: 'I reviewed your background and think you are a strong fit for this degree program.',
+    bodyText: 'Would you be open to an admissions interview?',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director opportunity',
+    snippet: 'I reviewed your background.',
+    bodyText: 'Would you be open to joining our volunteer board?',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `personalized wording cannot override strong non-employment evidence: ${example.subject}`,
+  )
+}
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Shareholder opportunity',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  }),
+  false,
+  'an executive title requires independent employment or outreach provenance',
+)
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Your application for the Director position',
+    snippet: 'The membership committee is reviewing your board nomination.',
+    bodyText: 'We will contact you after the association board meets.',
+  },
+  {
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Director application update',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Your application for a board position',
+    snippet: 'The nomination committee will review your materials.',
+    bodyText: 'Members will vote at the annual meeting.',
+  },
+  {
+    senderEmail: 'alerts@brokerage.com',
+    subject: 'Director application update for the board seat',
+    snippet: 'Review the nominee materials before voting.',
+    bodyText: 'The annual meeting ballot is now available.',
+  },
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Director board application update',
+    snippet: 'Your application status changed for the board position.',
+    bodyText: 'The nomination committee will place the nominee on the annual meeting ballot.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'Director MBA application update',
+    snippet: 'Your application status changed in the admissions portal.',
+    bodyText: 'Review the degree program decision online.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `application wording cannot override non-employment executive-title evidence: ${example.subject}`,
+  )
+}
+for (const example of [
+  {
+    senderEmail: 'board@association.org',
+    subject: 'Board candidate application update for Director',
+    snippet: 'Review the director nomination materials.',
+    bodyText: 'Your proxy ballot is ready.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'Candidate application update: Director MBA program',
+    snippet: 'The admissions committee reviewed your application.',
+    bodyText: 'Sign in to the degree program portal for next steps.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'MBA application update',
+    snippet: 'Your resume was received in the degree program admissions portal.',
+    bodyText: 'Review your status online.',
+  },
+  {
+    senderEmail: 'admissions@university.edu',
+    subject: 'MBA application update',
+    snippet: 'Advance your career through our MBA program.',
+    bodyText: 'Your materials are available in the degree program admissions portal.',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    false,
+    `candidate wording alone cannot override strong non-employment evidence: ${example.subject}`,
+  )
+}
+for (const example of [
+  {
+    subject: 'Candidate portal update: Director board position',
+    snippet: 'Your candidate profile was advanced by the nomination committee.',
+    bodyText: 'Review the nominee ballot before the annual meeting.',
+  },
+  {
+    subject: 'Candidate portal update: Director MBA program',
+    snippet: 'Your candidate profile is in the admissions portal.',
+    bodyText: 'Review the degree program application status.',
+  },
+]) {
+  const relevance = gmailSources.careerGmailMessageRelevance({
+    ...baseMessageSignals,
+    senderEmail: 'notifications@candidate-portal.example',
+    ...example,
+  })
+  assert.equal(relevance.relevant, false)
+  assert.equal(
+    relevance.reason,
+    'non-employment',
+    `candidate-portal wording cannot override contextual non-employment evidence: ${example.subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
@@ -671,6 +991,22 @@ assert.deepEqual(
 )
 assert.deepEqual(
   JSON.parse(JSON.stringify(gmailSources.careerGmailMessageRelevance({
+    ...sentCorrelatedSignals,
+    subject: 'Director opportunity on our volunteer board',
+    snippet: 'The nomination committee reviewed your background.',
+    bodyText: 'Would you be open to the board position?',
+    sentThreadMatched: true,
+  }))),
+  {
+    relevant: false,
+    reason: 'non-employment',
+    evidence: [],
+    sentThreadEligible: false,
+  },
+  'Sent-thread evidence cannot rescue contextual volunteer-board outreach',
+)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(gmailSources.careerGmailMessageRelevance({
     ...baseMessageSignals,
     senderEmail: 'support@saas.example',
     subject: 'Manager role permissions',
@@ -720,14 +1056,16 @@ for (const example of [
   assert.equal(relevance.relevant, false, `noise must be rejected: ${example.subject}`)
   assert.equal(relevance.reason, example.expectedReason)
 }
-assert.equal(
-  gmailSources.careerGmailMessageRelevance({
-    ...baseMessageSignals,
-    labelIds: ['SENT'],
-  }).reason,
-  'excluded-folder',
-  'Sent mail is evidence only and is never returned as an inbound conversation',
-)
+for (const label of ['SENT', 'DRAFT']) {
+  assert.equal(
+    gmailSources.careerGmailMessageRelevance({
+      ...baseMessageSignals,
+      labelIds: [label],
+    }).reason,
+    'excluded-folder',
+    `${label} mail is never returned as an inbound conversation`,
+  )
+}
 assert.deepEqual(
   JSON.parse(JSON.stringify(gmailSources.careerGmailMessageRelevance({
     ...baseMessageSignals,
@@ -791,7 +1129,7 @@ assert.deepEqual(
 assert.ok(providerCalls.every((call) => !Object.hasOwn(call.context, 'is_selected')))
 assert.ok(providerCalls.filter((call) => call.path.includes('?maxResults=')).every((call) => {
   const parsed = new URL(call.path, 'https://gateway.maton.ai')
-  return parsed.searchParams.get('maxResults') === '2'
+  return parsed.searchParams.get('maxResults') === String(contract.MAX_GMAIL_MESSAGES_PER_ACCOUNT)
     && parsed.searchParams.get('q') === `(${gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY}) after:1787832000 (newer_than:7d)`
     && parsed.searchParams.get('q').includes('-in:sent -in:drafts')
     && !parsed.searchParams.get('q').includes('job alert')
@@ -979,6 +1317,66 @@ assert.equal(
 )
 assert.equal(oversizedThreadRequests, 1)
 
+let streamedOversizedThreadRequests = 0
+const streamedOversizedThreadSources = loadGmailSources({
+  rows: [{
+    connectionId: 'streamed-oversized-thread',
+    accountEmail: 'streamed-bounded@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path) {
+    if (path.includes('?maxResults=')) {
+      return Response.json({ messages: [{ id: 'streamed-bounded-candidate' }] })
+    }
+    if (path.includes('/threads/')) {
+      streamedOversizedThreadRequests += 1
+      const response = new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(8 * 1024 * 1024))
+          controller.enqueue(new Uint8Array(1))
+          controller.close()
+        },
+      }))
+      assert.equal(response.headers.has('content-length'), false)
+      return response
+    }
+    return Response.json({
+      id: 'streamed-bounded-candidate',
+      threadId: 'streamed-bounded-thread',
+      sender: 'alex@acme.com',
+      subject: 'Vice President, Supply Chain position details',
+      receivedAt: '2026-08-28T16:00:00.000Z',
+      snippet: 'Here are the scope and compensation details from our earlier exchange.',
+      bodyText: 'The Vice President, Supply Chain position reports to the COO.',
+    })
+  },
+  parseGmailMessage(message) {
+    return {
+      externalMessageId: message.id,
+      externalThreadId: message.threadId,
+      senderEmail: message.sender,
+      recipientEmails: [],
+      subject: message.subject,
+      receivedAt: message.receivedAt,
+      snippet: message.snippet,
+      bodyText: message.bodyText,
+      markerReferences: [],
+      historyId: null,
+      labelIds: ['INBOX'],
+      sizeEstimate: null,
+    }
+  },
+})
+assert.deepEqual(
+  JSON.parse(JSON.stringify(await streamedOversizedThreadSources.searchCareerSiteGmailMessages({
+    ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+    request: { maxMessagesPerAccount: 1 },
+  }))),
+  [],
+  'a streamed provider response over 8 MiB fails closed without Content-Length',
+)
+assert.equal(streamedOversizedThreadRequests, 1)
+
 const forbiddenProvider = async () => {
   throw new Error('provider must not be called for ambiguous account configuration')
 }
@@ -1108,6 +1506,243 @@ for (const row of bulkRows) {
   )
 }
 assert.ok(bulkMessages.every((message) => message.urls.length === 20))
+
+const boundedProbeRows = Array.from({ length: 10 }, (_, index) => ({
+  connectionId: `bounded-probe-${index}`,
+  accountEmail: `bounded-probe-${index}@gmail.com`,
+  status: 'ACTIVE',
+}))
+let boundedProbeListCalls = 0
+let boundedProbeMessageCalls = 0
+let boundedProbeThreadCalls = 0
+let boundedProbeMessageInFlight = 0
+let boundedProbeMaxMessageInFlight = 0
+const boundedProbeSources = loadGmailSources({
+  rows: boundedProbeRows,
+  async matonFetch(path, init, context) {
+    assert.ok(init.signal instanceof AbortSignal)
+    assert.equal(context.ownerEmail, identity.CAREER_SITE_OWNER_EMAIL)
+    assert.equal(context.app, 'google-mail')
+    assert.ok(boundedProbeRows.some((row) => row.connectionId === context.boundConnectionId))
+    assert.ok(!Object.hasOwn(context, 'is_selected'))
+
+    const parsed = new URL(path, 'https://gateway.maton.ai')
+    if (parsed.searchParams.has('maxResults')) {
+      boundedProbeListCalls += 1
+      assert.equal(parsed.searchParams.get('maxResults'), '25')
+      assert.equal(parsed.searchParams.get('q'), `(${gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY})`)
+      const pageToken = parsed.searchParams.get('pageToken')
+      const pageIndex = pageToken === null
+        ? 0
+        : Number(pageToken.match(/-page-(\d+)$/)?.[1] || Number.NaN)
+      assert.ok(Number.isInteger(pageIndex) && pageIndex >= 0 && pageIndex <= 3)
+      const messages = Array.from({ length: 5 }, (_, index) => ({
+        id: `${context.boundConnectionId}-page-${pageIndex}-message-${index}`,
+      }))
+      return Response.json({
+        messages,
+        ...(pageIndex < 3
+          ? { nextPageToken: `${context.boundConnectionId}-page-${pageIndex + 1}` }
+          : {}),
+      })
+    }
+    if (path.includes('/threads/')) {
+      boundedProbeThreadCalls += 1
+      const threadId = decodeURIComponent(path.match(/\/threads\/([^?]+)/)?.[1] || '')
+      assert.equal(threadId, `${context.boundConnectionId}-shared-thread`)
+      assert.equal(parsed.searchParams.get('format'), 'minimal')
+      assert.equal(parsed.searchParams.get('fields'), 'id,messages(id,threadId,labelIds)')
+      return Response.json({
+        id: threadId,
+        messages: [{
+          id: `${context.boundConnectionId}-inbound-only`,
+          threadId,
+          labelIds: ['INBOX'],
+        }],
+      })
+    }
+
+    boundedProbeMessageCalls += 1
+    boundedProbeMessageInFlight += 1
+    boundedProbeMaxMessageInFlight = Math.max(
+      boundedProbeMaxMessageInFlight,
+      boundedProbeMessageInFlight,
+    )
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 1))
+    boundedProbeMessageInFlight -= 1
+    const id = decodeURIComponent(path.match(/\/messages\/([^?]+)/)?.[1] || '')
+    return Response.json({
+      id,
+      threadId: `${context.boundConnectionId}-shared-thread`,
+      sender: `alex@${context.boundConnectionId}.example`,
+      subject: 'Vice President, Supply Chain position details',
+      receivedAt: '2026-08-28T16:00:00.000Z',
+      snippet: 'Here are scope details from our earlier exchange.',
+      bodyText: 'The Vice President, Supply Chain position reports to the COO.',
+    })
+  },
+  parseGmailMessage(message) {
+    return {
+      externalMessageId: message.id,
+      externalThreadId: message.threadId,
+      senderEmail: message.sender,
+      recipientEmails: [],
+      subject: message.subject,
+      receivedAt: message.receivedAt,
+      snippet: message.snippet,
+      bodyText: message.bodyText,
+      markerReferences: [],
+      historyId: null,
+      labelIds: ['INBOX'],
+      sizeEstimate: null,
+    }
+  },
+})
+assert.deepEqual(
+  JSON.parse(JSON.stringify(await boundedProbeSources.searchCareerSiteGmailMessages({
+    ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+    request: { maxMessagesPerAccount: 25 },
+  }))),
+  [],
+  'bounded backfill must fail candidates closed when cached Sent-thread evidence is absent',
+)
+assert.equal(boundedProbeListCalls, 40, 'at most four list pages are read per connected account')
+assert.equal(boundedProbeMessageCalls, 200, 'aggregate full-message candidate reads are capped at 200')
+assert.equal(boundedProbeThreadCalls, 10, 'shared thread evidence is fetched once per bound connection')
+assert.ok(
+  boundedProbeMaxMessageInFlight > 1 && boundedProbeMaxMessageInFlight <= 5,
+  'aggregate full-message reads preserve concurrency five',
+)
+
+const backfillListTokens = []
+let backfillGetCalls = 0
+const backfillSources = loadGmailSources({
+  rows: [{
+    connectionId: 'backfill-connection',
+    accountEmail: 'backfill@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path, init, context) {
+    assert.ok(init.signal instanceof AbortSignal)
+    assert.equal(context.ownerEmail, identity.CAREER_SITE_OWNER_EMAIL)
+    assert.equal(context.app, 'google-mail')
+    assert.equal(context.boundConnectionId, 'backfill-connection')
+    assert.ok(!Object.hasOwn(context, 'is_selected'))
+    const parsed = new URL(path, 'https://gateway.maton.ai')
+    if (parsed.searchParams.has('maxResults')) {
+      assert.equal(
+        parsed.searchParams.get('maxResults'),
+        String(contract.MAX_GMAIL_MESSAGES_PER_ACCOUNT),
+      )
+      assert.equal(parsed.searchParams.get('q'), `(${gmailSources.CAREER_GMAIL_IMMUTABLE_QUERY})`)
+      const pageToken = parsed.searchParams.get('pageToken')
+      backfillListTokens.push(pageToken)
+      if (!pageToken) {
+        return Response.json({
+          messages: [{ id: 'promotional-first-hit' }],
+          nextPageToken: 'career-page',
+        })
+      }
+      assert.equal(pageToken, 'career-page')
+      return Response.json({ messages: [{ id: 'career-second-hit' }] })
+    }
+    backfillGetCalls += 1
+    const id = decodeURIComponent(path.match(/\/messages\/([^?]+)/)?.[1] || '')
+    if (id === 'promotional-first-hit') {
+      return Response.json({
+        id,
+        sender: 'offers@bank.com',
+        subject: 'Opportunity: auto loan at 3.9% APR',
+        receivedAt: '2026-08-28T20:00:00.000Z',
+        snippet: 'A limited-time credit offer.',
+        bodyText: 'Apply for a car loan and earn rewards points.',
+      })
+    }
+    assert.equal(id, 'career-second-hit')
+    return Response.json({
+      id,
+      sender: 'recruiter@acme.com',
+      subject: 'VP Operations role',
+      receivedAt: '2026-08-28T19:00:00.000Z',
+      snippet: 'A recruiter reviewed your background.',
+      bodyText: 'Would you be open to an interview?',
+    })
+  },
+  parseGmailMessage(message) {
+    return {
+      externalMessageId: message.id,
+      externalThreadId: null,
+      senderEmail: message.sender,
+      recipientEmails: [],
+      subject: message.subject,
+      receivedAt: message.receivedAt,
+      snippet: message.snippet,
+      bodyText: message.bodyText,
+      markerReferences: [],
+      historyId: null,
+      labelIds: ['INBOX'],
+      sizeEstimate: null,
+    }
+  },
+})
+const backfilledMessages = await backfillSources.searchCareerSiteGmailMessages({
+  ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+  request: { maxMessagesPerAccount: 1 },
+})
+assert.deepEqual(backfillListTokens, [null, 'career-page'])
+assert.equal(backfillGetCalls, 2)
+assert.equal(
+  JSON.stringify(backfilledMessages.map((message) => message.externalMessageId)),
+  JSON.stringify(['career-second-hit']),
+  'a rejected first page must backfill from a later bounded Gmail page',
+)
+
+for (const nextPageToken of [' unsafe-token ', `${'x'.repeat(2_049)}`]) {
+  const invalidTokenSources = loadGmailSources({
+    rows: [{
+      connectionId: 'invalid-page-token',
+      accountEmail: 'invalid-page-token@gmail.com',
+      status: 'ACTIVE',
+    }],
+    async matonFetch(path) {
+      assert.ok(path.includes('?maxResults='))
+      return Response.json({ messages: [], nextPageToken })
+    },
+    parseGmailMessage: unusedParser,
+  })
+  await assert.rejects(
+    invalidTokenSources.searchCareerSiteGmailMessages({
+      ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+      request: { maxMessagesPerAccount: 1 },
+    }),
+    (error) => error?.code === 'CAREER_SITE_GMAIL_SOURCE_PROVIDER_FAILED',
+    'unsafe Gmail page tokens are terminal provider failures',
+  )
+}
+
+let repeatedTokenListCalls = 0
+const repeatedTokenSources = loadGmailSources({
+  rows: [{
+    connectionId: 'repeated-page-token',
+    accountEmail: 'repeated-page-token@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path) {
+    assert.ok(path.includes('?maxResults='))
+    repeatedTokenListCalls += 1
+    return Response.json({ messages: [], nextPageToken: 'repeated-token' })
+  },
+  parseGmailMessage: unusedParser,
+})
+await assert.rejects(
+  repeatedTokenSources.searchCareerSiteGmailMessages({
+    ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+    request: { maxMessagesPerAccount: 1 },
+  }),
+  (error) => error?.code === 'CAREER_SITE_GMAIL_SOURCE_PROVIDER_FAILED',
+  'a repeated Gmail page token is a terminal provider failure',
+)
+assert.equal(repeatedTokenListCalls, 2)
 
 const malformedSources = loadGmailSources({
   rows: [{ connectionId: 'malformed', accountEmail: 'malformed@gmail.com', status: 'ACTIVE' }],

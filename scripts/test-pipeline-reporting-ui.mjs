@@ -8,6 +8,10 @@ const dashboard = read('app_src/components/pipeline/PipelineDashboard.tsx')
 const section = read('app_src/components/pipeline/PipelineSection.tsx')
 const insights = read('app_src/components/pipeline/PipelineInsights.tsx')
 const reportHook = read('app_src/components/pipeline/usePipelineReport.ts')
+const homeDashboard = read('app_src/components/dashboard/DashboardSection.tsx')
+const dashboardBootstrap = read('app_src/lib/dashboardBootstrapServer.ts')
+const crmPersistence = read('app_src/lib/persistence/crm.ts')
+const pipelineCurrency = read('app_src/lib/crm/pipelineCurrency.ts')
 
 for (const fragment of [
   "useState<ReportPreset>('last_3_calendar_months')",
@@ -130,5 +134,31 @@ assert.match(reportHook, /window\.setInterval\(\(\) =>/)
 assert.match(reportHook, /}, 60_000\)/)
 assert.match(reportHook, /setDayRefreshRevision\(nextDay\)/)
 assert.match(reportHook, /window\.clearInterval\(interval\)/)
+assert.match(reportHook, /const \[retryRevision, setRetryRevision\] = useState\(0\)/)
+assert.match(reportHook, /const retryReport = \(\) =>/)
+assert.match(reportHook, /setRetryRevision\(\(current\) => current \+ 1\)/)
+assert.match(dashboard, /onClick=\{retryReport\}>Retry</)
+
+for (const label of [
+  'Total opportunities',
+  'Active opportunities',
+  'Active pipeline value',
+  'Weighted pipeline value',
+]) {
+  assert.ok(homeDashboard.includes(label), `home dashboard missing honest pipeline label: ${label}`)
+}
+assert.doesNotMatch(homeDashboard, /\['Open value'/)
+assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.activePipelineValue/)
+assert.match(homeDashboard, /formatPipelineCurrency\(pipelineSummary\?\.weightedPipelineValue/)
+assert.match(pipelineCurrency, /minimumFractionDigits: 2/)
+assert.match(pipelineCurrency, /maximumFractionDigits: 2/)
+assert.match(section, /function fmt\$\(n: number\)[\s\S]{0,160}formatPipelineCurrency\(n\)/)
+assert.doesNotMatch(section, /function fmt\$\(n: number\)[\s\S]{0,100}if \(!n\) return '—'/)
+assert.match(dashboardBootstrap, /activeOpportunities: summary\.activeOpportunities/)
+assert.match(dashboardBootstrap, /activePipelineValue: summary\.activePipelineValue/)
+assert.match(dashboardBootstrap, /weightedPipelineValue: summary\.weightedPipelineValue/)
+assert.match(crmPersistence, /readCrmPipelineValueSnapshotWithClient/)
+assert.match(crmPersistence, /activePipelineValue: valueSnapshot\.activePipelineValue/)
+assert.match(crmPersistence, /weightedPipelineValue: valueSnapshot\.weightedPipelineValue/)
 
 console.log('pipeline reporting UI contract tests passed')

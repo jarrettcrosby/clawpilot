@@ -43,6 +43,7 @@ import WorkspaceSelector from '@/components/workspaces/WorkspaceSelector'
 import PipelineInsights from '@/components/pipeline/PipelineInsights'
 import PipelineDashboard from '@/components/pipeline/PipelineDashboard'
 import { usePipelineReport } from '@/components/pipeline/usePipelineReport'
+import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 import PipelineCatalogDialog, {
   type PipelineCatalogPerson,
   type PipelineCatalogProduct,
@@ -73,9 +74,11 @@ type SyncSurface = {
   lastSyncedAt: string | null
   summary?: {
     opportunities?: number
+    activeOpportunities?: number
     organizations?: number
     contacts?: number
     totalOpenValue?: number
+    activePipelineValue?: number
     weightedPipelineValue?: number
     pendingSync?: number
     failedSync?: number
@@ -168,20 +171,13 @@ const PRIORITY_SORT_WEIGHT: Record<string, number> = {
 }
 
 function fmt$(n: number) {
-  if (!n) return '—'
-  const value = Number(n || 0)
-  return '$' + value.toLocaleString('en-US', {
-    minimumFractionDigits: Number.isInteger(value) ? 0 : 2,
-    maximumFractionDigits: 2,
-  })
+  if (!Number.isFinite(n)) return '—'
+  return formatPipelineCurrency(n)
 }
 
 function fmtSnapshotCurrency(n: number | null) {
   if (n === null || !Number.isFinite(n)) return '—'
-  return '$' + n.toLocaleString('en-US', {
-    minimumFractionDigits: Number.isInteger(n) ? 0 : 2,
-    maximumFractionDigits: 2,
-  })
+  return formatPipelineCurrency(n)
 }
 
 function compareDealsForPriority(a: Deal, b: Deal) {

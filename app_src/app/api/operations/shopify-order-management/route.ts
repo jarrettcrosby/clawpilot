@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { isBrowserSameOriginRequest } from '@/lib/browserSameOrigin'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -14,7 +15,8 @@ import {
 import { ShopifyOrderManagementError } from '@/lib/integrations/shopifyOrderManagement'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
 import { ShopifyOrderManagementPersistenceError } from '@/lib/persistence/shopifyOrderManagement'
-import { requireRequestUser } from '@/lib/requestUser'
+import { appPublicUrl } from '@/lib/publicUrl'
+import { requestSession, requireRequestUser } from '@/lib/requestUser'
 
 export const dynamic = 'force-dynamic'
 export const revalidate = 0
@@ -32,6 +34,8 @@ const SHOPIFY_DOMAIN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.myshopify\.com$/u
 const SHA256 = /^[a-f0-9]{64}$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const COUNTRY_CODE = /^[A-Z]{2}$/u
+const CURRENCY_CODE = /^(?:[A-Z]{3}|USDC)$/u
+const NONNEGATIVE_DECIMAL = /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/u
 
 class ShopifyOrderManagementApiError extends Error {
   constructor(
@@ -290,8 +294,51 @@ function mutation(value: unknown) {
     })
   }
   if (kind === 'cancel') {
-    exactFields(input, ['kind'])
-    return Object.freeze({ kind })
+    exactFields(input, [
+      'kind', 'reasonCode', 'refundMethod', 'restock', 'notifyCustomer',
+    ])
+    const reasonCode = boundedText(
+      input.reasonCode,
+      'Shopify cancellation reason',
+      16,
+    )
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(reasonCode)) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation reason is invalid',
+      )
+    }
+    const refundMethod = boundedText(
+      input.refundMethod,
+      'Shopify cancellation refund choice',
+      32,
+    )
+    if (refundMethod !== 'none' && refundMethod !== 'original_payment_methods') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation refund choice is invalid',
+      )
+    }
+    if (
+      typeof input.restock !== 'boolean'
+      || typeof input.notifyCustomer !== 'boolean'
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_REQUEST_INVALID',
+        'Shopify cancellation options are invalid',
+      )
+    }
+    return Object.freeze({
+      kind,
+      reasonCode: reasonCode as
+        | 'CUSTOMER' | 'DECLINED' | 'FRAUD'
+        | 'INVENTORY' | 'OTHER' | 'STAFF',
+      refundMethod: refundMethod as 'none' | 'original_payment_methods',
+      restock: input.restock,
+      notifyCustomer: input.notifyCustomer,
+    })
   }
   if (kind === 'set_line_quantity') {
     exactFields(input, ['kind', 'lineItemId', 'quantity'])
@@ -469,6 +516,17 @@ function resultInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
   return Number(value)
 }
 
+function resultMoney(value: unknown) {
+  const source = resultRecord(value)
+  const amount = resultText(source.amount, 128)
+  const currencyCode = resultText(source.currencyCode, 4)
+  if (
+    !NONNEGATIVE_DECIMAL.test(amount)
+    || !CURRENCY_CODE.test(currencyCode)
+  ) resultInvalid()
+  return Object.freeze({ amount, currencyCode })
+}
+
 function resultShippingAddress(value: unknown) {
   if (value === null) return null
   const address = resultRecord(value)
@@ -530,6 +588,12 @@ function publicOpenAttempt(value: unknown) {
 
 function publicManagement(value: unknown) {
   const source = resultRecord(value)
+  const payment = resultRecord(source.payment)
+  const refundOptions = resultRecord(payment.refundOptions)
+  const noRefund = resultRecord(refundOptions.none)
+  const originalPaymentMethods = resultRecord(
+    refundOptions.original_payment_methods,
+  )
   const order = resultRecord(source.order)
   const eligibility = resultRecord(source.eligibility)
   const addTag = resultRecord(eligibility.addTag)
@@ -549,6 +613,10 @@ function publicManagement(value: unknown) {
     || typeof cancel.releasesAuthorization !== 'boolean'
     || typeof cancelAfterFulfillmentReversal.allowed !== 'boolean'
     || typeof cancelAfterFulfillmentReversal.releasesAuthorization !== 'boolean'
+    || typeof noRefund.allowed !== 'boolean'
+    || typeof noRefund.releasesAuthorization !== 'boolean'
+    || typeof originalPaymentMethods.allowed !== 'boolean'
+    || typeof originalPaymentMethods.releasesAuthorization !== 'boolean'
     || !Array.isArray(order.tags)
     || order.tags.length > 250
     || !Array.isArray(order.lines)
@@ -653,6 +721,23 @@ function publicManagement(value: unknown) {
     blockerCode: resultNullableText(source.blockerCode, 512),
     accountLabel: resultText(source.accountLabel, 255),
     shopDomain,
+    payment: Object.freeze({
+      totalReceived: resultMoney(payment.totalReceived),
+      totalRefunded: resultMoney(payment.totalRefunded),
+      totalCapturable: resultMoney(payment.totalCapturable),
+      refundOptions: Object.freeze({
+        none: Object.freeze({
+          allowed: noRefund.allowed,
+          reason: resultNullableText(noRefund.reason, 512),
+          releasesAuthorization: noRefund.releasesAuthorization,
+        }),
+        original_payment_methods: Object.freeze({
+          allowed: originalPaymentMethods.allowed,
+          reason: resultNullableText(originalPaymentMethods.reason, 512),
+          releasesAuthorization: originalPaymentMethods.releasesAuthorization,
+        }),
+      }),
+    }),
     order: Object.freeze({
       globalId: resultId(order.globalId, ORDER_GLOBAL_ID),
       externalOrderId: resultId(order.externalOrderId, SHOPIFY_ORDER_GID),
@@ -871,6 +956,66 @@ function requireWriteAuthority(actor: Awaited<ReturnType<typeof requireRequestUs
   return capabilities
 }
 
+function requireCancellationAuthority(
+  capabilities: ReturnType<typeof operationsCapabilities>,
+  parsedMutation: ReturnType<typeof mutation>,
+) {
+  if (
+    (
+      parsedMutation.kind === 'cancel'
+      || parsedMutation.kind === 'cancel_order_after_fulfillment_reversal'
+    )
+    && (!capabilities.canActivate || !capabilities.canExecute)
+  ) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_AUTHORITY_REQUIRED',
+      'Only an owner or operations administrator with execution permission can cancel a Shopify order',
+      403,
+    )
+  }
+}
+
+async function requireDirectCancellationSession(
+  req: NextRequest,
+  actor: Awaited<ReturnType<typeof requireRequestUser>>,
+  organizationId: string,
+) {
+  const session = await requestSession(req)
+  if (
+    !session
+    || session.legacy === true
+    || !['magic_code', 'google_sso', 'operator_password'].includes(
+      session.authMethod,
+    )
+    || session.impersonating
+    || session.impersonationStartedAt !== null
+    || session.impersonationExpiresAt !== null
+    || session.authenticatedUser !== session.effectiveUser
+    || session.authenticatedUser !== actor.email
+    || session.activeWorkspaceOrganizationId !== organizationId
+  ) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_DIRECT_SESSION_REQUIRED',
+      'Sign in directly as yourself in this workspace before cancelling a Shopify order',
+      403,
+    )
+  }
+}
+
+function requireCancellationSameOrigin(req: NextRequest) {
+  if (!isBrowserSameOriginRequest({
+    headers: req.headers,
+    requestOrigin: req.nextUrl.origin,
+    trustedOrigins: [appPublicUrl()],
+  })) {
+    fail(
+      'SHOPIFY_ORDER_CANCEL_SAME_ORIGIN_REQUIRED',
+      'Shopify cancellation must be confirmed from this ClawPilot site',
+      403,
+    )
+  }
+}
+
 function errorResponse(error: unknown) {
   if (error instanceof Error && error.message === 'Unauthorized') {
     return json({ ok: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
@@ -936,7 +1081,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const actor = await requireRequestUser(req)
-    requireWriteAuthority(actor)
+    const capabilities = requireWriteAuthority(actor)
     requirePostgres()
     const organizationId = activeOperationsOrganizationId(actor)
     const body = await requestBody(req)
@@ -947,6 +1092,18 @@ export async function POST(req: NextRequest) {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation',
       ])
+      const parsedMutation = mutation(body.mutation)
+      if (parsedMutation.kind === 'cancel') {
+        fail(
+          'SHOPIFY_ORDER_CANCEL_CONFIRMATION_REQUIRED',
+          'Prepare and confirm the Shopify cancellation before sending it',
+        )
+      }
+      if (parsedMutation.kind === 'cancel_order_after_fulfillment_reversal') {
+        requireCancellationAuthority(capabilities, parsedMutation)
+        await requireDirectCancellationSession(req, actor, organizationId)
+        requireCancellationSameOrigin(req)
+      }
       const result = await saveShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -956,7 +1113,7 @@ export async function POST(req: NextRequest) {
           ORDER_GLOBAL_ID,
         ),
         expectedRowVersion: rowVersion(body.expectedRowVersion),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         idempotencyKey: exactKey,
       })
       return json({ ok: true, result: publicResult(result) })
@@ -966,6 +1123,14 @@ export async function POST(req: NextRequest) {
       exactFields(body, [
         'action', 'orderGlobalId', 'expectedRowVersion', 'mutation', 'reason',
       ])
+      const parsedMutation = mutation(body.mutation)
+      requireCancellationAuthority(capabilities, parsedMutation)
+      if (
+        parsedMutation.kind === 'cancel'
+        || parsedMutation.kind === 'cancel_order_after_fulfillment_reversal'
+      ) {
+        await requireDirectCancellationSession(req, actor, organizationId)
+      }
       const result = await prepareShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -975,7 +1140,7 @@ export async function POST(req: NextRequest) {
           ORDER_GLOBAL_ID,
         ),
         expectedRowVersion: rowVersion(body.expectedRowVersion),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         reason: reason(body.reason),
         idempotencyKey: exactKey,
       })
@@ -994,6 +1159,15 @@ export async function POST(req: NextRequest) {
           'Shopify intent hash is invalid',
         )
       }
+      const parsedMutation = mutation(body.mutation)
+      requireCancellationAuthority(capabilities, parsedMutation)
+      if (
+        parsedMutation.kind === 'cancel'
+        || parsedMutation.kind === 'cancel_order_after_fulfillment_reversal'
+      ) {
+        await requireDirectCancellationSession(req, actor, organizationId)
+        requireCancellationSameOrigin(req)
+      }
       const result = await executeShopifyOrderManagementCommand({
         organizationId,
         actorEmail: actor.email,
@@ -1008,7 +1182,7 @@ export async function POST(req: NextRequest) {
           'Shopify confirmation statement',
           512,
         ),
-        mutation: mutation(body.mutation),
+        mutation: parsedMutation,
         reason: reason(body.reason),
         idempotencyKey: exactKey,
       })

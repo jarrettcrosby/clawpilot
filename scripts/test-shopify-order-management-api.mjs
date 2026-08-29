@@ -105,6 +105,23 @@ function managementFixture(globalId = 'gor1234567') {
         maxQuantity: 1,
       }],
     },
+    payment: {
+      totalReceived: { amount: '125.00', currencyCode: 'USD' },
+      totalRefunded: { amount: '0.00', currencyCode: 'USD' },
+      totalCapturable: { amount: '0.00', currencyCode: 'USD' },
+      refundOptions: {
+        none: {
+          allowed: true,
+          reason: null,
+          releasesAuthorization: false,
+        },
+        original_payment_methods: {
+          allowed: true,
+          reason: null,
+          releasesAuthorization: false,
+        },
+      },
+    },
     openAttempt: null,
   }
 }
@@ -153,7 +170,12 @@ const calls = []
 const routeErrors = []
 let postgresEnabled = true
 let actor = null
+let session = null
 let requestUserError = null
+let sameOriginImpl = ({ headers, requestOrigin }) => (
+  headers.get('origin') === requestOrigin
+  && headers.get('sec-fetch-site') !== 'cross-site'
+)
 let readImpl = async (input) => {
   calls.push(['read', input])
   return managementFixture(input.orderGlobalId)
@@ -260,8 +282,19 @@ function loadRoute() {
       if (specifier === '@/lib/persistence/shopifyOrderManagement') {
         return { ShopifyOrderManagementPersistenceError: MockTypedError }
       }
+      if (specifier === '@/lib/browserSameOrigin') {
+        return {
+          isBrowserSameOriginRequest: (...args) => sameOriginImpl(...args),
+        }
+      }
+      if (specifier === '@/lib/publicUrl') {
+        return { appPublicUrl: () => 'https://clawpilot.test' }
+      }
       if (specifier === '@/lib/requestUser') {
         return {
+          async requestSession() {
+            return session
+          },
           async requireRequestUser() {
             if (requestUserError) throw requestUserError
             return actor
@@ -299,6 +332,20 @@ function reset(overrides = {}) {
     activeOrganizationId: organizationA,
     capabilities: { ...fullCapabilities },
   }
+  session = {
+    legacy: false,
+    authMethod: 'google_sso',
+    impersonating: false,
+    impersonationStartedAt: null,
+    impersonationExpiresAt: null,
+    authenticatedUser: 'owner@example.com',
+    effectiveUser: 'owner@example.com',
+    activeWorkspaceOrganizationId: organizationA,
+  }
+  sameOriginImpl = ({ headers, requestOrigin }) => (
+    headers.get('origin') === requestOrigin
+    && headers.get('sec-fetch-site') !== 'cross-site'
+  )
   readImpl = async (input) => {
     calls.push(['read', input])
     return managementFixture(input.orderGlobalId)
@@ -320,6 +367,7 @@ function reset(overrides = {}) {
     return resultFixture('reconciled')
   }
   Object.assign(actor, overrides.actor || {})
+  Object.assign(session, overrides.session || {})
   if (overrides.capabilities) {
     actor.capabilities = { ...overrides.capabilities }
   }
@@ -434,6 +482,10 @@ assert.deepEqual(
   result.payload.management.eligibility.cancel,
   managementFixture(orderGlobalId).eligibility.cancel,
 )
+assert.deepEqual(
+  result.payload.management.payment,
+  managementFixture(orderGlobalId).payment,
+)
 
 result = await get(orderGlobalId, `&organizationId=${organizationA}`)
 assert.equal(result.status, 400)
@@ -490,12 +542,78 @@ const cancelAfterReversalMutation = Object.freeze({
   kind: 'cancel_order_after_fulfillment_reversal',
   predecessorAuthorizationGlobalId: 'gsom7654321',
 })
+
+// Post-reversal cancellation is still an irreversible order cancellation.
+// The route and the enabled UI control therefore share the same owner/admin
+// manage+activate+execute authority, direct-session, and same-origin boundary.
+for (const [capability, expectedCode] of [
+  ['canManage', 'SHOPIFY_ORDER_MANAGEMENT_AUTHORITY_REQUIRED'],
+  ['canActivate', 'SHOPIFY_ORDER_CANCEL_AUTHORITY_REQUIRED'],
+  ['canExecute', 'SHOPIFY_ORDER_CANCEL_AUTHORITY_REQUIRED'],
+]) {
+  reset({ capabilities: { ...fullCapabilities, [capability]: false } })
+  result = await post({
+    action: 'save',
+    orderGlobalId,
+    expectedRowVersion: 7,
+    mutation: cancelAfterReversalMutation,
+  }, {
+    headers: {
+      origin: 'https://clawpilot.test',
+      'sec-fetch-site': 'same-origin',
+    },
+  })
+  assert.equal(result.status, 403)
+  assert.equal(result.payload.code, expectedCode)
+  assert.equal(calls.length, 0)
+}
+
+reset({
+  session: {
+    impersonating: true,
+    impersonationStartedAt: '2026-08-14T03:00:00.000Z',
+    impersonationExpiresAt: '2026-08-14T03:30:00.000Z',
+    authenticatedUser: 'support-owner@example.com',
+    effectiveUser: 'owner@example.com',
+  },
+})
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelAfterReversalMutation,
+}, {
+  headers: {
+    origin: 'https://clawpilot.test',
+    'sec-fetch-site': 'same-origin',
+  },
+})
+assert.equal(result.status, 403)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_CANCEL_DIRECT_SESSION_REQUIRED')
+assert.equal(calls.length, 0)
+
 reset()
 result = await post({
   action: 'save',
   orderGlobalId,
   expectedRowVersion: 7,
   mutation: cancelAfterReversalMutation,
+})
+assert.equal(result.status, 403)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_CANCEL_SAME_ORIGIN_REQUIRED')
+assert.equal(calls.length, 0)
+
+reset()
+result = await post({
+  action: 'save',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelAfterReversalMutation,
+}, {
+  headers: {
+    origin: 'https://clawpilot.test',
+    'sec-fetch-site': 'same-origin',
+  },
 })
 assert.equal(result.status, 200)
 assert.deepEqual(plain(calls), [['save', {
@@ -593,6 +711,123 @@ assert.deepEqual(plain(calls), [['execute', {
   confirmationStatement,
   mutation: addTagMutation,
   reason,
+  idempotencyKey: idempotency,
+}]])
+
+const cancelMutation = Object.freeze({
+  kind: 'cancel',
+  reasonCode: 'CUSTOMER',
+  refundMethod: 'none',
+  restock: true,
+  notifyCustomer: false,
+})
+const cancelReason =
+  'Customer requested cancellation before any warehouse work began'
+const cancelConfirmation =
+  'AUTHORIZE SHOPIFY WRITE gsom1234567 CANCEL #6600 REFUND NONE RESTOCK YES NOTIFY NO'
+
+// Irreversible cancellation preparation and execution require the actual
+// signed-in user, never a support-impersonated effective user. Rejection must
+// happen before either durable command can attribute authorized_by to the
+// impersonated target.
+for (const action of ['prepare', 'execute']) {
+  reset({
+    session: {
+      impersonating: true,
+      impersonationStartedAt: '2026-08-14T03:00:00.000Z',
+      impersonationExpiresAt: '2026-08-14T03:30:00.000Z',
+      authenticatedUser: 'support-owner@example.com',
+      effectiveUser: 'owner@example.com',
+    },
+  })
+  const body = action === 'prepare'
+    ? {
+        action,
+        orderGlobalId,
+        expectedRowVersion: 7,
+        mutation: cancelMutation,
+        reason: cancelReason,
+      }
+    : {
+        action,
+        authorizationGlobalId,
+        intentHash,
+        confirmationStatement: cancelConfirmation,
+        mutation: cancelMutation,
+        reason: cancelReason,
+      }
+  result = await post(body, {
+    headers: {
+      origin: 'https://clawpilot.test',
+      'sec-fetch-site': 'same-origin',
+    },
+  })
+  assert.equal(result.status, 403)
+  assert.equal(
+    result.payload.code,
+    'SHOPIFY_ORDER_CANCEL_DIRECT_SESSION_REQUIRED',
+  )
+  assert.equal(calls.length, 0)
+}
+
+reset()
+result = await post({
+  action: 'prepare',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelMutation,
+  reason: cancelReason,
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['prepare', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  orderGlobalId,
+  expectedRowVersion: 7,
+  mutation: cancelMutation,
+  reason: cancelReason,
+  idempotencyKey: idempotency,
+}]])
+
+// The session cookie alone is not treated as CSRF protection for the
+// irreversible provider call. Execute requires an explicit same-origin
+// browser Origin and rejects cross-site requests before the command.
+reset()
+result = await post({
+  action: 'execute',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement: cancelConfirmation,
+  mutation: cancelMutation,
+  reason: cancelReason,
+})
+assert.equal(result.status, 403)
+assert.equal(result.payload.code, 'SHOPIFY_ORDER_CANCEL_SAME_ORIGIN_REQUIRED')
+assert.equal(calls.length, 0)
+
+reset()
+result = await post({
+  action: 'execute',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement: cancelConfirmation,
+  mutation: cancelMutation,
+  reason: cancelReason,
+}, {
+  headers: {
+    origin: 'https://clawpilot.test',
+    'sec-fetch-site': 'same-origin',
+  },
+})
+assert.equal(result.status, 200)
+assert.deepEqual(plain(calls), [['execute', {
+  organizationId: organizationA,
+  actorEmail: 'owner@example.com',
+  authorizationGlobalId,
+  intentHash,
+  confirmationStatement: cancelConfirmation,
+  mutation: cancelMutation,
+  reason: cancelReason,
   idempotencyKey: idempotency,
 }]])
 

@@ -35,6 +35,7 @@ import PrintRounded from '@mui/icons-material/PrintRounded'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import ReplayRounded from '@mui/icons-material/ReplayRounded'
 import RestartAltRounded from '@mui/icons-material/RestartAltRounded'
+import TaskAltRounded from '@mui/icons-material/TaskAltRounded'
 import TokenRounded from '@mui/icons-material/TokenRounded'
 import { useMeasurementSystem } from '@/components/measurements/MeasurementSystemProvider'
 import BarcodeLabelsDialog from '@/components/operations/BarcodeLabelsDialog'
@@ -45,6 +46,7 @@ import {
 } from '@/lib/measurements'
 import {
   DEFAULT_PRINT_AGENT_CAPABILITIES,
+  canAttestOperationsPrintJobPhysicalOutput,
   hasConnectedLocalPrintAgent,
   LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES,
   PRINT_DOCUMENT_TYPES,
@@ -586,8 +588,13 @@ export default function PrinterConfigurationPanel() {
   } | null>(null)
   const [jobAction, setJobAction] = useState<{
     job: OperationsPrintJobListItem
-    action: 'retry-job' | 'reprint-job' | 'cancel-job'
+    action:
+      | 'retry-job'
+      | 'reprint-job'
+      | 'cancel-job'
+      | 'attest-physical-output'
     reason: string
+    idempotencyKey: string
   } | null>(null)
   const [pairingGrant, setPairingGrant] = useState<PrintAgentPairingGrant | null>(null)
   const [barcodeLabelsOpen, setBarcodeLabelsOpen] = useState(false)
@@ -1052,13 +1059,35 @@ export default function PrinterConfigurationPanel() {
     }
   }
 
+  function openJobAction(
+    job: OperationsPrintJobListItem,
+    action: NonNullable<typeof jobAction>['action'],
+  ) {
+    setJobAction({
+      job,
+      action,
+      reason: '',
+      idempotencyKey:
+        `operations-print-${action}:${job.globalId}:${crypto.randomUUID()}`,
+    })
+  }
+
   async function runJobAction() {
     if (!jobAction) return
+    if (
+      jobAction.action === 'attest-physical-output'
+      && !canAttestOperationsPrintJobPhysicalOutput(jobAction.job)
+    ) {
+      setError('Refresh this print job before confirming physical output')
+      return
+    }
     const uncertainOutcomeRecovery = jobAction.action === 'reprint-job'
       && hasUncertainPrintOutcome(jobAction.job)
     if (!jobAction.reason.trim()) {
       const actionName = jobAction.action === 'reprint-job'
         ? uncertainOutcomeRecovery ? 'New-print authorization' : 'Reprint'
+        : jobAction.action === 'attest-physical-output'
+          ? 'Physical-output confirmation'
         : jobAction.action === 'cancel-job'
           ? 'Cancellation'
           : 'Retry'
@@ -1073,11 +1102,18 @@ export default function PrinterConfigurationPanel() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': crypto.randomUUID(),
+          'Idempotency-Key': jobAction.idempotencyKey,
         },
         body: JSON.stringify({
           action: jobAction.action,
           jobGlobalId: jobAction.job.globalId,
+          ...(jobAction.action === 'attest-physical-output'
+            ? {
+                expectedDeliveryAttemptId: jobAction.job.deliveredAttemptId,
+                expectedDeliveryAttemptSequenceNumber:
+                  jobAction.job.deliveredAttemptSequenceNumber,
+              }
+            : {}),
           reason: jobAction.reason.trim(),
         }),
       })
@@ -1091,6 +1127,8 @@ export default function PrinterConfigurationPanel() {
           ? uncertainOutcomeRecovery
             ? `New print ${result.job.globalId} was authorized and queued; ${jobAction.job.globalId} remains preserved as an uncertain outcome`
             : `Reprint ${result.job.globalId} was queued`
+          : jobAction.action === 'attest-physical-output'
+            ? `Physical paper output was confirmed for ${result.job.globalId}`
           : jobAction.action === 'cancel-job'
             ? `${result.job.globalId} was cancelled`
             : `${result.job.globalId} was queued for retry`,
@@ -1144,7 +1182,7 @@ export default function PrinterConfigurationPanel() {
       </Stack>
 
       <Alert severity="info" sx={{ mt: 2 }}>
-        Acknowledged means the local agent handed the document to its configured device. It does not prove physical output, and retries or reprints never purchase another carrier label.
+        Acknowledged means the local agent handed the document to its configured device. It does not prove physical output. After visually observing the paper or label, an authorized warehouse operator can add a separate immutable confirmation. Retries and reprints never purchase another carrier label.
       </Alert>
       {error && <Alert severity="error" onClose={() => setError('')} sx={{ mt: 1.5 }}>{error}</Alert>}
       {notice && <Alert severity="success" onClose={() => setNotice('')} sx={{ mt: 1.5 }}>{notice}</Alert>}
@@ -1186,6 +1224,9 @@ export default function PrinterConfigurationPanel() {
                     <Stack direction="row" gap={0.75} alignItems="center" flexWrap="wrap" useFlexGap>
                       <Typography fontWeight={700}>{job.globalId}</Typography>
                       <Chip size="small" label={label(job.status)} color={statusColor(job.status)} />
+                      {job.physicalOutputAttestation && (
+                        <Chip size="small" label="Paper output verified" color="success" variant="outlined" />
+                      )}
                       {job.documentType && <Chip size="small" label={label(job.documentType)} variant="outlined" />}
                       {job.media && <Chip size="small" label={label(job.media)} variant="outlined" />}
                       {job.format && <Chip size="small" label={job.format} variant="outlined" />}
@@ -1211,6 +1252,11 @@ export default function PrinterConfigurationPanel() {
                         Lease expires {timestamp(job.claimExpiresAt)}
                       </Typography>
                     )}
+                    {job.physicalOutputAttestation && (
+                      <Typography variant="caption" color="success.light" display="block" sx={{ mt: 0.35 }}>
+                        Physical output verified by {job.physicalOutputAttestation.verifiedBy} · {timestamp(job.physicalOutputAttestation.verifiedAt)}
+                      </Typography>
+                    )}
                   </Box>
                   <Stack direction="row" spacing={1} alignItems="center" justifyContent="flex-end">
                     <Button
@@ -1229,7 +1275,7 @@ export default function PrinterConfigurationPanel() {
                         size="small"
                         variant="outlined"
                         startIcon={<RestartAltRounded />}
-                        onClick={() => setJobAction({ job, action: 'retry-job', reason: '' })}
+                        onClick={() => openJobAction(job, 'retry-job')}
                       >
                         Retry
                       </Button>
@@ -1240,7 +1286,7 @@ export default function PrinterConfigurationPanel() {
                         variant="outlined"
                         color="warning"
                         startIcon={<ReplayRounded />}
-                        onClick={() => setJobAction({ job, action: 'reprint-job', reason: '' })}
+                        onClick={() => openJobAction(job, 'reprint-job')}
                       >
                         Authorize new print
                       </Button>
@@ -1250,9 +1296,20 @@ export default function PrinterConfigurationPanel() {
                         size="small"
                         variant="outlined"
                         startIcon={<ReplayRounded />}
-                        onClick={() => setJobAction({ job, action: 'reprint-job', reason: '' })}
+                        onClick={() => openJobAction(job, 'reprint-job')}
                       >
                         Reprint
+                      </Button>
+                    )}
+                    {canAttestOperationsPrintJobPhysicalOutput(job)
+                      && jobs.capabilities.canVerifyPhysicalOutput && (
+                      <Button
+                        size="small"
+                        variant="contained"
+                        startIcon={<TaskAltRounded />}
+                        onClick={() => openJobAction(job, 'attest-physical-output')}
+                      >
+                        Confirm paper output
                       </Button>
                     )}
                     {(job.status === 'queued' || job.status === 'claimed')
@@ -1262,7 +1319,7 @@ export default function PrinterConfigurationPanel() {
                         variant="outlined"
                         color="error"
                         startIcon={<CancelRounded />}
-                        onClick={() => setJobAction({ job, action: 'cancel-job', reason: '' })}
+                        onClick={() => openJobAction(job, 'cancel-job')}
                       >
                         Cancel
                       </Button>
@@ -1854,6 +1911,12 @@ export default function PrinterConfigurationPanel() {
                   <DetailField term="Available at" value={timestamp(selectedJob.availableAt)} />
                   <DetailField term="Claim lease expires" value={timestamp(selectedJob.claimExpiresAt)} />
                   <DetailField term="Delivered at" value={timestamp(selectedJob.deliveredAt)} />
+                  <DetailField
+                    term="Delivered event version"
+                    value={selectedJob.deliveredAttemptId
+                      ? `Event ${selectedJob.deliveredAttemptSequenceNumber} · ${selectedJob.deliveredAttemptId}`
+                      : null}
+                  />
                   <DetailField term="Created" value={timestamp(selectedJob.createdAt)} />
                   <DetailField term="Last updated" value={timestamp(selectedJob.updatedAt)} />
                   <DetailField term="Last error" value={selectedJob.lastError} />
@@ -1864,6 +1927,31 @@ export default function PrinterConfigurationPanel() {
                       : 'Original print job'}
                   />
                 </Box>
+              </Box>
+
+              <Divider />
+
+              <Box component="section" data-testid="print-job-physical-output-attestation">
+                <Typography fontWeight={700}>Physical output</Typography>
+                {selectedJob.physicalOutputAttestation ? (
+                  <Alert severity="success" sx={{ mt: 1 }}>
+                    <Typography variant="body2" fontWeight={700}>
+                      Paper output verified by {selectedJob.physicalOutputAttestation.verifiedBy}
+                    </Typography>
+                    <Typography variant="caption" display="block">
+                      {timestamp(selectedJob.physicalOutputAttestation.verifiedAt)} · Delivery event {selectedJob.physicalOutputAttestation.deliveryAttemptSequenceNumber}
+                    </Typography>
+                    <Typography variant="body2" sx={{ mt: 0.5 }}>
+                      {selectedJob.physicalOutputAttestation.reason}
+                    </Typography>
+                  </Alert>
+                ) : (
+                  <Alert severity={selectedJob.status === 'delivered' ? 'warning' : 'info'} sx={{ mt: 1 }}>
+                    {selectedJob.status === 'delivered'
+                      ? 'The device handoff is acknowledged, but no authorized operator has confirmed visible paper or label output.'
+                      : 'Physical output can be confirmed only after the local agent records an acknowledged device handoff.'}
+                  </Alert>
+                )}
               </Box>
 
               <Divider />
@@ -1914,10 +2002,16 @@ export default function PrinterConfigurationPanel() {
                         )}
                         <Typography
                           variant="caption"
-                          color={attempt.physicalOutputVerified ? 'success.light' : 'text.secondary'}
+                          color={selectedJob.physicalOutputAttestation?.deliveryAttemptId === attempt.id
+                            ? 'success.light'
+                            : 'text.secondary'}
                           display="block"
                         >
-                          Physical output: {attempt.physicalOutputVerified ? 'Verified' : 'Not verified'}
+                          {selectedJob.physicalOutputAttestation?.deliveryAttemptId === attempt.id
+                            ? `Operator-confirmed physical output by ${selectedJob.physicalOutputAttestation.verifiedBy}`
+                            : attempt.state === 'delivered'
+                              ? 'Agent acknowledgement only; physical output not operator-confirmed'
+                              : 'No physical-output assertion'}
                         </Typography>
                         {(attempt.errorCode || attempt.errorMessage) && (
                           <Typography variant="caption" color="error.light" display="block" sx={{ mt: 0.5 }}>
@@ -1956,7 +2050,7 @@ export default function PrinterConfigurationPanel() {
               startIcon={<RestartAltRounded />}
               onClick={() => {
                 setSelectedJob(null)
-                setJobAction({ job: selectedJob, action: 'retry-job', reason: '' })
+                openJobAction(selectedJob, 'retry-job')
               }}
             >
               Retry
@@ -1970,7 +2064,7 @@ export default function PrinterConfigurationPanel() {
               startIcon={<ReplayRounded />}
               onClick={() => {
                 setSelectedJob(null)
-                setJobAction({ job: selectedJob, action: 'reprint-job', reason: '' })
+                openJobAction(selectedJob, 'reprint-job')
               }}
             >
               Authorize new print
@@ -1981,10 +2075,23 @@ export default function PrinterConfigurationPanel() {
               startIcon={<ReplayRounded />}
               onClick={() => {
                 setSelectedJob(null)
-                setJobAction({ job: selectedJob, action: 'reprint-job', reason: '' })
+                openJobAction(selectedJob, 'reprint-job')
               }}
             >
               Reprint
+            </Button>
+          )}
+          {selectedJob
+            && canAttestOperationsPrintJobPhysicalOutput(selectedJob)
+            && jobs?.capabilities.canVerifyPhysicalOutput && (
+            <Button
+              startIcon={<TaskAltRounded />}
+              onClick={() => {
+                setSelectedJob(null)
+                openJobAction(selectedJob, 'attest-physical-output')
+              }}
+            >
+              Confirm paper output
             </Button>
           )}
           {selectedJob
@@ -1995,7 +2102,7 @@ export default function PrinterConfigurationPanel() {
               startIcon={<CancelRounded />}
               onClick={() => {
                 setSelectedJob(null)
-                setJobAction({ job: selectedJob, action: 'cancel-job', reason: '' })
+                openJobAction(selectedJob, 'cancel-job')
               }}
             >
               Cancel job
@@ -2451,6 +2558,8 @@ export default function PrinterConfigurationPanel() {
             ? hasUncertainPrintOutcome(jobAction.job)
               ? 'Authorize new print after uncertain outcome'
               : 'Authorize reprint'
+            : jobAction?.action === 'attest-physical-output'
+              ? 'Confirm physical paper output'
             : jobAction?.action === 'cancel-job'
               ? 'Cancel print job'
               : 'Retry print job'}
@@ -2463,6 +2572,8 @@ export default function PrinterConfigurationPanel() {
                   ? hasUncertainPrintOutcome(jobAction.job)
                     ? `The printer may already have produced ${jobAction.job.globalId}. Inspect the physical printer first. This preserves that uncertain job and creates a new audited job with the same immutable document; a duplicate physical print is possible, but no additional carrier label or postage is purchased.`
                     : `This creates a new audited job from ${jobAction.job.globalId} without purchasing another carrier label.`
+                  : jobAction.action === 'attest-physical-output'
+                    ? `Confirm only after you personally observed paper or label stock exit the printer for ${jobAction.job.globalId}. This immutable operator attestation is fenced to delivery event ${jobAction.job.deliveredAttemptSequenceNumber}; the local print agent cannot create it.`
                   : jobAction.action === 'cancel-job'
                     ? `This fences ${jobAction.job.globalId} from further delivery. A claimed device may already have accepted the document.`
                     : `This requeues ${jobAction.job.globalId} within its existing bounded attempt limit.`}
@@ -2475,6 +2586,8 @@ export default function PrinterConfigurationPanel() {
                   ? hasUncertainPrintOutcome(jobAction.job)
                     ? 'Required duplicate-risk authorization reason'
                     : 'Reprint reason'
+                  : jobAction.action === 'attest-physical-output'
+                    ? 'What physical output did you observe?'
                   : jobAction.action === 'cancel-job'
                     ? 'Cancellation reason'
                     : 'Retry reason'}
@@ -2502,6 +2615,8 @@ export default function PrinterConfigurationPanel() {
                 ? hasUncertainPrintOutcome(jobAction.job)
                   ? 'Queue new print'
                   : 'Queue reprint'
+                : jobAction?.action === 'attest-physical-output'
+                  ? 'Confirm paper output'
                 : jobAction?.action === 'cancel-job'
                   ? 'Cancel job'
                   : 'Queue retry'}

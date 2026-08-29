@@ -291,6 +291,55 @@ for (const fragment of [
   `Print-delivery migration missing ${fragment}`,
 )
 
+const physicalOutputMigration = read(
+  'db/migrations/0338_operations_print_physical_output_attestation.sql',
+)
+for (const fragment of [
+  'CREATE TABLE IF NOT EXISTS operations_print_physical_output_attestations',
+  'delivery_attempt_id uuid NOT NULL',
+  'delivery_attempt_sequence_number integer NOT NULL',
+  'verified_at timestamptz NOT NULL',
+  'verified_by text NOT NULL',
+  'reason text NOT NULL',
+  'operations_print_physical_output_pkey',
+  'operations_print_physical_output_organization_fkey',
+  'operations_print_physical_output_sequence_positive',
+  'operations_print_physical_output_one_per_job',
+  'operations_print_physical_output_idempotency_unique',
+  'validate_operations_print_physical_output_attestation',
+  "membership.permissions\n         @> '{\"executeWarehouse\":true}'::jsonb",
+  'physical output attestation delivery version is not current',
+  'protect_operations_print_physical_output_attestation_write',
+  'Local print agents never write this table',
+]) assert.ok(
+  physicalOutputMigration.includes(fragment),
+  `Physical-output migration missing ${fragment}`,
+)
+
+const physicalOutputHealth = read(
+  'app_src/lib/persistence/operationsPrintPhysicalOutputHealth.ts',
+)
+for (const fragment of [
+  '0338_operations_print_physical_output_attestation.sql',
+  '2ca77442275e87d8b8ee858f974ecc861fb30b0a523ae89092c1be7ab0e4e1cd',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_HEALTH_SQL',
+  "(1, 'id', 'uuid', true, 'gen_random_uuid()'::text)",
+  "(11, 'request_fingerprint', 'text', true, NULL::text)",
+  'operations_print_physical_output_one_per_job',
+  'pg_get_constraintdef',
+  "constraint_row.contype <> 'n'",
+  'pg_get_indexdef',
+  'procedure_row.prosrc',
+  '3fd4f54c7070a9c1c28082afe360d638621d45b8de7d8acc5db183d45daf30c0',
+  'fd15bac1d42a06fa88bae40902eed8c3f6f4ba5756f2fce1d86199c237feed02',
+  '747b8c3bd1c8cfeb41a10a068552b5964097a9a54c97e1f25abf8d34ef5fddc7',
+  '022c9cb1b8acb275a4ac43a9bb239e4446d8e4d3bc7d047f36b1ee2942e1444a',
+  'dcfc0393a532b05606f656ef31ff527ed31981bb314a187e14c2e571336ca787',
+]) assert.ok(
+  physicalOutputHealth.includes(fragment),
+  `Physical-output persistence health missing ${fragment}`,
+)
+
 const persistence = read('app_src/lib/persistence/operationPrinting.ts')
 for (const fragment of [
   'readOperationsPrinterWorkspaceFromPostgres',
@@ -319,6 +368,7 @@ for (const fragment of [
   'retryOperationsPrintJobInPostgres',
   'cancelOperationsPrintJobInPostgres',
   'reprintOperationsPrintJobInPostgres',
+  'attestOperationsPrintJobPhysicalOutputInPostgres',
   'upgradeOperationsPrintAgentToBundledCapabilitiesInPostgres',
   'LEGACY_BUNDLED_PRINT_AGENT_CAPABILITIES',
   'operations:print-attempt:',
@@ -328,7 +378,13 @@ for (const fragment of [
   'scheduleRetry',
   'reprint_of_job_id',
   "'operations.print_job.reprinted'",
+  "'operations.print_job.physical_output_verified'",
+  'expectedDeliveryAttemptSequenceNumber',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_VERSION_CHANGED',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_ALREADY_VERIFIED',
   'physicalOutputVerified: false',
+  'physical_output.delivered_at AS physical_output_delivered_at',
+  'deliveredAt: iso(row.physical_output_delivered_at) as string',
   'OPERATIONS_PRINT_AGENT_NEVER_CONNECTED',
   'A compatible printer is configured, but its local print agent has never connected',
 ]) assert.ok(delivery.includes(fragment), `Print delivery persistence missing ${fragment}`)
@@ -357,15 +413,51 @@ for (const fragment of [
   'Idempotency-Key',
   'Cache-Control',
 ]) assert.ok(agentRoute.includes(fragment), `Local print-agent route missing ${fragment}`)
+assert.ok(
+  !agentRoute.includes('attest-physical-output'),
+  'The local print-agent protocol must never expose operator physical-output attestation',
+)
 
 const jobRoute = read('app_src/app/api/operations/print-jobs/route.ts')
 for (const fragment of [
   "command.action === 'retry-job'",
   "command.action === 'cancel-job'",
   "command.action === 'reprint-job'",
+  "command.action === 'attest-physical-output'",
+  'expectedDeliveryAttemptId',
+  'expectedDeliveryAttemptSequenceNumber',
+  'capabilities.canExecute',
+  'requirePhysicalOutputBrowserSession',
+  'requireRequestSession(req)',
+  'canUsePhysicalOutputAttestationBrowserSession',
+  'canVerifyPhysicalOutput: capabilities.canExecute',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_BROWSER_SESSION_REQUIRED',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_SAME_ORIGIN_REQUIRED',
+  'physicalOutputReason(command.value.reason)',
+  'OPERATIONS_PRINT_PHYSICAL_OUTPUT_REASON_INVALID',
   'canManage || !capabilities.canExecute',
   'Idempotency-Key',
 ]) assert.ok(jobRoute.includes(fragment), `Print-job route missing ${fragment}`)
+
+const physicalOutputAuthorization = read(
+  'app_src/lib/operations/physicalOutputAttestationAuthorization.ts',
+)
+for (const fragment of [
+  "'magic_code'",
+  "'google_sso'",
+  "'operator_password'",
+  'session.legacy !== true',
+  '!session.impersonating',
+  'session.impersonationStartedAt === null',
+  'session.impersonationExpiresAt === null',
+  'session.authenticatedUser === session.effectiveUser',
+  'session.authenticatedUser === actor.email',
+  'session.activeWorkspaceOrganizationId === organizationId',
+  'session.activeWorkspaceRole === effectiveAuthorizationRole(actor)',
+]) assert.ok(
+  physicalOutputAuthorization.includes(fragment),
+  `Physical-output browser-session authorization missing ${fragment}`,
+)
 
 const panel = read('app_src/components/operations/PrinterConfigurationPanel.tsx')
 assert.ok(
@@ -402,6 +494,10 @@ for (const fragment of [
   'Cancel print job',
   'Retry print job',
   'does not prove physical output',
+  'Confirm paper output',
+  'operator attestation',
+  'canVerifyPhysicalOutput',
+  'physicalOutputAttestation',
   'Print job details',
   'Agent heartbeat',
   'Agent never connected',
@@ -467,6 +563,14 @@ for (const fragment of [
   'data-testid="order-shipping-labels"',
   "action: 'enqueue-label'",
   "action: 'reprint-job'",
+  "action: 'attest-physical-output'",
+  'order-label-print-history',
+  'Original',
+  'Reprint',
+  'Confirm physical paper output',
+  'expectedDeliveryAttemptId',
+  'expectedDeliveryAttemptSequenceNumber',
+  'canVerifyPhysicalOutput',
   'Reprint shipping label',
   'Reprints reuse this stored label document and never purchase new postage.',
   'the original carrier-label document was not imported into ClawPilot',
@@ -479,6 +583,10 @@ for (const fragment of [
   'labelPrintJobResult',
   'label.global_id AS source_label_global_id',
   'original.global_id AS reprint_of_job_global_id',
+  'operations_print_physical_output_attestations physical_output',
+  'physical_output.delivered_at AS physical_output_delivered_at',
+  'physicalOutputAttestation: item.physical_output_verified_at',
+  'deliveredAt: item.physical_output_delivered_at.toISOString()',
   'labelPrintJobs: labelPrintJobResult.rows.map',
 ]) assert.ok(
   operationsPersistence.includes(fragment),

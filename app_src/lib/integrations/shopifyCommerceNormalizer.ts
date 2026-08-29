@@ -810,6 +810,7 @@ function normalizedStates(
 function normalizeLine(
   source: unknown,
   knownVariants: ReadonlyMap<string, CommerceNormalizedVariant>,
+  orderCancelled: boolean,
 ): CommerceNormalizedOrderLine {
   const line = nodeRecord(source)
   if (!line) throw new Error('Shopify returned an invalid order line')
@@ -823,9 +824,18 @@ function normalizeLine(
     : null
   const quantity = nonnegativeCommerceInteger(line.quantity)
   const currentQuantity = nonnegativeCommerceInteger(line.currentQuantity)
-  const unfulfilledQuantity = nonnegativeCommerceInteger(
+  const reportedUnfulfilledQuantity = nonnegativeCommerceInteger(
     line.unfulfilledQuantity,
   )
+  // Shopify can retain the pre-cancellation unfulfilled quantity after a
+  // cancelled order has reduced currentQuantity to zero. The cancellation
+  // timestamp is the lifecycle authority; no units remain fulfillable.
+  const unfulfilledQuantity = orderCancelled
+    && currentQuantity !== null
+    && reportedUnfulfilledQuantity !== null
+    && reportedUnfulfilledQuantity > currentQuantity
+    ? currentQuantity
+    : reportedUnfulfilledQuantity
   if (
     quantity === null
     || quantity === 0
@@ -940,10 +950,14 @@ function normalizeOrder(
   const order = nodeRecord(source)
   if (!order) throw new Error('Shopify returned an invalid order')
   const identity = shopifyIdentity(order.id, 'order')
+  const states = normalizedStates(order)
   const linesConnection = asCommerceRecord(order.lineItems)
   const lines = commerceConnectionValues(order.lineItems)
-    .map((line) => normalizeLine(line, knownVariants))
-  const states = normalizedStates(order)
+    .map((line) => normalizeLine(
+      line,
+      knownVariants,
+      states.canonical.lifecycle === 'cancelled',
+    ))
   const party = partySnapshot(order, paths)
   const shipTo = addressSnapshot(order, paths)
   const delivery = requestedDelivery(order)

@@ -616,9 +616,15 @@ final class PickingPhoneModel: ObservableObject {
         defer { isAuthBusy = false }
         do {
             try await api.verifyMagicCode(email: email, code: code)
+        } catch let error as PickingAPIError {
+            isAuthenticated = false
+            status = error.isInvalidMagicCode
+                ? "That code is invalid or expired. Check the code or request a new one."
+                : "Code verification failed: \(error.localizedDescription)"
+            return
         } catch {
             isAuthenticated = false
-            status = "Code could not be verified. Request a new code and try again."
+            status = "Code verification failed: \(error.localizedDescription)"
             return
         }
         do {

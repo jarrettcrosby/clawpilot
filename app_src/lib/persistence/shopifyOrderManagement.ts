@@ -34,14 +34,20 @@ export type ShopifyOrderManagementAction =
     }
   | {
       type: 'cancel'
-      reason?: 'STAFF' | 'OTHER'
+      reason?: ShopifyOrderCancellationReason
       staffNote?: string
+      refundMethod?: ShopifyOrderCancellationRefundMethod
+      restock?: boolean
+      notifyCustomer?: boolean
     }
   | {
       type: 'cancel_order_after_fulfillment_reversal'
       predecessorAuthorizationGlobalId: string
-      reason?: 'STAFF' | 'OTHER'
+      reason?: ShopifyOrderCancellationReason
       staffNote?: string
+      refundMethod?: ShopifyOrderCancellationRefundMethod
+      restock?: boolean
+      notifyCustomer?: boolean
     }
   | {
       type: 'set_line_quantity'
@@ -73,7 +79,19 @@ export type ShopifyOrderManagementStatus =
   | 'reconciled'
   | 'expired'
 
-export type ShopifyOrderCancellationPaymentEvidenceBinding = Readonly<{
+export type ShopifyOrderCancellationReason =
+  | 'CUSTOMER'
+  | 'DECLINED'
+  | 'FRAUD'
+  | 'INVENTORY'
+  | 'OTHER'
+  | 'STAFF'
+
+export type ShopifyOrderCancellationRefundMethod =
+  | 'none'
+  | 'original_payment_methods'
+
+export type ShopifyOrderCancellationPaymentEvidenceBindingV1 = Readonly<{
   schema: 'shopify-order-cancel-payment-evidence-v1'
   transactionsCount: number
   authorizationTransactionId: string | null
@@ -83,12 +101,26 @@ export type ShopifyOrderCancellationPaymentEvidenceBinding = Readonly<{
   }> | null
 }>
 
+export type ShopifyOrderCancellationPaymentEvidenceBindingV2 = Readonly<{
+  schema: 'shopify-order-cancel-payment-evidence-v2'
+  transactionsCount: number
+  transactionsHash: string
+  totalReceived: Readonly<{ amount: string; currencyCode: string }>
+  totalRefunded: Readonly<{ amount: string; currencyCode: string }>
+  totalCapturable: Readonly<{ amount: string; currencyCode: string }>
+  refundMethod: ShopifyOrderCancellationRefundMethod
+}>
+
+export type ShopifyOrderCancellationPaymentEvidenceBinding =
+  | ShopifyOrderCancellationPaymentEvidenceBindingV1
+  | ShopifyOrderCancellationPaymentEvidenceBindingV2
+
 export type ShopifyOrderManagementAuthorization = {
   authorizationGlobalId: string
   organizationId: string
   accountGlobalId: string
   provider: 'shopify'
-  accountEnvironment: 'sandbox'
+  accountEnvironment: 'sandbox' | 'production'
   externalAccountId: string
   shopDomain: string
   credentialGeneration: number
@@ -116,7 +148,12 @@ export type ShopifyOrderManagementAuthorization = {
   expectedLineQuantity: number | null
   requestedQuantity: number | null
   tagHash: string | null
-  cancelReason: 'STAFF' | 'OTHER' | null
+  cancelReason: ShopifyOrderCancellationReason | null
+  cancelRefundMethod: ShopifyOrderCancellationRefundMethod | null
+  cancelRestock: boolean | null
+  cancelNotifyCustomer: boolean | null
+  cancellationPaymentEvidence:
+    ShopifyOrderCancellationPaymentEvidenceBinding | null
   staffNoteHash: string | null
   requestedProjectionHash: string | null
   requiresOrderEdits: boolean
@@ -276,7 +313,7 @@ type AuthorizationRow = {
   integration_account_id: string
   integration_account_global_id: string
   provider: 'shopify'
-  account_environment: 'sandbox'
+  account_environment: 'sandbox' | 'production'
   external_account_id: string
   shop_domain: string
   credential_generation: number
@@ -306,7 +343,12 @@ type AuthorizationRow = {
   expected_line_quantity: number | null
   requested_quantity: number | null
   tag_hash: string | null
-  cancel_reason: 'STAFF' | 'OTHER' | null
+  cancel_reason: ShopifyOrderCancellationReason | null
+  cancel_refund_method: ShopifyOrderCancellationRefundMethod | null
+  cancel_restock: boolean | null
+  cancel_notify_customer: boolean | null
+  cancellation_payment_evidence: unknown | null
+  legacy_cancellation_without_payment_evidence: boolean
   staff_note_hash: string | null
   requested_projection_hash: string | null
   requires_order_edits: boolean
@@ -344,7 +386,7 @@ type AuthorizationRow = {
 type BindingRow = {
   integration_account_id: string
   integration_account_global_id: string
-  account_environment: 'sandbox'
+  account_environment: 'sandbox' | 'production'
   external_account_id: string
   shop_domain: string
   credential_generation: number
@@ -547,6 +589,35 @@ function canonicalPositiveDecimal(value: unknown): string | null {
   return normalized === '0' ? null : normalized
 }
 
+function canonicalNonnegativeDecimal(value: unknown): string | null {
+  if (typeof value !== 'string' || !NONNEGATIVE_DECIMAL.test(value)) {
+    return null
+  }
+  const [whole, fraction = ''] = value.split('.')
+  const normalizedFraction = fraction.replace(/0+$/u, '')
+  return normalizedFraction ? `${whole}.${normalizedFraction}` : whole
+}
+
+function cancellationMoneyEvidence(
+  value: unknown,
+): Readonly<{ amount: string; currencyCode: string }> | null {
+  if (
+    typeof value !== 'object'
+    || value === null
+    || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
+  ) return null
+  const source = value as Record<string, unknown>
+  if (Object.keys(source).sort().join(',') !== 'amount,currencyCode') return null
+  const amount = canonicalNonnegativeDecimal(source.amount)
+  if (
+    amount === null
+    || typeof source.currencyCode !== 'string'
+    || !CURRENCY_CODE.test(source.currencyCode)
+  ) return null
+  return Object.freeze({ amount, currencyCode: source.currencyCode })
+}
+
 function normalizeCancellationPaymentEvidence(
   value: unknown,
   required: boolean,
@@ -578,6 +649,50 @@ function normalizeCancellationPaymentEvidence(
     )
   }
   const source = value as Record<string, unknown>
+  if (source.schema === 'shopify-order-cancel-payment-evidence-v2') {
+    const expectedKeys = [
+      'refundMethod',
+      'schema',
+      'totalCapturable',
+      'totalReceived',
+      'totalRefunded',
+      'transactionsCount',
+      'transactionsHash',
+    ]
+    const totalReceived = cancellationMoneyEvidence(source.totalReceived)
+    const totalRefunded = cancellationMoneyEvidence(source.totalRefunded)
+    const totalCapturable = cancellationMoneyEvidence(source.totalCapturable)
+    if (
+      Object.keys(source).sort().join(',') !== expectedKeys.join(',')
+      || !Number.isSafeInteger(source.transactionsCount)
+      || Number(source.transactionsCount) < 0
+      || Number(source.transactionsCount) > 25
+      || typeof source.transactionsHash !== 'string'
+      || !SHA256.test(source.transactionsHash)
+      || (source.refundMethod !== 'none'
+        && source.refundMethod !== 'original_payment_methods')
+      || !totalReceived
+      || !totalRefunded
+      || !totalCapturable
+      || totalRefunded.currencyCode !== totalReceived.currencyCode
+      || totalCapturable.currencyCode !== totalReceived.currencyCode
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_SNAPSHOT_INVALID',
+        'Cancellation payment evidence is invalid',
+        400,
+      )
+    }
+    return Object.freeze({
+      schema: 'shopify-order-cancel-payment-evidence-v2' as const,
+      transactionsCount: Number(source.transactionsCount),
+      transactionsHash: source.transactionsHash,
+      totalReceived,
+      totalRefunded,
+      totalCapturable,
+      refundMethod: source.refundMethod,
+    })
+  }
   const expectedKeys = [
     'authorizationAmount',
     'authorizationTransactionId',
@@ -910,10 +1025,12 @@ export function normalizeShopifyOrderManagementAction(
   }
   if (input.type === 'cancel') {
     const reason = input.reason === undefined ? 'STAFF' : input.reason
-    if (reason !== 'STAFF' && reason !== 'OTHER') {
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(String(reason))) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
-        'Cancellation reason must be STAFF or OTHER',
+        'Cancellation reason is invalid',
         400,
       )
     }
@@ -922,10 +1039,32 @@ export function normalizeShopifyOrderManagementAction(
       'Cancellation staff note',
       255,
     )
+    const refundMethod = input.refundMethod === undefined
+      ? 'none' : input.refundMethod
+    if (refundMethod !== 'none' && refundMethod !== 'original_payment_methods') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Cancellation refund choice is invalid',
+        400,
+      )
+    }
+    const restock = input.restock === undefined ? false : input.restock
+    const notifyCustomer = input.notifyCustomer === undefined
+      ? false : input.notifyCustomer
+    if (typeof restock !== 'boolean' || typeof notifyCustomer !== 'boolean') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
+        'Cancellation options are invalid',
+        400,
+      )
+    }
     return {
       type: 'cancel',
-      reason,
+      reason: reason as ShopifyOrderCancellationReason,
       ...(staffNote ? { staffNote } : {}),
+      refundMethod,
+      restock,
+      notifyCustomer,
     }
   }
   if (input.type === 'cancel_order_after_fulfillment_reversal') {
@@ -936,10 +1075,12 @@ export function normalizeShopifyOrderManagementAction(
       'A valid fulfillment-reversal authorization is required',
     )
     const reason = input.reason === undefined ? 'STAFF' : input.reason
-    if (reason !== 'STAFF' && reason !== 'OTHER') {
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(String(reason))) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_ACTION_INVALID',
-        'Cancellation reason must be STAFF or OTHER',
+        'Cancellation reason is invalid',
         400,
       )
     }
@@ -951,8 +1092,11 @@ export function normalizeShopifyOrderManagementAction(
     return {
       type: 'cancel_order_after_fulfillment_reversal',
       predecessorAuthorizationGlobalId,
-      reason,
+      reason: reason as ShopifyOrderCancellationReason,
       ...(staffNote ? { staffNote } : {}),
+      refundMethod: 'none',
+      restock: false,
+      notifyCustomer: false,
     }
   }
   if (input.type === 'set_line_quantity') {
@@ -1073,6 +1217,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
       }),
       cancelReason: null,
       staffNoteHash: null,
+      cancelRefundMethod: null,
+      cancelRestock: null,
+      cancelNotifyCustomer: null,
     }
   }
   if (action.type === 'cancel_fulfillment') {
@@ -1086,6 +1233,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
       tagHash: null,
       cancelReason: null,
       staffNoteHash: null,
+      cancelRefundMethod: null,
+      cancelRestock: null,
+      cancelNotifyCustomer: null,
     }
   }
   if (
@@ -1104,6 +1254,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
       requestedQuantity: null,
       tagHash: null,
       cancelReason: action.reason || 'STAFF',
+      cancelRefundMethod: action.refundMethod || 'none',
+      cancelRestock: action.restock ?? false,
+      cancelNotifyCustomer: action.notifyCustomer ?? false,
       staffNoteHash: action.staffNote
         ? shopifyOrderManagementEvidenceHash({
             schema: 'shopify-order-management-staff-note-v1',
@@ -1123,6 +1276,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
       tagHash: null,
       cancelReason: null,
       staffNoteHash: null,
+      cancelRefundMethod: null,
+      cancelRestock: null,
+      cancelNotifyCustomer: null,
     }
   }
   return {
@@ -1134,6 +1290,9 @@ function actionEvidence(action: ShopifyOrderManagementAction) {
     requestedQuantity: action.quantity,
     tagHash: null,
     cancelReason: null,
+    cancelRefundMethod: null,
+    cancelRestock: null,
+    cancelNotifyCustomer: null,
     staffNoteHash: action.staffNote
       ? shopifyOrderManagementEvidenceHash({
           schema: 'shopify-order-management-staff-note-v1',
@@ -1158,6 +1317,9 @@ type ShopifyOrderManagementProviderSnapshotInput = Readonly<{
   requiresOrderEdits: boolean
   cancellationPaymentEvidence:
     ShopifyOrderCancellationPaymentEvidenceBinding | null
+  cancelRefundMethod: ShopifyOrderCancellationRefundMethod | null
+  cancelRestock: boolean | null
+  cancelNotifyCustomer: boolean | null
 }>
 
 function providerSnapshotHash(
@@ -1167,7 +1329,7 @@ function providerSnapshotHash(
     || input.action === 'cancel_order_after_fulfillment_reversal'
   return shopifyOrderManagementEvidenceHash({
     schema: cancellation
-      ? 'shopify-order-management-provider-snapshot-v2'
+      ? 'shopify-order-management-provider-snapshot-v3'
       : 'shopify-order-management-provider-snapshot-v1',
     orderGlobalId: input.orderGlobalId,
     expectedSourceHash: input.expectedSourceHash,
@@ -1188,8 +1350,36 @@ function providerSnapshotHash(
         }
       : {}),
     ...(cancellation
-      ? { cancellationPaymentEvidence: input.cancellationPaymentEvidence }
+      ? {
+          cancellationPaymentEvidence: input.cancellationPaymentEvidence,
+          cancelRefundMethod: input.cancelRefundMethod,
+          cancelRestock: input.cancelRestock,
+          cancelNotifyCustomer: input.cancelNotifyCustomer,
+        }
       : {}),
+    expectedLineQuantity: input.expectedLineQuantity,
+    requestedProjectionHash: input.requestedProjectionHash,
+    requiresOrderEdits: input.requiresOrderEdits,
+  })
+}
+
+function legacyCancellationProviderSnapshotHash(
+  input: ShopifyOrderManagementProviderSnapshotInput,
+) {
+  return shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-provider-snapshot-v2',
+    orderGlobalId: input.orderGlobalId,
+    expectedSourceHash: input.expectedSourceHash,
+    providerOrderUpdatedAt: input.providerOrderUpdatedAt,
+    providerOrderObservedAt: input.providerOrderObservedAt,
+    providerOrderTest: input.providerOrderTest,
+    ...(input.action === 'cancel_order_after_fulfillment_reversal'
+      ? {
+          predecessorAuthorizationGlobalId:
+            input.predecessorAuthorizationGlobalId,
+        }
+      : {}),
+    cancellationPaymentEvidence: input.cancellationPaymentEvidence,
     expectedLineQuantity: input.expectedLineQuantity,
     requestedProjectionHash: input.requestedProjectionHash,
     requiresOrderEdits: input.requiresOrderEdits,
@@ -1210,7 +1400,7 @@ export function shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot
     const cancellationPaymentEvidence =
       normalizeCancellationPaymentEvidence(evidence, true)
     if (!cancellationPaymentEvidence) return false
-    return providerSnapshotHash({
+    const snapshotInput = {
       orderGlobalId: authorization.orderGlobalId,
       expectedSourceHash: authorization.expectedSourceHash,
       providerOrderUpdatedAt: authorization.providerOrderUpdatedAt,
@@ -1226,7 +1416,16 @@ export function shopifyOrderManagementCancellationPaymentEvidenceMatchesSnapshot
       requestedProjectionHash: authorization.requestedProjectionHash,
       requiresOrderEdits: authorization.requiresOrderEdits,
       cancellationPaymentEvidence,
-    }) === authorization.providerSnapshotHash
+      cancelRefundMethod: authorization.cancelRefundMethod,
+      cancelRestock: authorization.cancelRestock,
+      cancelNotifyCustomer: authorization.cancelNotifyCustomer,
+    }
+    return providerSnapshotHash(snapshotInput) === authorization.providerSnapshotHash
+      || (
+        authorization.cancellationPaymentEvidence === null
+        && legacyCancellationProviderSnapshotHash(snapshotInput)
+          === authorization.providerSnapshotHash
+      )
   } catch (error) {
     if (error instanceof ShopifyOrderManagementPersistenceError) return false
     throw error
@@ -1286,6 +1485,34 @@ function intentHash(
   })
 }
 
+function legacyCancellationIntentHash(
+  action: ShopifyOrderManagementAction,
+  reason: string,
+  expectedLineQuantityValue: number | null,
+) {
+  if (
+    action.type !== 'cancel'
+    && action.type !== 'cancel_order_after_fulfillment_reversal'
+  ) return null
+  const legacyAction = {
+    type: action.type,
+    ...(action.type === 'cancel_order_after_fulfillment_reversal'
+      ? {
+          predecessorAuthorizationGlobalId:
+            action.predecessorAuthorizationGlobalId,
+        }
+      : {}),
+    reason: action.reason,
+    ...(action.staffNote ? { staffNote: action.staffNote } : {}),
+  }
+  return shopifyOrderManagementEvidenceHash({
+    schema: 'shopify-order-management-intent-v1',
+    action: legacyAction,
+    reason,
+    expectedLineQuantity: expectedLineQuantityValue,
+  })
+}
+
 function iso(value: TimestampValue | null | undefined) {
   return value ? new Date(value).toISOString() : null
 }
@@ -1331,7 +1558,7 @@ function authorization(
     organizationId: row.organization_id,
     accountGlobalId: row.integration_account_global_id,
     provider: 'shopify',
-    accountEnvironment: 'sandbox',
+    accountEnvironment: row.account_environment,
     externalAccountId: row.external_account_id,
     shopDomain: row.shop_domain,
     credentialGeneration: Number(row.credential_generation),
@@ -1367,6 +1594,15 @@ function authorization(
       ? null : Number(row.requested_quantity),
     tagHash: row.tag_hash,
     cancelReason: row.cancel_reason,
+    cancelRefundMethod: row.cancel_refund_method,
+    cancelRestock: row.cancel_restock,
+    cancelNotifyCustomer: row.cancel_notify_customer,
+    cancellationPaymentEvidence: row.cancellation_payment_evidence === null
+      ? null
+      : normalizeCancellationPaymentEvidence(
+          row.cancellation_payment_evidence,
+          true,
+        ),
     staffNoteHash: row.staff_note_hash,
     requestedProjectionHash: row.requested_projection_hash || null,
     requiresOrderEdits: row.requires_order_edits === true,
@@ -1430,7 +1666,11 @@ LEFT JOIN operations_shopify_order_management_authorizations predecessor
 
 async function requireActorRole(
   client: PoolClient,
-  input: { organizationId: string; actorEmail: string },
+  input: {
+    organizationId: string
+    actorEmail: string
+    requiresCancellationAuthority?: boolean
+  },
 ) {
   const result = await client.query<{ role: 'owner' | 'admin' | 'member' }>(
     `SELECT membership.role
@@ -1445,8 +1685,27 @@ async function requireActorRole(
            false
          )
        )
+       AND (
+         NOT $3::boolean
+         OR membership.role = 'owner'
+         OR (
+           membership.role = 'admin'
+           AND COALESCE(
+             (membership.permissions->>'manageOperations')::boolean,
+             false
+           )
+           AND COALESCE(
+             (membership.permissions->>'executeWarehouse')::boolean,
+             false
+           )
+         )
+       )
      FOR SHARE`,
-    [input.organizationId, input.actorEmail],
+    [
+      input.organizationId,
+      input.actorEmail,
+      input.requiresCancellationAuthority === true,
+    ],
   )
   const role = result.rows[0]?.role
   if (role !== 'owner' && role !== 'admin' && role !== 'member') {
@@ -1612,7 +1871,7 @@ function assertCurrentBinding(
   const postReversalOrderCancellation =
     input.action === 'cancel_order_after_fulfillment_reversal'
   if (
-    row.account_environment !== 'sandbox'
+    !['sandbox', 'production'].includes(row.account_environment)
     || !row.external_account_id
     || !row.shop_domain
     || row.credential_generation < 1
@@ -1624,7 +1883,7 @@ function assertCurrentBinding(
   ) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_ACCOUNT_NOT_CURRENT',
-      'The Shopify sandbox account or credential is not current',
+      'The Shopify account or credential is not current',
     )
   }
   if (
@@ -1777,6 +2036,8 @@ export async function prepareShopifyOrderManagementInPostgres(
     const role = await requireActorRole(client, {
       organizationId: scopedOrganizationId,
       actorEmail: authorizedBy,
+      requiresCancellationAuthority: action.type === 'cancel'
+        || action.type === 'cancel_order_after_fulfillment_reversal',
     })
     const existing = await client.query<AuthorizationRow>(
       `${AUTHORIZATION_SELECT}
@@ -1816,7 +2077,6 @@ export async function prepareShopifyOrderManagementInPostgres(
       (
         action.type === 'cancel_fulfillment'
         || action.type === 'cancel_order_after_fulfillment_reversal'
-        || action.type === 'cancel'
         || action.type === 'set_line_quantity'
         || requiresOrderEdits
       )
@@ -1824,7 +2084,7 @@ export async function prepareShopifyOrderManagementInPostgres(
     ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
-        'Fulfillment reversal, cancellation, and line quantity changes require a Shopify test order',
+        'Fulfillment reversal and line quantity changes require a Shopify test order',
         409,
       )
     }
@@ -1844,6 +2104,9 @@ export async function prepareShopifyOrderManagementInPostgres(
       requestedProjectionHash,
       requiresOrderEdits,
       cancellationPaymentEvidence,
+      cancelRefundMethod: actionFacts.cancelRefundMethod,
+      cancelRestock: actionFacts.cancelRestock,
+      cancelNotifyCustomer: actionFacts.cancelNotifyCustomer,
     })
 
     await acquireTransactionAdvisoryLock(
@@ -1917,6 +2180,8 @@ export async function prepareShopifyOrderManagementInPostgres(
          idempotency_key, request_hash, status, authorized_by,
          authorized_role, accepted_observation_id,
          accepted_provider_order_updated_at, predecessor_authorization_id,
+         cancel_refund_method, cancel_restock, cancel_notify_customer,
+         cancellation_payment_evidence,
          prepared_at, expires_at
        )
        SELECT
@@ -1926,6 +2191,7 @@ export async function prepareShopifyOrderManagementInPostgres(
          $22::timestamptz, $23, $24, $25, $26, $27, $28, $29,
          $30, $31, $32, $33, $34, 'prepared', $35, $36,
          $37::uuid, $38::timestamptz, $39::uuid,
+         $40, $41::boolean, $42::boolean, $43::jsonb,
          prepared_clock.prepared_at,
          prepared_clock.prepared_at + interval '5 minutes'
        FROM prepared_clock
@@ -1970,6 +2236,11 @@ export async function prepareShopifyOrderManagementInPostgres(
         acceptedObservationId,
         acceptedProviderOrderUpdatedAt,
         binding.predecessor_authorization_id,
+        actionFacts.cancelRefundMethod,
+        actionFacts.cancelRestock,
+        actionFacts.cancelNotifyCustomer,
+        cancellationPaymentEvidence === null
+          ? null : JSON.stringify(cancellationPaymentEvidence),
       ],
     )
     const row = inserted.rows[0]
@@ -2006,6 +2277,10 @@ export async function prepareShopifyOrderManagementInPostgres(
         predecessorFulfillmentGid: binding.predecessor_fulfillment_gid,
         requestedProjectionHash,
         requiresOrderEdits,
+        cancelRefundMethod: actionFacts.cancelRefundMethod,
+        cancelRestock: actionFacts.cancelRestock,
+        cancelNotifyCustomer: actionFacts.cancelNotifyCustomer,
+        cancellationPaymentEvidence,
         expiresAt: iso(row.expires_at),
         providerWrites: 0,
       },
@@ -2041,6 +2316,11 @@ export async function claimShopifyOrderManagementInPostgres(
     reason,
     expectedLineQuantityValue,
   )
+  const exactLegacyCancellationIntentHash = legacyCancellationIntentHash(
+    action,
+    reason,
+    expectedLineQuantityValue,
+  )
 
   const result = await withTransaction(async (client) => {
     await acquireTransactionAdvisoryLock(
@@ -2050,6 +2330,8 @@ export async function claimShopifyOrderManagementInPostgres(
     const role = await requireActorRole(client, {
       organizationId: scopedOrganizationId,
       actorEmail: claimedBy,
+      requiresCancellationAuthority: action.type === 'cancel'
+        || action.type === 'cancel_order_after_fulfillment_reversal',
     })
     const selected = await client.query<AuthorizationRow>(
       `${AUTHORIZATION_SELECT}
@@ -2081,7 +2363,23 @@ export async function claimShopifyOrderManagementInPostgres(
       || (action.type === 'save_order') !== Boolean(
         row.requested_projection_hash,
       )
-      || row.intent_hash !== exactIntentHash
+      || (
+        row.intent_hash !== exactIntentHash
+        && !(
+          row.legacy_cancellation_without_payment_evidence
+          && row.intent_hash === exactLegacyCancellationIntentHash
+          && row.cancel_refund_method === 'none'
+          && row.cancel_restock === false
+          && row.cancel_notify_customer === false
+          && action.type !== 'add_tag'
+          && action.type !== 'cancel_fulfillment'
+          && action.type !== 'save_order'
+          && action.type !== 'set_line_quantity'
+          && action.refundMethod === 'none'
+          && action.restock === false
+          && action.notifyCustomer === false
+        )
+      )
     ) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_AUTHORIZATION_MISMATCH',
@@ -2152,6 +2450,12 @@ export async function claimShopifyOrderManagementInPostgres(
       acceptedProviderOrderUpdatedAt:
         iso(row.accepted_provider_order_updated_at),
       providerSnapshotHash: row.provider_snapshot_hash,
+      cancelRefundMethod: row.cancel_refund_method,
+      cancelRestock: row.cancel_restock,
+      cancelNotifyCustomer: row.cancel_notify_customer,
+      cancellationPaymentEvidence: row.cancellation_payment_evidence,
+      legacyCancellationWithoutPaymentEvidence:
+        row.legacy_cancellation_without_payment_evidence,
       ...(row.action === 'cancel_fulfillment'
         ? {
             fulfillmentGid: row.fulfillment_gid,
@@ -2182,7 +2486,8 @@ export async function claimShopifyOrderManagementInPostgres(
        INSERT INTO operations_shopify_order_management_attempts (
          organization_id, authorization_id, integration_account_id,
          integration_account_global_id, provider, external_account_id,
-         credential_generation, provider_write_control_row_version,
+         credential_generation, activation_revision,
+         provider_write_control_row_version,
          provider_write_scope_digest, order_id,
          order_global_id, external_order_id, expected_order_row_version,
          expected_source_hash, provider_snapshot_hash, action,
@@ -2190,13 +2495,17 @@ export async function claimShopifyOrderManagementInPostgres(
          expected_line_quantity, requested_projection_hash,
          requires_order_edits, attempt_hash, dispatch_state, claimed_by,
          accepted_observation_id, accepted_provider_order_updated_at,
-         predecessor_authorization_id, claimed_at,
+         predecessor_authorization_id,
+         cancel_refund_method, cancel_restock, cancel_notify_customer,
+         cancellation_payment_evidence,
+         legacy_cancellation_without_payment_evidence, claimed_at,
          processing_lease_expires_at
        ) SELECT
-         $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6, $7,
-         $8, $9::uuid, $10, $11, $12::bigint, $13, $14, $15,
-         $16, $17::timestamptz, $18, $19, $20, $21, $22,
-         'authorized', $23, $24::uuid, $25::timestamptz, $26::uuid,
+         $1::uuid, $2::uuid, $3::uuid, $4, 'shopify', $5, $6,
+         $7::integer, $8, $9, $10::uuid, $11, $12, $13::bigint, $14,
+         $15, $16, $17, $18::timestamptz, $19, $20, $21, $22, $23,
+         'authorized', $24, $25::uuid, $26::timestamptz, $27::uuid,
+         $28, $29::boolean, $30::boolean, $31::jsonb, $32::boolean,
          claim_clock.claimed_at,
          claim_clock.claimed_at + interval '5 minutes'
        FROM claim_clock
@@ -2209,6 +2518,7 @@ export async function claimShopifyOrderManagementInPostgres(
         row.integration_account_global_id,
         row.external_account_id,
         row.credential_generation,
+        row.activation_revision,
         row.provider_write_control_row_version,
         row.provider_write_scope_digest,
         row.order_id,
@@ -2229,6 +2539,12 @@ export async function claimShopifyOrderManagementInPostgres(
         row.accepted_observation_id,
         row.accepted_provider_order_updated_at,
         row.predecessor_authorization_id,
+        row.cancel_refund_method,
+        row.cancel_restock,
+        row.cancel_notify_customer,
+        row.cancellation_payment_evidence === null
+          ? null : JSON.stringify(row.cancellation_payment_evidence),
+        row.legacy_cancellation_without_payment_evidence,
       ],
     )
     const attempt = attempted.rows[0]
@@ -2281,6 +2597,9 @@ export async function claimShopifyOrderManagementInPostgres(
         expectedLineQuantity: row.expected_line_quantity,
         requestedProjectionHash: row.requested_projection_hash,
         requiresOrderEdits: row.requires_order_edits,
+        cancelRefundMethod: row.cancel_refund_method,
+        cancelRestock: row.cancel_restock,
+        cancelNotifyCustomer: row.cancel_notify_customer,
         intentHash: row.intent_hash,
         authorizationReason: row.authorization_reason,
         attemptHash,

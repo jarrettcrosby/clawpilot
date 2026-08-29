@@ -2628,6 +2628,32 @@ for (const code of [
   assert.equal(terminalCodes.get(code)?.blocking, true, `${code} must block`)
 }
 
+const cancelledUnfulfilledSource = clone(shopifySource)
+cancelledUnfulfilledSource.orders.nodes[0].cancelledAt = '2026-07-26T11:03:00Z'
+cancelledUnfulfilledSource.orders.nodes[0].status = 'CANCELLED'
+cancelledUnfulfilledSource.orders.nodes[0].displayFulfillmentStatus = 'UNFULFILLED'
+cancelledUnfulfilledSource.orders.nodes[0].lineItems.nodes[0].currentQuantity = 0
+// Shopify retains the pre-cancellation value here even though no current
+// units remain fulfillable.
+cancelledUnfulfilledSource.orders.nodes[0].lineItems.nodes[0].unfulfilledQuantity = 2
+const cancelledUnfulfilled = shopify.normalizeShopifyCommerce(
+  cancelledUnfulfilledSource,
+  {
+    ...baseContext,
+    externalAccountId: 'gid://shopify/Shop/1',
+  },
+)
+assert.deepEqual(
+  {
+    current: cancelledUnfulfilled.orders[0].lines[0].currentQuantity,
+    unfulfilled: cancelledUnfulfilled.orders[0].lines[0].unfulfilledQuantity,
+    cancelled: cancelledUnfulfilled.orders[0].lines[0].cancelledQuantity,
+    fulfilled: cancelledUnfulfilled.orders[0].lines[0].fulfilledQuantity,
+  },
+  { current: 0, unfulfilled: 0, cancelled: 2, fulfilled: 0 },
+  'Cancelled Shopify orders must normalize retained unfulfilled quantities to zero current units',
+)
+
 const unknownStateSource = clone(faireSource)
 delete unknownStateSource.orders[0].state
 delete unknownStateSource.orders[0].fulfillment_state

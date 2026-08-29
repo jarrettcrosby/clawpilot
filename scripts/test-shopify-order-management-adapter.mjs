@@ -241,6 +241,9 @@ function providerOrder(overrides = {}) {
     totalReceivedSet: {
       shopMoney: { amount: '0.00', currencyCode: 'USD' },
     },
+    totalRefundedSet: {
+      shopMoney: { amount: '0.00', currencyCode: 'USD' },
+    },
     totalCapturableSet: {
       shopMoney: { amount: '0.00', currencyCode: 'USD' },
     },
@@ -429,6 +432,7 @@ assert.equal(
   assert.match(request.query, /currentTotalPriceSet/)
   assert.match(request.query, /totalOutstandingSet/)
   assert.match(request.query, /totalReceivedSet/)
+  assert.match(request.query, /totalRefundedSet/)
   assert.match(request.query, /totalCapturableSet/)
   assert.match(request.query, /transactionsCount \{ count precision \}/)
   assert.match(request.query, /transactions\(first: 25\)/)
@@ -1431,7 +1435,7 @@ for (const fulfillment of [
       response: previewResponseWithExact(before, reversedFulfillment),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -1467,7 +1471,7 @@ for (const fulfillment of [
     h.calls.graphql.map((call) => call.request.operationName),
     [
       'ClawPilotShopifyOrderManagementPreview',
-      'ClawPilotShopifyTestOrderCancel',
+      'ClawPilotShopifyOrderCancel',
       'ClawPilotShopifyOrderManagementPreview',
     ],
   )
@@ -1573,7 +1577,7 @@ for (const fulfillment of [
       ),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: null,
@@ -1607,7 +1611,7 @@ for (const fulfillment of [
     h.calls.graphql.map((call) => call.request.operationName),
     [
       'ClawPilotShopifyOrderManagementPreview',
-      'ClawPilotShopifyTestOrderCancel',
+      'ClawPilotShopifyOrderCancel',
     ],
   )
 }
@@ -1625,7 +1629,7 @@ for (const fulfillment of [
       ),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       error: new Error('socket closed after post-reversal order cancel'),
     },
   ], {
@@ -1693,10 +1697,14 @@ for (const fulfillment of [
     ),
   )
   assert.deepEqual(observedEvidence, {
-    schema: 'shopify-order-cancel-payment-evidence-v1',
+    schema: 'shopify-order-cancel-payment-evidence-v2',
     transactionsCount: 1,
-    authorizationTransactionId: authorizationTransactionGid,
-    authorizationAmount: { amount: '150.00', currencyCode: 'USD' },
+    transactionsHash:
+      'f9f0b1774e7a079fa5c8f6bbc8eb3b67566ed38932471151432877e44c1d26b9',
+    totalReceived: { amount: '0.00', currencyCode: 'USD' },
+    totalRefunded: { amount: '0.00', currencyCode: 'USD' },
+    totalCapturable: { amount: '150.00', currencyCode: 'USD' },
+    refundMethod: 'none',
   })
   assert.deepEqual(
     h.calls.graphql.map((call) => call.request.operationName),
@@ -1761,7 +1769,7 @@ for (const fulfillment of [
       response: previewResponse(before),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -1794,7 +1802,7 @@ for (const fulfillment of [
     h.calls.graphql.map((call) => call.request.operationName),
     [
       'ClawPilotShopifyOrderManagementPreview',
-      'ClawPilotShopifyTestOrderCancel',
+      'ClawPilotShopifyOrderCancel',
       'ClawPilotShopifyOrderManagementPreview',
     ],
   )
@@ -1804,8 +1812,9 @@ for (const fulfillment of [
   )
 }
 
-// Cancellation is not proven when the exact pre-write authorization vanishes,
-// even if a same-count VOID row and every aggregate otherwise look released.
+// Shopify may replace a released authorization with a VOID row. Cancellation
+// is proven from the bound financial aggregates plus the absence of any live
+// authorization; it does not depend on Shopify retaining historical row IDs.
 {
   const before = authorizedProviderOrder()
   const after = providerOrder({
@@ -1824,7 +1833,7 @@ for (const fulfillment of [
       response: previewResponse(before),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -1841,26 +1850,29 @@ for (const fulfillment of [
     input({ type: 'cancel' }),
     h.dependencies,
   )
-  assert.equal(result.outcome, 'outcomeUnknown')
-  assert.equal(result.errorCode, 'SHOPIFY_ORDER_CANCEL_READBACK_MISMATCH')
+  assert.equal(result.outcome, 'succeeded')
+  assert.equal(result.errorCode, null)
   assert.equal(result.providerWrites, 1)
   assert.deepEqual(
     h.calls.graphql.map((call) => call.request.operationName),
     [
       'ClawPilotShopifyOrderManagementPreview',
-      'ClawPilotShopifyTestOrderCancel',
+      'ClawPilotShopifyOrderCancel',
       'ClawPilotShopifyOrderManagementPreview',
     ],
   )
 }
 
-// The exact authorization amount is part of release identity. Reusing the GID
-// with a changed amount cannot satisfy immediate readback.
+// Financial aggregates remain bound across dispatch. A changed received total
+// cannot satisfy immediate readback even when every transaction is terminal.
 {
   const before = authorizedProviderOrder()
   const after = providerOrder({
     updatedAt: afterUpdatedAt,
     cancelledAt: afterUpdatedAt,
+    totalReceivedSet: {
+      shopMoney: { amount: '1.00', currencyCode: 'USD' },
+    },
     transactions: [providerTransaction({
       amountSet: {
         shopMoney: { amount: '149.00', currencyCode: 'USD' },
@@ -1875,7 +1887,7 @@ for (const fulfillment of [
       response: previewResponse(before),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -1924,7 +1936,7 @@ for (const fulfillment of [
       response: previewResponse(before),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -2030,29 +2042,140 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
   assert.equal(h.calls.graphql.length, 1)
 }
 
+// An ordinary paid order may be cancelled without a refund when the operator
+// makes that choice explicitly. Readback proves the paid/refunded aggregates
+// did not change, and Shopify receives the exact restock/notification choices.
 {
-  const h = harness([{
-    operation: 'ClawPilotShopifyOrderManagementPreview',
-    response: previewResponse(providerOrder({
-      unpaid: false,
-      totalReceivedSet: {
-        shopMoney: { amount: '150.00', currencyCode: 'USD' },
+  const capturedTransaction = providerTransaction({
+    kind: 'CAPTURE',
+    test: false,
+    manuallyCapturable: false,
+    totalUnsettledSet: null,
+  })
+  const before = providerOrder({
+    test: false,
+    unpaid: false,
+    totalReceivedSet: {
+      shopMoney: { amount: '150.00', currencyCode: 'USD' },
+    },
+    transactions: [capturedTransaction],
+  })
+  const after = providerOrder({
+    ...before,
+    updatedAt: afterUpdatedAt,
+    cancelledAt: afterUpdatedAt,
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderCancel',
+      response: {
+        orderCancel: {
+          job: { id: cancellationJobGid, done: true },
+          orderCancelUserErrors: [],
+        },
       },
-      transactions: [providerTransaction({
-        kind: 'CAPTURE',
-        manuallyCapturable: false,
-        totalUnsettledSet: null,
-      })],
-    })),
-  }])
-  await assert.rejects(
-    adapter.executeShopifyOrderManagementAction(
-      input({ type: 'cancel' }),
-      h.dependencies,
-    ),
-    (error) => error.code === 'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({
+      type: 'cancel',
+      reason: 'CUSTOMER',
+      staffNote: 'Customer requested cancellation',
+      refundMethod: 'none',
+      restock: true,
+      notifyCustomer: false,
+    }),
+    h.dependencies,
   )
-  assert.equal(h.calls.graphql.length, 1)
+  assert.equal(result.outcome, 'succeeded')
+  assert.equal(result.before.test, false)
+  assert.equal(result.providerWrites, 1)
+  assert.deepEqual(plain(h.calls.graphql[1].request.variables), {
+    orderId: orderGid,
+    notifyCustomer: false,
+    refundMethod: { originalPaymentMethodsRefund: false },
+    restock: true,
+    reason: 'CUSTOMER',
+    staffNote: 'Customer requested cancellation',
+  })
+}
+
+// An ordinary paid order may instead request a full refund to the original
+// payment methods. Shopify receives that explicit choice and readback must
+// prove the previously received amount is now refunded.
+{
+  const capturedTransaction = providerTransaction({
+    kind: 'SALE',
+    test: false,
+    manuallyCapturable: false,
+    totalUnsettledSet: null,
+  })
+  const before = providerOrder({
+    test: false,
+    unpaid: false,
+    totalReceivedSet: {
+      shopMoney: { amount: '150.00', currencyCode: 'USD' },
+    },
+    transactions: [capturedTransaction],
+  })
+  const after = providerOrder({
+    ...before,
+    updatedAt: afterUpdatedAt,
+    cancelledAt: afterUpdatedAt,
+    totalRefundedSet: {
+      shopMoney: { amount: '150.00', currencyCode: 'USD' },
+    },
+  })
+  const h = harness([
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(before),
+    },
+    {
+      operation: 'ClawPilotShopifyOrderCancel',
+      response: {
+        orderCancel: {
+          job: { id: cancellationJobGid, done: true },
+          orderCancelUserErrors: [],
+        },
+      },
+    },
+    {
+      operation: 'ClawPilotShopifyOrderManagementPreview',
+      response: previewResponse(after),
+    },
+  ])
+  const result = await adapter.executeShopifyOrderManagementAction(
+    input({
+      type: 'cancel',
+      reason: 'INVENTORY',
+      staffNote: 'Inventory unavailable before warehouse release',
+      refundMethod: 'original_payment_methods',
+      restock: false,
+      notifyCustomer: true,
+    }),
+    h.dependencies,
+  )
+  assert.equal(result.outcome, 'succeeded')
+  assert.equal(result.before.test, false)
+  assert.equal(result.providerWrites, 1)
+  assert.equal(result.after.totalRefunded.amount, '150.00')
+  assert.deepEqual(plain(h.calls.graphql[1].request.variables), {
+    orderId: orderGid,
+    notifyCustomer: true,
+    refundMethod: { originalPaymentMethodsRefund: true },
+    restock: false,
+    reason: 'INVENTORY',
+    staffNote: 'Inventory unavailable before warehouse release',
+  })
 }
 
 // If a completed job readback still exposes a capturable authorization, the
@@ -2069,7 +2192,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
       response: previewResponse(before),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: true },
@@ -2102,7 +2225,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
       response: previewResponse(authorizedProviderOrder()),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: { id: cancellationJobGid, done: false },
@@ -2137,9 +2260,9 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
   assert.equal(h.calls.graphql.length, 2)
 }
 
-// A production, paid, partially fulfilled, capturable, returned, or stale
-// order is blocked before any mutation. One representative carries every
-// unsafe state to keep the focused test compact.
+// An ordinary order with fulfillment or return activity is blocked before any
+// mutation regardless of its payment or test flag. One representative carries
+// every unsafe order-state signal to keep the focused test compact.
 {
   const h = harness([{
     operation: 'ClawPilotShopifyOrderManagementPreview',
@@ -2161,7 +2284,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
       }),
       h.dependencies,
     ),
-    (error) => error.code === 'SHOPIFY_ORDER_MANAGEMENT_TEST_ORDER_REQUIRED',
+    (error) => error.code === 'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
   )
   assert.equal(h.calls.graphql.length, 1)
 }
@@ -2175,7 +2298,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
       response: previewResponse(),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       response: {
         orderCancel: {
           job: null,
@@ -2209,7 +2332,7 @@ for (const status of ['PENDING', 'AWAITING_RESPONSE', 'UNKNOWN']) {
       response: previewResponse(),
     },
     {
-      operation: 'ClawPilotShopifyTestOrderCancel',
+      operation: 'ClawPilotShopifyOrderCancel',
       error: new Error('socket closed after request dispatch'),
     },
   ])

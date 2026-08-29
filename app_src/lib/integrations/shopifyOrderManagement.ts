@@ -91,8 +91,11 @@ export type ShopifyOrderManagementAction =
     }
   | {
       type: 'cancel'
-      reason?: 'OTHER' | 'STAFF'
+      reason?: ShopifyOrderCancellationReason
       staffNote?: string | null
+      refundMethod?: ShopifyOrderCancellationRefundMethod
+      restock?: boolean
+      notifyCustomer?: boolean
     }
   | {
       type: 'cancel_fulfillment'
@@ -103,8 +106,11 @@ export type ShopifyOrderManagementAction =
       type: 'cancel_order_after_fulfillment_reversal'
       predecessorAuthorizationGlobalId: string
       reversedFulfillmentGid?: string
-      reason?: 'OTHER' | 'STAFF'
+      reason?: ShopifyOrderCancellationReason
       staffNote?: string | null
+      refundMethod?: ShopifyOrderCancellationRefundMethod
+      restock?: boolean
+      notifyCustomer?: boolean
     }
   | {
       type: 'set_line_quantity'
@@ -218,6 +224,7 @@ export type ShopifyOrderManagementPreview = {
   currentTotalPrice: ShopifyOrderManagementMoney
   totalOutstanding: ShopifyOrderManagementMoney
   totalReceived: ShopifyOrderManagementMoney
+  totalRefunded: ShopifyOrderManagementMoney
   totalCapturable: ShopifyOrderManagementMoney
   transactionsCount: number | null
   paymentEvidenceComplete: boolean
@@ -295,12 +302,38 @@ export type ShopifyOrderCancellationPaymentEligibility = Readonly<{
   releasesAuthorization: boolean
 }>
 
-export type ShopifyOrderCancellationPaymentEvidence = Readonly<{
+export type ShopifyOrderCancellationReason =
+  | 'CUSTOMER'
+  | 'DECLINED'
+  | 'FRAUD'
+  | 'INVENTORY'
+  | 'OTHER'
+  | 'STAFF'
+
+export type ShopifyOrderCancellationRefundMethod =
+  | 'none'
+  | 'original_payment_methods'
+
+export type ShopifyOrderCancellationPaymentEvidenceV1 = Readonly<{
   schema: 'shopify-order-cancel-payment-evidence-v1'
   transactionsCount: number
   authorizationTransactionId: string | null
   authorizationAmount: Readonly<ShopifyOrderManagementMoney> | null
 }>
+
+export type ShopifyOrderCancellationPaymentEvidenceV2 = Readonly<{
+  schema: 'shopify-order-cancel-payment-evidence-v2'
+  transactionsCount: number
+  transactionsHash: string
+  totalReceived: Readonly<ShopifyOrderManagementMoney>
+  totalRefunded: Readonly<ShopifyOrderManagementMoney>
+  totalCapturable: Readonly<ShopifyOrderManagementMoney>
+  refundMethod: ShopifyOrderCancellationRefundMethod
+}>
+
+export type ShopifyOrderCancellationPaymentEvidence =
+  | ShopifyOrderCancellationPaymentEvidenceV1
+  | ShopifyOrderCancellationPaymentEvidenceV2
 
 export type ShopifyOrderEditCommitResult = {
   orderGid: string
@@ -707,6 +740,7 @@ const UNRESOLVED_TRANSACTION_STATUSES = new Set([
  */
 export function shopifyOrderCancellationPaymentEligibility(
   preview: ShopifyOrderManagementPreview,
+  refundMethod: ShopifyOrderCancellationRefundMethod = 'none',
 ): ShopifyOrderCancellationPaymentEligibility {
   if (
     !preview.paymentEvidenceComplete
@@ -715,13 +749,6 @@ export function shopifyOrderCancellationPaymentEligibility(
     return Object.freeze({
       allowed: false,
       reason: 'Shopify payment transaction evidence is not bounded and exhaustive',
-      releasesAuthorization: false,
-    })
-  }
-  if (!preview.unpaid || !zeroMoney(preview.totalReceived)) {
-    return Object.freeze({
-      allowed: false,
-      reason: 'Paid or captured orders require an explicit refund workflow',
       releasesAuthorization: false,
     })
   }
@@ -734,30 +761,26 @@ export function shopifyOrderCancellationPaymentEligibility(
       releasesAuthorization: false,
     })
   }
-  if (preview.transactions.some((transaction) => (
-    transaction.status === 'SUCCESS'
-    && ['CAPTURE', 'SALE'].includes(transaction.kind)
-  ))) {
+  if (
+    preview.totalRefunded.currencyCode !== preview.totalReceived.currencyCode
+    || preview.totalCapturable.currencyCode !== preview.totalReceived.currencyCode
+    || compareDecimalAmounts(
+      preview.totalRefunded.amount,
+      preview.totalReceived.amount,
+    ) > 0
+  ) {
     return Object.freeze({
       allowed: false,
-      reason: 'Shopify reports a successful captured payment transaction',
+      reason: 'Shopify returned inconsistent received, refunded, or capturable totals',
       releasesAuthorization: false,
     })
   }
-
   const successfulAuthorizations = preview.transactions.filter(
     (transaction) => (
       transaction.kind === 'AUTHORIZATION'
       && transaction.status === 'SUCCESS'
     ),
   )
-  if (successfulAuthorizations.some((transaction) => !transaction.test)) {
-    return Object.freeze({
-      allowed: false,
-      reason: 'Shopify returned a non-test payment authorization',
-      releasesAuthorization: false,
-    })
-  }
   const liveTransactions = preview.transactions.filter((transaction) => (
     transaction.manuallyCapturable
     || positiveMoney(transaction.totalUnsettled)
@@ -772,26 +795,19 @@ export function shopifyOrderCancellationPaymentEligibility(
   }
 
   if (preview.capturable) {
-    if (
-      preview.transactionsCount === null
-      || preview.transactionsCount >= MAX_ORDER_TRANSACTIONS
-    ) {
-      return Object.freeze({
-        allowed: false,
-        reason: 'Shopify payment evidence has no bounded room to prove authorization release',
-        releasesAuthorization: false,
-      })
-    }
     const authorization = successfulAuthorizations.length === 1
       ? successfulAuthorizations[0]
       : null
     if (
       !authorization
-      || !authorization.test
       || liveTransactions.length !== 1
       || liveTransactions[0].id !== authorization.id
       || !positiveMoney(authorization.amount)
       || !positiveMoney(authorization.totalUnsettled)
+      || authorization.amount.currencyCode
+        !== preview.totalCapturable.currencyCode
+      || authorization.totalUnsettled!.currencyCode
+        !== preview.totalCapturable.currencyCode
       || compareDecimalAmounts(
         authorization.amount.amount,
         preview.totalCapturable.amount,
@@ -803,55 +819,90 @@ export function shopifyOrderCancellationPaymentEligibility(
     ) {
       return Object.freeze({
         allowed: false,
-        reason: 'The capturable balance is not one bounded successful test authorization',
+        reason: 'The capturable balance is not one bounded successful authorization',
         releasesAuthorization: false,
       })
     }
-    return Object.freeze({
-      allowed: true,
-      reason: null,
-      releasesAuthorization: true,
-    })
-  }
-
-  if (liveTransactions.length > 0) {
+  } else if (liveTransactions.length > 0) {
     return Object.freeze({
       allowed: false,
-      reason: 'Shopify still reports a live payment authorization',
+      reason: 'Shopify returned a live payment authorization without a capturable balance',
+      releasesAuthorization: false,
+    })
+  }
+  const capturedPayments = preview.transactions.filter((transaction) => (
+    transaction.status === 'SUCCESS'
+    && ['CAPTURE', 'SALE'].includes(transaction.kind)
+    && positiveMoney(transaction.amount)
+  ))
+  const unrefundedReceived = compareDecimalAmounts(
+    preview.totalReceived.amount,
+    preview.totalRefunded.amount,
+  ) > 0
+  if (refundMethod === 'original_payment_methods' && !unrefundedReceived) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'No captured Shopify payment remains to refund',
+      releasesAuthorization: false,
+    })
+  }
+  const expectedAdditionalTransactions = liveTransactions.length
+    + (refundMethod === 'original_payment_methods' && unrefundedReceived
+      ? Math.max(1, capturedPayments.length)
+      : 0)
+  if (
+    preview.transactionsCount === null
+    || preview.transactionsCount + expectedAdditionalTransactions
+      > MAX_ORDER_TRANSACTIONS
+  ) {
+    return Object.freeze({
+      allowed: false,
+      reason: 'Shopify payment history has no bounded room to verify cancellation',
       releasesAuthorization: false,
     })
   }
   return Object.freeze({
     allowed: true,
     reason: null,
-    releasesAuthorization: false,
+    releasesAuthorization: liveTransactions.length > 0,
   })
+}
+
+function cancellationTransactionsHash(
+  transactions: readonly ShopifyOrderManagementTransaction[],
+) {
+  return createHash('sha256').update(JSON.stringify(
+    [...transactions]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((transaction) => ({
+        id: transaction.id,
+        kind: transaction.kind,
+        status: transaction.status,
+        test: transaction.test,
+        manuallyCapturable: transaction.manuallyCapturable,
+        amount: transaction.amount,
+        totalUnsettled: transaction.totalUnsettled,
+      })),
+  )).digest('hex')
 }
 
 export function shopifyOrderCancellationPaymentEvidence(
   preview: ShopifyOrderManagementPreview,
+  refundMethod: ShopifyOrderCancellationRefundMethod = 'none',
 ): ShopifyOrderCancellationPaymentEvidence | null {
-  const eligibility = shopifyOrderCancellationPaymentEligibility(preview)
+  const eligibility = shopifyOrderCancellationPaymentEligibility(
+    preview,
+    refundMethod,
+  )
   if (!eligibility.allowed || preview.transactionsCount === null) return null
-  const authorization = eligibility.releasesAuthorization
-    ? preview.transactions.find((transaction) => (
-        transaction.kind === 'AUTHORIZATION'
-        && transaction.status === 'SUCCESS'
-        && transaction.test
-        && (
-          transaction.manuallyCapturable
-          || positiveMoney(transaction.totalUnsettled)
-        )
-      )) || null
-    : null
-  if (eligibility.releasesAuthorization && !authorization) return null
   return Object.freeze({
-    schema: 'shopify-order-cancel-payment-evidence-v1' as const,
+    schema: 'shopify-order-cancel-payment-evidence-v2' as const,
     transactionsCount: preview.transactionsCount,
-    authorizationTransactionId: authorization?.id || null,
-    authorizationAmount: authorization
-      ? Object.freeze({ ...authorization.amount })
-      : null,
+    transactionsHash: cancellationTransactionsHash(preview.transactions),
+    totalReceived: Object.freeze({ ...preview.totalReceived }),
+    totalRefunded: Object.freeze({ ...preview.totalRefunded }),
+    totalCapturable: Object.freeze({ ...preview.totalCapturable }),
+    refundMethod,
   })
 }
 
@@ -859,6 +910,47 @@ export function shopifyOrderCancellationPaymentReleased(
   preview: ShopifyOrderManagementPreview,
   expected: ShopifyOrderCancellationPaymentEvidence,
 ) {
+  if (expected.schema === 'shopify-order-cancel-payment-evidence-v2') {
+    const sameCurrency = [
+      preview.totalReceived,
+      preview.totalRefunded,
+      preview.totalCapturable,
+    ].every((money) => money.currencyCode === expected.totalReceived.currencyCode)
+      && expected.totalRefunded.currencyCode === expected.totalReceived.currencyCode
+      && expected.totalCapturable.currencyCode === expected.totalReceived.currencyCode
+    const refundProven = expected.refundMethod === 'none'
+      ? compareDecimalAmounts(
+          preview.totalRefunded.amount,
+          expected.totalRefunded.amount,
+        ) === 0
+      : compareDecimalAmounts(
+          preview.totalRefunded.amount,
+          expected.totalReceived.amount,
+        ) >= 0
+    const unexpectedCapturedPayment = zeroMoney(expected.totalReceived)
+      && preview.transactions.some((transaction) => (
+        transaction.status === 'SUCCESS'
+        && ['CAPTURE', 'SALE'].includes(transaction.kind)
+        && positiveMoney(transaction.amount)
+      ))
+    return sameCurrency
+      && preview.paymentEvidenceComplete
+      && preview.transactionsCount !== null
+      && preview.transactionsCount >= expected.transactionsCount
+      && compareDecimalAmounts(
+        preview.totalReceived.amount,
+        expected.totalReceived.amount,
+      ) === 0
+      && !preview.capturable
+      && zeroMoney(preview.totalCapturable)
+      && refundProven
+      && !unexpectedCapturedPayment
+      && !preview.transactions.some((transaction) => (
+        UNRESOLVED_TRANSACTION_STATUSES.has(transaction.status)
+        || transaction.manuallyCapturable
+        || positiveMoney(transaction.totalUnsettled)
+      ))
+  }
   const expectedAuthorization = expected.authorizationTransactionId
     ? preview.transactions.find((transaction) => (
         transaction.id === expected.authorizationTransactionId
@@ -886,8 +978,7 @@ export function shopifyOrderCancellationPaymentReleased(
           && zeroMoney(expectedAuthorization.totalUnsettled)
         )
       )
-  return expected.schema === 'shopify-order-cancel-payment-evidence-v1'
-    && preview.paymentEvidenceComplete
+  return preview.paymentEvidenceComplete
     && preview.transactionsCount !== null
     && preview.transactionsCount >= expected.transactionsCount
     && preview.unpaid
@@ -1687,6 +1778,11 @@ function parsePreview(
       'order total received',
       shopCurrencyCode,
     ),
+    totalRefunded: strictPreviewMoney(
+      order.totalRefundedSet,
+      'order total refunded',
+      shopCurrencyCode,
+    ),
     totalCapturable: strictPreviewMoney(
       order.totalCapturableSet,
       'order total capturable',
@@ -1767,6 +1863,9 @@ const SHOPIFY_ORDER_MANAGEMENT_PREVIEW_QUERY =
         shopMoney { amount currencyCode }
       }
       totalReceivedSet {
+        shopMoney { amount currencyCode }
+      }
+      totalRefundedSet {
         shopMoney { amount currencyCode }
       }
       totalCapturableSet {
@@ -2257,10 +2356,10 @@ export async function updateShopifyOrderMetadata(
 }
 
 const SHOPIFY_ORDER_CANCEL_MUTATION =
-  `mutation ClawPilotShopifyTestOrderCancel(
+  `mutation ClawPilotShopifyOrderCancel(
     $orderId: ID!
     $notifyCustomer: Boolean!
-    $refundMethod: OrderCancelRefundMethodInput!
+    $refundMethod: OrderCancelRefundMethodInput
     $restock: Boolean!
     $reason: OrderCancelReason!
     $staffNote: String
@@ -2278,22 +2377,44 @@ const SHOPIFY_ORDER_CANCEL_MUTATION =
     }
   }`
 
-export async function cancelShopifyTestOrder(
+export async function cancelShopifyOrder(
   credential: ShopifyCommerceRuntimeCredential,
   input: {
     orderGid: unknown
     reason?: unknown
     staffNote?: unknown
+    refundMethod?: unknown
+    restock?: unknown
+    notifyCustomer?: unknown
   },
   options: ShopifyCommerceClientOptions = {},
   overrides: Partial<ShopifyOrderManagementDependencies> = {},
 ): Promise<ShopifyOrderCancelMutationResult> {
   const orderGid = inputGid(input.orderGid, 'Shopify order ID', ORDER_GID_PATTERN)
   const reason = input.reason === undefined ? 'STAFF' : input.reason
-  if (reason !== 'OTHER' && reason !== 'STAFF') {
+  if (![
+    'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+  ].includes(String(reason))) {
     fail(
       'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
-      'Shopify cancellation reason must be STAFF or OTHER',
+      'Shopify cancellation reason is invalid',
+    )
+  }
+  const refundMethod = input.refundMethod === undefined
+    ? 'none' : input.refundMethod
+  if (refundMethod !== 'none' && refundMethod !== 'original_payment_methods') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify cancellation refund choice is invalid',
+    )
+  }
+  const restock = input.restock === undefined ? false : input.restock
+  const notifyCustomer = input.notifyCustomer === undefined
+    ? false : input.notifyCustomer
+  if (typeof restock !== 'boolean' || typeof notifyCustomer !== 'boolean') {
+    fail(
+      'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+      'Shopify cancellation options are invalid',
     )
   }
   const staffNote = normalizeStaffNote(input.staffNote, false)
@@ -2302,12 +2423,15 @@ export async function cancelShopifyTestOrder(
     credential,
     {
       query: SHOPIFY_ORDER_CANCEL_MUTATION,
-      operationName: 'ClawPilotShopifyTestOrderCancel',
+      operationName: 'ClawPilotShopifyOrderCancel',
       variables: {
         orderId: orderGid,
-        notifyCustomer: false,
-        refundMethod: { originalPaymentMethodsRefund: false },
-        restock: false,
+        notifyCustomer,
+        refundMethod: {
+          originalPaymentMethodsRefund:
+            refundMethod === 'original_payment_methods',
+        },
+        restock,
         reason,
         staffNote,
       },
@@ -2326,7 +2450,7 @@ export async function cancelShopifyTestOrder(
   if (safeUserErrors(payload.orderCancelUserErrors, { allowCode: true }).length) {
     providerRejected(
       'SHOPIFY_ORDER_CANCEL_REJECTED',
-      'Shopify rejected the test-order cancellation',
+      'Shopify rejected the order cancellation',
       'cancel',
     )
   }
@@ -2344,6 +2468,9 @@ export async function cancelShopifyTestOrder(
     done: strictBoolean(job.done, 'cancellation job state'),
   }
 }
+
+/** @deprecated Use cancelShopifyOrder. Retained for adapter compatibility. */
+export const cancelShopifyTestOrder = cancelShopifyOrder
 
 const SHOPIFY_FULFILLMENT_CANCEL_MUTATION =
   `mutation ClawPilotShopifyTestFulfillmentCancel($id: ID!) {
@@ -2744,24 +2871,59 @@ function normalizeAction(action: ShopifyOrderManagementAction): ShopifyOrderMana
   }
   if (action.type === 'cancel') {
     const reason = action.reason === undefined ? 'STAFF' : action.reason
-    if (reason !== 'OTHER' && reason !== 'STAFF') {
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(reason)) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
-        'Shopify cancellation reason must be STAFF or OTHER',
+        'Shopify cancellation reason is invalid',
+      )
+    }
+    const refundMethod = action.refundMethod === undefined
+      ? 'none' : action.refundMethod
+    if (refundMethod !== 'none' && refundMethod !== 'original_payment_methods') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify cancellation refund choice is invalid',
+      )
+    }
+    const restock = action.restock === undefined ? false : action.restock
+    const notifyCustomer = action.notifyCustomer === undefined
+      ? false : action.notifyCustomer
+    if (typeof restock !== 'boolean' || typeof notifyCustomer !== 'boolean') {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Shopify cancellation options are invalid',
       )
     }
     return {
       type: 'cancel',
       reason,
       staffNote: normalizeStaffNote(action.staffNote, false),
+      refundMethod,
+      restock,
+      notifyCustomer,
     }
   }
   if (action.type === 'cancel_order_after_fulfillment_reversal') {
     const reason = action.reason === undefined ? 'STAFF' : action.reason
-    if (reason !== 'OTHER' && reason !== 'STAFF') {
+    if (![
+      'CUSTOMER', 'DECLINED', 'FRAUD', 'INVENTORY', 'OTHER', 'STAFF',
+    ].includes(reason)) {
       fail(
         'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
-        'Shopify cancellation reason must be STAFF or OTHER',
+        'Shopify cancellation reason is invalid',
+      )
+    }
+    if (
+      (action.refundMethod !== undefined && action.refundMethod !== 'none')
+      || (action.restock !== undefined && action.restock !== false)
+      || (action.notifyCustomer !== undefined
+        && action.notifyCustomer !== false)
+    ) {
+      fail(
+        'SHOPIFY_ORDER_MANAGEMENT_INPUT_INVALID',
+        'Post-reversal cancellation options are fixed',
       )
     }
     return {
@@ -2778,6 +2940,9 @@ function normalizeAction(action: ShopifyOrderManagementAction): ShopifyOrderMana
       ),
       reason,
       staffNote: normalizeStaffNote(action.staffNote, false),
+      refundMethod: 'none',
+      restock: false,
+      notifyCustomer: false,
     }
   }
   if (action.type === 'cancel_fulfillment') {
@@ -3112,8 +3277,10 @@ function assertTestOrder(preview: ShopifyOrderManagementPreview) {
   }
 }
 
-function assertCancellationEligible(preview: ShopifyOrderManagementPreview) {
-  assertTestOrder(preview)
+function assertCancellationEligible(
+  preview: ShopifyOrderManagementPreview,
+  refundMethod: ShopifyOrderCancellationRefundMethod,
+) {
   if (
     preview.cancelledAt !== null
     || preview.closed
@@ -3122,16 +3289,19 @@ function assertCancellationEligible(preview: ShopifyOrderManagementPreview) {
   ) {
     fail(
       'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
-      'The test order is not open, wholly unfulfilled, and without returns',
+      'The order is not open, wholly unfulfilled, and without returns',
       409,
       { stage: 'eligibility' },
     )
   }
-  const payment = shopifyOrderCancellationPaymentEligibility(preview)
+  const payment = shopifyOrderCancellationPaymentEligibility(
+    preview,
+    refundMethod,
+  )
   if (!payment.allowed) {
     fail(
       'SHOPIFY_ORDER_CANCEL_NOT_ELIGIBLE',
-      payment.reason || 'The test order payment state is not eligible for cancellation',
+      payment.reason || 'The order payment state is not eligible for cancellation',
       409,
       { stage: 'eligibility' },
     )
@@ -3145,7 +3315,8 @@ function assertPostReversalCancellationEligible(
     { type: 'cancel_order_after_fulfillment_reversal' }
   >,
 ) {
-  assertCancellationEligible(preview)
+  assertTestOrder(preview)
+  assertCancellationEligible(preview, action.refundMethod || 'none')
   const reversedFulfillment = targetFulfillment(
     preview,
     action.reversedFulfillmentGid!,
@@ -3926,10 +4097,13 @@ export async function executeShopifyOrderManagementAction(
     if (action.type === 'cancel_order_after_fulfillment_reversal') {
       assertPostReversalCancellationEligible(before, action)
     } else {
-      assertCancellationEligible(before)
+      assertCancellationEligible(before, action.refundMethod || 'none')
     }
     const cancellationPaymentEvidence =
-      shopifyOrderCancellationPaymentEvidence(before)
+      shopifyOrderCancellationPaymentEvidence(
+        before,
+        action.refundMethod || 'none',
+      )
     if (!cancellationPaymentEvidence) {
       fail(
         'SHOPIFY_ORDER_CANCEL_PAYMENT_EVIDENCE_INVALID',
@@ -3952,12 +4126,15 @@ export async function executeShopifyOrderManagementAction(
     }
     let mutation: ShopifyOrderCancelMutationResult
     try {
-      mutation = await cancelShopifyTestOrder(
+      mutation = await cancelShopifyOrder(
         runtimeCredential,
         {
           orderGid: before.id,
           reason: action.reason,
           staffNote: action.staffNote,
+          refundMethod: action.refundMethod,
+          restock: action.restock,
+          notifyCustomer: action.notifyCustomer,
         },
         options,
         dependencies,
