@@ -3679,6 +3679,10 @@ async function hydrateInteractionRows(
   return rows.map((row) => interactionFromRow(row, byInteraction.get(String(row.id)) || []))
 }
 
+function hydrateInteractionRowsWithClient(client: PoolClient, rows: Record<string, unknown>[], pipelineId: string) {
+  return hydrateInteractionRows(rows, pipelineId, (text, values) => client.query<Record<string, unknown>>(text, values))
+}
+
 function hydrateInteractionRowsWithPool(rows: Record<string, unknown>[], pipelineId: string) {
   return hydrateInteractionRows(rows, pipelineId, (text, values) => query<Record<string, unknown>>(text, values))
 }
@@ -4898,6 +4902,301 @@ export async function listCrmPipelineUsersInPostgres(pipelineId: string): Promis
   }))
 }
 
+export const CRM_WORKBOOK_PROJECTION_DATA_ROW_CAPACITY = 19_996
+export const CRM_WORKBOOK_PROJECTION_PAGE_SIZE = 500
+
+export type CrmWorkbookProjectionCounts = {
+  organizations: number
+  contacts: number
+  opportunities: number
+  interactions: number
+}
+
+export type CrmWorkbookProjectionSnapshot = {
+  organizations: CrmOrganization[]
+  contacts: CrmContact[]
+  opportunities: CrmOpportunity[]
+  interactions: CrmInteraction[]
+  counts: CrmWorkbookProjectionCounts
+  dataRowCapacity: number
+}
+
+function exactProjectionCount(value: unknown, entity: keyof CrmWorkbookProjectionCounts): number {
+  const count = Number(value)
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new Error(`CRM workbook projection returned an invalid ${entity} source count`)
+  }
+  return count
+}
+
+export function assertCrmWorkbookProjectionCountsWithinCapacity(
+  counts: CrmWorkbookProjectionCounts,
+  dataRowCapacity = CRM_WORKBOOK_PROJECTION_DATA_ROW_CAPACITY,
+) {
+  for (const entity of Object.keys(counts) as Array<keyof CrmWorkbookProjectionCounts>) {
+    if (counts[entity] > dataRowCapacity) {
+      throw new Error(
+        `CRM workbook projection cannot safely write ${counts[entity]} ${entity}; `
+        + `the managed worksheet capacity is ${dataRowCapacity} data rows`,
+      )
+    }
+  }
+}
+
+async function readCrmWorkbookProjectionPages(
+  client: PoolClient,
+  input: {
+    pipelineId: string
+    entity: keyof CrmWorkbookProjectionCounts
+    expectedCount: number
+    sql: string
+    map: (row: Record<string, unknown>) => CrmOrganization | CrmContact | CrmOpportunity | CrmInteraction
+    hydrate?: (
+      rows: Record<string, unknown>[],
+      pipelineId: string,
+    ) => Promise<Array<CrmOrganization | CrmContact | CrmOpportunity | CrmInteraction>>
+  },
+) {
+  const records: Array<CrmOrganization | CrmContact | CrmOpportunity | CrmInteraction> = []
+  const seenIds = new Set<string>()
+  let cursor: string | null = null
+
+  while (records.length < input.expectedCount) {
+    const page: { rows: Record<string, unknown>[] } = await client.query<Record<string, unknown>>(
+      input.sql,
+      [input.pipelineId, cursor, CRM_WORKBOOK_PROJECTION_PAGE_SIZE],
+    )
+    if (page.rows.length === 0) break
+    const nextCursor = String(page.rows[page.rows.length - 1]?.id || '')
+    if (!nextCursor || nextCursor === cursor) {
+      throw new Error(`CRM workbook projection ${input.entity} cursor did not advance`)
+    }
+    for (const row of page.rows) {
+      const id = String(row.id || '')
+      if (!id || seenIds.has(id)) {
+        throw new Error(`CRM workbook projection ${input.entity} pagination returned a duplicate or missing id`)
+      }
+      seenIds.add(id)
+    }
+    const mapped = input.hydrate
+      ? await input.hydrate(page.rows, input.pipelineId)
+      : page.rows.map((row) => input.map(row))
+    records.push(...mapped)
+    if (records.length > input.expectedCount) {
+      throw new Error(`CRM workbook projection ${input.entity} exceeded its preflight source count`)
+    }
+    cursor = nextCursor
+  }
+
+  if (records.length !== input.expectedCount) {
+    throw new Error(
+      `CRM workbook projection ${input.entity} source-count mismatch: `
+      + `expected ${input.expectedCount}, read ${records.length}`,
+    )
+  }
+  return records
+}
+
+/**
+ * Read the four worksheet projections from one repeatable-read PostgreSQL snapshot.
+ * Counts and worksheet capacity are validated before the caller mutates Google Sheets.
+ */
+export async function readCrmWorkbookProjectionSnapshotInPostgres(input: {
+  pipelineId: string
+}): Promise<CrmWorkbookProjectionSnapshot> {
+  return withTransaction(async (client) => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const countResult = await client.query<Record<string, unknown>>(
+      `SELECT
+         EXISTS(SELECT 1 FROM pipeline_spaces WHERE id = $1::uuid) AS pipeline_exists,
+         (SELECT count(*) FROM crm_organizations organization
+          WHERE organization.pipeline_id = $1::uuid
+            AND ${activeCrmRecordSql('organization')})::text AS organizations,
+         (SELECT count(*) FROM crm_contacts contact
+          WHERE contact.pipeline_id = $1::uuid)::text AS contacts,
+         (SELECT count(*) FROM crm_opportunities opportunity
+          WHERE opportunity.pipeline_id = $1::uuid)::text AS opportunities,
+         (SELECT count(*) FROM crm_interactions interaction
+          WHERE interaction.pipeline_id = $1::uuid
+            AND ${activeCrmRecordSql('interaction')})::text AS interactions`,
+      [input.pipelineId],
+    )
+    const countRow = countResult.rows[0]
+    if (!countRow?.pipeline_exists) throw new Error('CRM workbook projection pipeline was not found')
+    const counts: CrmWorkbookProjectionCounts = {
+      organizations: exactProjectionCount(countRow.organizations, 'organizations'),
+      contacts: exactProjectionCount(countRow.contacts, 'contacts'),
+      opportunities: exactProjectionCount(countRow.opportunities, 'opportunities'),
+      interactions: exactProjectionCount(countRow.interactions, 'interactions'),
+    }
+    assertCrmWorkbookProjectionCountsWithinCapacity(counts)
+
+    const organizations = await readCrmWorkbookProjectionPages(client, {
+      pipelineId: input.pipelineId,
+      entity: 'organizations',
+      expectedCount: counts.organizations,
+      sql: `SELECT organization.*, parent.name AS parent_organization_name
+        FROM crm_organizations organization
+        LEFT JOIN crm_organizations parent
+          ON parent.pipeline_id = organization.pipeline_id
+         AND parent.id = organization.parent_organization_id
+        WHERE organization.pipeline_id = $1::uuid
+          AND ${activeCrmRecordSql('organization')}
+          AND ($2::uuid IS NULL OR organization.id > $2::uuid)
+        ORDER BY organization.id
+        LIMIT $3`,
+      map: organizationFromRow,
+    }) as CrmOrganization[]
+    const contacts = await readCrmWorkbookProjectionPages(client, {
+      pipelineId: input.pipelineId,
+      entity: 'contacts',
+      expectedCount: counts.contacts,
+      sql: `SELECT contact.*, organization.name AS organization_name
+        FROM crm_contacts contact
+        LEFT JOIN crm_organizations organization
+          ON organization.pipeline_id = contact.pipeline_id
+         AND organization.id = contact.organization_id
+        WHERE contact.pipeline_id = $1::uuid
+          AND ($2::uuid IS NULL OR contact.id > $2::uuid)
+        ORDER BY contact.id
+        LIMIT $3`,
+      map: contactFromRow,
+    }) as CrmContact[]
+    const opportunities = await readCrmWorkbookProjectionPages(client, {
+      pipelineId: input.pipelineId,
+      entity: 'opportunities',
+      expectedCount: counts.opportunities,
+      sql: `SELECT opportunity.*,
+          COALESCE(organization.name, opportunity.organization_name) AS organization_name
+        FROM crm_opportunities opportunity
+        LEFT JOIN crm_organizations organization
+          ON organization.pipeline_id = opportunity.pipeline_id
+         AND organization.id = opportunity.organization_id
+        WHERE opportunity.pipeline_id = $1::uuid
+          AND ($2::uuid IS NULL OR opportunity.id > $2::uuid)
+        ORDER BY opportunity.id
+        LIMIT $3`,
+      map: opportunityFromRow,
+    }) as CrmOpportunity[]
+    const interactions = await readCrmWorkbookProjectionPages(client, {
+      pipelineId: input.pipelineId,
+      entity: 'interactions',
+      expectedCount: counts.interactions,
+      sql: `SELECT interaction.*,
+          COALESCE(interaction.organization_id, contact.organization_id, lead.organization_id,
+            opportunity.organization_id, meeting.organization_id) AS organization_id,
+          organization.name AS organization_name,
+          contact.full_name AS contact_name,
+          contact.reference_code AS contact_reference_code,
+          contact.email AS contact_email,
+          contact.phone_work AS contact_phone_work,
+          contact.phone_mobile AS contact_phone_mobile,
+          contact.job_title AS contact_job_title,
+          lead.full_name AS lead_name,
+          opportunity.name AS opportunity_name,
+          meeting.subject AS meeting_name,
+          campaign.name AS campaign_name
+        FROM crm_interactions interaction
+        LEFT JOIN crm_contacts contact
+          ON contact.pipeline_id = interaction.pipeline_id
+         AND contact.id = interaction.contact_id
+        LEFT JOIN crm_leads lead
+          ON lead.pipeline_id = interaction.pipeline_id
+         AND lead.id = interaction.lead_id
+        LEFT JOIN crm_opportunities opportunity
+          ON opportunity.pipeline_id = interaction.pipeline_id
+         AND opportunity.id = interaction.opportunity_id
+        LEFT JOIN crm_meetings meeting
+          ON meeting.pipeline_id = interaction.pipeline_id
+         AND meeting.id = interaction.meeting_id
+        LEFT JOIN crm_campaigns campaign
+          ON campaign.pipeline_id = interaction.pipeline_id
+         AND campaign.id = interaction.campaign_id
+        LEFT JOIN crm_organizations organization
+          ON organization.pipeline_id = interaction.pipeline_id
+          AND organization.id = COALESCE(
+           interaction.organization_id, contact.organization_id, lead.organization_id,
+           opportunity.organization_id, meeting.organization_id
+         )
+        WHERE interaction.pipeline_id = $1::uuid
+          AND ${activeCrmRecordSql('interaction')}
+          AND ($2::uuid IS NULL OR interaction.id > $2::uuid)
+        ORDER BY interaction.id
+        LIMIT $3`,
+      map: interactionFromRow,
+      hydrate: (rows, pipelineId) => hydrateInteractionRowsWithClient(client, rows, pipelineId),
+    }) as CrmInteraction[]
+
+    return {
+      organizations,
+      contacts,
+      opportunities,
+      interactions,
+      counts,
+      dataRowCapacity: CRM_WORKBOOK_PROJECTION_DATA_ROW_CAPACITY,
+    }
+  })
+}
+
+export type CrmPipelineValueSnapshot = {
+  totalOpportunities: number
+  activeOpportunities: number
+  activePipelineValue: number
+  weightedPipelineValue: number
+}
+
+async function readCrmPipelineValueSnapshotWithClient(
+  client: PoolClient,
+  input: { pipelineId: string; organizationId?: string | null },
+): Promise<CrmPipelineValueSnapshot> {
+  const result = await client.query<Record<string, unknown>>(
+    `WITH scope AS (
+       SELECT pipeline.id
+       FROM pipeline_spaces pipeline
+       WHERE pipeline.id = $1::uuid
+         AND ($2::uuid IS NULL OR pipeline.workspace_organization_id = $2::uuid)
+     )
+     SELECT
+       (SELECT count(*) FROM scope)::text AS scope_count,
+       count(opportunity.id)::text AS total_opportunities,
+       count(opportunity.id) FILTER (
+         WHERE lower(btrim(COALESCE(opportunity.status, '')))
+           NOT IN ('won', 'lost', 'closed', 'abandoned')
+       )::text AS active_opportunities,
+       COALESCE(sum(COALESCE(opportunity.amount, 0)) FILTER (
+         WHERE lower(btrim(COALESCE(opportunity.status, '')))
+           NOT IN ('won', 'lost', 'closed', 'abandoned')
+       ), 0)::text AS active_pipeline_value,
+       COALESCE(sum(COALESCE(opportunity.amount, 0) * COALESCE(opportunity.probability, 0) / 100) FILTER (
+         WHERE lower(btrim(COALESCE(opportunity.status, '')))
+           NOT IN ('won', 'lost', 'closed', 'abandoned')
+       ), 0)::text AS weighted_pipeline_value
+     FROM scope
+     LEFT JOIN crm_opportunities opportunity ON opportunity.pipeline_id = scope.id`,
+    [input.pipelineId, input.organizationId || null],
+  )
+  if (!result.rows.length || finite(result.rows[0]?.scope_count) !== 1) {
+    throw new Error('Pipeline value snapshot scope was not found')
+  }
+  const row = result.rows[0]
+  return {
+    totalOpportunities: finite(row.total_opportunities),
+    activeOpportunities: finite(row.active_opportunities),
+    activePipelineValue: finite(row.active_pipeline_value),
+    weightedPipelineValue: finite(row.weighted_pipeline_value),
+  }
+}
+
+export async function readCrmPipelineValueSnapshotFromPostgres(input: {
+  pipelineId: string
+  organizationId?: string | null
+}): Promise<CrmPipelineValueSnapshot> {
+  return withTransaction(async (client) => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    return readCrmPipelineValueSnapshotWithClient(client, input)
+  })
+}
+
 export type CrmPipelineInteractionMonth = {
   month: string
   label: string
@@ -4994,15 +5293,11 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
     campaign: string
     other: string
     total_contacts: string
-    total_opportunities: string
-    active_opportunities: string
     open_opportunities: string
     on_hold_opportunities: string
     high_priority_active_opportunities: string
     won_opportunities: string
     lost_opportunities: string
-    active_pipeline_value: string
-    weighted_pipeline_value: string
     opportunity_stage_counts: string
     active_by_stage: string
     active_by_close_quarter: string
@@ -5016,8 +5311,10 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
     outside_or_unscheduled_weighted: string
   }
 
-  const result = await query<ReportRow>(
-    `WITH scope AS (
+  const { result, valueSnapshot } = await withTransaction(async (client) => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const result = await client.query<ReportRow>(
+      `WITH scope AS (
        SELECT pipeline.id
        FROM pipeline_spaces pipeline
        WHERE pipeline.id = $1::uuid
@@ -5231,13 +5528,6 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
          (SELECT count(*)
           FROM crm_contacts contact
           JOIN scope ON scope.id = contact.pipeline_id)::text AS total_contacts,
-         (SELECT count(*)
-          FROM crm_opportunities opportunity
-          JOIN scope ON scope.id = opportunity.pipeline_id)::text AS total_opportunities,
-         (SELECT count(*)
-         FROM crm_opportunities opportunity
-         JOIN scope ON scope.id = opportunity.pipeline_id
-         WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS active_opportunities,
          (SELECT count(*) FROM active_opportunity_snapshot WHERE status_key = 'open')::text AS open_opportunities,
          (SELECT count(*) FROM active_opportunity_snapshot WHERE status_key = 'on hold')::text AS on_hold_opportunities,
          (SELECT count(*) FROM active_opportunity_snapshot WHERE priority_key IN ('A+', 'A'))::text AS high_priority_active_opportunities,
@@ -5249,14 +5539,6 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
           FROM crm_opportunities opportunity
           JOIN scope ON scope.id = opportunity.pipeline_id
           WHERE lower(btrim(COALESCE(opportunity.status, ''))) IN ('lost', 'abandoned'))::text AS lost_opportunities,
-         (SELECT COALESCE(sum(opportunity.amount), 0)
-          FROM crm_opportunities opportunity
-          JOIN scope ON scope.id = opportunity.pipeline_id
-          WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS active_pipeline_value,
-         (SELECT COALESCE(sum(opportunity.amount * opportunity.probability / 100), 0)
-          FROM crm_opportunities opportunity
-          JOIN scope ON scope.id = opportunity.pipeline_id
-          WHERE lower(btrim(COALESCE(opportunity.status, ''))) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
          (SELECT COALESCE(
             jsonb_agg(
               jsonb_build_object('stage', stage_counts.stage, 'count', stage_counts.count)
@@ -5323,15 +5605,11 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
        summary.interactions,
        summary.opportunities_created,
        summary.total_contacts,
-       summary.total_opportunities,
-       summary.active_opportunities,
        summary.open_opportunities,
        summary.on_hold_opportunities,
        summary.high_priority_active_opportunities,
        summary.won_opportunities,
        summary.lost_opportunities,
-       summary.active_pipeline_value,
-       summary.weighted_pipeline_value,
        summary.opportunity_stage_counts,
        summary.active_by_stage,
        summary.active_by_close_quarter,
@@ -5358,22 +5636,25 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
      CROSS JOIN months
      LEFT JOIN interaction_months ON interaction_months.month_start = months.month_start
      ORDER BY months.month_start`,
-    [input.pipelineId, input.organizationId, input.startAt, input.endAtExclusive, input.timeZone, input.snapshotDate],
-  )
+      [input.pipelineId, input.organizationId, input.startAt, input.endAtExclusive, input.timeZone, input.snapshotDate],
+    )
+    if (!result.rows.length) throw new Error('Pipeline reporting scope was not found')
+    const valueSnapshot = await readCrmPipelineValueSnapshotWithClient(client, input)
+    return { result, valueSnapshot }
+  })
 
-  if (!result.rows.length) throw new Error('Pipeline reporting scope was not found')
   const first = result.rows[0]
   const snapshot = normalizePipelineReportingSnapshot({
     totalContacts: first.total_contacts,
-    totalOpportunities: first.total_opportunities,
-    activeOpportunities: first.active_opportunities,
+    totalOpportunities: valueSnapshot.totalOpportunities,
+    activeOpportunities: valueSnapshot.activeOpportunities,
     openOpportunities: first.open_opportunities,
     onHoldOpportunities: first.on_hold_opportunities,
     highPriorityActiveOpportunities: first.high_priority_active_opportunities,
     wonOpportunities: first.won_opportunities,
     lostOpportunities: first.lost_opportunities,
-    activePipelineValue: first.active_pipeline_value,
-    weightedPipelineValue: first.weighted_pipeline_value,
+    activePipelineValue: valueSnapshot.activePipelineValue,
+    weightedPipelineValue: valueSnapshot.weightedPipelineValue,
     opportunitiesByStage: first.opportunity_stage_counts,
     activeByStage: first.active_by_stage,
     activeByCloseQuarter: first.active_by_close_quarter,
@@ -5410,8 +5691,10 @@ export async function readCrmPipelineActivityReportFromPostgres(input: {
 }
 
 export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<CrmSummary> {
-  const result = await query<Record<string, string>>(
-    `
+  const { result, valueSnapshot } = await withTransaction(async (client) => {
+    await client.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const result = await client.query<Record<string, string>>(
+      `
       SELECT
         (SELECT count(*) FROM crm_organizations organization
          WHERE pipeline_id = $1::uuid
@@ -5421,7 +5704,6 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
          WHERE pipeline_id = $1::uuid
            AND ${activeCrmRecordSql('product')})::text AS products,
         (SELECT count(*) FROM crm_leads lead WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('lead')})::text AS leads,
-        (SELECT count(*) FROM crm_opportunities WHERE pipeline_id = $1::uuid)::text AS opportunities,
         (SELECT count(*) FROM crm_meetings WHERE pipeline_id = $1::uuid)::text AS meetings,
         (SELECT count(*) FROM crm_interactions interaction WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('interaction')})::text AS interactions,
         (SELECT count(*)
@@ -5437,8 +5719,6 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
              opportunity.organization_id, meeting.organization_id
            ) IS NULL)::text AS needs_review_interactions,
         (SELECT count(*) FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')})::text AS campaigns,
-        (SELECT COALESCE(sum(amount), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS open_pipeline_value,
-        (SELECT COALESCE(sum(amount * probability / 100), 0) FROM crm_opportunities WHERE pipeline_id = $1::uuid AND lower(COALESCE(status, '')) NOT IN ('won', 'lost', 'closed', 'abandoned'))::text AS weighted_pipeline_value,
         (SELECT count(*) FROM (
           SELECT sync_status FROM crm_organizations organization
             WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('organization')}
@@ -5464,14 +5744,19 @@ export async function readCrmSummaryFromPostgres(pipelineId: string): Promise<Cr
           UNION ALL SELECT sync_status FROM crm_campaigns campaign WHERE pipeline_id = $1::uuid AND ${activeCrmRecordSql('campaign')}
         ) records WHERE sync_status = 'failed')::text AS failed_sync
     `,
-    [pipelineId],
-  )
+      [pipelineId],
+    )
+    const valueSnapshot = await readCrmPipelineValueSnapshotWithClient(client, { pipelineId })
+    return { result, valueSnapshot }
+  })
   const row = result.rows[0] || {}
   return {
     organizations: finite(row.organizations), contacts: finite(row.contacts), products: finite(row.products), leads: finite(row.leads),
-    opportunities: finite(row.opportunities), meetings: finite(row.meetings), interactions: finite(row.interactions),
-    campaigns: finite(row.campaigns), openPipelineValue: finite(row.open_pipeline_value),
-    weightedPipelineValue: finite(row.weighted_pipeline_value), pendingSync: finite(row.pending_sync), failedSync: finite(row.failed_sync),
+    opportunities: valueSnapshot.totalOpportunities, activeOpportunities: valueSnapshot.activeOpportunities,
+    meetings: finite(row.meetings), interactions: finite(row.interactions),
+    campaigns: finite(row.campaigns), openPipelineValue: valueSnapshot.activePipelineValue,
+    activePipelineValue: valueSnapshot.activePipelineValue,
+    weightedPipelineValue: valueSnapshot.weightedPipelineValue, pendingSync: finite(row.pending_sync), failedSync: finite(row.failed_sync),
     needsReviewInteractions: finite(row.needs_review_interactions),
   }
 }

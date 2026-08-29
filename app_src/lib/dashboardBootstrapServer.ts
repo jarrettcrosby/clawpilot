@@ -31,9 +31,12 @@ async function readPipeline(
   return {
     summary: {
       opportunities: summary.opportunities,
+      activeOpportunities: summary.activeOpportunities,
       organizations: summary.organizations,
       contacts: summary.contacts,
       totalOpenValue: summary.openPipelineValue,
+      activePipelineValue: summary.activePipelineValue,
+      weightedPipelineValue: summary.weightedPipelineValue,
     },
     pipeline: { id: pipelineId, name: pipelineName || 'Pipeline' },
   }
