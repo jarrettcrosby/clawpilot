@@ -32,9 +32,12 @@ export type DashboardWorkspaceSnapshot = {
 export type DashboardPipelineSnapshot = {
   summary: {
     opportunities: number
+    activeOpportunities: number
     organizations: number
     contacts: number
     totalOpenValue: number
+    activePipelineValue: number
+    weightedPipelineValue: number
   }
   pipeline?: { id: string; name: string } | null
 }

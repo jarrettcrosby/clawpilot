@@ -19,9 +19,9 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    # Normal validation completes in roughly six minutes. Bound an abnormal
-    # stall so one wedged test cannot consume an unbounded Actions budget.
-    timeout-minutes: 30
+    # Leave room for the full PostgreSQL and browser contract matrix on a slow
+    # hosted runner while still bounding a genuinely wedged validation job.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v5

@@ -397,10 +397,12 @@ export type CrmSummary = {
   products: number
   leads: number
   opportunities: number
+  activeOpportunities: number
   meetings: number
   interactions: number
   campaigns: number
   openPipelineValue: number
+  activePipelineValue: number
   weightedPipelineValue: number
   pendingSync: number
   failedSync: number

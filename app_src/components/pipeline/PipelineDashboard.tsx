@@ -2,6 +2,7 @@
 
 import { type ReactElement, type ReactNode } from 'react'
 import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import MenuItem from '@mui/material/MenuItem'
@@ -16,6 +17,7 @@ import type {
   PipelineSnapshot,
   ReportPreset,
 } from '@/components/pipeline/usePipelineReport'
+import { formatPipelineCurrency } from '@/lib/crm/pipelineCurrency'
 
 type Props = {
   stages: string[]
@@ -91,13 +93,7 @@ function forecastMonthLabel(value: string) {
 }
 
 function money(value: number) {
-  const number = Number(value || 0)
-  return number.toLocaleString('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: Number.isInteger(number) ? 0 : 2,
-    maximumFractionDigits: 2,
-  })
+  return formatPipelineCurrency(Number(value || 0))
 }
 
 function shortMoney(value: number) {
@@ -552,6 +548,7 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
     customPeriodGuidance,
     reportError,
     isReportPending,
+    retryReport,
   } = reporting
   const currentContacts = snapshot?.totalContacts ?? totalContacts
 
@@ -661,9 +658,12 @@ export default function PipelineDashboard({ stages, totalContacts, lastSyncedLab
       ) : null}
 
       {reportError ? (
-        <Typography sx={{ mt: 1.5, fontFamily: DASHBOARD_FONT, color: '#FFB4AB', fontSize: 12 }}>
-          {reportError} Previously loaded reporting data remains visible when available.
-        </Typography>
+        <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'flex-start', sm: 'center' }} spacing={1} sx={{ mt: 1.5 }}>
+          <Typography sx={{ fontFamily: DASHBOARD_FONT, color: '#FFB4AB', fontSize: 12 }}>
+            {reportError}
+          </Typography>
+          <Button size="small" variant="outlined" onClick={retryReport}>Retry</Button>
+        </Stack>
       ) : null}
 
       <Box sx={{ mt: 2, display: 'grid', gridTemplateColumns: { xs: '1fr', lg: 'repeat(2, minmax(0, 1fr))' }, gap: 2 }}>

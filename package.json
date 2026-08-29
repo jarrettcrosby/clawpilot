@@ -171,7 +171,7 @@
     "test:dashboard-workspace-preferences": "node scripts/test-dashboard-workspace-preferences.mjs",
     "test:measurement-preferences": "node --experimental-strip-types --test app_src/tests/measurements/measurements.test.ts && node scripts/test-measurement-preferences.mjs",
     "test:pipeline-opportunities": "node scripts/test-pipeline-opportunity-workflow.mjs",
-    "test:pipeline-reporting": "node scripts/test-pipeline-reporting.mjs && node scripts/test-pipeline-reporting-postgres.mjs && node scripts/test-pipeline-reporting-ui.mjs",
+    "test:pipeline-reporting": "node --experimental-strip-types --test app_src/tests/crm/pipeline-currency.test.ts && node scripts/test-pipeline-reporting.mjs && node scripts/test-pipeline-reporting-postgres.mjs && node scripts/test-pipeline-reporting-ui.mjs",
     "test:pipeline-workbook": "node scripts/test-pipeline-workbook-dashboard.mjs",
     "test:pipeline-brief": "node scripts/test-pipeline-brief-insights.mjs",
     "test:suitecrm-interactions": "node scripts/test-suitecrm-interaction-ingestion.mjs",
