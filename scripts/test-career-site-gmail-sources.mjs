@@ -281,6 +281,22 @@ assert.equal(
   true,
   'a candidate application receipt remains eligible after broad provider retrieval',
 )
+for (const subject of [
+  'Your application for the VP Operations position',
+  'Your application for Director of Operations',
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      senderEmail: 'no-reply@manufacturer.com',
+      subject,
+      snippet: 'We have received your application.',
+      bodyText: 'We will contact you with next steps.',
+    }),
+    true,
+    `an explicit application role receipt remains eligible: ${subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,
@@ -292,6 +308,44 @@ assert.equal(
   true,
   'a recruiter calendar call to action is not consumer marketing evidence',
 )
+assert.equal(
+  gmailSources.careerGmailMessageIsRelevant({
+    ...baseMessageSignals,
+    senderEmail: 'coach@interviewprep.com',
+    subject: 'Interview coaching opportunity',
+    snippet: 'Prepare for your next interview with a one-hour coaching session.',
+    bodyText: 'Schedule your session today. Book now.',
+    labelIds: ['CATEGORY_PROMOTIONS'],
+    listUnsubscribe: '<https://interviewprep.com/unsubscribe>',
+    listId: 'coaching.interviewprep.com',
+    precedence: 'bulk',
+  }),
+  false,
+  'a bulk interview-coaching Book now promotion is not a job interview',
+)
+for (const example of [
+  {
+    senderEmail: 'jane@bank.example',
+    subject: 'VP Credit Risk role',
+    snippet: 'I came across your profile and think you would be a strong fit.',
+    bodyText: 'Would you be open to an interview?',
+  },
+  {
+    senderEmail: 'jane@insurer.example',
+    subject: 'Director of Insurance Operations position',
+    snippet: 'Your background caught my eye and aligns with this leadership position.',
+    bodyText: 'Would you be open to an interview?',
+  },
+]) {
+  assert.equal(
+    gmailSources.careerGmailMessageIsRelevant({
+      ...baseMessageSignals,
+      ...example,
+    }),
+    true,
+    `personalized employer outreach wins over an industry term: ${example.subject}`,
+  )
+}
 assert.equal(
   gmailSources.careerGmailMessageIsRelevant({
     ...baseMessageSignals,

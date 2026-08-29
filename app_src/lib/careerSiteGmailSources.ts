@@ -75,6 +75,8 @@ const CONSUMER_PROMOTION_PATTERN = /\b(?:apr|auto loans?|car loans?|mortgage|ref
 const NON_EMPLOYMENT_APPLICATION_PATTERN = /\b(?:admissions?|college|university|mba|degree program|enrollment|student|mortgage|loan|credit|rental|lease|apartment|insurance|membership|grant application)\b/i
 const MARKETING_SUBJECT_PATTERN = /\b(?:sale|save \$|save \d|newsletter|weekly digest|exclusive offer|special offer|member offer|ends (?:today|soon)|new cars?|travel deals?)\b/i
 const MARKETING_SENDER_PATTERN = /(?:^|[.@_+-])(?:marketing|newsletter|offers?|promotions?|deals?)(?:[.@_+-]|$)/i
+const BOOKING_CTA_PATTERN = /\bbook now\b/i
+const CAREER_COACHING_SUBJECT_PATTERN = /\b(?:interview|career|job search|resume|résumé) (?:coach(?:ing)?|prep(?:aration)?)\b/i
 const RECRUITING_SENDER_PATTERN = /^(?:recruiter|recruiting|talent|careers?|jobs?|people)(?:[.+_-][^@]+)?@/i
 const JOB_PLATFORM_DOMAINS = [
   'ashbyhq.com',
@@ -143,18 +145,21 @@ export function careerGmailMessageIsRelevant(
     applicationStatus
     && /\b(?:hiring manager|candidate|requisition|job application|employment application)\b/i.test(searchable)
   )
+  const personalizedRoleOutreach = humanOutreach && roleEvidence
   const independentEmploymentProvenance = (
     employmentContext
     || directRecruiting
     || jobPlatform
+    || employmentApplicationProvenance
   )
+  const applicationRoleEvidence = explicitRole || executiveTitle
   const applicationCareerContext = (
     applicationStatus
-    && independentEmploymentProvenance
+    && (independentEmploymentProvenance || applicationRoleEvidence)
   )
   const employmentInterview = (
     interview
-    && (independentEmploymentProvenance || (humanOutreach && roleEvidence))
+    && (independentEmploymentProvenance || personalizedRoleOutreach)
   )
   const interviewScheduling = interview && INTERVIEW_SCHEDULING_PATTERN.test(searchable)
   const roleWithCareerContext = (
@@ -170,7 +175,7 @@ export function careerGmailMessageIsRelevant(
     && !interview
     && !applicationCareerContext
     && !jobAlert
-    && !(humanOutreach && roleEvidence)
+    && !personalizedRoleOutreach
     && !roleWithCareerContext
     && !platformMessage
   ) return false
@@ -179,6 +184,8 @@ export function careerGmailMessageIsRelevant(
     (applicationStatus || interview)
     && NON_EMPLOYMENT_APPLICATION_PATTERN.test(searchable)
     && !independentEmploymentProvenance
+    && !personalizedRoleOutreach
+    && !(applicationStatus && explicitRole && executiveTitle)
   )
   const mediaInterview = (
     interview
@@ -187,6 +194,19 @@ export function careerGmailMessageIsRelevant(
     && !employmentApplicationProvenance
   )
   if (nonEmploymentApplicationOrInterview || mediaInterview) return false
+
+  const bookingPromotion = (
+    BOOKING_CTA_PATTERN.test(searchable)
+    && (
+      CAREER_COACHING_SUBJECT_PATTERN.test(subject)
+      || MARKETING_SUBJECT_PATTERN.test(subject)
+      || MARKETING_SENDER_PATTERN.test(input.senderEmail)
+    )
+    && !directRecruiting
+    && !jobPlatform
+    && !personalizedRoleOutreach
+  )
+  if (bookingPromotion) return false
 
   const consumerPromotion = (
     CONSUMER_PROMOTION_PATTERN.test(subject)
