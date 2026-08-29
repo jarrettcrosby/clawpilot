@@ -3,6 +3,7 @@ import {
   GMAIL_SOURCE_DEADLINE_MS,
   MAX_GMAIL_ACTIVE_ACCOUNTS,
   MAX_GMAIL_BODY_TEXT_CHARS,
+  MAX_GMAIL_MESSAGES_PER_ACCOUNT,
   MAX_GMAIL_RESPONSE_BYTES,
   MAX_GMAIL_SNIPPET_CHARS,
   MAX_GMAIL_TOTAL_MESSAGES,
@@ -25,9 +26,20 @@ import {
 
 const GMAIL_APP = 'google-mail'
 const GMAIL_MESSAGES_PATH = '/google-mail/gmail/v1/users/me/messages'
+const GMAIL_THREADS_PATH = '/google-mail/gmail/v1/users/me/threads'
 const MAX_RAW_URL_SOURCE_CHARS = 50_000
 const GMAIL_REQUEST_CONCURRENCY = 5
-export const CAREER_GMAIL_IMMUTABLE_QUERY = '{"job alert" recruiter recruiting hiring application interview subject:(job OR role)}'
+const GMAIL_LIST_PAGE_SIZE = MAX_GMAIL_MESSAGES_PER_ACCOUNT
+const MAX_GMAIL_LIST_PAGES_PER_ACCOUNT = 4
+const MAX_GMAIL_CANDIDATES_PER_ACCOUNT = (
+  GMAIL_LIST_PAGE_SIZE * MAX_GMAIL_LIST_PAGES_PER_ACCOUNT
+)
+const MAX_GMAIL_TOTAL_CANDIDATES = MAX_GMAIL_TOTAL_MESSAGES * 4
+const GMAIL_CANDIDATE_FETCH_BATCH_SIZE = GMAIL_REQUEST_CONCURRENCY * 2
+const MAX_GMAIL_PAGE_TOKEN_CHARS = 2_048
+const MAX_THREAD_EVIDENCE_MESSAGES = 100
+const MAX_GMAIL_PROVIDER_JSON_BYTES = 8 * 1024 * 1024
+export const CAREER_GMAIL_IMMUTABLE_QUERY = '{recruiter recruiting "talent acquisition" "hiring manager" interview assessment "phone screen" "your application" "application update" "next steps" subject:(job OR role OR position OR opportunity OR application OR interview OR assessment)} -in:spam -in:trash -in:sent -in:drafts'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
 type ActiveGmailConnection = ActiveMatonGatewayConnection & {
@@ -37,6 +49,344 @@ type ActiveGmailConnection = ActiveMatonGatewayConnection & {
 type GmailMessageCandidate = {
   connection: ActiveGmailConnection
   messageId: string
+}
+
+type CareerGmailMessageSignals = {
+  senderEmail: string
+  subject: string
+  snippet: string
+  bodyText: string
+  labelIds: readonly string[]
+  listUnsubscribe: string
+  listId?: string
+  feedbackId?: string
+  precedence: string
+  autoSubmitted: string
+  sentThreadMatched?: boolean
+}
+
+const DIRECT_RECRUITING_PATTERN = /\b(?:recruiter|recruiting|talent acquisition|talent partner|hiring manager|headhunter|executive search|sourcer|sourcing (?:for|a candidate))\b/i
+const INTERVIEW_PATTERN = /\b(?:interview|phone screen|screening call|candidate interview|meet (?:the|our) hiring (?:manager|team)|technical screen|panel interview)\b/i
+const ASSESSMENT_PATTERN = /\b(?:candidate assessment|skills? assessment|technical assessment|take-home (?:exercise|assessment)|case study|background check|reference check)\b/i
+const APPLICATION_STATUS_PATTERN = /\b(?:your application|application (?:for|to|status|update)|thank you for appl(?:y|ying)|we (?:have )?received your application|candidate (?:portal|profile|application)|next steps? (?:for|in) (?:your )?application|application is (?:under review|being reviewed)|moved to (?:the )?(?:next stage|hiring manager review))\b/i
+const CANDIDATE_APPLICATION_PATTERN = /\b(?:thank you for appl(?:y|ying)|we (?:have )?received your application|your application (?:for|to|has|is|status)|application is (?:under review|being reviewed)|application has (?:been )?(?:received|submitted|moved|advanced))\b/i
+const JOB_ALERT_PATTERN = /\b(?:job alert|saved search|new jobs? (?:for|matching|you)|recommended jobs?|jobs? you may be interested in|new matches for you|jobs? for you|weekly jobs?|job digest|job roundup|top job picks?)\b/i
+const ROLE_PATTERN = /\b(?:job|role|position|opening|vacancy|career opportunity|leadership opportunity|employment opportunity)\b/i
+const EXPLICIT_JOB_CONTEXT_PATTERN = /\b(?:job|position|opening|vacancy|career opportunity|employment opportunity)\b/i
+const EXECUTIVE_TITLE_PATTERN = /\b(?:vp|svp|evp|vice president|director|head of|chief (?:operating|technology|information|financial|supply chain|people|commercial) officer|coo|cto|cio|cfo|cpo)\b/i
+const EMPLOYMENT_CONTEXT_PATTERN = /\b(?:hiring|resume|résumé|compensation|salary|employment|career|job description|requisition)\b/i
+const HUMAN_OUTREACH_PATTERN = /\b(?:(?:came across|found|reviewed|saw|noticed) your (?:profile|background|experience)|your (?:profile|background|experience) (?:(?:caught|grabbed) my (?:eye|attention)|stood out|(?:aligns|matches|fits))|(?:strong|great|excellent|good|potential) fit|would you be open|open to (?:a |an )?(?:quick )?(?:call|chat|conversation|discussion|hearing|learning|exploring)|quick (?:call|chat|conversation)|connect (?:about|regarding|to discuss)|discuss (?:a|an|the|this) (?:job|role|position|opportunity))\b/i
+const PERSONALIZED_GREETING_PATTERN = /\b(?:hi|hello|dear)\s+jarrett\b/i
+const HUMAN_RESPONSE_INVITATION_PATTERN = /\b(?:would you be interested|are you interested|can we (?:talk|speak|connect)|i(?:'d| would) (?:like|love) to (?:talk|speak|connect)|let me know if (?:you are|you're) interested)\b/i
+const INTERVIEW_SCHEDULING_PATTERN = /\b(?:schedule|scheduled|scheduling|availability|available times?|calendar|appointment|zoom|microsoft teams|google meet|reschedule)\b/i
+const MEDIA_INTERVIEW_PATTERN = /\b(?:podcast|show|episode|publication|article|webinar|guest appearance|on camera|livestream|live stream)\b/i
+const CONSUMER_PROMOTION_PATTERN = /\b(?:apr|auto loans?|car loans?|refinanc(?:e|ing)|credit cards?|checking account|savings account|cash back|rewards points?|insurance quote|pre-?approved|limited[- ]time offer|coupon|percent off|\d{1,2}% off|shop now)\b/i
+const STRONG_NON_EMPLOYMENT_PATTERN = /\b(?:admissions? (?:application|portal|program|committee)|student (?:application|admissions?|portal|enrollment)|mba (?:application|program|admissions?|degree)|degree program|enrollment (?:application|status|portal)|membership (?:application|committee|nomination|vote|ballot)|grant application|volunteer board|board (?:nomination|position|seat|election)|director nomination|nomination committee|governance committee|nominee|annual[- ]meeting|ballot|proxy(?: ballot| vote| statement)?|(?:investor|shareholder) (?:meeting|vote|ballot|proposal|nomination|proxy))\b/i
+const AMBIGUOUS_NON_EMPLOYMENT_INDUSTRY_PATTERN = /\b(?:mortgage|loan|credit|rental|lease|apartment|insurance)\b/i
+const MARKETING_SUBJECT_PATTERN = /\b(?:sale|save \$|save \d|newsletter|weekly digest|exclusive offer|special offer|member offer|ends (?:today|soon)|new cars?|travel deals?|product update|release notes?)\b/i
+const MARKETING_SENDER_PATTERN = /(?:^|[.@_+-])(?:marketing|newsletter|offers?|promotions?|deals?|jobalerts?)(?:[.@_+-]|$)/i
+const BOOKING_CTA_PATTERN = /\b(?:book now|book (?:a|an|your) (?:call|consultation|session|appointment)|schedule (?:a|an|your) (?:call|consultation|session|appointment)|reserve (?:a|an|your) (?:consultation|session|appointment|spot)|(?:choose|select|pick) (?:a|an|your) (?:available )?(?:time|slot))\b/i
+const RECRUITING_SENDER_PATTERN = /^(?:recruiter|recruiting|talent|careers?|jobs?|people)(?:[.+_-][^@]+)?@/i
+const NO_REPLY_SENDER_PATTERN = /^(?:no-?reply|do-?not-?reply|notifications?|alerts?|status|updates?)(?:[.+_-][^@]+)?@/i
+const REQUISITION_PATTERN = /\b(?:requisition|req(?:uisition)?\.?|job id|position id|opening id)\s*(?:#|:|-)?\s*[a-z0-9][a-z0-9._/-]{2,}\b/i
+const CONCRETE_ROLE_PATTERN = /\b(?:(?:senior|sr\.?|principal|staff|lead|global|regional|executive|associate|assistant)?\s*(?:vice president|president|director|manager|head|chief|officer|engineer|analyst|specialist|consultant)(?:\s+(?:of\s+)?[a-z][a-z0-9&/ -]{2,60})?)\b/i
+const EMPLOYMENT_PROCESS_PATTERN = /\b(?:job application|employment application|candidate portal|candidate profile|hiring team|hiring manager|recruiting team|talent acquisition|requisition)\b/i
+const BENEFITS_ADMIN_PATTERN = /\b(?:open enrollment|benefits enrollment|benefits statement|health benefits|retirement plan|401\s*\(?k\)?|payroll notice|pay stub|expense report|timesheet)\b/i
+const TECH_NOTIFICATION_PATTERN = /\b(?:github|dependabot|pull request|merge request|workflow run|build (?:failed|passed)|service incident|status page|degraded performance|outage|maintenance window)\b/i
+const ATS_DOMAINS = [
+  'ashbyhq.com',
+  'bamboohr.com',
+  'greenhouse.io',
+  'icims.com',
+  'jobvite.com',
+  'lever.co',
+  'myworkday.com',
+  'myworkdayjobs.com',
+  'oraclecloud.com',
+  'successfactors.com',
+  'smartrecruiters.com',
+  'ultipro.com',
+  'workablemail.com',
+  'workday.com',
+] as const
+const JOB_BOARD_DOMAINS = ['indeed.com', 'linkedin.com', 'ziprecruiter.com'] as const
+const TECH_NOTIFICATION_DOMAINS = ['github.com', 'githubstatus.com', 'statuspage.io'] as const
+
+function senderDomain(senderEmail: string): string {
+  return senderEmail.split('@').pop()?.toLowerCase() || ''
+}
+
+function domainMatches(senderEmail: string, candidates: readonly string[]): boolean {
+  const domain = senderDomain(senderEmail)
+  return candidates.some((candidate) => (
+    domain === candidate || domain.endsWith(`.${candidate}`)
+  ))
+}
+
+export type CareerGmailRelevanceReason =
+  | 'human-recruiter'
+  | 'application-process'
+  | 'sent-thread'
+  | 'excluded-folder'
+  | 'job-alert'
+  | 'bulk-or-marketing'
+  | 'non-employment'
+  | 'consumer-or-benefits'
+  | 'media-or-technical'
+  | 'insufficient-evidence'
+
+export type CareerGmailRelevance = {
+  relevant: boolean
+  reason: CareerGmailRelevanceReason
+  evidence: string[]
+  sentThreadEligible: boolean
+}
+
+/**
+ * Gmail search is only a coarse candidate selector. This second deterministic
+ * gate prevents generic uses of "application" or "opportunity" in consumer
+ * marketing from becoming Career Desk inbox records.
+ */
+export function careerGmailMessageRelevance(
+  input: CareerGmailMessageSignals,
+): CareerGmailRelevance {
+  const labels = new Set(input.labelIds.map((label) => label.trim().toUpperCase()))
+  if (
+    labels.has('SPAM')
+    || labels.has('TRASH')
+    || labels.has('SENT')
+    || labels.has('DRAFT')
+  ) {
+    return {
+      relevant: false,
+      reason: 'excluded-folder',
+      evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+
+  const subject = input.subject.slice(0, 1_000)
+  const searchable = [subject, input.snippet, input.bodyText.slice(0, 12_000)].join('\n')
+  const interview = INTERVIEW_PATTERN.test(searchable)
+  const assessment = ASSESSMENT_PATTERN.test(searchable)
+  const applicationStatus = APPLICATION_STATUS_PATTERN.test(searchable)
+  const jobAlertSubject = JOB_ALERT_PATTERN.test(subject)
+  const jobAlertBody = JOB_ALERT_PATTERN.test([input.snippet, input.bodyText].join('\n'))
+  const humanOutreach = (
+    HUMAN_OUTREACH_PATTERN.test(searchable)
+    || (PERSONALIZED_GREETING_PATTERN.test(searchable)
+      && HUMAN_RESPONSE_INVITATION_PATTERN.test(searchable))
+  )
+  const executiveTitle = EXECUTIVE_TITLE_PATTERN.test(searchable)
+  const employmentContext = EMPLOYMENT_CONTEXT_PATTERN.test(searchable)
+  const explicitRole = ROLE_PATTERN.test(searchable)
+  const concreteRole = (
+    executiveTitle
+    || CONCRETE_ROLE_PATTERN.test(searchable.replace(/\bhiring manager\b/gi, ''))
+  )
+  const requisition = REQUISITION_PATTERN.test(searchable)
+  const roleEvidence = concreteRole || requisition
+  const candidateApplication = CANDIDATE_APPLICATION_PATTERN.test(searchable)
+  const atsSender = domainMatches(input.senderEmail, ATS_DOMAINS)
+  const jobBoardSender = domainMatches(input.senderEmail, JOB_BOARD_DOMAINS)
+  const noReplySender = NO_REPLY_SENDER_PATTERN.test(input.senderEmail)
+  const recruitingSender = (
+    DIRECT_RECRUITING_PATTERN.test(input.senderEmail)
+    || RECRUITING_SENDER_PATTERN.test(input.senderEmail)
+    || atsSender
+  )
+  const processProvenance = (
+    atsSender
+    || recruitingSender
+    || EMPLOYMENT_PROCESS_PATTERN.test(searchable)
+  )
+  const processTraffic = applicationStatus || interview || assessment
+  const concreteEmployment = (
+    roleEvidence
+    || EMPLOYMENT_PROCESS_PATTERN.test(searchable)
+    || (employmentContext && explicitRole)
+  )
+  const employmentApplicationProvenance = (
+    applicationStatus
+    && /\b(?:hiring manager|requisition|job application|employment application)\b/i.test(searchable)
+  )
+  const personalizedRoleOutreach = humanOutreach && roleEvidence
+  const independentEmploymentProvenance = (
+    employmentContext
+    || recruitingSender
+    || atsSender
+    || employmentApplicationProvenance
+  )
+  const unmistakableEmploymentProvenance = (
+    atsSender
+    || employmentApplicationProvenance
+    || (
+      recruitingSender
+      && /\b(?:job|employment|hiring|requisition|compensation|salary)\b/i.test(searchable)
+    )
+  )
+  const bulkDistribution = (
+    labels.has('CATEGORY_PROMOTIONS')
+    || labels.has('CATEGORY_SOCIAL')
+    || labels.has('CATEGORY_FORUMS')
+    || Boolean(String(input.listUnsubscribe || '').trim())
+    || Boolean(String(input.listId || '').trim())
+    || Boolean(String(input.feedbackId || '').trim())
+    || MARKETING_SENDER_PATTERN.test(input.senderEmail)
+    || /\b(?:bulk|list|junk)\b/i.test(input.precedence)
+  )
+  const automatedMessage = /\bauto-(?:generated|replied)\b/i.test(input.autoSubmitted)
+  const bulkMessage = bulkDistribution || automatedMessage
+  const bookingPromotion = (
+    BOOKING_CTA_PATTERN.test(searchable)
+    && (bulkDistribution || MARKETING_SUBJECT_PATTERN.test(subject))
+  )
+  const nonEmployment = (
+    (STRONG_NON_EMPLOYMENT_PATTERN.test(searchable) && !unmistakableEmploymentProvenance)
+    || (
+      processTraffic
+      && AMBIGUOUS_NON_EMPLOYMENT_INDUSTRY_PATTERN.test(searchable)
+      && !independentEmploymentProvenance
+      && !personalizedRoleOutreach
+    )
+  )
+  const mediaInterview = (
+    (interview || assessment)
+    && MEDIA_INTERVIEW_PATTERN.test(searchable)
+    && !processProvenance
+  )
+  const technicalNotification = (
+    (domainMatches(input.senderEmail, TECH_NOTIFICATION_DOMAINS)
+      || TECH_NOTIFICATION_PATTERN.test(subject))
+    && !processProvenance
+  )
+  const consumerPromotion = (
+    CONSUMER_PROMOTION_PATTERN.test(subject)
+    || (CONSUMER_PROMOTION_PATTERN.test(searchable) && !processTraffic)
+  )
+  const benefitsAdministration = (
+    BENEFITS_ADMIN_PATTERN.test(subject)
+    || (BENEFITS_ADMIN_PATTERN.test(searchable) && !processTraffic)
+  )
+
+  const customApplicationProcess = (
+    candidateApplication
+    && roleEvidence
+    && !bulkDistribution
+    && !jobBoardSender
+  )
+  const strongApplicationProcess = (
+    processTraffic
+    && concreteEmployment
+    && (atsSender || customApplicationProcess || (!bulkDistribution && processProvenance))
+  )
+  const personalizedRecruiterEvidence = humanOutreach && roleEvidence && !bulkDistribution
+  const trueJobAlert = (
+    jobAlertSubject
+    || (jobBoardSender && MARKETING_SUBJECT_PATTERN.test(subject))
+    || (bulkDistribution
+      && jobAlertBody
+      && !strongApplicationProcess
+      && !personalizedRecruiterEvidence)
+  )
+
+  if (trueJobAlert) {
+    return {
+      relevant: false,
+      reason: 'job-alert',
+      evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+  if (nonEmployment) {
+    return {
+      relevant: false,
+      reason: 'non-employment',
+      evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+  if (bookingPromotion || consumerPromotion || benefitsAdministration) {
+    return {
+      relevant: false,
+      reason: 'consumer-or-benefits',
+      evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+  if (mediaInterview || technicalNotification) {
+    return {
+      relevant: false,
+      reason: 'media-or-technical',
+      evidence: [],
+      sentThreadEligible: false,
+    }
+  }
+
+  const applicationProcess = strongApplicationProcess
+  if (applicationProcess) {
+    const evidence = ['employment-process']
+    if (atsSender) evidence.push('known-ats')
+    if (roleEvidence) evidence.push('concrete-role')
+    if (interview && INTERVIEW_SCHEDULING_PATTERN.test(searchable)) {
+      evidence.push('interview-scheduling')
+    }
+    return {
+      relevant: true,
+      reason: 'application-process',
+      evidence,
+      sentThreadEligible: false,
+    }
+  }
+
+  const humanRecruiter = (
+    !bulkMessage
+    && !noReplySender
+    && !jobBoardSender
+    && humanOutreach
+    && roleEvidence
+  )
+  if (humanRecruiter) {
+    return {
+      relevant: true,
+      reason: 'human-recruiter',
+      evidence: ['reply-capable-sender', 'personalized-outreach', 'concrete-role'],
+      sentThreadEligible: false,
+    }
+  }
+
+  const sentThreadEligible = (
+    !bulkDistribution
+    && !MARKETING_SUBJECT_PATTERN.test(subject)
+    && roleEvidence
+    && (
+      EXPLICIT_JOB_CONTEXT_PATTERN.test(searchable)
+      || employmentContext
+      || processTraffic
+      || recruitingSender
+    )
+  )
+  if (input.sentThreadMatched && sentThreadEligible) {
+    return {
+      relevant: true,
+      reason: 'sent-thread',
+      evidence: ['gmail-thread', 'sent-label', 'explicit-job-context'],
+      sentThreadEligible: false,
+    }
+  }
+
+  return {
+    relevant: false,
+    reason: bulkMessage ? 'bulk-or-marketing' : 'insufficient-evidence',
+    evidence: [],
+    sentThreadEligible,
+  }
+}
+
+export function careerGmailMessageIsRelevant(
+  input: CareerGmailMessageSignals,
+): boolean {
+  return careerGmailMessageRelevance(input).relevant
 }
 
 export class CareerSiteGmailSourceError extends Error {
@@ -177,7 +527,42 @@ async function gmailJson(
     throw providerError()
   }
   try {
-    const payload = asRecord(await response.json())
+    const declaredLength = response.headers.get('content-length')
+    if (
+      declaredLength
+      && /^\d+$/.test(declaredLength)
+      && Number(declaredLength) > MAX_GMAIL_PROVIDER_JSON_BYTES
+    ) {
+      if (operation === 'get') throw new SkippableGmailMessageError()
+      throw providerError()
+    }
+    if (!response.body) {
+      if (operation === 'get') throw new SkippableGmailMessageError()
+      throw providerError()
+    }
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let byteLength = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        byteLength += value.byteLength
+        if (byteLength > MAX_GMAIL_PROVIDER_JSON_BYTES) {
+          await reader.cancel().catch(() => undefined)
+          if (operation === 'get') throw new SkippableGmailMessageError()
+          throw providerError()
+        }
+        chunks.push(value)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    const raw = Buffer.concat(
+      chunks.map((chunk) => Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)),
+      byteLength,
+    ).toString('utf8')
+    const payload = asRecord(JSON.parse(raw))
     if (!payload) {
       if (operation === 'get') throw new SkippableGmailMessageError()
       throw providerError()
@@ -213,6 +598,18 @@ function listedMessageIds(payload: Record<string, unknown>): string[] {
   return ids
 }
 
+function listedNextPageToken(payload: Record<string, unknown>): string | null {
+  if (payload.nextPageToken === undefined) return null
+  const token = typeof payload.nextPageToken === 'string' ? payload.nextPageToken : ''
+  if (
+    !token
+    || token !== token.trim()
+    || token.length > MAX_GMAIL_PAGE_TOKEN_CHARS
+    || !/^[\x21-\x7e]+$/.test(token)
+  ) throw providerError()
+  return token
+}
+
 function gmailSearchQuery(request: CareerSiteGmailSourceRequest): string {
   const parts: string[] = [`(${CAREER_GMAIL_IMMUTABLE_QUERY})`]
   if (request.after) {
@@ -228,23 +625,110 @@ async function listedMessages(input: {
   request: CareerSiteGmailSourceRequest
   signal: AbortSignal
 }): Promise<string[]> {
-  const parameters = new URLSearchParams({
-    maxResults: String(input.request.maxMessagesPerAccount),
-  })
-  parameters.set('q', gmailSearchQuery(input.request))
-  const payload = await gmailJson(
-    input,
-    `${GMAIL_MESSAGES_PATH}?${parameters.toString()}`,
-    'list',
+  const candidateLimit = Math.min(
+    MAX_GMAIL_CANDIDATES_PER_ACCOUNT,
+    Math.max(
+      GMAIL_LIST_PAGE_SIZE,
+      input.request.maxMessagesPerAccount * MAX_GMAIL_LIST_PAGES_PER_ACCOUNT,
+    ),
   )
-  return listedMessageIds(payload).slice(0, input.request.maxMessagesPerAccount)
+  const messageIds: string[] = []
+  const seenMessageIds = new Set<string>()
+  const seenPageTokens = new Set<string>()
+  let pageToken: string | null = null
+
+  for (
+    let page = 0;
+    page < MAX_GMAIL_LIST_PAGES_PER_ACCOUNT && messageIds.length < candidateLimit;
+    page += 1
+  ) {
+    const parameters = new URLSearchParams({
+      maxResults: String(GMAIL_LIST_PAGE_SIZE),
+      q: gmailSearchQuery(input.request),
+    })
+    if (pageToken) parameters.set('pageToken', pageToken)
+    const payload = await gmailJson(
+      input,
+      `${GMAIL_MESSAGES_PATH}?${parameters.toString()}`,
+      'list',
+    )
+    for (const messageId of listedMessageIds(payload)) {
+      if (seenMessageIds.has(messageId)) continue
+      seenMessageIds.add(messageId)
+      messageIds.push(messageId)
+      if (messageIds.length >= candidateLimit) return messageIds
+    }
+    const nextPageToken = listedNextPageToken(payload)
+    if (!nextPageToken) return messageIds
+    if (seenPageTokens.has(nextPageToken)) throw providerError()
+    seenPageTokens.add(nextPageToken)
+    pageToken = nextPageToken
+  }
+  return messageIds
 }
 
-function header(part: GmailMessagePart, name: string): string {
+function header(part: GmailMessagePart | undefined, name: string): string {
   const normalized = name.toLowerCase()
-  return Array.isArray(part.headers)
+  return Array.isArray(part?.headers)
     ? String(part.headers.find((item) => item?.name?.toLowerCase() === normalized)?.value || '')
     : ''
+}
+
+function threadContainsSentMessage(payload: Record<string, unknown>, threadId: string): boolean {
+  let returnedThreadId: string
+  try {
+    returnedThreadId = safeMessageId(payload.id)
+  } catch {
+    return false
+  }
+  if (returnedThreadId !== threadId || !Array.isArray(payload.messages)) return false
+  if (payload.messages.length > MAX_THREAD_EVIDENCE_MESSAGES) return false
+  return payload.messages.some((entry) => {
+    const message = asRecord(entry)
+    if (!message || message.threadId !== threadId || !Array.isArray(message.labelIds)) {
+      return false
+    }
+    return message.labelIds.some((label) => String(label).trim().toUpperCase() === 'SENT')
+  })
+}
+
+async function gmailThreadHasSentEvidence(input: {
+  ownerEmail: string
+  connection: ActiveGmailConnection
+  threadId: string
+  signal: AbortSignal
+}): Promise<boolean> {
+  const parameters = new URLSearchParams({
+    format: 'minimal',
+    fields: 'id,messages(id,threadId,labelIds)',
+  })
+  try {
+    const payload = await gmailJson(
+      input,
+      `${GMAIL_THREADS_PATH}/${encodeURIComponent(input.threadId)}?${parameters.toString()}`,
+      'get',
+    )
+    return threadContainsSentMessage(payload, input.threadId)
+  } catch {
+    // Sent evidence is additive. Any unavailable or malformed thread fails this
+    // candidate closed without widening the search or failing proven messages.
+    return false
+  }
+}
+
+function cachedSentThreadEvidence(input: {
+  ownerEmail: string
+  connection: ActiveGmailConnection
+  threadId: string
+  signal: AbortSignal
+  cache: Map<string, Promise<boolean>>
+}): Promise<boolean> {
+  const key = `${input.connection.connectionId}\u0000${input.threadId}`
+  const existing = input.cache.get(key)
+  if (existing) return existing
+  const evidence = gmailThreadHasSentEvidence(input)
+  input.cache.set(key, evidence)
+  return evidence
 }
 
 function rawMessageUrlSources(message: GmailMessage): string[] {
@@ -281,6 +765,7 @@ async function getMessage(input: {
   connection: ActiveGmailConnection
   messageId: string
   signal: AbortSignal
+  sentThreadEvidenceCache: Map<string, Promise<boolean>>
 }): Promise<CareerSiteGmailMessage | null> {
   let payload: Record<string, unknown>
   try {
@@ -309,6 +794,36 @@ async function getMessage(input: {
   const bodyText = parsed.bodyText.slice(0, MAX_GMAIL_BODY_TEXT_CHARS).trim()
   const snippet = parsed.snippet.slice(0, MAX_GMAIL_SNIPPET_CHARS).trim()
   if (!bodyText && !snippet) return null
+  const signals: CareerGmailMessageSignals = {
+    senderEmail,
+    subject: parsed.subject,
+    snippet,
+    bodyText,
+    labelIds: parsed.labelIds,
+    listUnsubscribe: header(payload.payload as GmailMessagePart, 'list-unsubscribe'),
+    listId: header(payload.payload as GmailMessagePart, 'list-id'),
+    feedbackId: header(payload.payload as GmailMessagePart, 'feedback-id'),
+    precedence: header(payload.payload as GmailMessagePart, 'precedence'),
+    autoSubmitted: header(payload.payload as GmailMessagePart, 'auto-submitted'),
+  }
+  let relevance = careerGmailMessageRelevance(signals)
+  if (
+    !relevance.relevant
+    && relevance.sentThreadEligible
+    && parsed.externalThreadId
+  ) {
+    const sentThreadMatched = await cachedSentThreadEvidence({
+      ownerEmail: input.ownerEmail,
+      connection: input.connection,
+      threadId: parsed.externalThreadId,
+      signal: input.signal,
+      cache: input.sentThreadEvidenceCache,
+    })
+    if (sentThreadMatched) {
+      relevance = careerGmailMessageRelevance({ ...signals, sentThreadMatched: true })
+    }
+  }
+  if (!relevance.relevant) return null
   let urls: string[]
   try {
     urls = extractPublicHttpsUrls([
@@ -357,14 +872,14 @@ function boundedCandidates(
   listed: Array<{ connection: ActiveGmailConnection; messageIds: string[] }>,
 ): GmailMessageCandidate[] {
   const candidates: GmailMessageCandidate[] = []
-  for (let index = 0; candidates.length < MAX_GMAIL_TOTAL_MESSAGES; index += 1) {
+  for (let index = 0; candidates.length < MAX_GMAIL_TOTAL_CANDIDATES; index += 1) {
     let added = false
     for (const account of listed) {
       const messageId = account.messageIds[index]
       if (!messageId) continue
       candidates.push({ connection: account.connection, messageId })
       added = true
-      if (candidates.length >= MAX_GMAIL_TOTAL_MESSAGES) return candidates
+      if (candidates.length >= MAX_GMAIL_TOTAL_CANDIDATES) return candidates
     }
     if (!added) return candidates
   }
@@ -431,21 +946,41 @@ export async function searchCareerSiteGmailMessages(input: {
       controller.signal,
     )
     if (controller.signal.aborted) throw searchAbortError(timedOut)
-    const fetched = await mapWithConcurrency(
-      boundedCandidates(listed),
-      GMAIL_REQUEST_CONCURRENCY,
-      (candidate) => getMessage({
-        ownerEmail: input.ownerEmail,
-        connection: candidate.connection,
-        messageId: candidate.messageId,
-        signal: controller.signal,
-      }),
-      controller.signal,
-    )
-    if (controller.signal.aborted) throw searchAbortError(timedOut)
-    const eligible = fetched
-      .filter((message): message is CareerSiteGmailMessage => Boolean(message))
-      .slice(0, MAX_GMAIL_TOTAL_MESSAGES)
+    const sentThreadEvidenceCache = new Map<string, Promise<boolean>>()
+    const candidates = boundedCandidates(listed)
+    const eligible: CareerSiteGmailMessage[] = []
+    const eligibleByAccount = new Map<string, number>()
+    for (
+      let offset = 0;
+      offset < candidates.length && eligible.length < MAX_GMAIL_TOTAL_MESSAGES;
+      offset += GMAIL_CANDIDATE_FETCH_BATCH_SIZE
+    ) {
+      const fetched = await mapWithConcurrency(
+        candidates.slice(offset, offset + GMAIL_CANDIDATE_FETCH_BATCH_SIZE),
+        GMAIL_REQUEST_CONCURRENCY,
+        (candidate) => getMessage({
+          ownerEmail: input.ownerEmail,
+          connection: candidate.connection,
+          messageId: candidate.messageId,
+          signal: controller.signal,
+          sentThreadEvidenceCache,
+        }),
+        controller.signal,
+      )
+      if (controller.signal.aborted) throw searchAbortError(timedOut)
+      for (const message of fetched) {
+        if (!message) continue
+        const accountCount = eligibleByAccount.get(message.accountEmail) || 0
+        if (accountCount >= input.request.maxMessagesPerAccount) continue
+        eligible.push(message)
+        eligibleByAccount.set(message.accountEmail, accountCount + 1)
+        if (eligible.length >= MAX_GMAIL_TOTAL_MESSAGES) break
+      }
+      if (connections.every((connection) => (
+        (eligibleByAccount.get(connection.accountEmail) || 0)
+          >= input.request.maxMessagesPerAccount
+      ))) break
+    }
     return boundedResponseMessages(eligible).sort((left, right) => (
       right.receivedAt.localeCompare(left.receivedAt)
       || left.accountEmail.localeCompare(right.accountEmail)
