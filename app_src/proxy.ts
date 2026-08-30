@@ -76,6 +76,9 @@ function isPublicApi(pathname: string) {
     || normalizedPath === '/api/career-site/mail'
     || normalizedPath === '/api/career-site/agents'
     || normalizedPath === '/api/career-site/sources/gmail'
+    || normalizedPath === '/api/career-site/sources/linkedin'
+    || normalizedPath.startsWith('/api/career-site/sources/linkedin/')
+    || normalizedPath.startsWith('/api/internal/career-site/linkedin/worker/')
     || normalizedPath === '/api/career-site/submissions/outbox/process'
     || normalizedPath === '/api/operations/print-agent/jobs'
     || normalizedPath === '/api/operations/print-agent/pair'

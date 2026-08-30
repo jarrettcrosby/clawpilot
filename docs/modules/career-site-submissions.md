@@ -149,6 +149,45 @@ For retry-safe delivery, the worker assigns one deterministic RFC Message-ID per
 
 Internal notifications go to `JarrettCrosby@gmail.com`. Requester-facing mail comes from `Jarrett Crosby <info@suburbiasandwichco.com>`, replies to `JarrettCrosby@gmail.com`, calls the URL a secure résumé link, and says only that the requested résumé is ready. It does not expose backend branding or imply that the requester was screened. Newsletter language explicitly preserves separate consent and states that automatic enrollment did not occur.
 
+## Career Desk LinkedIn browser connector
+
+Career Desk uses a separate, owner-scoped LinkedIn browser connection for interactive job reads. It is not LinkedIn OAuth and it never accepts, stores, proxies, or logs a LinkedIn password, MFA code, TOTP seed, recovery code, or challenge answer. Jarrett enters login and checkpoint values directly into the worker's isolated live browser. Posts, comments, messages, applications, and every other external LinkedIn write are outside this connector.
+
+The private `jarrett-career-agents` service identity calls these control-plane routes:
+
+- `GET|DELETE /api/career-site/sources/linkedin` reads safe status or disconnects and cryptographically erases the persisted browser session.
+- `POST /api/career-site/sources/linkedin/connect` accepts only a request UUID and `https://jarrett.suburbiasandwichco.com/career/linkedin/return?attemptId=<same UUID>&destination=<overview|agents|settings>`. It returns a short-lived authentication attempt. The initial response alone contains `${CAREER_LINKEDIN_BROWSER_PUBLIC_URL}/live#token=<random preimage>`; the fragment is not sent in an HTTP request. Only its SHA-256 digest is stored, and idempotent replays return `authUrl: null`.
+- `GET|DELETE /api/career-site/sources/linkedin/auth-attempt?attemptId=<UUID>` polls or cancels that owner-scoped attempt.
+- `POST /api/career-site/sources/linkedin/scan` queues one idempotent, read-only job scan with at most 50 results. A connection has at most one queued, claimed, or authentication-waiting scan. `GET .../scan?scanId=<UUID>` polls the exact run and returns results only after success.
+
+Connection state is one of `disconnected`, `authenticating`, `connected`, `reauth_required`, `restricted`, or `error`. A restriction is explicit and terminal for the run; the worker must not evade it. Scans created without a usable session remain `awaiting_auth`. Successful authentication moves only that connection's waiting scans back to `queued`, preserving their exact IDs and filters.
+
+Migration `0339_career_site_linkedin_connector.sql` stores connection metadata, authentication attempts, scan runs, replay nonces, and the browser session. Browser state is AES-256-GCM encrypted with identity-bound associated data containing the source, owner, organization, and session generation. A dedicated versioned key ring and a separate keyed fingerprint provide rotation and blast-radius isolation. The browser worker receives only a lease-bound, transiently encrypted session envelope and a derived one-run data key; the database never stores that transient key. A claim exposes the renewable five-minute fencing deadline as `expiresAt` and, for authentication commands only, the separate 15-minute user window as `authExpiresAt`. Every flat claim also includes `authTokenAdoptionRequired`; it is false for scans and ordinary authentication claims. Thirty-second `awaiting_auth` reports renew the lease without extending that user window. Expired `claimed` and `awaiting_user` leases are recoverable after a worker crash. The raw live token remains one-time: after the worker locally matches its SHA-256 digest, it reports `evidence.event=live_token_redeemed`; ClawPilot atomically records the redeeming lease digest and worker before the worker may issue its own signed live-session cookie. If that exact current lease and worker repeat the report after losing the response, ClawPilot acknowledges it without a second audit event. If ClawPilot committed redemption but the worker crashed before issuing its cookie, the recovered claim alone sets `authTokenAdoptionRequired: true`; the new current lease must repeat the redemption handshake, which preserves the original redemption time, rebinds the fence, and emits one distinct adoption audit. The expired old lease, an unclaimed worker, a first-attempt mismatched fence, and terminal attempts remain rejected.
+
+Every accepted worker report also writes one durable receipt containing only SHA-256 digests of the exact serialized report body and lease token, the bounded worker ID, report status, and receipt time. A retry with the same body bytes, lease, worker, and status is acknowledged without repeating audit, session-generation, scan-result, or connection-state side effects. An exact active heartbeat retry renews only its current fenced lease. An exact retry after a scan moved to `awaiting_auth`, or after authentication or scan work completed, returns the already stored typed result even though the completing lock was cleared. A changed body, different lease or worker, superseded claim, expired heartbeat lease, cancelled work, or other missing receipt returns `409`. New claims and recovery, cancellation, and authentication-resume transitions clear the prior receipt before work can continue. Worker retries use a fresh HMAC timestamp and nonce with the identical serialized body; timeouts, malformed responses, `408`, `425`, `429`, and `5xx` remain ambiguous and retryable, while every other `4xx` is authoritative.
+
+The worker polls only these unified routes:
+
+- `POST /api/internal/career-site/linkedin/worker/claim`
+- `POST /api/internal/career-site/linkedin/worker/report`
+
+Both require `Authorization: Bearer <CAREER_LINKEDIN_BROWSER_WORKER_TOKEN>` plus a distinct HMAC secret. Required signature headers are `x-clawpilot-linkedin-worker-id`, `x-clawpilot-linkedin-timestamp`, `x-clawpilot-linkedin-nonce`, and `x-clawpilot-linkedin-signature`. The signature is lowercase hexadecimal HMAC-SHA256 over these exact newline-delimited UTF-8 bytes:
+
+```text
+clawpilot-linkedin-worker-v1
+<UPPERCASE HTTP METHOD>
+<exact pathname>
+<10-digit Unix timestamp seconds>
+<lowercase UUID nonce>
+<lowercase SHA-256 hex of exact request-body bytes>
+```
+
+ClawPilot allows at most 300 seconds of clock skew and records each valid worker-ID/nonce pair before executing the request. A retry therefore uses a fresh nonce and signature while retaining the same durable request ID or current lease ID/token. The bearer token and HMAC secret must be distinct from each other and every other service credential. Request URLs, live token fragments, session envelopes, and session data keys must not be logged.
+
+Required runtime variables are `CAREER_SITE_LINKEDIN_ENABLED`, `CAREER_LINKEDIN_BROWSER_PUBLIC_URL`, `CAREER_LINKEDIN_BROWSER_WORKER_TOKEN`, `CAREER_LINKEDIN_BROWSER_WORKER_HMAC_SECRET`, `CAREER_LINKEDIN_SESSION_ACTIVE_KEY_ID`, `CAREER_LINKEDIN_SESSION_ENCRYPTION_KEYS`, and `CAREER_LINKEDIN_SESSION_FINGERPRINT_KEY`. The two session-key values use base64-encoded, independently generated 32-byte keys. Keep the feature off until migration `0339`, the browser service, and all keys are present.
+
+`/api/health` exposes only non-secret LinkedIn readiness. `workerConnected` is true when ClawPilot recorded an authenticated, replay-protected worker request within the last 30 seconds, and `lastWorkerSeenAt` is that server-side observation time. LinkedIn `ready` requires configuration, session keys, schema, and this fresh worker signal. A transient missing worker signal does not by itself make the global health endpoint fail, which avoids a blue-green rollout deadlock; production verification checks the LinkedIn readiness block after cutover.
+
 ## Private Sheet contract
 
 The private tracker uses tab `Submissions`, headers in row 4, and data beginning in row 5. The 19 columns are, in this exact order:
