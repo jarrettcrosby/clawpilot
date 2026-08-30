@@ -830,7 +830,7 @@ export async function claimCareerSiteLinkedInWork(
     if (request.capabilities.includes('interactive_auth')) {
       const auth = await client.query<AuthAttemptRow>(
         `WITH candidate AS (
-           SELECT id FROM career_site_linkedin_auth_attempts
+           SELECT id AS candidate_id FROM career_site_linkedin_auth_attempts
            WHERE status = 'queued' AND available_at <= now() AND expires_at > now()
              AND attempts < $1
            ORDER BY available_at, created_at, id
@@ -845,7 +845,7 @@ export async function claimCareerSiteLinkedInWork(
              last_report_body_digest = NULL, last_report_lease_digest = NULL,
              last_report_worker_id = NULL, last_report_status = NULL, last_report_at = NULL,
              updated_at = now()
-         FROM candidate WHERE attempt.id = candidate.id
+         FROM candidate WHERE attempt.id = candidate.candidate_id
          RETURNING ${AUTH_FIELDS}`,
         [MAX_ATTEMPTS, WORK_LEASE_SECONDS, leaseToken, request.workerId],
       )
@@ -886,7 +886,7 @@ export async function claimCareerSiteLinkedInWork(
     if (request.capabilities.includes('jobs_read')) {
       const scan = await client.query<ScanRow>(
         `WITH candidate AS (
-           SELECT scan.id
+           SELECT scan.id AS candidate_id
            FROM career_site_linkedin_scan_runs scan
            JOIN career_site_linkedin_connections connection ON connection.id = scan.connection_id
            WHERE scan.status = 'queued' AND scan.available_at <= now() AND scan.attempts < $1
@@ -901,7 +901,7 @@ export async function claimCareerSiteLinkedInWork(
              last_report_body_digest = NULL, last_report_lease_digest = NULL,
              last_report_worker_id = NULL, last_report_status = NULL, last_report_at = NULL,
              updated_at = now()
-         FROM candidate WHERE scan.id = candidate.id
+         FROM candidate WHERE scan.id = candidate.candidate_id
          RETURNING ${SCAN_FIELDS}`,
         [MAX_ATTEMPTS, WORK_LEASE_SECONDS, leaseToken, request.workerId],
       )
