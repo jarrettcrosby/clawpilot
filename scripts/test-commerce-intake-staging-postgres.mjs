@@ -17,7 +17,9 @@ const ts = requireFromApp('typescript')
 const root = process.cwd()
 const actorEmail = 'commerce-staging-postgres-test@episcs.com'
 const observedAt = '2026-07-31T18:00:00.000Z'
-const retentionExpiresAt = '2026-08-29T18:00:00.000Z'
+const retentionExpiresAt = new Date(
+  Date.now() + 29 * 24 * 60 * 60 * 1_000,
+).toISOString()
 
 function read(path) {
   return readFileSync(resolve(root, path), 'utf8')

@@ -9,11 +9,14 @@ import { resolveCareerSiteAgentConfiguration } from '@/lib/careerSiteAgentContra
 import { getCareerSiteAgentConnectionHealth } from '@/lib/careerSiteAgents'
 import { resolveCareerSiteGmailSourceConfiguration } from '@/lib/careerSiteGmailSourceContract'
 import { getCareerSiteGmailSourceReadiness } from '@/lib/careerSiteGmailSources'
+import { resolveCareerSiteLinkedInConfiguration } from '@/lib/careerSiteLinkedInContract'
+import { careerSiteLinkedInSessionKeyReadiness } from '@/lib/careerSiteLinkedInCrypto'
 import { getStorageDriver, isHostedRuntime } from '@/lib/persistence/config'
 import { query as queryAgentCredentials } from '@/lib/persistence/agentCredentials'
 import { query } from '@/lib/persistence/postgres'
 import { readCareerSiteSubmissionOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteSubmissions'
 import { readCareerSiteMailOperationalHealthFromPostgres } from '@/lib/persistence/careerSiteMailOutbox'
+import { getCareerSiteLinkedInDatabaseReadiness } from '@/lib/persistence/careerSiteLinkedIn'
 import {
   OPERATIONS_COMMAND_RECEIPT_HEALTH_QUERY,
 } from '@/lib/persistence/operationsCommandReceiptHealth'
@@ -2931,6 +2934,16 @@ export async function GET() {
       ready: false,
       activeAccountCount: 0,
     }
+    let careerSiteLinkedIn: Record<string, unknown> = {
+      enabled: process.env.CAREER_SITE_LINKEDIN_ENABLED === '1',
+      configured: false,
+      ready: false,
+      workerUrlConfigured: false,
+      sessionKeysReady: false,
+      schemaReady: false,
+      workerConnected: false,
+      lastWorkerSeenAt: null,
+    }
     let credentialStore: Record<string, unknown> = { status: 'not-configured' }
     let worker: Record<string, unknown> = { status: 'not-owned' }
     let agentWorker: Record<string, unknown> = { status: 'not-owned' }
@@ -3179,6 +3192,28 @@ export async function GET() {
           name: error instanceof Error ? error.name : typeof error,
         })
         errors.push('Career Desk Gmail source configuration is invalid.')
+      }
+    }
+    if (process.env.CAREER_SITE_LINKEDIN_ENABLED === '1') {
+      try {
+        const configuration = resolveCareerSiteLinkedInConfiguration()
+        const sessionKeys = careerSiteLinkedInSessionKeyReadiness()
+        careerSiteLinkedIn = {
+          enabled: true,
+          configured: configuration.enabled && shortLinkConfigurationReady,
+          ready: false,
+          workerUrlConfigured: true,
+          sessionKeysReady: sessionKeys.ready,
+          schemaReady: false,
+        }
+        if (!sessionKeys.ready) {
+          errors.push('Career Desk LinkedIn session encryption keys are not ready.')
+        }
+      } catch (error) {
+        console.error('[health] Career Desk LinkedIn configuration check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career Desk LinkedIn configuration is invalid.')
       }
     }
     let embeddingProvider: 'local' | 'openai' = 'local'
@@ -10204,6 +10239,31 @@ export async function GET() {
       errors.push('Hosted runtime database is not configured.')
     }
 
+    if (process.env.CAREER_SITE_LINKEDIN_ENABLED === '1' && storage === 'postgres') {
+      try {
+        const databaseReadiness = await getCareerSiteLinkedInDatabaseReadiness()
+        careerSiteLinkedIn = {
+          ...careerSiteLinkedIn,
+          schemaReady: databaseReadiness.schemaReady,
+          migrationCurrent: databaseReadiness.migrationCurrent,
+          workerConnected: databaseReadiness.workerConnected,
+          lastWorkerSeenAt: databaseReadiness.lastWorkerSeenAt,
+          ready: careerSiteLinkedIn.configured === true
+            && careerSiteLinkedIn.sessionKeysReady === true
+            && databaseReadiness.schemaReady
+            && databaseReadiness.workerConnected,
+        }
+        if (!databaseReadiness.schemaReady) {
+          errors.push('Career Desk LinkedIn database schema is not ready.')
+        }
+      } catch (error) {
+        console.error('[health] Career Desk LinkedIn database readiness check failed', {
+          name: error instanceof Error ? error.name : typeof error,
+        })
+        errors.push('Career Desk LinkedIn database readiness could not be verified.')
+      }
+    }
+
     if (process.env.CAREER_SITE_SUBMISSIONS_ENABLED === '1') {
       try {
         const configuration = resolveCareerSiteSubmissionConfiguration()
@@ -10267,6 +10327,7 @@ export async function GET() {
       careerSiteMail,
       careerSiteAgents,
       careerSiteGmailSources,
+      careerSiteLinkedIn,
       credentialStore,
       worker,
       agentWorker,
