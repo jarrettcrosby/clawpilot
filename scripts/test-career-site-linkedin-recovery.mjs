@@ -108,6 +108,16 @@ assert.match(
   'a new lease must clear the prior lease report receipt before work resumes',
 )
 assert.equal(
+  persistence.match(/SELECT (?:scan[.])?id AS candidate_id/g)?.length,
+  2,
+  'authentication and scan claim candidates must not expose an id that collides with RETURNING fields',
+)
+assert.match(
+  persistence,
+  /attempt[.]id = candidate[.]candidate_id[\s\S]*scan[.]id = candidate[.]candidate_id/,
+  'both worker claim updates must join through the non-colliding candidate identifier',
+)
+assert.equal(
   persistence.match(/eventType: 'career_site[.]linkedin[.]live_token_redeemed'/g)?.length,
   1,
   'the durable redemption transition must have exactly one audit emission site',
