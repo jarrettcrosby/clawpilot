@@ -1823,6 +1823,168 @@ assert.equal(
   JSON.stringify(['valid']),
 )
 
+let rateLimitedGetCalls = 0
+const rateLimitedSources = loadGmailSources({
+  rows: [{
+    connectionId: 'rate-limited',
+    accountEmail: 'rate-limited@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path) {
+    if (path.includes('?maxResults=')) {
+      return Response.json({ messages: [{ id: 'rate-limited-message' }] })
+    }
+    rateLimitedGetCalls += 1
+    if (rateLimitedGetCalls === 1) {
+      return new Response(null, { status: 429 })
+    }
+    return Response.json({
+      id: 'rate-limited-message',
+      sender: 'recruiter@acme.com',
+      subject: 'Vice President, Operations role',
+      receivedAt: '2026-08-28T16:00:00.000Z',
+      snippet: 'I reviewed your background and would you be open to a conversation?',
+      bodyText: 'Your experience is a strong fit for this Vice President role.',
+    })
+  },
+  parseGmailMessage(message) {
+    return {
+      externalMessageId: message.id,
+      externalThreadId: null,
+      senderEmail: message.sender,
+      recipientEmails: [],
+      subject: message.subject,
+      receivedAt: message.receivedAt,
+      snippet: message.snippet,
+      bodyText: message.bodyText,
+      markerReferences: [],
+      historyId: null,
+      labelIds: ['INBOX'],
+      sizeEstimate: null,
+    }
+  },
+  globals: {
+    setTimeout(callback, delay) {
+      if (delay !== contract.GMAIL_SOURCE_DEADLINE_MS) queueMicrotask(callback)
+      return delay
+    },
+    clearTimeout() {},
+  },
+})
+const retriedMessages = await rateLimitedSources.searchCareerSiteGmailMessages({
+  ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+  request: { maxMessagesPerAccount: 1 },
+})
+assert.equal(rateLimitedGetCalls, 2, 'a bounded retry should recover one 429 response')
+assert.equal(
+  JSON.stringify(retriedMessages.map((message) => message.externalMessageId)),
+  JSON.stringify(['rate-limited-message']),
+)
+
+let exhaustedRateLimitGetCalls = 0
+let exhaustedRateLimitCancelCalls = 0
+const exhaustedRateLimitSources = loadGmailSources({
+  rows: [{
+    connectionId: 'rate-limit-exhausted',
+    accountEmail: 'rate-limit-exhausted@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path) {
+    if (path.includes('?maxResults=')) {
+      return Response.json({ messages: [{ id: 'rate-limit-exhausted-message' }] })
+    }
+    exhaustedRateLimitGetCalls += 1
+    return new Response(new ReadableStream({
+      cancel() {
+        exhaustedRateLimitCancelCalls += 1
+      },
+    }), { status: 429 })
+  },
+  parseGmailMessage: unusedParser,
+  globals: {
+    setTimeout(callback, delay) {
+      if (delay !== contract.GMAIL_SOURCE_DEADLINE_MS) queueMicrotask(callback)
+      return delay
+    },
+    clearTimeout() {},
+  },
+})
+await assert.rejects(
+  exhaustedRateLimitSources.searchCareerSiteGmailMessages({
+    ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+    request: { maxMessagesPerAccount: 1 },
+  }),
+  (error) => error?.code === 'CAREER_SITE_GMAIL_SOURCE_PROVIDER_FAILED',
+  'an exhausted 429 retry budget must remain a terminal provider failure',
+)
+assert.equal(exhaustedRateLimitGetCalls, 3, '429 retries must stop after three attempts')
+assert.equal(
+  exhaustedRateLimitCancelCalls,
+  3,
+  'every discarded 429 response body must be cancelled',
+)
+
+let abortedRateLimitGetCalls = 0
+let abortedRateLimitCancelCalls = 0
+let nextRateLimitTimerId = 1
+const pendingRateLimitTimers = []
+const clearedRateLimitTimers = new Set()
+const abortedRateLimitSources = loadGmailSources({
+  rows: [{
+    connectionId: 'rate-limit-aborted',
+    accountEmail: 'rate-limit-aborted@gmail.com',
+    status: 'ACTIVE',
+  }],
+  async matonFetch(path) {
+    if (path.includes('?maxResults=')) {
+      return Response.json({ messages: [{ id: 'rate-limit-aborted-message' }] })
+    }
+    abortedRateLimitGetCalls += 1
+    return new Response(new ReadableStream({
+      cancel() {
+        abortedRateLimitCancelCalls += 1
+      },
+    }), { status: 429 })
+  },
+  parseGmailMessage: unusedParser,
+  globals: {
+    setTimeout(callback, delay) {
+      const id = nextRateLimitTimerId
+      nextRateLimitTimerId += 1
+      if (delay !== contract.GMAIL_SOURCE_DEADLINE_MS) {
+        pendingRateLimitTimers.push({ id, callback })
+      }
+      return id
+    },
+    clearTimeout(id) {
+      clearedRateLimitTimers.add(id)
+    },
+  },
+})
+const callerAbortController = new AbortController()
+const abortedRateLimitSearch = abortedRateLimitSources.searchCareerSiteGmailMessages({
+  ownerEmail: identity.CAREER_SITE_OWNER_EMAIL,
+  request: { maxMessagesPerAccount: 1 },
+  signal: callerAbortController.signal,
+})
+for (let attempt = 0; attempt < 20 && pendingRateLimitTimers.length === 0; attempt += 1) {
+  await new Promise((resolveAttempt) => setImmediate(resolveAttempt))
+}
+assert.equal(pendingRateLimitTimers.length, 1, 'the first 429 must enter backoff')
+callerAbortController.abort()
+await assert.rejects(
+  abortedRateLimitSearch,
+  (error) => error?.code === 'CAREER_SITE_GMAIL_SOURCE_CANCELLED',
+  'caller cancellation during backoff must cancel the bounded search',
+)
+assert.equal(abortedRateLimitGetCalls, 1, 'caller cancellation must prevent a retry')
+assert.equal(abortedRateLimitCancelCalls, 1, 'the discarded 429 body must be cancelled')
+assert.equal(
+  clearedRateLimitTimers.has(pendingRateLimitTimers[0].id),
+  true,
+  'caller cancellation must clear the pending retry timer',
+)
+
 let siblingAborted = false
 const terminalFailureSources = loadGmailSources({
   rows: [

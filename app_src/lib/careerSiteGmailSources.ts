@@ -39,6 +39,7 @@ const GMAIL_CANDIDATE_FETCH_BATCH_SIZE = GMAIL_REQUEST_CONCURRENCY * 2
 const MAX_GMAIL_PAGE_TOKEN_CHARS = 2_048
 const MAX_THREAD_EVIDENCE_MESSAGES = 100
 const MAX_GMAIL_PROVIDER_JSON_BYTES = 8 * 1024 * 1024
+const GMAIL_PROVIDER_RATE_LIMIT_RETRY_DELAYS_MS = [1_000, 2_000] as const
 export const CAREER_GMAIL_IMMUTABLE_QUERY = '{recruiter recruiting "talent acquisition" "hiring manager" interview assessment "phone screen" "your application" "application update" "next steps" subject:(job OR role OR position OR opportunity OR application OR interview OR assessment)} -in:spam -in:trash -in:sent -in:drafts'
 const EMAIL_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$/i
 
@@ -510,18 +511,46 @@ async function gmailJson(
   path: string,
   operation: 'list' | 'get',
 ): Promise<Record<string, unknown>> {
-  let response: Response
-  try {
-    response = await matonFetch(path, { method: 'GET', signal: input.signal }, {
-      ownerEmail: input.ownerEmail,
-      app: GMAIL_APP,
-      boundConnectionId: input.connection.connectionId,
+  let response: Response | null = null
+  for (
+    let attempt = 0;
+    attempt <= GMAIL_PROVIDER_RATE_LIMIT_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    try {
+      response = await matonFetch(path, { method: 'GET', signal: input.signal }, {
+        ownerEmail: input.ownerEmail,
+        app: GMAIL_APP,
+        boundConnectionId: input.connection.connectionId,
+      })
+    } catch {
+      throw providerError()
+    }
+    if (
+      response.status !== 429
+      || attempt === GMAIL_PROVIDER_RATE_LIMIT_RETRY_DELAYS_MS.length
+    ) break
+
+    await response.body?.cancel().catch(() => undefined)
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timeout)
+        reject(providerError())
+      }
+      const timeout = setTimeout(() => {
+        input.signal.removeEventListener('abort', abort)
+        resolve()
+      }, GMAIL_PROVIDER_RATE_LIMIT_RETRY_DELAYS_MS[attempt])
+      if (input.signal.aborted) abort()
+      else input.signal.addEventListener('abort', abort, { once: true })
     })
-  } catch {
-    throw providerError()
   }
+  if (!response) throw providerError()
   if (!response.ok) {
-    if (operation === 'get' && [400, 404, 410, 422].includes(response.status)) {
+    const skippable = operation === 'get'
+      && [400, 404, 410, 422].includes(response.status)
+    await response.body?.cancel().catch(() => undefined)
+    if (skippable) {
       throw new SkippableGmailMessageError()
     }
     throw providerError()
