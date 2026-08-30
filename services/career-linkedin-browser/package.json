@@ -1,0 +1,19 @@
+{
+  "name": "@clawpilot/career-linkedin-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated, approval-safe LinkedIn authentication and read-only Jobs worker for Career Desk.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@novnc/novnc": "1.7.0",
+    "playwright-core": "1.62.1",
+    "ws": "8.21.3"
+  }
+}
