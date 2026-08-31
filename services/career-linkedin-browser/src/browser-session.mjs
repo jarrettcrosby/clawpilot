@@ -134,6 +134,53 @@ function isAllowedTopLevelUrl(value) {
   }
 }
 
+async function abortBlockedRoute(route) {
+  await route.abort("blockedbyclient").catch(() => undefined);
+}
+
+export async function handleBrowserRoute(route) {
+  try {
+    const request = route.request();
+    const requestUrl = request.url();
+    let targetProtocol;
+    try {
+      targetProtocol = new URL(requestUrl).protocol;
+    } catch {
+      await abortBlockedRoute(route);
+      return;
+    }
+
+    if (targetProtocol === "http:") {
+      await abortBlockedRoute(route);
+      return;
+    }
+
+    if (request.isNavigationRequest() && !isAllowedTopLevelUrl(requestUrl)) {
+      let frame;
+      let mainFrame;
+      try {
+        frame = request.frame();
+        mainFrame = frame?.page()?.mainFrame();
+      } catch {
+        await abortBlockedRoute(route);
+        return;
+      }
+      if (!frame || !mainFrame) {
+        await abortBlockedRoute(route);
+        return;
+      }
+      if (frame === mainFrame) {
+        await abortBlockedRoute(route);
+        return;
+      }
+    }
+
+    await route.continue();
+  } catch {
+    await abortBlockedRoute(route);
+  }
+}
+
 export class LinkedInBrowserSession {
   constructor(config) {
     this.config = config;
@@ -187,28 +234,7 @@ export class LinkedInBrowserSession {
       viewport: { width: 1280, height: 800 },
       locale: "en-US",
     });
-    await this.context.route("**/*", async (route) => {
-      const request = route.request();
-      let targetProtocol;
-      try {
-        targetProtocol = new URL(request.url()).protocol;
-      } catch {
-        targetProtocol = "invalid:";
-      }
-      if (targetProtocol === "http:" || targetProtocol === "invalid:") {
-        await route.abort("blockedbyclient");
-        return;
-      }
-      if (
-        request.isNavigationRequest() &&
-        request.frame() === request.frame().page().mainFrame() &&
-        !isAllowedTopLevelUrl(request.url())
-      ) {
-        await route.abort("blockedbyclient");
-        return;
-      }
-      await route.continue();
-    });
+    await this.context.route("**/*", handleBrowserRoute);
     this.context.on("page", (newPage) => {
       newPage.on("framenavigated", (frame) => {
         if (frame === newPage.mainFrame() && !isAllowedTopLevelUrl(frame.url())) {
