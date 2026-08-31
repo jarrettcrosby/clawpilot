@@ -636,6 +636,7 @@ type CommerceIntakeWorkflowProps = {
   canManage: boolean
   canActivate: boolean
   connectionReady?: boolean
+  onReviewOrders?: () => void
 }
 
 type WorkbenchTab = 'overview' | 'products' | 'orders' | 'issues'
@@ -1292,6 +1293,7 @@ export default function CommerceIntakeWorkflow({
   canManage,
   canActivate,
   connectionReady = true,
+  onReviewOrders,
 }: CommerceIntakeWorkflowProps) {
   const { measurementSystem } = useMeasurementSystem()
   const [intake, setIntake] = useState<CommerceIntake | null>(null)
@@ -1333,6 +1335,15 @@ export default function CommerceIntakeWorkflow({
   const [error, setError] = useState('')
   const [errorCode, setErrorCode] = useState('')
   const [notice, setNotice] = useState('')
+
+  const reviewOrders = () => {
+    if (onReviewOrders) {
+      setWorkbenchOpen(false)
+      onReviewOrders()
+      return
+    }
+    setWorkbenchTab('orders')
+  }
   const [productDrafts, setProductDrafts] = useState<
     Record<string, ProductDraft>
   >({})
@@ -4008,12 +4019,14 @@ export default function CommerceIntakeWorkflow({
               value="products"
               label={`Products (${totalUnresolvedProductCount})`}
             />
-            <Tab
-              id={`commerce-intake-tab-orders-${accountGlobalId}`}
-              aria-controls={`commerce-intake-panel-orders-${accountGlobalId}`}
-              value="orders"
-              label={`Order candidates (${candidates.length})`}
-            />
+            {!onReviewOrders ? (
+              <Tab
+                id={`commerce-intake-tab-orders-${accountGlobalId}`}
+                aria-controls={`commerce-intake-panel-orders-${accountGlobalId}`}
+                value="orders"
+                label={`Order candidates (${candidates.length})`}
+              />
+            ) : null}
             <Tab
               id={`commerce-intake-tab-issues-${accountGlobalId}`}
               aria-controls={`commerce-intake-panel-issues-${accountGlobalId}`}
@@ -4080,6 +4093,13 @@ export default function CommerceIntakeWorkflow({
                   onClick={() => {
                     if (!localReviewCommandsAllowed) {
                       window.location.hash = 'operations'
+                      return
+                    }
+                    if (
+                      recommendedAction.tab === 'orders'
+                      && onReviewOrders
+                    ) {
+                      reviewOrders()
                       return
                     }
                     setWorkbenchTab(recommendedAction.tab)
@@ -4770,7 +4790,7 @@ export default function CommerceIntakeWorkflow({
                           <Button
                             size="small"
                             variant="text"
-                            onClick={() => setWorkbenchTab('orders')}
+                            onClick={reviewOrders}
                             sx={{ alignSelf: 'flex-start' }}
                           >
                             Review affected orders

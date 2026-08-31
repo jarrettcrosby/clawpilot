@@ -13,6 +13,7 @@ import Typography from '@mui/material/Typography'
 import RefreshRounded from '@mui/icons-material/RefreshRounded'
 import SettingsRounded from '@mui/icons-material/SettingsRounded'
 import StorefrontRounded from '@mui/icons-material/StorefrontRounded'
+import ViewListRounded from '@mui/icons-material/ViewListRounded'
 import CommerceIntakeWorkflow from '@/components/settings/CommerceIntakeWorkflow'
 import ShopifyInventoryPanel from '@/components/operations/ShopifyInventoryPanel'
 import CartonizationRateEvidencePanel from '@/components/operations/CartonizationRateEvidencePanel'
@@ -55,8 +56,10 @@ function humanize(value: string) {
 
 export default function CommerceImportsPanel({
   onOpenOrder,
+  onReviewOrders,
 }: {
   onOpenOrder: (orderGlobalId: string) => void
+  onReviewOrders: () => void
 }) {
   const [payload, setPayload] = useState<CommercePayload | null>(null)
   const [selectedAccountGlobalId, setSelectedAccountGlobalId] = useState('')
@@ -176,11 +179,18 @@ export default function CommerceImportsPanel({
             Choose a connected sales channel
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Import and review provider data here. Connect stores, rotate
-            credentials, and manage provider setup in Settings.
+            Review products and provider exceptions here. Staged orders are
+            managed in the Orders workbench.
           </Typography>
         </Box>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
+          <Button
+            variant="contained"
+            startIcon={<ViewListRounded />}
+            onClick={onReviewOrders}
+          >
+            Review orders
+          </Button>
           <Button
             variant="outlined"
             startIcon={<RefreshRounded />}
@@ -278,6 +288,7 @@ export default function CommerceImportsPanel({
                 displayName={selectedAccount.displayName}
                 canManage={payload.canManage === true}
                 canActivate={payload.canActivate === true}
+                onReviewOrders={onReviewOrders}
               />
               {payload.canManage === true ? (
                 <>

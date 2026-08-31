@@ -1376,6 +1376,16 @@ const productCandidateReadSource = persistenceSource.slice(
   ),
 )
 includes(productCandidateReadSource, [
+  "candidate.workflow_state <> 'promoted'",
+  'candidate.canonical_order_id IS NULL',
+  'FROM operations_orders canonical',
+  'canonical.external_order_id = candidate.external_order_id',
+  'FROM operations_external_identifiers external',
+  "external.entity_type = 'operations.order'",
+  "external.status = 'active'",
+  'external.external_id = candidate.external_order_id',
+  'FROM operations_commerce_order_candidates promoted_history',
+  "promoted_history.workflow_state = 'promoted'",
   "candidate.mapping_state <> 'resolved'",
   "IN ('held', 'resolving', 'ready')",
   "WHERE latest.mapping_state <> 'resolved'\n               AND latest.workflow_state IN ('held', 'resolving')",

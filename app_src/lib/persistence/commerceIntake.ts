@@ -7760,8 +7760,41 @@ export async function readCommerceIntakeStateFromPostgres(input: {
            AND candidate.integration_account_id = $2::uuid
            AND candidate.expires_at > now()
            AND candidate.workflow_state <> 'expired'
+           AND candidate.workflow_state <> 'promoted'
+           AND candidate.canonical_order_id IS NULL
            AND run.expires_at > now()
            AND run.workflow_state <> 'expired'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_orders canonical
+             WHERE canonical.organization_id = candidate.organization_id
+               AND canonical.integration_account_id
+                   = candidate.integration_account_id
+               AND canonical.external_order_id = candidate.external_order_id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_external_identifiers external
+             WHERE external.organization_id = candidate.organization_id
+               AND external.integration_account_id
+                   = candidate.integration_account_id
+               AND external.entity_type = 'operations.order'
+               AND external.status = 'active'
+               AND external.external_id = candidate.external_order_id
+           )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_candidates promoted_history
+             WHERE promoted_history.organization_id = candidate.organization_id
+               AND promoted_history.integration_account_id
+                   = candidate.integration_account_id
+               AND promoted_history.external_order_id
+                   = candidate.external_order_id
+               AND (
+                 promoted_history.workflow_state = 'promoted'
+                 OR promoted_history.canonical_order_id IS NOT NULL
+               )
+           )
            AND candidate.id IN (
              SELECT DISTINCT ON (selected.external_order_id) selected.id
              FROM operations_commerce_order_candidates selected

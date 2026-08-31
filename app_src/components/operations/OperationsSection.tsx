@@ -4097,6 +4097,26 @@ export default function OperationsSection({
     window.location.hash = 'operations'
   }
 
+  const reviewImportedOrders = () => {
+    setView('orders')
+    setSearch('')
+    setStatus('')
+    closeDrawer()
+    closeExceptionDrawer()
+    setImportedDrawerOpen(false)
+    setSelectedImportedGlobalId(null)
+    setImportedOrderError('')
+    const currentUrl = window.location.href
+    const nextUrl = new URL(currentUrl)
+    nextUrl.searchParams.delete(OPERATIONS_ORDER_QUERY)
+    nextUrl.hash = 'operations'
+    window.history.replaceState(window.history.state, '', nextUrl.toString())
+    window.dispatchEvent(new HashChangeEvent('hashchange', {
+      oldURL: currentUrl,
+      newURL: nextUrl.toString(),
+    }))
+  }
+
   const loadPlanPreparation = async (
     order: OperationsOrderDetail,
     localTraining = false,
@@ -7591,7 +7611,10 @@ export default function OperationsSection({
             onOpenOrder={openPickingOrder}
           />
         ) : view === 'imports' ? (
-          <CommerceImportsPanel onOpenOrder={openPickingOrder} />
+          <CommerceImportsPanel
+            onOpenOrder={openPickingOrder}
+            onReviewOrders={reviewImportedOrders}
+          />
         ) : view === 'receiving' ? (
           <ReceivingPanel workspace={workspace} onRefresh={async () => {
             await loadWorkspace()

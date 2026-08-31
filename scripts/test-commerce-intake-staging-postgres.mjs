@@ -857,9 +857,9 @@ function loadCommerceStagingService(pool, counters, options = {}) {
         commerceCatalogCredentialSupportsProducts: mustNotRun(
           'commerceCatalogCredentialSupportsProducts',
         ),
-        readCommerceCatalogSyncStateWithClient: mustNotRun(
-          'readCommerceCatalogSyncStateWithClient',
-        ),
+        readCommerceCatalogSyncStateWithClient: options.allowIntakeStateRead
+          ? async () => null
+          : mustNotRun('readCommerceCatalogSyncStateWithClient'),
       },
       '@/lib/persistence/productChannelStates': productChannelStates,
       '@/lib/persistence/shopifyCheckoutRating': options
@@ -2452,6 +2452,142 @@ async function verifyFaireExactVariantPackBinding(
   assert.equal(promoted.providerWrites, 0)
   assert.equal(promoted.fulfillmentWrites, 0)
   assert.equal(promoted.shipmentWrites, 0)
+  const intakeReader = loadCommerceStagingService(
+    pool,
+    counters,
+    { allowIntakeStateRead: true },
+  )
+  const intakeAfterPromotion = await intakeReader
+    .readCommerceIntakeStateFromPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    intakeAfterPromotion.candidates.some(
+      (candidate) => candidate.globalId === promotableCandidate.global_id,
+    ),
+    false,
+    'A canonical order must leave the retained Order candidates projection',
+  )
+
+  const canonicalIdentity = (await pool.query(
+    `SELECT candidate.external_order_id,
+            candidate.promotion_command_receipt_id::text,
+            candidate.promotion_idempotency_key,
+            candidate.promotion_request_hash,
+            candidate.promoted_at,
+            canonical.id::text AS canonical_order_id
+     FROM operations_commerce_order_candidates candidate
+     JOIN operations_orders canonical
+       ON canonical.organization_id = candidate.organization_id
+      AND canonical.id = candidate.canonical_order_id
+     JOIN operations_external_identifiers external
+       ON external.organization_id = candidate.organization_id
+      AND external.integration_account_id = candidate.integration_account_id
+      AND external.entity_type = 'operations.order'
+      AND external.status = 'active'
+      AND external.external_id = candidate.external_order_id
+     WHERE candidate.organization_id = $1::uuid
+       AND candidate.global_id = $2`,
+    [ids.organization, promotableCandidate.global_id],
+  )).rows[0]
+  assert.ok(
+    canonicalIdentity,
+    'Promotion must retain an active external order identity',
+  )
+  const aliasFixture = await pool.connect()
+  try {
+    await aliasFixture.query('BEGIN')
+    await aliasFixture.query('SET LOCAL session_replication_role = replica')
+    await aliasFixture.query(
+      `UPDATE operations_orders
+       SET external_order_id = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        ids.organization,
+        canonicalIdentity.canonical_order_id,
+        `${canonicalIdentity.external_order_id}-canonical-fixture`,
+      ],
+    )
+    await aliasFixture.query(
+      `UPDATE operations_commerce_order_candidates
+       SET workflow_state = 'held', canonical_order_id = NULL,
+           promotion_command_receipt_id = NULL,
+           promotion_idempotency_key = NULL,
+           promotion_request_hash = NULL,
+           promoted_at = NULL,
+           row_version = row_version + 1,
+           updated_by = $3, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [ids.organization, promotableCandidate.global_id, actorEmail],
+    )
+    await aliasFixture.query('COMMIT')
+  } catch (error) {
+    await aliasFixture.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    aliasFixture.release()
+  }
+  const intakeWithCanonicalAlias = await intakeReader
+    .readCommerceIntakeStateFromPostgres({
+      organizationId: ids.organization,
+      accountGlobalId: runtime.globalId,
+    })
+  assert.equal(
+    intakeWithCanonicalAlias.candidates.some(
+      (candidate) => candidate.globalId === promotableCandidate.global_id,
+    ),
+    false,
+    'An active external order identity must suppress its staged alias',
+  )
+  const restoreCanonicalFixture = await pool.connect()
+  try {
+    await restoreCanonicalFixture.query('BEGIN')
+    await restoreCanonicalFixture.query(
+      'SET LOCAL session_replication_role = replica',
+    )
+    await restoreCanonicalFixture.query(
+      `UPDATE operations_orders
+       SET external_order_id = $3
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid`,
+      [
+        ids.organization,
+        canonicalIdentity.canonical_order_id,
+        canonicalIdentity.external_order_id,
+      ],
+    )
+    await restoreCanonicalFixture.query(
+      `UPDATE operations_commerce_order_candidates
+       SET workflow_state = 'promoted', canonical_order_id = $3::uuid,
+           promotion_command_receipt_id = $4::uuid,
+           promotion_idempotency_key = $5,
+           promotion_request_hash = $6,
+           promoted_at = $7::timestamptz,
+           row_version = row_version + 1,
+           updated_by = $8, updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND global_id = $2`,
+      [
+        ids.organization,
+        promotableCandidate.global_id,
+        canonicalIdentity.canonical_order_id,
+        canonicalIdentity.promotion_command_receipt_id,
+        canonicalIdentity.promotion_idempotency_key,
+        canonicalIdentity.promotion_request_hash,
+        canonicalIdentity.promoted_at,
+        actorEmail,
+      ],
+    )
+    await restoreCanonicalFixture.query('COMMIT')
+  } catch (error) {
+    await restoreCanonicalFixture.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    restoreCanonicalFixture.release()
+  }
 
   const destination = {
     name: 'Jarrett Crosby',
