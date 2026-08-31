@@ -67,12 +67,28 @@ for (const fragment of [
   'No new carrier request, commerce-provider',
   'This evidence is reused exactly as sealed',
   'store writes',
-  'const primaryAction = canPlanImportedOrder',
   'Order unit facts are read-only in training.',
   'Order unit facts cannot be changed in training.',
 ]) {
   assert.ok(operations.includes(fragment), `Operations training integration is missing ${fragment}`)
 }
+const primaryActionStart = operations.indexOf(
+  'const primaryAction = externalReconciliationAction',
+)
+const externalFulfillmentGate = operations.indexOf(
+  '|| (order?.externallyFulfilled',
+  primaryActionStart,
+)
+const importedTrainingGate = operations.indexOf(
+  ': canPlanImportedOrder',
+  externalFulfillmentGate,
+)
+assert.ok(
+  primaryActionStart >= 0
+  && externalFulfillmentGate > primaryActionStart
+  && importedTrainingGate > externalFulfillmentGate,
+  'required reconciliation must precede the external-fulfillment and imported-order training gates',
+)
 const unitWeightSaveStart = operations.indexOf(
   'const savePlanUnitWeights = async () =>',
 )
@@ -96,7 +112,7 @@ assert.match(
   'local training must not depend on a live Shopify planning-assignment read',
 )
 
-const mirrorOnlyStart = operations.indexOf('const primaryAction')
+const mirrorOnlyStart = operations.indexOf('const externalReconciliationAction')
 const primaryActionEnd = operations.indexOf(
   "const confirmingPicks = primaryAction?.action",
   mirrorOnlyStart,
@@ -113,7 +129,7 @@ assert.ok(
 )
 assert.match(
   mirrorOnlyPrimaryAction,
-  /: order\?\.status === 'released'[\s\S]*\? reconcileExternalFulfillmentAction[\s\S]*: confirmPicksAction/,
+  /const externalReconciliationAction = order\?\.status === 'released'[\s\S]*\? reconcileExternalFulfillmentAction[\s\S]*const primaryAction = externalReconciliationAction[\s\S]*: order\?\.status === 'released'[\s\S]*\? confirmPicksAction/,
   'ordinary released work must remain actionable in every profile',
 )
 

@@ -143,6 +143,7 @@ export type CommerceOrderRevisionCancellationResult = Readonly<{
 export type CommerceOrderRevisionManagerRefreshPreparation = Readonly<{
   replayed: boolean
   readGlobalId: string | null
+  replayedCapture: CommerceOrderRevisionCaptureResult | null
   claim: CommerceOrderRevisionClaim | null
   commandReceiptId: string
 }>
@@ -204,6 +205,781 @@ export class CommerceOrderRevisionDispositionError extends Error {
     this.status = status
     this.retryWithNewIdempotencyKey = retryWithNewIdempotencyKey
   }
+}
+
+export type CommerceOrderRevisionRefreshCandidate = Readonly<{
+  orderGlobalId: string
+  orderRowVersion: number
+  provider: CommerceOrderRevisionProvider
+  totalEligible: number
+}>
+
+export type CommerceOrderStatusSyncBatchPreparation = Readonly<{
+  receiptId: string
+  attemptToken: string | null
+  candidates: readonly CommerceOrderRevisionRefreshCandidate[]
+  replayedResult: Record<string, unknown> | null
+}>
+
+type CommerceOrderStatusSyncBatchPayload = Readonly<{
+  batchLimit: number
+  totalEligible: number
+  candidates: readonly CommerceOrderRevisionRefreshCandidate[]
+  response?: Record<string, unknown>
+}>
+
+const ORDER_STATUS_SYNC_RESULT_KEYS = Object.freeze([
+  'batchLimit',
+  'canonicalOrderWrites',
+  'counts',
+  'failedByCode',
+  'outcomes',
+  'providerWrites',
+  'status',
+  'totalEligible',
+])
+const ORDER_STATUS_SYNC_COUNT_KEYS = Object.freeze([
+  'attempted',
+  'changed',
+  'current',
+  'failed',
+  'providerCancelled',
+  'providerFulfilled',
+  'providerReads',
+  'refreshed',
+  'reviewRequired',
+  'selected',
+])
+const ORDER_STATUS_SYNC_OUTCOME_KEYS = Object.freeze([
+  'code',
+  'orderGlobalId',
+  'outcome',
+  'provider',
+])
+const ORDER_STATUS_SYNC_OUTCOMES = new Set([
+  'current',
+  'review_required',
+  'provider_cancelled',
+  'provider_fulfilled',
+  'failed',
+])
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]) {
+  const actual = Object.keys(value).sort()
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index])
+}
+
+function nonnegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0
+}
+
+function validatedOrderStatusSyncBatchResult(
+  value: unknown,
+  expected: CommerceOrderStatusSyncBatchPayload,
+): Record<string, unknown> {
+  const invalid = () => new CommerceOrderRevisionDispositionError(
+    'COMMERCE_ORDER_STATUS_SYNC_RESULT_INVALID',
+    'The retained order status sync result is invalid',
+    500,
+  )
+  if (!plainRecord(value) || !exactKeys(value, ORDER_STATUS_SYNC_RESULT_KEYS)) {
+    throw invalid()
+  }
+  const counts = value.counts
+  const failedByCode = value.failedByCode
+  const outcomes = value.outcomes
+  if (
+    !plainRecord(counts)
+    || !exactKeys(counts, ORDER_STATUS_SYNC_COUNT_KEYS)
+    || !plainRecord(failedByCode)
+    || !Array.isArray(outcomes)
+    || !nonnegativeSafeInteger(value.batchLimit)
+    || Number(value.batchLimit) < 1
+    || Number(value.batchLimit) > 10
+    || value.batchLimit !== expected.batchLimit
+    || !nonnegativeSafeInteger(value.totalEligible)
+    || value.totalEligible !== expected.totalEligible
+    || value.providerWrites !== 0
+    || value.canonicalOrderWrites !== 0
+  ) throw invalid()
+
+  for (const key of ORDER_STATUS_SYNC_COUNT_KEYS) {
+    if (!nonnegativeSafeInteger(counts[key])) throw invalid()
+  }
+  const selected = Number(counts.selected)
+  const attempted = Number(counts.attempted)
+  const refreshed = Number(counts.refreshed)
+  const changed = Number(counts.changed)
+  const failed = Number(counts.failed)
+  if (
+    selected !== expected.candidates.length
+    || selected > Number(value.batchLimit)
+    || selected > Number(value.totalEligible)
+    || attempted !== selected
+    || refreshed + failed !== attempted
+    || changed > refreshed
+    || outcomes.length !== selected
+    || Number(counts.current)
+      + Number(counts.providerFulfilled)
+      + Number(counts.providerCancelled)
+      + Number(counts.reviewRequired) !== refreshed
+  ) throw invalid()
+
+  const outcomeCounts: Record<string, number> = {
+    current: 0,
+    review_required: 0,
+    provider_cancelled: 0,
+    provider_fulfilled: 0,
+    failed: 0,
+  }
+  const outcomeFailures: Record<string, number> = {}
+  const expectedOutcomeKeys = new Set(expected.candidates.map((candidate) => (
+    `${candidate.provider}:${candidate.orderGlobalId}`
+  )))
+  const observedOutcomeKeys = new Set<string>()
+  for (const outcome of outcomes) {
+    if (
+      !plainRecord(outcome)
+      || !exactKeys(outcome, ORDER_STATUS_SYNC_OUTCOME_KEYS)
+      || !GLOBAL_ORDER_ID.test(String(outcome.orderGlobalId || ''))
+      || !['shopify', 'faire'].includes(String(outcome.provider || ''))
+      || !ORDER_STATUS_SYNC_OUTCOMES.has(String(outcome.outcome || ''))
+    ) throw invalid()
+    const outcomeKey = `${String(outcome.provider)}:${String(outcome.orderGlobalId)}`
+    if (
+      !expectedOutcomeKeys.has(outcomeKey)
+      || observedOutcomeKeys.has(outcomeKey)
+    ) throw invalid()
+    observedOutcomeKeys.add(outcomeKey)
+    const outcomeName = String(outcome.outcome)
+    outcomeCounts[outcomeName] += 1
+    if (outcomeName === 'failed') {
+      const code = String(outcome.code || '')
+      if (!ERROR_CODE.test(code)) throw invalid()
+      outcomeFailures[code] = (outcomeFailures[code] || 0) + 1
+    } else if (outcome.code !== null) {
+      throw invalid()
+    }
+  }
+  if (observedOutcomeKeys.size !== expectedOutcomeKeys.size) throw invalid()
+  if (
+    outcomeCounts.current !== Number(counts.current)
+    || outcomeCounts.provider_fulfilled !== Number(counts.providerFulfilled)
+    || outcomeCounts.provider_cancelled !== Number(counts.providerCancelled)
+    || outcomeCounts.review_required !== Number(counts.reviewRequired)
+    || outcomeCounts.failed !== failed
+  ) throw invalid()
+
+  const failedEntries = Object.entries(failedByCode)
+  if (
+    failedEntries.some(([code, count]) => (
+      !ERROR_CODE.test(code)
+      || !Number.isSafeInteger(count)
+      || Number(count) < 1
+      || outcomeFailures[code] !== count
+    ))
+    || failedEntries.length !== Object.keys(outcomeFailures).length
+    || failedEntries.reduce((sum, [, count]) => sum + Number(count), 0) !== failed
+  ) throw invalid()
+
+  const expectedStatus = failed === 0
+    ? 'succeeded'
+    : refreshed > 0
+      ? 'partial'
+      : 'failed'
+  if (value.status !== expectedStatus) throw invalid()
+  return value
+}
+
+function validatedOrderStatusSyncCandidates(
+  values: unknown,
+  batchLimit: number,
+  expectedTotalEligible?: number,
+): readonly CommerceOrderRevisionRefreshCandidate[] {
+  if (!Array.isArray(values) || values.length > batchLimit) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+      'The retained order status sync candidate set is invalid',
+      500,
+    )
+  }
+  const candidates = values.map((value) => {
+    if (
+      !plainRecord(value)
+      || !exactKeys(value, [
+        'orderGlobalId',
+        'orderRowVersion',
+        'provider',
+        'totalEligible',
+      ])
+    ) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+        'The retained order status sync candidate set is invalid',
+        500,
+      )
+    }
+    return validatedRefreshCandidate(
+      value as CommerceOrderRevisionRefreshCandidate,
+    )
+  })
+  const totalEligible = candidates[0]?.totalEligible || 0
+  const candidateKeys = new Set<string>()
+  const candidateOrderGlobalIds = new Set<string>()
+  for (const candidate of candidates) {
+    const candidateKey = `${candidate.provider}:${candidate.orderGlobalId}`
+    if (
+      candidate.totalEligible !== totalEligible
+      || candidate.totalEligible < candidates.length
+      || candidateKeys.has(candidateKey)
+      || candidateOrderGlobalIds.has(candidate.orderGlobalId)
+    ) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+        'The retained order status sync candidate set is invalid',
+        500,
+      )
+    }
+    candidateKeys.add(candidateKey)
+    candidateOrderGlobalIds.add(candidate.orderGlobalId)
+  }
+  if (
+    expectedTotalEligible !== undefined
+    && totalEligible !== expectedTotalEligible
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+      'The retained order status sync candidate set is invalid',
+      500,
+    )
+  }
+  return Object.freeze(candidates)
+}
+
+function validatedOrderStatusSyncBatchPayload(
+  value: unknown,
+  expectedResponse: boolean,
+): CommerceOrderStatusSyncBatchPayload {
+  const expectedKeys = expectedResponse
+    ? ['batchLimit', 'candidates', 'response', 'totalEligible']
+    : ['batchLimit', 'candidates', 'totalEligible']
+  if (
+    !plainRecord(value)
+    || !exactKeys(value, expectedKeys)
+    || !nonnegativeSafeInteger(value.batchLimit)
+    || Number(value.batchLimit) < 1
+    || Number(value.batchLimit) > 10
+    || !nonnegativeSafeInteger(value.totalEligible)
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+      'The retained order status sync candidate set is invalid',
+      500,
+    )
+  }
+  const batchLimit = Number(value.batchLimit)
+  const totalEligible = Number(value.totalEligible)
+  const candidates = validatedOrderStatusSyncCandidates(
+    value.candidates,
+    batchLimit,
+    totalEligible,
+  )
+  const payload: CommerceOrderStatusSyncBatchPayload = {
+    batchLimit,
+    totalEligible,
+    candidates,
+  }
+  if (!expectedResponse) return Object.freeze(payload)
+  return Object.freeze({
+    ...payload,
+    response: validatedOrderStatusSyncBatchResult(value.response, payload),
+  })
+}
+
+function validatedRefreshCandidate(
+  value: CommerceOrderRevisionRefreshCandidate,
+): CommerceOrderRevisionRefreshCandidate {
+  if (
+    !GLOBAL_ORDER_ID.test(value.orderGlobalId)
+    || !Number.isSafeInteger(value.orderRowVersion)
+    || value.orderRowVersion < 0
+    || !Number.isSafeInteger(value.totalEligible)
+    || value.totalEligible < 1
+    || !['shopify', 'faire'].includes(value.provider)
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_REFRESH_CANDIDATE_INVALID',
+      'A provider refresh candidate is invalid',
+      500,
+    )
+  }
+  return Object.freeze({
+    orderGlobalId: value.orderGlobalId,
+    orderRowVersion: value.orderRowVersion,
+    provider: value.provider,
+    totalEligible: value.totalEligible,
+  })
+}
+
+function validatedManagerRefreshReplayCapture(
+  value: unknown,
+  expected: {
+    orderGlobalId: string
+    orderRowVersion: number
+  },
+): CommerceOrderRevisionCaptureResult {
+  if (
+    !plainRecord(value)
+    || !exactKeys(value, [
+      'canonicalRowVersion',
+      'changed',
+      'managerDispositionRequired',
+      'materialState',
+      'observationGlobalId',
+      'orderGlobalId',
+      'provider',
+      'providerReads',
+      'providerWrites',
+      'readGlobalId',
+      'revisionHash',
+      'sourceHash',
+    ])
+    || value.orderGlobalId !== expected.orderGlobalId
+    || value.canonicalRowVersion !== expected.orderRowVersion
+    || !GLOBAL_OBSERVATION_ID.test(String(value.observationGlobalId || ''))
+    || !GLOBAL_READ_ID.test(String(value.readGlobalId || ''))
+    || !SHA256.test(String(value.sourceHash || ''))
+    || !SHA256.test(String(value.revisionHash || ''))
+    || !['shopify', 'faire'].includes(String(value.provider || ''))
+    || !['current', 'review_required', 'provider_cancelled', 'provider_fulfilled']
+      .includes(String(value.materialState || ''))
+    || typeof value.changed !== 'boolean'
+    || typeof value.managerDispositionRequired !== 'boolean'
+    || value.managerDispositionRequired !== (value.materialState !== 'current')
+    || !Number.isSafeInteger(value.providerReads)
+    || Number(value.providerReads) < 1
+    || Number(value.providerReads) > 4
+    || value.providerWrites !== 0
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_REFRESH_RESULT_INVALID',
+      'The retained provider refresh result is invalid',
+      500,
+    )
+  }
+  return Object.freeze({
+    observationGlobalId: String(value.observationGlobalId),
+    readGlobalId: String(value.readGlobalId),
+    sourceHash: String(value.sourceHash),
+    changed: value.changed,
+    materialState: value.materialState as CommerceOrderRevisionMaterialState,
+    managerDispositionRequired: value.managerDispositionRequired,
+    providerReads: Number(value.providerReads),
+    providerWrites: 0,
+  })
+}
+
+/**
+ * Returns the oldest-attempted canonical provider orders for one organization.
+ *
+ * The caller supplies no provider identity or account authority. Those are
+ * resolved from the organization-bound order and its current readable,
+ * verified integration. The exact manager refresh command revalidates every
+ * candidate under lock immediately before issuing provider I/O.
+ */
+export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
+  input: {
+    organizationId: string
+    limit?: number
+    excludeOrderGlobalIds?: readonly string[]
+  },
+): Promise<CommerceOrderRevisionRefreshCandidate[]> {
+  if (!UUID.test(input.organizationId)) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
+      'Provider refresh input is invalid',
+      400,
+    )
+  }
+  const limit = boundedPositiveInteger(
+    input.limit ?? 5,
+    'Provider refresh limit',
+    10,
+  )
+  const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
+  if (
+    !Array.isArray(excludeOrderGlobalIds)
+    || excludeOrderGlobalIds.length > 100
+    || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
+    || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_REVISION_REFRESH_INVALID',
+      'Provider refresh input is invalid',
+      400,
+    )
+  }
+  const result = await query<{
+    order_global_id: string
+    order_row_version: string
+    provider: CommerceOrderRevisionProvider
+    total_eligible: string
+  }>(
+    `SELECT order_row.global_id AS order_global_id,
+            order_row.row_version::text AS order_row_version,
+            order_row.source_provider AS provider,
+            count(*) OVER ()::text AS total_eligible
+     FROM operations_orders order_row
+     JOIN operations_integration_accounts account
+       ON account.organization_id = order_row.organization_id
+      AND account.id = order_row.integration_account_id
+     JOIN operations_commerce_credentials credential
+       ON credential.organization_id = account.organization_id
+      AND credential.integration_account_id = account.id
+     LEFT JOIN operations_commerce_order_revision_targets target
+       ON target.organization_id = order_row.organization_id
+      AND target.order_id = order_row.id
+     WHERE order_row.organization_id = $1::uuid
+       AND NOT (order_row.global_id = ANY($3::text[]))
+       AND order_row.archived_at IS NULL
+       AND order_row.status NOT IN ('shipped', 'cancelled')
+       AND order_row.source_provider IN ('shopify', 'faire')
+       AND account.integration_type = 'commerce'
+       AND account.provider = order_row.source_provider
+       AND account.external_account_id IS NOT NULL
+       AND ${READABLE_ACCOUNT_SQL}
+       AND credential.verification_status = 'verified'
+       AND credential.credential_version = account.commerce_credential_generation
+       AND (
+         target.id IS NULL
+         OR (
+           (
+             target.claim_state <> 'processing'
+             OR target.locked_until <= now()
+           )
+           AND (
+             target.claim_state NOT IN ('failed', 'dead_letter')
+             OR target.next_check_at <= now()
+           )
+         )
+       )
+     ORDER BY GREATEST(
+                COALESCE(target.checked_at, '-infinity'::timestamptz),
+                COALESCE(target.updated_at, '-infinity'::timestamptz)
+              ) ASC,
+              order_row.updated_at ASC,
+              order_row.id ASC
+     LIMIT $2`,
+    [input.organizationId, limit, excludeOrderGlobalIds],
+  )
+  return result.rows.map((row) => validatedRefreshCandidate({
+      orderGlobalId: row.order_global_id,
+      orderRowVersion: Number(row.order_row_version),
+      provider: row.provider,
+      totalEligible: Number(row.total_eligible),
+    }))
+}
+
+/**
+ * Retains the exact bounded candidate set before provider I/O. Replaying the
+ * batch key returns the retained response, and a stale interrupted attempt
+ * resumes the original candidates instead of silently selecting new orders.
+ */
+export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
+  organizationId: string
+  actorEmail: string
+  idempotencyKey: string
+  batchLimit: number
+  candidates: readonly CommerceOrderRevisionRefreshCandidate[]
+  excludeOrderGlobalIds?: readonly string[]
+}): Promise<CommerceOrderStatusSyncBatchPreparation> {
+  let actorEmail = ''
+  try {
+    actorEmail = boundedText(input.actorEmail, 'Actor email', 320)
+  } catch {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_INVALID',
+      'Sales-channel order status sync input is invalid',
+      400,
+    )
+  }
+  if (
+    !UUID.test(input.organizationId)
+    || !IDEMPOTENCY_KEY.test(input.idempotencyKey)
+    || !Number.isSafeInteger(input.batchLimit)
+    || input.batchLimit < 1
+    || input.batchLimit > 10
+    || input.candidates.length > input.batchLimit
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_INVALID',
+      'Sales-channel order status sync input is invalid',
+      400,
+    )
+  }
+  const candidates = validatedOrderStatusSyncCandidates(
+    input.candidates,
+    input.batchLimit,
+  )
+  const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
+  if (
+    !Array.isArray(excludeOrderGlobalIds)
+    || excludeOrderGlobalIds.length > 100
+    || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
+    || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_INVALID',
+      'Sales-channel order status sync input is invalid',
+      400,
+    )
+  }
+  const normalizedExcludedOrderGlobalIds = [...excludeOrderGlobalIds].sort()
+  const totalEligible = candidates[0]?.totalEligible || 0
+  const requestHash = createHash('sha256').update(canonicalJson({
+    action: 'sync_order_status_from_provider',
+    organizationId: input.organizationId,
+    actorEmail,
+    batchLimit: input.batchLimit,
+    excludeOrderGlobalIds: normalizedExcludedOrderGlobalIds,
+    providerWrites: 0,
+    canonicalOrderWrites: 0,
+  })).digest('hex')
+
+  return withTransaction(async (client) => {
+    await acquireTransactionAdvisoryLock(
+      client,
+      `commerce-order-status-sync:${input.organizationId}:${input.idempotencyKey}`,
+    )
+    const existing = await client.query<RevisionCommandReceiptRow>(
+      `SELECT id::text, request_hash, status, correlation_id::text,
+              result_payload,
+              error_code, error_message, updated_at
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND command_type = 'operations.commerce_order_status_sync'
+         AND idempotency_key = $2
+       FOR UPDATE`,
+      [input.organizationId, input.idempotencyKey],
+    )
+    let receipt = existing.rows[0] || null
+    if (receipt && receipt.request_hash !== requestHash) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_IDEMPOTENCY_CONFLICT',
+        'This Idempotency-Key was already used for a different order status sync',
+      )
+    }
+    if (receipt?.status === 'succeeded') {
+      const retained = validatedOrderStatusSyncBatchPayload(
+        receipt.result_payload,
+        true,
+      )
+      if (retained.batchLimit !== input.batchLimit) {
+        throw new CommerceOrderRevisionDispositionError(
+          'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+          'The retained order status sync candidate set is invalid',
+          500,
+        )
+      }
+      return Object.freeze({
+        receiptId: receipt.id,
+        attemptToken: null,
+        candidates: Object.freeze([]),
+        replayedResult: retained.response as Record<string, unknown>,
+      })
+    }
+    if (receipt?.status === 'failed') {
+      throw new CommerceOrderRevisionDispositionError(
+        ERROR_CODE.test(receipt.error_code || '')
+          ? String(receipt.error_code)
+          : 'COMMERCE_ORDER_STATUS_SYNC_PREVIOUSLY_FAILED',
+        'This order status sync previously failed. Retry with a new Idempotency-Key.',
+        409,
+        true,
+      )
+    }
+    if (
+      receipt?.status === 'processing'
+      && Date.now() - receipt.updated_at.getTime() < 5 * 60_000
+    ) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_IN_PROGRESS',
+        'This exact order status sync is already in progress',
+      )
+    }
+
+    let retainedCandidates = candidates
+    let retainedBatchLimit = input.batchLimit
+    let retainedTotalEligible = totalEligible
+    const attemptToken = randomUUID()
+    if (receipt) {
+      const retained = validatedOrderStatusSyncBatchPayload(
+        receipt.result_payload,
+        false,
+      )
+      if (retained.batchLimit !== input.batchLimit) {
+        throw new CommerceOrderRevisionDispositionError(
+          'COMMERCE_ORDER_STATUS_SYNC_CANDIDATES_INVALID',
+          'The retained order status sync candidate set is invalid',
+          500,
+        )
+      }
+      retainedCandidates = retained.candidates
+      retainedBatchLimit = retained.batchLimit
+      retainedTotalEligible = retained.totalEligible
+      const retried = await client.query<RevisionCommandReceiptRow>(
+        `UPDATE operations_command_receipts
+         SET status = 'processing', actor_email = $2,
+             attempts = attempts + 1, error_code = NULL,
+             error_message = NULL, completed_at = NULL,
+             correlation_id = $3::uuid,
+             started_at = now(), updated_at = now()
+         WHERE id = $1::uuid
+         RETURNING id::text, request_hash, status, correlation_id::text,
+                   result_payload,
+                   error_code, error_message, updated_at`,
+        [receipt.id, actorEmail, attemptToken],
+      )
+      receipt = retried.rows[0]
+    } else {
+      const created = await client.query<RevisionCommandReceiptRow>(
+        `INSERT INTO operations_command_receipts (
+           organization_id, command_type, idempotency_key, request_hash,
+           actor_email, status, correlation_id, result_payload
+         ) VALUES (
+           $1::uuid, 'operations.commerce_order_status_sync', $2, $3,
+           $4, 'processing', $5::uuid, $6::jsonb
+         )
+         RETURNING id::text, request_hash, status, correlation_id::text,
+                   result_payload,
+                   error_code, error_message, updated_at`,
+        [
+          input.organizationId,
+          input.idempotencyKey,
+          requestHash,
+          actorEmail,
+          attemptToken,
+          JSON.stringify({
+            batchLimit: retainedBatchLimit,
+            candidates: retainedCandidates,
+            totalEligible: retainedTotalEligible,
+          }),
+        ],
+      )
+      receipt = created.rows[0]
+    }
+    if (
+      !receipt
+      || !UUID.test(receipt.id)
+      || !UUID.test(receipt.correlation_id)
+      || receipt.correlation_id !== attemptToken
+    ) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_NOT_RETAINED',
+        'The order status sync command was not retained',
+        500,
+      )
+    }
+    return Object.freeze({
+      receiptId: receipt.id,
+      attemptToken,
+      candidates: Object.freeze([...retainedCandidates]),
+      replayedResult: null,
+    })
+  })
+}
+
+export async function completeCommerceOrderStatusSyncBatchInPostgres(input: {
+  organizationId: string
+  receiptId: string
+  attemptToken: string
+  result: Record<string, unknown>
+}) {
+  if (
+    !UUID.test(input.organizationId)
+    || !UUID.test(input.receiptId)
+    || !UUID.test(input.attemptToken)
+  ) {
+    throw new CommerceOrderRevisionDispositionError(
+      'COMMERCE_ORDER_STATUS_SYNC_COMPLETION_INVALID',
+      'Order status sync completion is invalid',
+      500,
+    )
+  }
+  return withTransaction(async (client) => {
+    const receiptResult = await client.query<RevisionCommandReceiptRow>(
+      `SELECT id::text, request_hash, status, correlation_id::text,
+              result_payload, error_code, error_message, updated_at
+       FROM operations_command_receipts
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND command_type = 'operations.commerce_order_status_sync'
+       FOR UPDATE`,
+      [input.organizationId, input.receiptId],
+    )
+    const receipt = receiptResult.rows[0]
+    if (!receipt) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_COMPLETION_NOT_RETAINED',
+        'Order status sync completion was not retained',
+        500,
+      )
+    }
+    if (receipt.correlation_id !== input.attemptToken) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_COMPLETION_STALE_ATTEMPT',
+        'This order status sync attempt lease is no longer current',
+        409,
+      )
+    }
+    if (receipt.status !== 'processing') {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_COMPLETION_NOT_RETAINED',
+        'Order status sync completion was not retained',
+        500,
+      )
+    }
+    const retained = validatedOrderStatusSyncBatchPayload(
+      receipt.result_payload,
+      false,
+    )
+    const result = validatedOrderStatusSyncBatchResult(input.result, retained)
+    const completed = await client.query<{ id: string }>(
+      `UPDATE operations_command_receipts
+       SET status = 'succeeded', result_payload = $4::jsonb,
+           error_code = NULL, error_message = NULL,
+           completed_at = now(), updated_at = now()
+       WHERE organization_id = $1::uuid
+         AND id = $2::uuid
+         AND command_type = 'operations.commerce_order_status_sync'
+         AND status = 'processing'
+         AND correlation_id = $3::uuid
+       RETURNING id::text`,
+      [
+        input.organizationId,
+        input.receiptId,
+        input.attemptToken,
+        JSON.stringify({
+          batchLimit: retained.batchLimit,
+          candidates: retained.candidates,
+          response: result,
+          totalEligible: retained.totalEligible,
+        }),
+      ],
+    )
+    if (completed.rowCount !== 1) {
+      throw new CommerceOrderRevisionDispositionError(
+        'COMMERCE_ORDER_STATUS_SYNC_COMPLETION_NOT_RETAINED',
+        'Order status sync completion was not retained',
+        500,
+      )
+    }
+  })
 }
 
 export function commerceOrderRevisionApplyConfigured() {
@@ -331,6 +1107,7 @@ type RevisionCommandReceiptRow = QueryResultRow & {
   id: string
   request_hash: string
   status: 'processing' | 'succeeded' | 'failed'
+  correlation_id: string
   result_payload: Record<string, unknown> | null
   error_code: string | null
   error_message: string | null
@@ -657,17 +1434,17 @@ export async function prepareManagerCommerceOrderRevisionRefreshInPostgres(
       )
     }
     if (receipt?.status === 'succeeded') {
-      const readGlobalId = String(receipt.result_payload?.readGlobalId || '')
-      if (!GLOBAL_READ_ID.test(readGlobalId)) {
-        throw new CommerceOrderRevisionDispositionError(
-          'COMMERCE_ORDER_REVISION_REFRESH_RESULT_INVALID',
-          'The retained provider refresh result is invalid',
-          500,
-        )
-      }
+      const replayedCapture = validatedManagerRefreshReplayCapture(
+        receipt.result_payload,
+        {
+          orderGlobalId: input.orderGlobalId,
+          orderRowVersion: input.expectedRowVersion,
+        },
+      )
       return Object.freeze({
         replayed: true,
-        readGlobalId,
+        readGlobalId: replayedCapture.readGlobalId,
+        replayedCapture,
         claim: null,
         commandReceiptId: receipt.id,
       })
@@ -868,6 +1645,7 @@ export async function prepareManagerCommerceOrderRevisionRefreshInPostgres(
     return Object.freeze({
       replayed: false,
       readGlobalId: null,
+      replayedCapture: null,
       claim,
       commandReceiptId: receipt.id,
     })

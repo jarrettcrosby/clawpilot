@@ -135,7 +135,15 @@ assert.match(ui, /orderDisplayStatus/)
 assert.match(ui, /Fulfilled externally/)
 assert.match(ui, /order-derived-fulfillment-status/)
 assert.match(persistence, /AS externally_fulfilled/)
-assert.match(persistence, /externallyFulfilled: Boolean\(externalFulfillmentRow\)/)
+assert.match(
+  persistence,
+  /providerFulfillmentStateResult\.rows\[0\]\?\.externally_fulfilled === true/,
+)
+assert.match(
+  persistence,
+  /#>> '\{order,canonicalStates,fulfillment\}' = 'fulfilled'/,
+)
+assert.match(persistence, /provider_read\.provider_write_count = 0/)
 assert.match(ui, /Shopify did not supply tracking details/)
 assert.match(ui, /ClawPilot will not buy replacement postage automatically/)
 assert.match(externalLabelMigration, /clawpilot-external-label/)

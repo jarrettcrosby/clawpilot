@@ -247,6 +247,39 @@ type OperationsPayload = {
     | CommerceStoreSyncUpdateResult
 }
 
+type OrderStatusSyncPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  result?: {
+    status: 'succeeded' | 'partial' | 'failed'
+    batchLimit: number
+    totalEligible: number
+    counts: {
+      selected: number
+      attempted: number
+      refreshed: number
+      changed: number
+      current: number
+      providerFulfilled: number
+      providerCancelled: number
+      reviewRequired: number
+      failed: number
+      providerReads: number
+    }
+    outcomes: Array<{
+      orderGlobalId: string
+      provider: 'shopify' | 'faire'
+      outcome: 'current' | 'provider_fulfilled' | 'provider_cancelled' | 'review_required' | 'failed'
+      code: string | null
+    }>
+    providerWrites: 0
+    canonicalOrderWrites: 0
+  }
+}
+
+const MAX_ORDER_STATUS_SYNC_ORDERS = 100
+
 type ImportedOrderWorkbenchPayload = {
   ok?: boolean
   error?: string
@@ -411,8 +444,11 @@ export type OperationsView =
   | 'gl-coding'
   | 'printing'
 
-const ORDER_STATUSES: Array<{ value: '' | OperationsOrderStatus; label: string }> = [
+type OperationsOrderFilter = '' | OperationsOrderStatus | 'fulfilled_externally'
+
+const ORDER_STATUSES: Array<{ value: OperationsOrderFilter; label: string }> = [
   { value: '', label: 'All statuses' },
+  { value: 'fulfilled_externally', label: 'Fulfilled externally' },
   { value: 'imported', label: 'Imported' },
   { value: 'validated', label: 'Validated' },
   { value: 'held', label: 'Held' },
@@ -1378,9 +1414,11 @@ function OrderDetailDrawer({
   const dateTime = useUserDateTime()
   const { measurementSystem } = useMeasurementSystem()
   const releaseAction = order?.availableActions?.find((item) => item.action === 'release_to_warehouse')
-  const replanningAction = order?.availableActions?.find(
-    (item) => item.action === 'reopen_for_replanning',
-  )
+  const replanningAction = order?.externallyFulfilled
+    ? undefined
+    : order?.availableActions?.find(
+        (item) => item.action === 'reopen_for_replanning',
+      )
   const confirmPicksAction = order?.availableActions?.find((item) => item.action === 'confirm_picks')
   const reconcileExternalFulfillmentAction = order?.availableActions?.find(
     (item) => item.action === 'reconcile_external_fulfillment',
@@ -1398,6 +1436,7 @@ function OrderDetailDrawer({
       : null
   const canPlanImportedOrder = Boolean(
     order?.status === 'imported'
+    && !order.externallyFulfilled
     && order.sourceProvider
     && order.sourceProvider !== 'mock-commerce'
     && (!canonicalShopifyTestLane || Boolean(canonicalShopifyAuthorization))
@@ -1408,19 +1447,24 @@ function OrderDetailDrawer({
   )
   const nativeOneOff = order?.sourceProvider === 'clawpilot_native'
     && Boolean(order.oneOffShippingMode)
-  const primaryAction = canPlanImportedOrder
-    ? undefined
-    : order?.status === 'released'
-      ? order.shopifyExternalFulfillmentReconciliationRequired
-        ? reconcileExternalFulfillmentAction
-        : confirmPicksAction
+  const externalReconciliationAction = order?.status === 'released'
+    && order.shopifyExternalFulfillmentReconciliationRequired
+    ? reconcileExternalFulfillmentAction
+    : undefined
+  const primaryAction = externalReconciliationAction
+    || (order?.externallyFulfilled
+      ? undefined
+      : canPlanImportedOrder
+      ? undefined
+      : order?.status === 'released'
+      ? confirmPicksAction
       : order?.status === 'picking'
         ? verifyPackAction
         : order?.status === 'packed'
           ? confirmShipmentAction
           : order && !['shipped', 'cancelled'].includes(order.status)
             ? releaseAction
-            : undefined
+            : undefined)
   const confirmingPicks = primaryAction?.action === 'confirm_picks'
   const reconcilingExternalFulfillment =
     primaryAction?.action === 'reconcile_external_fulfillment'
@@ -1429,6 +1473,9 @@ function OrderDetailDrawer({
   const confirmingShipment = primaryAction?.action === 'confirm_shipment'
   const shipments = order?.shipments || []
   const externalFulfillment = order?.externalFulfillment || null
+  const providerOnlyExternalFulfillment = Boolean(
+    order?.externallyFulfilled && !externalFulfillment,
+  )
   const trackingObservations = order?.trackingObservations || []
   const printArtifacts = order?.printArtifacts || []
   const labelPrintJobs = order?.labelPrintJobs || []
@@ -2304,7 +2351,12 @@ function OrderDetailDrawer({
             </DetailSection>
 
             <DetailSection title="Shipment evidence">
-              {shipments.length === 0
+              {providerOnlyExternalFulfillment ? (
+                <Alert severity="success">
+                  Fulfilled in {displayStatus(order.sourceProvider)} outside
+                  ClawPilot. No ClawPilot shipment or label was created.
+                </Alert>
+              ) : shipments.length === 0
                 && !externalFulfillment
                 && trackingObservations.length === 0
                 && printArtifacts.length === 0
@@ -3173,11 +3225,12 @@ export default function OperationsSection({
   const [commerceFulfillmentRecoveryEnabled, setCommerceFulfillmentRecoveryEnabled] =
     useState(false)
   const [loading, setLoading] = useState(true)
+  const [syncingOrderStatus, setSyncingOrderStatus] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [view, setView] = useState<OperationsView>(initialView)
   const [search, setSearch] = useState('')
-  const [status, setStatus] = useState<'' | OperationsOrderStatus>('')
+  const [status, setStatus] = useState<OperationsOrderFilter>('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -3189,6 +3242,7 @@ export default function OperationsSection({
   const [importedOrderError, setImportedOrderError] = useState('')
   const pendingImportedOrderSave = useRef<PendingImportedOrderSave | null>(null)
   const pendingImportedOrderAccept = useRef<PendingImportedOrderSave | null>(null)
+  const pendingOrderStatusSyncReload = useRef(false)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -3419,9 +3473,13 @@ export default function OperationsSection({
     setExceptionDrawerOpen(false)
   }, [initialView])
 
-  const loadWorkspace = useCallback(async (orderGlobalId?: string | null, signal?: AbortSignal) => {
+  const loadWorkspace = useCallback(async (
+    orderGlobalId?: string | null,
+    signal?: AbortSignal,
+    options?: { preserveFeedback?: boolean },
+  ) => {
     setLoading(true)
-    setError('')
+    if (!options?.preserveFeedback) setError('')
     const params = new URLSearchParams()
     if (search.trim()) params.set('search', search.trim())
     if (view === 'orders' && status) params.set('status', status)
@@ -3444,6 +3502,114 @@ export default function OperationsSection({
       if (!signal?.aborted) setLoading(false)
     }
   }, [exceptionStatus, search, status, view])
+
+  const syncOrderStatuses = useCallback(async () => {
+    setSyncingOrderStatus(true)
+    setError('')
+    setNotice('')
+    const checkedOrderGlobalIds = new Set<string>()
+    let remainingEligible = 0
+    const totals = {
+      attempted: 0,
+      refreshed: 0,
+      changed: 0,
+      failed: 0,
+    }
+    try {
+      while (checkedOrderGlobalIds.size < MAX_ORDER_STATUS_SYNC_ORDERS) {
+        const response = await fetch('/api/operations/order-status-sync', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Idempotency-Key': `operations-order-status-sync:${crypto.randomUUID()}`,
+          },
+          body: JSON.stringify({
+            excludeOrderGlobalIds: [...checkedOrderGlobalIds],
+          }),
+        })
+        const payload = await response.json().catch(() => ({})) as
+          OrderStatusSyncPayload
+        if (!response.ok || !payload.ok || !payload.result) {
+          throw new Error(
+            `${payload.error || 'Sales-channel order status could not be synchronized'}${
+              payload.code ? ` [${payload.code}]` : ''
+            }`,
+          )
+        }
+        const result = payload.result
+        if (
+          result.providerWrites !== 0
+          || result.canonicalOrderWrites !== 0
+          || result.counts.selected !== result.outcomes.length
+        ) {
+          throw new Error('Sales-channel order status sync returned invalid evidence')
+        }
+        const priorChecked = checkedOrderGlobalIds.size
+        for (const outcome of result.outcomes) {
+          checkedOrderGlobalIds.add(outcome.orderGlobalId)
+        }
+        if (
+          result.counts.selected > 0
+          && checkedOrderGlobalIds.size === priorChecked
+        ) {
+          throw new Error('Sales-channel order status sync did not advance')
+        }
+        totals.attempted += result.counts.attempted
+        totals.refreshed += result.counts.refreshed
+        totals.changed += result.counts.changed
+        totals.failed += result.counts.failed
+        remainingEligible = Math.max(
+          0,
+          result.totalEligible - result.counts.selected,
+        )
+        if (result.counts.selected === 0 || remainingEligible === 0) break
+      }
+      if (totals.attempted > 0) pendingOrderStatusSyncReload.current = true
+      if (totals.attempted === 0) {
+        setNotice(
+          'No Shopify or Faire orders are ready to check right now. Recent provider failures may be waiting for their safe retry window.',
+        )
+      } else {
+        setNotice(
+          `Checked ${totals.attempted} eligible sales-channel ${
+            totals.attempted === 1 ? 'order' : 'orders'
+          }. ${
+            totals.changed === 0
+              ? 'No provider changes were detected.'
+              : `${totals.changed} provider ${
+                  totals.changed === 1 ? 'change was' : 'changes were'
+                } detected.`
+          }${remainingEligible > 0
+            ? ` ${remainingEligible} eligible ${
+                remainingEligible === 1 ? 'order remains' : 'orders remain'
+              }; run sync again to check the next group.`
+            : ''}`,
+        )
+      }
+      if (totals.failed > 0) {
+        setError(
+          `${totals.failed} sales-channel ${
+            totals.failed === 1 ? 'order' : 'orders'
+          } could not be checked. It will be eligible again after the safe retry window.`,
+        )
+      }
+    } catch (caught) {
+      if (checkedOrderGlobalIds.size > 0) {
+        pendingOrderStatusSyncReload.current = true
+      }
+      setError(caught instanceof Error
+        ? caught.message
+        : 'Sales-channel order status could not be synchronized')
+    } finally {
+      setSyncingOrderStatus(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (syncingOrderStatus || !pendingOrderStatusSyncReload.current) return
+    pendingOrderStatusSyncReload.current = false
+    void loadWorkspace(selectedGlobalId, undefined, { preserveFeedback: true })
+  }, [loadWorkspace, selectedGlobalId, syncingOrderStatus])
 
   const loadOneOffExecutionState = useCallback(async (
     orderGlobalId: string,
@@ -6974,6 +7140,8 @@ export default function OperationsSection({
       : view === 'picking'
         ? 'Current picker assignments, evidence progress, manager interventions, and completed work'
       : `Distributed fulfillment${workspace ? ` · CRM: ${workspace.dataPipeline.name}` : ''}`
+  const orderStatusSyncAvailable = view === 'orders'
+    && workspace?.capabilities.canManage === true
 
   return (
     <Box
@@ -7022,7 +7190,25 @@ export default function OperationsSection({
             )}
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
             {mainWorkspaceView && (
-              <Tooltip title="Refresh orders"><span><IconButton aria-label="Refresh operations" disabled={loading} onClick={() => void loadWorkspace(selectedGlobalId)}><RefreshRounded /></IconButton></span></Tooltip>
+              <Tooltip title={orderStatusSyncAvailable
+                ? 'Sync sales-channel order status'
+                : 'Refresh operations'}>
+                <span>
+                  <IconButton
+                    aria-label={orderStatusSyncAvailable
+                      ? 'Sync sales-channel order status'
+                      : 'Refresh operations'}
+                    disabled={loading || syncingOrderStatus}
+                    onClick={() => void (orderStatusSyncAvailable
+                      ? syncOrderStatuses()
+                      : loadWorkspace(selectedGlobalId))}
+                  >
+                    {syncingOrderStatus
+                      ? <CircularProgress size={20} />
+                      : <RefreshRounded />}
+                  </IconButton>
+                </span>
+              </Tooltip>
             )}
           </Stack>
         </Stack>
@@ -7224,7 +7410,7 @@ export default function OperationsSection({
             {metric('Open orders', summary.openOrders)}
             {metric('Exceptions', summary.exceptions, summary.exceptions ? '#EF9A9A' : 'text.primary')}
             {metric('Due soon', summary.dueSoon, summary.dueSoon ? '#FFB74D' : 'text.primary')}
-            {metric('Shipped today', summary.shippedToday, '#81C784')}
+            {metric('ClawPilot shipped today', summary.shippedToday, '#81C784')}
             {metric('Available units', summary.availableUnits)}
             {metric('Reserved units', summary.reservedUnits)}
             {metric('Unbilled', money(summary.unbilledMinor))}
@@ -7347,7 +7533,7 @@ export default function OperationsSection({
               select
               size="small"
               value={status}
-              onChange={(event) => setStatus(event.target.value as '' | OperationsOrderStatus)}
+              onChange={(event) => setStatus(event.target.value as OperationsOrderFilter)}
               inputProps={{ 'aria-label': 'Filter orders by status' }}
               sx={{ ...controlSx, flex: '0 1 180px', minWidth: 150 }}
             >
