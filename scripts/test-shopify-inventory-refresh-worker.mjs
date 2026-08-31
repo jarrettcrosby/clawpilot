@@ -853,7 +853,9 @@ const operationsSection = read(
   'app_src/components/operations/OperationsSection.tsx',
 )
 includes(operationsSection, [
-  '<CommerceImportsPanel onOpenOrder={openPickingOrder} />',
+  '<CommerceImportsPanel',
+  'onOpenOrder={openPickingOrder}',
+  'onReviewOrders={reviewImportedOrders}',
   "const OPERATIONS_ORDER_QUERY = 'operationsOrder'",
   'OPERATIONS_ORDER_GLOBAL_ID.test(pendingOrderGlobalId)',
   'const openPickingOrder = (orderGlobalId: string) => {',

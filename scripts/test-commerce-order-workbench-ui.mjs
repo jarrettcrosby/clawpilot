@@ -3,9 +3,11 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
-const [operations, drawer] = await Promise.all([
+const [operations, drawer, imports, intake] = await Promise.all([
   read('app_src/components/operations/OperationsSection.tsx'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
+  read('app_src/components/operations/CommerceImportsPanel.tsx'),
+  read('app_src/components/settings/CommerceIntakeWorkflow.tsx'),
 ])
 
 for (const fragment of [
@@ -42,6 +44,42 @@ assert.ok(
   'Imported working copies must appear in the ordinary Orders list',
 )
 
+for (const fragment of [
+  'const reviewImportedOrders = () => {',
+  "setView('orders')",
+  "nextUrl.hash = 'operations'",
+  "new HashChangeEvent('hashchange'",
+  'onReviewOrders={reviewImportedOrders}',
+]) {
+  assert.ok(
+    operations.includes(fragment),
+    `Operations UI is missing the single order-review workflow ${fragment}`,
+  )
+}
+
+for (const fragment of [
+  'onReviewOrders: () => void',
+  'Review orders',
+  'Staged orders are',
+  'managed in the Orders workbench.',
+  'onReviewOrders={onReviewOrders}',
+]) {
+  assert.ok(
+    imports.includes(fragment),
+    `Commerce imports is missing the Orders handoff ${fragment}`,
+  )
+}
+
+assert.match(
+  intake,
+  /!onReviewOrders \? \([\s\S]{0,500}Order candidates/u,
+  'The legacy candidate tab must be hidden when Operations owns order review',
+)
+assert.match(
+  intake,
+  /const reviewOrders = \(\) => \{[\s\S]{0,180}onReviewOrders\(\)/u,
+  'Order-review actions must hand off to the Operations Orders workbench',
+)
 for (const fragment of [
   'Recipient name',
   'Apartment, suite, etc.',
