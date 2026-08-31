@@ -1699,6 +1699,12 @@ async function verifyRouteBehavior() {
     selectedOrderGlobalId: 'gor1234567',
   })
 
+  const externalFulfillmentRead = await route.GET(request(
+    'http://localhost/api/operations?status=fulfilled_externally',
+  ))
+  assert.equal(externalFulfillmentRead.status, 200)
+  assert.equal(calls.reads[1].status, 'fulfilled_externally')
+
   const impersonatedRead = await route.GET(request(
     'http://localhost/api/operations?order=gor1234567',
     {

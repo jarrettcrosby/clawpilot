@@ -141,7 +141,10 @@ const ACTIVE_SHIPMENT_GROUP_GLOBAL_ID = /^gash(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCTION_RERATE_RUN_GLOBAL_ID = /^gafr(?:[0-9]{7}|[0-9a-v]{12})$/
 const PRODUCTION_RERATE_OFFER_GLOBAL_ID = /^garo(?:[0-9]{7}|[0-9a-v]{12})$/
 const SHA256 = /^[a-f0-9]{64}$/
-const ORDER_STATUSES = new Set<OperationsOrderStatus>([
+const EXTERNAL_FULFILLMENT_STATUS = 'fulfilled_externally' as const
+type OperationsOrderFilter = OperationsOrderStatus | typeof EXTERNAL_FULFILLMENT_STATUS
+const ORDER_STATUSES = new Set<OperationsOrderFilter>([
+  EXTERNAL_FULFILLMENT_STATUS,
   'imported', 'validated', 'held', 'promised', 'reserved', 'planned',
   'released', 'picking', 'packed', 'shipped', 'cancelled', 'exception',
 ])
@@ -1092,7 +1095,7 @@ export async function GET(req: NextRequest) {
       }, 403)
     }
     const statusValue = String(req.nextUrl.searchParams.get('status') || '').trim()
-    if (statusValue && !ORDER_STATUSES.has(statusValue as OperationsOrderStatus)) {
+    if (statusValue && !ORDER_STATUSES.has(statusValue as OperationsOrderFilter)) {
       requestError('OPERATIONS_STATUS_INVALID', 'Order status is invalid')
     }
     const exceptionStatusValue = String(req.nextUrl.searchParams.get('exceptionStatus') || '').trim()

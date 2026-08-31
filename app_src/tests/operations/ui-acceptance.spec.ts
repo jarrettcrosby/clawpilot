@@ -374,6 +374,218 @@ async function installOperationsRoutes(page: Page) {
   })
 }
 
+async function installOrderStatusSyncRoutes(
+  page: Page,
+  options: {
+    delaySecondBatch?: boolean
+    releasedReconciliation?: boolean
+    eligibleOrderCount?: number
+  } = {},
+) {
+  const releasedReconciliation = options.releasedReconciliation === true
+  const eligibleOrderGlobalIds = Array.from(
+    { length: options.eligibleOrderCount || 1 },
+    (_, index) => `gor${7654321 + index}`,
+  )
+  let providerFulfilled = releasedReconciliation
+  const syncRequests: Array<{
+    idempotencyKey: string
+    body: { excludeOrderGlobalIds: string[] }
+    search: string
+  }> = []
+  const operationsStatusFilters: Array<string | null> = []
+  let markSecondBatchStarted: () => void = () => undefined
+  let releaseSecondBatch: () => void = () => undefined
+  const secondBatchStarted = new Promise<void>((resolve) => {
+    markSecondBatchStarted = resolve
+  })
+  const secondBatchRelease = new Promise<void>((resolve) => {
+    releaseSecondBatch = resolve
+  })
+  const order = () => ({
+    ...selectedOrder,
+    id: 'external-order-id',
+    globalId: 'gor7654321',
+    orderNumber: '#1005',
+    customerName: 'AG Alchemy customer',
+    customerGlobalId: 'ga7654321',
+    sourceProvider: 'shopify',
+    externalOrderId: 'gid://shopify/Order/1005',
+    status: releasedReconciliation ? 'released' : 'imported',
+    externallyFulfilled: providerFulfilled,
+    warehouseName: null,
+    promisedDeliveryAt: null,
+    planStatus: releasedReconciliation ? 'released' : null,
+    waveStatus: releasedReconciliation ? 'released' : null,
+    packageCount: 0,
+    plannedPackageCount: 0,
+    packedPackageCount: 0,
+    pickTaskCount: 0,
+    readyPickTaskCount: 0,
+    pickedPickTaskCount: 0,
+    shopifyExternalFulfillmentReconciliationRequired: releasedReconciliation,
+    availableActions: releasedReconciliation ? [{
+      action: 'reconcile_external_fulfillment',
+      label: 'Reconcile Shopify fulfillment',
+      enabled: true,
+      blockedReason: null,
+    }, {
+      action: 'confirm_picks',
+      label: 'Confirm all picks',
+      enabled: false,
+      blockedReason: 'Reconcile the external Shopify fulfillment first.',
+    }] : [{
+      action: 'release_to_warehouse',
+      label: 'Release to warehouse',
+      enabled: true,
+      blockedReason: null,
+    }],
+    packages: [],
+    rates: [],
+    billableEvents: [],
+    events: [],
+    shipments: [],
+    externalFulfillment: null,
+    trackingObservations: [],
+    printArtifacts: [],
+    commerceExports: [],
+    labelAttempts: [],
+    labelPrintJobs: [],
+    planningPreparation: null,
+    sandboxCommerceE2eAuthorization: null,
+  })
+  const currentWorkspace = (selected = false) => {
+    const base = workspace()
+    const currentOrder = order()
+    return {
+      ...base,
+      summary: {
+        ...base.summary,
+        openOrders: providerFulfilled ? 0 : 1,
+      },
+      orders: [currentOrder],
+      selectedOrder: selected ? currentOrder : null,
+      exceptions: [],
+    }
+  }
+
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-status-sync',
+    async (route) => {
+      const request = route.request()
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        excludeOrderGlobalIds: string[]
+      }
+      syncRequests.push({
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+        search: new URL(request.url()).search,
+      })
+      if (options.delaySecondBatch && syncRequests.length === 2) {
+        markSecondBatchStarted()
+        await secondBatchRelease
+      }
+      const excluded = new Set(body.excludeOrderGlobalIds)
+      const remaining = eligibleOrderGlobalIds.filter((globalId) => (
+        !excluded.has(globalId)
+      ))
+      const batch = remaining.slice(0, 10)
+      providerFulfilled = true
+      return route.fulfill({
+        json: {
+          ok: true,
+          result: {
+            status: 'succeeded',
+            batchLimit: 10,
+            totalEligible: remaining.length,
+            counts: {
+              selected: batch.length,
+              attempted: batch.length,
+              refreshed: batch.length,
+              changed: batch.length,
+              current: 0,
+              providerFulfilled: batch.length,
+              providerCancelled: 0,
+              reviewRequired: 0,
+              failed: 0,
+              providerReads: batch.length,
+            },
+            failedByCode: {},
+            outcomes: batch.map((orderGlobalId) => ({
+              orderGlobalId,
+              provider: 'shopify',
+              outcome: 'provider_fulfilled',
+              code: null,
+            })),
+            providerWrites: 0,
+            canonicalOrderWrites: 0,
+          },
+        },
+      })
+    },
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/order-revisions',
+    async (route) => route.fulfill({
+      json: {
+        ok: true,
+        revision: {
+          eligible: true,
+          provider: 'shopify',
+          orderGlobalId: 'gor7654321',
+          orderRowVersion: 0,
+          orderStatus: 'imported',
+          state: {
+            observationGlobalId: 'gco7654321',
+            readGlobalId: 'gcr7654321',
+            sourceHash: 'a'.repeat(64),
+            revisionHash: 'b'.repeat(64),
+            materialState: 'provider_fulfilled',
+            capturedAt: '2026-08-31T16:00:00.000Z',
+            fresh: true,
+            changed: true,
+            applyEligible: false,
+            applyBlockedCode: 'COMMERCE_ORDER_REVISION_NOT_APPLICABLE',
+            cancellationEligible: false,
+            providerReads: 1,
+            providerWrites: 0,
+            applicationGlobalId: null,
+            exceptionGlobalId: null,
+          },
+        },
+      },
+    }),
+  )
+  await page.route(
+    (url) => url.pathname === '/api/operations/shopify-order-management',
+    async (route) => route.fulfill({
+      status: 503,
+      json: {
+        ok: false,
+        code: 'NOT_REQUIRED_FOR_STATUS_SYNC_ACCEPTANCE',
+        error: 'Provider editing is outside this read-only status sync test',
+      },
+    }),
+  )
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    expect(route.request().method()).toBe('GET')
+    const requestUrl = new URL(route.request().url())
+    operationsStatusFilters.push(requestUrl.searchParams.get('status'))
+    const selected = requestUrl.searchParams.get('order') === 'gor7654321'
+    return route.fulfill({
+      json: { ok: true, operations: currentWorkspace(selected) },
+    })
+  })
+
+  return {
+    operationsStatusFilters,
+    releaseSecondBatch,
+    secondBatchStarted,
+    syncRequests,
+  }
+}
+
 async function installOrderLabelPrintRoutes(
   page: Page,
   options: {
@@ -2128,6 +2340,111 @@ test('imported order provider refresh resolves each address conflict explicitly'
   expect(capture.refreshRequests[0].idempotencyKey)
     .not.toBe(capture.refreshRequests[1].idempotencyKey)
   expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('orders refresh reads Shopify status and projects external fulfillment without local shipment evidence', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page)
+  await gotoApp(page, '/#operations')
+
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Imported')
+  await page.getByRole('button', { name: 'Sync sales-channel order status' }).click()
+
+  await expect(page.getByText(
+    'Checked 1 eligible sales-channel order. 1 provider change was detected.',
+  )).toBeVisible()
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+  await expect.poll(() => capture.operationsStatusFilters.at(-1))
+    .toBe('fulfilled_externally')
+  await expect(page.getByRole('row', { name: /#1005/ })).toContainText('Fulfilled externally')
+  expect(capture.syncRequests).toHaveLength(1)
+  expect(capture.syncRequests[0]).toEqual({
+    idempotencyKey: expect.stringMatching(
+      /^operations-order-status-sync:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+    body: { excludeOrderGlobalIds: [] },
+    search: '',
+  })
+
+  await page.getByRole('row', { name: /#1005/ }).click()
+  await expect(page.getByRole('heading', { name: 'Order #1005' })).toBeVisible()
+  await expect(page.getByTestId('order-derived-fulfillment-status'))
+    .toHaveText('Fulfilled externally')
+  await expect(page.getByText(
+    'Fulfilled in Shopify outside ClawPilot. No ClawPilot shipment or label was created.',
+  )).toBeVisible()
+  await expect(page.getByText(
+    'Shopify reports this order fulfilled outside ClawPilot. Its provider status is shown here; local fulfillment actions are unavailable.',
+  )).toBeVisible()
+  await expect(page.getByText(/Use Reconcile external fulfillment/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Release to warehouse' })).toHaveCount(0)
+})
+
+test('orders refresh continues bounded provider batches from one manager action', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    eligibleOrderCount: 15,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Sync sales-channel order status' }).click()
+
+  await expect(page.getByText(
+    'Checked 15 eligible sales-channel orders. 15 provider changes were detected.',
+  )).toBeVisible()
+  expect(capture.syncRequests).toHaveLength(2)
+  expect(capture.syncRequests[0].body.excludeOrderGlobalIds).toEqual([])
+  expect(capture.syncRequests[1].body.excludeOrderGlobalIds).toHaveLength(10)
+  expect(new Set(capture.syncRequests[1].body.excludeOrderGlobalIds).size).toBe(10)
+})
+
+test('orders refresh reloads the current filter after a delayed provider batch', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    delaySecondBatch: true,
+    eligibleOrderCount: 15,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Sync sales-channel order status' }).click()
+  await capture.secondBatchStarted
+  await page.getByRole('combobox', { name: 'Filter orders by status' }).click()
+  await page.getByRole('option', { name: 'Fulfilled externally' }).click()
+  await expect.poll(() => capture.operationsStatusFilters.at(-1))
+    .toBe('fulfilled_externally')
+  const requestsBeforeFinalReload = capture.operationsStatusFilters.length
+
+  capture.releaseSecondBatch()
+  await expect(page.getByText(
+    'Checked 15 eligible sales-channel orders. 15 provider changes were detected.',
+  )).toBeVisible()
+  await expect.poll(() => capture.operationsStatusFilters.length)
+    .toBeGreaterThan(requestsBeforeFinalReload)
+  expect(
+    capture.operationsStatusFilters
+      .slice(requestsBeforeFinalReload)
+      .every((value) => value === 'fulfilled_externally'),
+  ).toBe(true)
+})
+
+test('released Shopify fulfillment keeps the required reconciliation action ahead of ordinary work', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await installOrderStatusSyncRoutes(page, { releasedReconciliation: true })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('row', { name: /#1005/ }).click()
+  await expect(page.getByTestId('order-derived-fulfillment-status'))
+    .toHaveText('Fulfilled externally')
+  await expect(page.getByText(
+    'Shopify reports external fulfillment. Use Reconcile external fulfillment instead of updating this order.',
+  )).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reconcile Shopify fulfillment' }))
+    .toBeVisible()
+  await expect(page.getByRole('button', { name: 'Confirm all picks' })).toHaveCount(0)
 })
 
 test('operations workbench renders dense desktop evidence and order drill-in', async ({ page }) => {

@@ -503,10 +503,12 @@ export default function CommerceOrderRevisionManagerPanel({
             {recoveryOnly ? (
               <Alert severity="warning">
                 {exactState.materialState === 'provider_fulfilled'
-                  ? `${label} reports external fulfillment. Use Reconcile external fulfillment instead of updating this order.`
+                  ? orderStatus === 'imported' && revision?.orderStatus === 'imported'
+                    ? `${label} reports this order fulfilled outside ClawPilot. Its provider status is shown here; local fulfillment actions are unavailable.`
+                    : `${label} reports external fulfillment. Use Reconcile external fulfillment instead of updating this order.`
                   : exactState.materialState === 'provider_cancelled'
                     ? `${label} reports cancellation, but this order is started, partial, or has downstream evidence. Automatic cancellation is blocked; use manager recovery.`
-                  : 'This order is started, partial, or has downstream evidence. Automatic update is blocked; use manager recovery.'}
+                    : 'This order is started, partial, or has downstream evidence. Automatic update is blocked; use manager recovery.'}
               </Alert>
             ) : null}
 

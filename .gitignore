@@ -12,9 +12,14 @@ coverage/
 dist/
 backups/
 *.tsbuildinfo
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
 clients/apple/.build/
 clients/apple/.swiftpm/
 clients/apple/build/
+clients/apple/.artifacts/
 clients/apple/*.xcodeproj/
 clients/apple/Apps/iPhone/Info.plist
 clients/apple/Apps/Watch/Info.plist
@@ -33,9 +38,9 @@ app_src/coverage/
 #
 # These paths may contain live operator data, customer/pipeline data, local
 # runtime state, generated agent messages, and backup archives. They should not
-# be introduced to a public or shared GitHub remote. Some files are still
-# tracked from legacy local history; sanitize or rebuild a clean repo before the
-# first push.
+# be introduced to a public or shared GitHub remote. Historical commits may
+# still contain retired local artifacts, so new work must pass verify:repo
+# before it is promoted.
 data/*
 data-dev/*
 !data/README.md

@@ -180,6 +180,42 @@ type ProductRow = QueryResultRow & {
   sku: string | null
   price: string
 }
+
+/**
+ * Exact provider evidence may describe a completed external fulfillment while
+ * the canonical Operations status remains Imported. Keep those two facts
+ * separate: this predicate never manufactures a local shipment or label.
+ */
+function externallyFulfilledOrderSql(orderAlias: string) {
+  return `(
+    EXISTS (
+      SELECT 1
+      FROM operations_shopify_external_fulfillment_reconciliations
+             external_fulfillment
+      WHERE external_fulfillment.organization_id = ${orderAlias}.organization_id
+        AND external_fulfillment.order_id = ${orderAlias}.id
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM operations_commerce_order_revision_targets provider_target
+      JOIN operations_commerce_order_revision_reads provider_read
+        ON provider_read.organization_id = provider_target.organization_id
+       AND provider_read.id = provider_target.latest_read_id
+      JOIN operations_commerce_order_revision_observations provider_observation
+        ON provider_observation.organization_id = provider_read.organization_id
+       AND provider_observation.id = provider_read.observation_id
+      WHERE provider_target.organization_id = ${orderAlias}.organization_id
+        AND provider_target.order_id = ${orderAlias}.id
+        AND ${orderAlias}.status = 'imported'
+        AND provider_target.material_state = 'provider_fulfilled'
+        AND provider_target.latest_source_hash IS DISTINCT FROM
+            provider_target.accepted_source_hash
+        AND provider_read.provider_write_count = 0
+        AND provider_observation.normalized_snapshot
+              #>> '{order,canonicalStates,fulfillment}' = 'fulfilled'
+    )
+  )`
+}
 type IdRow = QueryResultRow & { id: string; global_id: string }
 type OrderLineIdentityRow = IdRow & { external_line_id: string }
 type WarehouseRow = QueryResultRow & {
@@ -3461,6 +3497,7 @@ async function readOrderDetail(
     labelPrintJobResult,
     shipmentResult,
     externalFulfillmentResult,
+    providerFulfillmentStateResult,
     trackingResult,
     artifactResult,
     commerceExportResult,
@@ -3763,6 +3800,15 @@ async function readOrderDetail(
        LIMIT 1`,
       [organizationId, row.id],
     ),
+    query<QueryResultRow & { externally_fulfilled: boolean }>(
+      `SELECT ${externallyFulfilledOrderSql('provider_order')}
+                AS externally_fulfilled
+       FROM operations_orders provider_order
+       WHERE provider_order.organization_id = $1::uuid
+         AND provider_order.id = $2::uuid
+       LIMIT 1`,
+      [organizationId, row.id],
+    ),
     query<QueryResultRow & {
       global_id: string
       shipment_global_id: string
@@ -3927,6 +3973,8 @@ async function readOrderDetail(
   }
 
   const externalFulfillmentRow = externalFulfillmentResult.rows[0]
+  const externallyFulfilled = Boolean(externalFulfillmentRow)
+    || providerFulfillmentStateResult.rows[0]?.externally_fulfilled === true
   const externalFulfillmentSnapshot = json(
     externalFulfillmentRow?.evidence_snapshot,
   )
@@ -3954,7 +4002,7 @@ async function readOrderDetail(
     customerGlobalId: row.customer_global_id,
     sourceProvider: row.source_provider,
     status: row.status,
-    externallyFulfilled: Boolean(externalFulfillmentRow),
+    externallyFulfilled,
     currency: row.currency,
     rowVersion: Number(row.row_version),
     oneOffShippingMode: row.one_off_shipping_mode,
@@ -4282,8 +4330,13 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     exceptionWhere.push(`(lower(exception.title) LIKE $${exceptionValues.length} OR lower(exception.global_id) LIKE $${exceptionValues.length} OR lower(COALESCE(orders.order_number, '')) LIKE $${exceptionValues.length} OR lower(COALESCE(customer.name, '')) LIKE $${exceptionValues.length})`)
   }
   if (input.status) {
-    values.push(input.status)
-    where.push(`orders.status = $${values.length}`)
+    if (input.status === 'fulfilled_externally') {
+      where.push(externallyFulfilledOrderSql('orders'))
+    } else {
+      values.push(input.status)
+      where.push(`orders.status = $${values.length}`)
+      where.push(`NOT (${externallyFulfilledOrderSql('orders')})`)
+    }
   }
   if (input.exceptionStatus) {
     exceptionValues.push(input.exceptionStatus)
@@ -4326,7 +4379,12 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       unbilled_minor: string
     }>(
       `SELECT
-         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status NOT IN ('shipped', 'cancelled'))::text AS open_orders,
+         (SELECT count(*)
+          FROM operations_orders summary_order
+          WHERE summary_order.organization_id = $1::uuid
+            AND summary_order.archived_at IS NULL
+            AND summary_order.status NOT IN ('shipped', 'cancelled')
+            AND NOT (${externallyFulfilledOrderSql('summary_order')}))::text AS open_orders,
          (SELECT count(*)
           FROM operations_exceptions exception
           LEFT JOIN operations_orders exception_order
@@ -4334,7 +4392,13 @@ export async function readOperationsWorkspaceFromPostgres(input: {
           WHERE exception.organization_id = $1::uuid
             AND exception.status IN ('open', 'acknowledged')
             AND (exception_order.id IS NULL OR exception_order.archived_at IS NULL))::text AS exceptions,
-         (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status NOT IN ('shipped', 'cancelled') AND promised_delivery_at <= now() + interval '2 days')::text AS due_soon,
+         (SELECT count(*)
+          FROM operations_orders summary_order
+          WHERE summary_order.organization_id = $1::uuid
+            AND summary_order.archived_at IS NULL
+            AND summary_order.status NOT IN ('shipped', 'cancelled')
+            AND summary_order.promised_delivery_at <= now() + interval '2 days'
+            AND NOT (${externallyFulfilledOrderSql('summary_order')}))::text AS due_soon,
          (SELECT count(*) FROM operations_orders WHERE organization_id = $1::uuid AND archived_at IS NULL AND status = 'shipped' AND updated_at >= date_trunc('day', now()))::text AS shipped_today,
          COALESCE((SELECT sum(position.reserved_quantity)
                    FROM operations_inventory_positions position
@@ -4388,13 +4452,8 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       `SELECT orders.id::text, orders.global_id, orders.order_number,
               customer.name AS customer_name, customer.reference_code AS customer_global_id,
               orders.source_provider, orders.status,
-              EXISTS (
-                SELECT 1
-                FROM operations_shopify_external_fulfillment_reconciliations
-                       external_fulfillment
-                WHERE external_fulfillment.organization_id = orders.organization_id
-                  AND external_fulfillment.order_id = orders.id
-              ) AS externally_fulfilled,
+              ${externallyFulfilledOrderSql('orders')}
+                AS externally_fulfilled,
               warehouse.name AS warehouse_name,
               orders.promised_delivery_at,
               (SELECT count(*) FROM operations_current_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
