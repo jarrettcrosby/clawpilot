@@ -91,6 +91,11 @@ const shopifyCheckoutLineAuthorityMigration = [
   '3997653966815d60a96ccaf252215e11fa603ca721ec7904298e71bce370c984',
 ]
 
+const orderWorkbenchExactHistoryMigration = [
+  'db/migrations/0340_operations_order_workbench_exact_history.sql',
+  '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e',
+]
+
 function fail(message) {
   console.error(`predeploy check failed: ${message}`)
   process.exit(1)
@@ -162,6 +167,10 @@ for (const requiredFragment of [
   '729f134cd49c97aae0d155d8d49cdc44b16b9eebde242cce016987b257ff75ad',
   'OPERATIONS_COMMERCE_FULFILLMENT_AUTHORITY_LEASES_ARTIFACT_COUNT = 14',
   '88e112da61f9894dbf031952f1c11bc7dce8b3c0398089e35c79adaeb91b1eae',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17',
+  'c9a6a9a9a29fe4feea20572ada59bb054b07fa8eb80a0d787b4bda492d747017',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
   'OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL',
 ]) {
   if (!orderEditingHealth.includes(requiredFragment)) {
@@ -303,6 +312,24 @@ if (
   fail('Shopify checkout line-authority migration checksum drifted')
 }
 
+const [orderWorkbenchExactHistoryMigrationPath,
+  orderWorkbenchExactHistoryMigrationChecksum] =
+  orderWorkbenchExactHistoryMigration
+if (!existsSync(resolve(root, orderWorkbenchExactHistoryMigrationPath))) {
+  fail(
+    `missing order workbench exact-history migration: ${orderWorkbenchExactHistoryMigrationPath}`,
+  )
+}
+if (
+  createHash('sha256')
+    .update(readFileSync(
+      resolve(root, orderWorkbenchExactHistoryMigrationPath),
+    ))
+    .digest('hex') !== orderWorkbenchExactHistoryMigrationChecksum
+) {
+  fail('Order workbench exact-history migration checksum drifted')
+}
+
 const healthRoute = readFileSync(
   resolve(root, 'app_src/app/api/health/route.ts'),
   'utf8',
@@ -310,7 +337,9 @@ const healthRoute = readFileSync(
 for (const requiredFragment of [
   "from '@/lib/persistence/operationsOrderEditingReleaseHealth'",
   '${OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL}',
+  '${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}',
   'AS operations_order_editing_release_applied',
+  'AS operations_order_workbench_exact_history_applied',
   '&& row?.operations_order_editing_release_applied',
   '|| !row?.operations_order_editing_release_applied',
 ]) {
@@ -848,6 +877,7 @@ for (const requiredPath of [
   'db/migrations/0327_operations_legacy_unit_pack_compatibility.sql',
   'db/migrations/0329_operations_shopify_checkout_unit_material_cartonization.sql',
   'db/migrations/0331_operations_shopify_checkout_line_authority.sql',
+  'db/migrations/0340_operations_order_workbench_exact_history.sql',
   'app_src/app/api/operations/external-label-artifacts/route.ts',
   'app_src/lib/persistence/operationExternalFulfillmentLabels.ts',
   'db/migrations/0304_shipping_one_off_pack_confirmation.sql',

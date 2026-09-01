@@ -843,6 +843,246 @@ async function seedTerminalProviderObservation(pool, fixture, key) {
   }
 }
 
+async function seedNewerTerminalProviderCandidate(pool, fixture) {
+  const runId = randomUUID()
+  const candidateId = randomUUID()
+  const runGlobalId = 'gcir0009715'
+  const candidateGlobalId = 'gcoc0009715'
+  const externalLineId = 'gid://shopify/LineItem/latest-terminal-0009715'
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO crm_reference_registry (
+         reference_code, prefix, canonical_code, status, entity_type
+       ) VALUES
+         ($1, 'gcir', $1, 'active', 'operations.commerce_intake_run'),
+         ($2, 'gcoc', $2, 'active', 'operations.commerce_order_candidate')`,
+      [runGlobalId, candidateGlobalId],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_intake_runs (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         provider, resource, credential_version, provider_api_version,
+         normalizer_version, idempotency_key, request_hash, window_end,
+         workflow_state, records_seen, records_staged, created_by, updated_by,
+         expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+         'shopify', 'orders', 1, '2026-07',
+         'commerce-order-workbench-postgres-v1', $6, $7,
+         now() + interval '2 seconds', 'held', 1, 1, $8, $8,
+         now() + interval '7 days'
+       )`,
+      [
+        runId,
+        runGlobalId,
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        `workbench-run-${runGlobalId}`,
+        'd'.repeat(64),
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_candidates (
+         id, global_id, organization_id, integration_account_id, pipeline_id,
+         run_id, provider, external_order_id, order_number_snapshot,
+         provider_order_status_raw, provider_financial_status_raw,
+         provider_fulfillment_status_raw, provider_return_status_raw,
+         normalized_order_status, normalized_payment_status,
+         normalized_fulfillment_status, normalized_return_status,
+         requires_shipping, currency_code, subtotal_minor, discount_minor,
+         brand_discount_minor, shipping_minor, tax_minor,
+         other_adjustment_minor, total_minor, party_snapshot_state,
+         customer_resolution_state, customer_id, customer_match_method,
+         ship_to_snapshot_state, ship_to_snapshot_source,
+         delivery_resolution_state, observed_at, provider_updated_at,
+         source_revision, source_hash, provider_api_version,
+         normalizer_version, workflow_state, blocking_codes, row_version,
+         created_by, updated_by, expires_at
+       ) VALUES (
+         $1::uuid, $2, $3::uuid, $4::uuid, $5::uuid,
+         $6::uuid, 'shopify', $7, $8,
+         'CLOSED', 'PAID', 'FULFILLED', 'NONE',
+         'closed', 'paid', 'fulfilled', 'none',
+         true, 'USD', 5000, 0, 0, 0, 0, 0, 5000, 'missing',
+         'resolved', $9::uuid, 'external_id', 'missing', 'none',
+         'not_supplied', now() - interval '1 hour',
+         now() + interval '2 seconds', $10, $11, '2026-07',
+         'commerce-order-workbench-postgres-v1', 'held',
+         '{}'::text[], 0, $12, $12, now() + interval '7 days'
+       )`,
+      [
+        candidateId,
+        candidateGlobalId,
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        runId,
+        `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
+        `#${fixture.candidateGlobalId.slice(-7)}`,
+        fixture.customer,
+        'workbench-latest-terminal-source',
+        '7'.repeat(64),
+        actorEmail,
+      ],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_order_candidate_lines (
+         organization_id, integration_account_id, pipeline_id, run_id,
+         order_candidate_id, provider, external_line_id,
+         product_title_snapshot, provider_status_raw, normalized_status,
+         ordered_quantity, current_quantity, cancelled_quantity,
+         fulfilled_quantity, unfulfilled_quantity, returned_quantity,
+         unit_multiplier, physical_quantity, currency_code, unit_price_minor,
+         subtotal_minor, discount_minor, brand_discount_minor, tax_minor,
+         other_adjustment_minor, total_minor, price_resolution_state,
+         resolved_currency_code, resolved_unit_price_minor,
+         resolved_subtotal_minor, resolved_discount_minor,
+         resolved_brand_discount_minor, resolved_tax_minor,
+         resolved_other_adjustment_minor, resolved_total_minor,
+         requires_shipping, mapping_state, product_id, packaging_state,
+         packaging_source, weight_grams, length_mm, width_mm, height_mm,
+         observed_at, source_revision, source_hash, provider_api_version,
+         normalizer_version, workflow_state, blocking_codes,
+         created_by, updated_by, expires_at
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+         $5::uuid, 'shopify', $6,
+         'Latest externally fulfilled item', 'FULFILLED', 'fulfilled',
+         7, 5, 2, 4, 0, 1, 1, 5, 'USD', 1000,
+         5000, 0, 0, 0, 0, 5000, 'provider',
+         'USD', 1000, 5000, 0, 0, 0, 0, 5000,
+         true, 'resolved', $7::uuid, 'resolved',
+         'manual', 250, 200, 150, 100,
+         now() + interval '2 seconds', $8, $9, '2026-07',
+         'commerce-order-workbench-postgres-v1', 'held', '{}'::text[],
+         $10, $10, now() + interval '7 days'
+       )`,
+      [
+        fixture.organization,
+        fixture.integration,
+        fixture.pipeline,
+        runId,
+        candidateId,
+        externalLineId,
+        fixture.product,
+        'workbench-latest-terminal-line',
+        '8'.repeat(64),
+        actorEmail,
+      ],
+    )
+    return { candidateId, candidateGlobalId, externalLineId }
+  } finally {
+    await client.query('SET session_replication_role = origin').catch(() => {})
+    client.release()
+  }
+}
+
+async function seedExactTerminalProviderHistory(
+  pool,
+  fixture,
+  terminalCandidate,
+) {
+  const leaseId = randomUUID()
+  const exactOnlyExternalLineId =
+    'gid://shopify/LineItem/exact-history-only-0009715'
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO operations_commerce_store_sync_controls (
+         organization_id, integration_account_id, desired_state,
+         explicit_choice, revision, reason, created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, 'running', true, 1,
+         'Exact terminal-order history regression fixture', $3, $3
+       )
+       ON CONFLICT (organization_id, integration_account_id) DO NOTHING`,
+      [fixture.organization, fixture.integration, actorEmail],
+    )
+    await client.query(
+      `INSERT INTO operations_commerce_store_sync_read_leases (
+         id, organization_id, integration_account_id, authority_kind,
+         read_kind, intent_fingerprint_sha256, control_revision,
+         activation_revision, acquired_by, acquired_at, heartbeat_at,
+         expires_at, captured_at
+       ) SELECT
+         $1::uuid, $2::uuid, $3::uuid, 'manual_read_only',
+         'order_history', $4, 1, activation.revision, $5,
+         clock_timestamp() - interval '1 second',
+         clock_timestamp() - interval '1 second',
+         clock_timestamp() + interval '60 seconds', clock_timestamp()
+       FROM operations_activation_scopes activation
+       WHERE activation.organization_id = $2::uuid`,
+      [
+        leaseId,
+        fixture.organization,
+        fixture.integration,
+        '6'.repeat(64),
+        actorEmail,
+      ],
+    )
+    const observation = (await client.query(
+      `INSERT INTO operations_commerce_order_observations (
+         organization_id, integration_account_id,
+         manual_provider_read_lease_id, provider, credential_generation,
+         observation_kind, external_order_id, order_number,
+         source_revision, source_hash, canonical_lifecycle_state,
+         canonical_payment_state, canonical_fulfillment_state,
+         canonical_return_state, provider_updated_at, observed_at,
+         provider_read_count
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', 1,
+         'manual_exact_read', $4, $5, $6, $7,
+         'closed', 'paid', 'fulfilled', 'returned',
+         now() + interval '4 seconds', now() + interval '4 seconds', 3
+       ) RETURNING id::text, global_id, observed_at`,
+      [
+        fixture.organization,
+        fixture.integration,
+        leaseId,
+        `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
+        `#${fixture.candidateGlobalId.slice(-7)}`,
+        'workbench-terminal-manual-exact-read-v1',
+        '9'.repeat(64),
+      ],
+    )).rows[0]
+    await client.query(
+      `INSERT INTO operations_commerce_order_observation_lines (
+         organization_id, observation_id, external_line_id,
+         external_product_id, external_variant_id, sku,
+         original_quantity, current_quantity, unfulfilled_quantity,
+         fulfilled_quantity, returned_quantity, requires_shipping
+       ) VALUES
+         ($1::uuid, $2::uuid, $3,
+          'gid://shopify/Product/exact-matched',
+          'gid://shopify/ProductVariant/exact-matched', 'EXACT-MATCHED',
+          9, 8, 0, 8, 3, true),
+         ($1::uuid, $2::uuid, $4,
+          'gid://shopify/Product/exact-only',
+          'gid://shopify/ProductVariant/exact-only', 'EXACT-ONLY-SKU',
+          2, 1, 0, 1, 1, true)`,
+      [
+        fixture.organization,
+        observation.id,
+        terminalCandidate.externalLineId,
+        exactOnlyExternalLineId,
+      ],
+    )
+    return {
+      exactOnlyExternalLineId,
+      observationGlobalId: observation.global_id,
+      observedAt: observation.observed_at.toISOString(),
+    }
+  } finally {
+    await client.query('SET session_replication_role = origin').catch(() => {})
+    client.release()
+  }
+}
+
 async function seedSearchBoundaryCandidates(pool, fixture) {
   const client = await pool.connect()
   try {
@@ -1316,6 +1556,105 @@ function workbenchPersistence(pool) {
       '@/lib/operations/orderShipTo': orderShipTo,
       '@/lib/persistence/commerceIntake': candidateResolver,
       '@/lib/persistence/commerceIntegrations': runtimePersistence,
+      '@/lib/persistence/commerceOrderSync': {
+        async readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres(
+          input,
+        ) {
+          assert.deepEqual(
+            Array.from(input.providerObservationKinds || []),
+            ['manual_exact_read', 'webhook_exact_read'],
+            'Workbench line history must request only exact provider evidence',
+          )
+          const observation = (await pool.query(
+            `SELECT observation.id::text, observation.global_id,
+                    observation.observed_at, observation.provider_updated_at
+             FROM operations_commerce_order_observations observation
+             JOIN operations_integration_accounts account
+               ON account.organization_id = observation.organization_id
+              AND account.id = observation.integration_account_id
+              AND account.global_id = $2
+             WHERE observation.organization_id = $1::uuid
+               AND observation.external_order_id = $3
+               AND observation.observation_kind = ANY($4::text[])
+             ORDER BY COALESCE(
+                        observation.provider_updated_at,
+                        observation.observed_at
+                      ) DESC,
+                      observation.observed_at DESC,
+                      observation.id DESC
+             LIMIT 1`,
+            [
+              input.organizationId,
+              input.accountGlobalId,
+              input.externalOrderId,
+              Array.from(input.providerObservationKinds),
+            ],
+          )).rows[0]
+          if (!observation) {
+            return {
+              items: [],
+              truncated: false,
+              limit: 500,
+              providerWrites: 0,
+            }
+          }
+          const lines = (await pool.query(
+            `SELECT external_line_id, external_product_id,
+                    external_variant_id, sku, original_quantity::text,
+                    current_quantity::text, unfulfilled_quantity::text,
+                    fulfilled_quantity::text, returned_quantity::text,
+                    requires_shipping
+             FROM operations_commerce_order_observation_lines
+             WHERE organization_id = $1::uuid
+               AND observation_id = $2::uuid
+             ORDER BY external_line_id`,
+            [input.organizationId, observation.id],
+          )).rows
+          return {
+            items: [{
+              evidenceSource: 'provider',
+              evidenceGlobalId: observation.global_id,
+              eventKind: 'order_lines_snapshot',
+              eventStatus: null,
+              occurredAt: (
+                observation.provider_updated_at || observation.observed_at
+              ).toISOString(),
+              attributionSource: 'provider_system',
+              actorEmail: null,
+              providerActorFingerprint: null,
+              locationReference: null,
+              payload: {
+                observationGlobalId: observation.global_id,
+                observedAt: observation.observed_at.toISOString(),
+                inventorySemantics: 'order_demand',
+                lines: lines.map((line) => ({
+                  externalLineId: line.external_line_id,
+                  externalProductId: line.external_product_id,
+                  externalVariantId: line.external_variant_id,
+                  sku: line.sku,
+                  originalQuantity: Number(line.original_quantity),
+                  currentQuantity: line.current_quantity === null
+                    ? null
+                    : Number(line.current_quantity),
+                  unfulfilledQuantity: line.unfulfilled_quantity === null
+                    ? null
+                    : Number(line.unfulfilled_quantity),
+                  fulfilledQuantity: line.fulfilled_quantity === null
+                    ? null
+                    : Number(line.fulfilled_quantity),
+                  returnedQuantity: line.returned_quantity === null
+                    ? null
+                    : Number(line.returned_quantity),
+                  requiresShipping: line.requires_shipping,
+                })),
+              },
+            }],
+            truncated: false,
+            limit: 500,
+            providerWrites: 0,
+          }
+        },
+      },
       '@/lib/persistence/postgres': postgresAdapter(pool),
     },
   )
@@ -1403,6 +1742,7 @@ async function verifyAcceptance(
         failedRetainedFixture,
         'Failed retained workbench',
       )
+      await seedReadyFacts(terminalRaceSeed, failedRetainedFixture)
       await seedTenant(
         terminalRaceSeed,
         lockOrderFixture,
@@ -1627,27 +1967,115 @@ async function verifyAcceptance(
       observedAt: failedRetained[0].providerState.observedAt,
       source: 'retained',
     })
-    await seedTerminalProviderObservation(
+    const latestTerminalCandidate = await seedNewerTerminalProviderCandidate(
       pool,
       failedRetainedFixture,
-      'failed-retained-terminal',
     )
-    const failedRetainedTerminal = plain(await persistence
+    const exactTerminalHistory = await seedExactTerminalProviderHistory(
+      pool,
+      failedRetainedFixture,
+      latestTerminalCandidate,
+    )
+    const failedRetainedTerminalSummary = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({
         organizationId: failedRetainedFixture.organization,
         candidateGlobalId: failedRetainedFixture.candidateGlobalId,
       }))
     assert.equal(
+      failedRetainedTerminalSummary[0].providerHistory.observedAt,
+      exactTerminalHistory.observedAt,
+      'summary rows must expose the latest persisted exact-history observation marker',
+    )
+    assert.deepEqual(
+      failedRetainedTerminalSummary[0].providerHistory.currentLines,
+      [],
+      'summary rows must not load exact-history line timelines',
+    )
+    assert.deepEqual(
+      failedRetainedTerminalSummary[0].providerHistory.events,
+      [],
+      'summary rows must not load exact-history event timelines',
+    )
+    const failedRetainedTerminal = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        includeResolutionDetails: true,
+      }))
+    assert.equal(
       failedRetainedTerminal.length,
       1,
-      'terminal provider history must retain the failed-candidate working copy',
+      'a newer terminal provider candidate must retain the accepted working copy',
+    )
+    assert.equal(
+      failedRetainedTerminal[0].candidateGlobalId,
+      failedRetainedFixture.candidateGlobalId,
+      'terminal display facts must not replace the accepted command identity',
     )
     assert.deepEqual(failedRetainedTerminal[0].providerState, {
       lifecycle: 'closed',
       fulfillment: 'fulfilled',
       observedAt: failedRetainedTerminal[0].providerState.observedAt,
       source: 'history',
-    }, 'a failed retained row must project its terminal provider history')
+    }, 'a retained row must project the latest exact terminal provider state')
+    assert.equal(failedRetainedTerminal[0].lineCount, 2)
+    assert.equal(
+      failedRetainedTerminal[0].providerHistory.currentLines.length,
+      2,
+      'the exact provider observation must retain its complete line snapshot',
+    )
+    assert.deepEqual(
+      Object.fromEntries(failedRetainedTerminal[0].lines.map((line) => [
+        line.externalLineId,
+        {
+          title: line.title,
+          sku: line.sku,
+          quantity: line.quantity,
+          orderedQuantity: line.orderedQuantity,
+          currentQuantity: line.currentQuantity,
+          cancelledOrRemovedQuantity: line.cancelledOrRemovedQuantity,
+          fulfilledQuantity: line.fulfilledQuantity,
+          unfulfilledQuantity: line.unfulfilledQuantity,
+          returnedQuantity: line.returnedQuantity,
+          providerStatus: line.providerStatus,
+          blockerCodes: line.blockerCodes,
+        },
+      ])),
+      {
+        [latestTerminalCandidate.externalLineId]: {
+          title: 'Latest externally fulfilled item',
+          sku: 'EXACT-MATCHED',
+          quantity: 0,
+          orderedQuantity: 9,
+          currentQuantity: 8,
+          cancelledOrRemovedQuantity: 1,
+          fulfilledQuantity: 8,
+          unfulfilledQuantity: 0,
+          returnedQuantity: 3,
+          providerStatus: 'returned',
+          blockerCodes: [],
+        },
+        [exactTerminalHistory.exactOnlyExternalLineId]: {
+          title: 'EXACT-ONLY-SKU',
+          sku: 'EXACT-ONLY-SKU',
+          quantity: 0,
+          orderedQuantity: 2,
+          currentQuantity: 1,
+          cancelledOrRemovedQuantity: 1,
+          fulfilledQuantity: 1,
+          unfulfilledQuantity: 0,
+          returnedQuantity: 1,
+          providerStatus: 'returned',
+          blockerCodes: [],
+        },
+      },
+      'terminal detail must prefer exact-observation adjustments and include history-only lines from the latest provider revision',
+    )
+    assert.equal(
+      failedRetainedTerminal[0].blockerCodes.includes('packaging_required'),
+      false,
+      'terminal line history must not reintroduce active packaging blockers',
+    )
     const failedRetainedTerminalState = await stateCounts(
       pool,
       failedRetainedFixture,
@@ -1680,6 +2108,106 @@ async function verifyAcceptance(
       failedRetainedTerminalState,
       'terminal retained-row save and accept attempts must roll back completely',
     )
+    const localDraftFacts = (await pool.query(
+      `SELECT line.global_id AS line_global_id,
+              product.reference_code AS product_global_id,
+              customer.reference_code AS customer_global_id
+       FROM operations_commerce_order_candidate_lines line
+       JOIN crm_products product
+         ON product.pipeline_id = line.pipeline_id
+        AND product.id = line.product_id
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = line.organization_id
+        AND candidate.id = line.order_candidate_id
+       JOIN crm_organizations customer
+         ON customer.pipeline_id = candidate.pipeline_id
+        AND customer.id = candidate.customer_id
+       WHERE line.organization_id = $1::uuid
+         AND line.order_candidate_id = $2::uuid
+       LIMIT 1`,
+      [failedRetainedFixture.organization, failedRetainedFixture.candidate],
+    )).rows[0]
+    const terminalDraftSeed = await pool.connect()
+    try {
+      await terminalDraftSeed.query('SET session_replication_role = replica')
+      await terminalDraftSeed.query(
+        `UPDATE operations_commerce_order_workbench
+         SET customer_global_id_draft = $2,
+             requested_delivery_at_draft =
+               '2026-09-15T16:00:00.000Z'::timestamptz,
+             line_resolution_drafts = jsonb_build_object(
+               $3::text,
+               jsonb_build_object(
+                 'productGlobalId', $4::text,
+                 'unitPriceMinor', 1000,
+                 'currency', 'USD',
+                 'packageProfileGlobalId', null
+               )
+             )
+         WHERE organization_id = $1::uuid`,
+        [
+          failedRetainedFixture.organization,
+          localDraftFacts.customer_global_id,
+          localDraftFacts.line_global_id,
+          localDraftFacts.product_global_id,
+        ],
+      )
+    } finally {
+      await terminalDraftSeed.query('SET session_replication_role = origin')
+        .catch(() => {})
+      terminalDraftSeed.release()
+    }
+    const terminalRebase = plain(await persistence
+      .rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
+        organizationId: failedRetainedFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-terminal-rebase-clears-drafts-0001',
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+      }))
+    assert.deepEqual(terminalRebase, {
+      previousCandidateGlobalId: failedRetainedFixture.candidateGlobalId,
+      candidateGlobalId: latestTerminalCandidate.candidateGlobalId,
+      rowVersion: 2,
+      status: 'rebased',
+      providerChangedFields: [],
+      preservedLocalFields: [],
+      preservedLineDrafts: [],
+      providerWrites: 0,
+      providerWriteIntentCreated: false,
+      replayed: false,
+    }, 'terminal refresh must rebase without irrelevant line conflicts')
+    const terminalRebasedState = (await pool.query(
+      `SELECT candidate.global_id AS candidate_global_id,
+              workbench.ship_to_edit_state,
+              workbench.ship_to_ciphertext,
+              workbench.customer_global_id_draft,
+              workbench.requested_delivery_at_draft,
+              workbench.line_resolution_drafts,
+              workbench.sync_state,
+              workbench.row_version::integer,
+              receipt.status AS receipt_status
+       FROM operations_commerce_order_workbench workbench
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = workbench.organization_id
+        AND candidate.id = workbench.candidate_id
+       JOIN operations_command_receipts receipt
+         ON receipt.organization_id = workbench.organization_id
+        AND receipt.id = workbench.last_command_receipt_id
+       WHERE workbench.organization_id = $1::uuid`,
+      [failedRetainedFixture.organization],
+    )).rows[0]
+    assert.deepEqual(plain(terminalRebasedState), {
+      candidate_global_id: latestTerminalCandidate.candidateGlobalId,
+      ship_to_edit_state: 'provider_snapshot',
+      ship_to_ciphertext: null,
+      customer_global_id_draft: null,
+      requested_delivery_at_draft: null,
+      line_resolution_drafts: {},
+      sync_state: 'provider_snapshot',
+      row_version: 2,
+      receipt_status: 'succeeded',
+    }, 'terminal refresh must discard every stale editable draft')
 
     let reportPromotionCandidateLocked = () => {}
     const promotionCandidateLocked = new Promise((resolve) => {

@@ -109,6 +109,7 @@ import {
 } from '@/lib/persistence/operationsPrintPhysicalOutputHealth'
 import {
   OPERATIONS_ORDER_EDITING_RELEASE_HEALTH_SQL,
+  OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL,
 } from '@/lib/persistence/operationsOrderEditingReleaseHealth'
 import {
   reconcileExpiredCommerceStoreSyncProviderReadLeasesInPostgres,
@@ -3431,6 +3432,7 @@ export async function GET() {
           operations_commerce_order_revision_apply_applied: boolean
           operations_one_off_carrier_selection_applied: boolean
           operations_commerce_order_sync_foundation_applied: boolean
+          operations_order_workbench_exact_history_applied: boolean
           operations_commerce_authority_policies_applied: boolean
           operations_shopify_order_webhook_signals_applied: boolean
           operations_shopify_order_management_applied: boolean
@@ -5520,6 +5522,268 @@ export async function GET() {
                 )
               )
                 AS operations_commerce_order_sync_foundation_applied,
+              (
+                ${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}
+              )
+              AND (
+                EXISTS (
+                  SELECT 1
+                  FROM public.schema_migrations
+                  WHERE filename =
+                    '0340_operations_order_workbench_exact_history.sql'
+                    AND checksum =
+                      '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e'
+                )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'operations_commerce_order_observations'
+                  AND column_name = 'manual_provider_read_lease_id'
+                  AND data_type = 'uuid'
+                  AND is_nullable = 'YES'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name =
+                    'operations_commerce_order_event_observations'
+                  AND column_name = 'tracking_url'
+                  AND data_type = 'text'
+                  AND is_nullable = 'YES'
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint installed_manual_read_fkey
+                WHERE installed_manual_read_fkey.conrelid = to_regclass(
+                    'public.operations_commerce_order_observations'
+                  )
+                  AND installed_manual_read_fkey.conname =
+                    'commerce_order_observation_manual_read_lease_fkey'
+                  AND installed_manual_read_fkey.contype = 'f'
+                  AND installed_manual_read_fkey.convalidated
+                  AND installed_manual_read_fkey.confrelid = to_regclass(
+                    'public.operations_commerce_store_sync_read_leases'
+                  )
+                  AND installed_manual_read_fkey.confdeltype = 'r'
+                  AND installed_manual_read_fkey.conkey = ARRAY[
+                    (
+                      SELECT attnum
+                      FROM pg_attribute
+                      WHERE attrelid = to_regclass(
+                          'public.operations_commerce_order_observations'
+                        )
+                        AND attname = 'manual_provider_read_lease_id'
+                    )
+                  ]::smallint[]
+                  AND installed_manual_read_fkey.confkey = ARRAY[
+                    (
+                      SELECT attnum
+                      FROM pg_attribute
+                      WHERE attrelid = to_regclass(
+                          'public.operations_commerce_store_sync_read_leases'
+                        )
+                        AND attname = 'id'
+                    )
+                  ]::smallint[]
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                    'operations_commerce_order_observations'
+                  )
+                  AND conname =
+                    'commerce_order_observation_kind_v3_valid'
+                  AND convalidated
+                  AND position(
+                    'manual_exact_read'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                    'operations_commerce_order_observations'
+                  )
+                  AND conname =
+                    'commerce_order_observation_source_lineage_valid'
+                  AND convalidated
+                  AND position(
+                    'manual_provider_read_lease_id'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+                  AND position(
+                    'manual_exact_read'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                    'public.operations_commerce_order_event_observations'
+                  )
+                  AND conname = 'commerce_order_event_tracking_url_valid'
+                  AND convalidated
+                  AND position(
+                    'tracking_url'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+                  AND position(
+                    '2048'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = to_regclass(
+                    'public.operations_commerce_order_event_observations'
+                  )
+                  AND conname =
+                    'commerce_order_event_sensitive_retention_valid'
+                  AND convalidated
+                  AND position(
+                    'tracking_url IS NULL'
+                    IN pg_get_constraintdef(pg_constraint.oid)
+                  ) > 0
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_index installed_manual_read_index
+                WHERE installed_manual_read_index.indexrelid = to_regclass(
+                    'public.idx_commerce_order_observation_manual_read'
+                  )
+                  AND installed_manual_read_index.indrelid = to_regclass(
+                    'public.operations_commerce_order_observations'
+                  )
+                  AND installed_manual_read_index.indisvalid
+                  AND installed_manual_read_index.indisready
+                  AND NOT installed_manual_read_index.indisunique
+                  AND NOT installed_manual_read_index.indisprimary
+                  AND installed_manual_read_index.indexprs IS NULL
+                  AND installed_manual_read_index.indnkeyatts = 3
+                  AND installed_manual_read_index.indnatts = 3
+                  AND ARRAY(
+                    SELECT indexed_column.attname
+                    FROM unnest(
+                      installed_manual_read_index.indkey::smallint[]
+                    ) WITH ORDINALITY indexed_attribute(attnum, ordinal)
+                    JOIN pg_attribute indexed_column
+                      ON indexed_column.attrelid =
+                        installed_manual_read_index.indrelid
+                     AND indexed_column.attnum = indexed_attribute.attnum
+                    ORDER BY indexed_attribute.ordinal
+                  ) = ARRAY[
+                    'organization_id',
+                    'integration_account_id',
+                    'manual_provider_read_lease_id'
+                  ]::name[]
+                  AND installed_manual_read_index.indpred IS NOT NULL
+                  AND position(
+                    'manual_provider_read_lease_id IS NOT NULL'
+                    IN pg_get_expr(
+                      installed_manual_read_index.indpred,
+                      installed_manual_read_index.indrelid
+                    )
+                  ) > 0
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES
+                  (
+                    'public.protect_commerce_order_observation_lineage()',
+                    'plpgsql', 'v', 'trigger',
+                    'search_path=pg_catalog, public, pg_temp',
+                    '0a94308fcea248c267ef2d6c83f06875f3c646adb565db0b0a8a8d177e460c79'
+                  ),
+                  (
+                    'public.commerce_order_observation_accepts_children(uuid,uuid)',
+                    'sql', 'v', 'boolean',
+                    'search_path=pg_catalog, public, pg_temp',
+                    'de0c144c9ca9f4ee57efd6ea6df27dc18999438821878dae8d4226bce7b0d75e'
+                  ),
+                  (
+                    'public.protect_commerce_order_event_tracking_url()',
+                    'plpgsql', 'v', 'trigger',
+                    'search_path=pg_catalog, public, pg_temp',
+                    'c51862e2cd78111afa76649445d2595413e0f569f76396cd173c89a7c30c474c'
+                  ),
+                  (
+                    'public.reject_commerce_order_sync_evidence_mutation()',
+                    'plpgsql', 'v', 'trigger',
+                    'search_path=pg_catalog, public, pg_temp',
+                    '84180f0e87bc9fdd81cb3f9af3304f4beb84cd1b30641e7bfc779366bb10a137'
+                  ),
+                  (
+                    'public.redact_expired_commerce_order_sensitive_evidence(integer)',
+                    'plpgsql', 'v', 'integer',
+                    'search_path=public, pg_temp',
+                    '7f2d8590f5bc995a5989c7dc56bd3080a8b5ec4d121f6bb2c285a90f0a0c82f8'
+                  )
+                ) AS required_exact_history_function(
+                  signature, language_name, volatility, result_type,
+                  search_path_config, body_sha256
+                )
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM pg_proc installed_exact_history_function
+                  JOIN pg_language installed_exact_history_language
+                    ON installed_exact_history_language.oid =
+                      installed_exact_history_function.prolang
+                  WHERE installed_exact_history_function.oid =
+                    to_regprocedure(required_exact_history_function.signature)
+                    AND installed_exact_history_language.lanname =
+                      required_exact_history_function.language_name
+                    AND installed_exact_history_function.provolatile =
+                      required_exact_history_function.volatility
+                    AND pg_get_function_result(
+                      installed_exact_history_function.oid
+                    ) = required_exact_history_function.result_type
+                    AND installed_exact_history_function.prokind = 'f'
+                    AND NOT installed_exact_history_function.proisstrict
+                    AND NOT installed_exact_history_function.prosecdef
+                    AND NOT installed_exact_history_function.proleakproof
+                    AND installed_exact_history_function.proparallel = 'u'
+                    AND installed_exact_history_function.proconfig = ARRAY[
+                      required_exact_history_function.search_path_config
+                    ]::text[]
+                    AND encode(
+                      public.digest(
+                        convert_to(
+                          btrim(regexp_replace(
+                            installed_exact_history_function.prosrc,
+                            '[[:space:]]+', ' ', 'g'
+                          )),
+                          'UTF8'
+                        ),
+                        'sha256'
+                      ),
+                      'hex'
+                    ) = required_exact_history_function.body_sha256
+                )
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM pg_trigger installed_tracking_url_trigger
+                WHERE installed_tracking_url_trigger.tgrelid = to_regclass(
+                    'operations_commerce_order_event_observations'
+                  )
+                  AND installed_tracking_url_trigger.tgname =
+                    'commerce_order_event_tracking_url_guard'
+                  AND installed_tracking_url_trigger.tgfoid = to_regprocedure(
+                    'protect_commerce_order_event_tracking_url()'
+                  )
+                  AND NOT installed_tracking_url_trigger.tgisinternal
+                  AND installed_tracking_url_trigger.tgenabled IN ('O', 'A')
+                  AND installed_tracking_url_trigger.tgtype = 7
+                  AND installed_tracking_url_trigger.tgconstraint = 0
+              )
+              )
+                AS operations_order_workbench_exact_history_applied,
               EXISTS (
                 SELECT 1
                 FROM schema_migrations
@@ -8165,6 +8429,7 @@ export async function GET() {
             : null
         const orderHistoryHealth =
           row?.operations_commerce_order_sync_foundation_applied
+          && row?.operations_order_workbench_exact_history_applied
             ? await Promise.all([
                 readCommerceOrderSyncHealthFromPostgres(),
                 readCommerceOrderSyncCursorKeyReadinessFromPostgres(),
@@ -8368,6 +8633,7 @@ export async function GET() {
             && row?.operations_commerce_order_revision_apply_applied
             && row?.operations_one_off_carrier_selection_applied
             && row?.operations_commerce_order_sync_foundation_applied
+            && row?.operations_order_workbench_exact_history_applied
             && row?.operations_commerce_authority_policies_applied
             && row?.operations_shopify_order_webhook_signals_applied
             && row?.operations_shopify_order_management_applied
@@ -8416,6 +8682,7 @@ export async function GET() {
           },
           orderEditing: {
             status: row?.operations_order_editing_release_applied
+              && row?.operations_order_workbench_exact_history_applied
               ? 'ready'
               : 'migration-structure-or-ledger-pending',
           },
@@ -8916,6 +9183,7 @@ export async function GET() {
           || !row?.operations_commerce_order_revision_apply_applied
           || !row?.operations_one_off_carrier_selection_applied
           || !row?.operations_commerce_order_sync_foundation_applied
+          || !row?.operations_order_workbench_exact_history_applied
           || !row?.operations_commerce_authority_policies_applied
           || !row?.operations_shopify_order_webhook_signals_applied
           || !row?.operations_shopify_order_management_applied

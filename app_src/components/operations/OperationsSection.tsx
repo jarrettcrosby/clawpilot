@@ -287,6 +287,33 @@ const MAX_CANONICAL_ORDER_PAGES = 20
 const MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 20
 const ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS = [250, 500, 1_000, 2_000, 3_000]
 const MAX_ORDER_STATUS_SYNC_ORDERS = 500
+const MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK = 10
+const IMPORTED_HISTORY_REFRESH_TTL_MS = 30 * 60 * 1000
+const IMPORTED_HISTORY_ROTATION_WINDOW_MS = 5 * 60 * 1000
+const IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS = 24 * 60 * 60 * 1000
+const IMPORTED_HISTORY_PROGRESS_STORAGE_PREFIX =
+  'clawpilot:operations:shopify-history-progress:v2:'
+const MAX_IMPORTED_HISTORY_REFRESH_CYCLE = 1_000_000_000
+
+type ImportedOrderHistoryRefreshBatchResult = {
+  eligible: number
+  captured: number
+  unavailable: number
+  conflicts: number
+  failed: number
+  remaining: number
+  progressCycle: number
+  progressRevisionKeys: string[]
+  failureMessages: string[]
+}
+
+type ImportedHistoryRefreshProgress = {
+  version: 2
+  updatedAt: number
+  refreshEpoch: number
+  cycle: number
+  attemptedRevisionKeys: string[]
+}
 
 function waitForOrderDiscoveryPoll(pollNumber: number) {
   const delay = ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS[
@@ -341,6 +368,12 @@ type ImportedOrderWorkbenchPayload = {
   code?: string
   result?: OperationsImportedOrderShipToUpdateResult
   refreshResult?: OperationsImportedOrderRefreshResult
+  historyRefresh?: {
+    status: 'not_applicable' | 'captured' | 'unavailable'
+    code: string | null
+    providerReads: number | null
+    providerWrites: 0
+  }
   order?: OperationsImportedOrderWorkingCopy | null
   orders?: OperationsImportedOrderWorkingCopy[]
   page?: OperationsImportedOrderPage
@@ -379,6 +412,373 @@ function validImportedOrderPage(
     && cursorIsValid
     && page.complete === (page.nextCursor === null)
     && page.truncated === (page.nextCursor !== null)
+}
+
+function importedHistoryRevisionKey(
+  order: OperationsImportedOrderWorkingCopy,
+) {
+  const sourceRevision = Date.parse(order.sourceUpdatedAt)
+  return `${order.candidateGlobalId}:${order.rowVersion}:${
+    Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
+  }`
+}
+
+function importedHistoryProgressStorageKey(organizationId: string) {
+  return `${IMPORTED_HISTORY_PROGRESS_STORAGE_PREFIX}${organizationId}`
+}
+
+function importedHistoryRefreshEpoch(now: number) {
+  return Math.floor(now / IMPORTED_HISTORY_REFRESH_TTL_MS)
+}
+
+function readImportedHistoryRefreshProgress(
+  organizationId: string,
+  now: number,
+): ImportedHistoryRefreshProgress | null {
+  try {
+    const raw = window.localStorage.getItem(
+      importedHistoryProgressStorageKey(organizationId),
+    )
+    if (!raw) return null
+    const value = JSON.parse(raw) as Partial<ImportedHistoryRefreshProgress>
+    if (
+      value.version !== 2
+      || !Number.isSafeInteger(value.updatedAt)
+      || Number(value.updatedAt) < 0
+      || Number(value.updatedAt) > now + IMPORTED_HISTORY_ROTATION_WINDOW_MS
+      || now - Number(value.updatedAt) > IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS
+      || !Number.isSafeInteger(value.refreshEpoch)
+      || Number(value.refreshEpoch) < 0
+      || Number(value.refreshEpoch) !== importedHistoryRefreshEpoch(
+        Number(value.updatedAt),
+      )
+      || !Number.isSafeInteger(value.cycle)
+      || Number(value.cycle) < 0
+      || Number(value.cycle) > MAX_IMPORTED_HISTORY_REFRESH_CYCLE
+      || !Array.isArray(value.attemptedRevisionKeys)
+      || value.attemptedRevisionKeys.length > (
+        IMPORTED_ORDER_PAGE_SIZE * MAX_IMPORTED_ORDER_PAGES
+      )
+      || value.attemptedRevisionKeys.some((key) => (
+        typeof key !== 'string'
+        || !/^gcoc(?:[0-9]{7}|[0-9a-v]{12}):\d+:(?:\d+|unknown)$/u.test(key)
+      ))
+    ) {
+      return null
+    }
+    return {
+      version: 2,
+      updatedAt: Number(value.updatedAt),
+      refreshEpoch: Number(value.refreshEpoch),
+      cycle: Number(value.cycle),
+      attemptedRevisionKeys: [...new Set(value.attemptedRevisionKeys)],
+    }
+  } catch {
+    return null
+  }
+}
+
+function writeImportedHistoryRefreshProgress(
+  organizationId: string,
+  progress: ImportedHistoryRefreshProgress,
+) {
+  try {
+    window.localStorage.setItem(
+      importedHistoryProgressStorageKey(organizationId),
+      JSON.stringify(progress),
+    )
+  } catch {
+    // The in-memory tenant map remains available when browser storage is blocked.
+  }
+}
+
+function importedHistoryRotationOffset(input: {
+  organizationId: string
+  className: 'terminal' | 'open'
+  length: number
+  now: number
+}) {
+  if (input.length <= 1) return 0
+  let hash = 2_166_136_261
+  const seed = `${input.organizationId}:${input.className}`
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = Math.imul(hash ^ seed.charCodeAt(index), 16_777_619)
+  }
+  const timeWindow = Math.floor(
+    input.now / IMPORTED_HISTORY_ROTATION_WINDOW_MS,
+  )
+  return (
+    (hash >>> 0)
+    + timeWindow * MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK
+  ) % input.length
+}
+
+function rotateImportedHistoryTargets(
+  targets: OperationsImportedOrderWorkingCopy[],
+  offset: number,
+) {
+  if (offset <= 0) return targets
+  return [...targets.slice(offset), ...targets.slice(0, offset)]
+}
+
+function importedOrderNeedsShopifyHistoryRefresh(
+  order: OperationsImportedOrderWorkingCopy,
+  now: number,
+) {
+  if (order.provider !== 'shopify') return false
+  if (!order.providerHistory.observedAt) return true
+  const sourceUpdatedAt = Date.parse(order.sourceUpdatedAt)
+  const historyObservedAt = Date.parse(order.providerHistory.observedAt)
+  return !Number.isFinite(sourceUpdatedAt)
+    || !Number.isFinite(historyObservedAt)
+    || sourceUpdatedAt > historyObservedAt
+    || historyObservedAt > now + IMPORTED_HISTORY_ROTATION_WINDOW_MS
+    || now - historyObservedAt >= IMPORTED_HISTORY_REFRESH_TTL_MS
+}
+
+function importedOrderCanAutoRefreshDrawerHistory(
+  order: OperationsImportedOrderWorkingCopy,
+  now: number,
+) {
+  return importedOrderIsTerminal(order)
+    && importedOrderNeedsShopifyHistoryRefresh(order, now)
+}
+
+function importedDrawerHistoryIdempotencyKey(
+  order: OperationsImportedOrderWorkingCopy,
+  now: number,
+) {
+  const sourceRevision = Date.parse(order.sourceUpdatedAt)
+  return `operations-imported-drawer-history:${
+    order.candidateGlobalId
+  }:${order.rowVersion}:${
+    Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
+  }:${importedHistoryRefreshEpoch(now)}`
+}
+
+async function refreshImportedShopifyHistoryBatch(
+  input: {
+    organizationId: string
+    attemptedRevisionKeys: ReadonlySet<string>
+    cycle: number
+    now: number
+  },
+): Promise<ImportedOrderHistoryRefreshBatchResult> {
+  const result: ImportedOrderHistoryRefreshBatchResult = {
+    eligible: 0,
+    captured: 0,
+    unavailable: 0,
+    conflicts: 0,
+    failed: 0,
+    remaining: 0,
+    progressCycle: input.cycle,
+    progressRevisionKeys: [],
+    failureMessages: [],
+  }
+  const targets: OperationsImportedOrderWorkingCopy[] = []
+  const seenCandidateGlobalIds = new Set<string>()
+  const seenCursors = new Set<string>()
+  let cursor: string | null = null
+  let pageNumber = 0
+
+  while (pageNumber < MAX_IMPORTED_ORDER_PAGES) {
+    const params = new URLSearchParams({
+      limit: String(IMPORTED_ORDER_PAGE_SIZE),
+    })
+    if (cursor) params.set('cursor', cursor)
+    const response = await fetch(
+      `/api/operations/order-workbench?${params.toString()}`,
+      { cache: 'no-store' },
+    )
+    const payload = await response.json().catch(() => ({})) as
+      ImportedOrderWorkbenchPayload
+    if (
+      !response.ok
+      || !payload.ok
+      || !Array.isArray(payload.orders)
+      || !validImportedOrderPage(payload.page)
+    ) {
+      throw new Error(
+        `${payload.error || 'Imported Shopify orders could not be loaded for history refresh'}${
+          payload.code ? ` [${payload.code}]` : ''
+        }`,
+      )
+    }
+    if (payload.page.returned !== payload.orders.length) {
+      throw new Error('Imported-order history pagination returned inconsistent evidence')
+    }
+    for (const order of payload.orders) {
+      if (seenCandidateGlobalIds.has(order.candidateGlobalId)) {
+        throw new Error('Imported-order history pagination returned a duplicate order')
+      }
+      seenCandidateGlobalIds.add(order.candidateGlobalId)
+      if (importedOrderNeedsShopifyHistoryRefresh(order, input.now)) {
+        targets.push(order)
+      }
+    }
+    pageNumber += 1
+    if (!payload.page.nextCursor) {
+      cursor = null
+      break
+    }
+    if (seenCursors.has(payload.page.nextCursor)) {
+      throw new Error('Imported-order history pagination did not advance')
+    }
+    seenCursors.add(payload.page.nextCursor)
+    cursor = payload.page.nextCursor
+  }
+  if (cursor) {
+    throw new Error(
+      `Imported Shopify history refresh exceeded the safe ${
+        IMPORTED_ORDER_PAGE_SIZE * MAX_IMPORTED_ORDER_PAGES
+      }-order page limit`,
+    )
+  }
+
+  targets.sort((left, right) => {
+    const terminalPriority = Number(importedOrderIsTerminal(right))
+      - Number(importedOrderIsTerminal(left))
+    if (terminalPriority !== 0) return terminalPriority
+    const sourcePriority = Date.parse(right.sourceUpdatedAt)
+      - Date.parse(left.sourceUpdatedAt)
+    if (Number.isFinite(sourcePriority) && sourcePriority !== 0) {
+      return sourcePriority
+    }
+    return left.candidateGlobalId.localeCompare(right.candidateGlobalId)
+  })
+  const targetRevisionKeys = new Set(targets.map((order) => (
+    importedHistoryRevisionKey(order)
+  )))
+  const progressRevisionKeys = new Set(
+    [...input.attemptedRevisionKeys].filter((key) => (
+      targetRevisionKeys.has(key)
+    )),
+  )
+  let pendingTargets = targets.filter((order) => (
+    !progressRevisionKeys.has(importedHistoryRevisionKey(order))
+  ))
+  if (pendingTargets.length === 0 && targets.length > 0) {
+    progressRevisionKeys.clear()
+    pendingTargets = targets
+    result.progressCycle = input.cycle >= MAX_IMPORTED_HISTORY_REFRESH_CYCLE
+      ? 0
+      : input.cycle + 1
+  }
+  const terminalTargets = pendingTargets.filter(importedOrderIsTerminal)
+  const openTargets = pendingTargets.filter((order) => (
+    !importedOrderIsTerminal(order)
+  ))
+  const orderedPendingTargets = [
+    ...rotateImportedHistoryTargets(
+      terminalTargets,
+      importedHistoryRotationOffset({
+        organizationId: input.organizationId,
+        className: 'terminal',
+        length: terminalTargets.length,
+        now: input.now,
+      }),
+    ),
+    ...rotateImportedHistoryTargets(
+      openTargets,
+      importedHistoryRotationOffset({
+        organizationId: input.organizationId,
+        className: 'open',
+        length: openTargets.length,
+        now: input.now,
+      }),
+    ),
+  ]
+  const selectedTargets = orderedPendingTargets.slice(
+    0,
+    MAX_IMPORTED_HISTORY_REFRESH_ORDERS_PER_CLICK,
+  )
+  result.eligible = selectedTargets.length
+  const refreshEpoch = importedHistoryRefreshEpoch(input.now)
+  for (const order of selectedTargets) {
+    const revisionKey = importedHistoryRevisionKey(order)
+    try {
+      const sourceRevision = Date.parse(order.sourceUpdatedAt)
+      const response = await fetch('/api/operations/order-workbench', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': `operations-imported-history:${
+            order.candidateGlobalId
+          }:${order.rowVersion}:${
+            Number.isFinite(sourceRevision) ? sourceRevision : 'unknown'
+          }:${refreshEpoch}:${result.progressCycle}`,
+        },
+        body: JSON.stringify({
+          action: 'refresh',
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+        }),
+      })
+      const payload = await response.json().catch(() => ({})) as
+        ImportedOrderWorkbenchPayload
+      if (
+        response.status === 409
+        && payload.code === 'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT'
+      ) {
+        progressRevisionKeys.add(revisionKey)
+        result.conflicts += 1
+        continue
+      }
+      if (
+        !response.ok
+        || !payload.ok
+        || !payload.order
+        || !payload.refreshResult
+      ) {
+        throw new Error(
+          `${payload.error || 'Imported Shopify history could not be refreshed'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
+      }
+      const historyRefresh = payload.historyRefresh
+      if (
+        !historyRefresh
+        || historyRefresh.providerWrites !== 0
+        || (
+          historyRefresh.status === 'captured'
+          && historyRefresh.providerReads === null
+        )
+        || (
+          historyRefresh.providerReads !== null
+          && (
+            !Number.isSafeInteger(historyRefresh.providerReads)
+            || historyRefresh.providerReads < 0
+          )
+        )
+      ) {
+        throw new Error('Imported Shopify history refresh returned invalid evidence')
+      }
+      if (historyRefresh.status === 'captured') {
+        progressRevisionKeys.add(revisionKey)
+        result.captured += 1
+        continue
+      }
+      if (historyRefresh.status === 'unavailable') {
+        progressRevisionKeys.add(revisionKey)
+        result.unavailable += 1
+        continue
+      }
+      throw new Error('Shopify order history refresh was not applicable')
+    } catch (caught) {
+      result.failed += 1
+      result.failureMessages.push(
+        `${order.orderNumber}: ${caught instanceof Error
+          ? caught.message
+          : 'Imported Shopify history could not be refreshed'}`,
+      )
+    }
+  }
+  result.remaining = targets.filter((order) => (
+    !progressRevisionKeys.has(importedHistoryRevisionKey(order))
+  )).length
+  result.progressRevisionKeys = [...progressRevisionKeys].sort()
+  return result
 }
 
 function validCanonicalOrderPage(
@@ -3419,7 +3819,11 @@ export default function OperationsSection({
   const pendingImportedOrderRefresh = useRef<PendingImportedOrderSave | null>(null)
   const pendingImportedOrderConflictRefresh =
     useRef<PendingImportedOrderSave | null>(null)
+  const attemptedImportedDrawerHistoryRefreshes = useRef(new Set<string>())
   const pendingOrderStatusSyncReload = useRef(false)
+  const importedHistoryProgressByOrganization = useRef(
+    new Map<string, ImportedHistoryRefreshProgress>(),
+  )
   const workspaceLoadGeneration = useRef(0)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
@@ -3859,6 +4263,8 @@ export default function OperationsSection({
       canonicalOrdersCreated: 0,
     }
     const discoveryFailures: string[] = []
+    const importedHistoryFailures: string[] = []
+    let importedHistoryBatch: ImportedOrderHistoryRefreshBatchResult | null = null
     const checkedOrderGlobalIds = new Set<string>()
     let remainingEligible = 0
     const totals = {
@@ -4036,6 +4442,79 @@ export default function OperationsSection({
         if (result.counts.selected === 0 || remainingEligible === 0) break
       }
       if (totals.attempted > 0) pendingOrderStatusSyncReload.current = true
+      try {
+        const organizationId = workspace?.organizationId
+        if (!organizationId) {
+          throw new Error('Shopify order details could not be refreshed')
+        }
+        const now = Date.now()
+        const storedProgress = readImportedHistoryRefreshProgress(
+          organizationId,
+          now,
+        )
+        const memoryProgress = importedHistoryProgressByOrganization.current
+          .get(organizationId)
+        const availableProgress = storedProgress || (
+          memoryProgress
+          && now - memoryProgress.updatedAt
+            <= IMPORTED_HISTORY_PROGRESS_MAX_AGE_MS
+            ? memoryProgress
+            : null
+        )
+        const refreshEpoch = importedHistoryRefreshEpoch(now)
+        const progress = availableProgress?.refreshEpoch === refreshEpoch
+          ? availableProgress
+          : null
+        importedHistoryBatch = await refreshImportedShopifyHistoryBatch({
+          organizationId,
+          attemptedRevisionKeys: new Set(
+            progress?.attemptedRevisionKeys || [],
+          ),
+          cycle: progress?.cycle || 0,
+          now,
+        })
+        const nextProgress: ImportedHistoryRefreshProgress = {
+          version: 2,
+          updatedAt: now,
+          refreshEpoch,
+          cycle: importedHistoryBatch.progressCycle,
+          attemptedRevisionKeys: importedHistoryBatch.progressRevisionKeys,
+        }
+        importedHistoryProgressByOrganization.current.set(
+          organizationId,
+          nextProgress,
+        )
+        writeImportedHistoryRefreshProgress(organizationId, nextProgress)
+        if (importedHistoryBatch.eligible > 0) {
+          pendingOrderStatusSyncReload.current = true
+        }
+        if (importedHistoryBatch.conflicts > 0) {
+          importedHistoryFailures.push(
+            `${importedHistoryBatch.conflicts} imported Shopify ${
+              importedHistoryBatch.conflicts === 1 ? 'order needs' : 'orders need'
+            } review because provider and saved order details changed together.`,
+          )
+        }
+        if (importedHistoryBatch.failed > 0) {
+          importedHistoryFailures.push(
+            `${importedHistoryBatch.failed} Shopify ${
+              importedHistoryBatch.failed === 1
+                ? 'order could not be updated'
+                : 'orders could not be updated'
+            }. ${importedHistoryBatch.failureMessages.slice(0, 3).join('; ')}${
+              importedHistoryBatch.failureMessages.length > 3
+                ? `; and ${importedHistoryBatch.failureMessages.length - 3} more`
+                : ''
+            }`,
+          )
+        }
+      } catch (caught) {
+        importedHistoryFailures.push(
+          caught instanceof Error
+            ? caught.message
+            : 'Imported Shopify orders could not be loaded for history refresh',
+        )
+      }
       const discoverySummary = discoveryTotals.accountsAttempted > 0
         ? `Checked ${discoveryTotals.accountsCompleted} of ${
             discoveryTotals.accountsAttempted
@@ -4070,8 +4549,40 @@ export default function OperationsSection({
                 remainingEligible === 1 ? 'order remains' : 'orders remain'
               }; refresh again to check the next group.`
             : ''}`
-      setNotice(`${discoverySummary} ${statusSummary}`)
-      const failureMessages = [...discoveryFailures]
+      const importedHistorySummary = importedHistoryBatch
+        && importedHistoryBatch.eligible > 0
+        ? ` ${importedHistoryBatch.captured > 0
+            ? `Updated Shopify details for ${importedHistoryBatch.captured} ${
+                importedHistoryBatch.captured === 1 ? 'order' : 'orders'
+              }.`
+            : 'No Shopify order details were updated.'}${
+            importedHistoryBatch.unavailable > 0
+            ? ` ${importedHistoryBatch.unavailable} Shopify ${
+                importedHistoryBatch.unavailable === 1
+                  ? 'order could not be loaded and can be retried'
+                  : 'orders could not be loaded and can be retried'
+              }.`
+            : ''}${importedHistoryBatch.conflicts > 0
+            ? ` ${importedHistoryBatch.conflicts} ${
+                importedHistoryBatch.conflicts === 1 ? 'order needs' : 'orders need'
+              } conflict review.`
+            : ''}${importedHistoryBatch.failed > 0
+            ? ` ${importedHistoryBatch.failed} ${
+                importedHistoryBatch.failed === 1
+                  ? 'order could not be updated'
+                  : 'orders could not be updated'
+              }.`
+            : ''}${importedHistoryBatch.remaining > 0
+            ? ` ${importedHistoryBatch.remaining} more ${
+                importedHistoryBatch.remaining === 1 ? 'order remains' : 'orders remain'
+              }; refresh again to continue.`
+            : ''}`
+        : ''
+      setNotice(`${discoverySummary} ${statusSummary}${importedHistorySummary}`)
+      const failureMessages = [
+        ...discoveryFailures,
+        ...importedHistoryFailures,
+      ]
       if (totals.failed > 0) {
         failureMessages.push(
           `${totals.failed} existing sales-channel ${
@@ -4092,7 +4603,7 @@ export default function OperationsSection({
     } finally {
       setSyncingOrderStatus(false)
     }
-  }, [workspace?.storeSync])
+  }, [workspace?.organizationId, workspace?.storeSync])
 
   useEffect(() => {
     if (syncingOrderStatus || !pendingOrderStatusSyncReload.current) return
@@ -4147,43 +4658,161 @@ export default function OperationsSection({
     const selected = workspace?.importedOrders.find((order) => (
       order.candidateGlobalId === selectedImportedGlobalId
     ))
-    if (!selected || selected.resolutionDetailsLoaded) return
+    if (!selected || savingImportedOrder || refreshingImportedOrder) return
+    const now = Date.now()
+    const automaticHistoryKey = workspace?.capabilities.canManage === true
+      && importedOrderCanAutoRefreshDrawerHistory(selected, now)
+      ? importedDrawerHistoryIdempotencyKey(selected, now)
+      : null
+    const shouldAutoRefreshHistory = Boolean(
+      automaticHistoryKey
+      && !attemptedImportedDrawerHistoryRefreshes.current.has(
+        automaticHistoryKey,
+      ),
+    )
+    if (!shouldAutoRefreshHistory && selected.resolutionDetailsLoaded) return
     const controller = new AbortController()
     const loadDetails = async () => {
+      let detailed: OperationsImportedOrderWorkingCopy | null = null
+      let automaticHistoryError = ''
       try {
-        const params = new URLSearchParams({
-          candidate: selected.candidateGlobalId,
-        })
-        const response = await fetch(
-          `/api/operations/order-workbench?${params.toString()}`,
-          { cache: 'no-store', signal: controller.signal },
-        )
-        const payload = await response.json().catch(() => ({})) as
-          ImportedOrderWorkbenchPayload
-        const detailed = payload.orders?.[0]
-        if (!response.ok || !payload.ok || !detailed) {
-          throw new Error(payload.error || 'Editable order details are unavailable')
+        if (shouldAutoRefreshHistory && automaticHistoryKey) {
+          attemptedImportedDrawerHistoryRefreshes.current.add(
+            automaticHistoryKey,
+          )
+          try {
+            const refreshResponse = await fetch(
+              '/api/operations/order-workbench',
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Idempotency-Key': automaticHistoryKey,
+                },
+                body: JSON.stringify({
+                  action: 'refresh',
+                  candidateGlobalId: selected.candidateGlobalId,
+                  expectedRowVersion: selected.rowVersion,
+                }),
+                signal: controller.signal,
+              },
+            )
+            const refreshPayload = await refreshResponse.json()
+              .catch(() => ({})) as ImportedOrderWorkbenchPayload
+            const historyRefresh = refreshPayload.historyRefresh
+            if (
+              !refreshResponse.ok
+              || !refreshPayload.ok
+              || !refreshPayload.order
+              || !refreshPayload.refreshResult
+              || !historyRefresh
+              || historyRefresh.providerWrites !== 0
+              || !['captured', 'unavailable'].includes(historyRefresh.status)
+              || (
+                historyRefresh.status === 'captured'
+                && historyRefresh.providerReads === null
+              )
+              || (
+                historyRefresh.providerReads !== null
+                && (
+                  !Number.isSafeInteger(historyRefresh.providerReads)
+                  || historyRefresh.providerReads < 0
+                )
+              )
+            ) {
+              throw new Error(
+                `${refreshPayload.error || 'Shopify order details could not be refreshed'}${
+                  refreshPayload.code ? ` [${refreshPayload.code}]` : ''
+                }`,
+              )
+            }
+            detailed = refreshPayload.order
+            if (historyRefresh.status === 'unavailable') {
+              automaticHistoryError =
+                `Stored order details are shown. Current Shopify history could not be loaded${
+                  historyRefresh.code ? ` [${historyRefresh.code}]` : ''
+                }.`
+            }
+          } catch (caught) {
+            if (caught instanceof DOMException && caught.name === 'AbortError') {
+              return
+            }
+            automaticHistoryError = caught instanceof Error
+              ? caught.message
+              : 'Shopify order details could not be refreshed'
+          }
         }
-        setWorkspace((current) => current ? {
-          ...current,
-          importedOrders: current.importedOrders.map((order) => (
-            order.candidateGlobalId === detailed.candidateGlobalId
-              ? detailed
-              : order
-          )),
-        } : current)
+        if (!detailed || !detailed.resolutionDetailsLoaded) {
+          const params = new URLSearchParams({
+            candidate: detailed?.candidateGlobalId
+              || selected.candidateGlobalId,
+          })
+          const response = await fetch(
+            `/api/operations/order-workbench?${params.toString()}`,
+            { cache: 'no-store', signal: controller.signal },
+          )
+          const payload = await response.json().catch(() => ({})) as
+            ImportedOrderWorkbenchPayload
+          detailed = payload.orders?.[0] || null
+          if (!response.ok || !payload.ok || !detailed) {
+            throw new Error(
+              payload.error || 'Editable order details are unavailable',
+            )
+          }
+        }
+        const refreshedCandidateGlobalId = detailed.candidateGlobalId
+        setWorkspace((current) => {
+          if (!current) return current
+          let inserted = false
+          const importedOrders = current.importedOrders.flatMap((order) => {
+            if (
+              order.candidateGlobalId !== selected.candidateGlobalId
+              && order.candidateGlobalId !== refreshedCandidateGlobalId
+            ) {
+              return [order]
+            }
+            if (inserted) return []
+            inserted = true
+            return [detailed!]
+          })
+          if (!inserted) importedOrders.unshift(detailed!)
+          return {
+            ...current,
+            importedOrders,
+          }
+        })
+        if (refreshedCandidateGlobalId !== selected.candidateGlobalId) {
+          setSelectedImportedGlobalId(refreshedCandidateGlobalId)
+          const nextUrl = new URL(window.location.href)
+          nextUrl.searchParams.set(
+            OPERATIONS_ORDER_QUERY,
+            refreshedCandidateGlobalId,
+          )
+          window.history.replaceState(window.history.state, '', nextUrl)
+        }
+        if (automaticHistoryError) {
+          setImportedOrderError(automaticHistoryError)
+        }
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === 'AbortError') return
-        setImportedOrderError(caught instanceof Error
+        const detailError = caught instanceof Error
           ? caught.message
-          : 'Editable order details are unavailable')
+          : 'Editable order details are unavailable'
+        setImportedOrderError(
+          automaticHistoryError
+            ? `${automaticHistoryError} ${detailError}`
+            : detailError,
+        )
       }
     }
     void loadDetails()
     return () => controller.abort()
   }, [
     importedDrawerOpen,
+    refreshingImportedOrder,
+    savingImportedOrder,
     selectedImportedGlobalId,
+    workspace?.capabilities.canManage,
     workspace?.importedOrders,
   ])
 
@@ -4472,8 +5101,14 @@ export default function OperationsSection({
         || !payload.order
         || !payload.refreshResult
       ) {
-        pendingRef.current = null
-        throw new Error(payload.error || 'Order could not be refreshed')
+        if (response.status >= 400 && response.status < 500) {
+          pendingRef.current = null
+        }
+        throw new Error(
+          `${payload.error || 'Order could not be refreshed'}${
+            payload.code ? ` [${payload.code}]` : ''
+          }`,
+        )
       }
       pendingRef.current = null
       const refreshed = payload.order
@@ -4500,7 +5135,11 @@ export default function OperationsSection({
       )
       window.history.replaceState(window.history.state, '', nextUrl)
       setNotice(
-        payload.refreshResult.status === 'rebased'
+        payload.historyRefresh?.status === 'unavailable'
+          ? `Order ${refreshed.orderNumber} refreshed; Shopify details could not be loaded and can be retried`
+          : payload.historyRefresh?.status === 'captured'
+            ? `Order ${refreshed.orderNumber} refreshed from Shopify`
+            : payload.refreshResult.status === 'rebased'
           ? payload.refreshResult.preservedLineDrafts.length
             ? `Order ${refreshed.orderNumber} refreshed; saved item matches were preserved`
             : `Order ${refreshed.orderNumber} refreshed; review provider item changes`

@@ -44,6 +44,9 @@ import {
   query,
   withTransaction,
 } from '@/lib/persistence/postgres'
+import {
+  readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres,
+} from '@/lib/persistence/commerceOrderSync'
 
 const COMMAND_TYPE = 'operations.commerce_order_workbench.update_ship_to'
 const REFRESH_COMMAND_TYPE = 'operations.commerce_order_workbench.refresh'
@@ -78,6 +81,7 @@ function workbenchLinePackFactsRequired(input: Readonly<{
 
 type WorkbenchReadRow = {
   candidate_id: string
+  display_candidate_id: string
   candidate_global_id: string
   organization_id: string
   integration_account_id: string
@@ -153,6 +157,7 @@ type WorkbenchReadRow = {
   provider_fulfillment_status: string
   provider_status_observed_at: Date
   provider_status_source: 'operational' | 'history' | 'retained'
+  latest_exact_history_observed_at: Date | null
   matching_total_count: string
 }
 
@@ -176,6 +181,8 @@ type LockedCandidateRow = {
   source_hash: string
   provider_updated_at: Date | null
   observed_at: Date
+  normalized_order_status: string
+  normalized_fulfillment_status: string
   canonical_order_id: string | null
   canonical_order_global_id: string | null
   workflow_state: 'held' | 'resolving' | 'ready' | 'promoted' | 'failed' | 'expired'
@@ -225,9 +232,16 @@ type CommerceOrderWorkbenchLineDraftMerge = {
 type WorkbenchLineReadRow = {
   candidate_id: string
   global_id: string
+  external_line_id: string
   product_title_snapshot: string
   sku_snapshot: string | null
+  normalized_status: 'open' | 'cancelled' | 'fulfilled' | 'returned' | 'unknown'
+  ordered_quantity: string
+  current_quantity: string
+  cancelled_quantity: string
+  fulfilled_quantity: string
   unfulfilled_quantity: string
+  returned_quantity: string
   unit_multiplier: string
   requires_shipping: boolean
   mapping_state:
@@ -849,11 +863,99 @@ function providerFulfillmentStatus(value: string) {
     : 'unknown' as const
 }
 
+function optionalTimelineText(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function optionalTimelineInteger(value: unknown) {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    ? value
+    : null
+}
+
+function providerHistoryFromTimeline(
+  timeline: Awaited<ReturnType<
+    typeof readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres
+  >>,
+): OperationsImportedOrderWorkingCopy['providerHistory'] {
+  const providerEvents = timeline.items.filter((event) => (
+    event.evidenceSource === 'provider'
+  ))
+  const lineSnapshot = providerEvents.find((event) => (
+    event.eventKind === 'order_lines_snapshot'
+  )) || null
+  const rawLines = Array.isArray(lineSnapshot?.payload.lines)
+    ? lineSnapshot.payload.lines
+    : []
+  const currentLines = rawLines.flatMap((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+    const line = value as Record<string, unknown>
+    const externalLineId = optionalTimelineText(line.externalLineId)
+    const orderedQuantity = optionalTimelineInteger(line.originalQuantity)
+    if (!externalLineId || orderedQuantity === null) return []
+    return [{
+      externalLineId,
+      externalProductId: optionalTimelineText(line.externalProductId),
+      externalVariantId: optionalTimelineText(line.externalVariantId),
+      sku: optionalTimelineText(line.sku),
+      orderedQuantity,
+      currentQuantity: optionalTimelineInteger(line.currentQuantity),
+      fulfilledQuantity: optionalTimelineInteger(line.fulfilledQuantity),
+      unfulfilledQuantity: optionalTimelineInteger(line.unfulfilledQuantity),
+      returnedQuantity: optionalTimelineInteger(line.returnedQuantity),
+      requiresShipping: typeof line.requiresShipping === 'boolean'
+        ? line.requiresShipping
+        : null,
+    }]
+  })
+  return {
+    observedAt: optionalTimelineText(lineSnapshot?.payload.observedAt),
+    currentLines,
+    events: providerEvents.flatMap((event) => {
+      if (event.eventKind === 'order_lines_snapshot') return []
+      const trackingNumber = optionalTimelineText(event.payload.trackingNumber)
+      const trackingUrl = optionalTimelineText(event.payload.trackingUrl)
+      return [{
+        globalId: event.evidenceGlobalId,
+        kind: event.eventKind,
+        status: event.eventStatus,
+        occurredAt: event.occurredAt,
+        externalSubjectId: optionalTimelineText(
+          event.payload.externalSubjectId,
+        ),
+        quantity: optionalTimelineInteger(event.payload.quantity),
+        amountMinor: optionalTimelineInteger(event.payload.amountMinor),
+        currency: optionalTimelineText(event.payload.currency),
+        trackingCarrier: optionalTimelineText(event.payload.trackingCarrier),
+        trackingNumber,
+        trackingUrl,
+        trackingRedacted: event.eventKind === 'tracking_updated'
+          && trackingNumber === null
+          && trackingUrl === null
+          && optionalTimelineText(
+            event.payload.sensitiveEvidenceRedactedAt,
+          ) !== null,
+      }]
+    }),
+    providerWrites: 0,
+  }
+}
+
 function mappedWorkingCopy(
   row: WorkbenchReadRow,
   details: WorkbenchResolutionDetails | null,
+  providerHistory: OperationsImportedOrderWorkingCopy['providerHistory'] = {
+    observedAt: null,
+    currentLines: [],
+    events: [],
+    providerWrites: 0,
+  },
 ): OperationsImportedOrderWorkingCopy {
-  const local = Boolean(
+  const providerTerminal = (
+    ['cancelled', 'closed'].includes(row.provider_lifecycle_status)
+    || ['fulfilled', 'cancelled'].includes(row.provider_fulfillment_status)
+  )
+  const local = !providerTerminal && Boolean(
     row.workbench_id
     && row.ship_to_edit_state
     && row.ship_to_edit_state !== 'provider_snapshot',
@@ -883,6 +985,8 @@ function mappedWorkingCopy(
   const issues = orderShipToIssues(shipTo)
   const packFactsStillRequired = details
     ? details.lines.some((line) => (
+        Number(line.unfulfilled_quantity) > 0
+        &&
         workbenchLinePackFactsRequired({
           requiresShipping: line.requires_shipping,
           unitMultiplier: Number(line.unit_multiplier),
@@ -914,6 +1018,127 @@ function mappedWorkingCopy(
     productOptions.set(product.product_id, option)
   }
   const lineDrafts = row.line_resolution_drafts || {}
+  const candidateLines: OperationsImportedOrderWorkingCopy['lines'] = (
+    details?.lines || []
+  ).map((line) => {
+    const draft = providerTerminal ? undefined : lineDrafts[line.global_id]
+    const candidateLine = {
+      globalId: line.global_id,
+      externalLineId: line.external_line_id,
+      title: line.product_title_snapshot,
+      sku: line.sku_snapshot,
+      quantity: Number(line.unfulfilled_quantity),
+      orderedQuantity: Number(line.ordered_quantity),
+      currentQuantity: Number(line.current_quantity),
+      cancelledOrRemovedQuantity: Number(line.cancelled_quantity),
+      fulfilledQuantity: Number(line.fulfilled_quantity),
+      unfulfilledQuantity: Number(line.unfulfilled_quantity),
+      returnedQuantity: Number(line.returned_quantity),
+      providerStatus: line.normalized_status,
+      unitMultiplier: Number(line.unit_multiplier),
+      requiresShipping: line.requires_shipping,
+      mappingStatus: line.mapping_state,
+      priceStatus: line.price_resolution_state,
+      packageStatus: line.packaging_state,
+      productGlobalId: draft?.productGlobalId || line.product_global_id,
+      unitPriceMinor: draft
+        ? draft.unitPriceMinor
+        : Number(
+          line.resolved_unit_price_minor
+          || line.provider_unit_price_minor
+          || Number.NaN,
+        ),
+      currency: draft?.currency
+        || line.resolved_currency_code
+        || line.provider_currency_code
+        || row.currency_code,
+      packageProfileGlobalId: draft
+        ? draft.packageProfileGlobalId
+        : line.package_profile_global_id,
+      blockerCodes: line.blocking_codes.filter((code) => (
+        code !== 'packaging_required'
+        || (
+          Number(line.unfulfilled_quantity) > 0
+          && workbenchLinePackFactsRequired({
+            requiresShipping: line.requires_shipping,
+            unitMultiplier: Number(line.unit_multiplier),
+          })
+          && line.packaging_state !== 'resolved'
+        )
+      )),
+    }
+    return {
+      ...candidateLine,
+      unitPriceMinor: Number.isSafeInteger(candidateLine.unitPriceMinor)
+        ? candidateLine.unitPriceMinor
+        : null,
+    }
+  })
+  const candidateLinesByExternalId = new Map(candidateLines.map((line) => (
+    [line.externalLineId, line]
+  )))
+  const displayLines = providerTerminal && providerHistory.currentLines.length
+    ? providerHistory.currentLines.map((historyLine) => {
+        const candidateLine = candidateLinesByExternalId.get(
+          historyLine.externalLineId,
+        )
+        const currentQuantity = historyLine.currentQuantity
+          ?? historyLine.orderedQuantity
+        const unfulfilledQuantity = historyLine.unfulfilledQuantity
+          ?? Math.max(
+            0,
+            currentQuantity - (historyLine.fulfilledQuantity ?? 0),
+          )
+        const fulfilledQuantity = historyLine.fulfilledQuantity
+          ?? Math.max(0, currentQuantity - unfulfilledQuantity)
+        const returnedQuantity = historyLine.returnedQuantity ?? 0
+        const cancelledOrRemovedQuantity = Math.max(
+          0,
+          historyLine.orderedQuantity - currentQuantity,
+        )
+        const providerStatus = unfulfilledQuantity > 0
+          ? 'open' as const
+          : returnedQuantity > 0
+            ? 'returned' as const
+            : fulfilledQuantity > 0
+              ? 'fulfilled' as const
+              : currentQuantity === 0
+                ? 'cancelled' as const
+                : 'unknown' as const
+        return {
+          globalId: candidateLine?.globalId
+            || `history:${historyLine.externalLineId}`,
+          externalLineId: historyLine.externalLineId,
+          title: candidateLine?.title
+            || historyLine.sku
+            || historyLine.externalVariantId
+            || historyLine.externalProductId
+            || `Provider item ${historyLine.externalLineId}`,
+          sku: historyLine.sku || candidateLine?.sku || null,
+          quantity: unfulfilledQuantity,
+          orderedQuantity: historyLine.orderedQuantity,
+          currentQuantity,
+          cancelledOrRemovedQuantity,
+          fulfilledQuantity,
+          unfulfilledQuantity,
+          returnedQuantity,
+          providerStatus,
+          unitMultiplier: candidateLine?.unitMultiplier || 1,
+          requiresShipping: historyLine.requiresShipping
+            ?? candidateLine?.requiresShipping
+            ?? false,
+          mappingStatus: candidateLine?.mappingStatus || 'unresolved',
+          priceStatus: candidateLine?.priceStatus || 'unsupported',
+          packageStatus: candidateLine?.packageStatus || 'not_required',
+          productGlobalId: candidateLine?.productGlobalId || null,
+          unitPriceMinor: candidateLine?.unitPriceMinor ?? null,
+          currency: candidateLine?.currency || row.currency_code,
+          packageProfileGlobalId:
+            candidateLine?.packageProfileGlobalId || null,
+          blockerCodes: [],
+        }
+      })
+    : candidateLines
   return {
     kind: 'imported_working_copy',
     globalId: row.candidate_global_id,
@@ -933,10 +1158,12 @@ function mappedWorkingCopy(
       observedAt: row.provider_status_observed_at.toISOString(),
       source: row.provider_status_source,
     },
-    needsInfo: issues.length > 0 || otherMissingFacts,
+    needsInfo: !providerTerminal && (issues.length > 0 || otherMissingFacts),
     blockerCodes: effectiveBlockerCodes,
     customerName: customerSnapshotName(row),
-    lineCount: Number(row.line_count),
+    lineCount: providerTerminal && providerHistory.currentLines.length
+      ? displayLines.length
+      : Number(row.line_count),
     sourceUpdatedAt: (
       row.provider_updated_at || row.observed_at
     ).toISOString(),
@@ -951,8 +1178,9 @@ function mappedWorkingCopy(
     customer: {
       status: row.customer_resolution_state,
       resolvedCustomerGlobalId: row.customer_global_id,
-      selectedCustomerGlobalId: row.customer_global_id_draft
-        || row.customer_global_id,
+      selectedCustomerGlobalId: providerTerminal
+        ? row.customer_global_id
+        : row.customer_global_id_draft || row.customer_global_id,
       options: (details?.customers || []).map((customer) => ({
         globalId: customer.reference_code,
         name: customer.name,
@@ -964,63 +1192,26 @@ function mappedWorkingCopy(
       providerRequestedDeliveryAt:
         row.provider_requested_delivery_at?.toISOString() || null,
       selectedDeliveryAt: row.requested_delivery_at?.toISOString() || null,
-      draftDeliveryAt: row.workbench_id
+      draftDeliveryAt: providerTerminal
+        ? row.requested_delivery_at?.toISOString()
+          || row.provider_requested_delivery_at?.toISOString()
+          || null
+        : row.workbench_id
         ? row.requested_delivery_at_draft?.toISOString() || null
         : row.requested_delivery_at?.toISOString()
           || row.provider_requested_delivery_at?.toISOString()
           || null,
     },
-    lines: (details?.lines || []).map((line) => {
-      const draft = lineDrafts[line.global_id]
-      return {
-        globalId: line.global_id,
-        title: line.product_title_snapshot,
-        sku: line.sku_snapshot,
-        quantity: Number(line.unfulfilled_quantity),
-        unitMultiplier: Number(line.unit_multiplier),
-        requiresShipping: line.requires_shipping,
-        mappingStatus: line.mapping_state,
-        priceStatus: line.price_resolution_state,
-        packageStatus: line.packaging_state,
-        productGlobalId: draft?.productGlobalId
-          || line.product_global_id,
-        unitPriceMinor: draft
-          ? draft.unitPriceMinor
-          : Number(
-            line.resolved_unit_price_minor
-            || line.provider_unit_price_minor
-            || Number.NaN,
-          ),
-        currency: draft?.currency
-          || line.resolved_currency_code
-          || line.provider_currency_code
-          || row.currency_code,
-        packageProfileGlobalId: draft
-          ? draft.packageProfileGlobalId
-          : line.package_profile_global_id,
-        blockerCodes: line.blocking_codes.filter((code) => (
-          code !== 'packaging_required'
-          || (
-            workbenchLinePackFactsRequired({
-              requiresShipping: line.requires_shipping,
-              unitMultiplier: Number(line.unit_multiplier),
-            })
-            && line.packaging_state !== 'resolved'
-          )
-        )),
-      }
-    }).map((line) => ({
-      ...line,
-      unitPriceMinor: Number.isSafeInteger(line.unitPriceMinor)
-        ? line.unitPriceMinor
-        : null,
-    })),
+    lines: displayLines,
+    providerHistory,
     productOptions: [...productOptions.values()],
     shipTo: {
       value: shipTo,
       readiness: orderShipToReadiness(shipTo),
       provenance: local ? 'local' : 'provider',
-      syncStatus: row.sync_state || 'provider_snapshot',
+      syncStatus: providerTerminal
+        ? 'provider_snapshot'
+        : row.sync_state || 'provider_snapshot',
       issues,
     },
     providerWrites: 0,
@@ -1191,6 +1382,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
      )
      SELECT
        candidate.id::text AS candidate_id,
+       display_candidate.id::text AS display_candidate_id,
        candidate.global_id AS candidate_global_id,
        candidate.organization_id::text,
        candidate.integration_account_id::text,
@@ -1198,32 +1390,32 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        account.display_name AS integration_account_name,
        candidate.provider,
        candidate.external_order_id,
-       candidate.order_number_snapshot,
-       candidate.source_hash,
-       candidate.provider_updated_at,
-       candidate.observed_at,
+       display_snapshot.order_number_snapshot,
+       display_snapshot.source_hash,
+       display_snapshot.provider_updated_at,
+       display_snapshot.observed_at,
        candidate.row_version::text AS candidate_row_version,
-       candidate.blocking_codes,
-       candidate.pipeline_id::text,
-       candidate.currency_code,
-       candidate.requires_shipping,
-       candidate.customer_resolution_state,
-       resolved_customer.reference_code AS customer_global_id,
-       candidate.delivery_resolution_state,
-       candidate.provider_requested_delivery_at,
-       candidate.requested_delivery_at,
+       display_snapshot.blocking_codes,
+       display_snapshot.pipeline_id::text,
+       display_snapshot.currency_code,
+       display_snapshot.requires_shipping,
+       display_snapshot.customer_resolution_state,
+       display_resolved_customer.reference_code AS customer_global_id,
+       display_snapshot.delivery_resolution_state,
+       display_snapshot.provider_requested_delivery_at,
+       display_snapshot.requested_delivery_at,
        canonical_order.global_id AS canonical_order_global_id,
-       customer.name AS customer_name,
+       display_customer.name AS customer_name,
        line_count.line_count,
        line_count.pack_facts_still_required,
-       candidate.party_snapshot_state,
-       candidate.party_snapshot_ciphertext,
-       candidate.party_snapshot_iv,
-       candidate.party_snapshot_tag,
-       candidate.ship_to_snapshot_state,
-       candidate.ship_to_snapshot_ciphertext,
-       candidate.ship_to_snapshot_iv,
-       candidate.ship_to_snapshot_tag,
+       display_snapshot.party_snapshot_state,
+       display_snapshot.party_snapshot_ciphertext,
+       display_snapshot.party_snapshot_iv,
+       display_snapshot.party_snapshot_tag,
+       display_snapshot.ship_to_snapshot_state,
+       display_snapshot.ship_to_snapshot_ciphertext,
+       display_snapshot.ship_to_snapshot_iv,
+       display_snapshot.ship_to_snapshot_tag,
        workbench.id::text AS workbench_id,
        workbench.accepted_provider_source_hash,
        workbench.ship_to_edit_state,
@@ -1259,6 +1451,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          provider_status.source,
          'retained'::text
        ) AS provider_status_source,
+       exact_history.observed_at AS latest_exact_history_observed_at,
        selected.matching_total_count
      FROM page_candidate_ids selected
      JOIN operations_commerce_order_candidates candidate
@@ -1276,27 +1469,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
      LEFT JOIN operations_orders canonical_order
        ON canonical_order.organization_id = candidate.organization_id
       AND canonical_order.id = candidate.canonical_order_id
-     LEFT JOIN crm_organizations customer
-       ON customer.pipeline_id = candidate.pipeline_id
-      AND customer.id = candidate.customer_id
-     LEFT JOIN crm_organizations resolved_customer
-       ON resolved_customer.pipeline_id = candidate.pipeline_id
-      AND resolved_customer.id = candidate.customer_id
-     CROSS JOIN LATERAL (
-       SELECT count(*)::text AS line_count,
-              COALESCE(bool_or(
-                line.unfulfilled_quantity > 0
-                AND line.requires_shipping
-                AND line.unit_multiplier <> 1
-                AND line.packaging_state <> 'resolved'
-              ), false) AS pack_facts_still_required
-       FROM operations_commerce_order_candidate_lines line
-       WHERE line.organization_id = candidate.organization_id
-         AND line.integration_account_id = candidate.integration_account_id
-         AND line.order_candidate_id = candidate.id
-     ) line_count
      LEFT JOIN LATERAL (
-       SELECT provider_candidate.source_hash
+       SELECT provider_candidate.id,
+              provider_candidate.source_hash
        FROM operations_commerce_order_candidates provider_candidate
        WHERE provider_candidate.organization_id = candidate.organization_id
          AND provider_candidate.integration_account_id
@@ -1305,6 +1480,10 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
            = candidate.external_order_id
          AND provider_candidate.workflow_state <> 'failed'
        ORDER BY
+         COALESCE(
+           provider_candidate.provider_updated_at,
+           provider_candidate.observed_at
+         ) DESC,
          provider_candidate.observed_at DESC,
          provider_candidate.created_at DESC,
          provider_candidate.id DESC
@@ -1357,6 +1536,61 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          status_evidence.evidence_id DESC
        LIMIT 1
      ) provider_status ON true
+     LEFT JOIN LATERAL (
+       SELECT observation.observed_at
+       FROM operations_commerce_order_observations observation
+       WHERE observation.organization_id = candidate.organization_id
+         AND observation.integration_account_id
+           = candidate.integration_account_id
+         AND observation.provider = 'shopify'
+         AND observation.external_order_id = candidate.external_order_id
+         AND observation.observation_kind IN (
+           'manual_exact_read', 'webhook_exact_read'
+         )
+       ORDER BY COALESCE(
+                  observation.provider_updated_at,
+                  observation.observed_at
+                ) DESC,
+                observation.observed_at DESC,
+                observation.id DESC
+       LIMIT 1
+     ) exact_history ON true
+     CROSS JOIN LATERAL (
+       SELECT CASE
+         WHEN COALESCE(
+           provider_status.lifecycle_status,
+           candidate.normalized_order_status
+         ) IN ('cancelled', 'closed')
+         OR COALESCE(
+           provider_status.fulfillment_status,
+           candidate.normalized_fulfillment_status
+         ) IN ('fulfilled', 'cancelled')
+         THEN COALESCE(latest_provider.id, candidate.id)
+         ELSE candidate.id
+       END AS id
+     ) display_candidate
+     JOIN operations_commerce_order_candidates display_snapshot
+       ON display_snapshot.organization_id = candidate.organization_id
+      AND display_snapshot.id = display_candidate.id
+     LEFT JOIN crm_organizations display_customer
+       ON display_customer.pipeline_id = display_snapshot.pipeline_id
+      AND display_customer.id = display_snapshot.customer_id
+     LEFT JOIN crm_organizations display_resolved_customer
+       ON display_resolved_customer.pipeline_id = display_snapshot.pipeline_id
+      AND display_resolved_customer.id = display_snapshot.customer_id
+     CROSS JOIN LATERAL (
+       SELECT count(*)::text AS line_count,
+              COALESCE(bool_or(
+                line.unfulfilled_quantity > 0
+                AND line.requires_shipping
+                AND line.unit_multiplier <> 1
+                AND line.packaging_state <> 'resolved'
+              ), false) AS pack_facts_still_required
+       FROM operations_commerce_order_candidate_lines line
+       WHERE line.organization_id = candidate.organization_id
+         AND line.integration_account_id = candidate.integration_account_id
+         AND line.order_candidate_id = display_candidate.id
+     ) line_count
      ORDER BY
        selected.provider_updated_at DESC NULLS LAST,
        selected.observed_at DESC,
@@ -1376,12 +1610,21 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   const pageRows = result.rows.slice(0, pageSize)
   const detailsByCandidate = new Map<string, WorkbenchResolutionDetails>()
   if (input.includeResolutionDetails && pageRows.length) {
-    const candidateIds = pageRows.map((row) => row.candidate_id)
+    const candidateIds = [...new Set(
+      pageRows.map((row) => row.display_candidate_id),
+    )]
     const [lines, customers, products] = await Promise.all([
       query<WorkbenchLineReadRow>(
         `SELECT line.order_candidate_id::text AS candidate_id,
-                line.global_id, line.product_title_snapshot,
-                line.sku_snapshot, line.unfulfilled_quantity::text,
+                line.global_id, line.external_line_id,
+                line.product_title_snapshot, line.sku_snapshot,
+                line.normalized_status,
+                line.ordered_quantity::text,
+                line.current_quantity::text,
+                line.cancelled_quantity::text,
+                line.fulfilled_quantity::text,
+                line.unfulfilled_quantity::text,
+                line.returned_quantity::text,
                 line.unit_multiplier::text,
                 line.requires_shipping,
                 line.mapping_state, line.price_resolution_state,
@@ -1404,7 +1647,6 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
           AND profile.id = line.package_profile_id
          WHERE line.organization_id = $1::uuid
            AND line.order_candidate_id = ANY($2::uuid[])
-           AND line.unfulfilled_quantity > 0
          ORDER BY line.created_at, line.id`,
         [organizationId, candidateIds],
       ),
@@ -1449,7 +1691,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     ])
     for (const row of pageRows) {
       detailsByCandidate.set(row.candidate_id, {
-        lines: lines.rows.filter((line) => line.candidate_id === row.candidate_id),
+        lines: lines.rows.filter((line) => (
+          line.candidate_id === row.display_candidate_id
+        )),
         customers: customers.rows,
         products: products.rows,
       })
@@ -1469,10 +1713,46 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   const nextCursor = hasNextPage && lastRow
     ? encodeWorkbenchPageCursor(lastRow, total, scopeHash)
     : null
+  const providerHistoryByCandidate = new Map<
+    string,
+    OperationsImportedOrderWorkingCopy['providerHistory']
+  >()
+  if (
+    input.includeResolutionDetails
+    && candidateGlobalId
+    && pageRows.length === 1
+  ) {
+    const row = pageRows[0]
+    const timeline =
+      await readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres({
+        organizationId,
+        accountGlobalId: row.integration_account_global_id,
+        externalOrderId: row.external_order_id,
+        providerObservationKinds: [
+          'manual_exact_read',
+          'webhook_exact_read',
+        ],
+      })
+    providerHistoryByCandidate.set(
+      row.candidate_id,
+      {
+        ...providerHistoryFromTimeline(timeline),
+        observedAt:
+          row.latest_exact_history_observed_at?.toISOString() || null,
+      },
+    )
+  }
   return {
     orders: pageRows.map((row) => mappedWorkingCopy(
       row,
       detailsByCandidate.get(row.candidate_id) || null,
+      providerHistoryByCandidate.get(row.candidate_id) || {
+        observedAt:
+          row.latest_exact_history_observed_at?.toISOString() || null,
+        currentLines: [],
+        events: [],
+        providerWrites: 0,
+      },
     )),
     page: {
       total,
@@ -2905,10 +3185,18 @@ export async function readCommerceOrderWorkbenchRefreshTargetFromPostgres(
   const candidateGlobalId = requireCandidateGlobalId(input.candidateGlobalId)
   const result = await query<{
     account_global_id: string
+    integration_account_id: string
+    provider: 'shopify' | 'faire'
+    external_order_id: string
+    credential_generation: string | number
     candidate_global_id: string
     candidate_row_version: string
   }>(
     `SELECT account.global_id AS account_global_id,
+            account.id::text AS integration_account_id,
+            account.provider,
+            accepted.external_order_id,
+            account.commerce_credential_generation AS credential_generation,
             COALESCE(latest.global_id, accepted.global_id)
               AS candidate_global_id,
             COALESCE(latest.row_version, accepted.row_version)::text
@@ -2954,6 +3242,10 @@ export async function readCommerceOrderWorkbenchRefreshTargetFromPostgres(
   }
   return {
     accountGlobalId: result.rows[0].account_global_id,
+    integrationAccountId: result.rows[0].integration_account_id,
+    provider: result.rows[0].provider,
+    externalOrderId: result.rows[0].external_order_id,
+    credentialGeneration: Number(result.rows[0].credential_generation),
     candidateGlobalId: result.rows[0].candidate_global_id,
     candidateRowVersion: Number(result.rows[0].candidate_row_version),
   }
@@ -3036,6 +3328,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               account.global_id AS account_global_id,
               candidate.external_order_id, candidate.source_hash,
               candidate.provider_updated_at, candidate.observed_at,
+              candidate.normalized_order_status,
+              candidate.normalized_fulfillment_status,
               candidate.canonical_order_id::text,
               canonical_order.global_id AS canonical_order_global_id,
               candidate.workflow_state, candidate.blocking_codes,
@@ -3098,6 +3392,8 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
               account.global_id AS account_global_id,
               candidate.external_order_id, candidate.source_hash,
               candidate.provider_updated_at, candidate.observed_at,
+              candidate.normalized_order_status,
+              candidate.normalized_fulfillment_status,
               candidate.canonical_order_id::text,
               canonical_order.global_id AS canonical_order_global_id,
               candidate.workflow_state, candidate.blocking_codes,
@@ -3225,6 +3521,116 @@ export async function rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(
         'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
         'This order changed. Reload it before refreshing',
       )
+    }
+
+    const latestProviderTerminal = (
+      ['cancelled', 'closed'].includes(latest.normalized_order_status)
+      || ['fulfilled', 'cancelled'].includes(
+        latest.normalized_fulfillment_status,
+      )
+    )
+    if (latestProviderTerminal) {
+      if (
+        Object.keys(resolutions).length
+        || Object.keys(lineResolutions).length
+      ) {
+        requestError(
+          'OPERATIONS_IMPORTED_ORDER_REFRESH_RESOLUTION_STALE',
+          'This provider order is final and no longer needs local resolutions',
+        )
+      }
+      const updated = await client.query<{ row_version: string }>(
+        `UPDATE operations_commerce_order_workbench
+         SET candidate_id = $4::uuid,
+             accepted_provider_source_hash = $5,
+             accepted_provider_updated_at = $6,
+             ship_to_edit_state = 'provider_snapshot',
+             ship_to_ciphertext = NULL,
+             ship_to_iv = NULL,
+             ship_to_tag = NULL,
+             ship_to_hash = NULL,
+             ship_to_source_hash = NULL,
+             ship_to_encryption_version = NULL,
+             customer_global_id_draft = NULL,
+             line_resolution_drafts = '{}'::jsonb,
+             requested_delivery_at_draft = $7::timestamptz,
+             sync_state = 'provider_snapshot',
+             last_command_receipt_id = $8::uuid,
+             last_idempotency_key = $9,
+             last_request_hash = $10,
+             row_version = row_version + 1,
+             updated_by = $11,
+             updated_at = now()
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND external_order_id = $3
+           AND candidate_id = $12::uuid
+           AND row_version = $13::bigint
+         RETURNING row_version::text`,
+        [
+          organizationId,
+          accepted.integration_account_id,
+          accepted.external_order_id,
+          latest.id,
+          latest.source_hash,
+          latest.provider_updated_at || latest.observed_at,
+          latest.provider_requested_delivery_at,
+          prepared.receipt.id,
+          input.idempotencyKey,
+          exactRequestHash,
+          actorEmail,
+          accepted.id,
+          input.expectedRowVersion,
+        ],
+      )
+      if (!updated.rows[0]) {
+        requestError(
+          'OPERATIONS_IMPORTED_ORDER_VERSION_CONFLICT',
+          'This order changed. Reload it before refreshing',
+        )
+      }
+      const result: OperationsImportedOrderRefreshResult = {
+        previousCandidateGlobalId: candidateGlobalId,
+        candidateGlobalId: latest.global_id,
+        rowVersion: Number(updated.rows[0].row_version),
+        status: 'rebased',
+        providerChangedFields: [],
+        preservedLocalFields: [],
+        preservedLineDrafts: [],
+        providerWrites: 0,
+        providerWriteIntentCreated: false,
+        replayed: false,
+      }
+      await client.query(
+        `UPDATE operations_command_receipts
+         SET status = 'succeeded', result_global_id = $2,
+             result_payload = $3::jsonb, error_code = NULL,
+             error_message = NULL, completed_at = now(), updated_at = now()
+         WHERE id = $1::uuid`,
+        [prepared.receipt.id, latest.global_id, JSON.stringify(result)],
+      )
+      await recordAuditEvent({
+        actor: actorEmail,
+        eventType: 'operations.commerce_order_workbench.provider_rebased',
+        aggregateType: 'operations.commerce_order_workbench',
+        aggregateId: latest.global_id,
+        subject: latest.global_id,
+        organizationId,
+        eventKey:
+          `operations:commerce-order-workbench-refresh:${prepared.receipt.id}`,
+        payload: {
+          previousCandidateGlobalId: candidateGlobalId,
+          candidateGlobalId: latest.global_id,
+          rowVersion: result.rowVersion,
+          providerTerminal: true,
+          discardedLocalDrafts: true,
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          commandReceiptId: prepared.receipt.id,
+          correlationId: prepared.receipt.correlation_id,
+        },
+      }, client)
+      return result
     }
 
     const acceptedProvider = decryptAddress({

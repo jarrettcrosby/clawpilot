@@ -434,14 +434,83 @@ async function verify(databaseUrl, ids) {
         currentQuantity: 1,
         unfulfilledQuantity: 1,
         fulfilledQuantity: 0,
+        returnedQuantity: 0,
         requiresShipping: true,
       }],
-      events: [],
+      events: [{
+        externalEventId: 'webhook-9301-tracking',
+        externalSubjectId: 'webhook-9301-shipment',
+        eventKind: 'tracking_updated',
+        eventStatus: 'in_transit',
+        inventoryEffectKind: 'none',
+        attributionSource: 'provider_system',
+        trackingCarrier: 'UPS',
+        trackingNumber: 'WEBHOOK-TRACKING-9301',
+        trackingUrl: 'https://www.ups.com/track?tracknum=WEBHOOK-TRACKING-9301',
+        occurredAt: providerUpdatedAt,
+      }],
     })
+    const firstObservation = observation('2026-08-13T17:02:00.000Z')
+    const normalizedFirstObservation = commerceOrderSync
+      .normalizeCommerceOrderObservationInput(firstObservation)
+    const scheduledSession = (await pool.query(
+      `SELECT id::text
+       FROM operations_commerce_order_backfill_sessions
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [ids.organization, ids.integration],
+    )).rows[0]
+    assert.ok(scheduledSession)
+    const crossKindSeed = await pool.connect()
+    try {
+      await crossKindSeed.query('BEGIN')
+      await crossKindSeed.query('SET LOCAL session_replication_role = replica')
+      await crossKindSeed.query(
+        `INSERT INTO operations_commerce_order_observations (
+           organization_id, integration_account_id, backfill_session_id,
+           provider, credential_generation, observation_kind,
+           external_order_id, order_number, source_revision, source_hash,
+           canonical_lifecycle_state, canonical_payment_state,
+           canonical_fulfillment_state, canonical_return_state,
+           currency, provider_total_minor, provider_created_at,
+           provider_updated_at, observed_at, provider_read_count
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 'scheduled_poll',
+           $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+           $14::timestamptz, $15::timestamptz, $16::timestamptz, 3
+         )`,
+        [
+          ids.organization,
+          ids.integration,
+          scheduledSession.id,
+          normalizedFirstObservation.externalOrderId,
+          normalizedFirstObservation.orderNumber,
+          normalizedFirstObservation.sourceRevision,
+          normalizedFirstObservation.sourceHash,
+          normalizedFirstObservation.canonicalLifecycleState,
+          normalizedFirstObservation.canonicalPaymentState,
+          normalizedFirstObservation.canonicalFulfillmentState,
+          normalizedFirstObservation.canonicalReturnState,
+          normalizedFirstObservation.currency,
+          normalizedFirstObservation.providerTotalMinor,
+          normalizedFirstObservation.providerCreatedAt,
+          normalizedFirstObservation.providerUpdatedAt,
+          normalizedFirstObservation.observedAt,
+        ],
+      )
+      await crossKindSeed.query('COMMIT')
+    } catch (error) {
+      await crossKindSeed.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      crossKindSeed.release()
+    }
     const firstRead = await persistence
       .appendShopifyOrderWebhookExactReadInPostgres({
         claim: claims[0],
-        observation: observation('2026-08-13T17:02:00.000Z'),
+        observation: firstObservation,
         readAllOrdersScopeObserved: true,
         returnHistoryScopeObserved: true,
       })
@@ -451,6 +520,39 @@ async function verify(databaseUrl, ids) {
     assert.equal(firstRead.appended, 1)
     assert.equal(firstRead.providerReads, 3)
     assert.equal(firstRead.providerWrites, 0)
+    const firstReadLineage = await pool.query(
+      `SELECT observation.observation_kind, observation.source_hash,
+              line.returned_quantity::text,
+              event.tracking_url
+       FROM operations_commerce_order_observations observation
+       LEFT JOIN operations_commerce_order_observation_lines line
+         ON line.organization_id = observation.organization_id
+        AND line.observation_id = observation.id
+       LEFT JOIN operations_commerce_order_event_observations event
+         ON event.organization_id = observation.organization_id
+        AND event.observation_id = observation.id
+       WHERE observation.organization_id = $1::uuid
+         AND observation.integration_account_id = $2::uuid
+         AND observation.external_order_id = $3
+       ORDER BY observation.observation_kind`,
+      [ids.organization, ids.integration, firstObservation.externalOrderId],
+    )
+    assert.deepEqual(firstReadLineage.rows.map((row) => ({
+      observationKind: row.observation_kind,
+      sourceHash: row.source_hash,
+      returnedQuantity: row.returned_quantity,
+      trackingUrl: row.tracking_url,
+    })), [{
+      observationKind: 'scheduled_poll',
+      sourceHash: normalizedFirstObservation.sourceHash,
+      returnedQuantity: null,
+      trackingUrl: null,
+    }, {
+      observationKind: 'webhook_exact_read',
+      sourceHash: normalizedFirstObservation.sourceHash,
+      returnedQuantity: '0',
+      trackingUrl: 'https://www.ups.com/track?tracknum=WEBHOOK-TRACKING-9301',
+    }], 'Webhook exact lineage, returned quantity, and tracking URL must persist independently of an identical scheduled row')
 
     const followupClaims = await persistence
       .claimShopifyOrderWebhookTargetsInPostgres({

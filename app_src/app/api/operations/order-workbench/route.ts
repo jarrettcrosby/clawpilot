@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
 import {
+  exactShopifyOrderHistoryProviderReads,
+  readExactShopifyOrderHistoryObservation,
+} from '@/lib/integrations/commerceOrderHistory'
+import {
   CommerceIntegrationRequestError,
   sanitizedCommerceIntegrationError,
 } from '@/lib/integrations/commerceIntegrations'
+import { ShopifyCommerceClientError } from '@/lib/integrations/shopifyCommerceClient'
 import {
   activeOperationsOrganizationId,
   operationsCapabilities,
@@ -20,6 +25,14 @@ import type {
   OperationsImportedOrderResolutionDraft,
 } from '@/lib/operations/types'
 import { isPostgresStorageEnabled } from '@/lib/persistence/config'
+import {
+  appendCommerceOrderWorkbenchExactReadInPostgres,
+  CommerceOrderSyncError,
+  readCommerceOrderWorkbenchExactReadReplayInPostgres,
+} from '@/lib/persistence/commerceOrderSync'
+import {
+  withCommerceStoreSyncProviderReadFenceInPostgres,
+} from '@/lib/persistence/commerceStoreSync'
 import {
   acceptCommerceOrderWorkbenchInPostgres,
   CommerceOrderWorkbenchError,
@@ -47,6 +60,12 @@ const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const MAX_PAGE_SIZE = 250
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
+const DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES = new Set([
+  'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
+  'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
+  'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+  'SHOPIFY_READ_ORDERS_REQUIRED',
+])
 const REFRESH_FIELDS = new Set<string>([
   ...ORDER_SHIP_TO_FIELDS,
   'requestedDeliveryAt',
@@ -85,6 +104,15 @@ function response(payload: Record<string, unknown>, status = 200) {
 
 function requestError(code: string, message: string, status = 400): never {
   throw new CommerceOrderWorkbenchApiError(code, message, status)
+}
+
+function exactShopifyHistoryUnavailableCode(error: unknown) {
+  if (error instanceof ShopifyCommerceClientError) return error.code
+  if (
+    error instanceof CommerceOrderSyncError
+    && DEGRADABLE_EXACT_SHOPIFY_HISTORY_CODES.has(error.code)
+  ) return error.code
+  return null
 }
 
 function requirePostgres() {
@@ -375,6 +403,7 @@ function errorResponse(error: unknown) {
   if (
     error instanceof CommerceOrderWorkbenchApiError
     || error instanceof CommerceOrderWorkbenchError
+    || error instanceof CommerceOrderSyncError
   ) {
     return response({
       ok: false,
@@ -571,6 +600,17 @@ export async function POST(req: NextRequest) {
       )
     }
     const requestKey = idempotencyKeyValue(req)
+    let historyRefresh: {
+      status: 'not_applicable' | 'captured' | 'unavailable'
+      code: string | null
+      providerReads: number | null
+      providerWrites: 0
+    } = {
+      status: 'not_applicable',
+      code: null,
+      providerReads: 0,
+      providerWrites: 0,
+    }
     if (!resolvingConflict) {
       const target = await readCommerceOrderWorkbenchRefreshTargetFromPostgres({
         organizationId,
@@ -586,8 +626,87 @@ export async function POST(req: NextRequest) {
           candidateGlobalId,
           purpose: 'provider',
         }),
-        candidateGlobalId: target.candidateGlobalId,
+        candidateGlobalId,
       })
+      if (target.provider === 'shopify') {
+        const historyIntentKey = [
+          'order-workbench-history',
+          requestKey,
+          candidateGlobalId,
+        ].join(':')
+        const replay =
+          await readCommerceOrderWorkbenchExactReadReplayInPostgres({
+            organizationId,
+            integrationAccountId: target.integrationAccountId,
+            externalOrderId: target.externalOrderId,
+            intentKey: historyIntentKey,
+          })
+        if (replay?.status === 'in_progress') {
+          requestError(
+            'OPERATIONS_IMPORTED_ORDER_REFRESH_IN_PROGRESS',
+            'This order refresh is still in progress',
+            409,
+          )
+        }
+        const captured = replay ||
+          await withCommerceStoreSyncProviderReadFenceInPostgres({
+            organizationId,
+            integrationAccountId: target.integrationAccountId,
+            authorityKind: 'manual_read_only',
+            readKind: 'order_history',
+            intentKey: historyIntentKey,
+            acquiredBy: actor.email,
+            read: async (providerReadLease) => {
+              try {
+                const exact = await readExactShopifyOrderHistoryObservation({
+                  organizationId,
+                  accountGlobalId: target.accountGlobalId,
+                  expectedCredentialGeneration: target.credentialGeneration,
+                  externalOrderId: target.externalOrderId,
+                  observationKind: 'manual_exact_read',
+                })
+                return appendCommerceOrderWorkbenchExactReadInPostgres({
+                  organizationId,
+                  integrationAccountId: target.integrationAccountId,
+                  accountGlobalId: target.accountGlobalId,
+                  credentialGeneration: target.credentialGeneration,
+                  externalOrderId: target.externalOrderId,
+                  providerReadLease,
+                  observation: exact.observation,
+                })
+              } catch (error) {
+                const code = exactShopifyHistoryUnavailableCode(error)
+                if (!code) throw error
+                return {
+                  status: 'unavailable' as const,
+                  code,
+                  providerReads:
+                    exactShopifyOrderHistoryProviderReads(error),
+                  providerWrites: 0 as const,
+                }
+              }
+            },
+          })
+        if ('status' in captured && captured.status === 'unavailable') {
+          historyRefresh = {
+            status: 'unavailable',
+            code: captured.code,
+            providerReads: captured.providerReads,
+            providerWrites: 0,
+          }
+          console.warn('[operations-order-workbench] exact history unavailable', {
+            code: captured.code,
+            candidateGlobalId,
+          })
+        } else {
+          historyRefresh = {
+            status: 'captured',
+            code: null,
+            providerReads: captured.providerReads,
+            providerWrites: 0,
+          }
+        }
+      }
     }
     const result = await rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
       organizationId,
@@ -616,7 +735,12 @@ export async function POST(req: NextRequest) {
         500,
       )
     }
-    return response({ ok: true, refreshResult: result, order })
+    return response({
+      ok: true,
+      refreshResult: result,
+      historyRefresh,
+      order,
+    })
   } catch (error) {
     return errorResponse(error)
   }

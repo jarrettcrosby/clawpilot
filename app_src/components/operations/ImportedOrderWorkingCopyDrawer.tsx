@@ -10,6 +10,7 @@ import {
   Divider,
   Drawer,
   IconButton,
+  Link,
   MenuItem,
   Stack,
   TextField,
@@ -133,6 +134,33 @@ function providerLabel(provider: OperationsImportedOrderWorkingCopy['provider'])
   return provider === 'shopify' ? 'Shopify' : 'Faire'
 }
 
+function providerEventLabel(kind: string) {
+  return kind
+    .replaceAll('_', ' ')
+    .replace(/\b\w/gu, (letter) => letter.toUpperCase())
+}
+
+function providerEventTime(value: string) {
+  const parsed = new Date(value)
+  if (!Number.isFinite(parsed.getTime())) return 'Time unavailable'
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(parsed)
+}
+
+function providerEventMoney(amountMinor: number | null, currency: string | null) {
+  if (amountMinor === null || !currency) return null
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency,
+    }).format(amountMinor / 100)
+  } catch {
+    return `${currency} ${(amountMinor / 100).toFixed(2)}`
+  }
+}
+
 function providerOrderStatus(order: OperationsImportedOrderWorkingCopy) {
   if (
     order.providerState.lifecycle === 'cancelled'
@@ -248,6 +276,26 @@ export default function ImportedOrderWorkingCopyDrawer({
   const draftReadiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
   const currentProviderStatus = order ? providerOrderStatus(order) : null
   const providerTerminal = currentProviderStatus?.terminal === true
+  const shipToFieldsDisabled = !order?.resolutionDetailsLoaded
+    || providerTerminal
+    || !canManage
+    || saving
+  const trackingHistory = (order?.providerHistory.events || []).filter((event) => (
+    event.kind === 'tracking_updated'
+  ))
+  const trackingDetails = trackingHistory.filter((event) => (
+    event.trackingNumber || event.trackingUrl || event.trackingRedacted
+  ))
+  const trackingEvents = trackingDetails.length
+    ? trackingDetails
+    : trackingHistory.slice(-1)
+  const fulfillmentEvents = (order?.providerHistory.events || []).filter((event) => (
+    ['fulfillment_created', 'fulfillment_updated', 'shipment_created']
+      .includes(event.kind)
+  ))
+  const adjustmentEvents = (order?.providerHistory.events || []).filter((event) => (
+    event.kind.startsWith('refund_') || event.kind.startsWith('return_')
+  ))
   const invalidLinePrices = useMemo(() => new Set((order?.lines || [])
     .filter((line) => {
       const draft = lineDrafts[line.globalId]
@@ -540,7 +588,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 {order?.integrationAccountName || '—'}
               </Typography>
             </Box>
-            {onRefresh && (
+            {onRefresh && canManage && (
               <Button
                 size="small"
                 variant="outlined"
@@ -552,6 +600,130 @@ export default function ImportedOrderWorkingCopyDrawer({
               </Button>
             )}
           </Stack>
+
+          {order?.resolutionDetailsLoaded
+            && (providerTerminal || order.providerHistory.events.length) && (
+            <>
+              <Divider />
+              <Stack spacing={1.5}>
+                <Box>
+                  <Typography fontWeight={700}>External fulfillment</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    Fulfillment, tracking, refunds, and returns reported by {order
+                      ? providerLabel(order.provider)
+                      : 'the provider'}.
+                  </Typography>
+                </Box>
+
+                {order?.providerHistory.observedAt ? (
+                  <Typography variant="caption" color="text.secondary">
+                    Latest exact provider snapshot {providerEventTime(
+                      order.providerHistory.observedAt,
+                    )}
+                  </Typography>
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    Tracking history has not been captured for this order. Refresh
+                    from {order ? providerLabel(order.provider) : 'the provider'}
+                    {' '}to load the latest provider record.
+                  </Typography>
+                )}
+
+                <Box>
+                  <Typography variant="body2" fontWeight={700} sx={{ mb: 0.5 }}>
+                    Tracking
+                  </Typography>
+                  {trackingEvents.length ? (
+                    <Stack spacing={0.75}>
+                      {trackingEvents.map((event) => (
+                        <Box key={event.globalId}>
+                          <Typography variant="body2">
+                            {[event.trackingCarrier, event.trackingNumber]
+                              .filter(Boolean).join(' · ')
+                              || (event.trackingRedacted
+                                ? 'Tracking number expired from retained evidence'
+                                : 'Tracking number not supplied')}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {[event.status, providerEventTime(event.occurredAt)]
+                              .filter(Boolean).join(' · ')}
+                          </Typography>
+                          {event.trackingUrl ? (
+                            <Typography variant="body2">
+                              <Link
+                                href={event.trackingUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Track shipment
+                              </Link>
+                            </Typography>
+                          ) : null}
+                        </Box>
+                      ))}
+                    </Stack>
+                  ) : order?.providerHistory.observedAt ? (
+                    <Typography variant="body2" color="text.secondary">
+                      No tracking number was supplied in the latest provider record.
+                    </Typography>
+                  ) : null}
+                </Box>
+
+                {fulfillmentEvents.length ? (
+                  <Box>
+                    <Typography variant="body2" fontWeight={700} sx={{ mb: 0.5 }}>
+                      Fulfillment activity
+                    </Typography>
+                    <Stack spacing={0.75}>
+                      {fulfillmentEvents.map((event) => (
+                        <Box key={event.globalId}>
+                          <Typography variant="body2">
+                            {providerEventLabel(event.kind)}
+                            {event.status ? ` · ${event.status}` : ''}
+                            {event.quantity !== null ? ` · ${event.quantity} units` : ''}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {providerEventTime(event.occurredAt)}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </Stack>
+                  </Box>
+                ) : null}
+
+                {adjustmentEvents.length ? (
+                  <Box>
+                    <Typography variant="body2" fontWeight={700} sx={{ mb: 0.5 }}>
+                      Adjustments
+                    </Typography>
+                    <Stack spacing={0.75}>
+                      {adjustmentEvents.map((event) => {
+                        const amount = providerEventMoney(
+                          event.amountMinor,
+                          event.currency,
+                        )
+                        return (
+                          <Box key={event.globalId}>
+                            <Typography variant="body2">
+                              {providerEventLabel(event.kind)}
+                              {event.status ? ` · ${event.status}` : ''}
+                              {event.quantity !== null
+                                ? ` · ${event.quantity} units`
+                                : ''}
+                              {amount ? ` · ${amount}` : ''}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary">
+                              {providerEventTime(event.occurredAt)}
+                            </Typography>
+                          </Box>
+                        )
+                      })}
+                    </Stack>
+                  </Box>
+                ) : null}
+              </Stack>
+            </>
+          )}
 
           <Divider />
 
@@ -570,6 +742,7 @@ export default function ImportedOrderWorkingCopyDrawer({
               onChange={(event) => setCustomerGlobalId(event.target.value)}
               disabled={
                 !order?.resolutionDetailsLoaded
+                || providerTerminal
                 || !canManage
                 || saving
                 || !order.customer.options.length
@@ -596,7 +769,12 @@ export default function ImportedOrderWorkingCopyDrawer({
               label="Requested delivery"
               value={requestedDeliveryAt}
               onChange={(event) => setRequestedDeliveryAt(event.target.value)}
-              disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+              disabled={
+                !order?.resolutionDetailsLoaded
+                || providerTerminal
+                || !canManage
+                || saving
+              }
               InputLabelProps={{ shrink: true }}
               inputProps={{ step: 0.001 }}
               helperText={order?.delivery.status === 'not_required'
@@ -618,7 +796,11 @@ export default function ImportedOrderWorkingCopyDrawer({
             <Box>
               <Typography fontWeight={700}>Items</Typography>
               <Typography variant="caption" color="text.secondary">
-                Provider SKU and quantity stay visible while you match each item.
+                {providerTerminal
+                  ? `Latest line quantities reported by ${order
+                    ? providerLabel(order.provider)
+                    : 'the provider'}.`
+                  : 'Provider SKU and quantity stay visible while you match each item.'}
               </Typography>
             </Box>
             {(order?.lines || []).map((line) => {
@@ -627,7 +809,8 @@ export default function ImportedOrderWorkingCopyDrawer({
                 option.globalId === draft?.productGlobalId
               ))
               const packageProfiles = product?.packageProfiles || []
-              const packFactsRequired = line.requiresShipping
+              const packFactsRequired = line.unfulfilledQuantity > 0
+                && line.requiresShipping
                 && (
                   !Number.isSafeInteger(line.unitMultiplier)
                   || line.unitMultiplier !== 1
@@ -651,11 +834,26 @@ export default function ImportedOrderWorkingCopyDrawer({
                           variant="outlined"
                           label={`SKU ${line.sku || 'not supplied'}`}
                         />
-                        <Chip
-                          size="small"
-                          variant="outlined"
-                          label={`Quantity ${line.quantity}`}
-                        />
+                        <Chip size="small" variant="outlined" label={`Ordered ${line.orderedQuantity}`} />
+                        <Chip size="small" variant="outlined" label={`Current ${line.currentQuantity}`} />
+                        <Chip size="small" variant="outlined" label={`Fulfilled ${line.fulfilledQuantity}`} />
+                        <Chip size="small" variant="outlined" label={`Remaining ${line.unfulfilledQuantity}`} />
+                        {line.cancelledOrRemovedQuantity > 0 && (
+                          <Chip
+                            size="small"
+                            color="warning"
+                            variant="outlined"
+                            label={`Removed or refunded ${line.cancelledOrRemovedQuantity}`}
+                          />
+                        )}
+                        {line.returnedQuantity > 0 && (
+                          <Chip
+                            size="small"
+                            color="warning"
+                            variant="outlined"
+                            label={`Returned ${line.returnedQuantity}`}
+                          />
+                        )}
                         {packFactsRequired && (
                           <Chip
                             size="small"
@@ -663,7 +861,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                             label={`Case pick · ${line.unitMultiplier} each`}
                           />
                         )}
-                        {line.blockerCodes.map((code) => (
+                        {!providerTerminal && line.blockerCodes.map((code) => (
                           <Chip
                             key={code}
                             size="small"
@@ -674,97 +872,104 @@ export default function ImportedOrderWorkingCopyDrawer({
                         ))}
                       </Stack>
                     </Box>
-                    <TextField
-                      select
-                      size="small"
-                      label="ClawPilot product"
-                      value={draft?.productGlobalId || ''}
-                      onChange={(event) => updateLine(line.globalId, {
-                        productGlobalId: event.target.value,
-                        packageProfileGlobalId: '',
-                      })}
-                      disabled={
-                        !order?.resolutionDetailsLoaded
-                        || !canManage
-                        || saving
-                        || !order.productOptions.length
-                      }
-                      helperText={order?.productOptions.length
-                        ? 'Match this provider item to an existing product'
-                        : 'No active product is available in this workspace'}
-                      fullWidth
-                    >
-                      <MenuItem value=""><em>Select product</em></MenuItem>
-                      {(order?.productOptions || []).map((option) => (
-                        <MenuItem key={option.globalId} value={option.globalId}>
-                          {option.name}{option.sku ? ` · ${option.sku}` : ''}
-                        </MenuItem>
-                      ))}
-                    </TextField>
-                    <TextField
-                      size="small"
-                      label={`Unit price (${draft?.currency || line.currency})`}
-                      value={draft?.unitPriceMajor || ''}
-                      onChange={(event) => updateLine(line.globalId, {
-                        unitPriceMajor: event.target.value,
-                      })}
-                      disabled={
-                        !order?.resolutionDetailsLoaded
-                        || !canManage
-                        || saving
-                        || !draft?.productGlobalId
-                      }
-                      error={invalidLinePrices.has(line.globalId)}
-                      helperText={invalidLinePrices.has(line.globalId)
-                        ? 'Enter a valid non-negative amount'
-                        : draft?.productGlobalId && !draft.unitPriceMajor.trim()
-                          ? 'Enter a price to finish matching this item'
-                          : 'Exact per-unit order price'}
-                      inputProps={{ inputMode: 'decimal' }}
-                      fullWidth
-                    />
-                    {line.requiresShipping && packageProfiles.length > 0 && (
-                      <TextField
-                        select
-                        size="small"
-                        label={packFactsRequired
-                          ? 'Approved case-pick pack'
-                          : 'Approved pack constraint (optional)'}
-                        value={draft?.packageProfileGlobalId || ''}
-                        SelectProps={{ displayEmpty: true }}
-                        InputLabelProps={{ shrink: true }}
-                        onChange={(event) => updateLine(line.globalId, {
-                          packageProfileGlobalId: event.target.value,
-                        })}
-                        disabled={
-                          !order?.resolutionDetailsLoaded
-                          || !canManage
-                          || saving
-                          || !draft?.productGlobalId
-                        }
-                        helperText={draft?.productGlobalId
-                          ? packFactsRequired
-                            ? 'Use the approved pack that represents this provider case pick.'
-                            : 'Cartonization chooses outbound packaging. Select only when this product must use an approved pack.'
-                          : 'Select a product first'}
-                        fullWidth
-                      >
-                        <MenuItem value=""><em>{packFactsRequired
-                          ? 'Use current mapped case pack'
-                          : 'No pack constraint — use cartonization'}</em></MenuItem>
-                        {packageProfiles.map((profile) => (
-                          <MenuItem key={profile.globalId} value={profile.globalId}>
-                            {profile.name}
-                          </MenuItem>
-                        ))}
-                      </TextField>
-                    )}
-                    {line.requiresShipping && packageProfiles.length === 0 && (
-                      <Alert severity={packFactsRequired ? 'warning' : 'info'}>
-                        {packFactsRequired
-                          ? 'This case pick needs an approved Product pack before import.'
-                          : 'Unit item — cartonization chooses outbound packaging. No Product package assignment is required.'}
-                      </Alert>
+                    {!providerTerminal && (
+                      <>
+                        <TextField
+                          select
+                          size="small"
+                          label="ClawPilot product"
+                          value={draft?.productGlobalId || ''}
+                          onChange={(event) => updateLine(line.globalId, {
+                            productGlobalId: event.target.value,
+                            packageProfileGlobalId: '',
+                          })}
+                          disabled={
+                            !order?.resolutionDetailsLoaded
+                            || providerTerminal
+                            || !canManage
+                            || saving
+                            || !order.productOptions.length
+                          }
+                          helperText={order?.productOptions.length
+                            ? 'Match this provider item to an existing product'
+                            : 'No active product is available in this workspace'}
+                          fullWidth
+                        >
+                          <MenuItem value=""><em>Select product</em></MenuItem>
+                          {(order?.productOptions || []).map((option) => (
+                            <MenuItem key={option.globalId} value={option.globalId}>
+                              {option.name}{option.sku ? ` · ${option.sku}` : ''}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        <TextField
+                          size="small"
+                          label={`Unit price (${draft?.currency || line.currency})`}
+                          value={draft?.unitPriceMajor || ''}
+                          onChange={(event) => updateLine(line.globalId, {
+                            unitPriceMajor: event.target.value,
+                          })}
+                          disabled={
+                            !order?.resolutionDetailsLoaded
+                            || providerTerminal
+                            || !canManage
+                            || saving
+                            || !draft?.productGlobalId
+                          }
+                          error={invalidLinePrices.has(line.globalId)}
+                          helperText={invalidLinePrices.has(line.globalId)
+                            ? 'Enter a valid non-negative amount'
+                            : draft?.productGlobalId && !draft.unitPriceMajor.trim()
+                              ? 'Enter a price to finish matching this item'
+                              : 'Exact per-unit order price'}
+                          inputProps={{ inputMode: 'decimal' }}
+                          fullWidth
+                        />
+                        {line.requiresShipping && packageProfiles.length > 0 && (
+                          <TextField
+                            select
+                            size="small"
+                            label={packFactsRequired
+                              ? 'Approved case-pick pack'
+                              : 'Approved pack constraint (optional)'}
+                            value={draft?.packageProfileGlobalId || ''}
+                            SelectProps={{ displayEmpty: true }}
+                            InputLabelProps={{ shrink: true }}
+                            onChange={(event) => updateLine(line.globalId, {
+                              packageProfileGlobalId: event.target.value,
+                            })}
+                            disabled={
+                              !order?.resolutionDetailsLoaded
+                              || providerTerminal
+                              || !canManage
+                              || saving
+                              || !draft?.productGlobalId
+                            }
+                            helperText={draft?.productGlobalId
+                              ? packFactsRequired
+                                ? 'Use the approved pack that represents this provider case pick.'
+                                : 'Cartonization chooses outbound packaging. Select only when this product must use an approved pack.'
+                              : 'Select a product first'}
+                            fullWidth
+                          >
+                            <MenuItem value=""><em>{packFactsRequired
+                              ? 'Use current mapped case pack'
+                              : 'No pack constraint — use cartonization'}</em></MenuItem>
+                            {packageProfiles.map((profile) => (
+                              <MenuItem key={profile.globalId} value={profile.globalId}>
+                                {profile.name}
+                              </MenuItem>
+                            ))}
+                          </TextField>
+                        )}
+                        {line.requiresShipping && packageProfiles.length === 0 && (
+                          <Alert severity={packFactsRequired ? 'warning' : 'info'}>
+                            {packFactsRequired
+                              ? 'This case pick needs an approved Product pack before import.'
+                              : 'Unit item — cartonization chooses outbound packaging. No Product package assignment is required.'}
+                          </Alert>
+                        )}
+                      </>
                     )}
                   </Stack>
                 </Box>
@@ -772,7 +977,7 @@ export default function ImportedOrderWorkingCopyDrawer({
             })}
             {order?.resolutionDetailsLoaded && !order.lines.length && (
               <Typography variant="body2" color="text.secondary">
-                No open order items were supplied by {providerLabel(order.provider)}.
+                No line-item snapshot was supplied by {providerLabel(order.provider)}.
               </Typography>
             )}
           </Stack>
@@ -790,15 +995,23 @@ export default function ImportedOrderWorkingCopyDrawer({
               <Box>
                 <Typography fontWeight={700}>Ship to</Typography>
                 <Typography variant="caption" color="text.secondary">
-                  ClawPilot shipment address
+                  {providerTerminal
+                    ? 'Latest provider shipping address'
+                    : 'ClawPilot shipment address'}
                 </Typography>
               </Box>
               {order && (
                 <Chip
                   size="small"
                   variant="outlined"
-                  color={draftReadiness === 'carrier_ready' ? 'success' : 'warning'}
-                  label={readinessLabel(draftReadiness)}
+                  color={providerTerminal
+                    ? 'default'
+                    : draftReadiness === 'carrier_ready'
+                      ? 'success'
+                      : 'warning'}
+                  label={providerTerminal
+                    ? 'Provider snapshot'
+                    : readinessLabel(draftReadiness)}
                 />
               )}
             </Stack>
@@ -809,7 +1022,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Recipient name"
                 value={shipTo.name || ''}
                 onChange={(event) => update('name', event.target.value)}
-                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                disabled={shipToFieldsDisabled}
                 fullWidth
               />
               <TextField
@@ -817,7 +1030,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Address"
                 value={shipTo.line1 || ''}
                 onChange={(event) => update('line1', event.target.value)}
-                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                disabled={shipToFieldsDisabled}
                 fullWidth
               />
               <TextField
@@ -825,7 +1038,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 label="Apartment, suite, etc."
                 value={shipTo.line2 || ''}
                 onChange={(event) => update('line2', event.target.value)}
-                disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                disabled={shipToFieldsDisabled}
                 fullWidth
               />
               <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5}>
@@ -834,7 +1047,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="City"
                   value={shipTo.city || ''}
                   onChange={(event) => update('city', event.target.value)}
-                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                  disabled={shipToFieldsDisabled}
                   fullWidth
                 />
                 <TextField
@@ -842,7 +1055,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="State / province"
                   value={shipTo.region || ''}
                   onChange={(event) => update('region', event.target.value)}
-                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                  disabled={shipToFieldsDisabled}
                   fullWidth
                 />
               </Stack>
@@ -852,7 +1065,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="Postal code"
                   value={shipTo.postalCode || ''}
                   onChange={(event) => update('postalCode', event.target.value)}
-                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                  disabled={shipToFieldsDisabled}
                   fullWidth
                 />
                 <TextField
@@ -860,7 +1073,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                   label="Country code"
                   value={shipTo.country || ''}
                   onChange={(event) => update('country', event.target.value.toUpperCase())}
-                  disabled={!order?.resolutionDetailsLoaded || !canManage || saving}
+                  disabled={shipToFieldsDisabled}
                   inputProps={{ maxLength: 2 }}
                   fullWidth
                 />

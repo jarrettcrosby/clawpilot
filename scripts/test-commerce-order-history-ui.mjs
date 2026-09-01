@@ -26,6 +26,13 @@ const health = await readFile(
   new URL('app_src/app/api/health/route.ts', root),
   'utf8',
 )
+const orderEditingReleaseHealth = await readFile(
+  new URL(
+    'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
+    root,
+  ),
+  'utf8',
+)
 const predeploy = await readFile(
   new URL('scripts/verify-predeploy.mjs', root),
   'utf8',
@@ -274,9 +281,20 @@ assert.match(imports, /onOpenOrder=\{onOpenOrder\}/)
 
 for (const contract of [
   '0276_operations_commerce_order_sync_foundation.sql',
+  '0340_operations_order_workbench_exact_history.sql',
   '0277_operations_commerce_authority_policies.sql',
   '0278_operations_shopify_order_webhook_signals.sql',
   'operations_commerce_order_sync_foundation_applied',
+  'operations_order_workbench_exact_history_applied',
+  '1668f266ef3c628e71fa9b75e120f086ffcbd4e40e6fe3ee42c9a39386db297e',
+  "'manual_provider_read_lease_id'",
+  "'tracking_url'",
+  "'commerce_order_observation_manual_read_lease_fkey'",
+  "'commerce_order_observation_kind_v3_valid'",
+  "'commerce_order_observation_source_lineage_valid'",
+  "'commerce_order_event_tracking_url_valid'",
+  "'commerce_order_event_sensitive_retention_valid'",
+  "'public.idx_commerce_order_observation_manual_read'",
   'operations_commerce_authority_policies_applied',
   'operations_shopify_order_webhook_signals_applied',
   'readCommerceOrderSyncHealthFromPostgres',
@@ -304,6 +322,9 @@ for (const contract of [
   "'commerce_order_observation_accepts_children(uuid,uuid)'",
   "'protect_commerce_order_observation_line_lineage()'",
   "'protect_commerce_order_event_lineage()'",
+  "'protect_commerce_order_event_tracking_url()'",
+  "'public.reject_commerce_order_sync_evidence_mutation()'",
+  "'public.redact_expired_commerce_order_sensitive_evidence(integer)'",
   "'reject_commerce_order_sync_evidence_mutation()'",
   "'operations_shopify_order_webhook_signals'",
   "'operations_shopify_order_webhook_targets'",
@@ -323,15 +344,37 @@ for (const contract of [
   "'commerce_order_observations_immutable'",
   "'commerce_order_observation_lines_immutable'",
   "'commerce_order_event_observations_immutable'",
+  "'commerce_order_event_tracking_url_guard'",
+  'installed_tracking_url_trigger.tgtype = 7',
   "installed_history_trigger.tgenabled IN ('O', 'A')",
   'installed_history_trigger.tgfoid = to_regprocedure',
 ]) {
   assert.ok(health.includes(contract), `Health is missing ${contract}`)
 }
 assert.ok(
+  health.includes('${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}'),
+  'Runtime health must evaluate the exact 0340 artifact fingerprint',
+)
+for (const contract of [
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17',
+  'c9a6a9a9a29fe4feea20572ada59bb054b07fa8eb80a0d787b4bda492d747017',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_FINGERPRINT_SQL',
+  'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL',
+]) {
+  assert.ok(
+    orderEditingReleaseHealth.includes(contract),
+    `Exact-history release health is missing ${contract}`,
+  )
+}
+assert.ok(
   (health.match(/operations_commerce_order_sync_foundation_applied/gu) || [])
     .length >= 4,
   'Order-history migration must gate database readiness and health errors',
+)
+assert.ok(
+  (health.match(/operations_order_workbench_exact_history_applied/gu) || [])
+    .length >= 5,
+  'Exact order history must gate database, history, and order-editing readiness',
 )
 assert.ok(
   (health.match(/operations_commerce_authority_policies_applied/gu) || [])
@@ -340,6 +383,7 @@ assert.ok(
 )
 for (const contract of [
   'db/migrations/0276_operations_commerce_order_sync_foundation.sql',
+  'db/migrations/0340_operations_order_workbench_exact_history.sql',
   'db/migrations/0277_operations_commerce_authority_policies.sql',
   'app_src/app/api/integrations/commerce/order-history/route.ts',
   'app_src/app/api/integrations/commerce/authority-policies/route.ts',

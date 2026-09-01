@@ -78,6 +78,7 @@ export async function processShopifyOrderWebhookSignals(input: {
             accountGlobalId: claim.accountGlobalId,
             expectedCredentialGeneration: claim.credentialGeneration,
             externalOrderId: claim.externalOrderId,
+            observationKind: 'webhook_exact_read',
           })
           if (
             read.provider !== 'shopify'

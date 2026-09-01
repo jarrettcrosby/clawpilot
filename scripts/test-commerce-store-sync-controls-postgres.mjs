@@ -2212,6 +2212,50 @@ async function verify(databaseUrl, fixtures) {
     }
     assert.equal(post0314AutomaticProviderCalls, 0)
     assert.equal(post0314ManualProviderCalls, 2)
+
+    const post0340Client = await pool.connect()
+    try {
+      await applyMigration(
+        post0340Client,
+        '0340_operations_order_workbench_exact_history.sql',
+      )
+    } finally {
+      post0340Client.release()
+    }
+    assert.equal(
+      await storeSyncRewrittenFunctionHealth(pool),
+      true,
+      'Exact order-history migration must preserve rewritten-function health',
+    )
+    assert.equal(
+      await storeSyncAuthorityContract(pool),
+      'legacy-writer-compatible',
+      'Exact order-history migration must preserve Store sync authority',
+    )
+    await assertRewrittenFunctionTamperDetected(
+      pool,
+      `ALTER FUNCTION protect_commerce_order_observation_lineage()
+       RESET ALL`,
+    )
+    const checksumTamperClient = await pool.connect()
+    try {
+      await checksumTamperClient.query('BEGIN')
+      await checksumTamperClient.query(
+        `UPDATE public.schema_migrations
+         SET checksum = repeat('0', 64)
+         WHERE filename =
+           '0340_operations_order_workbench_exact_history.sql'`,
+      )
+      assert.equal(
+        await storeSyncRewrittenFunctionHealth(checksumTamperClient),
+        false,
+        'Exact order-history migration checksum drift must fail health',
+      )
+    } finally {
+      await checksumTamperClient.query('ROLLBACK').catch(() => {})
+      checksumTamperClient.release()
+    }
+    assert.equal(await storeSyncRewrittenFunctionHealth(pool), true)
   } finally {
     await pool.end()
   }
@@ -2243,6 +2287,16 @@ async function main() {
     resolve(root, 'app_src/lib/persistence/commerceStoreSyncHealth.ts'),
     'utf8',
   )
+  const exactHistoryMigrationSource = readFileSync(
+    resolve(
+      root,
+      'db/migrations/0340_operations_order_workbench_exact_history.sql',
+    ),
+    'utf8',
+  )
+  const exactHistoryMigrationChecksum = createHash('sha256')
+    .update(exactHistoryMigrationSource)
+    .digest('hex')
   const healthRouteSource = readFileSync(
     resolve(root, 'app_src/app/api/health/route.ts'),
     'utf8',
@@ -2286,6 +2340,10 @@ async function main() {
   assert.ok(
     storeSyncHealthSource.includes(`'${migrationSha256}'`),
     'Store sync health must pin the exact 0298 migration bytes',
+  )
+  assert.ok(
+    storeSyncHealthSource.includes(`'${exactHistoryMigrationChecksum}'`),
+    'Store sync health must pin the exact 0340 migration bytes',
   )
   for (const contract of [
     'legacy-writer-compatible',

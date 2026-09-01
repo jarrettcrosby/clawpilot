@@ -1225,9 +1225,18 @@ export type OperationsImportedOrderWorkingCopy = {
   }
   lines: Array<{
     globalId: string
+    externalLineId: string
     title: string
     sku: string | null
+    /** Remaining provider quantity retained for existing fulfillment actions. */
     quantity: number
+    orderedQuantity: number
+    currentQuantity: number
+    cancelledOrRemovedQuantity: number
+    fulfilledQuantity: number
+    unfulfilledQuantity: number
+    returnedQuantity: number
+    providerStatus: 'open' | 'cancelled' | 'fulfilled' | 'returned' | 'unknown'
     unitMultiplier: number
     requiresShipping: boolean
     mappingStatus:
@@ -1244,6 +1253,36 @@ export type OperationsImportedOrderWorkingCopy = {
     packageProfileGlobalId: string | null
     blockerCodes: string[]
   }>
+  providerHistory: {
+    observedAt: string | null
+    currentLines: Array<{
+      externalLineId: string
+      externalProductId: string | null
+      externalVariantId: string | null
+      sku: string | null
+      orderedQuantity: number
+      currentQuantity: number | null
+      fulfilledQuantity: number | null
+      unfulfilledQuantity: number | null
+      returnedQuantity: number | null
+      requiresShipping: boolean | null
+    }>
+    events: Array<{
+      globalId: string
+      kind: string
+      status: string | null
+      occurredAt: string
+      externalSubjectId: string | null
+      quantity: number | null
+      amountMinor: number | null
+      currency: string | null
+      trackingCarrier: string | null
+      trackingNumber: string | null
+      trackingUrl: string | null
+      trackingRedacted: boolean
+    }>
+    providerWrites: 0
+  }
   productOptions: Array<{
     globalId: string
     name: string
