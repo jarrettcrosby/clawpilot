@@ -363,6 +363,14 @@ assert.ok(
   health.includes('${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}'),
   'Runtime health must evaluate the exact 0340 artifact fingerprint',
 )
+assert.ok(
+  health.includes('AND installed_manual_read_index.indisunique'),
+  'Runtime health must require the unique manual-read lineage index',
+)
+assert.ok(
+  !health.includes('AND NOT installed_manual_read_index.indisunique'),
+  'Runtime health must not reject the unique manual-read lineage index',
+)
 const trackingUrlGuardBody = exactHistoryMigration.match(
   /CREATE OR REPLACE FUNCTION protect_commerce_order_event_tracking_url\(\)[\s\S]*?AS \$\$([\s\S]*?)\$\$;/u,
 )?.[1]

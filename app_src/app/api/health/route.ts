@@ -5662,7 +5662,7 @@ export async function GET() {
                   )
                   AND installed_manual_read_index.indisvalid
                   AND installed_manual_read_index.indisready
-                  AND NOT installed_manual_read_index.indisunique
+                  AND installed_manual_read_index.indisunique
                   AND NOT installed_manual_read_index.indisprimary
                   AND installed_manual_read_index.indexprs IS NULL
                   AND installed_manual_read_index.indnkeyatts = 3
