@@ -1304,6 +1304,9 @@ async function verifyRouteBehavior() {
   const shadowTraining = loadTypeScriptModule(
     'app_src/lib/operations/shadowTraining.ts',
   )
+  const orderListQuery = loadTypeScriptModule(
+    'app_src/lib/operations/orderListQuery.ts',
+  )
   const physicalOutputAttestationAuthorization = loadTypeScriptModule(
     'app_src/lib/operations/physicalOutputAttestationAuthorization.ts',
     {
@@ -1356,6 +1359,7 @@ async function verifyRouteBehavior() {
       '@/lib/operations/physicalOutputAttestationAuthorization': (
         physicalOutputAttestationAuthorization
       ),
+      '@/lib/operations/orderListQuery': orderListQuery,
       '@/lib/operations/types': {
         canRequestOperationsPickHandoff: (capabilities) => (
           capabilities.canView && capabilities.canExecute
@@ -1695,6 +1699,11 @@ async function verifyRouteBehavior() {
     canPurchaseLivePostage: true,
     search: 'proof',
     status: 'shipped',
+    sort: 'updated',
+    direction: 'desc',
+    provider: null,
+    tracking: null,
+    updatedAfter: null,
     exceptionStatus: 'open',
     selectedOrderGlobalId: 'gor1234567',
   })
@@ -4037,6 +4046,9 @@ async function verifyPostgresAcceptance(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const orderListQuery = loadTypeScriptModule(
+      'app_src/lib/operations/orderListQuery.ts',
+    )
     const operationsOrderShipmentAddress = loadTypeScriptModule(
       'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
       {
@@ -4199,6 +4211,7 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/operations/pickManagement': pickManagement,
         '@/lib/operations/packingSlip': packingSlip,
         '@/lib/operations/barcodeLabels': barcodeLabels,
+        '@/lib/operations/orderListQuery': orderListQuery,
         '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
