@@ -1024,6 +1024,9 @@ function loadOperationalWarehouseServices(pool) {
   const commerceFulfillmentRecoveryPolicy = loadTypeScriptModule(
     'app_src/lib/commerceFulfillmentRecoveryPolicy.ts',
   )
+  const orderListQuery = loadTypeScriptModule(
+    'app_src/lib/operations/orderListQuery.ts',
+  )
   const operations = loadTypeScriptModule(
     'app_src/lib/persistence/operations.ts',
     {
@@ -1104,6 +1107,7 @@ function loadOperationalWarehouseServices(pool) {
       '@/lib/operations/domain': domain,
       '@/lib/operations/pickManagement': pickManagement,
       '@/lib/operations/packingSlip': packingSlip,
+      '@/lib/operations/orderListQuery': orderListQuery,
       '@/lib/operations/orderShipTo': orderShipTo,
       '@/lib/persistence/commerceOrderWorkbench': {
         async readCommerceOrderWorkbenchFromPostgres() {

@@ -2966,6 +2966,9 @@ async function verifyCanonicalPlanning(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const orderListQuery = loadTypeScriptModule(
+      'app_src/lib/operations/orderListQuery.ts',
+    )
     const operationsOrderShipmentAddress = loadTypeScriptModule(
       'app_src/lib/persistence/operationsOrderShipmentAddress.ts',
       {
@@ -3306,6 +3309,7 @@ async function verifyCanonicalPlanning(databaseUrl) {
           '@/lib/operations/pickManagement': pickManagement,
           '@/lib/operations/packingSlip': packingSlip,
           '@/lib/operations/barcodeLabels': barcodeLabels,
+          '@/lib/operations/orderListQuery': orderListQuery,
           '@/lib/operations/orderShipTo': orderShipTo,
           '@/lib/persistence/cartonizationRateEvidence':
             cartonizationRateEvidence,

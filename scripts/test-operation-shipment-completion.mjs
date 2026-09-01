@@ -1343,6 +1343,9 @@ async function verifyShipmentCompletion(databaseUrl) {
     const orderShipTo = loadTypeScriptModule(
       'app_src/lib/operations/orderShipTo.ts',
     )
+    const orderListQuery = loadTypeScriptModule(
+      'app_src/lib/operations/orderListQuery.ts',
+    )
     const carrierSandboxRate = loadTypeScriptModule(
       'app_src/lib/integrations/carrierSandboxRate.ts',
       {
@@ -1407,6 +1410,7 @@ async function verifyShipmentCompletion(databaseUrl) {
           assertCurrentOrderUnitWeightEvidence: async () => {},
         },
         '@/lib/persistence/commerceProviderWrites': commerceProviderWrites,
+        '@/lib/operations/orderListQuery': orderListQuery,
         '@/lib/operations/orderShipTo': orderShipTo,
         '@/lib/persistence/operationsOrderShipmentAddress':
           operationsOrderShipmentAddress,
