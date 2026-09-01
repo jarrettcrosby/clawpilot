@@ -16,6 +16,19 @@ import {
   readOperationsOrderShipmentAddressInPostgres,
 } from '@/lib/persistence/operationsOrderShipmentAddress'
 import { orderShipToStorageValue } from '@/lib/operations/orderShipTo'
+import {
+  OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH,
+  OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS,
+  isOperationsOrderCursorSortValue,
+  isOperationsOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+  type OperationsOrderSort,
+  type OperationsOrderSortDirection,
+  type OperationsOrderTrackingFilter,
+} from '@/lib/operations/orderListQuery'
 import { normalizedCrmIdentityText } from '@/lib/crm/stableId'
 import {
   executeShopifyFulfillmentWriteback,
@@ -219,6 +232,20 @@ function externallyFulfilledOrderSql(orderAlias: string) {
     )
   )`
 }
+
+function canonicalOrderValueMinorSql(orderAlias: string) {
+  return `(CASE
+    WHEN ${orderAlias}.source_provider IN ('shopify', 'faire')
+         AND COALESCE(
+           ${orderAlias}.source_payload #>> '{amountsMinor,total}',
+           ''
+         ) ~ '^[0-9]+$'
+      THEN ${orderAlias}.source_payload #>> '{amountsMinor,total}'
+    WHEN ${orderAlias}.source_provider IN ('shopify', 'faire')
+      THEN NULL
+    ELSE ${orderAlias}.merchandise_total_minor::text
+  END)`
+}
 type IdRow = QueryResultRow & { id: string; global_id: string }
 type OrderLineIdentityRow = IdRow & { external_line_id: string }
 type WarehouseRow = QueryResultRow & {
@@ -365,23 +392,26 @@ type OperationsOrderListReadRow = QueryResultRow & {
   customer_name: string
   customer_global_id: string
   source_provider: string
+  currency: string
   status: OperationsOrderStatus
   externally_fulfilled: boolean
   warehouse_name: string | null
   promised_delivery_at: Date | null
   line_count: string
   exception_count: string
+  order_value_minor: string | null
   expected_cost_minor: string | null
   expected_revenue_minor: string | null
   expected_margin_minor: string | null
   tracking_number: string | null
   updated_at: Date
+  cursor_sort_value: Date | string
   matching_total_count: string
 }
 
 type OperationsOrderPageCursor = {
-  v: 1
-  updatedAt: string
+  v: 2
+  sortValue: string
   orderId: string
   total: number
   scopeHash: string
@@ -3343,6 +3373,7 @@ async function readOrderDetail(
     existing_shipment_count: string
     exception_count: string
     blocking_exception_count: string
+    order_value_minor: string | null
     expected_cost_minor: string | null
     expected_revenue_minor: string | null
     expected_margin_minor: string | null
@@ -3452,8 +3483,11 @@ async function readOrderDetail(
        (SELECT count(*) FROM operations_exceptions exception
         WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged')
           AND exception.severity IN ('high', 'critical'))::text AS blocking_exception_count,
-       plan.estimated_cost_minor::text, plan.estimated_revenue_minor::text, plan.estimated_margin_minor::text,
-       shipment.tracking_number, orders.updated_at
+       ${canonicalOrderValueMinorSql('orders')} AS order_value_minor,
+       plan.estimated_cost_minor::text AS expected_cost_minor,
+       plan.estimated_revenue_minor::text AS expected_revenue_minor,
+       plan.estimated_margin_minor::text AS expected_margin_minor,
+       latest_tracking.tracking_number, orders.updated_at
      FROM operations_orders orders
      JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
      LEFT JOIN operations_integration_accounts source_account
@@ -3488,9 +3522,114 @@ async function readOrderDetail(
        ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1
      ) wave ON true
      LEFT JOIN LATERAL (
-       SELECT candidate.tracking_number FROM operations_shipments candidate
-       WHERE candidate.order_id = orders.id ORDER BY candidate.shipped_at DESC LIMIT 1
-     ) shipment ON true
+       SELECT candidate.tracking_number,
+              COALESCE(candidate.shipped_at, candidate.created_at)
+                AS activity_at
+       FROM operations_shipments candidate
+       WHERE candidate.organization_id = orders.organization_id
+         AND candidate.order_id = orders.id
+       ORDER BY candidate.shipped_at DESC NULLS LAST,
+                candidate.created_at DESC,
+                candidate.id DESC
+       LIMIT 1
+     ) latest_shipment ON true
+     LEFT JOIN LATERAL (
+       SELECT CASE
+                WHEN event.sensitive_evidence_redacted_at IS NULL
+                     AND event.sensitive_evidence_expires_at > now()
+                  THEN NULLIF(btrim(event.tracking_number), '')
+                ELSE NULL
+              END AS tracking_number,
+              GREATEST(
+                event.occurred_at,
+                event.observed_at,
+                event.created_at
+              ) AS activity_at
+       FROM operations_commerce_order_event_observations event
+       WHERE event.organization_id = orders.organization_id
+         AND (
+           event.order_id = orders.id
+           OR (
+             event.order_id IS NULL
+             AND event.integration_account_id = orders.integration_account_id
+             AND event.provider = orders.source_provider
+             AND event.external_order_id = orders.external_order_id
+           )
+         )
+         AND (
+           event.event_kind = 'tracking_updated'
+           OR NULLIF(btrim(event.tracking_number), '') IS NOT NULL
+         )
+       ORDER BY GREATEST(
+                  event.occurred_at,
+                  event.observed_at,
+                  event.created_at
+                ) DESC,
+                (event.event_kind = 'tracking_updated') DESC,
+                (
+                  event.sensitive_evidence_redacted_at IS NULL
+                  AND event.sensitive_evidence_expires_at > now()
+                  AND NULLIF(btrim(event.tracking_number), '') IS NOT NULL
+                ) DESC,
+                event.id DESC
+       LIMIT 1
+     ) latest_provider_tracking ON true
+     LEFT JOIN LATERAL (
+       SELECT GREATEST(
+                reconciliation.provider_order_updated_at,
+                reconciliation.provider_fulfillment_updated_at,
+                reconciliation.reconciled_at
+              ) AS activity_at,
+              (
+                SELECT NULLIF(btrim(tracking.value->>'number'), '')
+                FROM jsonb_array_elements(
+                  CASE
+                    WHEN jsonb_typeof(
+                      reconciliation.evidence_snapshot
+                        #> '{fulfillment,tracking}'
+                    ) = 'array'
+                      THEN reconciliation.evidence_snapshot
+                             #> '{fulfillment,tracking}'
+                    ELSE '[]'::jsonb
+                  END
+                ) WITH ORDINALITY AS tracking(value, position)
+                WHERE NULLIF(btrim(tracking.value->>'number'), '') IS NOT NULL
+                ORDER BY tracking.position
+                LIMIT 1
+              ) AS tracking_number
+       FROM operations_shopify_external_fulfillment_reconciliations
+              reconciliation
+       WHERE reconciliation.organization_id = orders.organization_id
+         AND reconciliation.order_id = orders.id
+       ORDER BY reconciliation.reconciled_at DESC,
+                reconciliation.id DESC
+       LIMIT 1
+     ) latest_external_reconciliation ON true
+     LEFT JOIN LATERAL (
+       SELECT evidence.tracking_number
+       FROM (VALUES
+         (
+           latest_shipment.tracking_number,
+           latest_shipment.activity_at,
+           1
+         ),
+         (
+           latest_provider_tracking.tracking_number,
+           latest_provider_tracking.activity_at,
+           2
+         ),
+         (
+           latest_external_reconciliation.tracking_number,
+           latest_external_reconciliation.activity_at,
+           3
+         )
+       ) AS evidence(tracking_number, activity_at, source_priority)
+       WHERE evidence.activity_at IS NOT NULL
+       ORDER BY evidence.activity_at DESC NULLS LAST,
+                (evidence.tracking_number IS NOT NULL) DESC,
+                evidence.source_priority ASC
+       LIMIT 1
+     ) latest_tracking ON true
      WHERE orders.organization_id = $1::uuid AND orders.global_id = $2
        AND orders.archived_at IS NULL
      LIMIT 1`,
@@ -4138,6 +4277,7 @@ async function readOrderDetail(
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
     lineCount: Number(row.line_count),
     exceptionCount: Number(row.exception_count),
+    orderValueMinor: row.order_value_minor,
     expectedCostMinor: row.expected_cost_minor,
     expectedRevenueMinor: row.expected_revenue_minor,
     expectedMarginMinor: row.expected_margin_minor,
@@ -4330,7 +4470,10 @@ async function readOrderDetail(
 
 type OperationsOrderPageStatus = OperationsOrderStatus | 'fulfilled_externally'
 
-const OPERATIONS_ORDER_PAGE_CURSOR = /^[A-Za-z0-9_-]{1,1000}$/u
+const OPERATIONS_ORDER_PAGE_CURSOR = new RegExp(
+  `^[A-Za-z0-9_-]{1,${OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH}}$`,
+  'u',
+)
 const OPERATIONS_ORDER_PAGE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
 const MAX_OPERATIONS_ORDER_PAGE_SIZE = 250
 
@@ -4338,6 +4481,11 @@ function operationsOrderPageScopeHash(input: Readonly<{
   organizationId: string
   search: string
   status: OperationsOrderPageStatus | null
+  sort: OperationsOrderSort
+  direction: OperationsOrderSortDirection
+  provider: string | null
+  tracking: OperationsOrderTrackingFilter | null
+  updatedAfter: string | null
 }>) {
   return createHash('sha256').update(JSON.stringify(input)).digest('hex')
 }
@@ -4346,6 +4494,7 @@ function validOperationsOrderCursorTimestamp(value: unknown): value is string {
   if (typeof value !== 'string' || value.length < 20 || value.length > 30) {
     return false
   }
+  if (value.startsWith('0000-')) return false
   const parsed = new Date(value)
   return Number.isFinite(parsed.valueOf()) && parsed.toISOString() === value
 }
@@ -4353,6 +4502,7 @@ function validOperationsOrderCursorTimestamp(value: unknown): value is string {
 function decodeOperationsOrderPageCursor(
   cursor: string | null | undefined,
   expectedScopeHash: string,
+  sort: OperationsOrderSort,
 ): OperationsOrderPageCursor | null {
   if (!cursor) return null
   if (!OPERATIONS_ORDER_PAGE_CURSOR.test(cursor)) {
@@ -4382,9 +4532,13 @@ function decodeOperationsOrderPageCursor(
   const parsed = value as Partial<OperationsOrderPageCursor>
   const keys = Object.keys(parsed).sort().join(',')
   if (
-    keys !== ['orderId', 'scopeHash', 'total', 'updatedAt', 'v'].sort().join(',')
-    || parsed.v !== 1
-    || !validOperationsOrderCursorTimestamp(parsed.updatedAt)
+    keys !== ['orderId', 'scopeHash', 'sortValue', 'total', 'v'].sort().join(',')
+    || parsed.v !== 2
+    || !isOperationsOrderCursorSortValue(parsed.sortValue, sort)
+    || (
+      sort === 'updated'
+      && !validOperationsOrderCursorTimestamp(parsed.sortValue)
+    )
     || typeof parsed.orderId !== 'string'
     || !OPERATIONS_ORDER_PAGE_UUID.test(parsed.orderId)
     || !Number.isSafeInteger(parsed.total)
@@ -4404,14 +4558,148 @@ function encodeOperationsOrderPageCursor(
   row: OperationsOrderListReadRow,
   total: number,
   scopeHash: string,
+  sort: OperationsOrderSort,
 ) {
-  return Buffer.from(JSON.stringify({
-    v: 1,
-    updatedAt: row.updated_at.toISOString(),
+  const sortValue = sort === 'updated'
+    ? (row.cursor_sort_value as Date).toISOString()
+    : String(row.cursor_sort_value)
+  const encoded = Buffer.from(JSON.stringify({
+    v: 2,
+    sortValue,
     orderId: row.id,
     total,
     scopeHash,
   } satisfies OperationsOrderPageCursor), 'utf8').toString('base64url')
+  if (encoded.length > OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_EVIDENCE_INVALID',
+      'Order pagination produced an oversized cursor',
+      500,
+    )
+  }
+  return encoded
+}
+
+function operationsOrderSortValue(
+  value: OperationsOrderSort | null | undefined,
+): OperationsOrderSort {
+  const sort = value || 'updated'
+  if (!isOperationsOrderSort(sort)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_SORT_INVALID',
+      'Order sort is invalid',
+      400,
+    )
+  }
+  return sort
+}
+
+function operationsOrderSortDirection(
+  value: OperationsOrderSortDirection | null | undefined,
+): OperationsOrderSortDirection {
+  const direction = value || 'desc'
+  if (!isOperationsOrderSortDirection(direction)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+      'Order sort direction is invalid',
+      400,
+    )
+  }
+  return direction
+}
+
+function operationsOrderProviderFilter(value: string | null | undefined) {
+  const provider = String(value || '').trim()
+  if (provider && !isOperationsOrderProviderFilter(provider)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PROVIDER_INVALID',
+      'Order provider is invalid',
+      400,
+    )
+  }
+  return provider || null
+}
+
+function operationsOrderTrackingFilter(
+  value: OperationsOrderTrackingFilter | null | undefined,
+) {
+  const tracking = value || null
+  if (tracking && !isOperationsOrderTrackingFilter(tracking)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+      'Order tracking filter is invalid',
+      400,
+    )
+  }
+  return tracking
+}
+
+function operationsOrderUpdatedAfter(value: string | null | undefined) {
+  const updatedAfter = String(value || '').trim()
+  if (updatedAfter && !isOperationsOrderUpdatedAfter(updatedAfter)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+      'Order updated-after value is invalid',
+      400,
+    )
+  }
+  return updatedAfter || null
+}
+
+function operationsOrderSortSql(sort: OperationsOrderSort) {
+  if (sort === 'updated') {
+    return {
+      expression: 'order_activity.activity_at',
+      cursorCast: 'timestamptz',
+    }
+  }
+  if (sort === 'order_number') {
+    return {
+      expression: `lower(left(
+        orders.order_number,
+        ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}
+      ))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'customer') {
+    return {
+      expression: `lower(left(
+        customer.name,
+        ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}
+      ))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'status') {
+    return {
+      expression: `lower(left(
+        CASE
+          WHEN ${externallyFulfilledOrderSql('orders')}
+            THEN 'fulfilled_externally'
+          ELSE orders.status::text
+        END,
+        ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}
+      ))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'provider') {
+    return {
+      expression: `lower(left(
+        orders.source_provider,
+        ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}
+      ))`,
+      cursorCast: 'text',
+    }
+  }
+  return {
+    expression: `lower(left(
+      COALESCE(latest_tracking.tracking_number, ''),
+      ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}
+    ))`,
+    cursorCast: 'text',
+  }
 }
 
 function operationsOrderPageSize(value: number | null | undefined) {
@@ -4438,12 +4726,14 @@ function operationsOrderListItem(row: OperationsOrderListReadRow): OperationsOrd
     customerName: row.customer_name,
     customerGlobalId: row.customer_global_id,
     sourceProvider: row.source_provider,
+    currency: row.currency,
     status: row.status,
     externallyFulfilled: row.externally_fulfilled,
     warehouseName: row.warehouse_name,
     promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
     lineCount: Number(row.line_count),
     exceptionCount: Number(row.exception_count),
+    orderValueMinor: row.order_value_minor,
     expectedCostMinor: row.expected_cost_minor,
     expectedRevenueMinor: row.expected_revenue_minor,
     expectedMarginMinor: row.expected_margin_minor,
@@ -4456,6 +4746,11 @@ export async function readOperationsOrderPageFromPostgres(input: {
   organizationId: string
   search?: string | null
   status?: OperationsOrderPageStatus | null
+  sort?: OperationsOrderSort | null
+  direction?: OperationsOrderSortDirection | null
+  provider?: string | null
+  tracking?: OperationsOrderTrackingFilter | null
+  updatedAfter?: string | null
   cursor?: string | null
   pageSize?: number | null
 }): Promise<{
@@ -4465,6 +4760,11 @@ export async function readOperationsOrderPageFromPostgres(input: {
   const organizationId = requireOrganizationId(input.organizationId)
   const search = String(input.search || '').trim()
   const status = input.status || null
+  const sort = operationsOrderSortValue(input.sort)
+  const direction = operationsOrderSortDirection(input.direction)
+  const provider = operationsOrderProviderFilter(input.provider)
+  const tracking = operationsOrderTrackingFilter(input.tracking)
+  const updatedAfter = operationsOrderUpdatedAfter(input.updatedAfter)
   const searchPattern = search
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
@@ -4473,23 +4773,241 @@ export async function readOperationsOrderPageFromPostgres(input: {
     organizationId,
     search,
     status,
+    sort,
+    direction,
+    provider,
+    tracking,
+    updatedAfter,
   })
-  const cursor = decodeOperationsOrderPageCursor(input.cursor, scopeHash)
+  const cursor = decodeOperationsOrderPageCursor(input.cursor, scopeHash, sort)
+  const sortSql = operationsOrderSortSql(sort)
+  const comparison = direction === 'asc' ? '>' : '<'
+  const orderDirection = direction === 'asc' ? 'ASC' : 'DESC'
   const result = await query<OperationsOrderListReadRow>(
     `WITH matching_order_ids AS (
-       SELECT orders.id, orders.updated_at,
+       SELECT orders.id, order_activity.activity_at AS updated_at,
+              latest_tracking.tracking_number AS latest_tracking_number,
+              ${sortSql.expression} AS cursor_sort_value,
               count(*) OVER ()::text AS matching_total_count
        FROM operations_orders orders
        JOIN crm_organizations customer
          ON customer.id = orders.customer_id
         AND customer.pipeline_id = orders.pipeline_id
+       LEFT JOIN LATERAL (
+         SELECT candidate.tracking_number,
+                COALESCE(candidate.shipped_at, candidate.created_at)
+                  AS activity_at
+         FROM operations_shipments candidate
+         WHERE candidate.organization_id = orders.organization_id
+           AND candidate.order_id = orders.id
+         ORDER BY candidate.shipped_at DESC NULLS LAST,
+                  candidate.created_at DESC,
+                  candidate.id DESC
+         LIMIT 1
+       ) latest_shipment ON true
+       LEFT JOIN LATERAL (
+         SELECT CASE
+                  WHEN event.sensitive_evidence_redacted_at IS NULL
+                       AND event.sensitive_evidence_expires_at > now()
+                    THEN NULLIF(btrim(event.tracking_number), '')
+                  ELSE NULL
+                END AS tracking_number,
+                GREATEST(
+                  event.occurred_at,
+                  event.observed_at,
+                  event.created_at
+                ) AS activity_at
+         FROM operations_commerce_order_event_observations event
+         WHERE event.organization_id = orders.organization_id
+           AND (
+             event.order_id = orders.id
+             OR (
+               event.order_id IS NULL
+               AND event.integration_account_id = orders.integration_account_id
+               AND event.provider = orders.source_provider
+               AND event.external_order_id = orders.external_order_id
+             )
+           )
+           AND (
+             event.event_kind = 'tracking_updated'
+             OR NULLIF(btrim(event.tracking_number), '') IS NOT NULL
+           )
+         ORDER BY GREATEST(
+                    event.occurred_at,
+                    event.observed_at,
+                    event.created_at
+                  ) DESC,
+                  (event.event_kind = 'tracking_updated') DESC,
+                  (
+                    event.sensitive_evidence_redacted_at IS NULL
+                    AND event.sensitive_evidence_expires_at > now()
+                    AND NULLIF(btrim(event.tracking_number), '') IS NOT NULL
+                  ) DESC,
+                  event.id DESC
+         LIMIT 1
+       ) latest_provider_tracking ON true
+       LEFT JOIN LATERAL (
+         SELECT GREATEST(
+                  reconciliation.provider_order_updated_at,
+                  reconciliation.provider_fulfillment_updated_at,
+                  reconciliation.reconciled_at
+                ) AS activity_at,
+                (
+                  SELECT NULLIF(btrim(tracking.value->>'number'), '')
+                  FROM jsonb_array_elements(
+                    CASE
+                      WHEN jsonb_typeof(
+                        reconciliation.evidence_snapshot
+                          #> '{fulfillment,tracking}'
+                      ) = 'array'
+                        THEN reconciliation.evidence_snapshot
+                               #> '{fulfillment,tracking}'
+                      ELSE '[]'::jsonb
+                    END
+                  ) WITH ORDINALITY AS tracking(value, position)
+                  WHERE NULLIF(btrim(tracking.value->>'number'), '')
+                        IS NOT NULL
+                  ORDER BY tracking.position
+                  LIMIT 1
+                ) AS tracking_number
+         FROM operations_shopify_external_fulfillment_reconciliations
+                reconciliation
+         WHERE reconciliation.organization_id = orders.organization_id
+           AND reconciliation.order_id = orders.id
+         ORDER BY reconciliation.reconciled_at DESC,
+                  reconciliation.id DESC
+         LIMIT 1
+       ) latest_external_reconciliation ON true
+       LEFT JOIN LATERAL (
+         SELECT date_trunc(
+                  'milliseconds',
+                  max(GREATEST(
+                    event.occurred_at,
+                    event.observed_at,
+                    event.created_at
+                  ))
+                ) AS activity_at
+         FROM operations_commerce_order_event_observations event
+         WHERE event.organization_id = orders.organization_id
+           AND (
+             event.order_id = orders.id
+             OR (
+               event.order_id IS NULL
+               AND event.integration_account_id = orders.integration_account_id
+               AND event.provider = orders.source_provider
+               AND event.external_order_id = orders.external_order_id
+             )
+           )
+       ) provider_event_activity ON true
+       LEFT JOIN LATERAL (
+         SELECT date_trunc(
+                  'milliseconds',
+                  max(GREATEST(
+                    observation.observed_at,
+                    COALESCE(
+                      observation.provider_updated_at,
+                      observation.observed_at
+                    ),
+                    observation.created_at
+                  ))
+                ) AS activity_at
+         FROM operations_commerce_order_observations observation
+         WHERE observation.organization_id = orders.organization_id
+           AND (
+             observation.order_id = orders.id
+             OR (
+               observation.order_id IS NULL
+               AND observation.integration_account_id =
+                     orders.integration_account_id
+               AND observation.provider = orders.source_provider
+               AND observation.external_order_id = orders.external_order_id
+             )
+           )
+       ) provider_order_activity ON true
+       LEFT JOIN LATERAL (
+         SELECT date_trunc(
+                  'milliseconds',
+                  max(GREATEST(observation.observed_at, observation.created_at))
+                ) AS activity_at
+         FROM operations_commerce_order_revision_observations observation
+         WHERE observation.organization_id = orders.organization_id
+           AND observation.order_id = orders.id
+       ) revision_observation_activity ON true
+       LEFT JOIN LATERAL (
+         SELECT date_trunc(
+                  'milliseconds',
+                  max(GREATEST(provider_read.observed_at, provider_read.created_at))
+                ) AS activity_at
+         FROM operations_commerce_order_revision_reads provider_read
+         WHERE provider_read.organization_id = orders.organization_id
+           AND provider_read.order_id = orders.id
+       ) revision_read_activity ON true
+       LEFT JOIN LATERAL (
+         SELECT evidence.tracking_number
+         FROM (VALUES
+           (
+             latest_shipment.tracking_number,
+             latest_shipment.activity_at,
+             1
+           ),
+           (
+             latest_provider_tracking.tracking_number,
+             latest_provider_tracking.activity_at,
+             2
+           ),
+           (
+             latest_external_reconciliation.tracking_number,
+             latest_external_reconciliation.activity_at,
+             3
+           )
+         ) AS evidence(tracking_number, activity_at, source_priority)
+         WHERE evidence.activity_at IS NOT NULL
+         ORDER BY evidence.activity_at DESC NULLS LAST,
+                  (evidence.tracking_number IS NOT NULL) DESC,
+                  evidence.source_priority ASC
+         LIMIT 1
+       ) latest_tracking ON true
+       CROSS JOIN LATERAL (
+         SELECT date_trunc(
+                  'milliseconds',
+                  GREATEST(
+                    orders.updated_at,
+                    COALESCE(latest_shipment.activity_at, orders.updated_at),
+                    COALESCE(provider_event_activity.activity_at, orders.updated_at),
+                    COALESCE(provider_order_activity.activity_at, orders.updated_at),
+                    COALESCE(revision_observation_activity.activity_at, orders.updated_at),
+                    COALESCE(revision_read_activity.activity_at, orders.updated_at),
+                    COALESCE(
+                      latest_external_reconciliation.activity_at,
+                      orders.updated_at
+                    )
+                  )
+                ) AS activity_at
+       ) order_activity
        WHERE orders.organization_id = $1::uuid
          AND orders.archived_at IS NULL
          AND (
            $2::text IS NULL
            OR orders.order_number ILIKE $2 ESCAPE '!'
            OR orders.global_id ILIKE $2 ESCAPE '!'
+           OR orders.external_order_id ILIKE $2 ESCAPE '!'
            OR customer.name ILIKE $2 ESCAPE '!'
+           OR customer.reference_code ILIKE $2 ESCAPE '!'
+           OR latest_tracking.tracking_number ILIKE $2 ESCAPE '!'
+           OR EXISTS (
+             SELECT 1
+             FROM operations_current_order_lines line
+             LEFT JOIN crm_products product
+               ON product.pipeline_id = line.pipeline_id
+              AND product.id = line.product_id
+             WHERE line.organization_id = orders.organization_id
+               AND line.order_id = orders.id
+               AND (
+                 line.channel_sku ILIKE $2 ESCAPE '!'
+                 OR COALESCE(product.sku, '') ILIKE $2 ESCAPE '!'
+                 OR product.reference_code ILIKE $2 ESCAPE '!'
+               )
+           )
          )
          AND (
            $3::text IS NULL
@@ -4503,23 +5021,42 @@ export async function readOperationsOrderPageFromPostgres(input: {
              AND NOT (${externallyFulfilledOrderSql('orders')})
            )
          )
+         AND ($4::text IS NULL OR orders.source_provider = $4::text)
+         AND (
+           $5::text IS NULL
+           OR (
+             $5::text = 'present'
+             AND latest_tracking.tracking_number IS NOT NULL
+           )
+           OR (
+             $5::text = 'missing'
+             AND latest_tracking.tracking_number IS NULL
+           )
+         )
+         AND (
+           $6::timestamptz IS NULL
+           OR order_activity.activity_at > $6::timestamptz
+         )
      ), page_order_ids AS (
        SELECT matching.id, matching.updated_at,
+              matching.latest_tracking_number,
+              matching.cursor_sort_value,
               matching.matching_total_count
        FROM matching_order_ids matching
-       WHERE NOT $4::boolean
-          OR matching.updated_at < $5::timestamptz
+       WHERE NOT $7::boolean
+          OR matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}
           OR (
-            matching.updated_at = $5::timestamptz
-            AND matching.id < $6::uuid
+            matching.cursor_sort_value = $8::${sortSql.cursorCast}
+            AND matching.id ${comparison} $9::uuid
           )
-       ORDER BY matching.updated_at DESC, matching.id DESC
-       LIMIT $7::integer
+       ORDER BY matching.cursor_sort_value ${orderDirection},
+                matching.id ${orderDirection}
+       LIMIT $10::integer
      )
      SELECT orders.id::text, orders.global_id, orders.order_number,
             customer.name AS customer_name,
             customer.reference_code AS customer_global_id,
-            orders.source_provider, orders.status,
+            orders.source_provider, orders.currency, orders.status,
             ${externallyFulfilledOrderSql('orders')}
               AS externally_fulfilled,
             warehouse.name AS warehouse_name,
@@ -4530,11 +5067,13 @@ export async function readOperationsOrderPageFromPostgres(input: {
              WHERE exception.order_id = orders.id
                AND exception.status IN ('open', 'acknowledged'))::text
               AS exception_count,
-            plan.estimated_cost_minor::text,
-            plan.estimated_revenue_minor::text,
-            plan.estimated_margin_minor::text,
-            shipment.tracking_number,
-            orders.updated_at,
+            ${canonicalOrderValueMinorSql('orders')} AS order_value_minor,
+            plan.estimated_cost_minor::text AS expected_cost_minor,
+            plan.estimated_revenue_minor::text AS expected_revenue_minor,
+            plan.estimated_margin_minor::text AS expected_margin_minor,
+            selected.latest_tracking_number AS tracking_number,
+            selected.updated_at,
+            selected.cursor_sort_value,
             selected.matching_total_count
      FROM page_order_ids selected
      JOIN operations_orders orders ON orders.id = selected.id
@@ -4547,19 +5086,18 @@ export async function readOperationsOrderPageFromPostgres(input: {
        ORDER BY candidate.version_number DESC LIMIT 1
      ) plan ON true
      LEFT JOIN operations_warehouses warehouse ON warehouse.id = plan.warehouse_id
-     LEFT JOIN LATERAL (
-       SELECT candidate.tracking_number FROM operations_shipments candidate
-       WHERE candidate.order_id = orders.id
-       ORDER BY candidate.shipped_at DESC LIMIT 1
-     ) shipment ON true
-     ORDER BY selected.updated_at DESC, selected.id DESC`,
+     ORDER BY selected.cursor_sort_value ${orderDirection},
+              selected.id ${orderDirection}`,
     [
       organizationId,
       searchPattern,
       status,
+      provider,
+      tracking,
+      updatedAfter,
       Boolean(cursor),
-      cursor?.updatedAt || null,
-      cursor?.orderId || null,
+      cursor?.sortValue ?? null,
+      cursor?.orderId ?? null,
       pageSize + 1,
     ],
   )
@@ -4577,7 +5115,7 @@ export async function readOperationsOrderPageFromPostgres(input: {
   }
   const lastRow = pageRows.at(-1) || null
   const nextCursor = hasNextPage && lastRow
-    ? encodeOperationsOrderPageCursor(lastRow, total, scopeHash)
+    ? encodeOperationsOrderPageCursor(lastRow, total, scopeHash, sort)
     : null
   return {
     orders: pageRows.map(operationsOrderListItem),
@@ -4600,6 +5138,11 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   canPurchaseLivePostage?: boolean
   search?: string
   status?: OperationsOrderPageStatus | null
+  sort?: OperationsOrderSort | null
+  direction?: OperationsOrderSortDirection | null
+  provider?: string | null
+  tracking?: OperationsOrderTrackingFilter | null
+  updatedAfter?: string | null
   exceptionStatus?: OperationsExceptionStatus | null
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
@@ -4610,11 +5153,21 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     readCommerceOrderWorkbenchPageFromPostgres({
       organizationId,
       search: input.search,
+      sort: input.sort,
+      direction: input.direction,
+      provider: input.provider,
+      tracking: input.tracking,
+      updatedAfter: input.updatedAfter,
     }),
     readOperationsOrderPageFromPostgres({
       organizationId,
       search: input.search,
       status: input.status,
+      sort: input.sort,
+      direction: input.direction,
+      provider: input.provider,
+      tracking: input.tracking,
+      updatedAfter: input.updatedAfter,
     }),
   ])
   const exceptionValues: unknown[] = [organizationId]

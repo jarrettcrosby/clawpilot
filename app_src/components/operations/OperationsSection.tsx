@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { FormEvent, forwardRef, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -33,6 +33,7 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TableSortLabel,
   Tabs,
   TextField,
   Tooltip,
@@ -148,6 +149,7 @@ import {
   SHOPIFY_TEST_STORE_CANONICAL_E2E_CONFIRMATION,
   SHOPIFY_TEST_STORE_FULFILLMENT_CONFIRMATION,
 } from '@/lib/operations/shopifyTestStoreCanonicalE2e'
+import { formatCommerceMoneyMajor } from '@/lib/integrations/commerceIntakeCsv'
 import { formatUserDateTime } from '@/lib/userDateTime'
 import {
   packagingMaterialReadiness,
@@ -156,6 +158,22 @@ import {
   type PackagingMaterialsWorkspace,
 } from '@/lib/operations/packagingMaterials'
 import type { OrderShipToDraft } from '@/lib/operations/orderShipTo'
+import {
+  OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH,
+} from '@/lib/operations/orderListQuery'
+import {
+  filterAndSortOperationsOrderRows,
+  OPERATIONS_ORDER_SAVED_VIEWS,
+  operationsOrderRowNeedsAttention,
+  operationsOrderRowMatchesSavedView,
+  operationsOrderRowUpdatedAt,
+  operationsOrderSavedViewCounts,
+  operationsOrderWorkbenchRows,
+  type OperationsOrderDateFilter,
+  type OperationsOrderSavedView,
+  type OperationsOrderSort,
+  type OperationsOrderTrackingFilter,
+} from '@/lib/operations/orderWorkbenchView'
 
 type SandboxCommerceE2eAuthorizationResult = {
   authorizationGlobalId: string
@@ -399,7 +417,7 @@ function validImportedOrderPage(
     || (
       typeof page.nextCursor === 'string'
       && page.nextCursor.length > 0
-      && page.nextCursor.length <= 1000
+      && page.nextCursor.length <= OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH
       && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
     )
   return Number.isSafeInteger(page.total)
@@ -790,7 +808,7 @@ function validCanonicalOrderPage(
     || (
       typeof page.nextCursor === 'string'
       && page.nextCursor.length > 0
-      && page.nextCursor.length <= 1000
+      && page.nextCursor.length <= OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH
       && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
     )
   return Number.isSafeInteger(page.total)
@@ -956,11 +974,16 @@ export type OperationsView =
   | 'gl-coding'
   | 'printing'
 
-type OperationsOrderFilter = '' | OperationsOrderStatus | 'fulfilled_externally'
+type OperationsOrderFilter =
+  | ''
+  | OperationsOrderStatus
+  | 'fulfilled_externally'
+  | 'closed_externally'
 
 const ORDER_STATUSES: Array<{ value: OperationsOrderFilter; label: string }> = [
   { value: '', label: 'All statuses' },
   { value: 'fulfilled_externally', label: 'Fulfilled externally' },
+  { value: 'closed_externally', label: 'Closed externally' },
   { value: 'imported', label: 'Imported' },
   { value: 'validated', label: 'Validated' },
   { value: 'held', label: 'Held' },
@@ -973,6 +996,37 @@ const ORDER_STATUSES: Array<{ value: OperationsOrderFilter; label: string }> = [
   { value: 'shipped', label: 'Shipped' },
   { value: 'cancelled', label: 'Cancelled' },
   { value: 'exception', label: 'Exception' },
+]
+
+const ORDER_SORTS: Array<{ value: OperationsOrderSort; label: string }> = [
+  { value: 'priority', label: 'Operational priority' },
+  { value: 'updated_desc', label: 'Last activity: newest' },
+  { value: 'updated_asc', label: 'Last activity: oldest' },
+  { value: 'order_desc', label: 'Order number: highest' },
+  { value: 'order_asc', label: 'Order number: lowest' },
+  { value: 'customer_asc', label: 'Customer: A–Z' },
+  { value: 'promise_asc', label: 'Promise date: earliest' },
+  { value: 'value_desc', label: 'Currency, then order total' },
+  { value: 'lines_desc', label: 'Item lines: most' },
+]
+
+const ORDER_DATE_FILTERS: Array<{
+  value: OperationsOrderDateFilter
+  label: string
+}> = [
+  { value: 'all', label: 'Any activity date' },
+  { value: '7d', label: 'Active in last 7 days' },
+  { value: '30d', label: 'Active in last 30 days' },
+  { value: '90d', label: 'Active in last 90 days' },
+]
+
+const ORDER_TRACKING_FILTERS: Array<{
+  value: OperationsOrderTrackingFilter
+  label: string
+}> = [
+  { value: 'all', label: 'Any tracking state' },
+  { value: 'present', label: 'Has tracking' },
+  { value: 'missing', label: 'Missing tracking' },
 ]
 
 const EXCEPTION_STATUSES: Array<{ value: '' | OperationsExceptionStatus; label: string }> = [
@@ -1228,6 +1282,9 @@ function importedOrderDisplayStatus(order: OperationsImportedOrderWorkingCopy) {
   if (['on_hold', 'scheduled'].includes(order.providerState.fulfillment)) {
     return 'On hold'
   }
+  if (!order.actionAvailable) {
+    return 'Refresh needed'
+  }
   return order.needsInfo ? 'Needs info' : 'Imported'
 }
 
@@ -1241,16 +1298,10 @@ function importedOrderStatusColor(order: OperationsImportedOrderWorkingCopy) {
     order.providerState.fulfillment === 'partial'
     || ['on_hold', 'scheduled'].includes(order.providerState.fulfillment)
   ) return 'warning' as const
+  if (!order.actionAvailable) {
+    return 'warning' as const
+  }
   return order.needsInfo ? 'warning' as const : 'info' as const
-}
-
-function importedOrderFilterStatus(order: OperationsImportedOrderWorkingCopy) {
-  if (
-    order.providerState.lifecycle === 'cancelled'
-    || order.providerState.fulfillment === 'cancelled'
-  ) return 'cancelled' as const
-  if (importedOrderIsTerminal(order)) return 'fulfilled_externally' as const
-  return 'imported' as const
 }
 
 function commerceActiveUnavailableLabel(
@@ -1355,13 +1406,52 @@ function money(minor: string | null | undefined, currency = 'USD') {
   if (minor === null || minor === undefined || minor === '') {
     return 'Not available'
   }
-  const value = Number(minor) / 100
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(Number.isFinite(value) ? value : 0)
+  const parsedMinor = Number(minor)
+  if (!Number.isSafeInteger(parsedMinor)) return 'Not available'
+  try {
+    const major = Number(formatCommerceMoneyMajor(parsedMinor, currency))
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+    }).format(major)
+  } catch {
+    return 'Not available'
+  }
+}
+
+function importedOrderMoney(order: OperationsImportedOrderWorkingCopy) {
+  return money(order.orderValueMinor, order.currency)
+}
+
+function orderListQuerySort(sort: OperationsOrderSort) {
+  if (sort === 'updated_asc') return { sort: 'updated', direction: 'asc' }
+  if (sort === 'order_asc') return { sort: 'order_number', direction: 'asc' }
+  if (sort === 'order_desc') return { sort: 'order_number', direction: 'desc' }
+  if (sort === 'customer_asc') return { sort: 'customer', direction: 'asc' }
+  return { sort: 'updated', direction: 'desc' }
+}
+
+function orderListUpdatedAfter(date: OperationsOrderDateFilter) {
+  if (date === 'all') return ''
+  const days = Number(date.slice(0, -1))
+  return new Date(Date.now() - (days * 24 * 60 * 60 * 1000)).toISOString()
+}
+
+function appendOrderListQuery(
+  params: URLSearchParams,
+  input: {
+    sort: OperationsOrderSort
+    provider: string
+    tracking: OperationsOrderTrackingFilter
+    updatedAfter: string
+  },
+) {
+  const querySort = orderListQuerySort(input.sort)
+  params.set('sort', querySort.sort)
+  params.set('direction', querySort.direction)
+  if (input.provider) params.set('provider', input.provider)
+  if (input.tracking !== 'all') params.set('tracking', input.tracking)
+  if (input.updatedAfter) params.set('updatedAfter', input.updatedAfter)
 }
 
 function operationalPlanningMaterialBlockers(
@@ -3805,6 +3895,14 @@ export default function OperationsSection({
   const [view, setView] = useState<OperationsView>(initialView)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<OperationsOrderFilter>('')
+  const [orderSavedView, setOrderSavedView] =
+    useState<OperationsOrderSavedView>('all')
+  const [orderSort, setOrderSort] = useState<OperationsOrderSort>('updated_desc')
+  const [orderProvider, setOrderProvider] = useState('')
+  const [orderTracking, setOrderTracking] =
+    useState<OperationsOrderTrackingFilter>('all')
+  const [orderDate, setOrderDate] = useState<OperationsOrderDateFilter>('all')
+  const [orderWarehouse, setOrderWarehouse] = useState('')
   const [exceptionStatus, setExceptionStatus] = useState<'' | OperationsExceptionStatus>('')
   const [selectedGlobalId, setSelectedGlobalId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -4064,10 +4162,19 @@ export default function OperationsSection({
     workspaceLoadGeneration.current = loadGeneration
     setLoading(true)
     if (!options?.preserveFeedback) setError('')
-    let workspaceWarning = ''
+    const workspaceWarnings: string[] = []
+    const orderQuery = {
+      sort: orderSort,
+      provider: orderProvider,
+      tracking: orderTracking,
+      updatedAfter: orderListUpdatedAfter(orderDate),
+    }
     const params = new URLSearchParams()
     if (search.trim()) params.set('search', search.trim())
-    if (view === 'orders' && status) params.set('status', status)
+    if (view === 'orders' && status && status !== 'closed_externally') {
+      params.set('status', status)
+    }
+    if (view === 'orders') appendOrderListQuery(params, orderQuery)
     if (view === 'exceptions' && exceptionStatus) params.set('exceptionStatus', exceptionStatus)
     if (orderGlobalId) params.set('order', orderGlobalId)
     try {
@@ -4106,6 +4213,7 @@ export default function OperationsSection({
           limit: String(IMPORTED_ORDER_PAGE_SIZE),
         })
         if (search.trim()) workbenchParams.set('search', search.trim())
+        appendOrderListQuery(workbenchParams, orderQuery)
         const pageResponse = await fetch(
           `/api/operations/order-workbench?${workbenchParams.toString()}`,
           { cache: 'no-store', signal },
@@ -4147,10 +4255,10 @@ export default function OperationsSection({
         },
       }
       if (importedOrderPage.nextCursor) {
-        workspaceWarning = `Loaded ${importedOrders.length} of ${Math.max(
+        workspaceWarnings.push(`Loaded ${importedOrders.length} of ${Math.max(
           importedOrderPage.total,
           importedOrders.length,
-        )} current provider orders. Refine the order search to load the remaining results safely.`
+        )} current provider orders. Refine the order search to load the remaining results safely.`)
       }
       const canonicalOrders = [...operations.orders]
       let orderPage = operations.orderPage
@@ -4177,7 +4285,10 @@ export default function OperationsSection({
           limit: String(CANONICAL_ORDER_PAGE_SIZE),
         })
         if (search.trim()) orderParams.set('search', search.trim())
-        if (status) orderParams.set('status', status)
+        if (status && status !== 'closed_externally') {
+          orderParams.set('status', status)
+        }
+        appendOrderListQuery(orderParams, orderQuery)
         const orderResponse = await fetch(
           `/api/operations/orders?${orderParams.toString()}`,
           { cache: 'no-store', signal },
@@ -4217,15 +4328,15 @@ export default function OperationsSection({
         },
       }
       if (orderPage.nextCursor) {
-        workspaceWarning = `Loaded ${canonicalOrders.length} of ${Math.max(
+        workspaceWarnings.push(`Loaded ${canonicalOrders.length} of ${Math.max(
           orderPage.total,
           canonicalOrders.length,
-        )} canonical orders. Refine the order search to load the remaining results safely.`
+        )} canonical orders. Refine the order search to load the remaining results safely.`)
       }
       if (signal?.aborted || loadGeneration !== workspaceLoadGeneration.current) {
         return null
       }
-      if (workspaceWarning) setError(workspaceWarning)
+      if (workspaceWarnings.length) setError(workspaceWarnings.join(' '))
       setWorkspace(operations)
       setCommerceFulfillmentRecoveryEnabled(
         payload.runtime?.commerceFulfillmentRecoveryEnabled === true,
@@ -4239,7 +4350,16 @@ export default function OperationsSection({
     } finally {
       if (loadGeneration === workspaceLoadGeneration.current) setLoading(false)
     }
-  }, [exceptionStatus, search, status, view])
+  }, [
+    exceptionStatus,
+    orderDate,
+    orderProvider,
+    orderSort,
+    orderTracking,
+    search,
+    status,
+    view,
+  ])
 
   const refreshOrders = useCallback(async () => {
     setSyncingOrderStatus(true)
@@ -5249,6 +5369,12 @@ export default function OperationsSection({
     setView('orders')
     setSearch('')
     setStatus('')
+    setOrderSavedView('all')
+    setOrderSort('updated_desc')
+    setOrderProvider('')
+    setOrderTracking('all')
+    setOrderDate('all')
+    setOrderWarehouse('')
     closeDrawer()
     closeExceptionDrawer()
     setImportedDrawerOpen(false)
@@ -8072,10 +8198,56 @@ export default function OperationsSection({
   const importedDetail = workspace?.importedOrders.find(
     (order) => order.candidateGlobalId === selectedImportedGlobalId,
   ) || null
-  const visibleImportedOrders = (workspace?.importedOrders || []).filter(
-    (order) => !status || importedOrderFilterStatus(order) === status,
+  const orderRows = useMemo(() => operationsOrderWorkbenchRows({
+    imported: workspace?.importedOrders || [],
+    canonical: workspace?.orders || [],
+  }), [workspace])
+  const orderWarehouses = useMemo(() => Array.from(new Set([
+    ...orderRows
+      .filter((row) => row.kind === 'canonical' && row.order.warehouseName)
+      .map((row) => row.kind === 'canonical' ? row.order.warehouseName || '' : '')
+      .filter(Boolean),
+    ...(orderWarehouse ? [orderWarehouse] : []),
+  ])).sort((left, right) => left.localeCompare(right)), [
+    orderRows,
+    orderWarehouse,
+  ])
+  const filteredOrderRows = useMemo(() => filterAndSortOperationsOrderRows({
+    rows: orderRows,
+    view: 'all',
+    sort: orderSort,
+    provider: orderProvider,
+    tracking: orderTracking,
+    date: orderDate,
+    warehouse: orderWarehouse,
+    status,
+  }), [
+    orderDate,
+    orderProvider,
+    orderRows,
+    orderSort,
+    orderTracking,
+    orderWarehouse,
+    status,
+  ])
+  const orderSavedViewCounts = useMemo(
+    () => operationsOrderSavedViewCounts(filteredOrderRows),
+    [filteredOrderRows],
   )
-  const visibleOrderCount = (workspace?.orders.length || 0) + visibleImportedOrders.length
+  const visibleOrderRows = useMemo(() => filteredOrderRows.filter((row) => (
+    operationsOrderRowMatchesSavedView(row, orderSavedView)
+  )), [filteredOrderRows, orderSavedView])
+  const visibleOrderCount = visibleOrderRows.length
+  const orderFiltersActive = Boolean(
+    search
+    || status
+    || orderProvider
+    || orderTracking !== 'all'
+    || orderDate !== 'all'
+    || orderWarehouse
+    || orderSavedView !== 'all'
+    || orderSort !== 'updated_desc',
+  )
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
   )
@@ -8655,14 +8827,17 @@ export default function OperationsSection({
               },
             }}
           >
-            <Tab value="orders" label={`Orders${workspace ? ` (${visibleOrderCount})` : ''}`} />
+            <Tab value="orders" label={`Orders${workspace ? ` (${orderSavedViewCounts.all})` : ''}`} />
             <Tab
               value="picking"
               icon={<AssignmentIndRounded fontSize="small" />}
               iconPosition="start"
               label="Picking"
             />
-            <Tab value="exceptions" label={`Exceptions${workspace ? ` (${workspace.summary.exceptions})` : ''}`} />
+            <Tab
+              value="exceptions"
+              label={`Exceptions${workspace ? ` (${workspace.summary.exceptions} active)` : ''}`}
+            />
             <Tab
               value="imports"
               icon={<ImportExportRounded fontSize="small" />}
@@ -8686,38 +8861,155 @@ export default function OperationsSection({
       </Box>
 
       {mainWorkspaceView && (
-        <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, display: 'flex', flexWrap: 'wrap', gap: 1.25, flexShrink: 0 }}>
-          <TextField
-            size="small"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder={view === 'orders' ? 'Search order, Global ID, or customer' : 'Search exception, order, or customer'}
-            inputProps={{ 'aria-label': view === 'orders' ? 'Search operations orders' : 'Search operations exceptions' }}
-            InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
-            sx={{ ...controlSx, flex: '1 1 280px', maxWidth: 440 }}
-          />
+        <Box sx={{ px: { xs: 2, md: 3 }, py: 1.5, flexShrink: 0 }}>
           {view === 'orders' ? (
-            <TextField
-              select
-              size="small"
-              value={status}
-              onChange={(event) => setStatus(event.target.value as OperationsOrderFilter)}
-              inputProps={{ 'aria-label': 'Filter orders by status' }}
-              sx={{ ...controlSx, flex: '0 1 180px', minWidth: 150 }}
-            >
-              {ORDER_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
-            </TextField>
+            <Stack spacing={1.25}>
+              <Box
+                role="group"
+                aria-label="Order views"
+                sx={{
+                  display: 'flex',
+                  gap: 0.75,
+                  overflowX: 'auto',
+                  pb: 0.25,
+                  WebkitOverflowScrolling: 'touch',
+                }}
+              >
+                {OPERATIONS_ORDER_SAVED_VIEWS.map((savedView) => (
+                  <Button
+                    key={savedView.value}
+                    size="small"
+                    variant={orderSavedView === savedView.value ? 'contained' : 'outlined'}
+                    aria-pressed={orderSavedView === savedView.value}
+                    onClick={() => setOrderSavedView(savedView.value)}
+                    sx={{ flexShrink: 0, whiteSpace: 'nowrap' }}
+                  >
+                    {savedView.label} ({orderSavedViewCounts[savedView.value]})
+                  </Button>
+                ))}
+              </Box>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.25 }}>
+                <TextField
+                  size="small"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Order, customer, SKU, or tracking"
+                  inputProps={{ 'aria-label': 'Search operations orders' }}
+                  InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
+                  sx={{ ...controlSx, flex: '1 1 300px', maxWidth: 460 }}
+                />
+                <TextField
+                  select
+                  size="small"
+                  value={status}
+                  onChange={(event) => setStatus(event.target.value as OperationsOrderFilter)}
+                  inputProps={{ 'aria-label': 'Filter orders by status' }}
+                  SelectProps={{ displayEmpty: true }}
+                  sx={{ ...controlSx, flex: '0 1 180px', minWidth: 160 }}
+                >
+                  {ORDER_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  value={orderProvider}
+                  onChange={(event) => setOrderProvider(event.target.value)}
+                  inputProps={{ 'aria-label': 'Filter orders by sales channel' }}
+                  SelectProps={{ displayEmpty: true }}
+                  sx={{ ...controlSx, flex: '0 1 170px', minWidth: 150 }}
+                >
+                  <MenuItem value="">All sales channels</MenuItem>
+                  <MenuItem value="shopify">Shopify</MenuItem>
+                  <MenuItem value="faire">Faire</MenuItem>
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  value={orderDate}
+                  onChange={(event) => setOrderDate(event.target.value as OperationsOrderDateFilter)}
+                  inputProps={{ 'aria-label': 'Filter orders by last activity' }}
+                  sx={{ ...controlSx, flex: '0 1 205px', minWidth: 180 }}
+                >
+                  {ORDER_DATE_FILTERS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  value={orderTracking}
+                  onChange={(event) => setOrderTracking(event.target.value as OperationsOrderTrackingFilter)}
+                  inputProps={{ 'aria-label': 'Filter orders by tracking state' }}
+                  sx={{ ...controlSx, flex: '0 1 185px', minWidth: 165 }}
+                >
+                  {ORDER_TRACKING_FILTERS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  value={orderWarehouse}
+                  onChange={(event) => setOrderWarehouse(event.target.value)}
+                  inputProps={{ 'aria-label': 'Filter orders by warehouse' }}
+                  SelectProps={{ displayEmpty: true }}
+                  sx={{ ...controlSx, flex: '0 1 190px', minWidth: 165 }}
+                >
+                  <MenuItem value="">All warehouses</MenuItem>
+                  {orderWarehouses.map((warehouse) => (
+                    <MenuItem key={warehouse} value={warehouse}>{warehouse}</MenuItem>
+                  ))}
+                </TextField>
+                <TextField
+                  select
+                  size="small"
+                  value={orderSort}
+                  onChange={(event) => setOrderSort(event.target.value as OperationsOrderSort)}
+                  inputProps={{ 'aria-label': 'Sort operations orders' }}
+                  sx={{ ...controlSx, flex: '0 1 210px', minWidth: 185 }}
+                >
+                  {ORDER_SORTS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
+                </TextField>
+                {orderFiltersActive && (
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setSearch('')
+                      setStatus('')
+                      setOrderSavedView('all')
+                      setOrderSort('updated_desc')
+                      setOrderProvider('')
+                      setOrderTracking('all')
+                      setOrderDate('all')
+                      setOrderWarehouse('')
+                    }}
+                  >
+                    Clear filters
+                  </Button>
+                )}
+              </Box>
+              <Typography variant="caption" color="text.secondary">
+                Showing {visibleOrderCount} of {orderSavedViewCounts.all} loaded orders
+              </Typography>
+            </Stack>
           ) : (
-            <TextField
-              select
-              size="small"
-              value={exceptionStatus}
-              onChange={(event) => setExceptionStatus(event.target.value as '' | OperationsExceptionStatus)}
-              inputProps={{ 'aria-label': 'Filter exceptions by status' }}
-              sx={{ ...controlSx, flex: '0 1 210px', minWidth: 180 }}
-            >
-              {EXCEPTION_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
-            </TextField>
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.25 }}>
+              <TextField
+                size="small"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search exception, order, or customer"
+                inputProps={{ 'aria-label': 'Search operations exceptions' }}
+                InputProps={{ startAdornment: <InputAdornment position="start"><SearchRounded fontSize="small" /></InputAdornment> }}
+                sx={{ ...controlSx, flex: '1 1 280px', maxWidth: 440 }}
+              />
+              <TextField
+                select
+                size="small"
+                value={exceptionStatus}
+                onChange={(event) => setExceptionStatus(event.target.value as '' | OperationsExceptionStatus)}
+                inputProps={{ 'aria-label': 'Filter exceptions by status' }}
+                sx={{ ...controlSx, flex: '0 1 210px', minWidth: 180 }}
+              >
+                {EXCEPTION_STATUSES.map((option) => <MenuItem key={option.value || 'all'} value={option.value}>{option.label}</MenuItem>)}
+              </TextField>
+            </Box>
           )}
         </Box>
       )}
@@ -8850,145 +9142,288 @@ export default function OperationsSection({
           </TableContainer>
         ) : mobile ? (
           <Stack divider={<Divider flexItem />}>
-            {visibleImportedOrders.map((order) => (
-              <Box
-                key={order.candidateGlobalId}
-                component="button"
-                type="button"
-                data-testid={`imported-order-${order.candidateGlobalId}`}
-                onClick={() => chooseImportedOrder(order)}
-                sx={{
-                  appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
-                  px: 2, py: 1.75, width: '100%', cursor: 'pointer',
-                  '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
-                }}
-              >
-                <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
-                  <Box sx={{ minWidth: 0 }}>
-                    <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
-                    <Typography variant="body2" color="text.secondary" noWrap>
-                      {order.customerName || 'Customer not provided'}
-                    </Typography>
+            {visibleOrderRows.map((row) => {
+              if (row.kind === 'imported') {
+                const order = row.order
+                return (
+                  <Box
+                    key={row.key}
+                    component="button"
+                    type="button"
+                    data-testid={`imported-order-${order.candidateGlobalId}`}
+                    onClick={() => chooseImportedOrder(order)}
+                    sx={{
+                      appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
+                      px: 2, py: 1.75, width: '100%', cursor: 'pointer',
+                      '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                    }}
+                  >
+                    <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
+                        <Typography variant="body2" color="text.secondary" noWrap>
+                          {order.customerName || 'Customer not provided'}
+                        </Typography>
+                      </Box>
+                      <Chip size="small" label={importedOrderDisplayStatus(order)} color={importedOrderStatusColor(order)} />
+                    </Stack>
+                    <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
+                      <Box sx={{ minWidth: 0 }}>
+                        <Typography variant="caption" color="#A8C7FA">
+                          {displayStatus(order.provider)} · {order.integrationAccountName}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                          {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Updated{' '}
+                          {formatUserDateTime(order.updatedAt, dateTime, {
+                            month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
+                          })}
+                        </Typography>
+                        {order.trackingNumber && (
+                          <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                            Tracking {order.trackingNumber}
+                          </Typography>
+                        )}
+                      </Box>
+                      <Stack alignItems="flex-end" spacing={0.5}>
+                        <Typography fontWeight={700}>
+                          {importedOrderMoney(order)}
+                        </Typography>
+                        {operationsOrderRowNeedsAttention(row) && (
+                          <Chip size="small" color="warning" label="Needs attention" />
+                        )}
+                      </Stack>
+                    </Stack>
                   </Box>
-                  <Chip
-                    size="small"
-                    label={importedOrderDisplayStatus(order)}
-                    color={importedOrderStatusColor(order)}
-                  />
-                </Stack>
-                <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
-                  <Box sx={{ minWidth: 0 }}>
-                    <Typography variant="caption" color="#A8C7FA">
-                      Imported from {displayStatus(order.provider)}
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary" display="block" noWrap>
-                      {displayStatus(order.provider)} · {order.integrationAccountName} · {order.lineCount}{' '}
-                      {order.lineCount === 1 ? 'line' : 'lines'}
-                    </Typography>
-                  </Box>
-                  <Typography variant="caption" fontWeight={700}>Local draft</Typography>
-                </Stack>
-              </Box>
-            ))}
-            {workspace?.orders.map((order) => (
-              <Box
-                key={order.globalId}
-                component="button"
-                type="button"
-                data-testid={`canonical-order-${order.globalId}`}
-                onClick={() => chooseOrder(order)}
-                sx={{
-                  appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
-                  px: 2, py: 1.75, width: '100%', cursor: 'pointer',
-                  '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
-                }}
-              >
-                <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
-                  <Box sx={{ minWidth: 0 }}>
-                    <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
-                    <Typography variant="body2" color="text.secondary" noWrap>{order.customerName}</Typography>
-                  </Box>
-                  <Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} />
-                </Stack>
-                <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
-                  <Box sx={{ minWidth: 0 }}>
-                    <Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography>
-                    <Typography variant="caption" color="text.secondary" display="block" noWrap>{order.warehouseName || 'Unassigned'} · {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'}</Typography>
-                  </Box>
-                  <Typography fontWeight={700}>{money(order.expectedRevenueMinor)}</Typography>
-                </Stack>
-              </Box>
-            ))}
+                )
+              }
+              const order = row.order
+              return (
+                <Box
+                  key={row.key}
+                  component="button"
+                  type="button"
+                  data-testid={`canonical-order-${order.globalId}`}
+                  onClick={() => chooseOrder(order)}
+                  sx={{
+                    appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
+                    px: 2, py: 1.75, width: '100%', cursor: 'pointer',
+                    '&:active': { backgroundColor: 'rgba(168,199,250,0.08)' },
+                  }}
+                >
+                  <Stack direction="row" justifyContent="space-between" alignItems="flex-start" gap={1.5}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography fontWeight={700} noWrap>Order {order.orderNumber}</Typography>
+                      <Typography variant="body2" color="text.secondary" noWrap>{order.customerName}</Typography>
+                    </Box>
+                    <Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} />
+                  </Stack>
+                  <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="caption" color="#A8C7FA">
+                        {displayStatus(order.sourceProvider)} · {order.warehouseName || 'Unassigned'}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                        {order.lineCount} {order.lineCount === 1 ? 'line' : 'lines'} · Updated{' '}
+                        {formatUserDateTime(order.updatedAt, dateTime, {
+                          month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
+                        })}
+                      </Typography>
+                      {order.trackingNumber && (
+                        <Typography variant="caption" color="text.secondary" display="block" noWrap>
+                          Tracking {order.trackingNumber}
+                        </Typography>
+                      )}
+                    </Box>
+                    <Stack alignItems="flex-end" spacing={0.5}>
+                      <Typography fontWeight={700}>
+                        {money(order.orderValueMinor, order.currency)}
+                      </Typography>
+                      {operationsOrderRowNeedsAttention(row) && (
+                        <Chip size="small" color="warning" label="Needs attention" />
+                      )}
+                    </Stack>
+                  </Stack>
+                </Box>
+              )
+            })}
           </Stack>
         ) : (
           <TableContainer sx={{ height: '100%' }}>
             <Table stickyHeader size="small" aria-label="Operations orders">
               <TableHead>
                 <TableRow>
-                  <TableCell>Order</TableCell><TableCell>Customer</TableCell><TableCell>Status</TableCell><TableCell>Warehouse</TableCell><TableCell>Promise</TableCell><TableCell align="right">Lines</TableCell><TableCell align="right">Revenue</TableCell><TableCell>Tracking</TableCell><TableCell padding="checkbox" />
+                  <TableCell sortDirection={orderSort === 'order_asc' ? 'asc' : orderSort === 'order_desc' ? 'desc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'order_asc' || orderSort === 'order_desc'}
+                      direction={orderSort === 'order_asc' ? 'asc' : 'desc'}
+                      onClick={() => setOrderSort(orderSort === 'order_asc' ? 'order_desc' : 'order_asc')}
+                    >
+                      Order
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell sortDirection={orderSort === 'customer_asc' ? 'asc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'customer_asc'}
+                      direction="asc"
+                      onClick={() => setOrderSort('customer_asc')}
+                    >
+                      Customer
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell>Status</TableCell>
+                  <TableCell>Attention</TableCell>
+                  <TableCell>Warehouse</TableCell>
+                  <TableCell sortDirection={orderSort === 'promise_asc' ? 'asc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'promise_asc'}
+                      direction="asc"
+                      onClick={() => setOrderSort('promise_asc')}
+                    >
+                      Promise
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right" sortDirection={orderSort === 'lines_desc' ? 'desc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'lines_desc'}
+                      direction="desc"
+                      onClick={() => setOrderSort('lines_desc')}
+                    >
+                      Lines
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell align="right" sortDirection={orderSort === 'value_desc' ? 'desc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'value_desc'}
+                      direction="desc"
+                      onClick={() => setOrderSort('value_desc')}
+                    >
+                      Order total
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell>Tracking</TableCell>
+                  <TableCell sortDirection={orderSort === 'updated_asc' ? 'asc' : orderSort === 'updated_desc' ? 'desc' : false}>
+                    <TableSortLabel
+                      active={orderSort === 'updated_asc' || orderSort === 'updated_desc'}
+                      direction={orderSort === 'updated_asc' ? 'asc' : 'desc'}
+                      onClick={() => setOrderSort(orderSort === 'updated_desc' ? 'updated_asc' : 'updated_desc')}
+                    >
+                      Last activity
+                    </TableSortLabel>
+                  </TableCell>
+                  <TableCell padding="checkbox" />
                 </TableRow>
               </TableHead>
               <TableBody>
-                {visibleImportedOrders.map((order) => (
-                  <TableRow
-                    key={order.candidateGlobalId}
-                    data-testid={`imported-order-${order.candidateGlobalId}`}
-                    hover
-                    onClick={() => chooseImportedOrder(order)}
-                    sx={{ cursor: 'pointer' }}
-                  >
-                    <TableCell>
-                      <Typography fontWeight={600}>{order.orderNumber}</Typography>
-                      <Typography variant="caption" color="#A8C7FA">
-                        Imported from {displayStatus(order.provider)}
-                      </Typography>
-                    </TableCell>
-                    <TableCell>
-                      <Typography>{order.customerName || '—'}</Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {displayStatus(order.provider)} · {order.integrationAccountName}
-                      </Typography>
-                    </TableCell>
-                    <TableCell>
-                      <Chip
-                        size="small"
-                        label={importedOrderDisplayStatus(order)}
-                        color={importedOrderStatusColor(order)}
-                      />
-                    </TableCell>
-                    <TableCell>—</TableCell>
-                    <TableCell>—</TableCell>
-                    <TableCell align="right">{order.lineCount}</TableCell>
-                    <TableCell align="right">—</TableCell>
-                    <TableCell>—</TableCell>
-                    <TableCell padding="checkbox">
-                      <Tooltip title="Open imported order">
-                        <IconButton size="small" aria-label={`Open imported order ${order.orderNumber}`}>
-                          <OpenInNewRounded fontSize="small" />
-                        </IconButton>
-                      </Tooltip>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {workspace?.orders.map((order) => (
-                  <TableRow
-                    key={order.globalId}
-                    data-testid={`canonical-order-${order.globalId}`}
-                    hover
-                    onClick={() => chooseOrder(order)}
-                    sx={{ cursor: 'pointer' }}
-                  >
-                    <TableCell><Typography fontWeight={600}>{order.orderNumber}</Typography><Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography></TableCell>
-                    <TableCell><Typography>{order.customerName}</Typography><Typography variant="caption" color="text.secondary">{order.customerGlobalId}</Typography></TableCell>
-                    <TableCell><Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} /></TableCell>
-                    <TableCell>{order.warehouseName || '—'}</TableCell>
-                    <TableCell>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: '—' })}</TableCell>
-                    <TableCell align="right">{order.lineCount}</TableCell>
-                    <TableCell align="right">{money(order.expectedRevenueMinor)}</TableCell>
-                    <TableCell sx={{ maxWidth: 150 }}><Typography variant="body2" noWrap>{order.trackingNumber || '—'}</Typography></TableCell>
-                    <TableCell padding="checkbox"><Tooltip title="Open order"><IconButton size="small" aria-label={`Open order ${order.orderNumber}`}><OpenInNewRounded fontSize="small" /></IconButton></Tooltip></TableCell>
-                  </TableRow>
-                ))}
+                {visibleOrderRows.map((row) => {
+                  if (row.kind === 'imported') {
+                    const order = row.order
+                    return (
+                      <TableRow
+                        key={row.key}
+                        data-testid={`imported-order-${order.candidateGlobalId}`}
+                        hover
+                        onClick={() => chooseImportedOrder(order)}
+                        sx={{ cursor: 'pointer' }}
+                      >
+                        <TableCell>
+                          <Typography fontWeight={600}>{order.orderNumber}</Typography>
+                          <Typography variant="caption" color="#A8C7FA">
+                            {displayStatus(order.provider)} · {order.candidateGlobalId}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>
+                          <Typography>{order.customerName || '—'}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {order.integrationAccountName}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>
+                          <Chip size="small" label={importedOrderDisplayStatus(order)} color={importedOrderStatusColor(order)} />
+                        </TableCell>
+                        <TableCell>
+                          {operationsOrderRowNeedsAttention(row)
+                            ? <Chip
+                                size="small"
+                                color="warning"
+                                label={order.blockerCodes.length > 0
+                                  ? `${order.blockerCodes.length} ${order.blockerCodes.length === 1 ? 'issue' : 'issues'}`
+                                  : 'Needs attention'}
+                              />
+                            : '—'}
+                        </TableCell>
+                        <TableCell>—</TableCell>
+                        <TableCell>
+                          {formatUserDateTime(order.delivery.selectedDeliveryAt, dateTime, {
+                            year: 'numeric', month: 'short', day: 'numeric', fallback: '—',
+                          })}
+                        </TableCell>
+                        <TableCell align="right">{order.lineCount}</TableCell>
+                        <TableCell align="right">{importedOrderMoney(order)}</TableCell>
+                        <TableCell sx={{ maxWidth: 160 }}>
+                          <Typography variant="body2" noWrap>{order.trackingNumber || '—'}</Typography>
+                        </TableCell>
+                        <TableCell>
+                          {formatUserDateTime(order.updatedAt, dateTime, {
+                            month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
+                          })}
+                        </TableCell>
+                        <TableCell padding="checkbox">
+                          <Tooltip title="Open order">
+                            <IconButton size="small" aria-label={`Open order ${order.orderNumber}`}>
+                              <OpenInNewRounded fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  }
+                  const order = row.order
+                  return (
+                    <TableRow
+                      key={row.key}
+                      data-testid={`canonical-order-${order.globalId}`}
+                      hover
+                      onClick={() => chooseOrder(order)}
+                      sx={{ cursor: 'pointer' }}
+                    >
+                      <TableCell>
+                        <Typography fontWeight={600}>{order.orderNumber}</Typography>
+                        <Typography variant="caption" color="#A8C7FA">
+                          {displayStatus(order.sourceProvider)} · {order.globalId}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <Typography>{order.customerName}</Typography>
+                        <Typography variant="caption" color="text.secondary">{order.customerGlobalId}</Typography>
+                      </TableCell>
+                      <TableCell><Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} /></TableCell>
+                      <TableCell>
+                        {operationsOrderRowNeedsAttention(row)
+                          ? <Chip
+                              size="small"
+                              color="warning"
+                              label={order.exceptionCount > 0
+                                ? `${order.exceptionCount} ${order.exceptionCount === 1 ? 'issue' : 'issues'}`
+                                : 'Needs attention'}
+                            />
+                          : '—'}
+                      </TableCell>
+                      <TableCell>{order.warehouseName || '—'}</TableCell>
+                      <TableCell>{formatUserDateTime(order.promisedDeliveryAt, dateTime, { year: 'numeric', month: 'short', day: 'numeric', fallback: '—' })}</TableCell>
+                      <TableCell align="right">{order.lineCount}</TableCell>
+                      <TableCell align="right">
+                        {money(order.orderValueMinor, order.currency)}
+                      </TableCell>
+                      <TableCell sx={{ maxWidth: 160 }}><Typography variant="body2" noWrap>{order.trackingNumber || '—'}</Typography></TableCell>
+                      <TableCell>
+                        {formatUserDateTime(operationsOrderRowUpdatedAt(row), dateTime, {
+                          month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', fallback: '—',
+                        })}
+                      </TableCell>
+                      <TableCell padding="checkbox"><Tooltip title="Open order"><IconButton size="small" aria-label={`Open order ${order.orderNumber}`}><OpenInNewRounded fontSize="small" /></IconButton></Tooltip></TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           </TableContainer>

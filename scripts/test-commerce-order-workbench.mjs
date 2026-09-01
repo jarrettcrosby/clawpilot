@@ -69,6 +69,7 @@ const [
   candidateResolver,
   drawer,
   idempotency,
+  orderListQuery,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
   read('db/migrations/0321_operations_unit_item_cartonization.sql'),
@@ -83,6 +84,7 @@ const [
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
   read('app_src/lib/operations/orderWorkbenchIdempotency.ts'),
+  read('app_src/lib/operations/orderListQuery.ts'),
 ])
 
 for (const fragment of [
@@ -217,11 +219,11 @@ assert.equal(
 )
 assert.ok(
   persistence.indexOf("ILIKE $3 ESCAPE '!'")
-    < persistence.indexOf('LIMIT $8::integer'),
+    < persistence.indexOf('LIMIT $10::integer'),
   'Search must execute in SQL before the bounded result cap',
 )
 assert.ok(
-  persistence.includes('LIMIT $8::integer'),
+  persistence.includes('LIMIT $10::integer'),
   'Each Orders pane keyset query must retain a bounded page size',
 )
 assert.equal(
@@ -352,7 +354,12 @@ assert.ok(
 for (const fragment of [
   'readCommerceOrderWorkbenchPageFromPostgres',
   'count(*) OVER ()::text AS matching_total_count',
-  'matching.candidate_id < $7::uuid',
+  'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
+  'matching.candidate_id ${comparison} $9::uuid',
+  'selected.cursor_sort_value',
+  'candidate_context.tracking_number ILIKE',
+  'COALESCE(line.sku_snapshot',
+  'COALESCE(line.sku',
   'nextCursor',
   'complete: nextCursor === null',
   'truncated: nextCursor !== null',
@@ -370,8 +377,11 @@ for (const fragment of [
   'export async function readOperationsOrderPageFromPostgres',
   'WITH matching_order_ids AS',
   'count(*) OVER ()::text AS matching_total_count',
-  'matching.id < $6::uuid',
-  'LIMIT $7::integer',
+  'matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}',
+  'matching.id ${comparison} $9::uuid',
+  'line.channel_sku ILIKE',
+  'latest_tracking.tracking_number ILIKE',
+  'LIMIT $10::integer',
   'orderPage: orderPageResult.page',
 ]) {
   assert.ok(
@@ -384,6 +394,11 @@ for (const fragment of [
   'readOperationsOrderPageFromPostgres',
   'cursor: cursor || null',
   'pageSize',
+  'sort: sortValue',
+  'direction: directionValue',
+  'provider: providerValue || null',
+  'tracking,',
+  'updatedAfter: updatedAfterValue || null',
 ]) {
   assert.ok(
     ordersRoute.includes(fragment),
@@ -395,12 +410,56 @@ assert.ok(
   'Workspace contract must expose canonical order page completion evidence',
 )
 for (const fragment of [
+  'workflowState:',
+  'actionAvailable: boolean',
+  'candidate_context.display_status',
+  'display_snapshot.order_number_snapshot',
+]) {
+  assert.ok(
+    types.includes(fragment) || persistence.includes(fragment),
+    `Unified order contract is missing ${fragment}`,
+  )
+}
+assert.ok(
+  orderListQuery.includes('OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS = 500'),
+  'Order-list cursor sort keys must have a shared bounded width',
+)
+for (const fragment of [
+  "'updated'",
+  "'order_number'",
+  "'customer'",
+  "'status'",
+  "'provider'",
+  "'tracking'",
+  'isOperationsOrderUpdatedAfter',
+]) {
+  assert.ok(
+    orderListQuery.includes(fragment),
+    `Order-list query contract is missing ${fragment}`,
+  )
+}
+for (const source of [route, ordersRoute, operationsRoute]) {
+  for (const fragment of [
+    "searchParams.get('sort')",
+    "searchParams.get('direction')",
+    "searchParams.get('provider')",
+    "searchParams.get('tracking')",
+    "searchParams.get('updatedAfter')",
+  ]) {
+    assert.ok(source.includes(fragment), `Order route is missing ${fragment}`)
+  }
+}
+for (const fragment of [
   'canonicalOrderGlobalId: string | null',
   "promotionStatus: 'not_ready' | 'needs_info' | 'promoted'",
   'remainingBlockerCodes: string[]',
   'resolutionDetailsLoaded: boolean',
   'OperationsImportedOrderWorkingCopyDraft',
   'requestedDeliveryAt: string | null',
+  'updatedAt: string',
+  'trackingNumber: string | null',
+  'orderValueMinor: string | null',
+  'currency: string',
 ]) {
   assert.ok(types.includes(fragment), `Result contract is missing ${fragment}`)
 }
@@ -454,6 +513,10 @@ let historyReplay = null
 const idempotencyModule = loadTypeScriptSourceModule(
   idempotency,
   'app_src/lib/operations/orderWorkbenchIdempotency.ts',
+)
+const orderListQueryModule = loadTypeScriptSourceModule(
+  orderListQuery,
+  'app_src/lib/operations/orderListQuery.ts',
 )
 const workbenchRoute = loadTypeScriptSourceModule(
   route,
@@ -518,6 +581,7 @@ const workbenchRoute = loadTypeScriptSourceModule(
         return actor.capabilities
       },
     },
+    '@/lib/operations/orderListQuery': orderListQueryModule,
     '@/lib/operations/orderWorkbenchIdempotency': idempotencyModule,
     '@/lib/operations/orderShipTo': {
       ORDER_SHIP_TO_FIELDS: [

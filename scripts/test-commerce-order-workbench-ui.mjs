@@ -12,9 +12,19 @@ const [operations, drawer, imports, intake] = await Promise.all([
 
 for (const fragment of [
   'workspace?.importedOrders',
-  'visibleImportedOrders.map',
+  'operationsOrderWorkbenchRows',
+  'filterAndSortOperationsOrderRows',
+  'visibleOrderRows.map',
   'label={importedOrderDisplayStatus(order)}',
-  'importedOrderFilterStatus(order) === status',
+  'importedOrderMoney(order)',
+  'operationsOrderRowNeedsAttention(row)',
+  'OPERATIONS_ORDER_SAVED_VIEWS.map',
+  'Filter orders by sales channel',
+  'Filter orders by last activity',
+  'Filter orders by tracking state',
+  'Filter orders by warehouse',
+  'Sort operations orders',
+  'Order, customer, SKU, or tracking',
   'chooseImportedOrder(order)',
   '<ImportedOrderWorkingCopyDrawer',
   "fetch('/api/operations/order-workbench'",
@@ -51,10 +61,15 @@ for (const fragment of [
   assert.ok(operations.includes(fragment), `Operations UI is missing ${fragment}`)
 }
 
-assert.ok(
-  operations.indexOf('visibleImportedOrders.map')
-    < operations.indexOf('workspace?.orders.map'),
-  'Imported working copies must appear in the ordinary Orders list',
+assert.equal(
+  operations.includes('visibleImportedOrders.map'),
+  false,
+  'Imported and canonical orders must not render as separate list blocks',
+)
+assert.equal(
+  operations.includes('workspace?.orders.map'),
+  false,
+  'Canonical orders must use the same globally sorted row projection',
 )
 
 for (const fragment of [
@@ -132,6 +147,8 @@ for (const fragment of [
   'providerOrderStatus(order)',
   'Fulfilled externally',
   'providerTerminal',
+  'editorUnavailable',
+  '!order.actionAvailable',
 ]) {
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }

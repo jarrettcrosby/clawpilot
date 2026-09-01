@@ -75,6 +75,7 @@ const selectedOrder = {
   promisedDeliveryAt: '2026-08-04T21:00:00.000Z',
   lineCount: 2,
   exceptionCount: 1,
+  orderValueMinor: '1335',
   expectedCostMinor: '1066',
   expectedRevenueMinor: '1335',
   expectedMarginMinor: '269',
@@ -598,6 +599,7 @@ async function installOrderStatusSyncRoutes(
               currentQuantity: details.lines[0].currentQuantity,
               fulfilledQuantity: details.lines[0].fulfilledQuantity,
               unfulfilledQuantity: details.lines[0].unfulfilledQuantity,
+              returnedQuantity: details.lines[0].returnedQuantity,
               requiresShipping: details.lines[0].requiresShipping,
             }],
             events: [{
@@ -1189,7 +1191,13 @@ function importedWorkbenchOrder(
     customerName: 'Northstar Receiving',
     lineCount: 1,
     sourceUpdatedAt: '2026-08-21T18:00:00.000Z',
+    updatedAt: '2026-08-21T18:00:00.000Z',
+    trackingNumber: null,
+    orderValueMinor: '2000',
+    currency: 'USD',
     candidateRowVersion: 4,
+    workflowState: 'held',
+    actionAvailable: true,
     rowVersion: 0,
     providerVersionChanged: false,
     resolutionDetailsLoaded: details,
@@ -1286,6 +1294,7 @@ function promotedWorkbenchOrder() {
     warehouseName: null,
     promisedDeliveryAt: '2026-08-30T15:30:00.000Z',
     lineCount: 1,
+    orderValueMinor: '2500',
     expectedCostMinor: '0',
     expectedRevenueMinor: '2500',
     expectedMarginMinor: '2500',
@@ -1346,6 +1355,8 @@ async function installImportedWorkbenchRoutes(
     providerVersionChanged?: boolean
     sourceUpdatedAt?: string
     canManage?: boolean
+    workflowState?: OperationsImportedOrderWorkingCopy['workflowState']
+    actionAvailable?: boolean
   } = {},
 ) {
   const capture = {
@@ -1381,6 +1392,12 @@ async function installImportedWorkbenchRoutes(
       ...detailedOrder,
       sourceUpdatedAt: options.sourceUpdatedAt,
     }
+  }
+  if (options.workflowState) {
+    detailedOrder = { ...detailedOrder, workflowState: options.workflowState }
+  }
+  if (options.actionAvailable !== undefined) {
+    detailedOrder = { ...detailedOrder, actionAvailable: options.actionAvailable }
   }
 
   if (options.refreshConflict) {
@@ -2725,6 +2742,37 @@ test('incomplete imported order saves locally before explicit acceptance into ca
   expect(capture.providerMutationRequests).toEqual([])
 })
 
+test('retained unavailable candidates stay visible but cannot be edited or imported', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    workflowState: 'failed',
+    actionAvailable: false,
+  })
+  await gotoApp(page, '/#operations')
+
+  const importedRow = page.getByTestId(
+    `imported-order-${workbenchCandidateGlobalId}`,
+  )
+  await expect(importedRow).toContainText('Refresh needed')
+  await importedRow.click()
+
+  await expect(page.getByText(
+    'This retained provider copy is no longer eligible for edits or import. Refresh it to fetch a current provider revision.',
+  )).toBeVisible()
+  await expect(page.getByRole('combobox', { name: 'Customer' })).toBeDisabled()
+  await expect(page.getByRole('button', {
+    name: 'Accept & import',
+    exact: true,
+  })).toBeDisabled()
+  await expect(page.getByRole('button', {
+    name: 'Save',
+    exact: true,
+  })).toBeDisabled()
+  expect(capture.patchRequests).toEqual([])
+  expect(capture.acceptRequests).toEqual([])
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
 test('provider-terminal candidates remain visible with current external status and cannot be imported', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.clock.setFixedTime('2026-08-31T18:05:00.000Z')
@@ -2758,6 +2806,7 @@ test('provider-terminal candidates remain visible with current external status a
         currentQuantity: 2,
         fulfilledQuantity: 2,
         unfulfilledQuantity: 0,
+        returnedQuantity: 1,
         requiresShipping: true,
       }],
       events: [{
@@ -3079,6 +3128,109 @@ test('imported order provider refresh reuses its UUID after a lost response', as
   )
   expect(capture.refreshRequests[1].idempotencyKey)
     .toBe(capture.refreshRequests[0].idempotencyKey)
+})
+
+test('orders workbench globally sorts both order sources and exposes operational saved views', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const base = workspace()
+  const readyOrder = {
+    ...base.orders[0],
+    globalId: 'gor7000001',
+    orderNumber: '#7001',
+    status: 'imported' as const,
+    exceptionCount: 0,
+    updatedAt: '2026-08-21T12:00:00.000Z',
+  }
+  const attentionOrder = {
+    ...importedWorkbenchOrder(false),
+    candidateGlobalId: 'gcoc7000002',
+    globalId: 'gcoc7000002',
+    orderNumber: '#7002',
+    updatedAt: '2026-08-22T12:00:00.000Z',
+  }
+  const fulfilledOrder = {
+    ...importedWorkbenchOrder(false),
+    candidateGlobalId: 'gcoc7000003',
+    globalId: 'gcoc7000003',
+    orderNumber: '#7003',
+    providerState: {
+      lifecycle: 'closed' as const,
+      fulfillment: 'fulfilled' as const,
+      observedAt: '2026-08-23T12:00:00.000Z',
+      source: 'history' as const,
+    },
+    updatedAt: '2026-08-23T12:00:00.000Z',
+    trackingNumber: '1Z7003',
+  }
+  const operationQueries: URLSearchParams[] = []
+  await page.route((url) => url.pathname === '/api/operations', async (route) => {
+    operationQueries.push(new URL(route.request().url()).searchParams)
+    return route.fulfill({
+      json: {
+        ok: true,
+        operations: {
+          ...base,
+          orders: [readyOrder],
+          orderPage: {
+            total: 1,
+            returned: 1,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          importedOrders: [attentionOrder, fulfilledOrder],
+          importedOrderPage: {
+            total: 2,
+            returned: 2,
+            pageSize: 250,
+            nextCursor: null,
+            complete: true,
+            truncated: false,
+          },
+          selectedOrder: null,
+          exceptions: [],
+        },
+      },
+    })
+  })
+
+  await gotoApp(page, '/#operations')
+  await expect(page.getByRole('button', { name: 'All orders (3)' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect(page.getByRole('button', { name: 'Needs attention (1)' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Ready to fulfill (1)' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'External history (1)' })).toBeVisible()
+  await expect(page.getByRole('combobox', { name: 'Filter orders by status' }))
+    .toHaveText('All statuses')
+  await expect(page.getByRole('combobox', { name: 'Filter orders by sales channel' }))
+    .toHaveText('All sales channels')
+  await expect(page.getByRole('combobox', { name: 'Filter orders by warehouse' }))
+    .toHaveText('All warehouses')
+  await expect(page.locator('tbody tr')).toHaveCount(3)
+  await expect(page.locator('tbody tr').nth(0)).toContainText('#7003')
+  await expect(page.locator('tbody tr').nth(1)).toContainText('#7002')
+  await expect(page.locator('tbody tr').nth(2)).toContainText('#7001')
+
+  await page.getByRole('button', { name: 'Ready to fulfill (1)' }).click()
+  await expect(page.locator('tbody tr')).toHaveCount(1)
+  await expect(page.locator('tbody tr')).toContainText('#7001')
+
+  await page.getByRole('button', { name: 'All orders (3)' }).click()
+  await page.getByRole('combobox', { name: 'Filter orders by tracking state' }).click()
+  await page.getByRole('option', { name: 'Has tracking' }).click()
+  await expect(page.locator('tbody tr')).toHaveCount(1)
+  await expect(page.locator('tbody tr')).toContainText('#7003')
+  await expect.poll(() => operationQueries.at(-1)?.get('tracking')).toBe('present')
+
+  await page.getByRole('button', { name: 'Clear filters' }).click()
+  await page.getByRole('combobox', { name: 'Sort operations orders' }).click()
+  await page.getByRole('option', { name: 'Order number: lowest' }).click()
+  await expect(page.locator('tbody tr').nth(0)).toContainText('#7001')
+  await expect.poll(() => operationQueries.at(-1)?.get('sort')).toBe('order_number')
+  await expect.poll(() => operationQueries.at(-1)?.get('direction')).toBe('asc')
 })
 
 test('orders refresh reads Shopify status and projects external fulfillment without local shipment evidence', async ({ page }) => {
@@ -3413,12 +3565,14 @@ test('Orders pane loads more than 100 canonical orders across each keyset page e
     customerName: `Canonical customer ${index + 1}`,
     customerGlobalId: `ga${String(2_000_000 + index)}`,
     sourceProvider: 'shopify',
+    currency: 'USD',
     status: 'imported',
     externallyFulfilled: false,
     warehouseName: null,
     promisedDeliveryAt: null,
     lineCount: 1,
     exceptionCount: 0,
+    orderValueMinor: '1000',
     expectedCostMinor: null,
     expectedRevenueMinor: '1000',
     expectedMarginMinor: null,
@@ -3637,13 +3791,13 @@ test('operations workbench renders dense desktop evidence and order drill-in', a
   await expect(page.getByText('Picks complete').locator('..').getByText('2 / 2')).toBeVisible()
   await page.getByRole('button', { name: 'Close order details' }).click()
 
-  await page.getByRole('tab', { name: 'Exceptions (1)' }).click()
+  await page.getByRole('tab', { name: 'Exceptions (1 active)' }).click()
   await expect(page.getByRole('table', { name: 'Operations exceptions' })).toBeVisible()
   await page.getByRole('row', { name: /Inventory reservation is short/ }).click()
   await expect(page.getByRole('heading', { name: 'Inventory reservation is short' })).toBeVisible()
   await expect(page.getByText('Replenish or move the line to another warehouse.')).toBeVisible()
   await page.getByRole('button', { name: 'Acknowledge' }).click()
-  await expect(page.getByRole('tab', { name: 'Exceptions (1)' })).toBeVisible()
+  await expect(page.getByRole('tab', { name: 'Exceptions (1 active)' })).toBeVisible()
 })
 
 test('shipped order independently confirms original and reprint paper output', async ({ page }) => {
@@ -4012,7 +4166,7 @@ test('operations mobile workflow has no page overflow and omits hosted proof gen
   await expect(page.getByText('Order PROOF-1042')).toBeVisible()
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(1)
 
-  await page.getByRole('tab', { name: 'Exceptions (1)' }).click()
+  await page.getByRole('tab', { name: 'Exceptions (1 active)' }).click()
   await page.getByRole('button', { name: /Inventory reservation is short/ }).click()
   await expect(page.getByRole('heading', { name: 'Inventory reservation is short' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Acknowledge' })).toBeVisible()

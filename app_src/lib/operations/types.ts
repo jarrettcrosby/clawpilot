@@ -650,12 +650,14 @@ export type OperationsOrderListItem = {
   customerName: string
   customerGlobalId: string
   sourceProvider: string
+  currency: string
   status: OperationsOrderStatus
   externallyFulfilled: boolean
   warehouseName: string | null
   promisedDeliveryAt: string | null
   lineCount: number
   exceptionCount: number
+  orderValueMinor: string | null
   expectedCostMinor: string | null
   expectedRevenueMinor: string | null
   expectedMarginMinor: string | null
@@ -1197,7 +1199,13 @@ export type OperationsImportedOrderWorkingCopy = {
   customerName: string | null
   lineCount: number
   sourceUpdatedAt: string
+  updatedAt: string
+  trackingNumber: string | null
+  orderValueMinor: string | null
+  currency: string
   candidateRowVersion: number
+  workflowState: 'held' | 'resolving' | 'ready' | 'promoted' | 'failed' | 'expired'
+  actionAvailable: boolean
   rowVersion: number
   providerVersionChanged: boolean
   resolutionDetailsLoaded: boolean

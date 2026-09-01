@@ -17,6 +17,19 @@ import {
   type OrderShipToField,
   type OrderShipToPatch,
 } from '@/lib/operations/orderShipTo'
+import {
+  OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH,
+  OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS,
+  isOperationsOrderCursorSortValue,
+  isOperationsOrderProviderFilter,
+  isOperationsOrderSort,
+  isOperationsOrderSortDirection,
+  isOperationsOrderTrackingFilter,
+  isOperationsOrderUpdatedAfter,
+  type OperationsOrderSort,
+  type OperationsOrderSortDirection,
+  type OperationsOrderTrackingFilter,
+} from '@/lib/operations/orderListQuery'
 import type {
   OperationsImportedOrderLineRefreshConflict,
   OperationsImportedOrderPage,
@@ -57,7 +70,10 @@ const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
-const WORKBENCH_CURSOR = /^[A-Za-z0-9_-]{1,1000}$/u
+const WORKBENCH_CURSOR = new RegExp(
+  `^[A-Za-z0-9_-]{1,${OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH}}$`,
+  'u',
+)
 const MAX_WORKBENCH_PAGE_SIZE = 250
 const MAX_WORKBENCH_COLLECTION_PAGES = 20
 
@@ -94,9 +110,13 @@ type WorkbenchReadRow = {
   provider_updated_at: Date | null
   observed_at: Date
   candidate_row_version: string
+  workflow_state: 'held' | 'resolving' | 'ready' | 'promoted' | 'failed' | 'expired'
+  action_available: boolean
   blocking_codes: string[]
   pipeline_id: string
   currency_code: string
+  total_minor: string | null
+  header_money_state: 'complete' | 'operational_incomplete'
   requires_shipping: boolean
   customer_resolution_state:
     | 'unresolved'
@@ -158,13 +178,15 @@ type WorkbenchReadRow = {
   provider_status_observed_at: Date
   provider_status_source: 'operational' | 'history' | 'retained'
   latest_exact_history_observed_at: Date | null
+  activity_at: Date
+  tracking_number: string | null
+  cursor_sort_value: Date | string
   matching_total_count: string
 }
 
 type WorkbenchPageCursor = {
-  v: 1
-  providerUpdatedAt: string | null
-  observedAt: string
+  v: 2
+  sortValue: string
   candidateId: string
   total: number
   scopeHash: string
@@ -348,18 +370,20 @@ function workbenchPageScopeHash(input: Readonly<{
   organizationId: string
   candidateGlobalId: string | null
   search: string
+  sort: OperationsOrderSort
+  direction: OperationsOrderSortDirection
+  provider: string | null
+  tracking: OperationsOrderTrackingFilter | null
+  updatedAfter: string | null
 }>) {
-  return createHash('sha256').update(JSON.stringify({
-    organizationId: input.organizationId,
-    candidateGlobalId: input.candidateGlobalId,
-    search: input.search,
-  })).digest('hex')
+  return createHash('sha256').update(JSON.stringify(input)).digest('hex')
 }
 
 function validCursorTimestamp(value: unknown): value is string {
   if (typeof value !== 'string' || value.length < 20 || value.length > 30) {
     return false
   }
+  if (value.startsWith('0000-')) return false
   const parsed = new Date(value)
   return Number.isFinite(parsed.valueOf()) && parsed.toISOString() === value
 }
@@ -367,6 +391,7 @@ function validCursorTimestamp(value: unknown): value is string {
 function decodeWorkbenchPageCursor(
   cursor: string | null | undefined,
   expectedScopeHash: string,
+  sort: OperationsOrderSort,
 ): WorkbenchPageCursor | null {
   if (!cursor) return null
   if (!WORKBENCH_CURSOR.test(cursor)) {
@@ -398,18 +423,14 @@ function decodeWorkbenchPageCursor(
   if (
     keys !== [
       'candidateId',
-      'observedAt',
-      'providerUpdatedAt',
       'scopeHash',
+      'sortValue',
       'total',
       'v',
     ].sort().join(',')
-    || parsed.v !== 1
-    || (
-      parsed.providerUpdatedAt !== null
-      && !validCursorTimestamp(parsed.providerUpdatedAt)
-    )
-    || !validCursorTimestamp(parsed.observedAt)
+    || parsed.v !== 2
+    || !isOperationsOrderCursorSortValue(parsed.sortValue, sort)
+    || (sort === 'updated' && !validCursorTimestamp(parsed.sortValue))
     || typeof parsed.candidateId !== 'string'
     || !UUID.test(parsed.candidateId)
     || !Number.isSafeInteger(parsed.total)
@@ -429,15 +450,129 @@ function encodeWorkbenchPageCursor(
   row: WorkbenchReadRow,
   total: number,
   scopeHash: string,
+  sort: OperationsOrderSort,
 ) {
-  return Buffer.from(JSON.stringify({
-    v: 1,
-    providerUpdatedAt: row.provider_updated_at?.toISOString() || null,
-    observedAt: row.observed_at.toISOString(),
+  const sortValue = sort === 'updated'
+    ? (row.cursor_sort_value as Date).toISOString()
+    : String(row.cursor_sort_value)
+  const encoded = Buffer.from(JSON.stringify({
+    v: 2,
+    sortValue,
     candidateId: row.candidate_id,
     total,
     scopeHash,
   } satisfies WorkbenchPageCursor), 'utf8').toString('base64url')
+  if (encoded.length > OPERATIONS_ORDER_PAGE_CURSOR_MAX_LENGTH) {
+    requestError(
+      'OPERATIONS_PAGE_EVIDENCE_INVALID',
+      'Imported-order pagination produced an oversized cursor',
+      500,
+    )
+  }
+  return encoded
+}
+
+function workbenchOrderSort(
+  value: OperationsOrderSort | null | undefined,
+): OperationsOrderSort {
+  const sort = value || 'updated'
+  if (!isOperationsOrderSort(sort)) {
+    requestError(
+      'OPERATIONS_ORDER_SORT_INVALID',
+      'Order sort is invalid',
+      400,
+    )
+  }
+  return sort
+}
+
+function workbenchOrderSortDirection(
+  value: OperationsOrderSortDirection | null | undefined,
+): OperationsOrderSortDirection {
+  const direction = value || 'desc'
+  if (!isOperationsOrderSortDirection(direction)) {
+    requestError(
+      'OPERATIONS_ORDER_SORT_DIRECTION_INVALID',
+      'Order sort direction is invalid',
+      400,
+    )
+  }
+  return direction
+}
+
+function workbenchOrderProviderFilter(value: string | null | undefined) {
+  const provider = String(value || '').trim()
+  if (provider && !isOperationsOrderProviderFilter(provider)) {
+    requestError(
+      'OPERATIONS_ORDER_PROVIDER_INVALID',
+      'Order provider is invalid',
+      400,
+    )
+  }
+  return provider || null
+}
+
+function workbenchOrderTrackingFilter(
+  value: OperationsOrderTrackingFilter | null | undefined,
+) {
+  const tracking = value || null
+  if (tracking && !isOperationsOrderTrackingFilter(tracking)) {
+    requestError(
+      'OPERATIONS_ORDER_TRACKING_FILTER_INVALID',
+      'Order tracking filter is invalid',
+      400,
+    )
+  }
+  return tracking
+}
+
+function workbenchOrderUpdatedAfter(value: string | null | undefined) {
+  const updatedAfter = String(value || '').trim()
+  if (updatedAfter && !isOperationsOrderUpdatedAfter(updatedAfter)) {
+    requestError(
+      'OPERATIONS_ORDER_UPDATED_AFTER_INVALID',
+      'Order updated-after value is invalid',
+      400,
+    )
+  }
+  return updatedAfter || null
+}
+
+function workbenchOrderSortSql(sort: OperationsOrderSort) {
+  if (sort === 'updated') {
+    return {
+      expression: 'candidate_context.activity_at',
+      cursorCast: 'timestamptz',
+    }
+  }
+  if (sort === 'order_number') {
+    return {
+      expression: `lower(left(candidate_context.order_number_snapshot, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'customer') {
+    return {
+      expression: `lower(left(COALESCE(candidate_context.customer_name, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'status') {
+    return {
+      expression: `lower(left(candidate_context.display_status, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      cursorCast: 'text',
+    }
+  }
+  if (sort === 'provider') {
+    return {
+      expression: `lower(left(candidate_context.provider, ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+      cursorCast: 'text',
+    }
+  }
+  return {
+    expression: `lower(left(COALESCE(candidate_context.tracking_number, ''), ${OPERATIONS_ORDER_SORT_KEY_MAX_CHARACTERS}))`,
+    cursorCast: 'text',
+  }
 }
 
 function workbenchPageSize(value: number | null | undefined) {
@@ -1167,7 +1302,15 @@ function mappedWorkingCopy(
     sourceUpdatedAt: (
       row.provider_updated_at || row.observed_at
     ).toISOString(),
+    updatedAt: row.activity_at.toISOString(),
+    trackingNumber: row.tracking_number,
+    orderValueMinor: row.header_money_state === 'complete'
+      ? row.total_minor
+      : null,
+    currency: row.currency_code,
     candidateRowVersion: Number(row.candidate_row_version),
+    workflowState: row.workflow_state,
+    actionAvailable: row.action_available,
     rowVersion: Number(row.workbench_row_version || 0),
     resolutionDetailsLoaded: details !== null,
     providerVersionChanged: Boolean(
@@ -1223,6 +1366,11 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   search?: string | null
   candidateGlobalId?: string | null
   includeResolutionDetails?: boolean
+  sort?: OperationsOrderSort | null
+  direction?: OperationsOrderSortDirection | null
+  provider?: string | null
+  tracking?: OperationsOrderTrackingFilter | null
+  updatedAfter?: string | null
   cursor?: string | null
   pageSize?: number | null
 }): Promise<{
@@ -1234,6 +1382,11 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     ? requireCandidateGlobalId(input.candidateGlobalId)
     : null
   const search = String(input.search || '').trim()
+  const sort = workbenchOrderSort(input.sort)
+  const direction = workbenchOrderSortDirection(input.direction)
+  const provider = workbenchOrderProviderFilter(input.provider)
+  const tracking = workbenchOrderTrackingFilter(input.tracking)
+  const updatedAfter = workbenchOrderUpdatedAfter(input.updatedAfter)
   const searchPattern = search
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
@@ -1242,8 +1395,16 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
     organizationId,
     candidateGlobalId,
     search,
+    sort,
+    direction,
+    provider,
+    tracking,
+    updatedAfter,
   })
-  const cursor = decodeWorkbenchPageCursor(input.cursor, scopeHash)
+  const cursor = decodeWorkbenchPageCursor(input.cursor, scopeHash, sort)
+  const sortSql = workbenchOrderSortSql(sort)
+  const comparison = direction === 'asc' ? '>' : '<'
+  const orderDirection = direction === 'asc' ? 'ASC' : 'DESC'
   const result = await query<WorkbenchReadRow>(
     `WITH latest_live_candidates AS (
        SELECT DISTINCT ON (
@@ -1308,11 +1469,55 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
              AND canonical.external_order_id
                = retained_candidate.external_order_id
          )
-     ), matching_candidate_ids AS (
+     ), candidate_context AS (
        SELECT candidate.id AS candidate_id,
-              candidate.provider_updated_at,
-              candidate.observed_at,
-              count(*) OVER ()::text AS matching_total_count
+              candidate.global_id AS candidate_global_id,
+              candidate.integration_account_id,
+              candidate.external_order_id,
+              display_snapshot.order_number_snapshot,
+              display_snapshot.provider,
+              display_snapshot.provider_updated_at,
+              display_snapshot.observed_at,
+              account.display_name AS integration_account_name,
+              display_customer.name AS customer_name,
+              canonical_order.global_id AS canonical_order_global_id,
+              latest_provider.id AS latest_provider_candidate_id,
+              latest_tracking.tracking_number,
+              CASE
+                WHEN COALESCE(
+                  provider_status.lifecycle_status,
+                  candidate.normalized_order_status
+                ) IN ('cancelled', 'canceled')
+                OR COALESCE(
+                  provider_status.fulfillment_status,
+                  candidate.normalized_fulfillment_status
+                ) IN ('cancelled', 'canceled')
+                THEN 'cancelled'
+                WHEN COALESCE(
+                  provider_status.fulfillment_status,
+                  candidate.normalized_fulfillment_status
+                ) = 'fulfilled'
+                THEN 'fulfilled_externally'
+                WHEN COALESCE(
+                  provider_status.lifecycle_status,
+                  candidate.normalized_order_status
+                ) = 'closed'
+                THEN 'closed_externally'
+                ELSE 'imported'
+              END AS display_status,
+              date_trunc('milliseconds', GREATEST(
+                  COALESCE(
+                    latest_provider.provider_updated_at,
+                    latest_provider.observed_at
+                  ),
+                  COALESCE(
+                    latest_observation.provider_updated_at,
+                    latest_observation.observed_at
+                  ),
+                  latest_tracking.activity_at,
+                  candidate.observed_at,
+                  workbench.updated_at
+                )) AS activity_at
        FROM selected_candidate_ids selected
        JOIN operations_commerce_order_candidates candidate
          ON candidate.organization_id = $1::uuid
@@ -1325,60 +1530,229 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        LEFT JOIN operations_orders canonical_order
          ON canonical_order.organization_id = candidate.organization_id
         AND canonical_order.id = candidate.canonical_order_id
-       LEFT JOIN crm_organizations customer
-         ON customer.pipeline_id = candidate.pipeline_id
-        AND customer.id = candidate.customer_id
-       WHERE ($2::text IS NULL OR candidate.global_id = $2)
+       LEFT JOIN operations_commerce_order_workbench workbench
+         ON workbench.organization_id = candidate.organization_id
+        AND workbench.integration_account_id = candidate.integration_account_id
+        AND workbench.external_order_id = candidate.external_order_id
+       LEFT JOIN LATERAL (
+         SELECT provider_candidate.id,
+                provider_candidate.provider_updated_at,
+                provider_candidate.observed_at
+         FROM operations_commerce_order_candidates provider_candidate
+         WHERE provider_candidate.organization_id = candidate.organization_id
+           AND provider_candidate.integration_account_id
+             = candidate.integration_account_id
+           AND provider_candidate.external_order_id
+             = candidate.external_order_id
+           AND provider_candidate.workflow_state <> 'failed'
+         ORDER BY
+           COALESCE(
+             provider_candidate.provider_updated_at,
+             provider_candidate.observed_at
+           ) DESC,
+           provider_candidate.observed_at DESC,
+           provider_candidate.created_at DESC,
+           provider_candidate.id DESC
+         LIMIT 1
+       ) latest_provider ON true
+       LEFT JOIN LATERAL (
+         SELECT status_evidence.lifecycle_status,
+                status_evidence.fulfillment_status
+         FROM (
+           SELECT provider_candidate.normalized_order_status
+                    AS lifecycle_status,
+                  provider_candidate.normalized_fulfillment_status
+                    AS fulfillment_status,
+                  provider_candidate.provider_updated_at,
+                  provider_candidate.observed_at,
+                  0::integer AS source_priority,
+                  provider_candidate.id AS evidence_id
+           FROM operations_commerce_order_candidates provider_candidate
+           WHERE provider_candidate.organization_id = candidate.organization_id
+             AND provider_candidate.integration_account_id
+               = candidate.integration_account_id
+             AND provider_candidate.external_order_id
+               = candidate.external_order_id
+             AND provider_candidate.workflow_state <> 'failed'
+           UNION ALL
+           SELECT observation.canonical_lifecycle_state,
+                  observation.canonical_fulfillment_state,
+                  observation.provider_updated_at,
+                  observation.observed_at,
+                  1::integer AS source_priority,
+                  observation.id AS evidence_id
+           FROM operations_commerce_order_observations observation
+           WHERE observation.organization_id = candidate.organization_id
+             AND observation.integration_account_id
+               = candidate.integration_account_id
+             AND observation.provider = candidate.provider
+             AND observation.external_order_id = candidate.external_order_id
+         ) status_evidence
+         ORDER BY
+           COALESCE(
+             status_evidence.provider_updated_at,
+             status_evidence.observed_at
+           ) DESC,
+           status_evidence.observed_at DESC,
+           status_evidence.source_priority DESC,
+           status_evidence.evidence_id DESC
+         LIMIT 1
+       ) provider_status ON true
+       CROSS JOIN LATERAL (
+         SELECT CASE
+           WHEN COALESCE(
+             provider_status.lifecycle_status,
+             candidate.normalized_order_status
+           ) IN ('cancelled', 'canceled', 'closed')
+           OR COALESCE(
+             provider_status.fulfillment_status,
+             candidate.normalized_fulfillment_status
+           ) IN ('fulfilled', 'cancelled', 'canceled')
+           THEN COALESCE(latest_provider.id, candidate.id)
+           ELSE candidate.id
+         END AS id
+       ) display_candidate
+       JOIN operations_commerce_order_candidates display_snapshot
+         ON display_snapshot.organization_id = candidate.organization_id
+        AND display_snapshot.id = display_candidate.id
+       LEFT JOIN crm_organizations display_customer
+         ON display_customer.pipeline_id = display_snapshot.pipeline_id
+        AND display_customer.id = display_snapshot.customer_id
+       LEFT JOIN LATERAL (
+         SELECT observation.provider_updated_at, observation.observed_at
+         FROM operations_commerce_order_observations observation
+         WHERE observation.organization_id = candidate.organization_id
+           AND observation.integration_account_id
+             = candidate.integration_account_id
+           AND observation.provider = candidate.provider
+           AND observation.external_order_id = candidate.external_order_id
+         ORDER BY
+           COALESCE(
+             observation.provider_updated_at,
+             observation.observed_at
+           ) DESC,
+           observation.observed_at DESC,
+           observation.id DESC
+         LIMIT 1
+       ) latest_observation ON true
+       LEFT JOIN LATERAL (
+         SELECT event.tracking_number,
+                date_trunc('milliseconds', GREATEST(
+                  event.occurred_at,
+                  event.observed_at,
+                  event.created_at
+                )) AS activity_at
+         FROM operations_commerce_order_event_observations event
+         WHERE event.organization_id = candidate.organization_id
+           AND event.integration_account_id = candidate.integration_account_id
+           AND event.provider = candidate.provider
+           AND event.external_order_id = candidate.external_order_id
+           AND event.event_kind = 'tracking_updated'
+           AND event.sensitive_evidence_redacted_at IS NULL
+           AND event.sensitive_evidence_expires_at > now()
+         ORDER BY event.occurred_at DESC,
+                  (event.tracking_number IS NOT NULL) DESC,
+                  event.external_event_id DESC NULLS LAST,
+                  event.id DESC
+         LIMIT 1
+       ) latest_tracking ON true
+     ), matching_candidate_ids AS (
+       SELECT candidate_context.candidate_id,
+              candidate_context.provider_updated_at,
+              candidate_context.observed_at,
+              candidate_context.activity_at,
+              candidate_context.tracking_number,
+              ${sortSql.expression} AS cursor_sort_value,
+              count(*) OVER ()::text AS matching_total_count
+       FROM candidate_context
+       WHERE (
+           $2::text IS NULL
+           OR candidate_context.candidate_global_id = $2
+         )
          AND (
            $3::text IS NULL
-           OR candidate.global_id ILIKE $3 ESCAPE '!'
-           OR candidate.order_number_snapshot ILIKE $3 ESCAPE '!'
-           OR candidate.external_order_id ILIKE $3 ESCAPE '!'
-           OR account.display_name ILIKE $3 ESCAPE '!'
-           OR candidate.provider ILIKE $3 ESCAPE '!'
-           OR COALESCE(customer.name, '') ILIKE $3 ESCAPE '!'
-           OR COALESCE(canonical_order.global_id, '') ILIKE $3 ESCAPE '!'
+           OR candidate_context.candidate_global_id ILIKE $3 ESCAPE '!'
+           OR candidate_context.order_number_snapshot ILIKE $3 ESCAPE '!'
+           OR candidate_context.external_order_id ILIKE $3 ESCAPE '!'
+           OR candidate_context.integration_account_name ILIKE $3 ESCAPE '!'
+           OR candidate_context.provider ILIKE $3 ESCAPE '!'
+           OR COALESCE(candidate_context.customer_name, '') ILIKE $3 ESCAPE '!'
+           OR COALESCE(
+             candidate_context.canonical_order_global_id,
+             ''
+           ) ILIKE $3 ESCAPE '!'
+           OR candidate_context.tracking_number ILIKE $3 ESCAPE '!'
+           OR EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_candidate_lines line
+             LEFT JOIN crm_products product
+               ON product.pipeline_id = line.pipeline_id
+              AND product.id = line.product_id
+             WHERE line.organization_id = $1::uuid
+               AND line.integration_account_id
+                 = candidate_context.integration_account_id
+               AND line.order_candidate_id IN (
+                 candidate_context.candidate_id,
+                 candidate_context.latest_provider_candidate_id
+               )
+               AND (
+                 COALESCE(line.sku_snapshot, '') ILIKE $3 ESCAPE '!'
+                 OR COALESCE(product.sku, '') ILIKE $3 ESCAPE '!'
+                 OR product.reference_code ILIKE $3 ESCAPE '!'
+               )
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM operations_commerce_order_observations observation
+             JOIN operations_commerce_order_observation_lines line
+               ON line.organization_id = observation.organization_id
+              AND line.observation_id = observation.id
+             WHERE observation.organization_id = $1::uuid
+               AND observation.integration_account_id
+                 = candidate_context.integration_account_id
+               AND observation.provider = candidate_context.provider
+               AND observation.external_order_id
+                 = candidate_context.external_order_id
+               AND COALESCE(line.sku, '') ILIKE $3 ESCAPE '!'
+           )
+         )
+         AND (
+           $4::text IS NULL
+           OR candidate_context.provider = $4::text
+         )
+         AND (
+           $5::text IS NULL
+           OR (
+             $5::text = 'present'
+             AND candidate_context.tracking_number IS NOT NULL
+           )
+           OR (
+             $5::text = 'missing'
+             AND candidate_context.tracking_number IS NULL
+           )
+         )
+         AND (
+           $6::timestamptz IS NULL
+           OR candidate_context.activity_at > $6::timestamptz
          )
      ), page_candidate_ids AS (
        SELECT matching.candidate_id,
               matching.provider_updated_at,
               matching.observed_at,
+              matching.activity_at,
+              matching.tracking_number,
+              matching.cursor_sort_value,
               matching.matching_total_count
        FROM matching_candidate_ids matching
-       WHERE NOT $4::boolean
+       WHERE NOT $7::boolean
+          OR matching.cursor_sort_value ${comparison} $8::${sortSql.cursorCast}
           OR (
-            $5::timestamptz IS NOT NULL
-            AND (
-              matching.provider_updated_at < $5::timestamptz
-              OR matching.provider_updated_at IS NULL
-              OR (
-                matching.provider_updated_at = $5::timestamptz
-                AND (
-                  matching.observed_at < $6::timestamptz
-                  OR (
-                    matching.observed_at = $6::timestamptz
-                    AND matching.candidate_id < $7::uuid
-                  )
-                )
-              )
-            )
+            matching.cursor_sort_value = $8::${sortSql.cursorCast}
+            AND matching.candidate_id ${comparison} $9::uuid
           )
-          OR (
-            $5::timestamptz IS NULL
-            AND matching.provider_updated_at IS NULL
-            AND (
-              matching.observed_at < $6::timestamptz
-              OR (
-                matching.observed_at = $6::timestamptz
-                AND matching.candidate_id < $7::uuid
-              )
-            )
-          )
-       ORDER BY
-         matching.provider_updated_at DESC NULLS LAST,
-         matching.observed_at DESC,
-         matching.candidate_id DESC
-       LIMIT $8::integer
+       ORDER BY matching.cursor_sort_value ${orderDirection},
+                matching.candidate_id ${orderDirection}
+       LIMIT $10::integer
      )
      SELECT
        candidate.id::text AS candidate_id,
@@ -1395,9 +1769,27 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
        display_snapshot.provider_updated_at,
        display_snapshot.observed_at,
        candidate.row_version::text AS candidate_row_version,
+       candidate.workflow_state,
+       (
+         candidate.workflow_state IN ('held', 'resolving', 'ready')
+         AND candidate.expires_at > now()
+         AND EXISTS (
+           SELECT 1
+           FROM operations_commerce_intake_runs candidate_run
+           WHERE candidate_run.organization_id = candidate.organization_id
+             AND candidate_run.integration_account_id
+               = candidate.integration_account_id
+             AND candidate_run.pipeline_id = candidate.pipeline_id
+             AND candidate_run.id = candidate.run_id
+             AND candidate_run.workflow_state <> 'expired'
+             AND candidate_run.expires_at > now()
+         )
+       ) AS action_available,
        display_snapshot.blocking_codes,
        display_snapshot.pipeline_id::text,
        display_snapshot.currency_code,
+       display_snapshot.total_minor::text,
+       display_snapshot.header_money_state,
        display_snapshot.requires_shipping,
        display_snapshot.customer_resolution_state,
        display_resolved_customer.reference_code AS customer_global_id,
@@ -1452,6 +1844,9 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          'retained'::text
        ) AS provider_status_source,
        exact_history.observed_at AS latest_exact_history_observed_at,
+       selected.activity_at,
+       selected.tracking_number,
+       selected.cursor_sort_value,
        selected.matching_total_count
      FROM page_candidate_ids selected
      JOIN operations_commerce_order_candidates candidate
@@ -1591,18 +1986,18 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
          AND line.integration_account_id = candidate.integration_account_id
          AND line.order_candidate_id = display_candidate.id
      ) line_count
-     ORDER BY
-       selected.provider_updated_at DESC NULLS LAST,
-       selected.observed_at DESC,
-       selected.candidate_id DESC`,
+     ORDER BY selected.cursor_sort_value ${orderDirection},
+              selected.candidate_id ${orderDirection}`,
     [
       organizationId,
       candidateGlobalId,
       searchPattern,
+      provider,
+      tracking,
+      updatedAfter,
       Boolean(cursor),
-      cursor?.providerUpdatedAt || null,
-      cursor?.observedAt || null,
-      cursor?.candidateId || null,
+      cursor?.sortValue ?? null,
+      cursor?.candidateId ?? null,
       pageSize + 1,
     ],
   )
@@ -1711,7 +2106,7 @@ export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   }
   const lastRow = pageRows.at(-1) || null
   const nextCursor = hasNextPage && lastRow
-    ? encodeWorkbenchPageCursor(lastRow, total, scopeHash)
+    ? encodeWorkbenchPageCursor(lastRow, total, scopeHash, sort)
     : null
   const providerHistoryByCandidate = new Map<
     string,
