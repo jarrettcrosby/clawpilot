@@ -4203,7 +4203,17 @@ async function verifyPostgresAcceptance(databaseUrl) {
         '@/lib/persistence/cartonizationRateEvidence':
           cartonizationRateEvidence,
         '@/lib/persistence/commerceOrderWorkbench': {
-          readCommerceOrderWorkbenchFromPostgres: async () => [],
+          readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+            orders: [],
+            page: {
+              total: 0,
+              returned: 0,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          }),
         },
         '@/lib/persistence/commerceProviderWrites': {
           CommerceProviderWriteControlError: class extends Error {},

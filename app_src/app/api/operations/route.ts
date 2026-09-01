@@ -1123,7 +1123,7 @@ export async function GET(req: NextRequest) {
       canPurchaseLivePostage:
         shippingCapabilities(actor).canPurchaseLivePostage,
       search,
-      status: statusValue || null,
+      status: (statusValue as OperationsOrderFilter) || null,
       exceptionStatus: (exceptionStatusValue as OperationsExceptionStatus) || null,
       selectedOrderGlobalId: selectedValue || null,
     })

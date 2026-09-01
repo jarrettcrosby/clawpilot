@@ -24,7 +24,8 @@ export const maxDuration = 300
 const BATCH_LIMIT = 10
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,120}$/u
 const ORDER_GLOBAL_ID = /^gor(?:[0-9]{7}|[0-9a-v]{12})$/u
-const MAX_EXCLUDED_ORDERS = 100
+const MAX_EXCLUDED_ORDERS = 500
+const MAX_REQUEST_BYTES = 16 * 1024
 
 function response(payload: Record<string, unknown>, status = 200) {
   return NextResponse.json(payload, {
@@ -81,7 +82,7 @@ export async function POST(req: NextRequest) {
       }, 400)
     }
     const rawBody = await req.text()
-    if (rawBody.length > 4096) {
+    if (Buffer.byteLength(rawBody, 'utf8') > MAX_REQUEST_BYTES) {
       return response({
         ok: false,
         code: 'COMMERCE_ORDER_STATUS_SYNC_BODY_INVALID',

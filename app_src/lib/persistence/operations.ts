@@ -3,7 +3,9 @@ import type { PoolClient, QueryResultRow } from 'pg'
 import { recordAuditEvent } from '@/lib/auditWriter'
 import { assertCurrentOrderUnitWeightEvidence } from '@/lib/persistence/orderUnitWeightEvidence'
 import { readCommerceStoreSyncControlsFromPostgres } from '@/lib/persistence/commerceStoreSync'
-import { readCommerceOrderWorkbenchFromPostgres } from '@/lib/persistence/commerceOrderWorkbench'
+import {
+  readCommerceOrderWorkbenchPageFromPostgres,
+} from '@/lib/persistence/commerceOrderWorkbench'
 import {
   CommerceProviderWriteControlError,
   readCommerceProviderWriteControlsFromPostgres,
@@ -133,6 +135,7 @@ import type {
   OperationsInboundReceiptInput,
   OperationsOrderDetail,
   OperationsOrderCommandResult,
+  OperationsOrderPage,
   OperationsOrderReplanningCorrectionResult,
   OperationsPlanCommandResult,
   OperationsOrderListItem,
@@ -353,6 +356,35 @@ type OrderIdentityRow = QueryResultRow & {
   status: OperationsOrderStatus
   row_version?: string
   tracking_number?: string | null
+}
+
+type OperationsOrderListReadRow = QueryResultRow & {
+  id: string
+  global_id: string
+  order_number: string
+  customer_name: string
+  customer_global_id: string
+  source_provider: string
+  status: OperationsOrderStatus
+  externally_fulfilled: boolean
+  warehouse_name: string | null
+  promised_delivery_at: Date | null
+  line_count: string
+  exception_count: string
+  expected_cost_minor: string | null
+  expected_revenue_minor: string | null
+  expected_margin_minor: string | null
+  tracking_number: string | null
+  updated_at: Date
+  matching_total_count: string
+}
+
+type OperationsOrderPageCursor = {
+  v: 1
+  updatedAt: string
+  orderId: string
+  total: number
+  scopeHash: string
 }
 
 type ActivationRow = QueryResultRow & {
@@ -4296,6 +4328,270 @@ async function readOrderDetail(
   }
 }
 
+type OperationsOrderPageStatus = OperationsOrderStatus | 'fulfilled_externally'
+
+const OPERATIONS_ORDER_PAGE_CURSOR = /^[A-Za-z0-9_-]{1,1000}$/u
+const OPERATIONS_ORDER_PAGE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+const MAX_OPERATIONS_ORDER_PAGE_SIZE = 250
+
+function operationsOrderPageScopeHash(input: Readonly<{
+  organizationId: string
+  search: string
+  status: OperationsOrderPageStatus | null
+}>) {
+  return createHash('sha256').update(JSON.stringify(input)).digest('hex')
+}
+
+function validOperationsOrderCursorTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 20 || value.length > 30) {
+    return false
+  }
+  const parsed = new Date(value)
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString() === value
+}
+
+function decodeOperationsOrderPageCursor(
+  cursor: string | null | undefined,
+  expectedScopeHash: string,
+): OperationsOrderPageCursor | null {
+  if (!cursor) return null
+  if (!OPERATIONS_ORDER_PAGE_CURSOR.test(cursor)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_CURSOR_INVALID',
+      'The order page cursor is invalid',
+      400,
+    )
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+  } catch {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_CURSOR_INVALID',
+      'The order page cursor is invalid',
+      400,
+    )
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_CURSOR_INVALID',
+      'The order page cursor is invalid',
+      400,
+    )
+  }
+  const parsed = value as Partial<OperationsOrderPageCursor>
+  const keys = Object.keys(parsed).sort().join(',')
+  if (
+    keys !== ['orderId', 'scopeHash', 'total', 'updatedAt', 'v'].sort().join(',')
+    || parsed.v !== 1
+    || !validOperationsOrderCursorTimestamp(parsed.updatedAt)
+    || typeof parsed.orderId !== 'string'
+    || !OPERATIONS_ORDER_PAGE_UUID.test(parsed.orderId)
+    || !Number.isSafeInteger(parsed.total)
+    || Number(parsed.total) < 0
+    || parsed.scopeHash !== expectedScopeHash
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_CURSOR_INVALID',
+      'The order page cursor is invalid',
+      400,
+    )
+  }
+  return parsed as OperationsOrderPageCursor
+}
+
+function encodeOperationsOrderPageCursor(
+  row: OperationsOrderListReadRow,
+  total: number,
+  scopeHash: string,
+) {
+  return Buffer.from(JSON.stringify({
+    v: 1,
+    updatedAt: row.updated_at.toISOString(),
+    orderId: row.id,
+    total,
+    scopeHash,
+  } satisfies OperationsOrderPageCursor), 'utf8').toString('base64url')
+}
+
+function operationsOrderPageSize(value: number | null | undefined) {
+  const pageSize = value ?? MAX_OPERATIONS_ORDER_PAGE_SIZE
+  if (
+    !Number.isSafeInteger(pageSize)
+    || pageSize < 1
+    || pageSize > MAX_OPERATIONS_ORDER_PAGE_SIZE
+  ) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_SIZE_INVALID',
+      'Order page size is invalid',
+      400,
+    )
+  }
+  return pageSize
+}
+
+function operationsOrderListItem(row: OperationsOrderListReadRow): OperationsOrderListItem {
+  return {
+    id: row.id,
+    globalId: row.global_id,
+    orderNumber: row.order_number,
+    customerName: row.customer_name,
+    customerGlobalId: row.customer_global_id,
+    sourceProvider: row.source_provider,
+    status: row.status,
+    externallyFulfilled: row.externally_fulfilled,
+    warehouseName: row.warehouse_name,
+    promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
+    lineCount: Number(row.line_count),
+    exceptionCount: Number(row.exception_count),
+    expectedCostMinor: row.expected_cost_minor,
+    expectedRevenueMinor: row.expected_revenue_minor,
+    expectedMarginMinor: row.expected_margin_minor,
+    trackingNumber: row.tracking_number,
+    updatedAt: row.updated_at.toISOString(),
+  }
+}
+
+export async function readOperationsOrderPageFromPostgres(input: {
+  organizationId: string
+  search?: string | null
+  status?: OperationsOrderPageStatus | null
+  cursor?: string | null
+  pageSize?: number | null
+}): Promise<{
+  orders: OperationsOrderListItem[]
+  page: OperationsOrderPage
+}> {
+  const organizationId = requireOrganizationId(input.organizationId)
+  const search = String(input.search || '').trim()
+  const status = input.status || null
+  const searchPattern = search
+    ? `%${search.replace(/[!%_]/gu, '!$&')}%`
+    : null
+  const pageSize = operationsOrderPageSize(input.pageSize)
+  const scopeHash = operationsOrderPageScopeHash({
+    organizationId,
+    search,
+    status,
+  })
+  const cursor = decodeOperationsOrderPageCursor(input.cursor, scopeHash)
+  const result = await query<OperationsOrderListReadRow>(
+    `WITH matching_order_ids AS (
+       SELECT orders.id, orders.updated_at,
+              count(*) OVER ()::text AS matching_total_count
+       FROM operations_orders orders
+       JOIN crm_organizations customer
+         ON customer.id = orders.customer_id
+        AND customer.pipeline_id = orders.pipeline_id
+       WHERE orders.organization_id = $1::uuid
+         AND orders.archived_at IS NULL
+         AND (
+           $2::text IS NULL
+           OR orders.order_number ILIKE $2 ESCAPE '!'
+           OR orders.global_id ILIKE $2 ESCAPE '!'
+           OR customer.name ILIKE $2 ESCAPE '!'
+         )
+         AND (
+           $3::text IS NULL
+           OR (
+             $3::text = 'fulfilled_externally'
+             AND ${externallyFulfilledOrderSql('orders')}
+           )
+           OR (
+             $3::text <> 'fulfilled_externally'
+             AND orders.status::text = $3::text
+             AND NOT (${externallyFulfilledOrderSql('orders')})
+           )
+         )
+     ), page_order_ids AS (
+       SELECT matching.id, matching.updated_at,
+              matching.matching_total_count
+       FROM matching_order_ids matching
+       WHERE NOT $4::boolean
+          OR matching.updated_at < $5::timestamptz
+          OR (
+            matching.updated_at = $5::timestamptz
+            AND matching.id < $6::uuid
+          )
+       ORDER BY matching.updated_at DESC, matching.id DESC
+       LIMIT $7::integer
+     )
+     SELECT orders.id::text, orders.global_id, orders.order_number,
+            customer.name AS customer_name,
+            customer.reference_code AS customer_global_id,
+            orders.source_provider, orders.status,
+            ${externallyFulfilledOrderSql('orders')}
+              AS externally_fulfilled,
+            warehouse.name AS warehouse_name,
+            orders.promised_delivery_at,
+            (SELECT count(*) FROM operations_current_order_lines line
+             WHERE line.order_id = orders.id)::text AS line_count,
+            (SELECT count(*) FROM operations_exceptions exception
+             WHERE exception.order_id = orders.id
+               AND exception.status IN ('open', 'acknowledged'))::text
+              AS exception_count,
+            plan.estimated_cost_minor::text,
+            plan.estimated_revenue_minor::text,
+            plan.estimated_margin_minor::text,
+            shipment.tracking_number,
+            orders.updated_at,
+            selected.matching_total_count
+     FROM page_order_ids selected
+     JOIN operations_orders orders ON orders.id = selected.id
+     JOIN crm_organizations customer
+       ON customer.id = orders.customer_id
+      AND customer.pipeline_id = orders.pipeline_id
+     LEFT JOIN LATERAL (
+       SELECT candidate.* FROM operations_fulfillment_plans candidate
+       WHERE candidate.order_id = orders.id
+       ORDER BY candidate.version_number DESC LIMIT 1
+     ) plan ON true
+     LEFT JOIN operations_warehouses warehouse ON warehouse.id = plan.warehouse_id
+     LEFT JOIN LATERAL (
+       SELECT candidate.tracking_number FROM operations_shipments candidate
+       WHERE candidate.order_id = orders.id
+       ORDER BY candidate.shipped_at DESC LIMIT 1
+     ) shipment ON true
+     ORDER BY selected.updated_at DESC, selected.id DESC`,
+    [
+      organizationId,
+      searchPattern,
+      status,
+      Boolean(cursor),
+      cursor?.updatedAt || null,
+      cursor?.orderId || null,
+      pageSize + 1,
+    ],
+  )
+  const hasNextPage = result.rows.length > pageSize
+  const pageRows = result.rows.slice(0, pageSize)
+  const total = pageRows.length
+    ? Number(pageRows[0].matching_total_count)
+    : cursor?.total || 0
+  if (!Number.isSafeInteger(total) || total < pageRows.length) {
+    throw new OperationsRequestError(
+      'OPERATIONS_ORDER_PAGE_EVIDENCE_INVALID',
+      'Order pagination returned invalid evidence',
+      500,
+    )
+  }
+  const lastRow = pageRows.at(-1) || null
+  const nextCursor = hasNextPage && lastRow
+    ? encodeOperationsOrderPageCursor(lastRow, total, scopeHash)
+    : null
+  return {
+    orders: pageRows.map(operationsOrderListItem),
+    page: {
+      total,
+      returned: pageRows.length,
+      pageSize,
+      nextCursor,
+      complete: nextCursor === null,
+      truncated: nextCursor !== null,
+    },
+  }
+}
+
 export async function readOperationsWorkspaceFromPostgres(input: {
   organizationId: string
   actorEmail?: string | null
@@ -4303,40 +4599,32 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   canVerifyPhysicalOutput?: boolean
   canPurchaseLivePostage?: boolean
   search?: string
-  status?: string | null
+  status?: OperationsOrderPageStatus | null
   exceptionStatus?: OperationsExceptionStatus | null
   selectedOrderGlobalId?: string | null
 }): Promise<OperationsWorkspace> {
   const organizationId = requireOrganizationId(input.organizationId)
-  const [activation, storeSync, importedOrders] = await Promise.all([
+  const [activation, storeSync, importedOrderResult, orderPageResult] = await Promise.all([
     withTransaction((client) => resolveActivation(client, organizationId)),
     readCommerceStoreSyncControlsFromPostgres(organizationId),
-    readCommerceOrderWorkbenchFromPostgres({
+    readCommerceOrderWorkbenchPageFromPostgres({
       organizationId,
       search: input.search,
     }),
+    readOperationsOrderPageFromPostgres({
+      organizationId,
+      search: input.search,
+      status: input.status,
+    }),
   ])
-  const values: unknown[] = [organizationId]
-  const where = ['orders.organization_id = $1::uuid', 'orders.archived_at IS NULL']
   const exceptionValues: unknown[] = [organizationId]
   const exceptionWhere = [
     'exception.organization_id = $1::uuid',
     '(orders.id IS NULL OR orders.archived_at IS NULL)',
   ]
   if (input.search) {
-    values.push(`%${input.search.toLowerCase()}%`)
-    where.push(`(lower(orders.order_number) LIKE $${values.length} OR lower(orders.global_id) LIKE $${values.length} OR lower(customer.name) LIKE $${values.length})`)
     exceptionValues.push(`%${input.search.toLowerCase()}%`)
     exceptionWhere.push(`(lower(exception.title) LIKE $${exceptionValues.length} OR lower(exception.global_id) LIKE $${exceptionValues.length} OR lower(COALESCE(orders.order_number, '')) LIKE $${exceptionValues.length} OR lower(COALESCE(customer.name, '')) LIKE $${exceptionValues.length})`)
-  }
-  if (input.status) {
-    if (input.status === 'fulfilled_externally') {
-      where.push(externallyFulfilledOrderSql('orders'))
-    } else {
-      values.push(input.status)
-      where.push(`orders.status = $${values.length}`)
-      where.push(`NOT (${externallyFulfilledOrderSql('orders')})`)
-    }
   }
   if (input.exceptionStatus) {
     exceptionValues.push(input.exceptionStatus)
@@ -4346,7 +4634,6 @@ export async function readOperationsWorkspaceFromPostgres(input: {
   const [
     configuredResult,
     summaryResult,
-    orderResult,
     exceptionResult,
     warehouseResult,
     warehouseLocationResult,
@@ -4429,52 +4716,6 @@ export async function readOperationsWorkspaceFromPostgres(input: {
                    WHERE event.organization_id = $1::uuid AND event.status = 'unbilled'
                      AND billable_order.archived_at IS NULL), 0)::text AS unbilled_minor`,
       [organizationId],
-    ),
-    query<QueryResultRow & {
-      id: string
-      global_id: string
-      order_number: string
-      customer_name: string
-      customer_global_id: string
-      source_provider: string
-      status: OperationsOrderStatus
-      externally_fulfilled: boolean
-      warehouse_name: string | null
-      promised_delivery_at: Date | null
-      line_count: string
-      exception_count: string
-      expected_cost_minor: string | null
-      expected_revenue_minor: string | null
-      expected_margin_minor: string | null
-      tracking_number: string | null
-      updated_at: Date
-    }>(
-      `SELECT orders.id::text, orders.global_id, orders.order_number,
-              customer.name AS customer_name, customer.reference_code AS customer_global_id,
-              orders.source_provider, orders.status,
-              ${externallyFulfilledOrderSql('orders')}
-                AS externally_fulfilled,
-              warehouse.name AS warehouse_name,
-              orders.promised_delivery_at,
-              (SELECT count(*) FROM operations_current_order_lines line WHERE line.order_id = orders.id)::text AS line_count,
-              (SELECT count(*) FROM operations_exceptions exception WHERE exception.order_id = orders.id AND exception.status IN ('open', 'acknowledged'))::text AS exception_count,
-              plan.estimated_cost_minor::text, plan.estimated_revenue_minor::text,
-              plan.estimated_margin_minor::text, shipment.tracking_number, orders.updated_at
-       FROM operations_orders orders
-       JOIN crm_organizations customer ON customer.id = orders.customer_id AND customer.pipeline_id = orders.pipeline_id
-       LEFT JOIN LATERAL (
-         SELECT candidate.* FROM operations_fulfillment_plans candidate
-         WHERE candidate.order_id = orders.id ORDER BY candidate.version_number DESC LIMIT 1
-       ) plan ON true
-       LEFT JOIN operations_warehouses warehouse ON warehouse.id = plan.warehouse_id
-       LEFT JOIN LATERAL (
-         SELECT candidate.tracking_number FROM operations_shipments candidate
-         WHERE candidate.order_id = orders.id ORDER BY candidate.shipped_at DESC LIMIT 1
-       ) shipment ON true
-       WHERE ${where.join(' AND ')}
-       ORDER BY orders.updated_at DESC, orders.id DESC
-       LIMIT 100`,
-      values,
     ),
     query<ExceptionRow>(
       `SELECT exception.id::text, exception.global_id, exception.exception_type,
@@ -4829,25 +5070,6 @@ export async function readOperationsWorkspaceFromPostgres(input: {
     ),
   ])
 
-  const orders: OperationsOrderListItem[] = orderResult.rows.map((row) => ({
-    id: row.id,
-    globalId: row.global_id,
-    orderNumber: row.order_number,
-    customerName: row.customer_name,
-    customerGlobalId: row.customer_global_id,
-    sourceProvider: row.source_provider,
-    status: row.status,
-    externallyFulfilled: row.externally_fulfilled,
-    warehouseName: row.warehouse_name,
-    promisedDeliveryAt: row.promised_delivery_at?.toISOString() || null,
-    lineCount: Number(row.line_count),
-    exceptionCount: Number(row.exception_count),
-    expectedCostMinor: row.expected_cost_minor,
-    expectedRevenueMinor: row.expected_revenue_minor,
-    expectedMarginMinor: row.expected_margin_minor,
-    trackingNumber: row.tracking_number,
-    updatedAt: row.updated_at.toISOString(),
-  }))
   const selectedGlobalId = input.selectedOrderGlobalId || null
   const summary = summaryResult.rows[0]
   return {
@@ -4871,7 +5093,8 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       updatedAt: activation.updated_at.toISOString(),
     },
     storeSync,
-    importedOrders,
+    importedOrders: importedOrderResult.orders,
+    importedOrderPage: importedOrderResult.page,
     summary: {
       openOrders: Number(summary?.open_orders || 0),
       exceptions: Number(summary?.exceptions || 0),
@@ -4881,7 +5104,8 @@ export async function readOperationsWorkspaceFromPostgres(input: {
       availableUnits: Number(summary?.available_units || 0),
       unbilledMinor: summary?.unbilled_minor || '0',
     },
-    orders,
+    orders: orderPageResult.orders,
+    orderPage: orderPageResult.page,
     exceptions: exceptionResult.rows.map(exceptionListItem),
     selectedOrder: selectedGlobalId ? await readOrderDetail(organizationId, selectedGlobalId, {
       activationState: activation.state,

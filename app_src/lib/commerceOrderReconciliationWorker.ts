@@ -288,6 +288,10 @@ async function persistAutomaticFaireAttention(
  */
 export async function processCommerceOrderReconciliation(input: {
   limit?: number
+  organizationId?: string
+  accountGlobalIds?: string[]
+  force?: boolean
+  processRevisionWorkers?: boolean
   /** Deterministic test seam; API callers never supply this. */
   clock?: () => number
 }) {
@@ -301,6 +305,9 @@ export async function processCommerceOrderReconciliation(input: {
       reason: 'commerce-intake-disabled',
       claimed: 0,
       staged: 0,
+      preserved: 0,
+      skippedCanonical: 0,
+      providerRecordsSeen: 0,
       rejected: 0,
       failed: 0,
       leaseLost: 0,
@@ -361,8 +368,16 @@ export async function processCommerceOrderReconciliation(input: {
   }
   const targets = await claimCommerceOrderReconciliationTargetsInPostgres({
     limit: Math.max(1, Math.min(Number(input.limit || 1), 5)),
+    ...(input.organizationId ? { organizationId: input.organizationId } : {}),
+    ...(input.accountGlobalIds
+      ? { accountGlobalIds: input.accountGlobalIds }
+      : {}),
+    ...(input.force === undefined ? {} : { force: input.force }),
   })
   let staged = 0
+  let preserved = 0
+  let skippedCanonical = 0
+  let providerRecordsSeen = 0
   let rejected = 0
   let failed = 0
   let leaseLost = 0
@@ -414,6 +429,8 @@ export async function processCommerceOrderReconciliation(input: {
       let targetPagesRead = 0
       let targetProviderRecordsSeen = 0
       let targetOrdersHeld = 0
+      let targetOrdersPreserved = 0
+      let targetOrdersSkippedCanonical = 0
       let targetRecordsRejected = 0
       let targetCustomersMatched = 0
       let targetCustomersCreated = 0
@@ -507,12 +524,12 @@ export async function processCommerceOrderReconciliation(input: {
                   continuationRunGlobalId,
                 })
               )
-            : deterministicRunUuid({
-                organizationId: target.organizationId,
-                accountGlobalId: target.accountGlobalId,
-                credentialVersion: target.credentialVersion,
-                startedAt: `${target.startedAt}:${targetPagesRead}:first`,
-              }),
+              : deterministicRunUuid({
+                  organizationId: target.organizationId,
+                  accountGlobalId: target.accountGlobalId,
+                  credentialVersion: target.credentialVersion,
+                  startedAt: `${target.startedAt}:${targetPagesRead}:first`,
+                }),
           continuationRunGlobalId,
         })
         const command = record(response.command)
@@ -529,6 +546,8 @@ export async function processCommerceOrderReconciliation(input: {
         const pageProviderRecordsSeen = count(pagination.providerRowsSeen)
         targetProviderRecordsSeen += pageProviderRecordsSeen
         targetOrdersHeld += count(command.ordersStaged)
+        targetOrdersPreserved += count(command.ordersPreserved)
+        targetOrdersSkippedCanonical += count(command.ordersSkippedCanonical)
         targetRecordsRejected += count(command.recordsRejected)
         targetCustomersMatched += count(automaticCustomerResolution.matched)
         targetCustomersCreated += count(automaticCustomerResolution.created)
@@ -956,6 +975,9 @@ export async function processCommerceOrderReconciliation(input: {
       } else {
         pagesRead += targetPagesRead
         staged += targetOrdersHeld
+        preserved += targetOrdersPreserved
+        skippedCanonical += targetOrdersSkippedCanonical
+        providerRecordsSeen += targetProviderRecordsSeen
         rejected += targetRecordsRejected
         customersMatched += targetCustomersMatched
         customersCreated += targetCustomersCreated
@@ -1056,14 +1078,43 @@ export async function processCommerceOrderReconciliation(input: {
     Number(input.limit || 1),
     MAX_PROVIDER_REVISION_TARGETS_PER_RECONCILIATION,
   ))
-  const [shopifyOrderRevisions, faireOrderRevisions] = await Promise.all([
-    processShopifyOrderRevisions({ limit: revisionLimit }),
-    processFaireOrderRevisions({ limit: revisionLimit }),
-  ])
+  const [shopifyOrderRevisions, faireOrderRevisions] =
+    input.processRevisionWorkers === false
+      ? [{
+          provider: 'shopify' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          parked: 0,
+          failureCodes: {},
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        }, {
+          provider: 'faire' as const,
+          claimed: 0,
+          captured: 0,
+          changed: 0,
+          failed: 0,
+          parked: 0,
+          failureCodes: {},
+          providerReadsPerCapture: 2 as const,
+          providerWrites: 0 as const,
+          canonicalOrderWrites: 0 as const,
+          managerDispositionRequired: 0,
+        }]
+      : await Promise.all([
+          processShopifyOrderRevisions({ limit: revisionLimit }),
+          processFaireOrderRevisions({ limit: revisionLimit }),
+        ])
   return {
     skipped: false,
     claimed: targets.length,
     staged,
+    preserved,
+    skippedCanonical,
+    providerRecordsSeen,
     rejected,
     failed,
     leaseLost,

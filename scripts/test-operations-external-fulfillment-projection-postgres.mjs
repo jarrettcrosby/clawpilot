@@ -76,7 +76,17 @@ function operationsPersistenceFor(pool) {
     '@/lib/persistence/crm': {},
     '@/lib/persistence/cartonizationRateEvidence': {},
     '@/lib/persistence/commerceOrderWorkbench': {
-      readCommerceOrderWorkbenchFromPostgres: async () => [],
+      readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+        orders: [],
+        page: {
+          total: 0,
+          returned: 0,
+          pageSize: 250,
+          nextCursor: null,
+          complete: true,
+          truncated: false,
+        },
+      }),
     },
     '@/lib/persistence/commerceProviderWrites': {
       CommerceProviderWriteControlError: NamedBoundaryError,
@@ -304,6 +314,36 @@ async function seedFixture(pool) {
         ],
       )
     }
+    await client.query(
+      `INSERT INTO operations_orders (
+         id, global_id, organization_id, pipeline_id, customer_id,
+         integration_account_id, source_provider, external_order_id,
+         order_number, status, currency, merchandise_total_minor,
+         promised_delivery_at, ship_to, source_payload,
+         created_by, updated_by, updated_at
+       )
+       SELECT gen_random_uuid(),
+              'gor' || lpad((9800 + seed)::text, 7, '0'),
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              'shopify',
+              'gid://shopify/Order/' || (9800 + seed)::text,
+              '#' || (9800 + seed)::text,
+              'cancelled', 'USD', 1000, NULL,
+              '{"name":"Projection recipient","line1":"35 Saxony Drive",'
+                '"city":"Trumbull","region":"CT","postalCode":"06611",'
+                '"country":"US"}'::jsonb,
+              jsonb_build_object('sourceHash', repeat('2', 64)),
+              $5, $5,
+              '2026-08-31T12:00:00.000Z'::timestamptz
+       FROM generate_series(0, 110) AS seed`,
+      [
+        ids.organization,
+        ids.pipeline,
+        ids.customer,
+        ids.integration,
+        actorEmail,
+      ],
+    )
 
     await client.query(
       `INSERT INTO operations_commerce_order_revision_targets (
@@ -476,6 +516,10 @@ async function verifyProjection(databaseUrl) {
     const projected = workspace.orders.find(
       (order) => order.globalId === 'gor0009701',
     )
+    assert.equal(workspace.orderPage.total, 115)
+    assert.equal(workspace.orderPage.returned, 115)
+    assert.equal(workspace.orderPage.nextCursor, null)
+    assert.equal(workspace.orders.length, 115)
     assert.equal(projected?.status, 'imported')
     assert.equal(projected?.externallyFulfilled, true)
     assert.equal(workspace.selectedOrder?.globalId, 'gor0009701')
@@ -491,6 +535,35 @@ async function verifyProjection(databaseUrl) {
     assert.deepEqual(workspace.selectedOrder?.labelPrintJobs, [])
     assert.equal(workspace.summary.openOrders, 2)
     assert.equal(workspace.summary.dueSoon, 1)
+
+    const cancelledOrders = []
+    let cancelledCursor = null
+    let cancelledPages = 0
+    do {
+      const page = plain(
+        await persistence.readOperationsOrderPageFromPostgres({
+          organizationId: ids.organization,
+          status: 'cancelled',
+          cursor: cancelledCursor,
+          pageSize: 40,
+        }),
+      )
+      cancelledPages += 1
+      assert.equal(page.page.total, 111)
+      assert.equal(page.page.returned, page.orders.length)
+      assert.equal(page.page.pageSize, 40)
+      assert.equal(page.page.complete, page.page.nextCursor === null)
+      assert.equal(page.page.truncated, page.page.nextCursor !== null)
+      cancelledOrders.push(...page.orders)
+      cancelledCursor = page.page.nextCursor
+    } while (cancelledCursor)
+    assert.equal(cancelledPages, 3)
+    assert.equal(cancelledOrders.length, 111)
+    assert.equal(
+      new Set(cancelledOrders.map((order) => order.globalId)).size,
+      111,
+      'canonical keyset pages must include each matching order exactly once',
+    )
 
     const imported = plain(
       await persistence.readOperationsWorkspaceFromPostgres({

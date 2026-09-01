@@ -13,6 +13,9 @@ const requireFromApp = createRequire(
 )
 const ts = requireFromApp('typescript')
 const routePath = 'app_src/app/api/operations/order-status-sync/route.ts'
+const discoveryRoutePath = 'app_src/app/api/operations/order-discovery/route.ts'
+const discoveryPersistencePath =
+  'app_src/lib/persistence/commerceOrderDiscovery.ts'
 const commandPath = 'app_src/lib/operations/commerceOrderRevisionCommands.ts'
 const persistencePath = 'app_src/lib/persistence/commerceOrderRevisions.ts'
 const operationsPath = 'app_src/lib/persistence/operations.ts'
@@ -39,6 +42,7 @@ function loadTypeScriptModule(path, mocks) {
   assert.deepEqual(errors, [], `${path} must transpile`)
   const module = { exports: {} }
   vm.runInNewContext(output.outputText, {
+    Buffer,
     Error,
     Headers,
     JSON,
@@ -537,7 +541,628 @@ assert.deepEqual({
   failure: 0,
 })
 
+class CommerceIntegrationRequestError extends Error {
+  constructor(message, status = 400, code = 'COMMERCE_REQUEST_INVALID') {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+const discoveryCalls = {
+  process: [],
+  controls: [],
+  reset: [],
+  state: [],
+  receiptPrepare: [],
+  receiptComplete: [],
+}
+const discoveryReceipts = new Map()
+let discoveryActor = {
+  email: actorEmail,
+  organizationId,
+  capabilities: { canManage: true },
+}
+let discoveryControls = [{
+  accountGlobalId: 'gia1000001',
+  provider: 'shopify',
+  environment: 'sandbox',
+  displayName: 'Test Shopify',
+  accountStatus: 'active',
+  desiredState: 'running',
+  effectiveState: 'running',
+  effectiveReason: 'STORE_SYNC_EXPLICIT_RUNNING',
+  effectiveReasonLabel: 'Running',
+  explicitChoice: true,
+  revision: 1,
+  reason: 'test',
+  updatedAt: '2026-08-31T20:00:00.000Z',
+}]
+let discoveryState = {
+  status: 'failed',
+  recordsSeen: 100,
+  recordsHeld: 90,
+  consecutiveFailures: 1,
+  lastErrorCode: 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+  lastStartedAt: '2026-08-31T20:00:00.000Z',
+  lastCompletedAt: null,
+  resumable: false,
+  resetRequired: true,
+  providerWrites: 0,
+  canonicalOrderWrites: 0,
+  inventoryWrites: 0,
+}
+let discoveryExecution = {
+  skipped: false,
+  providerWrites: 0,
+  canonicalOrderWrites: 2,
+  inventoryWrites: 0,
+  claimed: 1,
+  staged: 3,
+  preserved: 5,
+  skippedCanonical: 2,
+  providerRecordsSeen: 10,
+  rejected: 4,
+  failed: 0,
+  pagesRead: 2,
+  resumable: 0,
+  failureCodes: {},
+}
+const discoveryRoute = loadTypeScriptModule(discoveryRoutePath, {
+  'next/server': {
+    NextResponse: {
+      json(payload, init = {}) {
+        return new Response(JSON.stringify(payload), {
+          status: init.status || 200,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(init.headers || {}),
+          },
+        })
+      },
+    },
+  },
+  '@/lib/integrations/commerceIntegrations': {
+    CommerceIntegrationRequestError,
+    sanitizedCommerceIntegrationError(error) {
+      return {
+        code: error.code,
+        message: error.message,
+        status: error.status,
+      }
+    },
+  },
+  '@/lib/commerceOrderReconciliationWorker': {
+    async processCommerceOrderReconciliation(input) {
+      discoveryCalls.process.push(input)
+      discoveryState = {
+        ...discoveryState,
+        status: discoveryExecution.claimed === 0
+          ? 'running'
+          : discoveryExecution.failed > 0
+            ? 'failed'
+            : 'succeeded',
+        recordsSeen: discoveryExecution.failed > 0 ? 0 : 10,
+        recordsHeld: discoveryExecution.failed > 0 ? 0 : 3,
+        lastErrorCode: discoveryExecution.failed > 0
+          ? 'COMMERCE_PROVIDER_READ_FAILED'
+          : null,
+        lastStartedAt: '2026-08-31T20:01:00.000Z',
+        lastCompletedAt: discoveryExecution.claimed === 0
+          ? null
+          : '2026-08-31T20:01:01.000Z',
+        resetRequired: false,
+      }
+      return discoveryExecution
+    },
+  },
+  '@/lib/operations/authorization': {
+    activeOperationsOrganizationId(value) {
+      return value.organizationId
+    },
+    operationsCapabilities(value) {
+      return value.capabilities
+    },
+  },
+  '@/lib/persistence/config': {
+    isPostgresStorageEnabled() {
+      return true
+    },
+  },
+  '@/lib/persistence/commerceStoreSync': {
+    async readCommerceStoreSyncControlsFromPostgres(value) {
+      discoveryCalls.controls.push(value)
+      return discoveryControls
+    },
+  },
+  '@/lib/persistence/commerceOrderReconciliation': {
+    async readCommerceOrderReconciliationStateInPostgres(input) {
+      discoveryCalls.state.push(input)
+      return discoveryState
+    },
+    async resetCommerceOrderReconciliationInPostgres(input) {
+      discoveryCalls.reset.push(input)
+      discoveryState = {
+        ...discoveryState,
+        status: 'idle',
+        recordsSeen: 0,
+        recordsHeld: 0,
+        lastErrorCode: null,
+        lastStartedAt: null,
+        resetRequired: false,
+      }
+      return {
+        accountGlobalId: input.accountGlobalId,
+        status: 'idle',
+        providerWrites: 0,
+        canonicalOrderWrites: 0,
+        inventoryWrites: 0,
+      }
+    },
+  },
+  '@/lib/persistence/commerceOrderDiscovery': {
+    async prepareCommerceOrderDiscoveryCommandInPostgres(input) {
+      discoveryCalls.receiptPrepare.push(input)
+      const key = `${input.organizationId}:${input.idempotencyKey}`
+      const prior = discoveryReceipts.get(key)
+      if (prior) {
+        if (prior.accountGlobalId !== input.accountGlobalId) {
+          throw new CommerceIntegrationRequestError(
+            'This idempotency key was already used for a different connected store refresh',
+            409,
+            'COMMERCE_ORDER_DISCOVERY_IDEMPOTENCY_CONFLICT',
+          )
+        }
+        if (prior.result) return { kind: 'replay', result: prior.result }
+        throw new CommerceIntegrationRequestError(
+          'This connected-store refresh request is already being processed',
+          409,
+          'COMMERCE_ORDER_DISCOVERY_COMMAND_IN_PROGRESS',
+        )
+      }
+      const receiptId = `receipt-${discoveryReceipts.size + 1}`
+      const attemptToken = `00000000-0000-4000-8000-${String(
+        discoveryReceipts.size + 1,
+      ).padStart(12, '0')}`
+      discoveryReceipts.set(key, {
+        accountGlobalId: input.accountGlobalId,
+        receiptId,
+        attemptToken,
+        result: null,
+      })
+      return { kind: 'execute', receiptId, attemptToken }
+    },
+    async completeCommerceOrderDiscoveryCommandInPostgres(input) {
+      discoveryCalls.receiptComplete.push(input)
+      const key = `${input.organizationId}:${input.idempotencyKey}`
+      const receipt = discoveryReceipts.get(key)
+      assert.equal(receipt?.receiptId, input.receiptId)
+      assert.equal(receipt?.attemptToken, input.attemptToken)
+      if (receipt.result) return receipt.result
+      receipt.result = plain(input.result)
+      return receipt.result
+    },
+  },
+  '@/lib/requestUser': {
+    async requireRequestUser() {
+      return discoveryActor
+    },
+  },
+})
+
+function discoveryRequest(options = {}) {
+  const request = new Request(
+    options.url || 'https://clawpilot.example/api/operations/order-discovery',
+    {
+      method: 'POST',
+      headers: options.headers || {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': options.idempotencyKey
+          || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      },
+      body: options.body || JSON.stringify({
+        accountGlobalId: 'gia1000001',
+      }),
+    },
+  )
+  Object.defineProperty(request, 'nextUrl', { value: new URL(request.url) })
+  return request
+}
+
+const discoveredResponse = await discoveryRoute.POST(discoveryRequest())
+assert.equal(discoveredResponse.status, 200)
+const discoveredPayload = plain(await discoveredResponse.json())
+assert.deepEqual(discoveredPayload, {
+  ok: true,
+  result: {
+    accountGlobalId: 'gia1000001',
+    displayName: 'Test Shopify',
+    provider: 'shopify',
+    counts: {
+      providerRowsSeen: 10,
+      eligibleOrdersSeen: 10,
+      ordersStaged: 3,
+      ordersPreserved: 5,
+      ordersSkippedCanonical: 2,
+      recordsRejected: 4,
+      canonicalOrdersCreated: 2,
+    },
+    pagination: {
+      batchNumber: 2,
+      continuationRunGlobalId: null,
+      hasNextBatch: false,
+      sessionComplete: true,
+    },
+    refresh: {
+      claimed: 1,
+      failed: 0,
+      failureCodes: {},
+      reset: true,
+      status: 'succeeded',
+      resumable: false,
+    },
+    providerWrites: 0,
+  },
+})
+assert.deepEqual(discoveryCalls.controls, [organizationId])
+assert.deepEqual(plain(discoveryCalls.process), [{
+  limit: 1,
+  organizationId,
+  accountGlobalIds: ['gia1000001'],
+  force: true,
+  processRevisionWorkers: false,
+}])
+assert.equal(discoveryCalls.reset.length, 1)
+assert.deepEqual({
+  organizationId: discoveryCalls.reset[0].organizationId,
+  accountGlobalId: discoveryCalls.reset[0].accountGlobalId,
+  actorEmail: discoveryCalls.reset[0].actorEmail,
+  expectedLastErrorCode: discoveryCalls.reset[0].expectedLastErrorCode,
+  expectedLastStartedAt: discoveryCalls.reset[0].expectedLastStartedAt,
+  confirmReset: discoveryCalls.reset[0].confirmReset,
+}, {
+  organizationId,
+  accountGlobalId: 'gia1000001',
+  actorEmail,
+  expectedLastErrorCode: 'COMMERCE_INTAKE_READ_RESTART_REQUIRED',
+  expectedLastStartedAt: '2026-08-31T20:00:00.000Z',
+  confirmReset: true,
+})
+assert.match(
+  discoveryCalls.reset[0].idempotencyKey,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+)
+assert.notEqual(
+  discoveryCalls.reset[0].idempotencyKey,
+  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+)
+const discoveryReplay = await discoveryRoute.POST(discoveryRequest())
+assert.equal(discoveryReplay.status, 200)
+assert.deepEqual(
+  plain(await discoveryReplay.json()),
+  discoveredPayload,
+  'a lost-response retry must replay the exact completed result',
+)
+assert.equal(discoveryCalls.process.length, 1)
+assert.equal(discoveryCalls.receiptComplete.length, 1)
+
+discoveryExecution = {
+  ...discoveryExecution,
+  claimed: 0,
+  staged: 0,
+  rejected: 0,
+  pagesRead: 0,
+}
+const runningDiscovery = await discoveryRoute.POST(discoveryRequest({
+  idempotencyKey: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+}))
+assert.equal(runningDiscovery.status, 202)
+const runningDiscoveryPayload = await runningDiscovery.json()
+assert.equal(runningDiscoveryPayload.result.refresh.status, 'running')
+assert.equal(runningDiscoveryPayload.result.pagination.hasNextBatch, true)
+assert.equal(runningDiscoveryPayload.result.pagination.sessionComplete, false)
+
+discoveryExecution = {
+  ...discoveryExecution,
+  claimed: 1,
+  failed: 1,
+  failureCodes: { COMMERCE_PROVIDER_READ_FAILED: 1 },
+}
+const failedDiscovery = await discoveryRoute.POST(discoveryRequest({
+  idempotencyKey: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+}))
+assert.equal(failedDiscovery.status, 502)
+assert.equal(
+  (await failedDiscovery.json()).code,
+  'COMMERCE_ORDER_DISCOVERY_PROVIDER_READ_FAILED',
+)
+
+discoveryExecution = {
+  ...discoveryExecution,
+  claimed: 1,
+  failed: 0,
+  failureCodes: {},
+}
+
+discoveryControls = [{ ...discoveryControls[0], effectiveState: 'paused' }]
+const pausedResponse = await discoveryRoute.POST(discoveryRequest({
+  idempotencyKey: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+}))
+assert.equal(pausedResponse.status, 409)
+assert.equal(
+  (await pausedResponse.json()).code,
+  'COMMERCE_ORDER_DISCOVERY_ACCOUNT_PAUSED',
+)
+assert.equal(discoveryCalls.process.length, 3)
+
+discoveryControls = [{ ...discoveryControls[0], effectiveState: 'running' }]
+discoveryActor = { ...discoveryActor, organizationId: otherOrganizationId }
+const otherTenantSameKey = await discoveryRoute.POST(discoveryRequest())
+assert.equal(otherTenantSameKey.status, 200)
+assert.equal(
+  (await otherTenantSameKey.json()).result.accountGlobalId,
+  'gia1000001',
+)
+discoveryActor = { ...discoveryActor, organizationId }
+discoveryControls = [
+  discoveryControls[0],
+  {
+    ...discoveryControls[0],
+    accountGlobalId: 'gia1000002',
+    displayName: 'Other Shopify',
+  },
+]
+const mismatchedAccountReplay = await discoveryRoute.POST(discoveryRequest({
+  body: JSON.stringify({ accountGlobalId: 'gia1000002' }),
+}))
+assert.equal(mismatchedAccountReplay.status, 409)
+assert.equal(
+  (await mismatchedAccountReplay.json()).code,
+  'COMMERCE_ORDER_DISCOVERY_IDEMPOTENCY_CONFLICT',
+)
+
+discoveryActor = {
+  ...discoveryActor,
+  capabilities: { canManage: false },
+}
+const forbiddenDiscovery = await discoveryRoute.POST(discoveryRequest())
+assert.equal(forbiddenDiscovery.status, 403)
+assert.equal((await forbiddenDiscovery.json()).code, 'OPERATIONS_MANAGE_REQUIRED')
+
+const durableDiscoveryReceipts = new Map()
+const durableDiscoveryLocks = []
+const durableDiscoveryClient = {
+  async query(sql, values = []) {
+    const normalized = sql.replace(/\s+/g, ' ').trim()
+    const lookupKey = `${values[0]}:${values[1]}:${values[2]}`
+    if (
+      normalized.startsWith('SELECT id::text, request_hash')
+      && normalized.includes('FROM operations_command_receipts')
+    ) {
+      const receipt = durableDiscoveryReceipts.get(lookupKey)
+      if (!receipt || (values[3] && receipt.id !== values[3])) {
+        return { rows: [], rowCount: 0 }
+      }
+      return { rows: [receipt], rowCount: 1 }
+    }
+    if (normalized.startsWith('INSERT INTO operations_command_receipts')) {
+      const receiptNumber = durableDiscoveryReceipts.size + 1
+      const receipt = {
+        id: receiptNumber === 1
+          ? 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+          : `00000000-0000-4000-8000-${String(receiptNumber).padStart(12, '0')}`,
+        request_hash: values[3],
+        target_global_id: values[6],
+        status: 'processing',
+        correlation_id: values[5],
+        result_payload: null,
+        updated_at: new Date(),
+      }
+      durableDiscoveryReceipts.set(lookupKey, receipt)
+      return {
+        rows: [{ id: receipt.id, correlation_id: receipt.correlation_id }],
+        rowCount: 1,
+      }
+    }
+    if (
+      normalized.startsWith('UPDATE operations_command_receipts')
+      && normalized.includes("SET status = 'succeeded'")
+    ) {
+      const receipt = [...durableDiscoveryReceipts.values()]
+        .find((candidate) => candidate.id === values[0])
+      assert.ok(receipt)
+      if (
+        receipt.status !== 'processing'
+        || receipt.correlation_id !== values[3]
+      ) {
+        return { rows: [], rowCount: 0 }
+      }
+      receipt.status = 'succeeded'
+      receipt.target_global_id = values[1]
+      receipt.result_payload = JSON.parse(values[2])
+      receipt.updated_at = new Date()
+      return { rows: [receipt], rowCount: 1 }
+    }
+    if (
+      normalized.startsWith('UPDATE operations_command_receipts')
+      && normalized.includes("SET status = 'processing'")
+    ) {
+      const receipt = [...durableDiscoveryReceipts.values()]
+        .find((candidate) => candidate.id === values[0])
+      assert.ok(receipt)
+      receipt.status = 'processing'
+      receipt.correlation_id = values[2]
+      receipt.result_payload = null
+      receipt.updated_at = new Date()
+      return {
+        rows: [{ id: receipt.id, correlation_id: receipt.correlation_id }],
+        rowCount: 1,
+      }
+    }
+    throw new Error(`Unexpected discovery receipt SQL: ${normalized}`)
+  },
+}
+const discoveryReceiptPersistence = loadTypeScriptModule(
+  discoveryPersistencePath,
+  {
+    '@/lib/integrations/commerceIntegrations': {
+      CommerceIntegrationRequestError,
+    },
+    '@/lib/persistence/postgres': {
+      async acquireTransactionAdvisoryLock(_client, key) {
+        durableDiscoveryLocks.push(key)
+      },
+      async withTransaction(action) {
+        return action(durableDiscoveryClient)
+      },
+    },
+  },
+)
+const durableCommandInput = {
+  organizationId,
+  accountGlobalId: 'gia1000001',
+  actorEmail,
+  idempotencyKey: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+}
+const durablePrepared = await discoveryReceiptPersistence
+  .prepareCommerceOrderDiscoveryCommandInPostgres(durableCommandInput)
+assert.deepEqual(plain(durablePrepared), {
+  kind: 'execute',
+  receiptId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+  attemptToken: durablePrepared.attemptToken,
+})
+assert.match(
+  durablePrepared.attemptToken,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+)
+const durableHttpResult = {
+  status: 202,
+  body: {
+    ok: true,
+    result: {
+      accountGlobalId: 'gia1000001',
+      providerWrites: 0,
+      pagination: { hasNextBatch: true, sessionComplete: false },
+    },
+  },
+}
+assert.deepEqual(
+  plain(await discoveryReceiptPersistence
+    .completeCommerceOrderDiscoveryCommandInPostgres({
+      ...durableCommandInput,
+      receiptId: durablePrepared.receiptId,
+      attemptToken: durablePrepared.attemptToken,
+      result: durableHttpResult,
+    })),
+  durableHttpResult,
+)
+assert.deepEqual(
+  plain(await discoveryReceiptPersistence
+    .completeCommerceOrderDiscoveryCommandInPostgres({
+      ...durableCommandInput,
+      receiptId: durablePrepared.receiptId,
+      attemptToken: durablePrepared.attemptToken,
+      result: durableHttpResult,
+    })),
+  durableHttpResult,
+  'same-attempt completion retries must replay an already committed result',
+)
+assert.deepEqual(
+  plain(await discoveryReceiptPersistence
+    .prepareCommerceOrderDiscoveryCommandInPostgres(durableCommandInput)),
+  { kind: 'replay', result: durableHttpResult },
+  'the durable receipt must replay the exact response status and body',
+)
+let durableConflict = null
+try {
+  await discoveryReceiptPersistence
+    .prepareCommerceOrderDiscoveryCommandInPostgres({
+      ...durableCommandInput,
+      accountGlobalId: 'gia1000002',
+    })
+} catch (error) {
+  durableConflict = error
+}
+assert.equal(
+  durableConflict?.code,
+  'COMMERCE_ORDER_DISCOVERY_IDEMPOTENCY_CONFLICT',
+)
+const isolatedTenantPrepared = await discoveryReceiptPersistence
+  .prepareCommerceOrderDiscoveryCommandInPostgres({
+    ...durableCommandInput,
+    organizationId: otherOrganizationId,
+  })
+assert.equal(isolatedTenantPrepared.kind, 'execute')
+
+const takeoverCommandInput = {
+  ...durableCommandInput,
+  idempotencyKey: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+}
+const originalAttempt = await discoveryReceiptPersistence
+  .prepareCommerceOrderDiscoveryCommandInPostgres(takeoverCommandInput)
+assert.equal(originalAttempt.kind, 'execute')
+const takeoverReceipt = [...durableDiscoveryReceipts.values()]
+  .find((receipt) => receipt.id === originalAttempt.receiptId)
+assert.ok(takeoverReceipt)
+takeoverReceipt.updated_at = new Date(Date.now() - 7 * 60_000)
+const retryAttempt = await discoveryReceiptPersistence
+  .prepareCommerceOrderDiscoveryCommandInPostgres(takeoverCommandInput)
+assert.equal(retryAttempt.kind, 'execute')
+assert.equal(retryAttempt.receiptId, originalAttempt.receiptId)
+assert.notEqual(retryAttempt.attemptToken, originalAttempt.attemptToken)
+
+let supersededAttemptError = null
+try {
+  await discoveryReceiptPersistence
+    .completeCommerceOrderDiscoveryCommandInPostgres({
+      ...takeoverCommandInput,
+      receiptId: originalAttempt.receiptId,
+      attemptToken: originalAttempt.attemptToken,
+      result: {
+        status: 200,
+        body: { ok: true, result: { source: 'stale-original' } },
+      },
+    })
+} catch (error) {
+  supersededAttemptError = error
+}
+assert.equal(
+  supersededAttemptError?.code,
+  'COMMERCE_ORDER_DISCOVERY_ATTEMPT_SUPERSEDED',
+)
+assert.equal(takeoverReceipt.status, 'processing')
+assert.equal(takeoverReceipt.result_payload, null)
+
+const takeoverHttpResult = {
+  status: 200,
+  body: { ok: true, result: { source: 'retry-takeover' } },
+}
+assert.deepEqual(
+  plain(await discoveryReceiptPersistence
+    .completeCommerceOrderDiscoveryCommandInPostgres({
+      ...takeoverCommandInput,
+      receiptId: retryAttempt.receiptId,
+      attemptToken: retryAttempt.attemptToken,
+      result: takeoverHttpResult,
+    })),
+  takeoverHttpResult,
+)
+assert.deepEqual(
+  plain(await discoveryReceiptPersistence
+    .prepareCommerceOrderDiscoveryCommandInPostgres(takeoverCommandInput)),
+  { kind: 'replay', result: takeoverHttpResult },
+  'a stale original attempt must not overwrite the retry takeover result',
+)
+assert.ok(durableDiscoveryLocks.every((key) => (
+  key.includes('commerce-order-discovery:')
+)))
+
 const routeSource = readFileSync(resolve(root, routePath), 'utf8')
+const discoveryRouteSource = readFileSync(resolve(root, discoveryRoutePath), 'utf8')
+const discoveryPersistenceSource = readFileSync(
+  resolve(root, discoveryPersistencePath),
+  'utf8',
+)
 const persistenceSource = readFileSync(resolve(root, persistencePath), 'utf8')
 const operationsSource = readFileSync(resolve(root, operationsPath), 'utf8')
 const uiSource = readFileSync(resolve(root, uiPath), 'utf8')
@@ -548,6 +1173,30 @@ assert.match(routeSource, /completeCommerceOrderStatusSyncBatchInPostgres/)
 assert.match(routeSource, /attemptToken: batch\.attemptToken/)
 assert.match(routeSource, /providerWrites: 0/)
 assert.match(routeSource, /canonicalOrderWrites: 0/)
+assert.match(discoveryRouteSource, /processCommerceOrderReconciliation/)
+assert.match(
+  discoveryRouteSource,
+  /prepareCommerceOrderDiscoveryCommandInPostgres/,
+)
+assert.match(
+  discoveryRouteSource,
+  /completeCommerceOrderDiscoveryCommandInPostgres/,
+)
+assert.match(discoveryRouteSource, /processRevisionWorkers: false/)
+assert.match(discoveryRouteSource, /providerRecordsSeen/)
+assert.match(discoveryRouteSource, /ordersPreserved/)
+assert.match(discoveryRouteSource, /ordersSkippedCanonical/)
+assert.match(discoveryRouteSource, /control\.effectiveState !== 'running'/)
+assert.match(discoveryRouteSource, /providerWrites: 0/)
+assert.match(discoveryPersistenceSource, /operations_command_receipts/)
+assert.match(
+  discoveryPersistenceSource,
+  /WHERE organization_id = \$1::uuid[\s\S]*command_type = \$2[\s\S]*idempotency_key = \$3/,
+)
+assert.match(discoveryPersistenceSource, /target_global_id !== input\.accountGlobalId/)
+assert.match(discoveryPersistenceSource, /receipt\.request_hash !== expectedRequestHash/)
+assert.match(discoveryPersistenceSource, /status = 'succeeded'/)
+assert.match(discoveryPersistenceSource, /result_payload = \$3::jsonb/)
 assert.match(persistenceSource, /WHERE order_row\.organization_id = \$1::uuid/)
 assert.match(persistenceSource, /order_row\.global_id = ANY\(\$3::text\[\]\)/)
 assert.match(persistenceSource, /target\.claim_state <> 'processing'/)
@@ -570,14 +1219,25 @@ assert.match(
   'unreconciled provider evidence must not close released warehouse work',
 )
 assert.match(operationsSource, /AND NOT \(\$\{externallyFulfilledOrderSql\('summary_order'\)\}\)/)
-assert.match(operationsSource, /input\.status === 'fulfilled_externally'/)
+assert.match(operationsSource, /\$3::text = 'fulfilled_externally'/)
 assert.match(
   operationsSource,
-  /where\.push\(`NOT \(\$\{externallyFulfilledOrderSql\('orders'\)\}\)`\)/,
+  /\$3::text <> 'fulfilled_externally'[\s\S]*AND NOT \(\$\{externallyFulfilledOrderSql\('orders'\)\}\)/,
   'canonical status filters must exclude externally fulfilled display overrides',
 )
 assert.match(uiSource, /fetch\('\/api\/operations\/order-status-sync'/)
-assert.match(uiSource, /MAX_ORDER_STATUS_SYNC_ORDERS = 100/)
+assert.match(uiSource, /fetch\('\/api\/operations\/order-discovery'/)
+assert.match(uiSource, /Refresh connected-store orders/)
+assert.match(uiSource, /MAX_ORDER_STATUS_SYNC_ORDERS = 500/)
+assert.match(uiSource, /MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 20/)
+assert.match(
+  uiSource,
+  /invocation < MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT/,
+)
+assert.match(uiSource, /if \(!result\.pagination\.hasNextBatch\)/)
+assert.match(uiSource, /accountComplete = true/)
+assert.match(routeSource, /MAX_EXCLUDED_ORDERS = 500/)
+assert.match(persistenceSource, /excludeOrderGlobalIds\.length > 500/)
 assert.match(uiSource, /excludeOrderGlobalIds: \[\.\.\.checkedOrderGlobalIds\]/)
 assert.match(uiSource, /\{ value: 'fulfilled_externally', label: 'Fulfilled externally' \}/)
 assert.match(uiSource, /ClawPilot shipped today/)

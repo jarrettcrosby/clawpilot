@@ -2367,6 +2367,104 @@ async function lockCommerceOrderIdentity(
   )
 }
 
+type CommerceOrderProviderStateEvidence = {
+  lifecycle_status: string
+  fulfillment_status: string
+  evidence_source: 'operational' | 'history'
+  evidence_observed_at: string | Date
+}
+
+function providerStateIsTerminal(
+  evidence: CommerceOrderProviderStateEvidence,
+) {
+  return (
+    ['cancelled', 'closed'].includes(evidence.lifecycle_status)
+    || ['fulfilled', 'cancelled'].includes(evidence.fulfillment_status)
+  )
+}
+
+/**
+ * Serializes provider-order staging and history observation writers, then
+ * rejects any local fulfillment transition when the freshest durable provider
+ * evidence is terminal. Callers keep this transaction open through their
+ * write so a candidate or observation cannot race the decision.
+ */
+export async function assertCommerceOrderProviderNonterminalWithClient(
+  client: PoolClient,
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    provider: 'shopify' | 'faire'
+    externalOrderId: string
+  },
+) {
+  await lockCommerceOrderIdentity(client, input)
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+    [
+      `commerce-order-observation:${input.organizationId}`
+        + `:${input.integrationAccountId}:${input.provider}`
+        + `:${input.externalOrderId}`,
+    ],
+  )
+  const evidence = (
+    await client.query<CommerceOrderProviderStateEvidence>(
+      `SELECT latest.lifecycle_status,
+              latest.fulfillment_status,
+              latest.evidence_source,
+              latest.evidence_observed_at
+       FROM (
+         SELECT candidate.normalized_order_status AS lifecycle_status,
+                candidate.normalized_fulfillment_status
+                  AS fulfillment_status,
+                candidate.provider_updated_at,
+                candidate.observed_at AS evidence_observed_at,
+                'operational'::text AS evidence_source,
+                0::integer AS source_priority,
+                candidate.id AS evidence_id
+         FROM operations_commerce_order_candidates candidate
+         WHERE candidate.organization_id = $1::uuid
+           AND candidate.integration_account_id = $2::uuid
+           AND candidate.provider = $3
+           AND candidate.external_order_id = $4
+         UNION ALL
+         SELECT observation.canonical_lifecycle_state,
+                observation.canonical_fulfillment_state,
+                observation.provider_updated_at,
+                observation.observed_at,
+                'history'::text AS evidence_source,
+                1::integer AS source_priority,
+                observation.id AS evidence_id
+         FROM operations_commerce_order_observations observation
+         WHERE observation.organization_id = $1::uuid
+           AND observation.integration_account_id = $2::uuid
+           AND observation.provider = $3
+           AND observation.external_order_id = $4
+       ) latest
+       ORDER BY
+         COALESCE(latest.provider_updated_at, latest.evidence_observed_at)
+           DESC,
+         latest.evidence_observed_at DESC,
+         latest.source_priority DESC,
+         latest.evidence_id DESC
+       LIMIT 1`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.provider,
+        input.externalOrderId,
+      ],
+    )
+  ).rows[0]
+  if (evidence && providerStateIsTerminal(evidence)) {
+    intakeError(
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      'The provider now reports this order as closed, cancelled, or fulfilled. Refresh the order; no ClawPilot fulfillment demand was created',
+      409,
+    )
+  }
+}
+
 async function lockCandidate(
   client: PoolClient,
   context: CandidateCommandContext,
@@ -11032,6 +11130,18 @@ export async function readAutomaticShopifyOrderPromotionTargetsForRunInPostgres(
         continue
       }
       if (
+        ['cancelled', 'closed'].includes(candidate.normalized_order_status)
+        || ['fulfilled', 'cancelled'].includes(
+          candidate.normalized_fulfillment_status,
+        )
+      ) {
+        targets.push(heldAutomaticShopifyPromotionTarget(
+          candidate,
+          'order_terminal_no_demand',
+        ))
+        continue
+      }
+      if (
         candidate.normalized_order_status !== 'open'
         || candidate.normalized_payment_status !== 'paid'
         || candidate.normalized_fulfillment_status !== 'unfulfilled'
@@ -13987,6 +14097,8 @@ export async function promoteCommerceCandidateInPostgres(input: {
     cohortHash: string
     notBefore: string
   }
+  /** Test-only concurrency seam after the candidate row lock is held. */
+  afterCandidateLockBeforeProviderStateFence?: () => void | Promise<void>
 }) {
   return withTransaction(async (client) => {
     const started = await commandStart(
@@ -14061,9 +14173,11 @@ export async function promoteCommerceCandidateInPostgres(input: {
       })
     }
     const candidate = await lockCandidate(client, input)
-    await lockCommerceOrderIdentity(client, {
+    await input.afterCandidateLockBeforeProviderStateFence?.()
+    await assertCommerceOrderProviderNonterminalWithClient(client, {
       organizationId: candidate.organization_id,
       integrationAccountId: candidate.integration_account_id,
+      provider: candidate.provider,
       externalOrderId: candidate.external_order_id,
     })
     if (input.automaticFairePromotion) {
