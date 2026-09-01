@@ -19,6 +19,7 @@ import {
 } from '@/lib/operations/orderShipTo'
 import type {
   OperationsImportedOrderLineRefreshConflict,
+  OperationsImportedOrderPage,
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
@@ -26,6 +27,7 @@ import type {
   OperationsImportedOrderWorkingCopy,
 } from '@/lib/operations/types'
 import {
+  assertCommerceOrderProviderNonterminalWithClient,
   confirmCommerceCandidateAddressInPostgres,
   promoteCommerceCandidateInPostgres,
   resolveCommerceCandidateCustomerInPostgres,
@@ -52,6 +54,9 @@ const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,200}$/u
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
+const WORKBENCH_CURSOR = /^[A-Za-z0-9_-]{1,1000}$/u
+const MAX_WORKBENCH_PAGE_SIZE = 250
+const MAX_WORKBENCH_COLLECTION_PAGES = 20
 
 const ADDRESS_BLOCKERS = new Set([
   'ship_to_confirmation_required',
@@ -144,6 +149,20 @@ type WorkbenchReadRow = {
     | null
   workbench_row_version: string | null
   latest_provider_source_hash: string
+  provider_lifecycle_status: string
+  provider_fulfillment_status: string
+  provider_status_observed_at: Date
+  provider_status_source: 'operational' | 'history' | 'retained'
+  matching_total_count: string
+}
+
+type WorkbenchPageCursor = {
+  v: 1
+  providerUpdatedAt: string | null
+  observedAt: string
+  candidateId: string
+  total: number
+  scopeHash: string
 }
 
 type LockedCandidateRow = {
@@ -151,6 +170,7 @@ type LockedCandidateRow = {
   global_id: string
   organization_id: string
   integration_account_id: string
+  provider: 'shopify' | 'faire'
   account_global_id: string
   external_order_id: string
   source_hash: string
@@ -308,6 +328,118 @@ function requestError(
   details: Record<string, unknown> | null = null,
 ): never {
   throw new CommerceOrderWorkbenchError(code, message, status, details)
+}
+
+function workbenchPageScopeHash(input: Readonly<{
+  organizationId: string
+  candidateGlobalId: string | null
+  search: string
+}>) {
+  return createHash('sha256').update(JSON.stringify({
+    organizationId: input.organizationId,
+    candidateGlobalId: input.candidateGlobalId,
+    search: input.search,
+  })).digest('hex')
+}
+
+function validCursorTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length < 20 || value.length > 30) {
+    return false
+  }
+  const parsed = new Date(value)
+  return Number.isFinite(parsed.valueOf()) && parsed.toISOString() === value
+}
+
+function decodeWorkbenchPageCursor(
+  cursor: string | null | undefined,
+  expectedScopeHash: string,
+): WorkbenchPageCursor | null {
+  if (!cursor) return null
+  if (!WORKBENCH_CURSOR.test(cursor)) {
+    requestError(
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      'The imported-order page cursor is invalid',
+      400,
+    )
+  }
+  let value: unknown
+  try {
+    value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'))
+  } catch {
+    requestError(
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      'The imported-order page cursor is invalid',
+      400,
+    )
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    requestError(
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      'The imported-order page cursor is invalid',
+      400,
+    )
+  }
+  const parsed = value as Partial<WorkbenchPageCursor>
+  const keys = Object.keys(parsed).sort().join(',')
+  if (
+    keys !== [
+      'candidateId',
+      'observedAt',
+      'providerUpdatedAt',
+      'scopeHash',
+      'total',
+      'v',
+    ].sort().join(',')
+    || parsed.v !== 1
+    || (
+      parsed.providerUpdatedAt !== null
+      && !validCursorTimestamp(parsed.providerUpdatedAt)
+    )
+    || !validCursorTimestamp(parsed.observedAt)
+    || typeof parsed.candidateId !== 'string'
+    || !UUID.test(parsed.candidateId)
+    || !Number.isSafeInteger(parsed.total)
+    || Number(parsed.total) < 0
+    || parsed.scopeHash !== expectedScopeHash
+  ) {
+    requestError(
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      'The imported-order page cursor is invalid',
+      400,
+    )
+  }
+  return parsed as WorkbenchPageCursor
+}
+
+function encodeWorkbenchPageCursor(
+  row: WorkbenchReadRow,
+  total: number,
+  scopeHash: string,
+) {
+  return Buffer.from(JSON.stringify({
+    v: 1,
+    providerUpdatedAt: row.provider_updated_at?.toISOString() || null,
+    observedAt: row.observed_at.toISOString(),
+    candidateId: row.candidate_id,
+    total,
+    scopeHash,
+  } satisfies WorkbenchPageCursor), 'utf8').toString('base64url')
+}
+
+function workbenchPageSize(value: number | null | undefined) {
+  const pageSize = value ?? MAX_WORKBENCH_PAGE_SIZE
+  if (
+    !Number.isSafeInteger(pageSize)
+    || pageSize < 1
+    || pageSize > MAX_WORKBENCH_PAGE_SIZE
+  ) {
+    requestError(
+      'OPERATIONS_PAGE_SIZE_INVALID',
+      'Imported-order page size is invalid',
+      400,
+    )
+  }
+  return pageSize
 }
 
 function canonicalJson(value: unknown): string {
@@ -692,6 +824,31 @@ function customerSnapshotName(row: WorkbenchReadRow) {
     || null
 }
 
+function providerLifecycleStatus(value: string) {
+  return ['open', 'closed', 'cancelled'].includes(value)
+    ? value as 'open' | 'closed' | 'cancelled'
+    : 'unknown' as const
+}
+
+function providerFulfillmentStatus(value: string) {
+  return [
+    'unfulfilled',
+    'partial',
+    'fulfilled',
+    'on_hold',
+    'scheduled',
+    'cancelled',
+  ].includes(value)
+    ? value as
+      | 'unfulfilled'
+      | 'partial'
+      | 'fulfilled'
+      | 'on_hold'
+      | 'scheduled'
+      | 'cancelled'
+    : 'unknown' as const
+}
+
 function mappedWorkingCopy(
   row: WorkbenchReadRow,
   details: WorkbenchResolutionDetails | null,
@@ -768,6 +925,14 @@ function mappedWorkingCopy(
     externalOrderId: row.external_order_id,
     orderNumber: row.order_number_snapshot,
     status: 'imported',
+    providerState: {
+      lifecycle: providerLifecycleStatus(row.provider_lifecycle_status),
+      fulfillment: providerFulfillmentStatus(
+        row.provider_fulfillment_status,
+      ),
+      observedAt: row.provider_status_observed_at.toISOString(),
+      source: row.provider_status_source,
+    },
     needsInfo: issues.length > 0 || otherMissingFacts,
     blockerCodes: effectiveBlockerCodes,
     customerName: customerSnapshotName(row),
@@ -862,12 +1027,17 @@ function mappedWorkingCopy(
   }
 }
 
-export async function readCommerceOrderWorkbenchFromPostgres(input: {
+export async function readCommerceOrderWorkbenchPageFromPostgres(input: {
   organizationId: string
   search?: string | null
   candidateGlobalId?: string | null
   includeResolutionDetails?: boolean
-}): Promise<OperationsImportedOrderWorkingCopy[]> {
+  cursor?: string | null
+  pageSize?: number | null
+}): Promise<{
+  orders: OperationsImportedOrderWorkingCopy[]
+  page: OperationsImportedOrderPage
+}> {
   const organizationId = requireOrganizationId(input.organizationId)
   const candidateGlobalId = input.candidateGlobalId
     ? requireCandidateGlobalId(input.candidateGlobalId)
@@ -876,6 +1046,13 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
   const searchPattern = search
     ? `%${search.replace(/[!%_]/gu, '!$&')}%`
     : null
+  const pageSize = workbenchPageSize(input.pageSize)
+  const scopeHash = workbenchPageScopeHash({
+    organizationId,
+    candidateGlobalId,
+    search,
+  })
+  const cursor = decodeWorkbenchPageCursor(input.cursor, scopeHash)
   const result = await query<WorkbenchReadRow>(
     `WITH latest_live_candidates AS (
        SELECT DISTINCT ON (
@@ -940,6 +1117,77 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
              AND canonical.external_order_id
                = retained_candidate.external_order_id
          )
+     ), matching_candidate_ids AS (
+       SELECT candidate.id AS candidate_id,
+              candidate.provider_updated_at,
+              candidate.observed_at,
+              count(*) OVER ()::text AS matching_total_count
+       FROM selected_candidate_ids selected
+       JOIN operations_commerce_order_candidates candidate
+         ON candidate.organization_id = $1::uuid
+        AND candidate.id = selected.candidate_id
+       JOIN operations_integration_accounts account
+         ON account.organization_id = candidate.organization_id
+        AND account.id = candidate.integration_account_id
+        AND account.integration_type = 'commerce'
+        AND account.provider IN ('shopify', 'faire')
+       LEFT JOIN operations_orders canonical_order
+         ON canonical_order.organization_id = candidate.organization_id
+        AND canonical_order.id = candidate.canonical_order_id
+       LEFT JOIN crm_organizations customer
+         ON customer.pipeline_id = candidate.pipeline_id
+        AND customer.id = candidate.customer_id
+       WHERE ($2::text IS NULL OR candidate.global_id = $2)
+         AND (
+           $3::text IS NULL
+           OR candidate.global_id ILIKE $3 ESCAPE '!'
+           OR candidate.order_number_snapshot ILIKE $3 ESCAPE '!'
+           OR candidate.external_order_id ILIKE $3 ESCAPE '!'
+           OR account.display_name ILIKE $3 ESCAPE '!'
+           OR candidate.provider ILIKE $3 ESCAPE '!'
+           OR COALESCE(customer.name, '') ILIKE $3 ESCAPE '!'
+           OR COALESCE(canonical_order.global_id, '') ILIKE $3 ESCAPE '!'
+         )
+     ), page_candidate_ids AS (
+       SELECT matching.candidate_id,
+              matching.provider_updated_at,
+              matching.observed_at,
+              matching.matching_total_count
+       FROM matching_candidate_ids matching
+       WHERE NOT $4::boolean
+          OR (
+            $5::timestamptz IS NOT NULL
+            AND (
+              matching.provider_updated_at < $5::timestamptz
+              OR matching.provider_updated_at IS NULL
+              OR (
+                matching.provider_updated_at = $5::timestamptz
+                AND (
+                  matching.observed_at < $6::timestamptz
+                  OR (
+                    matching.observed_at = $6::timestamptz
+                    AND matching.candidate_id < $7::uuid
+                  )
+                )
+              )
+            )
+          )
+          OR (
+            $5::timestamptz IS NULL
+            AND matching.provider_updated_at IS NULL
+            AND (
+              matching.observed_at < $6::timestamptz
+              OR (
+                matching.observed_at = $6::timestamptz
+                AND matching.candidate_id < $7::uuid
+              )
+            )
+          )
+       ORDER BY
+         matching.provider_updated_at DESC NULLS LAST,
+         matching.observed_at DESC,
+         matching.candidate_id DESC
+       LIMIT $8::integer
      )
      SELECT
        candidate.id::text AS candidate_id,
@@ -994,8 +1242,25 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
        COALESCE(
          latest_provider.source_hash,
          candidate.source_hash
-       ) AS latest_provider_source_hash
-     FROM selected_candidate_ids selected
+       ) AS latest_provider_source_hash,
+       COALESCE(
+         provider_status.lifecycle_status,
+         candidate.normalized_order_status
+       ) AS provider_lifecycle_status,
+       COALESCE(
+         provider_status.fulfillment_status,
+         candidate.normalized_fulfillment_status
+       ) AS provider_fulfillment_status,
+       COALESCE(
+         provider_status.observed_at,
+         candidate.observed_at
+       ) AS provider_status_observed_at,
+       COALESCE(
+         provider_status.source,
+         'retained'::text
+       ) AS provider_status_source,
+       selected.matching_total_count
+     FROM page_candidate_ids selected
      JOIN operations_commerce_order_candidates candidate
        ON candidate.organization_id = $1::uuid
       AND candidate.id = selected.candidate_id
@@ -1045,27 +1310,73 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
          provider_candidate.id DESC
        LIMIT 1
      ) latest_provider ON true
-     WHERE ($2::text IS NULL OR candidate.global_id = $2)
-       AND (
-         $3::text IS NULL
-         OR candidate.global_id ILIKE $3 ESCAPE '!'
-         OR candidate.order_number_snapshot ILIKE $3 ESCAPE '!'
-         OR candidate.external_order_id ILIKE $3 ESCAPE '!'
-         OR account.display_name ILIKE $3 ESCAPE '!'
-         OR candidate.provider ILIKE $3 ESCAPE '!'
-         OR COALESCE(customer.name, '') ILIKE $3 ESCAPE '!'
-         OR COALESCE(canonical_order.global_id, '') ILIKE $3 ESCAPE '!'
-       )
+     LEFT JOIN LATERAL (
+       SELECT status_evidence.lifecycle_status,
+              status_evidence.fulfillment_status,
+              status_evidence.observed_at,
+              status_evidence.source
+       FROM (
+         SELECT provider_candidate.normalized_order_status
+                  AS lifecycle_status,
+                provider_candidate.normalized_fulfillment_status
+                  AS fulfillment_status,
+                provider_candidate.provider_updated_at,
+                provider_candidate.observed_at,
+                'operational'::text AS source,
+                0::integer AS source_priority,
+                provider_candidate.id AS evidence_id
+         FROM operations_commerce_order_candidates provider_candidate
+         WHERE provider_candidate.organization_id = candidate.organization_id
+           AND provider_candidate.integration_account_id
+             = candidate.integration_account_id
+           AND provider_candidate.external_order_id
+             = candidate.external_order_id
+           AND provider_candidate.workflow_state <> 'failed'
+         UNION ALL
+         SELECT observation.canonical_lifecycle_state,
+                observation.canonical_fulfillment_state,
+                observation.provider_updated_at,
+                observation.observed_at,
+                'history'::text AS source,
+                1::integer AS source_priority,
+                observation.id AS evidence_id
+         FROM operations_commerce_order_observations observation
+         WHERE observation.organization_id = candidate.organization_id
+           AND observation.integration_account_id
+             = candidate.integration_account_id
+           AND observation.provider = candidate.provider
+           AND observation.external_order_id = candidate.external_order_id
+       ) status_evidence
+       ORDER BY
+         COALESCE(
+           status_evidence.provider_updated_at,
+           status_evidence.observed_at
+         ) DESC,
+         status_evidence.observed_at DESC,
+         status_evidence.source_priority DESC,
+         status_evidence.evidence_id DESC
+       LIMIT 1
+     ) provider_status ON true
      ORDER BY
-       candidate.provider_updated_at DESC NULLS LAST,
-       candidate.observed_at DESC,
-       candidate.id DESC
-     LIMIT 200`,
-    [organizationId, candidateGlobalId, searchPattern],
+       selected.provider_updated_at DESC NULLS LAST,
+       selected.observed_at DESC,
+       selected.candidate_id DESC`,
+    [
+      organizationId,
+      candidateGlobalId,
+      searchPattern,
+      Boolean(cursor),
+      cursor?.providerUpdatedAt || null,
+      cursor?.observedAt || null,
+      cursor?.candidateId || null,
+      pageSize + 1,
+    ],
   )
+  const hasNextPage = result.rows.length > pageSize
+  const pageRows = result.rows.slice(0, pageSize)
   const detailsByCandidate = new Map<string, WorkbenchResolutionDetails>()
-  if (input.includeResolutionDetails && result.rows.length) {
-    const candidateIds = result.rows.map((row) => row.candidate_id)
+  if (input.includeResolutionDetails && pageRows.length) {
+    const candidateIds = pageRows.map((row) => row.candidate_id)
     const [lines, customers, products] = await Promise.all([
       query<WorkbenchLineReadRow>(
         `SELECT line.order_candidate_id::text AS candidate_id,
@@ -1136,7 +1447,7 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
         [organizationId, candidateIds],
       ),
     ])
-    for (const row of result.rows) {
+    for (const row of pageRows) {
       detailsByCandidate.set(row.candidate_id, {
         lines: lines.rows.filter((line) => line.candidate_id === row.candidate_id),
         customers: customers.rows,
@@ -1144,12 +1455,64 @@ export async function readCommerceOrderWorkbenchFromPostgres(input: {
       })
     }
   }
-  return result.rows
-    .map((row) => mappedWorkingCopy(
+  const total = pageRows.length
+    ? Number(pageRows[0].matching_total_count)
+    : cursor?.total || 0
+  if (!Number.isSafeInteger(total) || total < pageRows.length) {
+    requestError(
+      'OPERATIONS_PAGE_EVIDENCE_INVALID',
+      'Imported-order pagination returned invalid evidence',
+      500,
+    )
+  }
+  const lastRow = pageRows.at(-1) || null
+  const nextCursor = hasNextPage && lastRow
+    ? encodeWorkbenchPageCursor(lastRow, total, scopeHash)
+    : null
+  return {
+    orders: pageRows.map((row) => mappedWorkingCopy(
       row,
       detailsByCandidate.get(row.candidate_id) || null,
-    ))
-    .slice(0, 100)
+    )),
+    page: {
+      total,
+      returned: pageRows.length,
+      pageSize,
+      nextCursor,
+      complete: nextCursor === null,
+      truncated: nextCursor !== null,
+    },
+  }
+}
+
+export async function readCommerceOrderWorkbenchFromPostgres(input: {
+  organizationId: string
+  search?: string | null
+  candidateGlobalId?: string | null
+  includeResolutionDetails?: boolean
+}): Promise<OperationsImportedOrderWorkingCopy[]> {
+  const orders: OperationsImportedOrderWorkingCopy[] = []
+  let cursor: string | null = null
+  for (
+    let pageNumber = 0;
+    pageNumber < MAX_WORKBENCH_COLLECTION_PAGES;
+    pageNumber += 1
+  ) {
+    const result = await readCommerceOrderWorkbenchPageFromPostgres({
+      ...input,
+      cursor,
+      pageSize: input.candidateGlobalId ? 1 : MAX_WORKBENCH_PAGE_SIZE,
+    })
+    orders.push(...result.orders)
+    cursor = result.page.nextCursor
+    if (!cursor) return orders
+  }
+  requestError(
+    'OPERATIONS_IMPORTED_ORDER_RESULT_LIMIT',
+    `More than ${orders.length} imported orders matched; use paged reads or refine the search`,
+    413,
+    { loaded: orders.length },
+  )
 }
 
 async function prepareReceipt(
@@ -1942,6 +2305,7 @@ async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
          candidate.global_id,
          candidate.organization_id::text,
          candidate.integration_account_id::text,
+         candidate.provider,
          account.global_id AS account_global_id,
          candidate.external_order_id,
          candidate.source_hash,
@@ -2003,6 +2367,15 @@ async function saveOrAcceptCommerceOrderWorkbenchInPostgres(input: {
         404,
       )
     }
+    // Promotion locks the candidate row before it takes the provider-order
+    // identity and observation locks. Keep the same global lock order here so
+    // a manager Save/Accept cannot deadlock with automatic promotion.
+    await assertCommerceOrderProviderNonterminalWithClient(client, {
+      organizationId,
+      integrationAccountId: candidate.integration_account_id,
+      provider: candidate.provider,
+      externalOrderId: candidate.external_order_id,
+    })
     await acquireTransactionAdvisoryLock(
       client,
       `commerce-order-workbench:${organizationId}:${candidate.integration_account_id}:${candidate.external_order_id}`,

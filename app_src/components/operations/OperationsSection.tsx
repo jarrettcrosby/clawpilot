@@ -73,6 +73,7 @@ import type {
   OperationsExternalFulfillmentReconciliationResult,
   OperationsImportedOrderRefreshConflict,
   OperationsImportedOrderLineRefreshConflict,
+  OperationsImportedOrderPage,
   OperationsImportedOrderRefreshResult,
   OperationsImportedOrderShipToUpdateResult,
   OperationsImportedOrderWorkingCopyDraft,
@@ -80,6 +81,7 @@ import type {
   OperationsOrderCommandResult,
   OperationsOrderDetail,
   OperationsOrderListItem,
+  OperationsOrderPage,
   OperationsOrderReplanningCorrectionResult,
   OperationsOrderStatus,
   OperationsPackingSlipCommandResult,
@@ -278,7 +280,60 @@ type OrderStatusSyncPayload = {
   }
 }
 
-const MAX_ORDER_STATUS_SYNC_ORDERS = 100
+const IMPORTED_ORDER_PAGE_SIZE = 250
+const MAX_IMPORTED_ORDER_PAGES = 20
+const CANONICAL_ORDER_PAGE_SIZE = 250
+const MAX_CANONICAL_ORDER_PAGES = 20
+const MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT = 20
+const ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS = [250, 500, 1_000, 2_000, 3_000]
+const MAX_ORDER_STATUS_SYNC_ORDERS = 500
+
+function waitForOrderDiscoveryPoll(pollNumber: number) {
+  const delay = ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS[
+    Math.min(
+      pollNumber,
+      ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS.length - 1,
+    )
+  ]
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, delay)
+  })
+}
+
+type OrderDiscoveryPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  result?: {
+    accountGlobalId: string
+    displayName: string
+    provider: 'shopify' | 'faire'
+    counts: {
+      providerRowsSeen: number
+      eligibleOrdersSeen: number
+      ordersStaged: number
+      ordersPreserved: number
+      ordersSkippedCanonical: number
+      recordsRejected: number
+      canonicalOrdersCreated: number
+    }
+    pagination: {
+      batchNumber: number
+      continuationRunGlobalId: string | null
+      hasNextBatch: boolean
+      sessionComplete: boolean
+    }
+    refresh: {
+      claimed: number
+      failed: number
+      failureCodes: Record<string, number>
+      reset: boolean
+      status: 'idle' | 'running' | 'succeeded' | 'failed'
+      resumable: boolean
+    }
+    providerWrites: 0
+  }
+}
 
 type ImportedOrderWorkbenchPayload = {
   ok?: boolean
@@ -288,9 +343,66 @@ type ImportedOrderWorkbenchPayload = {
   refreshResult?: OperationsImportedOrderRefreshResult
   order?: OperationsImportedOrderWorkingCopy | null
   orders?: OperationsImportedOrderWorkingCopy[]
+  page?: OperationsImportedOrderPage
   latestCandidateGlobalId?: string
   conflicts?: OperationsImportedOrderRefreshConflict[]
   lineConflicts?: OperationsImportedOrderLineRefreshConflict[]
+}
+
+type CanonicalOrderListPayload = {
+  ok?: boolean
+  error?: string
+  code?: string
+  orders?: OperationsOrderListItem[]
+  page?: OperationsOrderPage
+}
+
+function validImportedOrderPage(
+  value: unknown,
+): value is OperationsImportedOrderPage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const page = value as Partial<OperationsImportedOrderPage>
+  const cursorIsValid = page.nextCursor === null
+    || (
+      typeof page.nextCursor === 'string'
+      && page.nextCursor.length > 0
+      && page.nextCursor.length <= 1000
+      && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
+    )
+  return Number.isSafeInteger(page.total)
+    && Number(page.total) >= 0
+    && Number.isSafeInteger(page.returned)
+    && Number(page.returned) >= 0
+    && Number.isSafeInteger(page.pageSize)
+    && Number(page.pageSize) >= 1
+    && Number(page.pageSize) <= IMPORTED_ORDER_PAGE_SIZE
+    && cursorIsValid
+    && page.complete === (page.nextCursor === null)
+    && page.truncated === (page.nextCursor !== null)
+}
+
+function validCanonicalOrderPage(
+  value: unknown,
+): value is OperationsOrderPage {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const page = value as Partial<OperationsOrderPage>
+  const cursorIsValid = page.nextCursor === null
+    || (
+      typeof page.nextCursor === 'string'
+      && page.nextCursor.length > 0
+      && page.nextCursor.length <= 1000
+      && /^[A-Za-z0-9_-]+$/u.test(page.nextCursor)
+    )
+  return Number.isSafeInteger(page.total)
+    && Number(page.total) >= 0
+    && Number.isSafeInteger(page.returned)
+    && Number(page.returned) >= 0
+    && Number.isSafeInteger(page.pageSize)
+    && Number(page.pageSize) >= 1
+    && Number(page.pageSize) <= CANONICAL_ORDER_PAGE_SIZE
+    && cursorIsValid
+    && page.complete === (page.nextCursor === null)
+    && page.truncated === (page.nextCursor !== null)
 }
 
 type PendingImportedOrderSave = {
@@ -521,6 +633,23 @@ function importedOrderDraftFingerprint(
   return JSON.stringify(draft)
 }
 
+function importedOrderRefreshFingerprint(conflictResolution?: {
+  latestCandidateGlobalId: string
+  resolutions: Partial<
+    Record<keyof OrderShipToDraft, 'local' | 'provider'>
+  >
+  lineResolutions: Record<string, 'provider'>
+}) {
+  if (!conflictResolution) return 'provider-refresh'
+  const sortedEntries = (value: object) => Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+  return JSON.stringify({
+    latestCandidateGlobalId: conflictResolution.latestCandidateGlobalId,
+    resolutions: sortedEntries(conflictResolution.resolutions),
+    lineResolutions: sortedEntries(conflictResolution.lineResolutions),
+  })
+}
+
 function isCommerceFulfillmentReconciliationPending(input: {
   provider: string
   state: string
@@ -677,6 +806,51 @@ function orderStatusColor(
   order: Pick<OperationsOrderListItem, 'status' | 'externallyFulfilled'>,
 ) {
   return statusColor(order.externallyFulfilled ? 'shipped' : order.status)
+}
+
+function importedOrderIsTerminal(order: OperationsImportedOrderWorkingCopy) {
+  return ['cancelled', 'closed'].includes(order.providerState.lifecycle)
+    || ['cancelled', 'fulfilled'].includes(order.providerState.fulfillment)
+}
+
+function importedOrderDisplayStatus(order: OperationsImportedOrderWorkingCopy) {
+  if (
+    order.providerState.lifecycle === 'cancelled'
+    || order.providerState.fulfillment === 'cancelled'
+  ) return 'Cancelled'
+  if (order.providerState.fulfillment === 'fulfilled') {
+    return 'Fulfilled externally'
+  }
+  if (order.providerState.lifecycle === 'closed') return 'Closed externally'
+  if (order.providerState.fulfillment === 'partial') {
+    return 'Partially fulfilled'
+  }
+  if (['on_hold', 'scheduled'].includes(order.providerState.fulfillment)) {
+    return 'On hold'
+  }
+  return order.needsInfo ? 'Needs info' : 'Imported'
+}
+
+function importedOrderStatusColor(order: OperationsImportedOrderWorkingCopy) {
+  if (
+    order.providerState.lifecycle === 'cancelled'
+    || order.providerState.fulfillment === 'cancelled'
+  ) return statusColor('cancelled')
+  if (importedOrderIsTerminal(order)) return statusColor('shipped')
+  if (
+    order.providerState.fulfillment === 'partial'
+    || ['on_hold', 'scheduled'].includes(order.providerState.fulfillment)
+  ) return 'warning' as const
+  return order.needsInfo ? 'warning' as const : 'info' as const
+}
+
+function importedOrderFilterStatus(order: OperationsImportedOrderWorkingCopy) {
+  if (
+    order.providerState.lifecycle === 'cancelled'
+    || order.providerState.fulfillment === 'cancelled'
+  ) return 'cancelled' as const
+  if (importedOrderIsTerminal(order)) return 'fulfilled_externally' as const
+  return 'imported' as const
 }
 
 function commerceActiveUnavailableLabel(
@@ -3242,7 +3416,11 @@ export default function OperationsSection({
   const [importedOrderError, setImportedOrderError] = useState('')
   const pendingImportedOrderSave = useRef<PendingImportedOrderSave | null>(null)
   const pendingImportedOrderAccept = useRef<PendingImportedOrderSave | null>(null)
+  const pendingImportedOrderRefresh = useRef<PendingImportedOrderSave | null>(null)
+  const pendingImportedOrderConflictRefresh =
+    useRef<PendingImportedOrderSave | null>(null)
   const pendingOrderStatusSyncReload = useRef(false)
+  const workspaceLoadGeneration = useRef(0)
   const [selectedExceptionGlobalId, setSelectedExceptionGlobalId] = useState<string | null>(null)
   const [exceptionDrawerOpen, setExceptionDrawerOpen] = useState(false)
   const [updatingException, setUpdatingException] = useState(false)
@@ -3478,8 +3656,11 @@ export default function OperationsSection({
     signal?: AbortSignal,
     options?: { preserveFeedback?: boolean },
   ) => {
+    const loadGeneration = workspaceLoadGeneration.current + 1
+    workspaceLoadGeneration.current = loadGeneration
     setLoading(true)
     if (!options?.preserveFeedback) setError('')
+    let workspaceWarning = ''
     const params = new URLSearchParams()
     if (search.trim()) params.set('search', search.trim())
     if (view === 'orders' && status) params.set('status', status)
@@ -3489,24 +3670,195 @@ export default function OperationsSection({
       const response = await fetch(`/api/operations?${params.toString()}`, { cache: 'no-store', signal })
       const payload = await response.json().catch(() => ({})) as OperationsPayload
       if (!response.ok || !payload.operations) throw new Error(payload.error || 'Operations data is unavailable')
-      setWorkspace(payload.operations)
+      if (!validImportedOrderPage(payload.operations.importedOrderPage)) {
+        throw new Error('Imported-order pagination returned invalid evidence')
+      }
+      if (!validCanonicalOrderPage(payload.operations.orderPage)) {
+        throw new Error('Order pagination returned invalid evidence')
+      }
+      let operations = payload.operations
+      const importedOrders = [...operations.importedOrders]
+      let importedOrderPage = operations.importedOrderPage
+      if (importedOrderPage.returned !== importedOrders.length) {
+        throw new Error('Imported-order pagination returned inconsistent evidence')
+      }
+      const seenCandidateGlobalIds = new Set(
+        importedOrders.map((order) => order.candidateGlobalId),
+      )
+      const seenCursors = new Set<string>()
+      let pagesLoaded = 1
+      while (
+        view === 'orders'
+        && importedOrderPage.nextCursor
+        && pagesLoaded < MAX_IMPORTED_ORDER_PAGES
+      ) {
+        const cursor = importedOrderPage.nextCursor
+        if (seenCursors.has(cursor)) {
+          throw new Error('Imported-order pagination did not advance')
+        }
+        seenCursors.add(cursor)
+        const workbenchParams = new URLSearchParams({
+          cursor,
+          limit: String(IMPORTED_ORDER_PAGE_SIZE),
+        })
+        if (search.trim()) workbenchParams.set('search', search.trim())
+        const pageResponse = await fetch(
+          `/api/operations/order-workbench?${workbenchParams.toString()}`,
+          { cache: 'no-store', signal },
+        )
+        const pagePayload = await pageResponse.json().catch(() => ({})) as
+          ImportedOrderWorkbenchPayload
+        if (
+          !pageResponse.ok
+          || !pagePayload.ok
+          || !Array.isArray(pagePayload.orders)
+          || !validImportedOrderPage(pagePayload.page)
+        ) {
+          throw new Error(
+            pagePayload.error || 'The next imported-order page is unavailable',
+          )
+        }
+        if (pagePayload.page.returned !== pagePayload.orders.length) {
+          throw new Error('Imported-order pagination returned inconsistent evidence')
+        }
+        for (const order of pagePayload.orders) {
+          if (seenCandidateGlobalIds.has(order.candidateGlobalId)) {
+            throw new Error('Imported-order pagination returned a duplicate order')
+          }
+          seenCandidateGlobalIds.add(order.candidateGlobalId)
+          importedOrders.push(order)
+        }
+        importedOrderPage = pagePayload.page
+        pagesLoaded += 1
+      }
+      operations = {
+        ...operations,
+        importedOrders,
+        importedOrderPage: {
+          ...importedOrderPage,
+          total: Math.max(importedOrderPage.total, importedOrders.length),
+          returned: importedOrders.length,
+          complete: importedOrderPage.nextCursor === null,
+          truncated: importedOrderPage.nextCursor !== null,
+        },
+      }
+      if (importedOrderPage.nextCursor) {
+        workspaceWarning = `Loaded ${importedOrders.length} of ${Math.max(
+          importedOrderPage.total,
+          importedOrders.length,
+        )} current provider orders. Refine the order search to load the remaining results safely.`
+      }
+      const canonicalOrders = [...operations.orders]
+      let orderPage = operations.orderPage
+      if (orderPage.returned !== canonicalOrders.length) {
+        throw new Error('Order pagination returned inconsistent evidence')
+      }
+      const seenOrderGlobalIds = new Set(
+        canonicalOrders.map((order) => order.globalId),
+      )
+      const seenOrderCursors = new Set<string>()
+      let orderPagesLoaded = 1
+      while (
+        view === 'orders'
+        && orderPage.nextCursor
+        && orderPagesLoaded < MAX_CANONICAL_ORDER_PAGES
+      ) {
+        const cursor = orderPage.nextCursor
+        if (seenOrderCursors.has(cursor)) {
+          throw new Error('Order pagination did not advance')
+        }
+        seenOrderCursors.add(cursor)
+        const orderParams = new URLSearchParams({
+          cursor,
+          limit: String(CANONICAL_ORDER_PAGE_SIZE),
+        })
+        if (search.trim()) orderParams.set('search', search.trim())
+        if (status) orderParams.set('status', status)
+        const orderResponse = await fetch(
+          `/api/operations/orders?${orderParams.toString()}`,
+          { cache: 'no-store', signal },
+        )
+        const orderPayload = await orderResponse.json().catch(() => ({})) as
+          CanonicalOrderListPayload
+        if (
+          !orderResponse.ok
+          || !orderPayload.ok
+          || !Array.isArray(orderPayload.orders)
+          || !validCanonicalOrderPage(orderPayload.page)
+        ) {
+          throw new Error(orderPayload.error || 'The next order page is unavailable')
+        }
+        if (orderPayload.page.returned !== orderPayload.orders.length) {
+          throw new Error('Order pagination returned inconsistent evidence')
+        }
+        for (const order of orderPayload.orders) {
+          if (seenOrderGlobalIds.has(order.globalId)) {
+            throw new Error('Order pagination returned a duplicate order')
+          }
+          seenOrderGlobalIds.add(order.globalId)
+          canonicalOrders.push(order)
+        }
+        orderPage = orderPayload.page
+        orderPagesLoaded += 1
+      }
+      operations = {
+        ...operations,
+        orders: canonicalOrders,
+        orderPage: {
+          ...orderPage,
+          total: Math.max(orderPage.total, canonicalOrders.length),
+          returned: canonicalOrders.length,
+          complete: orderPage.nextCursor === null,
+          truncated: orderPage.nextCursor !== null,
+        },
+      }
+      if (orderPage.nextCursor) {
+        workspaceWarning = `Loaded ${canonicalOrders.length} of ${Math.max(
+          orderPage.total,
+          canonicalOrders.length,
+        )} canonical orders. Refine the order search to load the remaining results safely.`
+      }
+      if (signal?.aborted || loadGeneration !== workspaceLoadGeneration.current) {
+        return null
+      }
+      if (workspaceWarning) setError(workspaceWarning)
+      setWorkspace(operations)
       setCommerceFulfillmentRecoveryEnabled(
         payload.runtime?.commerceFulfillmentRecoveryEnabled === true,
       )
-      return payload.operations
+      return operations
     } catch (caught) {
       if (caught instanceof DOMException && caught.name === 'AbortError') return null
+      if (loadGeneration !== workspaceLoadGeneration.current) return null
       setError(caught instanceof Error ? caught.message : 'Operations data is unavailable')
       return null
     } finally {
-      if (!signal?.aborted) setLoading(false)
+      if (loadGeneration === workspaceLoadGeneration.current) setLoading(false)
     }
   }, [exceptionStatus, search, status, view])
 
-  const syncOrderStatuses = useCallback(async () => {
+  const refreshOrders = useCallback(async () => {
     setSyncingOrderStatus(true)
     setError('')
     setNotice('')
+    const discoveryAccounts = (workspace?.storeSync || []).filter((control) => (
+      control.accountStatus === 'active'
+      && control.effectiveState === 'running'
+    ))
+    const discoveryTotals = {
+      accountsAttempted: 0,
+      accountsCompleted: 0,
+      accountsInProgress: 0,
+      accountsContinuing: 0,
+      providerRowsSeen: 0,
+      eligibleOrdersSeen: 0,
+      ordersStaged: 0,
+      ordersPreserved: 0,
+      ordersSkippedCanonical: 0,
+      recordsRejected: 0,
+      canonicalOrdersCreated: 0,
+    }
+    const discoveryFailures: string[] = []
     const checkedOrderGlobalIds = new Set<string>()
     let remainingEligible = 0
     const totals = {
@@ -3516,6 +3868,125 @@ export default function OperationsSection({
       failed: 0,
     }
     try {
+      for (const account of discoveryAccounts) {
+        discoveryTotals.accountsAttempted += 1
+        try {
+          let accountComplete = false
+          let accountPollTimedOut = false
+          let runningPolls = 0
+          for (
+            let invocation = 0;
+            invocation < MAX_ORDER_DISCOVERY_INVOCATIONS_PER_ACCOUNT;
+            invocation += 1
+          ) {
+            const response = await fetch('/api/operations/order-discovery', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': crypto.randomUUID(),
+              },
+              body: JSON.stringify({
+                accountGlobalId: account.accountGlobalId,
+              }),
+            })
+            const payload = await response.json().catch(() => ({})) as
+              OrderDiscoveryPayload
+            const result = payload.result
+            if (!response.ok || !payload.ok || !result) {
+              throw new Error(
+                `${payload.error || `${account.displayName} orders could not be refreshed`}${
+                  payload.code ? ` [${payload.code}]` : ''
+                }`,
+              )
+            }
+            const evidenceCounts = [
+              result.counts.providerRowsSeen,
+              result.counts.eligibleOrdersSeen,
+              result.counts.ordersStaged,
+              result.counts.ordersPreserved,
+              result.counts.ordersSkippedCanonical,
+              result.counts.recordsRejected,
+              result.counts.canonicalOrdersCreated,
+              result.pagination.batchNumber,
+              result.refresh.claimed,
+              result.refresh.failed,
+            ]
+            if (
+              result.accountGlobalId !== account.accountGlobalId
+              || result.provider !== account.provider
+              || result.providerWrites !== 0
+              || evidenceCounts.some((count) => (
+                !Number.isSafeInteger(count) || count < 0
+              ))
+              || result.refresh.failed !== 0
+              || result.refresh.status === 'failed'
+              || result.pagination.sessionComplete
+                === result.pagination.hasNextBatch
+              || (
+                result.refresh.claimed === 0
+                && result.refresh.status !== 'running'
+                && !(
+                  result.refresh.status === 'succeeded'
+                  && result.pagination.sessionComplete
+                )
+              )
+            ) {
+              throw new Error(
+                `${account.displayName} order refresh returned invalid evidence`,
+              )
+            }
+            if (
+              result.refresh.claimed === 0
+              && result.refresh.status === 'running'
+            ) {
+              if (
+                runningPolls
+                >= ORDER_DISCOVERY_RUNNING_POLL_BACKOFF_MS.length
+              ) {
+                accountPollTimedOut = true
+                break
+              }
+              await waitForOrderDiscoveryPoll(runningPolls)
+              runningPolls += 1
+              continue
+            }
+            runningPolls = 0
+            discoveryTotals.providerRowsSeen += result.counts.providerRowsSeen
+            discoveryTotals.eligibleOrdersSeen += result.counts.eligibleOrdersSeen
+            discoveryTotals.ordersStaged += result.counts.ordersStaged
+            discoveryTotals.ordersPreserved += result.counts.ordersPreserved
+            discoveryTotals.ordersSkippedCanonical +=
+              result.counts.ordersSkippedCanonical
+            discoveryTotals.recordsRejected += result.counts.recordsRejected
+            discoveryTotals.canonicalOrdersCreated +=
+              result.counts.canonicalOrdersCreated
+            if (!result.pagination.hasNextBatch) {
+              accountComplete = true
+              break
+            }
+          }
+          if (accountComplete) {
+            discoveryTotals.accountsCompleted += 1
+          } else if (accountPollTimedOut) {
+            discoveryTotals.accountsInProgress += 1
+            discoveryFailures.push(
+              `${account.displayName} is still refreshing after the bounded wait. Current results are being reloaded and may not include that scan yet; refresh again after it finishes.`,
+            )
+          } else {
+            discoveryTotals.accountsContinuing += 1
+            discoveryFailures.push(
+              `${account.displayName} still has provider pages after the safe per-click limit; refresh again to continue.`,
+            )
+          }
+        } catch (caught) {
+          discoveryFailures.push(caught instanceof Error
+            ? caught.message
+            : `${account.displayName} orders could not be refreshed`)
+        }
+      }
+      if (discoveryTotals.accountsAttempted > 0) {
+        pendingOrderStatusSyncReload.current = true
+      }
       while (checkedOrderGlobalIds.size < MAX_ORDER_STATUS_SYNC_ORDERS) {
         const response = await fetch('/api/operations/order-status-sync', {
           method: 'POST',
@@ -3565,33 +4036,51 @@ export default function OperationsSection({
         if (result.counts.selected === 0 || remainingEligible === 0) break
       }
       if (totals.attempted > 0) pendingOrderStatusSyncReload.current = true
-      if (totals.attempted === 0) {
-        setNotice(
-          'No Shopify or Faire orders are ready to check right now. Recent provider failures may be waiting for their safe retry window.',
-        )
-      } else {
-        setNotice(
-          `Checked ${totals.attempted} eligible sales-channel ${
+      const discoverySummary = discoveryTotals.accountsAttempted > 0
+        ? `Checked ${discoveryTotals.accountsCompleted} of ${
+            discoveryTotals.accountsAttempted
+          } connected ${
+            discoveryTotals.accountsAttempted === 1 ? 'store' : 'stores'
+          } for new orders and found ${discoveryTotals.eligibleOrdersSeen} eligible provider ${
+            discoveryTotals.eligibleOrdersSeen === 1 ? 'order' : 'orders'
+          }.${discoveryTotals.accountsInProgress > 0
+            ? ` ${discoveryTotals.accountsInProgress} ${
+                discoveryTotals.accountsInProgress === 1 ? 'store is' : 'stores are'
+              } still refreshing after the bounded wait.`
+            : ''}${discoveryTotals.accountsContinuing > 0
+            ? ` ${discoveryTotals.accountsContinuing} ${
+                discoveryTotals.accountsContinuing === 1
+                  ? 'store still has'
+                  : 'stores still have'
+              } provider pages after this bounded refresh.`
+            : ''}`
+        : 'No running connected stores were available for order discovery.'
+      const statusSummary = totals.attempted === 0
+        ? 'No existing orders were ready for an exact status check.'
+        : `Checked ${totals.attempted} existing sales-channel ${
             totals.attempted === 1 ? 'order' : 'orders'
           }. ${
             totals.changed === 0
-              ? 'No provider changes were detected.'
-              : `${totals.changed} provider ${
+              ? 'No provider status changes were detected.'
+              : `${totals.changed} provider status ${
                   totals.changed === 1 ? 'change was' : 'changes were'
                 } detected.`
           }${remainingEligible > 0
             ? ` ${remainingEligible} eligible ${
                 remainingEligible === 1 ? 'order remains' : 'orders remain'
-              }; run sync again to check the next group.`
-            : ''}`,
+              }; refresh again to check the next group.`
+            : ''}`
+      setNotice(`${discoverySummary} ${statusSummary}`)
+      const failureMessages = [...discoveryFailures]
+      if (totals.failed > 0) {
+        failureMessages.push(
+          `${totals.failed} existing sales-channel ${
+            totals.failed === 1 ? 'order' : 'orders'
+          } could not be checked and will retry after the safe retry window.`,
         )
       }
-      if (totals.failed > 0) {
-        setError(
-          `${totals.failed} sales-channel ${
-            totals.failed === 1 ? 'order' : 'orders'
-          } could not be checked. It will be eligible again after the safe retry window.`,
-        )
+      if (failureMessages.length > 0) {
+        setError(failureMessages.join(' '))
       }
     } catch (caught) {
       if (checkedOrderGlobalIds.size > 0) {
@@ -3603,7 +4092,7 @@ export default function OperationsSection({
     } finally {
       setSyncingOrderStatus(false)
     }
-  }, [])
+  }, [workspace?.storeSync])
 
   useEffect(() => {
     if (syncingOrderStatus || !pendingOrderStatusSyncReload.current) return
@@ -3921,6 +4410,23 @@ export default function OperationsSection({
       (candidate) => candidate.candidateGlobalId === selectedImportedGlobalId,
     )
     if (!order || refreshingImportedOrder || savingImportedOrder) return null
+    const pendingRef = conflictResolution
+      ? pendingImportedOrderConflictRefresh
+      : pendingImportedOrderRefresh
+    const fingerprint = importedOrderRefreshFingerprint(conflictResolution)
+    const retained = pendingRef.current
+    const pending = retained
+      && retained.candidateGlobalId === order.candidateGlobalId
+      && retained.expectedRowVersion === order.rowVersion
+      && retained.fingerprint === fingerprint
+      ? retained
+      : {
+          candidateGlobalId: order.candidateGlobalId,
+          expectedRowVersion: order.rowVersion,
+          fingerprint,
+          idempotencyKey: crypto.randomUUID(),
+        }
+    pendingRef.current = pending
     setRefreshingImportedOrder(true)
     setImportedOrderError('')
     try {
@@ -3928,12 +4434,12 @@ export default function OperationsSection({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Idempotency-Key': crypto.randomUUID(),
+          'Idempotency-Key': pending.idempotencyKey,
         },
         body: JSON.stringify({
           action: 'refresh',
-          candidateGlobalId: order.candidateGlobalId,
-          expectedRowVersion: order.rowVersion,
+          candidateGlobalId: pending.candidateGlobalId,
+          expectedRowVersion: pending.expectedRowVersion,
           ...(conflictResolution
             ? {
                 latestCandidateGlobalId:
@@ -3953,6 +4459,7 @@ export default function OperationsSection({
         && Array.isArray(payload.conflicts)
         && Array.isArray(payload.lineConflicts)
       ) {
+        pendingRef.current = null
         return {
           latestCandidateGlobalId: payload.latestCandidateGlobalId,
           conflicts: payload.conflicts,
@@ -3965,8 +4472,10 @@ export default function OperationsSection({
         || !payload.order
         || !payload.refreshResult
       ) {
+        pendingRef.current = null
         throw new Error(payload.error || 'Order could not be refreshed')
       }
+      pendingRef.current = null
       const refreshed = payload.order
       setWorkspace((current) => {
         if (!current) return current
@@ -6924,9 +7433,9 @@ export default function OperationsSection({
   const importedDetail = workspace?.importedOrders.find(
     (order) => order.candidateGlobalId === selectedImportedGlobalId,
   ) || null
-  const visibleImportedOrders = !status || status === 'imported'
-    ? workspace?.importedOrders || []
-    : []
+  const visibleImportedOrders = (workspace?.importedOrders || []).filter(
+    (order) => !status || importedOrderFilterStatus(order) === status,
+  )
   const visibleOrderCount = (workspace?.orders.length || 0) + visibleImportedOrders.length
   const planEvidenceValid = CARTONIZATION_EVIDENCE_GLOBAL_ID.test(
     planCartonizationEvidenceGlobalId.trim().toLowerCase(),
@@ -7211,16 +7720,16 @@ export default function OperationsSection({
             <Tooltip title="Operations guide"><IconButton aria-label="Open operations guide" onClick={() => setGuideOpen(true)}><HelpOutlineRounded /></IconButton></Tooltip>
             {mainWorkspaceView && (
               <Tooltip title={orderStatusSyncAvailable
-                ? 'Sync sales-channel order status'
+                ? 'Refresh connected-store orders'
                 : 'Refresh operations'}>
                 <span>
                   <IconButton
                     aria-label={orderStatusSyncAvailable
-                      ? 'Sync sales-channel order status'
+                      ? 'Refresh connected-store orders'
                       : 'Refresh operations'}
                     disabled={loading || syncingOrderStatus}
                     onClick={() => void (orderStatusSyncAvailable
-                      ? syncOrderStatuses()
+                      ? refreshOrders()
                       : loadWorkspace(selectedGlobalId))}
                   >
                     {syncingOrderStatus
@@ -7724,8 +8233,8 @@ export default function OperationsSection({
                   </Box>
                   <Chip
                     size="small"
-                    label={order.needsInfo ? 'Needs info' : 'Imported'}
-                    color={order.needsInfo ? 'warning' : 'info'}
+                    label={importedOrderDisplayStatus(order)}
+                    color={importedOrderStatusColor(order)}
                   />
                 </Stack>
                 <Stack direction="row" justifyContent="space-between" alignItems="flex-end" gap={1.5} sx={{ mt: 1.25 }}>
@@ -7747,6 +8256,7 @@ export default function OperationsSection({
                 key={order.globalId}
                 component="button"
                 type="button"
+                data-testid={`canonical-order-${order.globalId}`}
                 onClick={() => chooseOrder(order)}
                 sx={{
                   appearance: 'none', border: 0, background: 'transparent', color: 'inherit', textAlign: 'left',
@@ -7803,8 +8313,8 @@ export default function OperationsSection({
                     <TableCell>
                       <Chip
                         size="small"
-                        label={order.needsInfo ? 'Needs info' : 'Imported'}
-                        color={order.needsInfo ? 'warning' : 'info'}
+                        label={importedOrderDisplayStatus(order)}
+                        color={importedOrderStatusColor(order)}
                       />
                     </TableCell>
                     <TableCell>—</TableCell>
@@ -7822,7 +8332,13 @@ export default function OperationsSection({
                   </TableRow>
                 ))}
                 {workspace?.orders.map((order) => (
-                  <TableRow key={order.globalId} hover onClick={() => chooseOrder(order)} sx={{ cursor: 'pointer' }}>
+                  <TableRow
+                    key={order.globalId}
+                    data-testid={`canonical-order-${order.globalId}`}
+                    hover
+                    onClick={() => chooseOrder(order)}
+                    sx={{ cursor: 'pointer' }}
+                  >
                     <TableCell><Typography fontWeight={600}>{order.orderNumber}</Typography><Typography variant="caption" color="#A8C7FA">{order.globalId}</Typography></TableCell>
                     <TableCell><Typography>{order.customerName}</Typography><Typography variant="caption" color="text.secondary">{order.customerGlobalId}</Typography></TableCell>
                     <TableCell><Chip size="small" label={orderDisplayStatus(order)} color={orderStatusColor(order)} /></TableCell>

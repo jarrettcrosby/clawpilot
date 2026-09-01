@@ -614,7 +614,7 @@ export async function listCommerceOrderRevisionRefreshCandidatesInPostgres(
   const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
   if (
     !Array.isArray(excludeOrderGlobalIds)
-    || excludeOrderGlobalIds.length > 100
+    || excludeOrderGlobalIds.length > 500
     || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
     || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
   ) {
@@ -729,7 +729,7 @@ export async function prepareCommerceOrderStatusSyncBatchInPostgres(input: {
   const excludeOrderGlobalIds = input.excludeOrderGlobalIds || []
   if (
     !Array.isArray(excludeOrderGlobalIds)
-    || excludeOrderGlobalIds.length > 100
+    || excludeOrderGlobalIds.length > 500
     || new Set(excludeOrderGlobalIds).size !== excludeOrderGlobalIds.length
     || excludeOrderGlobalIds.some((globalId) => !GLOBAL_ORDER_ID.test(globalId))
   ) {

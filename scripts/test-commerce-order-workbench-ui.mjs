@@ -13,9 +13,9 @@ const [operations, drawer, imports, intake] = await Promise.all([
 for (const fragment of [
   'workspace?.importedOrders',
   'visibleImportedOrders.map',
-  "label={order.needsInfo ? 'Needs info' : 'Imported'}",
+  'label={importedOrderDisplayStatus(order)}',
+  'importedOrderFilterStatus(order) === status',
   'chooseImportedOrder(order)',
-  "!status || status === 'imported'",
   '<ImportedOrderWorkingCopyDrawer',
   "fetch('/api/operations/order-workbench'",
   "'Idempotency-Key': pending.idempotencyKey",
@@ -34,6 +34,17 @@ for (const fragment of [
   'lineResolutions: conflictResolution.lineResolutions',
   'Array.isArray(payload.lineConflicts)',
   'saved item matches were preserved',
+  'validImportedOrderPage',
+  'MAX_IMPORTED_ORDER_PAGES',
+  '`/api/operations/order-workbench?${workbenchParams.toString()}`',
+  'Imported-order pagination did not advance',
+  'Loaded ${importedOrders.length} of ${Math.max(',
+  'validCanonicalOrderPage',
+  'MAX_CANONICAL_ORDER_PAGES',
+  '`/api/operations/orders?${orderParams.toString()}`',
+  'Order pagination did not advance',
+  'Order pagination returned a duplicate order',
+  'Loaded ${canonicalOrders.length} of ${Math.max(',
 ]) {
   assert.ok(operations.includes(fragment), `Operations UI is missing ${fragment}`)
 }
@@ -106,6 +117,9 @@ for (const fragment of [
   'lineRefreshChoices[conflict.lineGlobalId]',
   "field === 'requestedDeliveryAt'",
   'savedDraftComplete',
+  'providerOrderStatus(order)',
+  'Fulfilled externally',
+  'providerTerminal',
 ]) {
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }

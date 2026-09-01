@@ -1391,7 +1391,17 @@ async function verifyShipmentCompletion(databaseUrl) {
           readCommerceStoreSyncControlsFromPostgres: async () => [],
         },
         '@/lib/persistence/commerceOrderWorkbench': {
-          readCommerceOrderWorkbenchFromPostgres: async () => [],
+          readCommerceOrderWorkbenchPageFromPostgres: async () => ({
+            orders: [],
+            page: {
+              total: 0,
+              returned: 0,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          }),
         },
         '@/lib/persistence/orderUnitWeightEvidence': {
           assertCurrentOrderUnitWeightEvidence: async () => {},

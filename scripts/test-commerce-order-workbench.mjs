@@ -1,6 +1,58 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
+import vm from 'node:vm'
+
+const nodeRequire = createRequire(import.meta.url)
+const requireFromApp = createRequire(
+  new URL('../app_src/package.json', import.meta.url),
+)
+const ts = requireFromApp('typescript')
+
+function loadTypeScriptSourceModule(source, path, mocks = {}) {
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+    fileName: path,
+    reportDiagnostics: true,
+  })
+  const errors = (output.diagnostics || []).filter(
+    (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+  )
+  assert.deepEqual(errors, [], `${path} must transpile`)
+  const module = { exports: {} }
+  vm.runInNewContext(output.outputText, {
+    Buffer,
+    Error,
+    Headers,
+    JSON,
+    Number,
+    Object,
+    Promise,
+    RegExp,
+    Request,
+    Response,
+    Set,
+    String,
+    URL,
+    URLSearchParams,
+    console,
+    exports: module.exports,
+    module,
+    process,
+    require(specifier) {
+      if (Object.prototype.hasOwnProperty.call(mocks, specifier)) {
+        return mocks[specifier]
+      }
+      return nodeRequire(specifier)
+    },
+  }, { filename: path })
+  return module.exports
+}
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), 'utf8')
 const [
@@ -9,24 +61,28 @@ const [
   duplicateWorkbenchMigration,
   persistence,
   route,
+  ordersRoute,
   operationsRoute,
   operations,
   types,
   intake,
   candidateResolver,
   drawer,
+  idempotency,
 ] = await Promise.all([
   read('db/migrations/0307_operations_commerce_order_workbench.sql'),
   read('db/migrations/0321_operations_unit_item_cartonization.sql'),
   read('db/migrations/0322_operations_duplicate_order_workbench_recovery.sql'),
   read('app_src/lib/persistence/commerceOrderWorkbench.ts'),
   read('app_src/app/api/operations/order-workbench/route.ts'),
+  read('app_src/app/api/operations/orders/route.ts'),
   read('app_src/app/api/operations/route.ts'),
   read('app_src/lib/persistence/operations.ts'),
   read('app_src/lib/operations/types.ts'),
   read('app_src/lib/integrations/commerceIntake.ts'),
   read('app_src/lib/persistence/commerceIntake.ts'),
   read('app_src/components/operations/ImportedOrderWorkingCopyDrawer.tsx'),
+  read('app_src/lib/operations/orderWorkbenchIdempotency.ts'),
 ])
 
 for (const fragment of [
@@ -147,13 +203,27 @@ assert.equal(
 )
 assert.ok(
   persistence.indexOf("ILIKE $3 ESCAPE '!'")
-    < persistence.indexOf('LIMIT 200`'),
+    < persistence.indexOf('LIMIT $8::integer'),
   'Search must execute in SQL before the bounded result cap',
+)
+assert.ok(
+  persistence.includes('LIMIT $8::integer'),
+  'Each Orders pane keyset query must retain a bounded page size',
+)
+assert.equal(
+  /candidate\.id DESC\s+LIMIT 1000`/u.test(persistence),
+  false,
+  'The Orders pane must not silently stop at 1,000 current provider orders',
 )
 assert.equal(
   persistence.includes('.filter((order)'),
   false,
   'Bounded rows must not be filtered in memory after the SQL limit',
+)
+assert.equal(
+  persistence.includes('.slice(0, 100)'),
+  false,
+  'The Orders pane must not hide staged provider orders after the SQL query',
 )
 
 for (const fragment of [
@@ -168,8 +238,21 @@ for (const fragment of [
   'acceptCommerceOrderWorkbenchInPostgres',
   'capabilities.canManage',
   'idempotencyKeyValue(req)',
+  'derivedOrderWorkbenchIdempotencyKey',
+  "purpose: 'provider'",
 ]) {
   assert.ok(route.includes(fragment), `Route is missing ${fragment}`)
+}
+
+for (const fragment of [
+  "input.purpose === 'provider'",
+  '(bytes[6] & 0x0f) | 0x50',
+  '(bytes[8] & 0x3f) | 0x80',
+]) {
+  assert.ok(
+    idempotency.includes(fragment),
+    `Order workbench idempotency is missing ${fragment}`,
+  )
 }
 
 for (const fragment of [
@@ -241,16 +324,61 @@ assert.ok(
 )
 
 assert.ok(
-  operations.includes('readCommerceOrderWorkbenchFromPostgres'),
-  'Operations workspace must load imported working copies',
+  operations.includes('readCommerceOrderWorkbenchPageFromPostgres'),
+  'Operations workspace must load a bounded imported-order page',
 )
 assert.ok(
-  operations.includes('importedOrders,'),
+  operations.includes('importedOrders: importedOrderResult.orders'),
   'Operations workspace must expose imported working copies',
 )
 assert.ok(
   types.includes('importedOrders: OperationsImportedOrderWorkingCopy[]'),
   'Workspace contract must expose imported working copies',
+)
+for (const fragment of [
+  'readCommerceOrderWorkbenchPageFromPostgres',
+  'count(*) OVER ()::text AS matching_total_count',
+  'matching.candidate_id < $7::uuid',
+  'nextCursor',
+  'complete: nextCursor === null',
+  'truncated: nextCursor !== null',
+]) {
+  assert.ok(
+    persistence.includes(fragment),
+    `Workbench pagination is missing ${fragment}`,
+  )
+}
+assert.ok(
+  types.includes('importedOrderPage: OperationsImportedOrderPage'),
+  'Workspace contract must expose imported-order page completion evidence',
+)
+for (const fragment of [
+  'export async function readOperationsOrderPageFromPostgres',
+  'WITH matching_order_ids AS',
+  'count(*) OVER ()::text AS matching_total_count',
+  'matching.id < $6::uuid',
+  'LIMIT $7::integer',
+  'orderPage: orderPageResult.page',
+]) {
+  assert.ok(
+    operations.includes(fragment),
+    `Canonical order pagination is missing ${fragment}`,
+  )
+}
+for (const fragment of [
+  'export async function GET',
+  'readOperationsOrderPageFromPostgres',
+  'cursor: cursor || null',
+  'pageSize',
+]) {
+  assert.ok(
+    ordersRoute.includes(fragment),
+    `Canonical order page route is missing ${fragment}`,
+  )
+}
+assert.ok(
+  types.includes('orderPage: OperationsOrderPage'),
+  'Workspace contract must expose canonical order page completion evidence',
 )
 for (const fragment of [
   'canonicalOrderGlobalId: string | null',
@@ -262,5 +390,174 @@ for (const fragment of [
 ]) {
   assert.ok(types.includes(fragment), `Result contract is missing ${fragment}`)
 }
+
+class CommerceIntegrationRequestError extends Error {
+  constructor(message, status = 400, code = 'COMMERCE_REQUEST_INVALID') {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
+class CommerceOrderWorkbenchError extends Error {
+  constructor(code, message, status = 400, details = null) {
+    super(message)
+    this.code = code
+    this.status = status
+    this.details = details
+  }
+}
+
+const organizationId = 'bb13beb0-2b75-48a2-8b1d-2bd154950668'
+const actorEmail = 'workbench-route@example.test'
+const candidateGlobalId = 'gcoc1000001'
+const inboundIdempotencyKey = 'd4783b27-b341-49d0-8e1e-1278b39039a8'
+const providerRefreshCalls = []
+const rebaseCalls = []
+const idempotencyModule = loadTypeScriptSourceModule(
+  idempotency,
+  'app_src/lib/operations/orderWorkbenchIdempotency.ts',
+)
+const workbenchRoute = loadTypeScriptSourceModule(
+  route,
+  'app_src/app/api/operations/order-workbench/route.ts',
+  {
+    'next/server': {
+      NextResponse: {
+        json(payload, init = {}) {
+          return new Response(JSON.stringify(payload), {
+            status: init.status || 200,
+            headers: {
+              'Content-Type': 'application/json',
+              ...(init.headers || {}),
+            },
+          })
+        },
+      },
+    },
+    '@/lib/integrations/commerceIntake': {
+      async refreshCommerceOrderWorkbenchCandidate(input) {
+        providerRefreshCalls.push(input)
+      },
+    },
+    '@/lib/integrations/commerceIntegrations': {
+      CommerceIntegrationRequestError,
+      sanitizedCommerceIntegrationError(error) {
+        return {
+          code: error.code,
+          message: error.message,
+          status: error.status,
+        }
+      },
+    },
+    '@/lib/operations/authorization': {
+      activeOperationsOrganizationId(actor) {
+        return actor.organizationId
+      },
+      operationsCapabilities(actor) {
+        return actor.capabilities
+      },
+    },
+    '@/lib/operations/orderWorkbenchIdempotency': idempotencyModule,
+    '@/lib/operations/orderShipTo': {
+      ORDER_SHIP_TO_FIELDS: [
+        'name',
+        'line1',
+        'line2',
+        'city',
+        'region',
+        'postalCode',
+        'country',
+      ],
+    },
+    '@/lib/persistence/config': {
+      isPostgresStorageEnabled() {
+        return true
+      },
+    },
+    '@/lib/persistence/commerceOrderWorkbench': {
+      CommerceOrderWorkbenchError,
+      async readCommerceOrderWorkbenchRefreshTargetFromPostgres(input) {
+        assert.deepEqual(JSON.parse(JSON.stringify(input)), {
+          organizationId,
+          candidateGlobalId,
+        })
+        return {
+          accountGlobalId: 'gia1000001',
+          candidateGlobalId,
+          candidateRowVersion: 0,
+        }
+      },
+      async rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres(input) {
+        rebaseCalls.push(input)
+        return {
+          previousCandidateGlobalId: candidateGlobalId,
+          candidateGlobalId,
+          rowVersion: 0,
+          status: 'unchanged',
+          providerChangedFields: [],
+          preservedLocalFields: [],
+          preservedLineDrafts: [],
+          providerWrites: 0,
+          providerWriteIntentCreated: false,
+          replayed: false,
+        }
+      },
+      async readCommerceOrderWorkbenchFromPostgres() {
+        return [{ candidateGlobalId, provider: 'shopify' }]
+      },
+    },
+    '@/lib/requestUser': {
+      async requireRequestUser() {
+        return {
+          email: actorEmail,
+          organizationId,
+          capabilities: { canManage: true },
+        }
+      },
+    },
+  },
+)
+const refreshRequest = new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': inboundIdempotencyKey,
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+)
+const refreshResponse = await workbenchRoute.POST(refreshRequest)
+assert.equal(refreshResponse.status, 200)
+assert.equal((await refreshResponse.json()).ok, true)
+assert.equal(providerRefreshCalls.length, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(providerRefreshCalls[0])),
+  {
+    organizationId,
+    accountGlobalId: 'gia1000001',
+    actorEmail,
+    idempotencyKey: idempotencyModule.derivedOrderWorkbenchIdempotencyKey({
+      organizationId,
+      idempotencyKey: inboundIdempotencyKey,
+      candidateGlobalId,
+      purpose: 'provider',
+    }),
+    candidateGlobalId,
+  },
+  'the POST refresh route must pass the derived provider key to commerce intake',
+)
+assert.match(
+  providerRefreshCalls[0].idempotencyKey,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  'commerce intake must receive a valid UUID idempotency key',
+)
+assert.equal(rebaseCalls.length, 1)
 
 console.log('Commerce order workbench contract passed')

@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 import { refreshCommerceOrderWorkbenchCandidate } from '@/lib/integrations/commerceIntake'
 import {
@@ -9,6 +8,9 @@ import {
   activeOperationsOrganizationId,
   operationsCapabilities,
 } from '@/lib/operations/authorization'
+import {
+  derivedOrderWorkbenchIdempotencyKey,
+} from '@/lib/operations/orderWorkbenchIdempotency'
 import {
   ORDER_SHIP_TO_FIELDS,
   type OrderShipToField,
@@ -23,6 +25,7 @@ import {
   CommerceOrderWorkbenchError,
   readCommerceOrderWorkbenchRefreshTargetFromPostgres,
   readCommerceOrderWorkbenchFromPostgres,
+  readCommerceOrderWorkbenchPageFromPostgres,
   rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres,
   updateCommerceOrderWorkbenchShipToInPostgres,
   type CommerceOrderWorkbenchLineRefreshResolution,
@@ -42,6 +45,7 @@ const CUSTOMER_GLOBAL_ID = /^ga(?:[0-9]{7}|[0-9a-v]{12})$/u
 const LINE_GLOBAL_ID = /^gcol(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PRODUCT_GLOBAL_ID = /^gp(?:[0-9]{7}|[0-9a-v]{12})$/u
 const PACKAGE_PROFILE_GLOBAL_ID = /^gpp(?:[0-9]{7}|[0-9a-v]{12})$/u
+const MAX_PAGE_SIZE = 250
 const SHIP_TO_FIELDS = new Set<string>(ORDER_SHIP_TO_FIELDS)
 const REFRESH_FIELDS = new Set<string>([
   ...ORDER_SHIP_TO_FIELDS,
@@ -327,21 +331,6 @@ function lineRefreshResolutionsValue(
   return resolutions
 }
 
-function derivedIdempotencyKey(input: {
-  organizationId: string
-  idempotencyKey: string
-  candidateGlobalId: string
-  purpose: 'provider' | 'rebase'
-}) {
-  const digest = createHash('sha256').update([
-    input.organizationId,
-    input.idempotencyKey,
-    input.candidateGlobalId,
-    input.purpose,
-  ].join(':')).digest('hex')
-  return `order-workbench-${input.purpose}:${digest}`
-}
-
 async function requestBody(req: NextRequest) {
   const contentType = String(req.headers.get('content-type') || '').toLowerCase()
   if (!/^application\/json(?:\s*;|$)/u.test(contentType)) {
@@ -433,15 +422,36 @@ export async function GET(req: NextRequest) {
     const candidateValue = String(
       req.nextUrl.searchParams.get('candidate') || '',
     ).trim()
-    const orders = await readCommerceOrderWorkbenchFromPostgres({
+    const cursor = String(
+      req.nextUrl.searchParams.get('cursor') || '',
+    ).trim()
+    const limitValue = String(
+      req.nextUrl.searchParams.get('limit') || MAX_PAGE_SIZE,
+    ).trim()
+    if (!/^\d{1,3}$/u.test(limitValue)) {
+      requestError('OPERATIONS_PAGE_SIZE_INVALID', 'Order page size is invalid')
+    }
+    const pageSize = Number(limitValue)
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
+      requestError('OPERATIONS_PAGE_SIZE_INVALID', 'Order page size is invalid')
+    }
+    if (candidateValue && cursor) {
+      requestError(
+        'OPERATIONS_PAGE_CURSOR_INVALID',
+        'A single-order read cannot use an order-page cursor',
+      )
+    }
+    const result = await readCommerceOrderWorkbenchPageFromPostgres({
       organizationId: activeOperationsOrganizationId(actor),
       search,
       candidateGlobalId: candidateValue
         ? candidateGlobalIdValue(candidateValue)
         : null,
       includeResolutionDetails: Boolean(candidateValue),
+      cursor: cursor || null,
+      pageSize: candidateValue ? 1 : pageSize,
     })
-    return response({ ok: true, orders })
+    return response({ ok: true, orders: result.orders, page: result.page })
   } catch (error) {
     return errorResponse(error)
   }
@@ -570,7 +580,7 @@ export async function POST(req: NextRequest) {
         organizationId,
         accountGlobalId: target.accountGlobalId,
         actorEmail: actor.email,
-        idempotencyKey: derivedIdempotencyKey({
+        idempotencyKey: derivedOrderWorkbenchIdempotencyKey({
           organizationId,
           idempotencyKey: requestKey,
           candidateGlobalId,
@@ -582,7 +592,7 @@ export async function POST(req: NextRequest) {
     const result = await rebaseCommerceOrderWorkbenchFromLatestCandidateInPostgres({
       organizationId,
       actorEmail: actor.email,
-      idempotencyKey: derivedIdempotencyKey({
+      idempotencyKey: derivedOrderWorkbenchIdempotencyKey({
         organizationId,
         idempotencyKey: requestKey,
         candidateGlobalId,

@@ -1016,7 +1016,9 @@ export type OperationsWorkspace = {
   storeSync: import('@/lib/operations/commerceStoreSync').CommerceStoreSyncControl[]
   summary: OperationsSummary
   importedOrders: OperationsImportedOrderWorkingCopy[]
+  importedOrderPage: OperationsImportedOrderPage
   orders: OperationsOrderListItem[]
+  orderPage: OperationsOrderPage
   exceptions: OperationsExceptionListItem[]
   selectedOrder: OperationsOrderDetail | null
   warehouses: Array<{
@@ -1148,6 +1150,24 @@ export type OperationsWorkspace = {
   generatedAt: string
 }
 
+export type OperationsImportedOrderPage = {
+  total: number
+  returned: number
+  pageSize: number
+  nextCursor: string | null
+  complete: boolean
+  truncated: boolean
+}
+
+export type OperationsOrderPage = {
+  total: number
+  returned: number
+  pageSize: number
+  nextCursor: string | null
+  complete: boolean
+  truncated: boolean
+}
+
 export type OperationsImportedOrderWorkingCopy = {
   kind: 'imported_working_copy'
   globalId: string
@@ -1159,6 +1179,19 @@ export type OperationsImportedOrderWorkingCopy = {
   externalOrderId: string
   orderNumber: string
   status: 'imported'
+  providerState: {
+    lifecycle: 'open' | 'closed' | 'cancelled' | 'unknown'
+    fulfillment:
+      | 'unfulfilled'
+      | 'partial'
+      | 'fulfilled'
+      | 'on_hold'
+      | 'scheduled'
+      | 'cancelled'
+      | 'unknown'
+    observedAt: string
+    source: 'operational' | 'history' | 'retained'
+  }
   needsInfo: boolean
   blockerCodes: string[]
   customerName: string | null

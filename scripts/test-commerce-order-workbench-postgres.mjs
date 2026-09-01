@@ -81,6 +81,54 @@ async function expectDatabaseError(action, pattern) {
   assert.match(String(observed.message || observed), pattern)
 }
 
+async function waitForBlockedDatabaseLock(pool, label) {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const result = await pool.query(
+      `SELECT count(*)::integer AS waiting
+       FROM pg_stat_activity
+       WHERE datname = current_database()
+         AND pid <> pg_backend_pid()
+         AND wait_event_type = 'Lock'`,
+    )
+    if (Number(result.rows[0]?.waiting || 0) > 0) return
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.fail(`${label} did not reach its expected database lock wait`)
+}
+
+async function providerFenceLocksAreAvailable(pool, fixture) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const externalOrderId =
+      `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`
+    const keys = [
+      [
+        'commerce-intake-order-identity-v1',
+        fixture.organization,
+        fixture.integration,
+        externalOrderId,
+      ].join(':'),
+      `commerce-order-observation:${fixture.organization}`
+        + `:${fixture.integration}:shopify:${externalOrderId}`,
+    ]
+    for (const key of keys) {
+      const result = await client.query(
+        `SELECT pg_try_advisory_xact_lock(
+           hashtextextended($1::text, 0)
+         ) AS acquired`,
+        [key],
+      )
+      if (result.rows[0]?.acquired !== true) return false
+    }
+    return true
+  } finally {
+    await client.query('ROLLBACK').catch(() => {})
+    client.release()
+  }
+}
+
 async function seedTenant(client, fixture, label) {
   await client.query(
     `INSERT INTO crm_reference_registry (
@@ -724,6 +772,77 @@ async function seedFixtures(
   }
 }
 
+async function seedTerminalProviderObservation(pool, fixture, key) {
+  const client = await pool.connect()
+  try {
+    await client.query('SET session_replication_role = replica')
+    await client.query(
+      `INSERT INTO operations_commerce_order_sync_policies (
+         organization_id, integration_account_id,
+         historical_observation_enabled, continuous_observation_enabled,
+         continuous_transport, provider_event_processor_state, revision,
+         created_by, updated_by
+       ) VALUES (
+         $1::uuid, $2::uuid, false, true,
+         'scheduled_poll', 'processor_pending', 1, $3, $3
+       )`,
+      [fixture.organization, fixture.integration, actorEmail],
+    )
+    const session = (await client.query(
+      `INSERT INTO operations_commerce_order_backfill_sessions (
+         organization_id, integration_account_id, provider, session_kind,
+         credential_generation, policy_revision, coverage_basis, status,
+         requested_from, requested_through, locked_at, locked_by,
+         lock_token, lease_expires_at, idempotency_key, request_hash,
+         query_hash, requested_by, reason
+       ) VALUES (
+         $1::uuid, $2::uuid, 'shopify', 'continuous_poll', 1, 1,
+         'shopify_updated_at_overlap', 'processing',
+         now() - interval '1 day', now() + interval '2 seconds',
+         now(), $3, gen_random_uuid(), now() + interval '5 minutes',
+         $4, $5, $6, $7, $8
+       ) RETURNING id::text`,
+      [
+        fixture.organization,
+        fixture.integration,
+        `workbench-provider-status-${key}`,
+        `workbench-provider-status-${key}`,
+        'f'.repeat(64),
+        '0'.repeat(64),
+        actorEmail,
+        'Workbench current provider status read fixture',
+      ],
+    )).rows[0]
+    await client.query(
+      `INSERT INTO operations_commerce_order_observations (
+         organization_id, integration_account_id, backfill_session_id,
+         provider, credential_generation, observation_kind,
+         external_order_id, order_number, source_revision, source_hash,
+         canonical_lifecycle_state, canonical_payment_state,
+         canonical_fulfillment_state, canonical_return_state,
+         provider_updated_at, observed_at, provider_read_count
+       ) VALUES (
+         $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 'scheduled_poll',
+         $4, $5, $6, $7,
+         'closed', 'paid', 'fulfilled', 'none',
+         now() + interval '1 second', now() + interval '1 second', 1
+       )`,
+      [
+        fixture.organization,
+        fixture.integration,
+        session.id,
+        `gid://shopify/Order/${fixture.candidateGlobalId.slice(-7)}`,
+        `#${fixture.candidateGlobalId.slice(-7)}`,
+        `workbench-provider-status-${key}`,
+        'e'.repeat(64),
+      ],
+    )
+  } finally {
+    await client.query('SET session_replication_role = origin').catch(() => {})
+    client.release()
+  }
+}
+
 async function seedSearchBoundaryCandidates(pool, fixture) {
   const client = await pool.connect()
   try {
@@ -764,7 +883,7 @@ async function seedSearchBoundaryCandidates(pool, fixture) {
          'commerce-order-workbench-postgres-v1', 'held',
          ARRAY['ship_to_unavailable']::text[], 0, $5, $5,
          now() + interval '7 days'
-       FROM generate_series(1, 205) AS ordinal`,
+       FROM generate_series(1, 1205) AS ordinal`,
       [
         fixture.organization,
         fixture.integration,
@@ -1267,7 +1386,35 @@ async function verifyAcceptance(
       refreshFixture,
       nonShippingFixture,
     )
+    const terminalRaceFixture = ids('0009712')
+    const failedRetainedFixture = ids('0009713')
+    const lockOrderFixture = ids('0009714')
+    const terminalRaceSeed = await pool.connect()
+    try {
+      await terminalRaceSeed.query('SET session_replication_role = replica')
+      await seedTenant(
+        terminalRaceSeed,
+        terminalRaceFixture,
+        'Terminal evidence race workbench',
+      )
+      await seedReadyFacts(terminalRaceSeed, terminalRaceFixture)
+      await seedTenant(
+        terminalRaceSeed,
+        failedRetainedFixture,
+        'Failed retained workbench',
+      )
+      await seedTenant(
+        terminalRaceSeed,
+        lockOrderFixture,
+        'Promotion save lock order workbench',
+      )
+    } finally {
+      await terminalRaceSeed.query('SET session_replication_role = origin')
+        .catch(() => {})
+      terminalRaceSeed.release()
+    }
     const persistence = workbenchPersistence(pool)
+    const candidatePersistence = candidateResolverPersistence(pool)
     const emptyAddress = {
       name: null,
       line1: null,
@@ -1425,6 +1572,12 @@ async function verifyAcceptance(
     assert.equal(initial[0].shipTo.syncStatus, 'provider_snapshot')
     assert.equal(initial[0].providerWrites, 0)
     assert.equal(initial[0].providerVersionChanged, false)
+    assert.deepEqual(initial[0].providerState, {
+      lifecycle: 'open',
+      fulfillment: 'unfulfilled',
+      observedAt: initial[0].providerState.observedAt,
+      source: 'operational',
+    })
     assert.deepEqual(initial[0].shipTo.value, {
       name: null,
       line1: null,
@@ -1434,10 +1587,424 @@ async function verifyAcceptance(
       postalCode: null,
       country: null,
     })
+    const retainedDraft = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: failedRetainedFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-failed-retained-save-0001',
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: { name: 'Retained after failed provider row' },
+      }))
+    assert.equal(retainedDraft.rowVersion, 1)
+    const failedRetainedSeed = await pool.connect()
+    try {
+      await failedRetainedSeed.query('SET session_replication_role = replica')
+      await failedRetainedSeed.query(
+        `UPDATE operations_commerce_order_candidates
+         SET workflow_state = 'failed', updated_at = now()
+         WHERE organization_id = $1::uuid AND id = $2::uuid`,
+        [failedRetainedFixture.organization, failedRetainedFixture.candidate],
+      )
+    } finally {
+      await failedRetainedSeed.query('SET session_replication_role = origin')
+        .catch(() => {})
+      failedRetainedSeed.release()
+    }
+    const failedRetained = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+      }))
+    assert.equal(
+      failedRetained.length,
+      1,
+      'a retained working copy must survive a failed latest provider row',
+    )
+    assert.deepEqual(failedRetained[0].providerState, {
+      lifecycle: 'open',
+      fulfillment: 'unfulfilled',
+      observedAt: failedRetained[0].providerState.observedAt,
+      source: 'retained',
+    })
+    await seedTerminalProviderObservation(
+      pool,
+      failedRetainedFixture,
+      'failed-retained-terminal',
+    )
+    const failedRetainedTerminal = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: failedRetainedFixture.organization,
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+      }))
+    assert.equal(
+      failedRetainedTerminal.length,
+      1,
+      'terminal provider history must retain the failed-candidate working copy',
+    )
+    assert.deepEqual(failedRetainedTerminal[0].providerState, {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: failedRetainedTerminal[0].providerState.observedAt,
+      source: 'history',
+    }, 'a failed retained row must project its terminal provider history')
+    const failedRetainedTerminalState = await stateCounts(
+      pool,
+      failedRetainedFixture,
+    )
+    await expectWorkbenchError(
+      () => persistence.updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: failedRetainedFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-failed-retained-terminal-save-0001',
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+        changes: { name: 'Must not save a terminal retained order' },
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    await expectWorkbenchError(
+      () => persistence.acceptCommerceOrderWorkbenchInPostgres({
+        organizationId: failedRetainedFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-failed-retained-terminal-accept-0001',
+        candidateGlobalId: failedRetainedFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    assert.deepEqual(
+      await stateCounts(pool, failedRetainedFixture),
+      failedRetainedTerminalState,
+      'terminal retained-row save and accept attempts must roll back completely',
+    )
+
+    let reportPromotionCandidateLocked = () => {}
+    const promotionCandidateLocked = new Promise((resolve) => {
+      reportPromotionCandidateLocked = resolve
+    })
+    let allowPromotionToContinue = () => {}
+    const promotionMayContinue = new Promise((resolve) => {
+      allowPromotionToContinue = resolve
+    })
+    const promotionOutcomePromise = candidatePersistence
+      .promoteCommerceCandidateInPostgres({
+        runtime: {
+          organizationId: lockOrderFixture.organization,
+          integrationAccountId: lockOrderFixture.integration,
+          globalId: lockOrderFixture.integrationGlobalId,
+          provider: 'shopify',
+          environment: 'sandbox',
+          externalAccountId:
+            `gid://shopify/Shop/${lockOrderFixture.integrationGlobalId.slice(-7)}`,
+          status: 'active',
+          verificationStatus: 'verified',
+          credentialVersion: 1,
+          authMode: 'shopify_client_credentials',
+          configuration: {},
+          encrypted: {},
+        },
+        actorEmail,
+        idempotencyKey: 'workbench-lock-order-promote-0001',
+        candidateGlobalId: lockOrderFixture.candidateGlobalId,
+        candidateRowVersion: 0,
+        requestHash: '8'.repeat(64),
+        async afterCandidateLockBeforeProviderStateFence() {
+          reportPromotionCandidateLocked()
+          await promotionMayContinue
+        },
+      })
+      .then(
+        (value) => ({ status: 'fulfilled', value }),
+        (reason) => ({ status: 'rejected', reason }),
+      )
+    await Promise.race([
+      promotionCandidateLocked,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('Promotion did not acquire the candidate row')),
+        5_000,
+      )),
+    ])
+    const saveOutcomePromise = persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: lockOrderFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-lock-order-save-0001',
+        candidateGlobalId: lockOrderFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: { name: 'Serialized after promotion' },
+      })
+      .then(
+        (value) => ({ status: 'fulfilled', value }),
+        (reason) => ({ status: 'rejected', reason }),
+      )
+    await waitForBlockedDatabaseLock(
+      pool,
+      'Concurrent workbench Save behind promotion',
+    )
+    let providerLocksAvailable = false
+    try {
+      providerLocksAvailable = await providerFenceLocksAreAvailable(
+        pool,
+        lockOrderFixture,
+      )
+    } finally {
+      allowPromotionToContinue()
+    }
+    const [promotionOutcome, saveOutcome] = await Promise.all([
+      promotionOutcomePromise,
+      saveOutcomePromise,
+    ])
+    assert.equal(
+      providerLocksAvailable,
+      true,
+      'Save must wait on the candidate row before taking provider identity locks',
+    )
+    assert.equal(promotionOutcome.status, 'rejected')
+    assert.notEqual(
+      promotionOutcome.reason?.code,
+      '40P01',
+      'promotion must not deadlock against a concurrent manager Save',
+    )
+    assert.equal(
+      saveOutcome.status,
+      'fulfilled',
+      `manager Save must resume after promotion rolls back: ${
+        saveOutcome.reason?.message || 'unknown failure'
+      }`,
+    )
+    assert.equal(saveOutcome.value.rowVersion, 1)
+
     assert.ok(
       !initial.some((row) => row.candidateGlobalId === other.candidateGlobalId),
       'tenant list must not leak another organization candidate',
     )
+
+    const providerStatusFixture = other
+    const providerStatusClient = await pool.connect()
+    try {
+      await providerStatusClient.query('SET session_replication_role = replica')
+      await providerStatusClient.query(
+        `INSERT INTO operations_commerce_order_sync_policies (
+           organization_id, integration_account_id,
+           historical_observation_enabled, continuous_observation_enabled,
+           continuous_transport, provider_event_processor_state, revision,
+           created_by, updated_by
+         ) VALUES (
+           $1::uuid, $2::uuid, false, true,
+           'scheduled_poll', 'processor_pending', 1, $3, $3
+         )`,
+        [
+          providerStatusFixture.organization,
+          providerStatusFixture.integration,
+          actorEmail,
+        ],
+      )
+      const providerStatusSession = (await providerStatusClient.query(
+        `INSERT INTO operations_commerce_order_backfill_sessions (
+           organization_id, integration_account_id, provider, session_kind,
+           credential_generation, policy_revision, coverage_basis, status,
+           requested_from, requested_through, locked_at, locked_by,
+           lock_token, lease_expires_at, idempotency_key, request_hash,
+           query_hash, requested_by, reason
+         ) VALUES (
+           $1::uuid, $2::uuid, 'shopify', 'continuous_poll', 1, 1,
+           'shopify_updated_at_overlap', 'processing',
+           now() - interval '1 day', now() + interval '2 seconds',
+           now(), 'workbench-provider-status-fixture', gen_random_uuid(),
+           now() + interval '5 minutes', $3, $4, $5, $6, $7
+         ) RETURNING id::text`,
+        [
+          providerStatusFixture.organization,
+          providerStatusFixture.integration,
+          `workbench-provider-status-${providerStatusFixture.candidateGlobalId}`,
+          'f'.repeat(64),
+          '0'.repeat(64),
+          actorEmail,
+          'Workbench current provider status read fixture',
+        ],
+      )).rows[0]
+      await providerStatusClient.query(
+        `INSERT INTO operations_commerce_order_observations (
+           organization_id, integration_account_id, backfill_session_id,
+           provider,
+           credential_generation, observation_kind, external_order_id,
+           order_number, source_revision, source_hash,
+           canonical_lifecycle_state, canonical_payment_state,
+           canonical_fulfillment_state, canonical_return_state,
+           provider_updated_at, observed_at, provider_read_count
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 'scheduled_poll',
+           $4, $5, 'workbench-provider-status-v2', $6,
+           'closed', 'paid', 'fulfilled', 'none',
+           now() + interval '1 second', now() + interval '1 second', 1
+         )`,
+        [
+          providerStatusFixture.organization,
+          providerStatusFixture.integration,
+          providerStatusSession.id,
+          `gid://shopify/Order/${providerStatusFixture.candidateGlobalId.slice(-7)}`,
+          `#${providerStatusFixture.candidateGlobalId.slice(-7)}`,
+          'e'.repeat(64),
+        ],
+      )
+    } finally {
+      await providerStatusClient.query('SET session_replication_role = origin')
+      providerStatusClient.release()
+    }
+    const [externallyFulfilled] = plain(await persistence
+      .readCommerceOrderWorkbenchFromPostgres({
+        organizationId: providerStatusFixture.organization,
+      }))
+    assert.equal(
+      externallyFulfilled.candidateGlobalId,
+      providerStatusFixture.candidateGlobalId,
+    )
+    assert.deepEqual(externallyFulfilled.providerState, {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: externallyFulfilled.providerState.observedAt,
+      source: 'history',
+    })
+    const providerTerminalStateBefore = await stateCounts(
+      pool,
+      providerStatusFixture,
+    )
+    await expectWorkbenchError(
+      () => persistence.updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: providerStatusFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-provider-terminal-save-0001',
+        candidateGlobalId: providerStatusFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: { name: 'Must not create a terminal-order draft' },
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    await expectWorkbenchError(
+      () => persistence.acceptCommerceOrderWorkbenchInPostgres({
+        organizationId: providerStatusFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-provider-terminal-accept-0001',
+        candidateGlobalId: providerStatusFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    await expectWorkbenchError(
+      () => candidatePersistence.promoteCommerceCandidateInPostgres({
+        runtime: {
+          organizationId: providerStatusFixture.organization,
+          integrationAccountId: providerStatusFixture.integration,
+          globalId: providerStatusFixture.integrationGlobalId,
+          provider: 'shopify',
+          environment: 'sandbox',
+          externalAccountId:
+            `gid://shopify/Shop/${providerStatusFixture.integrationGlobalId}`,
+          status: 'active',
+          verificationStatus: 'verified',
+          credentialVersion: 1,
+          authMode: 'shopify_client_credentials',
+          configuration: {},
+          encrypted: {},
+        },
+        actorEmail,
+        idempotencyKey: 'workbench-provider-terminal-promote-0001',
+        candidateGlobalId: providerStatusFixture.candidateGlobalId,
+        candidateRowVersion: 0,
+        requestHash: '9'.repeat(64),
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    assert.deepEqual(
+      await stateCounts(pool, providerStatusFixture),
+      providerTerminalStateBefore,
+      'terminal provider evidence must roll back save and accept checkpoints',
+    )
+    assert.equal(Number((await pool.query(
+      `SELECT count(*)::integer AS count
+       FROM operations_orders
+       WHERE organization_id = $1::uuid
+         AND integration_account_id = $2::uuid
+         AND external_order_id = $3`,
+      [
+        providerStatusFixture.organization,
+        providerStatusFixture.integration,
+        `gid://shopify/Order/${providerStatusFixture.candidateGlobalId.slice(-7)}`,
+      ],
+    )).rows[0].count), 0, 'terminal evidence must block canonical promotion')
+
+    const terminalRaceDraft = plain(await persistence
+      .updateCommerceOrderWorkbenchShipToInPostgres({
+        organizationId: terminalRaceFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-terminal-race-save-0001',
+        candidateGlobalId: terminalRaceFixture.candidateGlobalId,
+        expectedRowVersion: 0,
+        changes: {
+          name: 'Terminal Race Receiving',
+          line1: '22 Market Street',
+          city: 'Charlotte',
+          region: 'NC',
+          postalCode: '28202',
+          country: 'US',
+        },
+      }))
+    assert.equal(terminalRaceDraft.rowVersion, 1)
+    await expectWorkbenchError(
+      () => persistence.acceptCommerceOrderWorkbenchInPostgres({
+        organizationId: terminalRaceFixture.organization,
+        actorEmail,
+        idempotencyKey: 'workbench-terminal-race-accept-0002',
+        candidateGlobalId: terminalRaceFixture.candidateGlobalId,
+        expectedRowVersion: 1,
+        async afterLocalSaveBeforeHandoff() {
+          await seedTerminalProviderObservation(
+            pool,
+            terminalRaceFixture,
+            'accept-race',
+          )
+        },
+      }),
+      'COMMERCE_INTAKE_PROVIDER_ORDER_TERMINAL',
+      409,
+    )
+    const terminalRaceState = (await pool.query(
+      `SELECT
+         workbench.row_version::integer,
+         workbench.canonical_order_id::text,
+         receipt.status,
+         (
+           SELECT count(*)::integer
+           FROM operations_orders canonical
+           WHERE canonical.organization_id = $1::uuid
+             AND canonical.integration_account_id = $2::uuid
+             AND canonical.external_order_id = $4
+         ) AS canonical_count
+       FROM operations_commerce_order_workbench workbench
+       JOIN operations_command_receipts receipt
+         ON receipt.organization_id = workbench.organization_id
+        AND receipt.id = workbench.last_command_receipt_id
+       WHERE workbench.organization_id = $1::uuid
+         AND receipt.idempotency_key = $3`,
+      [
+        terminalRaceFixture.organization,
+        terminalRaceFixture.integration,
+        'workbench-terminal-race-accept-0002',
+        `gid://shopify/Order/${terminalRaceFixture.candidateGlobalId.slice(-7)}`,
+      ],
+    )).rows[0]
+    assert.deepEqual(plain(terminalRaceState), {
+      row_version: 2,
+      canonical_order_id: null,
+      status: 'processing',
+      canonical_count: 0,
+    }, 'terminal history arriving after the Accept checkpoint must fence promotion')
 
     const needsInfoBefore = await candidateSnapshot(pool, needsInfoFixture)
     const [needsInfoDetailed] = plain(await persistence
@@ -1695,16 +2262,60 @@ async function verifyAcceptance(
        WHERE organization_id = $1::uuid`,
       [primary.organization],
     )
-    assert.ok(boundaryCount.rows[0].count > 200)
+    assert.ok(boundaryCount.rows[0].count > 1000)
+    const pagedBoundary = []
+    let boundaryCursor = null
+    let firstBoundaryCursor = null
+    let boundaryPages = 0
+    do {
+      const page = plain(await persistence
+        .readCommerceOrderWorkbenchPageFromPostgres({
+          organizationId: primary.organization,
+          cursor: boundaryCursor,
+          pageSize: 100,
+        }))
+      boundaryPages += 1
+      assert.equal(page.page.total, boundaryCount.rows[0].count)
+      assert.equal(page.page.returned, page.orders.length)
+      assert.equal(page.page.pageSize, 100)
+      assert.equal(page.page.complete, page.page.nextCursor === null)
+      assert.equal(page.page.truncated, page.page.nextCursor !== null)
+      pagedBoundary.push(...page.orders)
+      boundaryCursor = page.page.nextCursor
+      if (boundaryPages === 1) firstBoundaryCursor = boundaryCursor
+    } while (boundaryCursor)
+    assert.ok(boundaryPages > 10)
+    assert.equal(pagedBoundary.length, boundaryCount.rows[0].count)
+    assert.equal(
+      new Set(pagedBoundary.map((order) => order.candidateGlobalId)).size,
+      boundaryCount.rows[0].count,
+      'keyset pages must include each current provider order exactly once',
+    )
+    assert.ok(firstBoundaryCursor)
+    await expectWorkbenchError(
+      () => persistence.readCommerceOrderWorkbenchPageFromPostgres({
+        organizationId: primary.organization,
+        search: 'different query',
+        cursor: firstBoundaryCursor,
+        pageSize: 100,
+      }),
+      'OPERATIONS_PAGE_CURSOR_INVALID',
+      400,
+    )
     const unfilteredBoundary = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({
         organizationId: primary.organization,
       }))
+    assert.equal(
+      unfilteredBoundary.length,
+      boundaryCount.rows[0].count,
+      'the bounded Orders pane window must include the current provider set above the legacy 200-row cap',
+    )
     assert.ok(
-      !unfilteredBoundary.some((order) => (
+      unfilteredBoundary.some((order) => (
         order.orderNumber === '#NeedleBeyondLimit'
       )),
-      'boundary fixture must fall beyond the unfiltered result cap',
+      'a current provider order beyond the legacy cap must remain visible',
     )
     const searchedBoundary = plain(await persistence
       .readCommerceOrderWorkbenchFromPostgres({

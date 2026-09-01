@@ -338,6 +338,9 @@ export async function readCommerceOrderReconciliationHealthFromPostgres() {
  */
 export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
   limit: number
+  organizationId?: string
+  accountGlobalIds?: string[]
+  force?: boolean
 }) {
   return withTransaction(async (client) => {
     const claimed = await client.query<{
@@ -446,6 +449,11 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
          ) continuation ON true
          WHERE account.integration_type = 'commerce'
            AND account.provider IN ('shopify', 'faire')
+           AND ($2::uuid IS NULL OR account.organization_id = $2::uuid)
+           AND (
+             $3::text[] IS NULL
+             OR account.global_id = ANY($3::text[])
+           )
            -- Development preserves verified polling-only connections. Hosted
            -- production is narrowed by ORDER_READ_ACCOUNT_SQL to active
            -- production accounts before any provider read can be claimed.
@@ -468,12 +476,15 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
                - interval '${ORDER_RECONCILIATION_LEASE}'
            )
            AND (
+             $4::boolean
+             OR
              cursor.reconciliation_status IS DISTINCT FROM 'failed'
              OR cursor.last_started_at < now()
                - interval '${ORDER_RECONCILIATION_INTERVAL}'
            )
            AND (
              continuation.run_global_id IS NOT NULL
+             OR $4::boolean
              OR cursor.integration_account_id IS NULL
              OR cursor.last_started_at IS NULL
              OR cursor.last_started_at < now()
@@ -609,7 +620,12 @@ export async function claimCommerceOrderReconciliationTargetsInPostgres(input: {
          last_started_at,
          records_seen,
          records_held`,
-      [Math.max(1, Math.min(Number(input.limit || 1), 5))],
+      [
+        Math.max(1, Math.min(Number(input.limit || 1), 5)),
+        input.organizationId || null,
+        input.accountGlobalIds?.length ? input.accountGlobalIds : null,
+        input.force === true,
+      ],
     )
     return claimed.rows
       .filter((row) => (

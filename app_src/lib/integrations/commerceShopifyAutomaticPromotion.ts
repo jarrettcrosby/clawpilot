@@ -23,6 +23,7 @@ const MAX_COHORT_SIZE = 25
 
 const BENIGN_AUTOMATIC_SHOPIFY_PROMOTION_HOLDS = new Set([
   'canonical_order_exists',
+  'order_terminal_no_demand',
 ])
 
 type ShopifyAutomaticPromotionEnvironment = Partial<Record<
@@ -147,6 +148,7 @@ const AUTOMATIC_SHOPIFY_PROMOTION_PUBLIC_HOLD_REASONS = [
   'canonical_order_exists',
   'prior_candidate_requires_review',
   'source_age_requires_review',
+  'order_terminal_no_demand',
   'order_state_requires_review',
   'order_money_requires_review',
   'customer_resolution_required',

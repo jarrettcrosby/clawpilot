@@ -133,6 +133,42 @@ function providerLabel(provider: OperationsImportedOrderWorkingCopy['provider'])
   return provider === 'shopify' ? 'Shopify' : 'Faire'
 }
 
+function providerOrderStatus(order: OperationsImportedOrderWorkingCopy) {
+  if (
+    order.providerState.lifecycle === 'cancelled'
+    || order.providerState.fulfillment === 'cancelled'
+  ) return { label: 'Cancelled', color: 'error' as const, terminal: true }
+  if (order.providerState.fulfillment === 'fulfilled') {
+    return {
+      label: 'Fulfilled externally',
+      color: 'success' as const,
+      terminal: true,
+    }
+  }
+  if (order.providerState.lifecycle === 'closed') {
+    return {
+      label: 'Closed externally',
+      color: 'success' as const,
+      terminal: true,
+    }
+  }
+  if (order.providerState.fulfillment === 'partial') {
+    return {
+      label: 'Partially fulfilled',
+      color: 'warning' as const,
+      terminal: false,
+    }
+  }
+  if (['on_hold', 'scheduled'].includes(order.providerState.fulfillment)) {
+    return { label: 'On hold', color: 'warning' as const, terminal: false }
+  }
+  return {
+    label: order.needsInfo ? 'Needs info' : 'Imported',
+    color: order.needsInfo ? 'warning' as const : 'success' as const,
+    terminal: false,
+  }
+}
+
 function readinessLabel(readiness: ReturnType<typeof orderShipToReadiness>) {
   if (readiness === 'carrier_ready') return 'Ready for rates'
   if (readiness === 'missing') return 'Ship-to needed for rates'
@@ -210,6 +246,8 @@ export default function ImportedOrderWorkingCopyDrawer({
     shipTo,
   ])
   const draftReadiness = useMemo(() => orderShipToReadiness(shipTo), [shipTo])
+  const currentProviderStatus = order ? providerOrderStatus(order) : null
+  const providerTerminal = currentProviderStatus?.terminal === true
   const invalidLinePrices = useMemo(() => new Set((order?.lines || [])
     .filter((line) => {
       const draft = lineDrafts[line.globalId]
@@ -346,8 +384,8 @@ export default function ImportedOrderWorkingCopyDrawer({
               {order && (
                 <Chip
                   size="small"
-                  color={order.needsInfo ? 'warning' : 'success'}
-                  label={order.needsInfo ? 'Needs info' : 'Imported'}
+                  color={currentProviderStatus?.color}
+                  label={currentProviderStatus?.label}
                 />
               )}
             </Stack>
@@ -375,6 +413,14 @@ export default function ImportedOrderWorkingCopyDrawer({
 
         <Stack spacing={2.5} sx={{ flex: 1, overflowY: 'auto', px: { xs: 2, sm: 3 }, py: 2.5 }}>
           {error && <Alert severity="error">{error}</Alert>}
+          {providerTerminal && order && (
+            <Alert severity="info">
+              {providerLabel(order.provider)} reports this order as{' '}
+              {currentProviderStatus?.label.toLowerCase()}. It remains visible
+              for provider history and is not eligible for a new ClawPilot
+              fulfillment.
+            </Alert>
+          )}
           {order && !order.resolutionDetailsLoaded && (
             <Alert severity="info" icon={<CircularProgress size={18} />}>
               Loading editable order details…
@@ -846,6 +892,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 !order
                 || !order.resolutionDetailsLoaded
                 || !canManage
+                || providerTerminal
                 || saving
                 || changed
                 || !savedDraftComplete
@@ -863,6 +910,7 @@ export default function ImportedOrderWorkingCopyDrawer({
                 !order
                 || !order.resolutionDetailsLoaded
                 || !canManage
+                || providerTerminal
                 || saving
                 || !changed
                 || invalidLinePrices.size > 0

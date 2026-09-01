@@ -959,26 +959,19 @@ type OperationalPageResult = {
   }
 }
 
-function operationalOrders(envelope: CommerceNormalizationEnvelope) {
-  return envelope.orders.filter((order) => (
-    order.canonicalStates.lifecycle !== 'cancelled'
-    && order.canonicalStates.lifecycle !== 'closed'
-    && order.canonicalStates.fulfillment !== 'fulfilled'
-  ))
-}
-
 function envelopeWith(
   envelope: CommerceNormalizationEnvelope,
   input: {
     rejections?: readonly CommerceNormalizationRejection[]
-    operationalOnly?: boolean
   },
 ): CommerceNormalizationEnvelope {
   return Object.freeze({
     ...envelope,
-    orders: Object.freeze(
-      input.operationalOnly ? operationalOrders(envelope) : envelope.orders,
-    ),
+    // Terminal provider rows remain durable intake evidence. They are shown in
+    // the Orders pane and can update an older candidate's provider state, but
+    // the automatic-promotion gates below still reject them as having no
+    // fulfillment demand.
+    orders: Object.freeze(envelope.orders),
     rejections: Object.freeze([
       ...envelope.rejections,
       ...(input.rejections || []),
@@ -1413,8 +1406,10 @@ async function shopifyEnvelope(
     'read_customers',
   )
   // `read_orders` grants Shopify's current-order window. Keep unattended
-  // reads explicitly inside that window; historical backfill is separate and
-  // may require `read_all_orders` when introduced as its own workflow.
+  // reads explicitly inside that window, but include every lifecycle state so
+  // the Orders pane can reconcile orders closed, cancelled, or fulfilled in
+  // Shopify. Historical backfill outside this window remains separate and may
+  // require `read_all_orders`.
   const currentOrderWindow = page.windowStart
     ? ` updated_at:>='${page.windowStart}'`
     : ''
@@ -1435,7 +1430,7 @@ async function shopifyEnvelope(
           operationName: 'ClawPilotCommerceOrders',
           variables: {
             after: page.orderCursor,
-            query: `${testOrderSearchConstraint}status:open${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
+            query: `${testOrderSearchConstraint}status:any${currentOrderWindow} updated_at:<='${page.windowEnd}'`,
           },
         },
         { timeoutMs: SHOPIFY_GRAPHQL_TIMEOUT_MS },
@@ -1490,7 +1485,6 @@ async function shopifyEnvelope(
     },
     shopDomain,
   }, normalizationContext(runtime)), {
-    operationalOnly: !targetExternalOrderId,
     rejections,
   })
   return {
@@ -1715,7 +1709,6 @@ async function faireEnvelope(
     runtime,
     targetExternalOrderId ? 'current' : 'stale',
   )), {
-    operationalOnly: !targetExternalOrderId,
     rejections: bounded.rejections,
   })
   return {
