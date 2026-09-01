@@ -639,7 +639,15 @@ assert.match(
 )
 assert.match(
   historyRuntime.shopifyOrderHistoryDetailQuery(true),
-  /nodes \{ id name status createdAt closedAt requestApprovedAt totalQuantity \}/u,
+  /returnLineItems\(first: 51\)/u,
+)
+assert.match(
+  historyRuntime.shopifyOrderHistoryDetailQuery(true),
+  /refundLineItems\(first: 51\)/u,
+)
+assert.match(
+  historyRuntime.shopifyOrderHistoryDetailQuery(true),
+  /fulfillmentLineItem \{ lineItem \{ id \} \}/u,
 )
 assert.doesNotMatch(
   historyRuntime.shopifyOrderHistoryDetailQuery(true),
@@ -778,6 +786,10 @@ const validShopifyReturnDetail = {
       requestApprovedAt: null,
       closedAt: null,
       totalQuantity: 1,
+      returnLineItems: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
     }],
     pageInfo: { hasNextPage: false, endCursor: null },
   },
@@ -787,6 +799,54 @@ assert.doesNotThrow(
     validShopifyReturnDetail,
     true,
   ),
+)
+const attributedShopifyReturns = historyRuntime
+  .shopifyOrderHistoryReturnedQuantities({
+    refunds: [{
+      refundLineItems: {
+        nodes: [{
+          quantity: 2,
+          restockType: 'RETURN',
+          lineItem: { id: 'gid://shopify/LineItem/1' },
+        }, {
+          quantity: 1,
+          restockType: 'NO_RESTOCK',
+          lineItem: { id: 'gid://shopify/LineItem/2' },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    }],
+    returns: {
+      nodes: [{
+        returnLineItems: {
+          nodes: [{
+            __typename: 'ReturnLineItem',
+            processedQuantity: 1,
+            refundedQuantity: 1,
+            fulfillmentLineItem: {
+              lineItem: { id: 'gid://shopify/LineItem/1' },
+            },
+          }, {
+            __typename: 'ReturnLineItem',
+            processedQuantity: 2,
+            refundedQuantity: 0,
+            fulfillmentLineItem: {
+              lineItem: { id: 'gid://shopify/LineItem/2' },
+            },
+          }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  })
+assert.deepEqual(
+  Object.fromEntries(attributedShopifyReturns),
+  {
+    'gid://shopify/LineItem/1': 2,
+    'gid://shopify/LineItem/2': 2,
+  },
+  'exact refunds and processed returns must retain per-line quantities without double counting',
 )
 for (const invalid of [
   { ...validShopifyDetail, processedAt: 'not-a-time' },
@@ -951,6 +1011,7 @@ let adapterProvider = 'shopify'
 let shopifyAdapterDetail = null
 let shopifyAdapterNextCursor = null
 let shopifyAdapterReadReturns = false
+let shopifyAdapterFailureStage = null
 let faireAdapterOrder = null
 const normalizedAdapterOrder = (provider, source) => ({
   provider,
@@ -983,7 +1044,24 @@ const normalizedAdapterOrder = (provider, source) => ({
     lifecycle: 'open', payment: 'paid', fulfillment: 'fulfilled', returns: 'none',
   },
   total: { state: 'unavailable' },
-  lines: [],
+  lines: provider === 'shopify'
+    ? (source.lineItems?.nodes || []).map((line) => ({
+        identity: { value: String(line.id) },
+        productIdentity: line.product?.id
+          ? { state: 'available', value: { value: String(line.product.id) } }
+          : { state: 'unavailable', value: null },
+        variantIdentity: line.variant?.id
+          ? { state: 'available', value: { value: String(line.variant.id) } }
+          : { state: 'unavailable', value: null },
+        sku: line.sku ?? null,
+        orderedQuantity: line.quantity,
+        currentQuantity: line.currentQuantity,
+        unfulfilledQuantity: line.unfulfilledQuantity,
+        fulfilledQuantity: line.currentQuantity - line.unfulfilledQuantity,
+        returnedQuantity: null,
+        requiresShipping: line.requiresShipping,
+      }))
+    : [],
   lineItemsTruncated: false,
 })
 const adapterHistoryRuntime = loadTypeScript(
@@ -1021,22 +1099,35 @@ const adapterHistoryRuntime = loadTypeScript(
     },
     '@/lib/integrations/shopifyCommerceClient': {
       normalizeShopifyShopDomain: (value) => value,
-      requestShopifyAccessToken: async () => ({
-        accessToken: 'access',
-        grantedScopes: [
-          'read_orders', 'read_all_orders',
-          ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
-        ],
-      }),
-      probeShopifyConnection: async () => ({
-        shopId: 'gid://shopify/Shop/adapter',
-        grantedScopes: [
-          'read_orders', 'read_all_orders',
-          ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
-        ],
-      }),
-      shopifyAdminGraphql: async (_credential, request) => (
-        request.operationName === 'ClawPilotCommerceOrderHistoryIds'
+      requestShopifyAccessToken: async () => {
+        if (shopifyAdapterFailureStage === 'token') {
+          throw new Error('token read failed')
+        }
+        return {
+          accessToken: 'access',
+          grantedScopes: [
+            'read_orders', 'read_all_orders',
+            ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
+          ],
+        }
+      },
+      probeShopifyConnection: async () => {
+        if (shopifyAdapterFailureStage === 'probe') {
+          throw new Error('probe read failed')
+        }
+        return {
+          shopId: 'gid://shopify/Shop/adapter',
+          grantedScopes: [
+            'read_orders', 'read_all_orders',
+            ...(shopifyAdapterReadReturns ? ['read_returns'] : []),
+          ],
+        }
+      },
+      shopifyAdminGraphql: async (_credential, request) => {
+        if (shopifyAdapterFailureStage === 'detail') {
+          throw new Error('detail read failed')
+        }
+        return request.operationName === 'ClawPilotCommerceOrderHistoryIds'
           ? {
               orders: {
                 nodes: [{
@@ -1051,7 +1142,7 @@ const adapterHistoryRuntime = loadTypeScript(
               },
             }
           : { order: shopifyAdapterDetail }
-      ),
+      },
     },
     '@/lib/integrations/shopifyCommerceNormalizer': {
       normalizeShopifyCommerce: (value) => ({
@@ -1132,6 +1223,34 @@ const readShopifyAdapter = async (detail, overrides = {}) => {
     mode: overrides.mode ?? 'historical_backfill',
   })
 }
+
+shopifyAdapterDetail = validShopifyDetail
+for (const [failureStage, expectedProviderReads] of [
+  ['probe', 2],
+  ['detail', 3],
+]) {
+  shopifyAdapterFailureStage = failureStage
+  let exactReadError = null
+  try {
+    await adapterHistoryRuntime.readExactShopifyOrderHistoryObservation({
+      organizationId: '00000000-0000-4000-8000-000000000001',
+      accountGlobalId: 'gia0000001',
+      expectedCredentialGeneration: 1,
+      externalOrderId: validShopifyDetail.id,
+      observedAt: '2026-08-13T00:03:00.000Z',
+      observationKind: 'manual_exact_read',
+    })
+  } catch (error) {
+    exactReadError = error
+  }
+  assert.ok(exactReadError, `${failureStage} failure must reject the exact read`)
+  assert.equal(
+    adapterHistoryRuntime.exactShopifyOrderHistoryProviderReads(exactReadError),
+    expectedProviderReads,
+    `${failureStage} failure must retain attempted provider-read volume`,
+  )
+}
+shopifyAdapterFailureStage = null
 const shopifyAdapterOne = await readShopifyAdapter(
   shopifyTrackingDetail('1Z-ADAPTER-ONE', '2026-08-13T00:00:00.000Z'),
 )
@@ -1248,6 +1367,10 @@ const shopifyLifecycleDetail = (
     totalRefundedSet: {
       shopMoney: { amount: refundAmount, currencyCode: 'USD' },
     },
+    refundLineItems: {
+      nodes: [],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
   }],
 })
 const shopifyLifecycleOne = await readShopifyAdapter(
@@ -1316,6 +1439,69 @@ for (const [events, revision, payment, returns, amount] of [
   assert.equal(refundEvent.amountMinor, amount)
 }
 
+const exactShopifyLineAdjustment = await readShopifyAdapter({
+  ...shopifyTrackingDetail(
+    '1Z-LINE-ADJUSTMENT',
+    '2026-08-13T00:02:00.000Z',
+  ),
+  returnStatus: 'RETURNED',
+  lineItems: {
+    ...validShopifyDetail.lineItems,
+    nodes: [{
+      ...validShopifyDetail.lineItems.nodes[0],
+      currentQuantity: 0,
+      unfulfilledQuantity: 0,
+    }],
+  },
+  refunds: [{
+    id: 'gid://shopify/Refund/line-adjustment',
+    createdAt: '2026-08-12T21:00:00.000Z',
+    processedAt: '2026-08-12T21:01:00.000Z',
+    updatedAt: '2026-08-13T00:02:00.000Z',
+    totalRefundedSet: {
+      shopMoney: { amount: '10.00', currencyCode: 'USD' },
+    },
+    refundLineItems: {
+      nodes: [{
+        quantity: 1,
+        restockType: 'RETURN',
+        lineItem: { id: 'gid://shopify/LineItem/1' },
+      }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    },
+  }],
+  returns: {
+    nodes: [{
+      id: 'gid://shopify/Return/line-adjustment',
+      name: '#return-line-adjustment',
+      status: 'CLOSED',
+      createdAt: '2026-08-12T20:00:00.000Z',
+      requestApprovedAt: '2026-08-12T20:01:00.000Z',
+      closedAt: '2026-08-13T00:01:00.000Z',
+      totalQuantity: 1,
+      returnLineItems: {
+        nodes: [{
+          __typename: 'ReturnLineItem',
+          id: 'gid://shopify/ReturnLineItem/line-adjustment',
+          quantity: 1,
+          processedQuantity: 1,
+          refundedQuantity: 1,
+          fulfillmentLineItem: {
+            lineItem: { id: 'gid://shopify/LineItem/1' },
+          },
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    }],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  },
+}, { readReturns: true })
+assert.equal(
+  exactShopifyLineAdjustment.observations[0].lines[0].returnedQuantity,
+  1,
+  'a Shopify return and its refund must persist one exact returned unit, not two stale or duplicated units',
+)
+
 const shopifyReturnSnapshot = ({
   status,
   approvedAt = null,
@@ -1332,6 +1518,10 @@ const shopifyReturnSnapshot = ({
       requestApprovedAt: approvedAt,
       closedAt,
       totalQuantity: 1,
+      returnLineItems: {
+        nodes: [],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
     }],
     pageInfo: { hasNextPage: false, endCursor: null },
   },

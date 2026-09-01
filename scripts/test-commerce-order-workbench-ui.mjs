@@ -25,7 +25,9 @@ for (const fragment of [
   'await loadWorkspace(canonicalOrderGlobalId)',
   'setImportedDrawerOpen(false)',
   'setDrawerOpen(true)',
-  "candidate: selected.candidateGlobalId",
+  'candidateGlobalId: selected.candidateGlobalId',
+  'importedDrawerHistoryIdempotencyKey(selected, now)',
+  'workspace?.capabilities.canManage === true',
   'resolution: draft.resolution',
   'resolutionDetailsLoaded',
   "action: 'accept'",
@@ -110,7 +112,17 @@ for (const fragment of [
   'Unit item — cartonization chooses outbound packaging.',
   'Provider SKU and quantity stay visible',
   'SKU ${line.sku || \'not supplied\'}',
-  'Quantity ${line.quantity}',
+  'Ordered ${line.orderedQuantity}',
+  'Current ${line.currentQuantity}',
+  'Fulfilled ${line.fulfilledQuantity}',
+  'Remaining ${line.unfulfilledQuantity}',
+  'Removed or refunded ${line.cancelledOrRemovedQuantity}',
+  'Returned ${line.returnedQuantity}',
+  'External fulfillment',
+  'Tracking history has not been captured for this order.',
+  'trackingEvents.map',
+  'fulfillmentEvents.map',
+  'adjustmentEvents.map',
   'Accept &amp; import',
   'order.providerVersionChanged',
   'Use refreshed provider item',
@@ -124,6 +136,16 @@ for (const fragment of [
   assert.ok(drawer.includes(fragment), `Imported order drawer is missing ${fragment}`)
 }
 assert.match(drawer, />\s*Save\s*<\/Button>/u)
+assert.match(
+  drawer,
+  /onRefresh && canManage && \(/u,
+  'Provider refresh must not be offered to view-only users',
+)
+assert.match(
+  drawer,
+  /trackingEvents\.length[\s\S]*: order\?\.providerHistory\.observedAt \? \(/u,
+  'An absent exact snapshot must keep tracking unknown instead of claiming none was supplied',
+)
 
 assert.equal(
   /confirmationStatement|reasonValue|canActivate|canExecute/u.test(drawer),

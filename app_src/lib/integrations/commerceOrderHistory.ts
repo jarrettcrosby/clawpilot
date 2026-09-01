@@ -40,6 +40,7 @@ const SHOPIFY_FULFILLMENT_LIMIT = 20
 const SHOPIFY_TRACKING_LIMIT = 10
 const SHOPIFY_REFUND_LIMIT = 100
 const SHOPIFY_RETURN_LIMIT = 20
+const SHOPIFY_ADJUSTMENT_LINE_LIMIT = SHOPIFY_LINE_LIMIT
 const FAIRE_PAGE_SIZE = 50
 const FAIRE_LINE_LIMIT = 250
 const FAIRE_LIFECYCLE_COLLECTION_LIMIT = 100
@@ -80,6 +81,7 @@ export type ExactShopifyOrderHistoryInput = {
   expectedCredentialGeneration: number
   externalOrderId: string
   observedAt?: string
+  observationKind: 'webhook_exact_read' | 'manual_exact_read'
 }
 
 export type ExactShopifyOrderHistoryRead = {
@@ -89,6 +91,30 @@ export type ExactShopifyOrderHistoryRead = {
   providerWrites: 0
   readAllOrdersScopeObserved: boolean
   returnHistoryScopeObserved: boolean
+}
+
+const exactShopifyOrderHistoryReadAttempts = new WeakMap<object, number>()
+
+/**
+ * Returns the number of Shopify network reads attempted before an exact-order
+ * read failed. The count is request-local diagnostic evidence; it deliberately
+ * does not change the provider error's public code or status.
+ */
+export function exactShopifyOrderHistoryProviderReads(error: unknown) {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
+    return null
+  }
+  return exactShopifyOrderHistoryReadAttempts.get(error as object) ?? null
+}
+
+function retainExactShopifyOrderHistoryReadAttempts(
+  error: unknown,
+  providerReads: number,
+): never {
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    exactShopifyOrderHistoryReadAttempts.set(error as object, providerReads)
+  }
+  throw error
 }
 
 function historyError(code: string, message: string, status = 409): never {
@@ -303,6 +329,23 @@ function optionalProviderText(value: unknown, label: string) {
   return normalized
 }
 
+function optionalProviderTrackingUrl(value: unknown) {
+  const normalized = optionalProviderText(value, 'Provider tracking URL')
+  if (!normalized) return null
+  if (normalized.length > 2_048) {
+    providerResponseInvalid('Provider tracking URL')
+  }
+  try {
+    const parsed = new URL(normalized)
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      providerResponseInvalid('Provider tracking URL')
+    }
+    return parsed.toString()
+  } catch {
+    providerResponseInvalid('Provider tracking URL')
+  }
+}
+
 export function normalizeCommerceHistoryProviderQuantity(value: unknown) {
   return (
     typeof value === 'number'
@@ -320,6 +363,84 @@ export function sumCommerceHistoryProviderQuantities(value: unknown) {
   if (quantities.some((entry) => entry === null)) return null
   const sum = (quantities as number[]).reduce((total, entry) => total + entry, 0)
   return Number.isSafeInteger(sum) ? sum : null
+}
+
+/**
+ * Shopify exposes removed/refunded units through LineItem.currentQuantity,
+ * but a physical return is only attributable to an order line through Refund
+ * and Return line records. A processed Return and its later restocking Refund
+ * can describe the same units, so retain the larger exact total instead of
+ * adding the two provider representations and double-counting them.
+ */
+export function shopifyOrderHistoryReturnedQuantities(value: unknown) {
+  const source = asRecord(value)
+  if (!source) providerResponseInvalid('Shopify historical-order detail')
+  const refundedReturns = new Map<string, number>()
+  const processedReturns = new Map<string, number>()
+  const add = (target: Map<string, number>, identity: string, quantity: number) => {
+    const next = (target.get(identity) || 0) + quantity
+    if (!Number.isSafeInteger(next)) {
+      providerResponseInvalid('Shopify returned line quantity')
+    }
+    target.set(identity, next)
+  }
+
+  for (const refund of strictRecordArray(source.refunds, 'Shopify refund rows')) {
+    const connection = strictConnection(
+      refund.refundLineItems,
+      'Shopify refund line rows',
+    )
+    for (const line of connection.values) {
+      const restockType = exactString(line.restockType)
+      if (!['RETURN', 'LEGACY_RESTOCK'].includes(restockType || '')) continue
+      const lineItem = asRecord(line.lineItem)
+      const externalLineId = exactString(lineItem?.id)
+      const quantity = normalizeCommerceHistoryProviderQuantity(line.quantity)
+      if (!externalLineId || quantity === null) {
+        providerResponseInvalid('Shopify refund line attribution')
+      }
+      add(refundedReturns, externalLineId, quantity)
+    }
+  }
+
+  const returns = strictConnection(
+    source.returns,
+    'Shopify return rows',
+    { optional: true },
+  )
+  for (const providerReturn of returns.values) {
+    const connection = strictConnection(
+      providerReturn.returnLineItems,
+      'Shopify return line rows',
+    )
+    for (const line of connection.values) {
+      if (exactString(line.__typename) !== 'ReturnLineItem') continue
+      const fulfillmentLine = asRecord(line.fulfillmentLineItem)
+      const orderLine = asRecord(fulfillmentLine?.lineItem)
+      const externalLineId = exactString(orderLine?.id)
+      const processed = normalizeCommerceHistoryProviderQuantity(
+        line.processedQuantity,
+      )
+      const refunded = normalizeCommerceHistoryProviderQuantity(
+        line.refundedQuantity,
+      )
+      if (!externalLineId || processed === null || refunded === null) {
+        providerResponseInvalid('Shopify return line attribution')
+      }
+      add(processedReturns, externalLineId, Math.max(processed, refunded))
+    }
+  }
+
+  return new Map([...new Set([
+    ...refundedReturns.keys(),
+    ...processedReturns.keys(),
+  ])].map((externalLineId) => [
+    externalLineId,
+    Math.max(
+      refundedReturns.get(externalLineId) || 0,
+      processedReturns.get(externalLineId) || 0,
+    ),
+  ]))
 }
 
 function money(order: CommerceNormalizedOrder) {
@@ -548,6 +669,9 @@ function providerEvents(
         providerLocationId: exactString(location?.id ?? fulfillment.location_id),
         trackingCarrier: exactString(item.company ?? item.carrier),
         trackingNumber: number,
+        trackingUrl: optionalProviderTrackingUrl(
+          item.url ?? item.tracking_url,
+        ),
         occurredAt,
       })
     }
@@ -572,11 +696,16 @@ function providerEvents(
     )
     if (!createdAt) continue
     const exactMoney = refundMoney(refund)
-    const refundItems = strictRecordArray(
-      refund.refundLineItems ?? refund.items,
-      `${provider} refund item rows`,
-      { optional: true },
-    )
+    const refundItems = provider === 'shopify'
+      ? strictConnection(
+          refund.refundLineItems,
+          'Shopify refund line rows',
+        ).values
+      : strictRecordArray(
+          refund.refundLineItems ?? refund.items,
+          `${provider} refund item rows`,
+          { optional: true },
+        )
     const restocks = refundItems.some(
       (line) => ['RETURN', 'CANCEL', 'LEGACY_RESTOCK'].includes(
         exactString(line.restockType ?? line.restock_type) || '',
@@ -763,9 +892,13 @@ function observation(
   observationKind:
     | 'historical_backfill'
     | 'scheduled_poll'
-    | 'webhook_exact_read',
+    | 'webhook_exact_read'
+    | 'manual_exact_read',
 ): CommerceOrderObservationInput {
   const orderMoney = money(order)
+  const returnedQuantities = provider === 'shopify'
+    ? shopifyOrderHistoryReturnedQuantities(source)
+    : new Map<string, number>()
   const events = providerEvents(
     provider,
     order,
@@ -796,6 +929,8 @@ function observation(
       current: line.currentQuantity,
       unfulfilled: line.unfulfilledQuantity,
       fulfilled: line.fulfilledQuantity,
+      returned: returnedQuantities.get(line.identity.value)
+        ?? line.returnedQuantity,
       requiresShipping: line.requiresShipping,
     })),
     events: events.map(privacyMinimizedCommerceOrderEventEvidence),
@@ -842,6 +977,7 @@ function observation(
       currentQuantity: line.current,
       unfulfilledQuantity: line.unfulfilled,
       fulfilledQuantity: line.fulfilled,
+      returnedQuantity: line.returned,
       requiresShipping: line.requiresShipping,
     })),
     events,
@@ -934,9 +1070,24 @@ export function shopifyOrderHistoryDetailQuery(includeReturns: boolean) {
     refunds {
       id createdAt processedAt updatedAt
       totalRefundedSet { shopMoney { amount currencyCode } }
+      refundLineItems(first: ${SHOPIFY_ADJUSTMENT_LINE_LIMIT + 1}) {
+        nodes { quantity restockType lineItem { id } }
+        pageInfo { hasNextPage endCursor }
+      }
     }
     ${includeReturns ? `returns(first: ${SHOPIFY_RETURN_LIMIT + 1}) {
-      nodes { id name status createdAt closedAt requestApprovedAt totalQuantity }
+      nodes {
+        id name status createdAt closedAt requestApprovedAt totalQuantity
+        returnLineItems(first: ${SHOPIFY_ADJUSTMENT_LINE_LIMIT + 1}) {
+          nodes {
+            __typename id quantity processedQuantity refundedQuantity
+            ... on ReturnLineItem {
+              fulfillmentLineItem { lineItem { id } }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
       pageInfo { hasNextPage }
     }` : ''}
   }
@@ -1110,6 +1261,29 @@ export function assertShopifyOrderHistoryDetailEvidence(
       required: true,
       requireShopMoney: true,
     })
+    const refundLines = strictConnection(
+      refund.refundLineItems,
+      'Shopify refund line rows',
+    )
+    if (
+      refundLines.values.length > SHOPIFY_ADJUSTMENT_LINE_LIMIT
+      || refundLines.hasNextPage
+    ) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
+        'A Shopify refund exceeds the bounded line-item page',
+        409,
+      )
+    }
+    for (const line of refundLines.values) {
+      if (normalizeCommerceHistoryProviderQuantity(line.quantity) === null) {
+        providerResponseInvalid('Shopify refund line quantity')
+      }
+      strictRequiredTextFact(line.restockType, 'Shopify refund restock type')
+      const lineItem = asRecord(line.lineItem)
+      if (!lineItem) providerResponseInvalid('Shopify refund order line')
+      strictRequiredTextFact(lineItem.id, 'Shopify refund order-line identity')
+    }
   }
 
   const returns = strictConnection(
@@ -1136,6 +1310,40 @@ export function assertShopifyOrderHistoryDetailEvidence(
     strictRequiredIsoFact(providerReturn.createdAt, 'Shopify return createdAt')
     for (const key of ['closedAt', 'requestApprovedAt'] as const) {
       strictOptionalIsoFact(providerReturn[key], `Shopify return ${key}`)
+    }
+    const returnLines = strictConnection(
+      providerReturn.returnLineItems,
+      'Shopify return line rows',
+    )
+    if (
+      returnLines.values.length > SHOPIFY_ADJUSTMENT_LINE_LIMIT
+      || returnLines.hasNextPage
+    ) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_NESTED_PAGINATION_LIMIT',
+        'A Shopify return exceeds the bounded line-item page',
+        409,
+      )
+    }
+    for (const line of returnLines.values) {
+      strictRequiredTextFact(line.__typename, 'Shopify return line type')
+      strictRequiredTextFact(line.id, 'Shopify return line identity')
+      for (const key of [
+        'quantity', 'processedQuantity', 'refundedQuantity',
+      ] as const) {
+        if (normalizeCommerceHistoryProviderQuantity(line[key]) === null) {
+          providerResponseInvalid(`Shopify return line ${key}`)
+        }
+      }
+      if (line.__typename === 'ReturnLineItem') {
+        const fulfillmentLine = asRecord(line.fulfillmentLineItem)
+        const orderLine = asRecord(fulfillmentLine?.lineItem)
+        if (!orderLine) providerResponseInvalid('Shopify return order line')
+        strictRequiredTextFact(
+          orderLine.id,
+          'Shopify return order-line identity',
+        )
+      }
     }
   }
   return source
@@ -1819,7 +2027,7 @@ export async function readCommerceOrderHistoryPage(
 }
 
 /**
- * Reads one exact Shopify Order GID after a minimized signed webhook signal.
+ * Reads one exact Shopify Order GID for an explicitly authorized hydration.
  * This path performs token, shop/scope probe, and exact order reads only. It
  * does not list orders, retain the webhook payload, advance a cursor, mutate a
  * provider, or write inventory/canonical Operations state.
@@ -1844,7 +2052,7 @@ export async function readExactShopifyOrderHistoryObservation(
   if (runtime.provider !== 'shopify') {
     historyError(
       'SHOPIFY_ORDER_HISTORY_ACCOUNT_REQUIRED',
-      'Exact webhook reads require a Shopify connection',
+      'Exact Shopify order reads require a Shopify connection',
     )
   }
   const secret = decryptCommerceCredential(
@@ -1861,81 +2069,89 @@ export async function readExactShopifyOrderHistoryObservation(
     )
   }
   const shopDomain = normalizeShopifyShopDomain(runtime.configuration.shopDomain)
-  const grant = await requestShopifyAccessToken({
-    shopDomain,
-    clientId: secret.clientId,
-    clientSecret: secret.clientSecret,
-  }, { timeoutMs: PROVIDER_TIMEOUT_MS })
-  const credential = { shopDomain, accessToken: grant.accessToken }
-  const probe = await probeShopifyConnection(credential, {
-    timeoutMs: PROVIDER_TIMEOUT_MS,
-  })
-  if (probe.shopId !== runtime.externalAccountId) {
-    historyError(
-      'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
-      'Shopify returned a different store identity',
-    )
-  }
-  const readOrders = hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
-    && hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
-  if (!readOrders) {
-    historyError(
-      'SHOPIFY_READ_ORDERS_REQUIRED',
-      'Shopify must grant read_orders for exact order reads',
-    )
-  }
-  const readAllOrders = hasEffectiveShopifyScope(
-    grant.grantedScopes,
-    'read_all_orders',
-  ) && hasEffectiveShopifyScope(probe.grantedScopes, 'read_all_orders')
-  const readReturns = hasEffectiveShopifyScope(grant.grantedScopes, 'read_returns')
-    && hasEffectiveShopifyScope(probe.grantedScopes, 'read_returns')
-  const detail = await shopifyAdminGraphql<JsonRecord>(credential, {
-    query: shopifyOrderHistoryDetailQuery(readReturns),
-    operationName: 'ClawPilotCommerceOrderHistoryDetail',
-    variables: { id: externalOrderId },
-  }, { timeoutMs: PROVIDER_TIMEOUT_MS })
-  const source = asRecord(detail.order)
-  if (!source || exactString(source.id) !== externalOrderId) {
-    historyError(
-      'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
-      'Shopify exact-order webhook hydration changed identity',
-      502,
-    )
-  }
-  assertShopifyOrderHistoryDetailEvidence(source, readReturns)
-  const normalized = normalizeShopifyCommerce({
-    data: {
-      products: completeConnection([]),
-      orders: completeConnection([source]),
-    },
-    shopDomain,
-  }, context(runtime, observedAt))
-  if (
-    normalized.rejections.length
-    || normalized.orders.length !== 1
-    || normalized.orders[0].identity.value !== externalOrderId
-    || normalized.orders[0].lineItemsTruncated
-  ) {
-    historyError(
-      'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
-      'The Shopify exact-order read could not be normalized without loss',
-      409,
-    )
-  }
-  return {
-    provider: 'shopify',
-    observation: observation(
-      'shopify',
-      normalized.orders[0],
-      source,
-      observedAt,
-      3,
-      'webhook_exact_read',
-    ),
-    providerReads: 3,
-    providerWrites: 0,
-    readAllOrdersScopeObserved: readAllOrders,
-    returnHistoryScopeObserved: readReturns,
+  let providerReads = 0
+  try {
+    providerReads += 1
+    const grant = await requestShopifyAccessToken({
+      shopDomain,
+      clientId: secret.clientId,
+      clientSecret: secret.clientSecret,
+    }, { timeoutMs: PROVIDER_TIMEOUT_MS })
+    const credential = { shopDomain, accessToken: grant.accessToken }
+    providerReads += 1
+    const probe = await probeShopifyConnection(credential, {
+      timeoutMs: PROVIDER_TIMEOUT_MS,
+    })
+    if (probe.shopId !== runtime.externalAccountId) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_ACCOUNT_CHANGED',
+        'Shopify returned a different store identity',
+      )
+    }
+    const readOrders = hasEffectiveShopifyScope(grant.grantedScopes, 'read_orders')
+      && hasEffectiveShopifyScope(probe.grantedScopes, 'read_orders')
+    if (!readOrders) {
+      historyError(
+        'SHOPIFY_READ_ORDERS_REQUIRED',
+        'Shopify must grant read_orders for exact order reads',
+      )
+    }
+    const readAllOrders = hasEffectiveShopifyScope(
+      grant.grantedScopes,
+      'read_all_orders',
+    ) && hasEffectiveShopifyScope(probe.grantedScopes, 'read_all_orders')
+    const readReturns = hasEffectiveShopifyScope(grant.grantedScopes, 'read_returns')
+      && hasEffectiveShopifyScope(probe.grantedScopes, 'read_returns')
+    providerReads += 1
+    const detail = await shopifyAdminGraphql<JsonRecord>(credential, {
+      query: shopifyOrderHistoryDetailQuery(readReturns),
+      operationName: 'ClawPilotCommerceOrderHistoryDetail',
+      variables: { id: externalOrderId },
+    }, { timeoutMs: PROVIDER_TIMEOUT_MS })
+    const source = asRecord(detail.order)
+    if (!source || exactString(source.id) !== externalOrderId) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+        'Shopify exact-order hydration changed identity',
+        502,
+      )
+    }
+    assertShopifyOrderHistoryDetailEvidence(source, readReturns)
+    const normalized = normalizeShopifyCommerce({
+      data: {
+        products: completeConnection([]),
+        orders: completeConnection([source]),
+      },
+      shopDomain,
+    }, context(runtime, observedAt))
+    if (
+      normalized.rejections.length
+      || normalized.orders.length !== 1
+      || normalized.orders[0].identity.value !== externalOrderId
+      || normalized.orders[0].lineItemsTruncated
+    ) {
+      historyError(
+        'COMMERCE_ORDER_HISTORY_NORMALIZATION_REJECTED',
+        'The Shopify exact-order read could not be normalized without loss',
+        409,
+      )
+    }
+    return {
+      provider: 'shopify',
+      observation: observation(
+        'shopify',
+        normalized.orders[0],
+        source,
+        observedAt,
+        3,
+        input.observationKind,
+      ),
+      providerReads: 3,
+      providerWrites: 0,
+      readAllOrdersScopeObserved: readAllOrders,
+      returnHistoryScopeObserved: readReturns,
+    }
+  } catch (error) {
+    retainExactShopifyOrderHistoryReadAttempts(error, providerReads)
   }
 }

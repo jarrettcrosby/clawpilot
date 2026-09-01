@@ -176,6 +176,10 @@ for (const fragment of [
   'readCommerceOrderWorkbenchRefreshTargetFromPostgres',
   'OPERATIONS_IMPORTED_ORDER_REFRESH_CONFLICT',
   'provider_rebased',
+  'returnedQuantity: optionalTimelineInteger(line.returnedQuantity)',
+  'providerObservationKinds:',
+  "'manual_exact_read', 'webhook_exact_read'",
+  'row.latest_exact_history_observed_at?.toISOString() || null',
   'resolveCommerceCandidateCustomerInPostgres',
   'resolveCommerceCandidateDeliveryInPostgres',
   'resolveCommerceCandidateProductInPostgres',
@@ -191,6 +195,16 @@ for (const fragment of [
 ]) {
   assert.ok(persistence.includes(fragment), `Persistence is missing ${fragment}`)
 }
+assert.match(
+  persistence,
+  /SELECT provider_candidate\.id,[\s\S]{0,900}ORDER BY\s+COALESCE\(\s*provider_candidate\.provider_updated_at,\s*provider_candidate\.observed_at\s*\) DESC,\s*provider_candidate\.observed_at DESC/u,
+  'terminal display candidates must follow provider revision time before arrival time',
+)
+assert.match(
+  persistence,
+  /SELECT observation\.observed_at[\s\S]{0,900}observation_kind IN \([\s\S]{0,180}ORDER BY COALESCE\(\s*observation\.provider_updated_at,\s*observation\.observed_at\s*\) DESC,\s*observation\.observed_at DESC,\s*observation\.id DESC/u,
+  'the current exact-history marker must follow provider revision time before arrival time',
+)
 assert.equal(
   persistence.includes('INSERT INTO operations_commerce_external_effect_intents'),
   false,
@@ -408,12 +422,35 @@ class CommerceOrderWorkbenchError extends Error {
   }
 }
 
+class CommerceOrderSyncError extends Error {
+  constructor(code, message, status = 400) {
+    super(message)
+    this.code = code
+    this.status = status
+  }
+}
+
+class ShopifyCommerceClientError extends Error {
+  constructor(message, status = 502, code = 'SHOPIFY_UPSTREAM_FAILED') {
+    super(message)
+    this.status = status
+    this.code = code
+  }
+}
+
 const organizationId = 'bb13beb0-2b75-48a2-8b1d-2bd154950668'
 const actorEmail = 'workbench-route@example.test'
 const candidateGlobalId = 'gcoc1000001'
+const latestTargetCandidateGlobalId = 'gcoc1000002'
 const inboundIdempotencyKey = 'd4783b27-b341-49d0-8e1e-1278b39039a8'
 const providerRefreshCalls = []
+const historyReadCalls = []
+const historyAppendCalls = []
+const historyReplayCalls = []
 const rebaseCalls = []
+let historyReadError = null
+let historyAppendError = null
+let historyReplay = null
 const idempotencyModule = loadTypeScriptSourceModule(
   idempotency,
   'app_src/lib/operations/orderWorkbenchIdempotency.ts',
@@ -440,6 +477,26 @@ const workbenchRoute = loadTypeScriptSourceModule(
         providerRefreshCalls.push(input)
       },
     },
+    '@/lib/integrations/commerceOrderHistory': {
+      exactShopifyOrderHistoryProviderReads(error) {
+        return Number.isSafeInteger(error?.providerReads)
+          ? error.providerReads
+          : null
+      },
+      async readExactShopifyOrderHistoryObservation(input) {
+        historyReadCalls.push(input)
+        if (historyReadError) throw historyReadError
+        return {
+          observation: {
+            observationKind: 'manual_exact_read',
+            externalOrderId: input.externalOrderId,
+            providerReadCount: 3,
+          },
+          providerReads: 3,
+          providerWrites: 0,
+        }
+      },
+    },
     '@/lib/integrations/commerceIntegrations': {
       CommerceIntegrationRequestError,
       sanitizedCommerceIntegrationError(error) {
@@ -449,6 +506,9 @@ const workbenchRoute = loadTypeScriptSourceModule(
           status: error.status,
         }
       },
+    },
+    '@/lib/integrations/shopifyCommerceClient': {
+      ShopifyCommerceClientError,
     },
     '@/lib/operations/authorization': {
       activeOperationsOrganizationId(actor) {
@@ -475,6 +535,31 @@ const workbenchRoute = loadTypeScriptSourceModule(
         return true
       },
     },
+    '@/lib/persistence/commerceOrderSync': {
+      CommerceOrderSyncError,
+      async readCommerceOrderWorkbenchExactReadReplayInPostgres(input) {
+        historyReplayCalls.push(input)
+        return historyReplay
+      },
+      async appendCommerceOrderWorkbenchExactReadInPostgres(input) {
+        historyAppendCalls.push(input)
+        if (historyAppendError) throw historyAppendError
+        return { providerReads: 3, providerWrites: 0 }
+      },
+    },
+    '@/lib/persistence/commerceStoreSync': {
+      async withCommerceStoreSyncProviderReadFenceInPostgres(input) {
+        return input.read({
+          id: '66f1bf15-ad9e-4b62-a099-7e91c01b43dc',
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256: 'a'.repeat(64),
+          controlRevision: 1,
+          activationRevision: 1,
+          expiresAt: '2026-09-01T18:00:00.000Z',
+        })
+      },
+    },
     '@/lib/persistence/commerceOrderWorkbench': {
       CommerceOrderWorkbenchError,
       async readCommerceOrderWorkbenchRefreshTargetFromPostgres(input) {
@@ -484,7 +569,11 @@ const workbenchRoute = loadTypeScriptSourceModule(
         })
         return {
           accountGlobalId: 'gia1000001',
-          candidateGlobalId,
+          integrationAccountId: 'f923a810-9f0d-45ae-865b-cbb4f41553cc',
+          provider: 'shopify',
+          externalOrderId: 'gid://shopify/Order/1000001',
+          credentialGeneration: 1,
+          candidateGlobalId: latestTargetCandidateGlobalId,
           candidateRowVersion: 0,
         }
       },
@@ -559,5 +648,144 @@ assert.match(
   'commerce intake must receive a valid UUID idempotency key',
 )
 assert.equal(rebaseCalls.length, 1)
+assert.equal(historyReadCalls.length, 1)
+assert.equal(historyAppendCalls.length, 1)
+assert.equal(historyReadCalls[0].observationKind, 'manual_exact_read')
+assert.equal(historyReplayCalls.length, 1)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(historyReplayCalls[0])),
+  {
+    organizationId,
+    integrationAccountId: 'f923a810-9f0d-45ae-865b-cbb4f41553cc',
+    externalOrderId: 'gid://shopify/Order/1000001',
+    intentKey: `order-workbench-history:${inboundIdempotencyKey}:${candidateGlobalId}`,
+  },
+  'exact-history replay lookup must remain bound to the accepted order command',
+)
+
+historyReplay = {
+  status: 'captured',
+  code: null,
+  providerReads: 0,
+  providerWrites: 0,
+}
+const replayResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': inboundIdempotencyKey,
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(replayResponse.status, 200)
+assert.deepEqual(
+  JSON.parse(JSON.stringify((await replayResponse.json()).historyRefresh)),
+  historyReplay,
+  'a lost-response retry must replay the durable exact capture',
+)
+assert.equal(historyReadCalls.length, 1)
+assert.equal(historyAppendCalls.length, 1)
+assert.equal(historyReplayCalls.length, 2)
+assert.equal(
+  historyReplayCalls[1].intentKey,
+  historyReplayCalls[0].intentKey,
+  'a changed latest candidate must not change the same command replay key',
+)
+historyReplay = null
+
+historyReadError = new ShopifyCommerceClientError(
+  'Shopify exact-order read timed out',
+  502,
+  'SHOPIFY_UPSTREAM_FAILED',
+)
+historyReadError.providerReads = 2
+const unavailableResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': '9eadcadd-ef5c-45dd-99ce-bf1b5d71dd20',
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(unavailableResponse.status, 200)
+const unavailablePayload = await unavailableResponse.json()
+assert.equal(unavailablePayload.ok, true)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(unavailablePayload.historyRefresh)),
+  {
+    status: 'unavailable',
+    code: 'SHOPIFY_UPSTREAM_FAILED',
+    providerReads: 2,
+    providerWrites: 0,
+  },
+  'a genuine Shopify read failure may degrade without losing the refreshed order',
+)
+historyReadError = null
+
+historyReplay = {
+  status: 'unavailable',
+  code: 'COMMERCE_ORDER_HISTORY_PREVIOUSLY_UNAVAILABLE',
+  providerReads: 0,
+  providerWrites: 0,
+}
+const unavailableReplayResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': '9eadcadd-ef5c-45dd-99ce-bf1b5d71dd20',
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(unavailableReplayResponse.status, 200)
+assert.deepEqual(
+  JSON.parse(JSON.stringify(
+    (await unavailableReplayResponse.json()).historyRefresh,
+  )),
+  historyReplay,
+  'a same-key unavailable result must replay without a duplicate provider read',
+)
+assert.equal(historyReadCalls.length, 2)
+historyReplay = null
+
+historyAppendError = new Error('exact history append failed')
+const persistenceFailureResponse = await workbenchRoute.POST(new Request(
+  'https://clawpilot.example/api/operations/order-workbench',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': '27649439-c8c3-4bb1-a9cb-e602637bb566',
+    },
+    body: JSON.stringify({
+      action: 'refresh',
+      candidateGlobalId,
+      expectedRowVersion: 0,
+    }),
+  },
+))
+assert.equal(persistenceFailureResponse.status, 500)
+assert.equal((await persistenceFailureResponse.json()).ok, false)
+historyAppendError = null
 
 console.log('Commerce order workbench contract passed')

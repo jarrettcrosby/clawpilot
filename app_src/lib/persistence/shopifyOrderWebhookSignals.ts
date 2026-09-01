@@ -988,17 +988,20 @@ async function assertPreservedSensitiveEvidence(
 ) {
   const sensitive = observation.events.filter((event) => (
     event.trackingNumber !== null
+      || event.trackingUrl !== null
       || event.providerActorFingerprint !== null
   ))
   if (!sensitive.length) return
   const retained = await client.query<{
     event_hash: string
     tracking_number: string | null
+    tracking_url: string | null
     provider_actor_fingerprint: string | null
     sensitive_evidence_redacted_at: Date | null
     sensitive_evidence_expired: boolean
   }>(
-    `SELECT event_hash, tracking_number, provider_actor_fingerprint,
+    `SELECT event_hash, tracking_number, tracking_url,
+            provider_actor_fingerprint,
             sensitive_evidence_redacted_at,
             sensitive_evidence_expires_at <= clock_timestamp()
               AS sensitive_evidence_expired
@@ -1027,6 +1030,7 @@ async function assertPreservedSensitiveEvidence(
         stored.sensitive_evidence_redacted_at === null
         && (
           stored.tracking_number !== event.trackingNumber
+          || stored.tracking_url !== event.trackingUrl
           || stored.provider_actor_fingerprint
             !== event.providerActorFingerprint
         )
@@ -1051,6 +1055,9 @@ async function insertExactObservation(
     global_id: string
     order_id: string | null
     source_hash: string
+    observation_kind: string
+    webhook_target_id: string | null
+    webhook_dirty_version: string | null
   }
   await client.query(
     `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
@@ -1062,7 +1069,9 @@ async function insertExactObservation(
   )
   let row = (
     await client.query<ObservationRow>(
-      `SELECT id::text, global_id, order_id::text, source_hash
+      `SELECT id::text, global_id, order_id::text, source_hash,
+              observation_kind, webhook_target_id::text,
+              webhook_dirty_version::text
        FROM operations_commerce_order_observations
        WHERE organization_id = $1::uuid
          AND integration_account_id = $2::uuid
@@ -1079,10 +1088,17 @@ async function insertExactObservation(
     )
   ).rows[0]
   let appended = false
-  if (row?.source_hash !== observation.sourceHash) {
+  if (
+    row?.source_hash !== observation.sourceHash
+    || row.observation_kind !== 'webhook_exact_read'
+    || row.webhook_target_id !== claim.id
+    || row.webhook_dirty_version !== String(claim.capturedDirtyVersion)
+  ) {
     row = (
       await client.query<ObservationRow>(
-        `SELECT id::text, global_id, order_id::text, source_hash
+        `SELECT id::text, global_id, order_id::text, source_hash,
+                observation_kind, webhook_target_id::text,
+                webhook_dirty_version::text
          FROM operations_commerce_order_observations
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
@@ -1090,6 +1106,9 @@ async function insertExactObservation(
            AND external_order_id = $3
            AND source_hash = $4
            AND observed_at = $5::timestamptz
+           AND observation_kind = 'webhook_exact_read'
+           AND webhook_target_id = $6::uuid
+           AND webhook_dirty_version = $7
          LIMIT 1
          FOR SHARE`,
         [
@@ -1098,6 +1117,8 @@ async function insertExactObservation(
           observation.externalOrderId,
           observation.sourceHash,
           observation.observedAt,
+          claim.id,
+          claim.capturedDirtyVersion,
         ],
       )
     ).rows[0]
@@ -1136,7 +1157,9 @@ async function insertExactObservation(
        ) canonical ON true
        ON CONFLICT (
          organization_id, integration_account_id, provider,
-         external_order_id, observed_at, source_hash
+         external_order_id, observation_kind, observed_at, source_hash,
+         backfill_session_id, webhook_target_id, webhook_dirty_version,
+         manual_provider_read_lease_id
        ) DO NOTHING
        RETURNING id::text, global_id, order_id::text, source_hash`,
       [
@@ -1175,7 +1198,9 @@ async function insertExactObservation(
     if (!row) {
       row = (
         await client.query<ObservationRow>(
-          `SELECT id::text, global_id, order_id::text, source_hash
+          `SELECT id::text, global_id, order_id::text, source_hash,
+                  observation_kind, webhook_target_id::text,
+                  webhook_dirty_version::text
            FROM operations_commerce_order_observations
            WHERE organization_id = $1::uuid
              AND integration_account_id = $2::uuid
@@ -1183,6 +1208,9 @@ async function insertExactObservation(
              AND external_order_id = $3
              AND source_hash = $4
              AND observed_at = $5::timestamptz
+             AND observation_kind = 'webhook_exact_read'
+             AND webhook_target_id = $6::uuid
+             AND webhook_dirty_version = $7
            LIMIT 1
            FOR SHARE`,
           [
@@ -1191,6 +1219,8 @@ async function insertExactObservation(
             observation.externalOrderId,
             observation.sourceHash,
             observation.observedAt,
+            claim.id,
+            claim.capturedDirtyVersion,
           ],
         )
       ).rows[0]
@@ -1214,9 +1244,9 @@ async function insertExactObservation(
          organization_id, observation_id, external_line_id,
          external_product_id, external_variant_id, sku,
          original_quantity, current_quantity, unfulfilled_quantity,
-         fulfilled_quantity, requires_shipping
+         fulfilled_quantity, returned_quantity, requires_shipping
        ) VALUES (
-         $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11
+         $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
        )`,
       [
         claim.organizationId,
@@ -1229,6 +1259,7 @@ async function insertExactObservation(
         line.currentQuantity,
         line.unfulfilledQuantity,
         line.fulfilledQuantity,
+        line.returnedQuantity,
         line.requiresShipping,
       ],
     )
@@ -1243,13 +1274,13 @@ async function insertExactObservation(
          quantity, amount_minor, currency, inventory_effect_kind,
          attribution_source, provider_actor_fingerprint,
          provider_location_id, tracking_carrier, tracking_number,
-         sensitive_evidence_expires_at, occurred_at, observed_at
+         tracking_url, sensitive_evidence_expires_at, occurred_at, observed_at
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'shopify', $5, $6, $7,
          $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-         $19, LEAST($20::timestamptz, $22::timestamptz)
-           + make_interval(days => $21),
-         $20::timestamptz, $22::timestamptz
+         $19, $20, LEAST($21::timestamptz, $23::timestamptz)
+           + make_interval(days => $22),
+         $21::timestamptz, $23::timestamptz
        )
        ON CONFLICT (
          organization_id, integration_account_id, provider,
@@ -1275,6 +1306,7 @@ async function insertExactObservation(
         event.providerLocationId,
         event.trackingCarrier,
         event.trackingNumber,
+        event.trackingUrl,
         event.occurredAt,
         sensitiveEvidenceRetentionDays(),
         observation.observedAt,

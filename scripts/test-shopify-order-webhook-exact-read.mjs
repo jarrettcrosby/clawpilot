@@ -34,6 +34,7 @@ function loadTypeScriptModule(path, mocks = {}) {
     RegExp,
     Set,
     String,
+    URL,
     console,
     exports: loaded.exports,
     module: loaded,
@@ -110,7 +111,19 @@ const detail = {
     }],
     pageInfo: { hasNextPage: false, endCursor: null },
   },
-  fulfillments: [],
+  fulfillments: [{
+    id: 'gid://shopify/Fulfillment/9301',
+    status: 'SUCCESS',
+    displayStatus: 'DELIVERED',
+    createdAt: '2026-08-13T16:30:00.000Z',
+    updatedAt: '2026-08-13T17:00:00.000Z',
+    location: { id: 'gid://shopify/Location/9301' },
+    trackingInfo: [{
+      company: 'USPS',
+      number: '9400111899223856928499',
+      url: 'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+    }],
+  }],
   refunds: [],
   returns: {
     nodes: [],
@@ -250,6 +263,7 @@ const read = await history.readExactShopifyOrderHistoryObservation({
   expectedCredentialGeneration: 1,
   externalOrderId: 'gid://shopify/Order/9301',
   observedAt: '2026-08-13T17:01:00.000Z',
+  observationKind: 'webhook_exact_read',
 })
 assert.deepEqual(providerOperations, [
   'token',
@@ -264,6 +278,36 @@ assert.equal(read.returnHistoryScopeObserved, true)
 assert.equal(read.observation.observationKind, 'webhook_exact_read')
 assert.equal(read.observation.externalOrderId, 'gid://shopify/Order/9301')
 assert.equal(read.observation.providerReadCount, 3)
+const trackingEvent = read.observation.events.find(
+  (event) => event.trackingNumber === '9400111899223856928499',
+)
+assert.equal(trackingEvent?.trackingCarrier, 'USPS')
+assert.equal(
+  trackingEvent?.trackingUrl,
+  'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+)
+
+returnedOrder = {
+  ...detail,
+  fulfillments: [{
+    ...detail.fulfillments[0],
+    trackingInfo: [{
+      ...detail.fulfillments[0].trackingInfo[0],
+      url: 'javascript:alert(1)',
+    }],
+  }],
+}
+await assert.rejects(
+  history.readExactShopifyOrderHistoryObservation({
+    organizationId: '00000000-0000-4000-8000-000000000001',
+    accountGlobalId: 'gia0009301',
+    expectedCredentialGeneration: 1,
+    externalOrderId: 'gid://shopify/Order/9301',
+    observedAt: '2026-08-13T17:01:00.000Z',
+    observationKind: 'webhook_exact_read',
+  }),
+  (error) => error.code === 'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
+)
 
 returnedOrder = { ...detail, id: 'gid://shopify/Order/9999' }
 await assert.rejects(
@@ -273,6 +317,7 @@ await assert.rejects(
     expectedCredentialGeneration: 1,
     externalOrderId: 'gid://shopify/Order/9301',
     observedAt: '2026-08-13T17:01:00.000Z',
+    observationKind: 'webhook_exact_read',
   }),
   (error) => error.code === 'COMMERCE_ORDER_HISTORY_PROVIDER_RESPONSE_INVALID',
 )
@@ -282,6 +327,7 @@ await assert.rejects(
     accountGlobalId: 'gia0009301',
     expectedCredentialGeneration: 1,
     externalOrderId: '9301',
+    observationKind: 'webhook_exact_read',
   }),
   (error) => error.code === 'SHOPIFY_ORDER_HISTORY_EXACT_ID_INVALID',
 )

@@ -400,6 +400,13 @@ async function installOrderStatusSyncRoutes(
     discoveryRunningResponses?: number
     releasedReconciliation?: boolean
     eligibleOrderCount?: number
+    canManage?: boolean
+    importedHistoryOutcomes?: Array<'captured' | 'unavailable' | 'hard_failure'>
+    currentImportedHistoryIndexes?: number[]
+    importedHistorySourceUpdatedAt?: string
+    importedHistoryRefreshedAt?: string
+    terminalImportedHistoryIndexes?: number[]
+    returnDetailedImportedHistoryOnRefresh?: boolean
   } = {},
 ) {
   const releasedReconciliation = options.releasedReconciliation === true
@@ -416,6 +423,14 @@ async function installOrderStatusSyncRoutes(
   const discoveryRequests: Array<{
     idempotencyKey: string
     body: { accountGlobalId: string }
+  }> = []
+  const importedHistoryRefreshRequests: Array<{
+    idempotencyKey: string
+    body: {
+      action: string
+      candidateGlobalId: string
+      expectedRowVersion: number
+    }
   }> = []
   const operationsStatusFilters: Array<string | null> = []
   let markSecondBatchStarted: () => void = () => undefined
@@ -486,18 +501,122 @@ async function installOrderStatusSyncRoutes(
     planningPreparation: null,
     sandboxCommerceE2eAuthorization: null,
   })
-  const currentWorkspace = (selected = false) => {
+  const currentWorkspace = (
+    selected = false,
+    importedOrders: OperationsImportedOrderWorkingCopy[] = [],
+  ) => {
     const base = workspace()
     const currentOrder = order()
     return {
       ...base,
+      capabilities: {
+        ...base.capabilities,
+        canManage: options.canManage !== false,
+        canExecute: options.canManage !== false,
+      },
       summary: {
         ...base.summary,
         openOrders: providerFulfilled ? 0 : 1,
       },
       orders: [currentOrder],
       selectedOrder: selected ? currentOrder : null,
+      importedOrders,
+      importedOrderPage: {
+        total: importedOrders.length,
+        returned: importedOrders.length,
+        pageSize: 250,
+        nextCursor: null,
+        complete: true,
+        truncated: false,
+      },
       exceptions: [],
+    }
+  }
+  const terminalImportedHistoryIndexes = new Set(
+    options.terminalImportedHistoryIndexes || [0],
+  )
+  const importedHistoryOrders = (options.importedHistoryOutcomes || []).map(
+    (_, index) => {
+      const sourceUpdatedAt = options.importedHistorySourceUpdatedAt
+        || '2026-08-31T18:00:00.000Z'
+      const identifiers = [
+        { candidateGlobalId: 'gcoc6662001', orderNumber: '#6662' },
+        { candidateGlobalId: 'gcoc6682001', orderNumber: '#6682' },
+        { candidateGlobalId: 'gcoc6690001', orderNumber: '#6690' },
+      ][index] || {
+        candidateGlobalId: `gcoc${String(7_000_001 + index)}`,
+        orderNumber: `#${7_000 + index}`,
+      }
+      return {
+        ...importedWorkbenchOrder(false),
+        globalId: identifiers.candidateGlobalId,
+        candidateGlobalId: identifiers.candidateGlobalId,
+        externalOrderId: `gid://shopify/Order/${identifiers.orderNumber.slice(1)}`,
+        orderNumber: identifiers.orderNumber,
+        rowVersion: index + 2,
+        providerState: terminalImportedHistoryIndexes.has(index)
+          ? {
+              lifecycle: 'closed' as const,
+              fulfillment: 'fulfilled' as const,
+              observedAt: '2026-08-31T18:00:00.000Z',
+              source: 'history' as const,
+            }
+          : importedWorkbenchOrder(false).providerState,
+        sourceUpdatedAt,
+        providerHistory: {
+          observedAt: options.currentImportedHistoryIndexes?.includes(index)
+            ? sourceUpdatedAt
+            : null,
+          currentLines: [],
+          events: [],
+          providerWrites: 0 as const,
+        },
+      }
+    },
+  )
+  const detailedImportedHistoryOrder = (
+    order: OperationsImportedOrderWorkingCopy,
+    outcome: 'captured' | 'unavailable' | 'hard_failure' | undefined,
+  ): OperationsImportedOrderWorkingCopy => {
+    const details = importedWorkbenchOrder(true)
+    return {
+      ...order,
+      resolutionDetailsLoaded: true,
+      customer: details.customer,
+      lines: details.lines,
+      productOptions: details.productOptions,
+      providerHistory: outcome === 'captured'
+        ? {
+            observedAt: options.importedHistoryRefreshedAt
+              || new Date().toISOString(),
+            currentLines: [{
+              externalLineId: details.lines[0].externalLineId,
+              externalProductId: 'gid://shopify/Product/66821',
+              externalVariantId: 'gid://shopify/ProductVariant/66821',
+              sku: details.lines[0].sku,
+              orderedQuantity: details.lines[0].orderedQuantity,
+              currentQuantity: details.lines[0].currentQuantity,
+              fulfilledQuantity: details.lines[0].fulfilledQuantity,
+              unfulfilledQuantity: details.lines[0].unfulfilledQuantity,
+              requiresShipping: details.lines[0].requiresShipping,
+            }],
+            events: [{
+              globalId: 'gcoe6682001',
+              kind: 'tracking_updated',
+              status: 'in_transit',
+              occurredAt: '2026-09-01T11:55:00.000Z',
+              externalSubjectId: 'gid://shopify/Fulfillment/66821',
+              quantity: null,
+              amountMinor: null,
+              currency: null,
+              trackingCarrier: 'UPS',
+              trackingNumber: '1Z6682LATEST',
+              trackingUrl: 'https://www.ups.com/track?tracknum=1Z6682LATEST',
+              trackingRedacted: false,
+            }],
+            providerWrites: 0,
+          }
+        : order.providerHistory,
     }
   }
 
@@ -620,6 +739,109 @@ async function installOrderStatusSyncRoutes(
     },
   )
   await page.route(
+    (url) => url.pathname === '/api/operations/order-workbench',
+    async (route) => {
+      const request = route.request()
+      if (request.method() === 'GET') {
+        const params = new URL(request.url()).searchParams
+        const candidateGlobalId = params.get('candidate')
+        if (candidateGlobalId) {
+          const orderIndex = importedHistoryOrders.findIndex((order) => (
+            order.candidateGlobalId === candidateGlobalId
+          ))
+          expect(orderIndex).toBeGreaterThanOrEqual(0)
+          const outcome = options.importedHistoryOutcomes?.[orderIndex]
+          return route.fulfill({
+            json: {
+              ok: true,
+              orders: [detailedImportedHistoryOrder(
+                importedHistoryOrders[orderIndex],
+                outcome,
+              )],
+            },
+          })
+        }
+        expect(params.get('limit')).toBe('250')
+        expect(params.get('cursor')).toBeNull()
+        expect(params.get('search')).toBeNull()
+        return route.fulfill({
+          json: {
+            ok: true,
+            orders: importedHistoryOrders,
+            page: {
+              total: importedHistoryOrders.length,
+              returned: importedHistoryOrders.length,
+              pageSize: 250,
+              nextCursor: null,
+              complete: true,
+              truncated: false,
+            },
+          },
+        })
+      }
+      expect(request.method()).toBe('POST')
+      const body = request.postDataJSON() as {
+        action: string
+        candidateGlobalId: string
+        expectedRowVersion: number
+      }
+      const captured = {
+        idempotencyKey: request.headers()['idempotency-key'] || '',
+        body,
+      }
+      importedHistoryRefreshRequests.push(captured)
+      const orderIndex = importedHistoryOrders.findIndex((order) => (
+        order.candidateGlobalId === body.candidateGlobalId
+      ))
+      expect(orderIndex).toBeGreaterThanOrEqual(0)
+      const order = importedHistoryOrders[orderIndex]
+      expect(body).toEqual({
+        action: 'refresh',
+        candidateGlobalId: order.candidateGlobalId,
+        expectedRowVersion: order.rowVersion,
+      })
+      const outcome = options.importedHistoryOutcomes?.[orderIndex]
+      if (outcome === 'hard_failure') {
+        return route.fulfill({
+          status: 500,
+          json: {
+            ok: false,
+            code: 'OPERATIONS_IMPORTED_ORDER_REQUEST_FAILED',
+            error: 'Imported order could not be loaded or saved',
+          },
+        })
+      }
+      return route.fulfill({
+        json: {
+          ok: true,
+          refreshResult: {
+            previousCandidateGlobalId: order.candidateGlobalId,
+            candidateGlobalId: order.candidateGlobalId,
+            rowVersion: order.rowVersion,
+            status: 'current',
+            providerChangedFields: [],
+            preservedLocalFields: [],
+            preservedLineDrafts: [],
+            providerWrites: 0,
+            providerWriteIntentCreated: false,
+            replayed: false,
+          },
+          historyRefresh: {
+            status: outcome,
+            code: outcome === 'unavailable'
+              ? 'SHOPIFY_ORDER_HISTORY_UNAVAILABLE'
+              : null,
+            providerReads: outcome === 'captured' ? 3 : null,
+            providerWrites: 0,
+          },
+          order: options.returnDetailedImportedHistoryOnRefresh
+            ? detailedImportedHistoryOrder(order, outcome)
+            : order,
+        },
+      })
+    },
+  )
+  await page.route(
     (url) => url.pathname === '/api/operations/order-revisions',
     async (route) => route.fulfill({
       json: {
@@ -668,7 +890,7 @@ async function installOrderStatusSyncRoutes(
     const statusFilter = requestUrl.searchParams.get('status')
     operationsStatusFilters.push(statusFilter)
     const selected = requestUrl.searchParams.get('order') === 'gor7654321'
-    let responseWorkspace = currentWorkspace(selected)
+    let responseWorkspace = currentWorkspace(selected, importedHistoryOrders)
     if (
       options.delayFinalWorkspace
       && providerFulfilled
@@ -705,6 +927,7 @@ async function installOrderStatusSyncRoutes(
     releaseSecondBatch,
     secondBatchStarted,
     discoveryRequests,
+    importedHistoryRefreshRequests,
     syncRequests,
   }
 }
@@ -988,9 +1211,17 @@ function importedWorkbenchOrder(
     },
     lines: details ? [{
       globalId: workbenchLineGlobalId,
+      externalLineId: 'gid://shopify/LineItem/77101',
       title: 'Trail Pack retail unit',
       sku: 'TRAIL-PROVIDER-001',
       quantity: 2,
+      orderedQuantity: 2,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 0,
+      fulfilledQuantity: 0,
+      unfulfilledQuantity: 2,
+      returnedQuantity: 0,
+      providerStatus: 'open',
       unitMultiplier: 1,
       requiresShipping: true,
       mappingStatus: 'unresolved',
@@ -1005,6 +1236,12 @@ function importedWorkbenchOrder(
         'line_price_required',
       ],
     }] : [],
+    providerHistory: {
+      observedAt: null,
+      currentLines: [],
+      events: [],
+      providerWrites: 0,
+    },
     productOptions: details ? [{
       globalId: workbenchProductGlobalId,
       name: 'Trail Pack',
@@ -1101,7 +1338,14 @@ async function installImportedWorkbenchRoutes(
   options: {
     refreshConflict?: boolean
     refreshNetworkFailureOnce?: boolean
+    historyRefreshStatus?: 'captured' | 'unavailable'
     providerState?: OperationsImportedOrderWorkingCopy['providerState']
+    lines?: OperationsImportedOrderWorkingCopy['lines']
+    providerHistory?: OperationsImportedOrderWorkingCopy['providerHistory']
+    rowVersion?: number
+    providerVersionChanged?: boolean
+    sourceUpdatedAt?: string
+    canManage?: boolean
   } = {},
 ) {
   const capture = {
@@ -1118,6 +1362,25 @@ async function installImportedWorkbenchRoutes(
 
   if (options.providerState) {
     detailedOrder = { ...detailedOrder, providerState: options.providerState }
+  }
+  if (options.lines) detailedOrder = { ...detailedOrder, lines: options.lines }
+  if (options.providerHistory) {
+    detailedOrder = { ...detailedOrder, providerHistory: options.providerHistory }
+  }
+  if (options.rowVersion !== undefined) {
+    detailedOrder = { ...detailedOrder, rowVersion: options.rowVersion }
+  }
+  if (options.providerVersionChanged !== undefined) {
+    detailedOrder = {
+      ...detailedOrder,
+      providerVersionChanged: options.providerVersionChanged,
+    }
+  }
+  if (options.sourceUpdatedAt) {
+    detailedOrder = {
+      ...detailedOrder,
+      sourceUpdatedAt: options.sourceUpdatedAt,
+    }
   }
 
   if (options.refreshConflict) {
@@ -1306,7 +1569,11 @@ async function installImportedWorkbenchRoutes(
       if (
         request.method() !== 'POST'
         || captured.body.action !== 'refresh'
-        || (!options.refreshConflict && !options.refreshNetworkFailureOnce)
+        || (
+          !options.refreshConflict
+          && !options.refreshNetworkFailureOnce
+          && !options.historyRefreshStatus
+        )
       ) {
         throw new Error(`Unexpected order-workbench request: ${request.method()}`)
       }
@@ -1374,6 +1641,18 @@ async function installImportedWorkbenchRoutes(
             providerWriteIntentCreated: false,
             replayed: false,
           },
+          ...(options.historyRefreshStatus ? {
+            historyRefresh: {
+              status: options.historyRefreshStatus,
+              code: options.historyRefreshStatus === 'unavailable'
+                ? 'SHOPIFY_ORDER_HISTORY_UNAVAILABLE'
+                : null,
+              providerReads: options.historyRefreshStatus === 'captured'
+                ? 3
+                : null,
+              providerWrites: 0,
+            },
+          } : {}),
           order: detailedOrder,
         },
       })
@@ -1391,6 +1670,10 @@ async function installImportedWorkbenchRoutes(
         ok: true,
         operations: {
           ...workspace(),
+          capabilities: {
+            ...workspace().capabilities,
+            canManage: options.canManage ?? workspace().capabilities.canManage,
+          },
           activation: { ...workspace().activation, state: 'read_only' },
           summary: {
             ...workspace().summary,
@@ -2344,7 +2627,8 @@ test('incomplete imported order saves locally before explicit acceptance into ca
     .toBeVisible()
   await expect(page.getByText('Ship-to incomplete for rates')).toBeVisible()
   await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
-  await expect(page.getByText('Quantity 2')).toBeVisible()
+  await expect(page.getByText('Ordered 2')).toBeVisible()
+  await expect(page.getByText('Remaining 2')).toBeVisible()
 
   const customer = page.getByRole('combobox', { name: 'Customer' })
   await expect(customer).toBeEnabled()
@@ -2443,12 +2727,80 @@ test('incomplete imported order saves locally before explicit acceptance into ca
 
 test('provider-terminal candidates remain visible with current external status and cannot be imported', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 })
-  await installImportedWorkbenchRoutes(page, {
+  await page.clock.setFixedTime('2026-08-31T18:05:00.000Z')
+  const capture = await installImportedWorkbenchRoutes(page, {
+    historyRefreshStatus: 'captured',
     providerState: {
       lifecycle: 'closed',
       fulfillment: 'fulfilled',
       observedAt: '2026-08-31T18:00:00.000Z',
       source: 'history',
+    },
+    lines: [{
+      ...importedWorkbenchOrder(true).lines[0],
+      quantity: 0,
+      orderedQuantity: 3,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 1,
+      fulfilledQuantity: 2,
+      unfulfilledQuantity: 0,
+      returnedQuantity: 1,
+      providerStatus: 'returned',
+    }],
+    providerHistory: {
+      observedAt: '2026-08-31T18:00:00.000Z',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/77101',
+        externalProductId: 'gid://shopify/Product/77101',
+        externalVariantId: 'gid://shopify/ProductVariant/77101',
+        sku: 'TRAIL-PROVIDER-001',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        requiresShipping: true,
+      }],
+      events: [{
+        globalId: 'gcoe7654321',
+        kind: 'tracking_updated',
+        status: 'delivered',
+        occurredAt: '2026-08-31T17:00:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: null,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: 'USPS',
+        trackingNumber: '9400111899223856928499',
+        trackingUrl: 'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+        trackingRedacted: false,
+      }, {
+        globalId: 'gcoe7654322',
+        kind: 'fulfillment_updated',
+        status: 'delivered',
+        occurredAt: '2026-08-31T17:00:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: 2,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }, {
+        globalId: 'gcoe7654323',
+        kind: 'refund_created',
+        status: 'succeeded',
+        occurredAt: '2026-08-31T17:30:00.000Z',
+        externalSubjectId: 'gid://shopify/Refund/77101',
+        quantity: 1,
+        amountMinor: 1250,
+        currency: 'USD',
+        trackingCarrier: null,
+        trackingNumber: null,
+        trackingUrl: null,
+        trackingRedacted: false,
+      }],
+      providerWrites: 0,
     },
   })
   await gotoApp(page, '/#operations')
@@ -2463,14 +2815,181 @@ test('provider-terminal candidates remain visible with current external status a
   await expect(page.getByText(
     'Shopify reports this order as fulfilled externally. It remains visible for provider history and is not eligible for a new ClawPilot fulfillment.',
   )).toBeVisible()
+  await expect(page.getByText('Ordered 3')).toBeVisible()
+  await expect(page.getByText('Current 2')).toBeVisible()
+  await expect(page.getByText('Fulfilled 2')).toBeVisible()
+  await expect(page.getByText('Remaining 0')).toBeVisible()
+  await expect(page.getByText('Removed or refunded 1')).toBeVisible()
+  await expect(page.getByText('Returned 1')).toBeVisible()
+  await expect(page.getByText('USPS · 9400111899223856928499'))
+    .toBeVisible()
+  await expect(page.getByRole('link', { name: 'Track shipment' }))
+    .toHaveAttribute('href', /tools\.usps\.com/)
+  await expect(page.getByText('Fulfillment Updated · delivered · 2 units'))
+    .toBeVisible()
+  await expect(page.getByText('Refund Created · succeeded · 1 units · $12.50'))
+    .toBeVisible()
+  await expect(page.getByText(/No line-item snapshot was supplied/)).toHaveCount(0)
+  await expect(page.getByText('Latest line quantities reported by Shopify.'))
+    .toBeVisible()
+  await expect(page.getByText('Latest provider shipping address')).toBeVisible()
+  await expect(page.getByText('Provider snapshot', { exact: true }))
+    .toBeVisible()
+  await expect(page.getByLabel('Customer')).toBeDisabled()
+  await expect(page.getByLabel('Requested delivery')).toBeDisabled()
+  for (const label of [
+    'Recipient name',
+    'Address',
+    'Apartment, suite, etc.',
+    'City',
+    'State / province',
+    'Postal code',
+    'Country code',
+  ]) {
+    await expect(page.getByLabel(label)).toBeDisabled()
+  }
+  await expect(page.getByLabel('ClawPilot product')).toHaveCount(0)
+  await expect(page.getByLabel(/Unit price/)).toHaveCount(0)
+  await expect(page.getByText(/cartonization chooses outbound packaging/i))
+    .toHaveCount(0)
   await expect(page.getByRole('button', {
     name: 'Accept & import',
     exact: true,
   })).toBeDisabled()
   await expect(page.getByRole('button', { name: 'Save', exact: true }))
     .toBeDisabled()
+  const refresh = page.getByRole('button', { name: 'Refresh from Shopify' })
+  await expect(refresh).toBeEnabled()
+  await refresh.click()
+  await expect(page.getByText('Order #7710 refreshed from Shopify'))
+    .toBeVisible()
+  expect(capture.refreshRequests).toHaveLength(1)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 0,
+  })
+  expect(capture.refreshRequests[0].idempotencyKey).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('opening another stale externally fulfilled order refreshes exact Shopify history automatically', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  const sourceUpdatedAt = '2026-08-31T18:00:00.000Z'
+  await page.clock.setFixedTime(refreshNow)
+  const capture = await installImportedWorkbenchRoutes(page, {
+    historyRefreshStatus: 'captured',
+    rowVersion: 4,
+    providerVersionChanged: true,
+    sourceUpdatedAt,
+    providerState: {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: sourceUpdatedAt,
+      source: 'history',
+    },
+    lines: [{
+      ...importedWorkbenchOrder(true).lines[0],
+      quantity: 0,
+      orderedQuantity: 3,
+      currentQuantity: 2,
+      cancelledOrRemovedQuantity: 1,
+      fulfilledQuantity: 2,
+      unfulfilledQuantity: 0,
+      returnedQuantity: 1,
+      providerStatus: 'returned',
+    }],
+    providerHistory: {
+      observedAt: '2026-08-31T17:00:00.000Z',
+      currentLines: [{
+        externalLineId: 'gid://shopify/LineItem/77101',
+        externalProductId: 'gid://shopify/Product/77101',
+        externalVariantId: 'gid://shopify/ProductVariant/77101',
+        sku: 'TRAIL-PROVIDER-001',
+        orderedQuantity: 3,
+        currentQuantity: 2,
+        fulfilledQuantity: 2,
+        unfulfilledQuantity: 0,
+        returnedQuantity: 1,
+        requiresShipping: true,
+      }],
+      events: [{
+        globalId: 'gcoe7654999',
+        kind: 'tracking_updated',
+        status: 'in_transit',
+        occurredAt: '2026-08-31T17:30:00.000Z',
+        externalSubjectId: 'gid://shopify/Fulfillment/77101',
+        quantity: null,
+        amountMinor: null,
+        currency: null,
+        trackingCarrier: 'UPS',
+        trackingNumber: '1Z999AA10123456784',
+        trackingUrl: 'https://www.ups.com/track?tracknum=1Z999AA10123456784',
+        trackingRedacted: false,
+      }],
+      providerWrites: 0,
+    },
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+
+  await expect.poll(() => capture.refreshRequests.length).toBe(1)
+  expect(capture.refreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: workbenchCandidateGlobalId,
+    expectedRowVersion: 4,
+  })
+  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  expect(capture.refreshRequests[0].idempotencyKey).toBe(
+    `operations-imported-drawer-history:${workbenchCandidateGlobalId}:4:${
+      Date.parse(sourceUpdatedAt)
+    }:${refreshEpoch}`,
+  )
+  await expect(page.getByText('UPS · 1Z999AA10123456784')).toBeVisible()
+  await expect(page.getByText('Returned 1')).toBeVisible()
+  await expect(page.getByText(/No line-item snapshot was supplied/)).toHaveCount(0)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect.poll(() => capture.refreshRequests.length).toBe(2)
+  expect(capture.refreshRequests[1].idempotencyKey)
+    .toBe(capture.refreshRequests[0].idempotencyKey)
+  expect(capture.providerMutationRequests).toEqual([])
+})
+
+test('opening stale external history stays read-only for a viewer without manage permission', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  const capture = await installImportedWorkbenchRoutes(page, {
+    canManage: false,
+    historyRefreshStatus: 'captured',
+    sourceUpdatedAt: '2026-08-31T18:00:00.000Z',
+    providerState: {
+      lifecycle: 'closed',
+      fulfillment: 'fulfilled',
+      observedAt: '2026-08-31T18:00:00.000Z',
+      source: 'history',
+    },
+    providerHistory: {
+      observedAt: '2026-08-31T17:00:00.000Z',
+      currentLines: [],
+      events: [],
+      providerWrites: 0,
+    },
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId(`imported-order-${workbenchCandidateGlobalId}`).click()
+
+  await expect(page.getByText(
+    'Shopify reports this order as fulfilled externally. It remains visible for provider history and is not eligible for a new ClawPilot fulfillment.',
+  )).toBeVisible()
   await expect(page.getByRole('button', { name: 'Refresh from Shopify' }))
-    .toBeEnabled()
+    .toHaveCount(0)
+  expect(capture.refreshRequests).toEqual([])
+  expect(capture.providerMutationRequests).toEqual([])
 })
 
 test('imported order provider refresh resolves each address conflict explicitly', async ({ page }) => {
@@ -2608,6 +3127,244 @@ test('orders refresh reads Shopify status and projects external fulfillment with
   await expect(page.getByText(/Use Reconcile external fulfillment/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Prepare order' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Release to warehouse' })).toHaveCount(0)
+})
+
+test('orders refresh hydrates multiple stale Shopify orders and continues unavailable history', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  await page.clock.setFixedTime(refreshNow)
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured', 'unavailable'],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(/Updated Shopify details for 1 order/))
+    .toBeVisible()
+  await expect(page.getByText(
+    /1 Shopify order could not be loaded and can be retried/,
+  )).toBeVisible()
+  expect(capture.importedHistoryRefreshRequests).toHaveLength(2)
+  expect(capture.importedHistoryRefreshRequests.map((request) => request.body))
+    .toEqual([{
+      action: 'refresh',
+      candidateGlobalId: 'gcoc6662001',
+      expectedRowVersion: 2,
+    }, {
+      action: 'refresh',
+      candidateGlobalId: 'gcoc6682001',
+      expectedRowVersion: 3,
+    }])
+  const sourceRevision = Date.parse('2026-08-31T18:00:00.000Z')
+  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  expect(capture.importedHistoryRefreshRequests.map((request) => (
+    request.idempotencyKey
+  ))).toEqual([
+    `operations-imported-history:gcoc6662001:2:${sourceRevision}:${refreshEpoch}:0`,
+    `operations-imported-history:gcoc6682001:3:${sourceRevision}:${refreshEpoch}:0`,
+  ])
+  expect(new Set(
+    capture.importedHistoryRefreshRequests.map((request) => request.idempotencyKey),
+  ).size).toBe(2)
+})
+
+test('opening another stale terminal Shopify order refreshes its exact history once per mount', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  await page.clock.setFixedTime(refreshNow)
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured', 'captured'],
+    currentImportedHistoryIndexes: [0],
+    terminalImportedHistoryIndexes: [0, 1],
+    importedHistoryRefreshedAt: new Date(refreshNow).toISOString(),
+    returnDetailedImportedHistoryOnRefresh: true,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId('imported-order-gcoc6682001').click()
+
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByText('UPS · 1Z6682LATEST')).toBeVisible()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(1)
+  expect(capture.importedHistoryRefreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: 'gcoc6682001',
+    expectedRowVersion: 3,
+  })
+  const sourceRevision = Date.parse('2026-08-31T18:00:00.000Z')
+  const refreshEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  const firstIdempotencyKey =
+    `operations-imported-drawer-history:gcoc6682001:3:${sourceRevision}:${refreshEpoch}`
+  expect(capture.importedHistoryRefreshRequests[0].idempotencyKey)
+    .toBe(firstIdempotencyKey)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(2)
+  expect(capture.importedHistoryRefreshRequests[1].idempotencyKey)
+    .toBe(firstIdempotencyKey)
+})
+
+test('opening terminal Shopify history as a view-only user keeps stored details without a forbidden refresh', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    canManage: false,
+    importedHistoryOutcomes: ['captured', 'unavailable'],
+    currentImportedHistoryIndexes: [0],
+    terminalImportedHistoryIndexes: [0, 1],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByTestId('imported-order-gcoc6682001').click()
+
+  await expect(page.getByRole('heading', { name: 'Order #6682' }))
+    .toBeVisible()
+  await expect(page.getByText('SKU TRAIL-PROVIDER-001')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Refresh from Shopify' }))
+    .toHaveCount(0)
+  expect(capture.importedHistoryRefreshRequests).toEqual([])
+})
+
+test('orders refresh skips imported Shopify histories already current with the provider revision', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const sourceUpdatedAt = new Date().toISOString()
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured', 'captured', 'captured'],
+    currentImportedHistoryIndexes: [0, 2],
+    importedHistorySourceUpdatedAt: sourceUpdatedAt,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(/Updated Shopify details for 1 order/))
+    .toBeVisible()
+  expect(capture.importedHistoryRefreshRequests.map((request) => (
+    request.body.candidateGlobalId
+  ))).toEqual(['gcoc6682001'])
+})
+
+test('orders refresh uses a new command in a later TTL epoch when nested activity leaves the parent revision unchanged', async ({ page }) => {
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const refreshNow = Date.parse('2026-09-01T12:05:00.000Z')
+  await page.clock.setFixedTime(refreshNow)
+  const unchangedParentRevision = new Date(
+    refreshNow - (31 * 60 * 1000),
+  ).toISOString()
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['captured'],
+    currentImportedHistoryIndexes: [0],
+    importedHistorySourceUpdatedAt: unchangedParentRevision,
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(/Updated Shopify details for 1 order/))
+    .toBeVisible()
+  expect(capture.importedHistoryRefreshRequests).toHaveLength(1)
+  expect(capture.importedHistoryRefreshRequests[0].body).toEqual({
+    action: 'refresh',
+    candidateGlobalId: 'gcoc6662001',
+    expectedRowVersion: 2,
+  })
+  const firstKey = capture.importedHistoryRefreshRequests[0].idempotencyKey
+  const firstEpoch = Math.floor(refreshNow / (30 * 60 * 1000))
+  expect(firstKey).toBe(
+    `operations-imported-history:gcoc6662001:2:${
+      Date.parse(unchangedParentRevision)
+    }:${firstEpoch}:0`,
+  )
+
+  await page.clock.setFixedTime(refreshNow + (31 * 60 * 1000))
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(2)
+  const laterKey = capture.importedHistoryRefreshRequests[1].idempotencyKey
+  expect(laterKey).toBe(
+    `operations-imported-history:gcoc6662001:2:${
+      Date.parse(unchangedParentRevision)
+    }:${firstEpoch + 1}:0`,
+  )
+  expect(laterKey).not.toBe(firstKey)
+})
+
+test('orders refresh surfaces a local history failure and continues the remaining exact refreshes', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: ['hard_failure', 'captured'],
+  })
+  await gotoApp(page, '/#operations')
+
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+
+  await expect(page.getByText(/Updated Shopify details for 1 order/))
+    .toBeVisible()
+  await expect(page.getByText(/1 order could not be updated/)).toBeVisible()
+  await expect(page.getByText(
+    /#6662: Imported order could not be loaded or saved \[OPERATIONS_IMPORTED_ORDER_REQUEST_FAILED\]/,
+  )).toBeVisible()
+  expect(capture.importedHistoryRefreshRequests.map((request) => (
+    request.body.candidateGlobalId
+  ))).toEqual(['gcoc6662001', 'gcoc6682001'])
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await page.getByRole('button', { name: 'Refresh connected-store orders' }).click()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(3)
+  expect(capture.importedHistoryRefreshRequests[2].idempotencyKey)
+    .toBe(capture.importedHistoryRefreshRequests[0].idempotencyKey)
+})
+
+test('orders refresh caps unavailable Shopify reads and resumes fairly after a remount', async ({ page }) => {
+  test.slow()
+  await page.setViewportSize({ width: 1366, height: 900 })
+  await page.clock.setFixedTime('2026-09-01T12:05:00.000Z')
+  const capture = await installOrderStatusSyncRoutes(page, {
+    importedHistoryOutcomes: Array.from({ length: 12 }, () => 'unavailable'),
+  })
+  await gotoApp(page, '/#operations')
+  const refresh = page.getByRole('button', { name: 'Refresh connected-store orders' })
+
+  await refresh.click()
+  await expect(page.getByText(/No Shopify order details were updated/))
+    .toBeVisible()
+  await expect(page.getByText(/10 Shopify orders could not be loaded and can be retried/))
+    .toBeVisible()
+  await expect(page.getByText(/2 more orders remain; refresh again to continue/))
+    .toBeVisible()
+  expect(capture.importedHistoryRefreshRequests).toHaveLength(10)
+
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect(refresh).toBeVisible()
+  await refresh.click()
+  await expect(page.getByText(/2 Shopify orders could not be loaded and can be retried/))
+    .toBeVisible()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(12)
+  expect(new Set(capture.importedHistoryRefreshRequests.map((request) => (
+    request.body.candidateGlobalId
+  ))).size).toBe(12)
+
+  const firstCycleKeys = new Map(
+    capture.importedHistoryRefreshRequests.map((request) => [
+      request.body.candidateGlobalId,
+      request.idempotencyKey,
+    ]),
+  )
+  await page.reload({ waitUntil: 'domcontentloaded' })
+  await expect(refresh).toBeVisible()
+  await refresh.click()
+  await expect.poll(() => capture.importedHistoryRefreshRequests.length).toBe(22)
+  for (const request of capture.importedHistoryRefreshRequests.slice(12)) {
+    expect(request.idempotencyKey).not.toBe(
+      firstCycleKeys.get(request.body.candidateGlobalId),
+    )
+    expect(request.idempotencyKey).toMatch(/:1$/)
+  }
 })
 
 test('orders refresh continues bounded provider batches from one manager action', async ({ page }) => {

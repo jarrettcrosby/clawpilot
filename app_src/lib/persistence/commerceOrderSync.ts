@@ -23,6 +23,7 @@ import {
 } from '@/lib/persistence/postgres'
 import {
   assertCommerceStoreSyncProviderReadLeaseCurrentWithClient,
+  commerceStoreSyncProviderReadIntentFingerprint,
   type CommerceStoreSyncProviderReadLease,
 } from '@/lib/persistence/commerceStoreSync'
 
@@ -48,6 +49,7 @@ const OBSERVATION_KINDS = new Set([
   'historical_backfill',
   'scheduled_poll',
   'webhook_exact_read',
+  'manual_exact_read',
 ] as const)
 const EVENT_KINDS = new Set([
   'order_created',
@@ -83,6 +85,7 @@ type CommerceOrderObservationKind =
   | 'historical_backfill'
   | 'scheduled_poll'
   | 'webhook_exact_read'
+  | 'manual_exact_read'
 type CommerceOrderEventKind =
   | 'order_created'
   | 'order_updated'
@@ -220,6 +223,24 @@ function optionalText(value: unknown, label: string, maximum: number) {
   return text(value, label, maximum)
 }
 
+function optionalHttpUrl(value: unknown, label: string) {
+  const normalized = optionalText(value, label, 2_048)
+  if (!normalized) return null
+  try {
+    const parsed = new URL(normalized)
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('unsupported protocol')
+    }
+    return parsed.toString()
+  } catch {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      `${label} is invalid`,
+      400,
+    )
+  }
+}
+
 function iso(value: unknown, label: string, optional: true): string | null
 function iso(value: unknown, label: string, optional?: false): string
 function iso(value: unknown, label: string, optional = false) {
@@ -334,6 +355,7 @@ export type CommerceOrderObservationLineInput = {
   currentQuantity?: number | null
   unfulfilledQuantity?: number | null
   fulfilledQuantity?: number | null
+  returnedQuantity?: number | null
   requiresShipping?: boolean | null
 }
 
@@ -351,6 +373,7 @@ export type CommerceOrderEventObservationInput = {
   providerLocationId?: string | null
   trackingCarrier?: string | null
   trackingNumber?: string | null
+  trackingUrl?: string | null
   occurredAt: string
 }
 
@@ -505,6 +528,11 @@ export function normalizeCommerceOrderObservationInput(
         'Fulfilled quantity',
         true,
       ),
+      returnedQuantity: quantity(
+        line.returnedQuantity,
+        'Returned quantity',
+        true,
+      ),
       requiresShipping: typeof line.requiresShipping === 'boolean'
         ? line.requiresShipping
         : null,
@@ -539,6 +567,8 @@ export function normalizeCommerceOrderObservationInput(
         && line.currentQuantity
           !== line.unfulfilledQuantity + line.fulfilledQuantity
       )
+      || (line.returnedQuantity !== null
+        && line.returnedQuantity > line.originalQuantity)
     ) {
       throw new CommerceOrderSyncError(
         'COMMERCE_ORDER_SYNC_INPUT_INVALID',
@@ -643,10 +673,12 @@ export function normalizeCommerceOrderObservationInput(
           'Tracking number',
           512,
         ),
+        trackingUrl: optionalHttpUrl(event.trackingUrl, 'Tracking URL'),
         occurredAt,
       }
       const sensitiveIdentifiers = [
         normalized.trackingNumber,
+        normalized.trackingUrl,
         normalized.providerActorFingerprint,
       ].filter((value): value is string => Boolean(value))
       const durableIdentifiers = [
@@ -670,7 +702,9 @@ export function normalizeCommerceOrderObservationInput(
       }
       const privacyMinimizedEvent = Object.fromEntries(
         Object.entries(normalized).filter(([key]) => (
-          key !== 'trackingNumber' && key !== 'providerActorFingerprint'
+          key !== 'trackingNumber'
+          && key !== 'trackingUrl'
+          && key !== 'providerActorFingerprint'
         )),
       )
       return {
@@ -780,6 +814,7 @@ type ObservationPersistenceContext = {
   provider: CommerceProvider
   credentialGeneration: number
   backfillSessionId: string | null
+  manualProviderReadLeaseId: string | null
 }
 
 async function appendObservationsWithClient(
@@ -811,8 +846,11 @@ async function appendObservationsWithClient(
         global_id: string
         order_id: string | null
         source_hash: string
+        observation_kind: CommerceOrderObservationKind
+        manual_provider_read_lease_id: string | null
       }>(
-        `SELECT id::text, global_id, order_id::text, source_hash
+        `SELECT id::text, global_id, order_id::text, source_hash,
+                observation_kind, manual_provider_read_lease_id::text
          FROM operations_commerce_order_observations
          WHERE organization_id = $1::uuid
            AND integration_account_id = $2::uuid
@@ -829,8 +867,22 @@ async function appendObservationsWithClient(
         ],
       )
     ).rows[0]
+    const exactObservation = ['manual_exact_read', 'webhook_exact_read']
+      .includes(observation.observationKind)
+    const exactLineageMatches = (
+      observation.observationKind !== 'manual_exact_read'
+      || latestObservationRow?.manual_provider_read_lease_id
+        === context.manualProviderReadLeaseId
+    )
     let observationRow = latestObservationRow?.source_hash
         === observation.sourceHash
+      && (
+        !exactObservation
+        || (
+          latestObservationRow.observation_kind === observation.observationKind
+          && exactLineageMatches
+        )
+      )
       ? latestObservationRow
       : (
           await client.query<{
@@ -838,8 +890,11 @@ async function appendObservationsWithClient(
             global_id: string
             order_id: string | null
             source_hash: string
+            observation_kind: CommerceOrderObservationKind
+            manual_provider_read_lease_id: string | null
           }>(
-            `SELECT id::text, global_id, order_id::text, source_hash
+            `SELECT id::text, global_id, order_id::text, source_hash,
+                    observation_kind, manual_provider_read_lease_id::text
              FROM operations_commerce_order_observations
              WHERE organization_id = $1::uuid
                AND integration_account_id = $2::uuid
@@ -847,6 +902,16 @@ async function appendObservationsWithClient(
                AND external_order_id = $4
                AND source_hash = $5
                AND observed_at = $6::timestamptz
+               AND (
+                 NOT $7::boolean
+                 OR (
+                   observation_kind = $8
+                   AND (
+                     $8 <> 'manual_exact_read'
+                     OR manual_provider_read_lease_id = $9::uuid
+                   )
+                 )
+               )
              LIMIT 1
              FOR SHARE`,
             [
@@ -856,23 +921,29 @@ async function appendObservationsWithClient(
               observation.externalOrderId,
               observation.sourceHash,
               observation.observedAt,
+              exactObservation,
+              observation.observationKind,
+              context.manualProviderReadLeaseId,
             ],
           )
         ).rows[0]
     if (observationRow) {
       const sensitiveEvents = observation.events.filter((event) => (
         event.trackingNumber !== null
+          || event.trackingUrl !== null
           || event.providerActorFingerprint !== null
       ))
       if (sensitiveEvents.length) {
         const retainedSensitive = await client.query<{
           event_hash: string
           tracking_number: string | null
+          tracking_url: string | null
           provider_actor_fingerprint: string | null
           sensitive_evidence_redacted_at: Date | null
           sensitive_evidence_expired: boolean
         }>(
-          `SELECT event_hash, tracking_number, provider_actor_fingerprint,
+          `SELECT event_hash, tracking_number, tracking_url,
+                  provider_actor_fingerprint,
                   sensitive_evidence_redacted_at,
                   sensitive_evidence_expires_at <= clock_timestamp()
                     AS sensitive_evidence_expired
@@ -904,6 +975,7 @@ async function appendObservationsWithClient(
               retained.sensitive_evidence_redacted_at === null
               && (
                 retained.tracking_number !== event.trackingNumber
+                || retained.tracking_url !== event.trackingUrl
                 || retained.provider_actor_fingerprint
                   !== event.providerActorFingerprint
               )
@@ -936,14 +1008,15 @@ async function appendObservationsWithClient(
          canonical_return_state, currency, provider_total_minor,
          provider_inventory_reservation_state, provider_created_at,
          provider_processed_at, provider_updated_at, provider_cancelled_at,
-         provider_closed_at, observed_at, provider_read_count
+         provider_closed_at, observed_at, provider_read_count,
+         manual_provider_read_lease_id
        )
        SELECT
          $1::uuid, $2::uuid, $3::uuid, canonical.id, $4, $5, $6,
          $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
          $18, $19, $20, $21, $22::timestamptz, $23::timestamptz,
          $24::timestamptz, $25::timestamptz, $26::timestamptz,
-         $27::timestamptz, $28
+         $27::timestamptz, $28, $29::uuid
        FROM (SELECT 1) singleton
        LEFT JOIN LATERAL (
          SELECT orders.id
@@ -956,7 +1029,9 @@ async function appendObservationsWithClient(
        ) canonical ON true
        ON CONFLICT (
          organization_id, integration_account_id, provider,
-         external_order_id, observed_at, source_hash
+         external_order_id, observation_kind, observed_at, source_hash,
+         backfill_session_id, webhook_target_id, webhook_dirty_version,
+         manual_provider_read_lease_id
        ) DO NOTHING
        RETURNING id::text, global_id, order_id::text, source_hash`,
       [
@@ -988,6 +1063,7 @@ async function appendObservationsWithClient(
         observation.providerClosedAt,
         observation.observedAt,
         observation.providerReadCount,
+        context.manualProviderReadLeaseId,
       ],
     )
     observationRow = observationRow || inserted?.rows[0]
@@ -997,30 +1073,40 @@ async function appendObservationsWithClient(
       preserved += 1
       observationWasPreserved = true
       observationRow = (
-        await client.query<{
-          id: string
-          global_id: string
-          order_id: string | null
-          source_hash: string
-        }>(
-          `SELECT id::text, global_id, order_id::text, source_hash
-           FROM operations_commerce_order_observations
-           WHERE organization_id = $1::uuid
-             AND integration_account_id = $2::uuid
-             AND provider = $3
-             AND external_order_id = $4
-             AND source_hash = $5
-             AND observed_at = $6::timestamptz
-           LIMIT 1`,
-          [
-            context.organizationId,
-            context.integrationAccountId,
-            context.provider,
-            observation.externalOrderId,
-            observation.sourceHash,
-            observation.observedAt,
-          ],
-        )
+          await client.query<{
+            id: string
+            global_id: string
+            order_id: string | null
+            source_hash: string
+            observation_kind: CommerceOrderObservationKind
+            manual_provider_read_lease_id: string | null
+          }>(
+            `SELECT id::text, global_id, order_id::text, source_hash,
+                    observation_kind, manual_provider_read_lease_id::text
+             FROM operations_commerce_order_observations
+             WHERE organization_id = $1::uuid
+               AND integration_account_id = $2::uuid
+               AND provider = $3
+               AND external_order_id = $4
+               AND source_hash = $5
+               AND observed_at = $6::timestamptz
+               AND observation_kind = $7
+               AND (
+                 $7 <> 'manual_exact_read'
+                 OR manual_provider_read_lease_id = $8::uuid
+               )
+             LIMIT 1`,
+            [
+              context.organizationId,
+              context.integrationAccountId,
+              context.provider,
+              observation.externalOrderId,
+              observation.sourceHash,
+              observation.observedAt,
+              observation.observationKind,
+              context.manualProviderReadLeaseId,
+            ],
+          )
       ).rows[0]
     }
     if (!observationRow) {
@@ -1033,9 +1119,9 @@ async function appendObservationsWithClient(
            organization_id, observation_id, external_line_id,
            external_product_id, external_variant_id, sku,
            original_quantity, current_quantity, unfulfilled_quantity,
-           fulfilled_quantity, requires_shipping
+           fulfilled_quantity, returned_quantity, requires_shipping
          ) VALUES (
-           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11
+           $1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
          )
          ON CONFLICT (
            organization_id, observation_id, external_line_id
@@ -1051,6 +1137,7 @@ async function appendObservationsWithClient(
           line.currentQuantity,
           line.unfulfilledQuantity,
           line.fulfilledQuantity,
+          line.returnedQuantity,
           line.requiresShipping,
         ],
       )
@@ -1084,13 +1171,14 @@ async function appendObservationsWithClient(
            quantity, amount_minor, currency, inventory_effect_kind,
            attribution_source, provider_actor_fingerprint,
            provider_location_id, tracking_carrier, tracking_number,
+           tracking_url,
            sensitive_evidence_expires_at, occurred_at, observed_at
          ) VALUES (
            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8,
            $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
-           $20, LEAST($21::timestamptz, $23::timestamptz)
-             + make_interval(days => $22),
-           $21::timestamptz, $23::timestamptz
+           $20, $21, LEAST($22::timestamptz, $24::timestamptz)
+             + make_interval(days => $23),
+           $22::timestamptz, $24::timestamptz
          )
          ON CONFLICT (
            organization_id, integration_account_id, provider,
@@ -1117,6 +1205,7 @@ async function appendObservationsWithClient(
           event.providerLocationId,
           event.trackingCarrier,
           event.trackingNumber,
+          event.trackingUrl,
           event.occurredAt,
           sensitiveEvidenceRetentionDays(),
           observation.observedAt,
@@ -1126,6 +1215,217 @@ async function appendObservationsWithClient(
     }
   }
   return { appended, preserved, linesAppended, eventsAppended }
+}
+
+/**
+ * Persists one manager-requested, exact Shopify order read in the same
+ * append-only evidence ledger used by webhook hydration and scheduled order
+ * history. The provider read is fenced separately by the caller; this method
+ * only accepts the exact account, credential generation, and order identity
+ * covered by that lease.
+ */
+export async function appendCommerceOrderWorkbenchExactReadInPostgres(input: {
+  organizationId: string
+  integrationAccountId: string
+  accountGlobalId: string
+  credentialGeneration: number
+  externalOrderId: string
+  providerReadLease: CommerceStoreSyncProviderReadLease
+  observation: CommerceOrderObservationInput
+}) {
+  if (
+    !UUID_PATTERN.test(input.organizationId)
+    || !UUID_PATTERN.test(input.integrationAccountId)
+    || !Number.isSafeInteger(input.credentialGeneration)
+    || input.credentialGeneration < 1
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      'Exact order-history authority is invalid',
+      400,
+    )
+  }
+  const observation = normalizeObservation(input.observation)
+  if (
+    observation.observationKind !== 'manual_exact_read'
+    || observation.externalOrderId !== input.externalOrderId
+    || observation.providerReadCount !== 3
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      'Exact order-history evidence does not match the refreshed order',
+      400,
+    )
+  }
+  return withTransaction(async (client) => {
+    await assertCommerceStoreSyncProviderReadLeaseCurrentWithClient(client, {
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+      lease: input.providerReadLease,
+      authorityKind: 'manual_read_only',
+      readKind: 'order_history',
+    })
+    const account = await client.query<{ integration_account_id: string }>(
+      `SELECT account.id::text AS integration_account_id
+       FROM operations_integration_accounts account
+       JOIN operations_commerce_credentials credential
+         ON credential.organization_id = account.organization_id
+        AND credential.integration_account_id = account.id
+        AND credential.credential_version = $4
+        AND credential.external_account_id = account.external_account_id
+        AND credential.auth_mode = 'shopify_client_credentials'
+        AND credential.verification_status = 'verified'
+       WHERE account.organization_id = $1::uuid
+         AND account.id = $2::uuid
+         AND account.global_id = $3
+         AND account.integration_type = 'commerce'
+         AND account.provider = 'shopify'
+         AND account.status = 'active'
+         AND account.commerce_credential_generation = $4
+       LIMIT 1
+       FOR SHARE OF account, credential`,
+      [
+        input.organizationId,
+        input.integrationAccountId,
+        input.accountGlobalId,
+        input.credentialGeneration,
+      ],
+    )
+    if (!account.rows[0]) {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_ACCOUNT_INELIGIBLE',
+        'The exact verified commerce connection changed before history was saved',
+      )
+    }
+    const persisted = await appendObservationsWithClient(client, {
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+      provider: 'shopify',
+      credentialGeneration: input.credentialGeneration,
+      backfillSessionId: null,
+      manualProviderReadLeaseId: input.providerReadLease.id,
+    }, [observation])
+    return Object.freeze({
+      ...persisted,
+      providerReads: 3 as const,
+      providerWrites: 0 as const,
+    })
+  })
+}
+
+export type CommerceOrderWorkbenchExactReadReplay = {
+  status: 'captured' | 'unavailable' | 'in_progress'
+  code: string | null
+  providerReads: 0
+  providerWrites: 0
+}
+
+/**
+ * Resolves an exact-order read command before repeating provider I/O. A
+ * completed capture replays from its immutable observation lineage; a prior
+ * unavailable result remains a no-write replay for the same command key.
+ */
+export async function readCommerceOrderWorkbenchExactReadReplayInPostgres(
+  input: {
+    organizationId: string
+    integrationAccountId: string
+    externalOrderId: string
+    intentKey: string
+  },
+): Promise<CommerceOrderWorkbenchExactReadReplay | null> {
+  if (
+    !UUID_PATTERN.test(input.organizationId)
+    || !UUID_PATTERN.test(input.integrationAccountId)
+    || !input.externalOrderId.trim()
+    || !input.intentKey.trim()
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      'Exact order-history replay evidence is invalid',
+      400,
+    )
+  }
+  const fingerprint = commerceStoreSyncProviderReadIntentFingerprint({
+    organizationId: input.organizationId,
+    integrationAccountId: input.integrationAccountId,
+    authorityKind: 'manual_read_only',
+    readKind: 'order_history',
+    intentKey: input.intentKey,
+  })
+  const result = await query<{
+    captured_at: Date | null
+    released_at: Date | null
+    release_reason: 'completed' | 'failed' | 'expired' | null
+    observation_id: string | null
+    observation_external_order_id: string | null
+  }>(
+    `SELECT lease.captured_at, lease.released_at, lease.release_reason,
+            observation.id::text AS observation_id,
+            observation.external_order_id AS observation_external_order_id
+     FROM operations_commerce_store_sync_read_leases lease
+     LEFT JOIN operations_commerce_order_observations observation
+       ON observation.organization_id = lease.organization_id
+      AND observation.integration_account_id = lease.integration_account_id
+      AND observation.manual_provider_read_lease_id = lease.id
+      AND observation.provider = 'shopify'
+      AND observation.observation_kind = 'manual_exact_read'
+     WHERE lease.organization_id = $1::uuid
+       AND lease.integration_account_id = $2::uuid
+       AND lease.authority_kind = 'manual_read_only'
+       AND lease.read_kind = 'order_history'
+       AND lease.intent_fingerprint_sha256 = $3
+     ORDER BY observation.observed_at DESC NULLS LAST,
+              observation.id DESC NULLS LAST
+     LIMIT 1`,
+    [
+      input.organizationId,
+      input.integrationAccountId,
+      fingerprint,
+    ],
+  )
+  const retained = result.rows[0]
+  if (!retained) return null
+  if (retained.observation_id) {
+    if (retained.observation_external_order_id !== input.externalOrderId) {
+      return null
+    }
+    if (!retained.captured_at) {
+      throw new CommerceOrderSyncError(
+        'COMMERCE_ORDER_HISTORY_REPLAY_INVALID',
+        'Exact order-history replay evidence is incomplete',
+        500,
+      )
+    }
+    return {
+      status: 'captured',
+      code: null,
+      providerReads: 0,
+      providerWrites: 0,
+    }
+  }
+  if (retained.captured_at) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_HISTORY_REPLAY_INVALID',
+      'Exact order-history capture is missing its observation',
+      500,
+    )
+  }
+  if (!retained.released_at) {
+    return {
+      status: 'in_progress',
+      code: 'COMMERCE_ORDER_HISTORY_REFRESH_IN_PROGRESS',
+      providerReads: 0,
+      providerWrites: 0,
+    }
+  }
+  return {
+    status: 'unavailable',
+    code: retained.release_reason === 'completed'
+      ? 'COMMERCE_ORDER_HISTORY_PREVIOUSLY_UNAVAILABLE'
+      : 'COMMERCE_ORDER_HISTORY_PREVIOUS_ATTEMPT_FAILED',
+    providerReads: 0,
+    providerWrites: 0,
+  }
 }
 
 type AccountRow = {
@@ -2269,6 +2569,7 @@ export async function appendCommerceOrderBackfillPageInPostgres(input: {
       provider: input.job.provider,
       credentialGeneration: input.job.credentialGeneration,
       backfillSessionId: input.job.id,
+      manualProviderReadLeaseId: null,
     }, observations)
     const providerDates = observations
       .map((observation) => observation.providerCreatedAt)
@@ -2817,6 +3118,7 @@ export async function readCommerceOrderSyncHealthFromPostgres() {
           AND (
             event.provider_actor_fingerprint IS NOT NULL
             OR event.tracking_number IS NOT NULL
+            OR event.tracking_url IS NOT NULL
           )) AS expired_sensitive_evidence,
        max(session.completed_at) AS last_completed_at
      FROM operations_commerce_order_backfill_sessions session`,
@@ -3287,8 +3589,25 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
     organizationId: string
     accountGlobalId: string
     externalOrderId: string
+    providerObservationKinds?: readonly CommerceOrderObservationKind[]
   },
 ): Promise<CommerceOrderEvidenceTimelinePage> {
+  const providerObservationKinds = input.providerObservationKinds || null
+  if (
+    providerObservationKinds
+    && (
+      providerObservationKinds.length < 1
+      || new Set(providerObservationKinds).size
+        !== providerObservationKinds.length
+      || providerObservationKinds.some((kind) => !OBSERVATION_KINDS.has(kind))
+    )
+  ) {
+    throw new CommerceOrderSyncError(
+      'COMMERCE_ORDER_SYNC_INPUT_INVALID',
+      'Provider observation-kind anchor is invalid',
+      400,
+    )
+  }
   const result = await query<{
     evidence_source: 'provider' | 'clawpilot'
     required_line_snapshot: boolean
@@ -3327,7 +3646,16 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
         AND account.id = observation.integration_account_id
         AND account.provider = observation.provider
        WHERE observation.external_order_id = $3
-       ORDER BY observation.observed_at DESC, observation.id DESC
+         AND (
+           $4::text[] IS NULL
+           OR observation.observation_kind = ANY($4::text[])
+         )
+       ORDER BY COALESCE(
+                  observation.provider_updated_at,
+                  observation.observed_at
+                ) DESC,
+                observation.observed_at DESC,
+                observation.id DESC
        LIMIT 1
      )
      SELECT 'provider'::text AS evidence_source,
@@ -3352,6 +3680,9 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
               'trackingNumber', CASE
                 WHEN event.sensitive_evidence_expires_at > now()
                   THEN event.tracking_number ELSE NULL END,
+              'trackingUrl', CASE
+                WHEN event.sensitive_evidence_expires_at > now()
+                  THEN event.tracking_url ELSE NULL END,
               'sensitiveEvidenceRedactedAt',
                 event.sensitive_evidence_redacted_at
             )) AS payload
@@ -3360,7 +3691,33 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
        ON account.organization_id = event.organization_id
       AND account.id = event.integration_account_id
       AND account.provider = event.provider
+     JOIN operations_commerce_order_observations event_observation
+       ON event_observation.organization_id = event.organization_id
+      AND event_observation.id = event.observation_id
+      AND event_observation.integration_account_id
+          = event.integration_account_id
+      AND event_observation.provider = event.provider
+      AND event_observation.external_order_id = event.external_order_id
      WHERE event.external_order_id = $3
+       AND (
+         $4::text[] IS NULL
+         OR EXISTS (
+           SELECT 1
+           FROM latest_observation anchor
+           WHERE (
+             COALESCE(
+               event_observation.provider_updated_at,
+               event_observation.observed_at
+             ),
+             event_observation.observed_at,
+             event_observation.id
+           ) <= (
+             COALESCE(anchor.provider_updated_at, anchor.observed_at),
+             anchor.observed_at,
+             anchor.id
+           )
+         )
+       )
      UNION ALL
      SELECT 'provider'::text AS evidence_source,
             true AS required_line_snapshot,
@@ -3375,6 +3732,7 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
             NULL::text AS location_reference,
             jsonb_build_object(
               'observationGlobalId', latest.global_id,
+              'observedAt', latest.observed_at,
               'inventorySemantics', 'order_demand',
               'lines', COALESCE(lines.payload, '[]'::jsonb)
             ) AS payload
@@ -3389,6 +3747,7 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
                 'currentQuantity', line.current_quantity,
                 'unfulfilledQuantity', line.unfulfilled_quantity,
                 'fulfilledQuantity', line.fulfilled_quantity,
+                'returnedQuantity', line.returned_quantity,
                 'requiresShipping', line.requires_shipping
               )) ORDER BY line.external_line_id) AS payload
        FROM operations_commerce_order_observation_lines line
@@ -3476,6 +3835,7 @@ export async function readCommerceOrderEvidenceTimelineByExternalOrderFromPostgr
       input.organizationId,
       input.accountGlobalId,
       text(input.externalOrderId, 'External order ID', 512),
+      providerObservationKinds,
     ],
   )
   const requiredLineSnapshot = result.rows.find(
@@ -3553,7 +3913,10 @@ export async function readCommerceOrderEvidenceTimelineFromPostgres(input: {
               'trackingCarrier', event.tracking_carrier,
               'trackingNumber', CASE
                 WHEN event.sensitive_evidence_expires_at > now()
-                  THEN event.tracking_number ELSE NULL END
+                  THEN event.tracking_number ELSE NULL END,
+              'trackingUrl', CASE
+                WHEN event.sensitive_evidence_expires_at > now()
+                  THEN event.tracking_url ELSE NULL END
             )) AS payload
      FROM operations_commerce_order_event_observations event
      JOIN target

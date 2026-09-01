@@ -31,6 +31,19 @@ function evidenceHash(label) {
   return createHash('sha256').update(label).digest('hex')
 }
 
+function providerReadIntentFingerprint(input) {
+  return createHash('sha256')
+    .update(JSON.stringify({
+      version: 'commerce-store-sync-provider-read-v1',
+      organizationId: input.organizationId,
+      integrationAccountId: input.integrationAccountId,
+      authorityKind: 'manual_read_only',
+      readKind: 'order_history',
+      intentKey: input.intentKey,
+    }))
+    .digest('hex')
+}
+
 async function verify(databaseUrl, ids) {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 })
   const accountTwo = randomUUID()
@@ -280,7 +293,619 @@ async function verify(databaseUrl, ids) {
         },
         '@/lib/persistence/config': { isHostedRuntime: () => false },
         '@/lib/persistence/postgres': adapter,
+        '@/lib/persistence/commerceStoreSync': {
+          async assertCommerceStoreSyncProviderReadLeaseCurrentWithClient() {},
+          commerceStoreSyncProviderReadIntentFingerprint(input) {
+            return providerReadIntentFingerprint(input)
+          },
+        },
       },
+    )
+    const manualIntentKey = 'manual-exact-order-history-lease'
+    const manualIntentFingerprint = providerReadIntentFingerprint({
+      organizationId: ids.organization,
+      integrationAccountId: ids.integration,
+      intentKey: manualIntentKey,
+    })
+    const manualLeaseId = randomUUID()
+    const manualLease = (await pool.query(
+      `WITH lease_clock AS (
+         SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+       )
+       INSERT INTO operations_commerce_store_sync_read_leases (
+         id, organization_id, integration_account_id, authority_kind,
+         read_kind, intent_fingerprint_sha256,
+         control_revision, activation_revision, acquired_by,
+         acquired_at, heartbeat_at, expires_at, captured_at
+       )
+       SELECT
+         $1::uuid, $2::uuid, $3::uuid, 'manual_read_only',
+         'order_history', $4,
+         control.revision, activation.revision, $5,
+         lease_clock.value, lease_clock.value,
+         lease_clock.value + interval '60 seconds', lease_clock.value
+       FROM operations_commerce_store_sync_controls control
+       JOIN operations_activation_scopes activation
+         ON activation.organization_id = control.organization_id
+       CROSS JOIN lease_clock
+       WHERE control.organization_id = $2::uuid
+         AND control.integration_account_id = $3::uuid
+       RETURNING id::text, control_revision::integer,
+                 activation_revision::integer, expires_at`,
+      [
+        manualLeaseId,
+        ids.organization,
+        ids.integration,
+        manualIntentFingerprint,
+        actorEmail,
+      ],
+    )).rows[0]
+    assert.ok(manualLease, 'manual exact-read lease must be captured')
+    const manualObservedAt = new Date().toISOString()
+    const manualExternalOrderId =
+      'gid://shopify/Order/manual-exact-history-9402'
+    const manualObservation = {
+      observationKind: 'manual_exact_read',
+      externalOrderId: manualExternalOrderId,
+      orderNumber: '#MANUAL-9402',
+      sourceRevision: manualObservedAt,
+      sourceHash: evidenceHash('manual-exact-order-history-observation'),
+      canonicalLifecycleState: 'closed',
+      canonicalPaymentState: 'partially_refunded',
+      canonicalFulfillmentState: 'fulfilled',
+      canonicalReturnState: 'returned',
+      currency: 'USD',
+      providerTotalMinor: 5900,
+      providerCreatedAt: manualObservedAt,
+      providerUpdatedAt: manualObservedAt,
+      providerClosedAt: manualObservedAt,
+      observedAt: manualObservedAt,
+      providerReadCount: 3,
+      lines: [{
+        externalLineId: 'gid://shopify/LineItem/manual-9402-1',
+        externalProductId: 'gid://shopify/Product/manual-9402',
+        externalVariantId: 'gid://shopify/ProductVariant/manual-9402',
+        sku: 'MANUAL-9402',
+        originalQuantity: 7,
+        currentQuantity: 5,
+        fulfilledQuantity: 5,
+        unfulfilledQuantity: 0,
+        requiresShipping: true,
+      }],
+      events: [{
+        externalEventId: 'manual-9402-fulfillment',
+        externalSubjectId: 'manual-9402-shipment',
+        eventKind: 'fulfillment_updated',
+        eventStatus: 'delivered',
+        quantity: 5,
+        inventoryEffectKind: 'none',
+        attributionSource: 'provider_system',
+        trackingCarrier: null,
+        trackingNumber: null,
+        occurredAt: manualObservedAt,
+      }, {
+        externalEventId: 'manual-9402-tracking',
+        externalSubjectId: 'manual-9402-shipment',
+        eventKind: 'tracking_updated',
+        eventStatus: 'delivered',
+        inventoryEffectKind: 'none',
+        attributionSource: 'provider_system',
+        trackingCarrier: 'USPS',
+        trackingNumber: '9400111899223856928499',
+        trackingUrl:
+          'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+        occurredAt: manualObservedAt,
+      }, {
+        externalEventId: 'manual-9402-refund',
+        externalSubjectId: 'manual-9402-refund-subject',
+        eventKind: 'refund_created',
+        eventStatus: 'succeeded',
+        amountMinor: 1200,
+        currency: 'USD',
+        inventoryEffectKind: 'restock_instruction',
+        attributionSource: 'provider_system',
+        occurredAt: manualObservedAt,
+      }],
+    }
+    const normalizedManualObservation = persistence
+      .normalizeCommerceOrderObservationInput(manualObservation)
+    const crossKindSeed = await pool.connect()
+    try {
+      await crossKindSeed.query('BEGIN')
+      await crossKindSeed.query('SET LOCAL session_replication_role = replica')
+      await crossKindSeed.query(
+        `INSERT INTO operations_commerce_order_observations (
+           organization_id, integration_account_id, backfill_session_id,
+           provider, credential_generation, observation_kind,
+           external_order_id, order_number, source_revision, source_hash,
+           canonical_lifecycle_state, canonical_payment_state,
+           canonical_fulfillment_state, canonical_return_state,
+           currency, provider_total_minor, provider_created_at,
+           provider_updated_at, provider_closed_at, observed_at,
+           provider_read_count
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 'scheduled_poll',
+           $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+           $14::timestamptz, $15::timestamptz, $16::timestamptz,
+           $17::timestamptz, 3
+         )`,
+        [
+          ids.organization,
+          ids.integration,
+          sessionOne.id,
+          manualExternalOrderId,
+          normalizedManualObservation.orderNumber,
+          normalizedManualObservation.sourceRevision,
+          normalizedManualObservation.sourceHash,
+          normalizedManualObservation.canonicalLifecycleState,
+          normalizedManualObservation.canonicalPaymentState,
+          normalizedManualObservation.canonicalFulfillmentState,
+          normalizedManualObservation.canonicalReturnState,
+          normalizedManualObservation.currency,
+          normalizedManualObservation.providerTotalMinor,
+          normalizedManualObservation.providerCreatedAt,
+          normalizedManualObservation.providerUpdatedAt,
+          normalizedManualObservation.providerClosedAt,
+          normalizedManualObservation.observedAt,
+        ],
+      )
+      await crossKindSeed.query('COMMIT')
+    } catch (error) {
+      await crossKindSeed.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      crossKindSeed.release()
+    }
+    const manualAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        accountGlobalId: 'gia0009301',
+        credentialGeneration: 1,
+        externalOrderId: manualExternalOrderId,
+        providerReadLease: {
+          id: manualLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256: manualIntentFingerprint,
+          controlRevision: manualLease.control_revision,
+          activationRevision: manualLease.activation_revision,
+          expiresAt: manualLease.expires_at.toISOString(),
+        },
+        observation: manualObservation,
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(manualAppend)), {
+      appended: 1,
+      preserved: 0,
+      linesAppended: 1,
+      eventsAppended: 3,
+      providerReads: 3,
+      providerWrites: 0,
+    })
+    const manualEvidence = (await pool.query(
+      `SELECT observation.observation_kind,
+              observation.manual_provider_read_lease_id::text,
+              observation.provider_read_count,
+              observation.canonical_lifecycle_state,
+              observation.canonical_fulfillment_state,
+              observation.canonical_return_state,
+              (SELECT jsonb_agg(jsonb_build_object(
+                 'externalLineId', line.external_line_id,
+                 'originalQuantity', line.original_quantity,
+                 'currentQuantity', line.current_quantity,
+                 'fulfilledQuantity', line.fulfilled_quantity,
+                 'unfulfilledQuantity', line.unfulfilled_quantity
+               ) ORDER BY line.external_line_id)
+               FROM operations_commerce_order_observation_lines line
+               WHERE line.organization_id = observation.organization_id
+                 AND line.observation_id = observation.id) AS lines,
+              (SELECT jsonb_agg(jsonb_build_object(
+                 'kind', event.event_kind,
+                 'carrier', event.tracking_carrier,
+                 'number', event.tracking_number,
+                 'url', event.tracking_url,
+                 'amountMinor', event.amount_minor
+               ) ORDER BY event.event_kind)
+               FROM operations_commerce_order_event_observations event
+               WHERE event.organization_id = observation.organization_id
+                 AND event.observation_id = observation.id) AS events
+       FROM operations_commerce_order_observations observation
+       WHERE observation.organization_id = $1::uuid
+         AND observation.integration_account_id = $2::uuid
+         AND observation.external_order_id = $3
+         AND observation.observation_kind = 'manual_exact_read'`,
+      [ids.organization, ids.integration, manualExternalOrderId],
+    )).rows[0]
+    assert.deepEqual(JSON.parse(JSON.stringify(manualEvidence)), {
+      observation_kind: 'manual_exact_read',
+      manual_provider_read_lease_id: manualLease.id,
+      provider_read_count: 3,
+      canonical_lifecycle_state: 'closed',
+      canonical_fulfillment_state: 'fulfilled',
+      canonical_return_state: 'returned',
+      lines: [{
+        externalLineId: 'gid://shopify/LineItem/manual-9402-1',
+        originalQuantity: 7,
+        currentQuantity: 5,
+        fulfilledQuantity: 5,
+        unfulfilledQuantity: 0,
+      }],
+      events: [{
+        kind: 'fulfillment_updated',
+        carrier: null,
+        number: null,
+        url: null,
+        amountMinor: null,
+      }, {
+        kind: 'refund_created',
+        carrier: null,
+        number: null,
+        url: null,
+        amountMinor: 1200,
+      }, {
+        kind: 'tracking_updated',
+        carrier: 'USPS',
+        number: '9400111899223856928499',
+        url: 'https://tools.usps.com/go/TrackConfirmAction?qtc_tLabels1=9400111899223856928499',
+        amountMinor: null,
+      }],
+    },
+    'manual exact refresh must retain terminal lines, adjustments, and tracking under its captured read lease')
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT observation_kind, source_hash
+         FROM operations_commerce_order_observations
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND external_order_id = $3
+         ORDER BY observation_kind`,
+        [ids.organization, ids.integration, manualExternalOrderId],
+      )).rows,
+      [{
+        observation_kind: 'manual_exact_read',
+        source_hash: normalizedManualObservation.sourceHash,
+      }, {
+        observation_kind: 'scheduled_poll',
+        source_hash: normalizedManualObservation.sourceHash,
+      }],
+      'Exact provider-read lineage must not collapse into a scheduled observation with the same provider facts and clock',
+    )
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+          organizationId: ids.organization,
+          integrationAccountId: ids.integration,
+          externalOrderId: manualExternalOrderId,
+          intentKey: manualIntentKey,
+        }),
+      )),
+      {
+        status: 'captured',
+        code: null,
+        providerReads: 0,
+        providerWrites: 0,
+      },
+      'A captured exact-read lease must replay without a second provider read',
+    )
+    const isolatedReplayInputs = [{
+      organizationId: randomUUID(),
+      integrationAccountId: ids.integration,
+      externalOrderId: manualExternalOrderId,
+      intentKey: manualIntentKey,
+    }, {
+      organizationId: ids.organization,
+      integrationAccountId: accountTwo,
+      externalOrderId: manualExternalOrderId,
+      intentKey: manualIntentKey,
+    }, {
+      organizationId: ids.organization,
+      integrationAccountId: ids.integration,
+      externalOrderId: `${manualExternalOrderId}-different`,
+      intentKey: manualIntentKey,
+    }, {
+      organizationId: ids.organization,
+      integrationAccountId: ids.integration,
+      externalOrderId: manualExternalOrderId,
+      intentKey: `${manualIntentKey}-different`,
+    }]
+    for (const isolatedInput of isolatedReplayInputs) {
+      assert.equal(
+        await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres(
+          isolatedInput,
+        ),
+        null,
+        'Exact-read replay must remain isolated by organization, account, order, and intent',
+      )
+    }
+    const createAdditionalManualLease = async (intentKey) => {
+      const id = randomUUID()
+      const intentFingerprintSha256 = providerReadIntentFingerprint({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        intentKey,
+      })
+      const lease = (await pool.query(
+        `WITH lease_clock AS (
+           SELECT date_trunc('milliseconds', clock_timestamp()) AS value
+         )
+         INSERT INTO operations_commerce_store_sync_read_leases (
+           id, organization_id, integration_account_id, authority_kind,
+           read_kind, intent_fingerprint_sha256,
+           control_revision, activation_revision, acquired_by,
+           acquired_at, heartbeat_at, expires_at, captured_at
+         )
+         SELECT
+           $1::uuid, $2::uuid, $3::uuid, 'manual_read_only',
+           'order_history', $4, control.revision, activation.revision, $5,
+           lease_clock.value, lease_clock.value,
+           lease_clock.value + interval '60 seconds', lease_clock.value
+         FROM operations_commerce_store_sync_controls control
+         JOIN operations_activation_scopes activation
+           ON activation.organization_id = control.organization_id
+         CROSS JOIN lease_clock
+         WHERE control.organization_id = $2::uuid
+           AND control.integration_account_id = $3::uuid
+         RETURNING id::text, control_revision::integer,
+                   activation_revision::integer, expires_at`,
+        [
+          id,
+          ids.organization,
+          ids.integration,
+          intentFingerprintSha256,
+          actorEmail,
+        ],
+      )).rows[0]
+      assert.ok(lease)
+      return { ...lease, intentKey, intentFingerprintSha256 }
+    }
+    const sameFactLease = await createAdditionalManualLease(
+      'manual-exact-order-history-same-facts',
+    )
+    const sameFactAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        accountGlobalId: 'gia0009301',
+        credentialGeneration: 1,
+        externalOrderId: manualExternalOrderId,
+        providerReadLease: {
+          id: sameFactLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256: sameFactLease.intentFingerprintSha256,
+          controlRevision: sameFactLease.control_revision,
+          activationRevision: sameFactLease.activation_revision,
+          expiresAt: sameFactLease.expires_at.toISOString(),
+        },
+        observation: manualObservation,
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(sameFactAppend)), {
+      appended: 1,
+      preserved: 0,
+      linesAppended: 1,
+      eventsAppended: 0,
+      providerReads: 3,
+      providerWrites: 0,
+    }, 'Identical provider facts from a different exact command need distinct lease lineage')
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(
+        await persistence.readCommerceOrderWorkbenchExactReadReplayInPostgres({
+          organizationId: ids.organization,
+          integrationAccountId: ids.integration,
+          externalOrderId: manualExternalOrderId,
+          intentKey: sameFactLease.intentKey,
+        }),
+      )),
+      {
+        status: 'captured',
+        code: null,
+        providerReads: 0,
+        providerWrites: 0,
+      },
+    )
+    const delayedOlderLease = await createAdditionalManualLease(
+      'manual-exact-order-history-delayed-older-revision',
+    )
+    const delayedObservedAt = new Date(
+      new Date(manualObservedAt).getTime() + 30_000,
+    ).toISOString()
+    const olderProviderUpdatedAt = new Date(
+      new Date(manualObservedAt).getTime() - 86_400_000,
+    ).toISOString()
+    const delayedOlderAppend = await persistence
+      .appendCommerceOrderWorkbenchExactReadInPostgres({
+        organizationId: ids.organization,
+        integrationAccountId: ids.integration,
+        accountGlobalId: 'gia0009301',
+        credentialGeneration: 1,
+        externalOrderId: manualExternalOrderId,
+        providerReadLease: {
+          id: delayedOlderLease.id,
+          authorityKind: 'manual_read_only',
+          readKind: 'order_history',
+          intentFingerprintSha256: delayedOlderLease.intentFingerprintSha256,
+          controlRevision: delayedOlderLease.control_revision,
+          activationRevision: delayedOlderLease.activation_revision,
+          expiresAt: delayedOlderLease.expires_at.toISOString(),
+        },
+        observation: {
+          ...manualObservation,
+          sourceRevision: olderProviderUpdatedAt,
+          providerCreatedAt: olderProviderUpdatedAt,
+          providerUpdatedAt: olderProviderUpdatedAt,
+          providerClosedAt: olderProviderUpdatedAt,
+          observedAt: delayedObservedAt,
+          lines: [{
+            ...manualObservation.lines[0],
+            currentQuantity: 2,
+            fulfilledQuantity: 2,
+          }],
+          events: [],
+        },
+      })
+    assert.deepEqual(JSON.parse(JSON.stringify(delayedOlderAppend)), {
+      appended: 1,
+      preserved: 0,
+      linesAppended: 1,
+      eventsAppended: 0,
+      providerReads: 3,
+      providerWrites: 0,
+    })
+    assert.deepEqual(
+      (await pool.query(
+        `SELECT manual_provider_read_lease_id::text AS lease_id
+         FROM operations_commerce_order_observations
+         WHERE organization_id = $1::uuid
+           AND integration_account_id = $2::uuid
+           AND external_order_id = $3
+           AND observation_kind = 'manual_exact_read'
+         ORDER BY manual_provider_read_lease_id::text`,
+        [ids.organization, ids.integration, manualExternalOrderId],
+      )).rows.map((row) => row.lease_id),
+      [manualLease.id, sameFactLease.id, delayedOlderLease.id].sort(),
+      'Every exact command must retain one independently replayable observation',
+    )
+    await pool.query(
+      `UPDATE operations_commerce_store_sync_read_leases
+       SET released_at = date_trunc('milliseconds', clock_timestamp()),
+           release_reason = 'completed'
+       WHERE id = ANY($1::uuid[])`,
+      [[manualLease.id, sameFactLease.id, delayedOlderLease.id]],
+    )
+    const laterScheduledObservedAt = new Date(
+      new Date(manualObservedAt).getTime() + 60_000,
+    ).toISOString()
+    const laterScheduledTracking = 'LATER-SCHEDULED-TRACKING-9402'
+    const laterScheduledSeed = await pool.connect()
+    try {
+      await laterScheduledSeed.query('BEGIN')
+      await laterScheduledSeed.query(
+        'SET LOCAL session_replication_role = replica',
+      )
+      const laterObservation = (await laterScheduledSeed.query(
+        `INSERT INTO operations_commerce_order_observations (
+           organization_id, integration_account_id, backfill_session_id,
+           provider, credential_generation, observation_kind,
+           external_order_id, order_number, source_revision, source_hash,
+           canonical_lifecycle_state, canonical_payment_state,
+           canonical_fulfillment_state, canonical_return_state,
+           currency, provider_total_minor, provider_created_at,
+           provider_updated_at, provider_closed_at, observed_at,
+           provider_read_count
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'shopify', 1, 'scheduled_poll',
+           $4, '#MANUAL-9402', 'later-scheduled-v1', $6,
+           'closed', 'partially_refunded',
+           'fulfilled', 'returned', 'USD', 5900, $7::timestamptz,
+           $5::timestamptz, $5::timestamptz, $5::timestamptz, 1
+         ) RETURNING id::text`,
+        [
+          ids.organization,
+          ids.integration,
+          sessionOne.id,
+          manualExternalOrderId,
+          laterScheduledObservedAt,
+          evidenceHash('manual-history-later-scheduled-state'),
+          manualObservedAt,
+        ],
+      )).rows[0]
+      await laterScheduledSeed.query(
+        `INSERT INTO operations_commerce_order_observation_lines (
+           organization_id, observation_id, external_line_id,
+           external_product_id, external_variant_id, sku,
+           original_quantity, current_quantity, unfulfilled_quantity,
+           fulfilled_quantity, returned_quantity, requires_shipping
+         ) VALUES (
+           $1::uuid, $2::uuid, $3, $4, $5, 'MANUAL-9402',
+           7, 4, 0, 4, 3, true
+         )`,
+        [
+          ids.organization,
+          laterObservation.id,
+          'gid://shopify/LineItem/manual-9402-1',
+          'gid://shopify/Product/manual-9402',
+          'gid://shopify/ProductVariant/manual-9402',
+        ],
+      )
+      await laterScheduledSeed.query(
+        `INSERT INTO operations_commerce_order_event_observations (
+           organization_id, integration_account_id, observation_id,
+           provider, external_order_id, external_event_id,
+           external_subject_id, event_hash, event_kind, event_status,
+           attribution_source, tracking_carrier, tracking_number,
+           tracking_url, sensitive_evidence_expires_at,
+           occurred_at, observed_at
+         ) VALUES (
+           $1::uuid, $2::uuid, $3::uuid, 'shopify', $4,
+           'manual-9402-later-scheduled-tracking',
+           'manual-9402-later-scheduled-shipment', $5,
+           'tracking_updated', 'delivered', 'provider_system', 'UPS', $6,
+           'https://www.ups.com/track?tracknum=LATER-SCHEDULED-TRACKING-9402',
+           $7::timestamptz + interval '30 days',
+           $7::timestamptz, $7::timestamptz
+         )`,
+        [
+          ids.organization,
+          ids.integration,
+          laterObservation.id,
+          manualExternalOrderId,
+          evidenceHash('manual-history-later-scheduled-tracking'),
+          laterScheduledTracking,
+          laterScheduledObservedAt,
+        ],
+      )
+      await laterScheduledSeed.query('COMMIT')
+    } catch (error) {
+      await laterScheduledSeed.query('ROLLBACK').catch(() => {})
+      throw error
+    } finally {
+      laterScheduledSeed.release()
+    }
+    const exactTimeline = await persistence
+      .readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres({
+        organizationId: ids.organization,
+        accountGlobalId: 'gia0009301',
+        externalOrderId: manualExternalOrderId,
+        providerObservationKinds: [
+          'manual_exact_read',
+          'webhook_exact_read',
+        ],
+      })
+    const exactLineSnapshot = exactTimeline.items.find(
+      (entry) => entry.eventKind === 'order_lines_snapshot',
+    )
+    assert.deepEqual(exactLineSnapshot.payload.lines.map((line) => ({
+      originalQuantity: line.originalQuantity,
+      currentQuantity: line.currentQuantity,
+      fulfilledQuantity: line.fulfilledQuantity,
+    })), [{
+      originalQuantity: 7,
+      currentQuantity: 5,
+      fulfilledQuantity: 5,
+    }], 'Workbench history must stay anchored to the latest exact observation')
+    assert.equal(
+      exactTimeline.items.some(
+        (entry) => entry.payload.trackingNumber === laterScheduledTracking,
+      ),
+      false,
+      'Events from a later scheduled observation must not leak past the exact-read anchor',
+    )
+    const unanchoredTimeline = await persistence
+      .readCommerceOrderEvidenceTimelineByExternalOrderFromPostgres({
+        organizationId: ids.organization,
+        accountGlobalId: 'gia0009301',
+        externalOrderId: manualExternalOrderId,
+      })
+    const unanchoredLineSnapshot = unanchoredTimeline.items.find(
+      (entry) => entry.eventKind === 'order_lines_snapshot',
+    )
+    assert.equal(unanchoredLineSnapshot.payload.lines[0].currentQuantity, 4)
+    assert.equal(
+      unanchoredTimeline.items.some(
+        (entry) => entry.payload.trackingNumber === laterScheduledTracking,
+      ),
+      true,
+      'The generic timeline must retain its latest-observation behavior',
     )
     await pool.query(
       `UPDATE operations_commerce_store_sync_controls
@@ -749,29 +1374,31 @@ async function verify(databaseUrl, ids) {
       /commerce_order_event_sensitive_retention_valid/u,
     )
     const sensitiveTracking = '1Z-PRIVATE'
+    const sensitiveTrackingUrl = 'https://carrier.example/track/1Z-PRIVATE'
     const sensitiveFingerprint = '4'.repeat(64)
     const sensitiveEvent = (await pool.query(
       `INSERT INTO operations_commerce_order_event_observations (
          organization_id, integration_account_id, observation_id,
          provider, external_order_id, event_hash, event_kind,
          attribution_source, provider_actor_fingerprint,
-         tracking_carrier, tracking_number, occurred_at, observed_at,
+         tracking_carrier, tracking_number, tracking_url,
+         occurred_at, observed_at,
          sensitive_evidence_expires_at, external_event_id,
          external_subject_id
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, 'faire', $4, $5,
-         'tracking_updated', 'provider_staff', $6, 'UPS', $7,
+         'tracking_updated', 'provider_staff', $6, 'UPS', $7, $8,
          now() - interval '401 days', now(), now() - interval '1 day',
          'shipment-history:tracking:0:0', 'shipment-history'
        ) RETURNING id::text`,
       [
         ids.organization, accountTwo, evidenceObservation.id,
         historyOnlyObservation.externalOrderId, '3'.repeat(64),
-        sensitiveFingerprint, sensitiveTracking,
+        sensitiveFingerprint, sensitiveTracking, sensitiveTrackingUrl,
       ],
     )).rows[0]
     const redactedAtInsert = (await pool.query(
-      `SELECT provider_actor_fingerprint, tracking_number,
+      `SELECT provider_actor_fingerprint, tracking_number, tracking_url,
               attribution_source, sensitive_evidence_redacted_at IS NOT NULL
                 AS redacted,
               external_event_id, external_subject_id, event_hash
@@ -782,6 +1409,7 @@ async function verify(databaseUrl, ids) {
     assert.deepEqual(redactedAtInsert, {
       provider_actor_fingerprint: null,
       tracking_number: null,
+      tracking_url: null,
       attribution_source: 'unavailable',
       redacted: true,
       external_event_id: 'shipment-history:tracking:0:0',
@@ -801,11 +1429,12 @@ async function verify(databaseUrl, ids) {
          organization_id, integration_account_id, observation_id,
          provider, external_order_id, event_hash, event_kind,
          attribution_source, provider_actor_fingerprint,
-         tracking_carrier, tracking_number, occurred_at, observed_at,
+         tracking_carrier, tracking_number, tracking_url,
+         occurred_at, observed_at,
          sensitive_evidence_expires_at, external_event_id
        ) VALUES (
          $1::uuid, $2::uuid, $3::uuid, 'faire', $4, $5,
-         'tracking_updated', 'provider_staff', $6, 'UPS', $7,
+         'tracking_updated', 'provider_staff', $6, 'UPS', $7, $8,
          now() - interval '399 days', now(),
          clock_timestamp() + interval '50 milliseconds',
          'shipment-recent:tracking:0:0'
@@ -814,6 +1443,7 @@ async function verify(databaseUrl, ids) {
         ids.organization, accountTwo, evidenceObservation.id,
         historyOnlyObservation.externalOrderId, '5'.repeat(64),
         '6'.repeat(64), '1Z-RECENT-PRIVATE',
+        'https://carrier.example/track/1Z-RECENT-PRIVATE',
       ],
     )).rows[0]
     await pool.query(`SELECT pg_sleep(0.1)`)
@@ -849,7 +1479,7 @@ async function verify(databaseUrl, ids) {
       .redactExpiredCommerceOrderSensitiveEvidenceInPostgres({ limit: 10 })
     assert.equal(redaction.redacted, 1)
     const redacted = (await pool.query(
-      `SELECT provider_actor_fingerprint, tracking_number,
+      `SELECT provider_actor_fingerprint, tracking_number, tracking_url,
               attribution_source, sensitive_evidence_redacted_at IS NOT NULL
                 AS redacted
        FROM operations_commerce_order_event_observations
@@ -859,6 +1489,7 @@ async function verify(databaseUrl, ids) {
     assert.deepEqual(redacted, {
       provider_actor_fingerprint: null,
       tracking_number: null,
+      tracking_url: null,
       attribution_source: 'unavailable',
       redacted: true,
     })
