@@ -5710,7 +5710,7 @@ export async function GET() {
                     'public.protect_commerce_order_event_tracking_url()',
                     'plpgsql', 'v', 'trigger',
                     'search_path=pg_catalog, public, pg_temp',
-                    'c51862e2cd78111afa76649445d2595413e0f569f76396cd173c89a7c30c474c'
+                    '6d5085be7d8b3cc0c41bcb96aafe492232d47c819c264296c1cd52d066b16a46'
                   ),
                   (
                     'public.reject_commerce_order_sync_evidence_mutation()',

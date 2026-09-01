@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { readFile } from 'node:fs/promises'
 import vm from 'node:vm'
@@ -29,6 +30,13 @@ const health = await readFile(
 const orderEditingReleaseHealth = await readFile(
   new URL(
     'app_src/lib/persistence/operationsOrderEditingReleaseHealth.ts',
+    root,
+  ),
+  'utf8',
+)
+const exactHistoryMigration = await readFile(
+  new URL(
+    'db/migrations/0340_operations_order_workbench_exact_history.sql',
     root,
   ),
   'utf8',
@@ -354,6 +362,17 @@ for (const contract of [
 assert.ok(
   health.includes('${OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_HEALTH_SQL}'),
   'Runtime health must evaluate the exact 0340 artifact fingerprint',
+)
+const trackingUrlGuardBody = exactHistoryMigration.match(
+  /CREATE OR REPLACE FUNCTION protect_commerce_order_event_tracking_url\(\)[\s\S]*?AS \$\$([\s\S]*?)\$\$;/u,
+)?.[1]
+assert.ok(trackingUrlGuardBody, 'Tracking-URL guard function body is missing')
+const trackingUrlGuardBodyHash = createHash('sha256')
+  .update(trackingUrlGuardBody.trim().replace(/\s+/gu, ' '), 'utf8')
+  .digest('hex')
+assert.ok(
+  health.includes(`'${trackingUrlGuardBodyHash}'`),
+  'Runtime health must attest the installed tracking-URL guard body',
 )
 for (const contract of [
   'OPERATIONS_ORDER_WORKBENCH_EXACT_HISTORY_ARTIFACT_COUNT = 17',
